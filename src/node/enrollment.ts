@@ -542,6 +542,28 @@ export function defaultInstallIdentityPath(credentialPath = defaultCredentialPat
   return join(dirname(credentialPath), 'install-identity.json');
 }
 
+export function defaultPendingDaemonBindPath(credentialPath = defaultCredentialPath()): string {
+  return join(dirname(credentialPath), 'pending-daemon-bind.json');
+}
+
+export interface PendingDaemonBindPrepared {
+  workerUrl: string;
+  serverId: string;
+  token: string;
+  serverName: string;
+  activeUserKey?: string;
+}
+
+export interface PendingDaemonBindRecord {
+  version: 1;
+  relayOrigin: string;
+  installId: string;
+  nodeTokenHash: string;
+  activeUserKey?: string;
+  prepared: PendingDaemonBindPrepared;
+  createdAt: number;
+}
+
 /** Stable trailer-free executable path used by boot autostart (distinct from download path). */
 export function defaultStagedExecutablePath(platform: NodeJS.Platform = process.platform): string {
   if (platform === 'win32') return join(windowsCredentialDir(), 'imcodes-node.exe');
@@ -584,7 +606,7 @@ export interface ProtectedSecretLoadOptions {
   assertCredentialDirSecured?: (dir: string) => void | Promise<void>;
 }
 
-async function assertSecretPathProtected(path: string, label: 'credential' | 'install_identity', options: ProtectedSecretLoadOptions): Promise<void> {
+async function assertSecretPathProtected(path: string, label: 'credential' | 'install_identity' | 'pending_bind', options: ProtectedSecretLoadOptions): Promise<void> {
   const platform = options.platform ?? process.platform;
   if (platform === 'win32') {
     const st = await lstat(path);
@@ -597,6 +619,65 @@ async function assertSecretPathProtected(path: string, label: 'credential' | 'in
   const st = await lstat(path);
   if (st.isSymbolicLink()) throw new Error(`${label}_path_is_symlink`);
   if ((st.mode & 0o077) !== 0) throw new Error(`${label}_permissions_insecure`);
+}
+
+function isValidPendingDaemonBindRecord(value: unknown): value is PendingDaemonBindRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const r = value as Partial<PendingDaemonBindRecord>;
+  if (r.version !== 1) return false;
+  if (typeof r.relayOrigin !== 'string' || !r.relayOrigin) return false;
+  if (typeof r.installId !== 'string' || !r.installId) return false;
+  if (typeof r.nodeTokenHash !== 'string' || !isEnrollmentNodeTokenHash(r.nodeTokenHash)) return false;
+  if (r.activeUserKey !== undefined && (typeof r.activeUserKey !== 'string' || !r.activeUserKey)) return false;
+  if (typeof r.createdAt !== 'number' || !Number.isFinite(r.createdAt) || r.createdAt < 0) return false;
+  if (!r.prepared || typeof r.prepared !== 'object' || Array.isArray(r.prepared)) return false;
+  const p = r.prepared as Partial<PendingDaemonBindPrepared>;
+  if (typeof p.workerUrl !== 'string' || !p.workerUrl) return false;
+  if (typeof p.serverId !== 'string' || !p.serverId) return false;
+  if (typeof p.token !== 'string' || !p.token) return false;
+  if (typeof p.serverName !== 'string') return false;
+  if (p.activeUserKey !== undefined && (typeof p.activeUserKey !== 'string' || !p.activeUserKey)) return false;
+  return true;
+}
+
+export async function loadPendingDaemonBind(
+  path = defaultPendingDaemonBindPath(),
+  options: ProtectedSecretLoadOptions = {},
+): Promise<PendingDaemonBindRecord | null> {
+  try {
+    await assertSecretPathProtected(path, 'pending_bind', options);
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!isValidPendingDaemonBindRecord(parsed)) {
+      throw new Error('pending_bind_invalid');
+    }
+    return parsed;
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+export async function persistPendingDaemonBind(
+  record: PendingDaemonBindRecord,
+  path = defaultPendingDaemonBindPath(),
+): Promise<void> {
+  if (!isValidPendingDaemonBindRecord(record)) {
+    throw new Error('pending_bind_invalid');
+  }
+  await assertWritablePathIsNotSymlink(path, 'pending_bind_path_is_symlink');
+  await writeProtectedJson(path, record);
+}
+
+export async function removePendingDaemonBind(
+  path = defaultPendingDaemonBindPath(),
+): Promise<void> {
+  try {
+    await assertWritablePathIsNotSymlink(path, 'pending_bind_path_is_symlink');
+    await unlink(path);
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
 }
 
 export async function loadInstallIdentity(

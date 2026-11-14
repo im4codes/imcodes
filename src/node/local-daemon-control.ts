@@ -122,6 +122,8 @@ export interface LocalDaemonSetupBindingInfo {
   bound: boolean;
   workerUrl: string | null;
   serverId: string | null;
+  activeUserKey?: string | null;
+  daemonInstalled?: boolean;
 }
 
 export interface PreparedDaemonBind {
@@ -129,6 +131,7 @@ export interface PreparedDaemonBind {
   serverId: string;
   token: string;
   serverName: string;
+  activeUserKey?: string;
 }
 
 export type PrepareDaemonBindResult =
@@ -2185,14 +2188,43 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     return next;
   }
 
+  function activeUserKeyForUser(user: ActiveDesktopUser): string {
+    return `${user.platform}:${typeof user.uid === 'number' ? user.uid : ''}:${user.username}:${user.home}`;
+  }
+
   return {
     status: () => inspectStatus(),
     readSetupBindingInfo: async (): Promise<LocalDaemonSetupBindingInfo> => {
       const user = await resolveUser();
-      if (!user) return { bound: false, workerUrl: null, serverId: null };
+      if (!user) {
+        return {
+          bound: false,
+          workerUrl: null,
+          serverId: null,
+          activeUserKey: null,
+          daemonInstalled: false,
+        };
+      }
+      const activeUserKey = activeUserKeyForUser(user);
+      const runtime = discoverCodingDaemonRuntime({
+        platform,
+        env,
+        execPath,
+        userHome: user.home,
+        bundleDirs: deps.bundleDirs,
+        cliCandidates: deps.cliCandidates,
+      });
       const stateDir = stateDirForUser(user);
       const creds = readServerCredentials(stateDir);
-      if (!creds) return { bound: false, workerUrl: null, serverId: null };
+      if (!creds) {
+        return {
+          bound: false,
+          workerUrl: null,
+          serverId: null,
+          activeUserKey,
+          daemonInstalled: Boolean(runtime),
+        };
+      }
       let normalizedWorkerUrl: string | null = creds.workerUrl ?? null;
       if (normalizedWorkerUrl) {
         try {
@@ -2205,6 +2237,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         bound: true,
         workerUrl: normalizedWorkerUrl,
         serverId: creds.serverId || null,
+        activeUserKey,
+        daemonInstalled: Boolean(runtime),
       };
     },
     logs: async () => {
@@ -2228,12 +2262,23 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       if (!runtime) {
         return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
       }
-      return await prepareBindUserDaemon(stateDirForUser(user), payload);
+      const prep = await prepareBindUserDaemon(stateDirForUser(user), payload);
+      if (!prep.ok) return prep;
+      return {
+        ...prep,
+        prepared: {
+          ...prep.prepared,
+          activeUserKey: activeUserKeyForUser(user),
+        },
+      };
     }),
     commitBind: (prepared: PreparedDaemonBind) => serialized(async (): Promise<LocalDaemonActionResult> => {
       const user = await resolveUser();
       if (!user) {
         return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NO_ACTIVE_USER };
+      }
+      if (prepared.activeUserKey && prepared.activeUserKey !== activeUserKeyForUser(user)) {
+        return { ok: false, statusCode: 409, error: 'active_user_changed' };
       }
       const stateDir = stateDirForUser(user);
       const runtime = discoverCodingDaemonRuntime({

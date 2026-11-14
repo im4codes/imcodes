@@ -10,8 +10,11 @@ import {
 import {
   EnrollDirectUnsupportedError,
   defaultInstallIdentityPath,
+  defaultPendingDaemonBindPath,
   loadCredential,
   loadInstallIdentity,
+  loadPendingDaemonBind,
+  persistCredential,
 } from '../../src/node/enrollment.js';
 import { loadInstallJournal, writeInstallPhase } from '../../src/node/install-journal.js';
 import { createLocalDaemonController, type LocalDaemonController } from '../../src/node/local-daemon-control.js';
@@ -488,10 +491,11 @@ describe('executePendingDesktopSetup chained bind + enroll', () => {
     // Relay A binding, exact file bytes, 0600 mode, and running daemon A were NEVER touched
     expect(await readFile(serverJsonPath, 'utf8')).toBe(relayAServerJson);
     expect((await stat(serverJsonPath)).mode & 0o777).toBe(0o600);
-    expect(await realDaemon.readSetupBindingInfo?.()).toEqual({
+    expect(await realDaemon.readSetupBindingInfo?.()).toMatchObject({
       bound: true,
       workerUrl: 'https://relay-a.example.com',
       serverId: 'srv-relay-a',
+      daemonInstalled: true,
     });
     expect(daemonKills).toEqual([]);
     expect(daemonSpawns).toEqual([]);
@@ -570,5 +574,379 @@ describe('executePendingDesktopSetup chained bind + enroll', () => {
     expect((await stat(serverJsonPath)).mode & 0o777).toBe(0o600);
     expect(daemonARunning).toBe(true);
     await expect(readFile(paths.credentialPath, 'utf8')).rejects.toThrow();
+  });
+
+  it('F3-R2: persists files_staged + stagedReceipt before saving credential, so crash after credential fsync rolls forward cleanly in bootstrap', async () => {
+    const paths = await makePaths(true);
+    const daemon: LocalDaemonController = {
+      status: vi.fn(async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        serverId: 'srv-daemon-f3',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      })),
+      logs: vi.fn(async () => ({ text: '', truncated: false })),
+      performAction: vi.fn(async () => ({ ok: true, statusCode: 200 })),
+      readSetupBindingInfo: vi.fn(async () => ({
+        bound: true,
+        workerUrl: 'https://relay.example.com',
+        serverId: 'srv-daemon-f3',
+      })),
+    };
+    const fetchFn = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const res = new Response(JSON.stringify({
+        ok: true,
+        serverId: 'srv-ctrl-f3',
+        nodeId: '1234567899',
+        nodeRole: 'controlled',
+        idempotent: false,
+        hostServerId: 'srv-daemon-f3',
+      }), { status: 201, headers: { 'content-type': 'application/json' } });
+      Object.defineProperty(res, 'url', { value: url });
+      return res;
+    }) as unknown as typeof fetch;
+
+    // Simulate process exit / write failure immediately after credential.json fsync completes (before enrolled write)
+    await expect(executePendingDesktopSetup({
+      relayOrigin: 'https://relay.example.com',
+      apiKey: 'deck_f3_crash',
+      daemonController: daemon,
+      deps: {
+        ...paths,
+        platform: 'linux',
+        arch: 'x64',
+        hostname: 'f3-box',
+        fetchFn,
+        persistCredentialFn: async (cred, path) => {
+          await persistCredential(cred, path);
+          throw new Error('simulated_crash_after_credential_fsync');
+        },
+      },
+    })).rejects.toThrow('simulated_crash_after_credential_fsync');
+
+    // credential.json exists on disk AND journal is already at files_staged WITH stagedReceipt
+    const savedCred = await loadCredential(paths.credentialPath);
+    expect(savedCred?.serverId).toBe('srv-ctrl-f3');
+    const preCrashJournal = await loadInstallJournal(paths.journalPath);
+    expect(preCrashJournal.phase).toBe('files_staged');
+    expect(preCrashJournal.stagedReceipt).toBeDefined();
+
+    // Next bootstrap must roll forward files_staged -> enrolled -> service_start_requested without manual recovery error
+    const baseDeps = defaultBootstrapDeps(Date.now());
+    const serviceReceipt = { name: 'imcodes-node.service', platform: 'linux' as const, action: paths.stagedExecutablePath };
+    const makeRollForwardDeps = () => ({
+      ...baseDeps,
+      loadCredential: () => loadCredential(paths.credentialPath),
+      loadInstallIdentity: () => loadInstallIdentity(defaultInstallIdentityPath(paths.credentialPath)),
+      credentialPath: paths.credentialPath,
+      journalPath: paths.journalPath,
+      stagedExecutablePath: paths.stagedExecutablePath,
+      sourceExecutablePath: paths.stagedExecutablePath,
+      isStableRuntime: (j: typeof preCrashJournal) => isCurrentExecutableStable(j, paths.stagedExecutablePath),
+      assertElevated: async () => {},
+      prepareCredentialDir: async () => {},
+      ensureReleasePublisherTrust: async () => {},
+      installDefinition: async () => serviceReceipt,
+      inspectDefinition: async () => serviceReceipt,
+      inspectServiceState: async () => ({
+        installed: true,
+        action: paths.stagedExecutablePath,
+        effectiveAction: paths.stagedExecutablePath,
+        loadedActionMatches: true,
+        loaded: true,
+        bootEnabled: true,
+        principal: 'root',
+        restartPolicy: 'on-failure',
+        observedDefinitionSha256: null,
+        definitionMatches: true,
+        runState: 'running' as const,
+        errors: [],
+        raw: 'running',
+      }),
+      startService: async () => {},
+      recoverInterruptedUpgrade: undefined,
+    });
+    const boot = await bootstrapControlledNodeWithDisposition(makeRollForwardDeps());
+    expect(boot.disposition).toBe('run_runtime');
+    expect(boot.journal.phase).toBe('service_start_requested');
+    expect(boot.journal.serverId).toBe('srv-ctrl-f3');
+  });
+
+  it('F3-R2: failure during executable staging leaves credential absent and stays recoverable via pending_setup + retry', async () => {
+    const credentialPath = join(dir, 'credential.json');
+    const journalPath = join(dir, 'install-journal.json');
+    const sourceExe = join(dir, 'source-node');
+    const stagedExe = join(dir, 'staged', 'imcodes-node');
+
+    const daemon: LocalDaemonController = {
+      status: vi.fn(async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        serverId: 'srv-daemon-stage',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      })),
+      logs: vi.fn(async () => ({ text: '', truncated: false })),
+      performAction: vi.fn(async () => ({ ok: true, statusCode: 200 })),
+      readSetupBindingInfo: vi.fn(async () => ({
+        bound: true,
+        workerUrl: 'https://relay.example.com',
+        serverId: 'srv-daemon-stage',
+      })),
+    };
+    const fetchFn = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const res = new Response(JSON.stringify({
+        ok: true,
+        serverId: 'srv-ctrl-stage',
+        nodeId: '2234567890',
+        nodeRole: 'controlled',
+        idempotent: false,
+        hostServerId: 'srv-daemon-stage',
+      }), { status: 201, headers: { 'content-type': 'application/json' } });
+      Object.defineProperty(res, 'url', { value: url });
+      return res;
+    }) as unknown as typeof fetch;
+
+    // Source binary missing on first attempt -> staging fails BEFORE credential write
+    await expect(executePendingDesktopSetup({
+      relayOrigin: 'https://relay.example.com',
+      apiKey: 'deck_stage_retry',
+      daemonController: daemon,
+      deps: {
+        credentialPath,
+        journalPath,
+        stagedExecutablePath: stagedExe,
+        sourceExecutablePath: sourceExe,
+        platform: 'linux',
+        arch: 'x64',
+        hostname: 'stage-box',
+        fetchFn,
+      },
+    })).rejects.toThrow();
+
+    expect(await loadCredential(credentialPath)).toBeNull();
+    expect((await loadInstallJournal(journalPath)).phase).toBe('credential_prepared');
+    expect(fetchFn).not.toHaveBeenCalled();
+
+    // Restart still enters pending_setup cleanly, then retry with valid source succeeds
+    await writeFile(sourceExe, '#!/bin/sh\necho ok\n', { mode: 0o755 });
+    const baseDeps = defaultBootstrapDeps(Date.now());
+    const bootPending = await bootstrapControlledNodeWithDisposition({
+      ...baseDeps,
+      loadCredential: () => loadCredential(credentialPath),
+      loadInstallIdentity: () => loadInstallIdentity(defaultInstallIdentityPath(credentialPath)),
+      credentialPath,
+      journalPath,
+      stagedExecutablePath: stagedExe,
+      sourceExecutablePath: sourceExe,
+      isStableRuntime: async () => false,
+      assertElevated: async () => {},
+      prepareCredentialDir: async () => {},
+      ensureReleasePublisherTrust: async () => {},
+      recoverInterruptedUpgrade: undefined,
+    });
+    expect(bootPending.disposition).toBe('pending_setup');
+
+    const cred = await executePendingDesktopSetup({
+      relayOrigin: 'https://relay.example.com',
+      apiKey: 'deck_stage_retry',
+      daemonController: daemon,
+      deps: {
+        credentialPath,
+        journalPath,
+        stagedExecutablePath: stagedExe,
+        sourceExecutablePath: sourceExe,
+        platform: 'linux',
+        arch: 'x64',
+        hostname: 'stage-box',
+        fetchFn,
+      },
+    });
+    expect(cred.serverId).toBe('srv-ctrl-stage');
+    expect((await loadInstallJournal(journalPath)).phase).toBe('enrolled');
+    expect((await loadInstallJournal(journalPath)).stagedReceipt).toBeDefined();
+  });
+
+  it('F5-R2: persists pending bind at 0600 before enroll, reuses B1 across lost enroll response and commitBind rollback even when /api/bind/direct generates new IDs, and cleans up on completion', async () => {
+    const home = join(dir, 'home-r2');
+    const stateDir = join(home, '.imcodes');
+    await mkdir(stateDir, { recursive: true, mode: 0o700 });
+    const relayAServerJson = JSON.stringify({
+      serverId: 'srv-relay-a',
+      token: 'tok-relay-a',
+      workerUrl: 'https://relay-a.example.com',
+      serverName: 'alice-box',
+    }, null, 2);
+    const serverJsonPath = join(stateDir, 'server.json');
+    await writeFile(serverJsonPath, relayAServerJson, { mode: 0o600 });
+    await writeFile(join(stateDir, 'daemon.pid'), '55555\n');
+    const procRoot = join(dir, 'proc-r2');
+    await mkdir(join(procRoot, '55555'), { recursive: true });
+    await writeFile(
+      join(procRoot, '55555', 'cmdline'),
+      '/opt/imcodes/daemon-runtime/bin/node\0/opt/imcodes/package/dist/src/index.js\0start\0--foreground\0',
+    );
+    const bundleDir = await createFakeBundleAsync(dir, '1.0.0', 'linux');
+    const paths = await makePaths(true);
+    const pendingBindPath = defaultPendingDaemonBindPath(paths.credentialPath);
+
+    let daemonARunning = true;
+    let bindDirectCalls = 0;
+    const daemonFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === 'https://relay-b.example.com/api/bind/direct') {
+        bindDirectCalls += 1;
+        return new Response(JSON.stringify({
+          serverId: `srv-relay-b-${bindDirectCalls}`,
+          token: `tok-relay-b-${bindDirectCalls}`,
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected daemon fetch: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const enrolledNodes = new Map<string, { serverId: string; hostServerId: string }>();
+    let dropFirstEnrollResponse = true;
+    const enrollFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const body = JSON.parse(String(init?.body ?? '{}')) as { nodeTokenHash: string; hostServerId: string };
+      const existing = enrolledNodes.get(body.nodeTokenHash);
+      if (existing) {
+        if (existing.hostServerId !== body.hostServerId) {
+          const conflictRes = new Response(JSON.stringify({ error: 'host_server_conflict' }), { status: 409 });
+          Object.defineProperty(conflictRes, 'url', { value: url });
+          return conflictRes;
+        }
+        const replayRes = new Response(JSON.stringify({
+          ok: true,
+          serverId: existing.serverId,
+          nodeId: '7777777777',
+          nodeRole: 'controlled',
+          idempotent: true,
+          hostServerId: existing.hostServerId,
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+        Object.defineProperty(replayRes, 'url', { value: url });
+        return replayRes;
+      }
+      enrolledNodes.set(body.nodeTokenHash, { serverId: 'srv-ctrl-r2', hostServerId: body.hostServerId });
+      if (dropFirstEnrollResponse) {
+        dropFirstEnrollResponse = false;
+        throw new TypeError('network response lost after server committed');
+      }
+      const createdRes = new Response(JSON.stringify({
+        ok: true,
+        serverId: 'srv-ctrl-r2',
+        nodeId: '7777777777',
+        nodeRole: 'controlled',
+        idempotent: false,
+        hostServerId: body.hostServerId,
+      }), { status: 201, headers: { 'content-type': 'application/json' } });
+      Object.defineProperty(createdRes, 'url', { value: url });
+      return createdRes;
+    }) as unknown as typeof fetch;
+
+    const makeController = (failFirstSpawn: boolean) => {
+      let spawns = 0;
+      return createLocalDaemonController({
+        platform: 'linux',
+        env: {},
+        procRoot,
+        bundleDirs: [bundleDir],
+        currentUid: () => process.getuid!(),
+        currentGid: () => process.getgid!(),
+        activeUser: { platform: 'linux', username: 'alice', home, uid: process.getuid!(), gid: process.getgid!() },
+        isPidAlive: () => daemonARunning,
+        execText: async (file, args) => {
+          if (file === 'systemctl' && args[1] === 'show-environment') throw new Error('no systemd');
+          return { stdout: '', stderr: '' };
+        },
+        killProcess: () => { daemonARunning = false; },
+        spawnDetached: () => {
+          spawns += 1;
+          if (failFirstSpawn && spawns === 1) throw new Error('spawn_b_failed');
+          daemonARunning = true;
+        },
+        fetchImpl: daemonFetch,
+        stopWaitMs: 10,
+        sleep: async () => {},
+      });
+    };
+
+    // Attempt 1: prepareBind gets srv-relay-b-1, server commits N->srv-relay-b-1, HTTP response drops
+    await expect(executePendingDesktopSetup({
+      relayOrigin: 'https://relay-b.example.com',
+      apiKey: 'deck_b_retry',
+      daemonController: makeController(false),
+      deps: { ...paths, pendingBindPath, platform: 'linux', arch: 'x64', hostname: 'alice-box', fetchFn: enrollFetch },
+    })).rejects.toThrow(/network response lost/);
+
+    expect(bindDirectCalls).toBe(1);
+    expect(await readFile(serverJsonPath, 'utf8')).toBe(relayAServerJson);
+    expect((await stat(pendingBindPath)).mode & 0o777).toBe(0o600);
+    expect((await loadPendingDaemonBind(pendingBindPath))?.prepared.serverId).toBe('srv-relay-b-1');
+
+    // Attempt 2 (fresh controller / restarted process): reuses srv-relay-b-1 (NO /bind/direct call), commitBind fails -> rolls back A, pendingBind kept
+    await expect(executePendingDesktopSetup({
+      relayOrigin: 'https://relay-b.example.com',
+      apiKey: 'deck_b_retry',
+      daemonController: makeController(true),
+      deps: { ...paths, pendingBindPath, platform: 'linux', arch: 'x64', hostname: 'alice-box', fetchFn: enrollFetch },
+    })).rejects.toThrow(/start_failed|daemon_bind_failed/);
+
+    expect(bindDirectCalls).toBe(1);
+    expect(await readFile(serverJsonPath, 'utf8')).toBe(relayAServerJson);
+    expect((await stat(serverJsonPath)).mode & 0o777).toBe(0o600);
+    expect(daemonARunning).toBe(true);
+    expect(await loadCredential(paths.credentialPath)).toBeNull();
+    const savedPending = await loadPendingDaemonBind(pendingBindPath);
+    expect(savedPending?.prepared.serverId).toBe('srv-relay-b-1');
+
+    // Also verify pending bind is NOT reused if active user changes (no hostServerId leakage across OS users)
+    const bobController = createLocalDaemonController({
+      platform: 'linux',
+      env: {},
+      procRoot,
+      bundleDirs: [bundleDir],
+      currentUid: () => process.getuid!(),
+      currentGid: () => process.getgid!(),
+      activeUser: { platform: 'linux', username: 'bob', home: join(dir, 'bob-home'), uid: process.getuid!(), gid: process.getgid!() },
+      fetchImpl: daemonFetch,
+    });
+    expect((await bobController.readSetupBindingInfo?.())?.activeUserKey).not.toBe(
+      (await makeController(false).readSetupBindingInfo?.())?.activeUserKey,
+    );
+    expect(await bobController.commitBind?.(savedPending!.prepared)).toMatchObject({
+      ok: false,
+      error: 'active_user_changed',
+    });
+
+    // Attempt 3 (fresh controller / restarted process): reuses srv-relay-b-1, gets 200 idempotent (NO 409 conflict), commits B1, clears pendingBind
+    const finalCred = await executePendingDesktopSetup({
+      relayOrigin: 'https://relay-b.example.com',
+      apiKey: 'deck_b_retry',
+      daemonController: makeController(false),
+      deps: { ...paths, pendingBindPath, platform: 'linux', arch: 'x64', hostname: 'alice-box', fetchFn: enrollFetch },
+    });
+
+    expect(bindDirectCalls).toBe(1);
+    expect(finalCred.serverId).toBe('srv-ctrl-r2');
+    expect(JSON.parse(await readFile(serverJsonPath, 'utf8')).serverId).toBe('srv-relay-b-1');
+    expect((await stat(serverJsonPath)).mode & 0o777).toBe(0o600);
+    expect((await loadCredential(paths.credentialPath))?.serverId).toBe('srv-ctrl-r2');
+    expect((await loadInstallJournal(paths.journalPath)).phase).toBe('enrolled');
+    expect(await loadPendingDaemonBind(pendingBindPath)).toBeNull();
+    expect(enrolledNodes.size).toBe(1);
   });
 });
