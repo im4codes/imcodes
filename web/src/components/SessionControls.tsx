@@ -181,9 +181,10 @@ import { recordPerfRender } from '../perf-render-debug.js';
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
 export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
+const VOICE_HOLD_TAP_GUARD_MS = 145;
 const VOICE_HOLD_UNFOCUSED_DELAY_MS = 175;
 const VOICE_HOLD_FOCUSED_DELAY_MS = 240;
-const VOICE_HOLD_SLIDE_PROMOTE_MS = 90;
+const VOICE_HOLD_SLIDE_INTENT_MS = 90;
 const VOICE_HOLD_SLIDE_PROMOTE_PX = 14;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
 const VOICE_HOLD_SCROLL_ABORT_PX = 40;
@@ -214,6 +215,12 @@ function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEdita
 
 function clearComposerVoiceTouchLock(el: HTMLDivElement | null, disabled: boolean): void {
   if (!el) return;
+  const composer = el.closest('.controls-composer');
+  if (composer) {
+    // Strip pending/holding classes synchronously so -webkit-user-modify: read-only !important
+    // is lifted before el.focus() executes in the same pointerup/fallback user-gesture turn.
+    composer.classList.remove('controls-composer-voice-pending', 'controls-composer-voice-holding');
+  }
   const style = el.style as CSSStyleDeclaration & {
     webkitUserSelect?: string;
     webkitTouchCallout?: string;
@@ -1338,6 +1345,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldError, setVoiceHoldError] = useState<string | null>(null);
   const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldSlideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldPointerRef = useRef<{
     id: number;
@@ -1345,6 +1353,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     startY: number;
     wasFocused: boolean;
     pointerType: string;
+    slideIntentDx: number | null;
     downAt: number;
     lastActivityAt: number;
     captureLost: boolean;
@@ -5231,6 +5240,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearTimeout(voiceHoldTimerRef.current);
       voiceHoldTimerRef.current = null;
     }
+    if (voiceHoldSlideTimerRef.current !== null) {
+      clearTimeout(voiceHoldSlideTimerRef.current);
+      voiceHoldSlideTimerRef.current = null;
+    }
     if (voiceHoldRecognizingTimerRef.current !== null) {
       clearTimeout(voiceHoldRecognizingTimerRef.current);
       voiceHoldRecognizingTimerRef.current = null;
@@ -5387,11 +5400,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (tx.drainPromise !== null) return tx.drainPromise;
     resetVoiceHoldInteractionState();
 
-    const shouldFallbackToClick =
-      outcome === 'failed'
-      && !tx.didStartRecording
-      && tx.zone !== 'cancel';
-    if (shouldFallbackToClick) {
+    // Any hold that never succeeded in active capture falls back to typing focus
+    // (regardless of slide zone), whereas explicit slide-to-cancel after active
+    // recording stops cleanly without popping open the keyboard.
+    const didPreRecordingFallback =
+      !tx.didStartRecording
+      && (outcome === 'failed' || outcome === 'cancel');
+    if (didPreRecordingFallback) {
       fallbackToComposerClick(tx.pointerType);
     }
 
@@ -5461,10 +5476,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
         if (timedOut || tx.settled || outcome === 'failed' || tx.phase === 'failed' || !started || tx.error !== null || !mountedRef.current) {
           if (
-            !shouldFallbackToClick
-            && (!started || tx.error !== null)
+            !didPreRecordingFallback
+            && (!started || tx.error !== null || timedOut)
             && !tx.didStartRecording
-            && tx.zone !== 'cancel'
             && mountedRef.current
           ) {
             fallbackToComposerClick(tx.pointerType);
@@ -5531,8 +5545,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (tx && (tx.settled || tx.phase === 'draining' || tx.drainPromise !== null)) {
       return;
     }
+    if (!tx) {
+      resetVoiceHoldInteractionState();
+      fallbackToComposerClick(ptr.pointerType);
+      return;
+    }
+    if (!tx.didStartRecording) {
+      void finalizeVoiceHold(tx, 'failed');
+      return;
+    }
     ptr.captureLost = true;
-  }, []);
+  }, [fallbackToComposerClick, finalizeVoiceHold, resetVoiceHoldInteractionState]);
 
   /** Transition a pending pointer press into active voice capture (shared by hold timer and slide promotion). */
   const activateComposerVoiceHold = useCallback((
@@ -5540,10 +5563,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     initialDx = 0,
     captureTarget?: EventTarget | null,
   ) => {
-    if (voiceHoldTimerRef.current !== null) {
-      clearTimeout(voiceHoldTimerRef.current);
-      voiceHoldTimerRef.current = null;
-    }
+    clearVoiceHoldTimers();
     voiceHoldPendingRef.current = false;
     setVoiceHoldPending(false);
     if (!mountedRef.current || voiceHoldTxRef.current !== null) {
@@ -5708,6 +5728,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       startY,
       wasFocused,
       pointerType,
+      slideIntentDx: null as number | null,
       downAt: now,
       lastActivityAt: now,
       captureLost: false,
@@ -5747,19 +5768,38 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (!ptr) return;
       const dx = (event.clientX ?? 0) - ptr.startX;
       const dy = (event.clientY ?? 0) - ptr.startY;
+      const dist = Math.hypot(dx, dy);
       const elapsed = Date.now() - ptr.downAt;
-      // Multi-signal horizontal slide-hold promotion past short tap debounce
-      if (
+      const hasHorizontalSlideIntent =
         !ptr.wasFocused
-        && elapsed >= VOICE_HOLD_SLIDE_PROMOTE_MS
         && Math.abs(dx) >= VOICE_HOLD_SLIDE_PROMOTE_PX
-        && Math.abs(dx) > Math.abs(dy) * 1.2
-      ) {
+        && Math.abs(dx) > Math.abs(dy) * 1.2;
+
+      // Never start mic capture inside the <=140ms tap protection window;
+      // past 90ms recognize horizontal intent and promote once the tap guard clears.
+      if (hasHorizontalSlideIntent && elapsed >= VOICE_HOLD_TAP_GUARD_MS) {
         if (event.cancelable) event.preventDefault();
         activateComposerVoiceHold(ptr, dx, divRef.current);
         return;
       }
-      if (Math.hypot(dx, dy) > VOICE_HOLD_MOVE_SLOP_PX) {
+      if (hasHorizontalSlideIntent && elapsed >= VOICE_HOLD_SLIDE_INTENT_MS) {
+        ptr.slideIntentDx = dx;
+        if (voiceHoldSlideTimerRef.current === null) {
+          const remainingMs = Math.max(1, VOICE_HOLD_TAP_GUARD_MS - elapsed);
+          voiceHoldSlideTimerRef.current = setTimeout(() => {
+            voiceHoldSlideTimerRef.current = null;
+            if (voiceHoldPointerRef.current !== ptr || voiceHoldTxRef.current !== null) return;
+            activateComposerVoiceHold(ptr, ptr.slideIntentDx ?? 0, divRef.current);
+          }, remainingMs);
+        }
+        return;
+      }
+      ptr.slideIntentDx = null;
+      if (voiceHoldSlideTimerRef.current !== null) {
+        clearTimeout(voiceHoldSlideTimerRef.current);
+        voiceHoldSlideTimerRef.current = null;
+      }
+      if (dist > VOICE_HOLD_MOVE_SLOP_PX) {
         const isStrongVerticalScroll =
           Math.abs(dy) >= VOICE_HOLD_SCROLL_ABORT_PX
           && Math.abs(dy) > Math.abs(dx) * 1.5;
@@ -5802,9 +5842,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldPendingRef.current = false;
     setVoiceHoldPending(false);
 
-    if (voiceHoldTimerRef.current !== null) {
-      clearTimeout(voiceHoldTimerRef.current);
-      voiceHoldTimerRef.current = null;
+    if (voiceHoldTimerRef.current !== null || voiceHoldSlideTimerRef.current !== null || !tx) {
+      clearVoiceHoldTimers();
       clearComposerVoiceWindowListeners();
       // Any short release or pending pointercancel before active recording falls back to typing focus.
       fallbackToComposerClick(resolvedPointerType);
@@ -5812,20 +5851,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     clearComposerVoiceWindowListeners();
-    if (!tx) return;
     if (tx.settled || tx.drainPromise !== null) {
-      if (tx.phase === 'failed' && !tx.didStartRecording && tx.zone !== 'cancel') {
+      if (!tx.didStartRecording && (tx.phase === 'failed' || tx.error !== null)) {
         fallbackToComposerClick(resolvedPointerType);
       }
       return;
     }
     event.preventDefault();
-    if (cancelled && !tx.didStartRecording) {
+    if ((cancelled || tx.error !== null) && !tx.didStartRecording) {
       try { divRef.current?.blur(); } catch { /* ignore */ }
-      void finalizeVoiceHold(tx, 'failed');
-      return;
-    }
-    if (tx.error !== null && !tx.didStartRecording && tx.zone !== 'cancel') {
       void finalizeVoiceHold(tx, 'failed');
       return;
     }

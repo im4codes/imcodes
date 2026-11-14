@@ -1,6 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -1427,6 +1428,225 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     }
   });
 
+  it('exercises real interactive SessionControls touch/pointer tap-guard, slide-hold, failed-hold keyboard fallback, and active cancel in mobile Chromium', { timeout: 60000 }, async () => {
+    vi.useRealTimers();
+    const require = createRequire(import.meta.url);
+    const browserType = (require('playwright') as typeof import('playwright')).chromium;
+    if (!existsSync(browserType.executablePath())) {
+      return;
+    }
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    const webDir = resolve(testDir, '../..');
+    const stylesCss = readFileSync(resolve(webDir, 'src/styles.css'), 'utf8');
+
+    const entrySource = `
+      import { render } from 'preact';
+      import { SessionControls } from './src/components/SessionControls.tsx';
+      const ws = { connected: true, send: () => {}, sendSessionCommand: () => {}, onMessage: () => () => {} };
+      const session = { name: 'deck_main', project: 'main', role: 'main', agentType: 'claude-code-sdk', state: 'idle', runtimeType: 'transport', projectDir: '/tmp/project' };
+      const quickData = { data: { history: [], sessionHistory: {}, commands: [], phrases: [] }, loaded: true, recordHistory: () => {}, addCommand: () => {}, addPhrase: () => {}, removeCommand: () => {}, removePhrase: () => {}, removeHistory: () => {}, removeSessionHistory: () => {}, clearHistory: () => {}, clearSessionHistory: () => {} };
+      render(<SessionControls ws={ws} activeSession={session} quickData={quickData} sessions={[]} subSessions={[]} serverId="srv-1" />, document.getElementById('app'));
+    `;
+
+    // Bundle in a clean Node subprocess to avoid jsdom cross-realm TextEncoder/Uint8Array mismatch in esbuild
+    const bundleCode = execFileSync(
+      process.execPath,
+      [
+        '-e',
+        `
+        const esbuild = require(require('path').resolve(process.cwd(), 'node_modules/esbuild'));
+        const entry = process.env.BUILD_ENTRY;
+        const stubPlugin = {
+          name: 'chromium-session-controls-stubs',
+          setup(build) {
+            build.onResolve({ filter: /^\\.\\/VoiceInput\\.js$/ }, (args) =>
+              args.importer.endsWith('SessionControls.tsx') ? { path: 'voice-input-stub', namespace: 'stub' } : null,
+            );
+            build.onResolve({ filter: /^\\.\\/VoiceOverlay\\.js$/ }, (args) =>
+              args.importer.endsWith('SessionControls.tsx') ? { path: 'voice-overlay-stub', namespace: 'stub' } : null,
+            );
+            build.onResolve({ filter: /^react-i18next$/ }, () => ({ path: 'i18n-stub', namespace: 'stub' }));
+            build.onLoad({ filter: /.*/, namespace: 'stub' }, (args) => {
+              if (args.path === 'voice-input-stub') {
+                return {
+                  contents: 'export const isAvailable=()=>true;export const prewarm=(o)=>window.__voiceMock.prewarm(o);export const startListening=(...a)=>window.__voiceMock.startListening(...a);export const stopListening=()=>window.__voiceMock.stopListening();export const onAudioLevel=(cb)=>window.__voiceMock.onAudioLevel(cb);',
+                  loader: 'js',
+                };
+              }
+              if (args.path === 'voice-overlay-stub') {
+                return { contents: 'export const VoiceOverlay = () => null;', loader: 'js' };
+              }
+              return { contents: 'export const useTranslation = () => ({ t: (k) => k, i18n: { language: "en" } });', loader: 'js' };
+            });
+          },
+        };
+        esbuild.build({
+          stdin: { contents: entry, resolveDir: process.cwd(), loader: 'tsx' },
+          absWorkingDir: process.cwd(),
+          bundle: true,
+          format: 'iife',
+          write: false,
+          jsx: 'automatic',
+          jsxImportSource: 'preact',
+          tsconfig: require('path').resolve(process.cwd(), 'tsconfig.json'),
+          plugins: [stubPlugin],
+        }).then((built) => {
+          process.stdout.write(built.outputFiles[0].text);
+        }).catch((err) => {
+          console.error(err);
+          process.exit(1);
+        });
+        `,
+      ],
+      {
+        cwd: webDir,
+        env: { ...process.env, BUILD_ENTRY: entrySource },
+        encoding: 'utf8',
+        maxBuffer: 20 * 1024 * 1024,
+      },
+    );
+
+    const browser = await browserType.launch({ headless: true });
+    try {
+      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
+      const page = await context.newPage();
+      await page.route('https://imcodes.test/**', async (route) => {
+        const url = route.request().url();
+        if (url === 'https://imcodes.test/') {
+          await route.fulfill({
+            status: 200,
+            contentType: 'text/html; charset=utf-8',
+            body: `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${stylesCss}</style></head><body><div id="app"></div></body></html>`,
+          });
+          return;
+        }
+        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+      });
+
+      await page.goto('https://imcodes.test/');
+      await page.evaluate(() => {
+        (window as any).__voiceCalls = { start: 0, stop: 0, nextStartResult: true };
+        (window as any).__voiceMock = {
+          prewarm: async () => {},
+          startListening: async () => {
+            (window as any).__voiceCalls.start += 1;
+            return (window as any).__voiceCalls.nextStartResult;
+          },
+          stopListening: async () => {
+            (window as any).__voiceCalls.stop += 1;
+          },
+          onAudioLevel: () => () => {},
+        };
+      });
+      await page.addScriptTag({ content: bundleCode });
+      await page.waitForSelector('.controls-composer-voice-ready .controls-input');
+
+      // 1. Real mobile tap (60ms with dx=12 thumb drift) must focus composer for real Chromium typing and never start voice
+      const box = await page.locator('.controls-input').boundingBox();
+      expect(box).not.toBeNull();
+      const cx = box!.x + box!.width / 2;
+      const cy = box!.y + box!.height / 2;
+
+      await page.evaluate(async ({ x, y }) => {
+        const el = document.querySelector('.controls-input')!;
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 60));
+        el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 12, clientY: y + 1, pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x + 12, clientY: y + 1, pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+      }, { x: cx, y: cy });
+
+      await page.keyboard.type('abc');
+      const tapResult = await page.evaluate(() => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        return {
+          starts: (window as any).__voiceCalls.start,
+          ce: el.getAttribute('contenteditable'),
+          focused: document.activeElement === el,
+          text: el.textContent,
+        };
+      });
+      expect(tapResult.starts).toBe(0);
+      expect(tapResult.ce).toBe('true');
+      expect(tapResult.focused).toBe(true);
+      expect(tapResult.text).toBe('abc');
+
+      // Clear & reset to unfocused
+      await page.evaluate(() => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        el.textContent = '';
+        el.blur();
+      });
+
+      // 2. Slide-hold (>=95ms move, >145ms promote) whose startListening resolves false MUST still focus composer so real typing succeeds
+      await page.evaluate(async ({ x, y }) => {
+        (window as any).__voiceCalls.nextStartResult = false;
+        const el = document.querySelector('.controls-input')!;
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 100));
+        el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 22, clientY: y + 1, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 65));
+        el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x + 22, clientY: y + 1, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+      }, { x: cx, y: cy });
+
+      await page.keyboard.type('ok');
+      const failedHoldResult = await page.evaluate(() => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        return {
+          starts: (window as any).__voiceCalls.start,
+          ce: el.getAttribute('contenteditable'),
+          focused: document.activeElement === el,
+          text: el.textContent,
+          hudPresent: !!document.querySelector('.voice-hold-hud'),
+        };
+      });
+      expect(failedHoldResult.starts).toBe(1);
+      expect(failedHoldResult.ce).toBe('true');
+      expect(failedHoldResult.focused).toBe(true);
+      expect(failedHoldResult.text).toBe('ok');
+      expect(failedHoldResult.hudPresent).toBe(false);
+
+      // Reset to unfocused
+      await page.evaluate(() => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        el.textContent = '';
+        el.blur();
+      });
+
+      // 3. Active hold (startListening -> true) + slide left into cancel & release stays unfocused and clears HUD
+      await page.evaluate(async ({ x, y }) => {
+        (window as any).__voiceCalls.nextStartResult = true;
+        const el = document.querySelector('.controls-input')!;
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 100));
+        el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 20, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 65));
+        el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x - 110, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x - 110, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+        await new Promise((r) => setTimeout(r, 20));
+      }, { x: cx, y: cy });
+
+      const activeCancelResult = await page.evaluate(() => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        return {
+          starts: (window as any).__voiceCalls.start,
+          stops: (window as any).__voiceCalls.stop,
+          ce: el.getAttribute('contenteditable'),
+          focused: document.activeElement === el,
+          hudPresent: !!document.querySelector('.voice-hold-hud'),
+        };
+      });
+      expect(activeCancelResult.starts).toBe(2);
+      expect(activeCancelResult.stops).toBe(2); // 1 defensive stop from step 2 failed hold + 1 from step 3 active cancel
+      expect(activeCancelResult.ce).toBe('false');
+      expect(activeCancelResult.focused).toBe(false);
+      expect(activeCancelResult.hudPresent).toBe(false);
+
+      await context.close();
+    } finally {
+      await browser.close();
+    }
+  });
+
   it('programmatic focus intents (pendingPrefillText, quick fill, external inputRef) exit read-only mode on mobile while guarding active voice holds', async () => {
     const inputRef: { current: HTMLDivElement | null } = { current: null };
     const onPendingPrefillApplied = vi.fn();
@@ -1785,7 +2005,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     }));
   });
 
-  it('defers setPointerCapture until hold activates, promotes horizontal slide-hold past 90ms debounce, keeps focused 240ms vs unfocused 175ms distinct, and invokes passive prewarm', async () => {
+  it('defers setPointerCapture until hold activates, promotes horizontal slide-hold right after 140ms tap-guard (145ms), keeps focused 240ms vs unfocused 175ms distinct, and invokes passive prewarm', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -1811,10 +2031,15 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
     expect(setPointerCaptureSpy).not.toHaveBeenCalled();
 
-    // 2. Horizontal slide past 90ms debounce promotes immediately (before 175ms) even if setPointerCapture throws
+    // 2. Horizontal slide past 90ms debounce does NOT prematurely fire inside <=140ms single-tap guard; promotes cleanly at 145ms (<175ms) even if setPointerCapture throws
     setPointerCaptureSpy.mockImplementationOnce(() => { throw new Error('unsupported'); });
     await vi.advanceTimersByTimeAsync(95);
     dispatchPointer(input, 'pointermove', 200, 502, 1); // dx = +20, dy = +2
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    expect(setPointerCaptureSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(45); // total 140ms — still guarded
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5); // total 145ms — slide-intent promotes early (<175ms stationary / <240ms focused)
     expect(setPointerCaptureSpy).toHaveBeenCalledWith(1);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
     expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
@@ -1941,5 +2166,131 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
     expect(document.activeElement).toBe(input);
+  });
+
+  it('fixes Round 1 F1 & F2: restores click focus on lostpointercapture/cancel before recording starts and keeps <=140ms slide-drifted taps safe', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    const dispatchPrimaryPointer = (
+      el: EventTarget,
+      type: string,
+      clientX: number,
+      clientY: number,
+      pointerId: number,
+      buttons: number,
+    ) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.assign(event, { clientX, clientY, pointerId, pointerType: 'touch', isPrimary: true, button: 0, buttons });
+      fireEvent(el, event);
+    };
+    const resetToUnfocused = async () => {
+      input.blur();
+      fireEvent.blur(input);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('false');
+    };
+
+    // F1-A: lostpointercapture during starting (!didStartRecording, buttons=0, no pointerup) must abort & focus immediately
+    let resolveLateStart!: (ok: boolean) => void;
+    voiceMock.startListening.mockImplementationOnce(() => new Promise<boolean>((r) => { resolveLateStart = r; }));
+    dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 11, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 11, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    // Late resolution must stop safely without re-locking or stealing focus
+    resolveLateStart(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceMock.stopListening).toHaveBeenCalled();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    await resetToUnfocused();
+
+    // F1-B: lostpointercapture during pending (!tx, buttons=0, no pointerup) must clear timers & focus immediately
+    voiceMock.startListening.mockClear();
+    dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 12, 1);
+    await vi.advanceTimersByTimeAsync(50);
+    dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 12, 0);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    await resetToUnfocused();
+
+    // F1-C: startListening fails (resolve(false)) / rejects / emits error AFTER sliding into cancel zone while !didStartRecording -> STILL focuses!
+    for (const [idx, failMode] of (['resolveFalse', 'reject', 'onErrorFalse'] as const).entries()) {
+      const pid = 20 + idx;
+      if (failMode === 'resolveFalse') {
+        voiceMock.startListening.mockResolvedValueOnce(false);
+      } else if (failMode === 'reject') {
+        voiceMock.startListening.mockRejectedValueOnce(new Error('permission_denied'));
+      } else {
+        voiceMock.startListening.mockImplementationOnce(async (_r, _l, onError) => {
+          onError?.('permission_denied');
+          return false;
+        });
+      }
+      dispatchPrimaryPointer(input, 'pointerdown', 180, 500, pid, 1);
+      await vi.advanceTimersByTimeAsync(175);
+      // Slide into cancel zone BEFORE or AFTER startListening fails while !didStartRecording
+      dispatchPrimaryPointer(input, 'pointermove', 90, 500, pid, 1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(document.activeElement).toBe(input);
+      dispatchPrimaryPointer(input, 'pointerup', 90, 500, pid, 0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(document.activeElement).toBe(input);
+      await resetToUnfocused();
+    }
+
+    // F1-D: Positive control — AFTER didStartRecording=true, lostpointercapture + window slide-to-cancel keeps composer unfocused
+    voiceMock.stopListening.mockClear();
+    dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 30, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+    dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 30, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    // Recording stays alive on window listener
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    dispatchPrimaryPointer(window, 'pointermove', 90, 500, 30, 1);
+    dispatchPrimaryPointer(window, 'pointerup', 90, 500, 30, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceMock.stopListening).toHaveBeenCalled();
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    expect(document.activeElement).not.toBe(input);
+
+    // F2: <=140ms taps with thumb drift (dx=14, 15, 18 across 95..140ms) MUST NEVER start voice & MUST focus cleanly without orphaned slide timers
+    voiceMock.startListening.mockClear();
+    for (const [idx, dx] of ([14, 15, 18] as const).entries()) {
+      const pid = 40 + idx;
+      dispatchPrimaryPointer(input, 'pointerdown', 180, 500, pid, 1);
+      await vi.advanceTimersByTimeAsync(95);
+      dispatchPrimaryPointer(input, 'pointermove', 180 + dx, 501, pid, 1);
+      expect(voiceMock.startListening).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(45); // total 140ms — still inside single-tap guard
+      expect(voiceMock.startListening).not.toHaveBeenCalled();
+      dispatchPrimaryPointer(input, 'pointerup', 180 + dx, 501, pid, 0);
+      await vi.advanceTimersByTimeAsync(200); // verify slide timer was cleared and never fires orphaned
+      expect(voiceMock.startListening).not.toHaveBeenCalled();
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(document.activeElement).toBe(input);
+      await resetToUnfocused();
+    }
   });
 });
