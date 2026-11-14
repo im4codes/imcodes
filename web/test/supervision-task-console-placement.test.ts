@@ -126,6 +126,6 @@ describe('toolbar placement & retired supervision task console toggle', () => {
 
   it('mounts CloudDocsPanel inside FloatingPanel when showCloudDocs is enabled', () => {
     expect(app).toContain('id={DESKTOP_WINDOW_IDS.cloudDocs}');
-    expect(app).toContain('<CloudDocsPanel />');
+    expect(app).toMatch(/id=\{DESKTOP_WINDOW_IDS\.cloudDocs\}[\s\S]*?<CloudDocsPanel\b/);
   });
 });

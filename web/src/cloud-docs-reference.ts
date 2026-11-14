@@ -150,3 +150,112 @@ export function computeRightHalfUnobstructedCloudDocsGeometry(
 
   return { x, y, w, h };
 }
+
+/**
+ * Formats the text segment to append to an existing composer value so it separates cleanly with one space when needed.
+ */
+export function formatCloudDocQuoteAppendText(existing: string, quoteText: string): string {
+  const needsGap = existing.length > 0 && !/[\s\n]$/.test(existing);
+  return `${needsGap ? ' ' : ''}${quoteText}`;
+}
+
+/**
+ * Joins existing composer text with a newly quoted CloudDoc/file reference using a single separator space when needed.
+ */
+export function mergeCloudDocQuoteText(existing: string, quoteText: string): string {
+  return `${existing}${formatCloudDocQuoteAppendText(existing, quoteText)}`;
+}
+
+export interface ExecuteCloudDocQuoteInput {
+  target: CloudDocQuoteTarget;
+  openSubIds: ReadonlySet<string>;
+  stack?: MutableDesktopWindowStack | null;
+  focusedSubId?: string | null;
+  subSessions: ReadonlyArray<{ id: string; sessionName: string; label?: string | null }>;
+  activeSession: string | null | undefined;
+  isMobile: boolean;
+  showCloudDocs: boolean;
+  getInputElement: (sessionName: string) => HTMLDivElement | null;
+  getWorkspaceBounds: () => WorkspaceBounds | null;
+  bringSubToFront: (subId: string) => void;
+  setShowCloudDocs: (open: boolean) => void;
+  setDesktopCloudDocsMaximized: (maximized: boolean) => void;
+  requestCloudDocsGeometry: (geometry: WindowGeometry) => void;
+  appendComposerText: (inputEl: HTMLDivElement, text: string) => void;
+  focusComposer: (inputEl: HTMLDivElement) => void;
+  appendPendingPrefill: (sessionName: string, quoteText: string) => void;
+  scheduleFrame?: (cb: () => void) => void;
+}
+
+/**
+ * Routes a Cloud Docs quote action to the frontmost open sub-session or active main session,
+ * unmaximizing and docking the desktop Cloud Docs FloatingPanel on the right half above the composer
+ * whenever the destination is the desktop main session.
+ */
+export function executeCloudDocQuote(input: ExecuteCloudDocQuoteInput): ResolvedQuoteDestination | null {
+  const destination = resolveCloudDocQuoteTarget({
+    openSubIds: input.openSubIds,
+    stack: input.stack,
+    focusedSubId: input.focusedSubId,
+    subSessions: input.subSessions,
+    activeSession: input.activeSession,
+  });
+  if (!destination) return null;
+
+  const quoteText = formatCloudDocQuoteText(input.target);
+  const inputEl = input.getInputElement(destination.sessionName);
+
+  if (destination.kind === 'sub') {
+    if (!input.isMobile) {
+      input.bringSubToFront(destination.subId);
+    } else {
+      input.setShowCloudDocs(false);
+    }
+  } else if (input.isMobile) {
+    input.setShowCloudDocs(false);
+  } else if (input.showCloudDocs) {
+    const workspaceBounds = input.getWorkspaceBounds();
+    if (workspaceBounds) {
+      const composerHost = inputEl?.closest<HTMLElement>('.controls-wrapper') ?? inputEl;
+      const composerRect = composerHost?.getBoundingClientRect();
+      const composerTopPx = composerRect && composerRect.height > 0 ? composerRect.top : null;
+      const dockedGeometry = computeRightHalfUnobstructedCloudDocsGeometry({
+        workspaceBounds,
+        composerTopPx,
+        minW: DEFAULT_DOCK_MIN_W,
+        minH: DEFAULT_DOCK_MIN_H,
+      });
+      input.setDesktopCloudDocsMaximized(false);
+      input.requestCloudDocsGeometry(dockedGeometry);
+    } else {
+      input.setDesktopCloudDocsMaximized(false);
+    }
+  }
+
+  const runAfterFrame = input.scheduleFrame
+    ?? (typeof requestAnimationFrame === 'function' ? requestAnimationFrame : null);
+
+  if (inputEl && inputEl.isConnected) {
+    input.appendComposerText(inputEl, formatCloudDocQuoteAppendText(inputEl.textContent ?? '', quoteText));
+    if (runAfterFrame) {
+      runAfterFrame(() => {
+        if (destination.kind === 'sub' && !input.isMobile) {
+          input.bringSubToFront(destination.subId);
+        }
+        const liveEl = input.getInputElement(destination.sessionName);
+        if (liveEl && liveEl.isConnected) {
+          input.focusComposer(liveEl);
+        }
+      });
+    }
+  } else {
+    input.appendPendingPrefill(destination.sessionName, quoteText);
+    if (destination.kind === 'sub' && !input.isMobile && runAfterFrame) {
+      runAfterFrame(() => {
+        input.bringSubToFront(destination.subId);
+      });
+    }
+  }
+
+  return destination;
+}

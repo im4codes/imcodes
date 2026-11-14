@@ -79,9 +79,8 @@ import {
 import { CloudDocsGlyphIcon, CloudDocsPanel } from './components/CloudDocsPanel.js';
 import type { CloudDocsMainChatContext } from './components/CloudDocsMainChatFloat.js';
 import {
-  computeRightHalfUnobstructedCloudDocsGeometry,
-  formatCloudDocQuoteText,
-  resolveCloudDocQuoteTarget,
+  executeCloudDocQuote,
+  mergeCloudDocQuoteText,
   type CloudDocQuoteTarget,
 } from './cloud-docs-reference.js';
 import {
@@ -8092,78 +8091,35 @@ function InternalMainApp() {
   visibleOpenWindowIdsRef.current = visibleOpenWindowIds;
 
   const handleQuoteCloudDoc = useCallback((target: CloudDocQuoteTarget) => {
-    const destination = resolveCloudDocQuoteTarget({
+    executeCloudDocQuote({
+      target,
       openSubIds: visibleOpenWindowIdsRef.current,
       stack: stackRef.current,
       focusedSubId: focusedSubIdRef.current,
       subSessions: subSessionsRef.current,
       activeSession: activeSessionRef.current,
-    });
-    if (!destination) return;
-
-    const quoteText = formatCloudDocQuoteText(target);
-    const inputEl = inputRefsMap.current.get(destination.sessionName) ?? null;
-
-    if (destination.kind === 'sub') {
-      if (!isMobileRef.current) {
-        bringSubToFront(destination.subId);
-      } else {
-        setShowCloudDocs(false);
-      }
-    } else if (isMobileRef.current) {
-      setShowCloudDocs(false);
-    } else if (showCloudDocsRef.current) {
-      const workspaceBounds = getDesktopMaximizeBounds();
-      if (workspaceBounds) {
-        const composerHost = inputEl?.closest<HTMLElement>('.controls-wrapper') ?? inputEl;
-        const composerRect = composerHost?.getBoundingClientRect();
-        const composerTopPx = composerRect && composerRect.height > 0 ? composerRect.top : null;
-        const dockedGeometry = computeRightHalfUnobstructedCloudDocsGeometry({
-          workspaceBounds,
-          composerTopPx,
-          minW: 420,
-          minH: 360,
-        });
-        setDesktopCloudDocsMaximized(false);
+      isMobile: isMobileRef.current,
+      showCloudDocs: showCloudDocsRef.current,
+      getInputElement: (sessionName) => inputRefsMap.current.get(sessionName) ?? null,
+      getWorkspaceBounds: getDesktopMaximizeBounds,
+      bringSubToFront,
+      setShowCloudDocs,
+      setDesktopCloudDocsMaximized,
+      requestCloudDocsGeometry: (geometry) => {
         setCloudDocsGeometryRequest((prev) => ({
           version: (prev?.version ?? 0) + 1,
-          geometry: dockedGeometry,
+          geometry,
         }));
-      } else {
-        setDesktopCloudDocsMaximized(false);
-      }
-    }
-
-    if (inputEl && inputEl.isConnected) {
-      const existingText = inputEl.textContent ?? '';
-      const needsGap = existingText.length > 0 && !/[\s\n]$/.test(existingText);
-      appendContentEditableTextPreservingNewlines(inputEl, `${needsGap ? ' ' : ''}${quoteText}`);
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(() => {
-          if (destination.kind === 'sub' && !isMobileRef.current) {
-            bringSubToFront(destination.subId);
-          }
-          const liveEl = inputRefsMap.current.get(destination.sessionName);
-          if (liveEl && liveEl.isConnected) {
-            focusComposerElement(liveEl, { moveCursorToEnd: true });
-          }
-        });
-      }
-    } else {
-      setPendingPrefills((prev) => {
-        const existing = prev[destination.sessionName] || '';
-        const needsGap = existing.length > 0 && !/[\s\n]$/.test(existing);
-        return {
+      },
+      appendComposerText: appendContentEditableTextPreservingNewlines,
+      focusComposer: (el) => focusComposerElement(el, { moveCursorToEnd: true }),
+      appendPendingPrefill: (sessionName, quoteText) => {
+        setPendingPrefills((prev) => ({
           ...prev,
-          [destination.sessionName]: `${existing}${needsGap ? ' ' : ''}${quoteText}`,
-        };
-      });
-      if (destination.kind === 'sub' && !isMobileRef.current && typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(() => {
-          bringSubToFront(destination.subId);
-        });
-      }
-    }
+          [sessionName]: mergeCloudDocQuoteText(prev[sessionName] || '', quoteText),
+        }));
+      },
+    });
   }, [bringSubToFront, getDesktopMaximizeBounds]);
 
   useEffect(() => subscribeCloudDocQuotes(handleQuoteCloudDoc), [handleQuoteCloudDoc]);
