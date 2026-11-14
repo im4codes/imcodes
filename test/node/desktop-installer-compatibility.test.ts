@@ -631,5 +631,55 @@ describe('AC 2: discoverCodingDaemonRuntime current/ alignment & imcodes CLI thi
     expect(() =>
       assertSafeNodeIsolatedTargetPath(join(loopA, 'child'), 'linux', root, isoRoot, 'container'),
     ).toThrow(/canonical_path_symlink_loop/i);
+
+    // Ancestor suffix cycle (a -> b/child, b -> a/child) must fail with bounded hop budget
+    const ancA = join(isoRoot, 'anc-a');
+    const ancB = join(isoRoot, 'anc-b');
+    symlinkSync(join('anc-b', 'child'), ancA);
+    symlinkSync(join('anc-a', 'child'), ancB);
+    for (const [probeTarget, mode] of [
+      [ancA, 'container'],
+      [join(ancA, 'nested'), 'container'],
+      [join(ancA, 'imcodes'), 'entry'],
+    ] as const) {
+      expect(() =>
+        assertSafeNodeIsolatedTargetPath(probeTarget, 'linux', root, isoRoot, mode),
+      ).toThrow(/canonical_path_symlink_loop/i);
+    }
+
+    // `..` after symlink must resolve symlink before collapsing `..`, preventing lexical bypass
+    const realOutside = join(root, 'outside-real');
+    mkdirSync(realOutside, { recursive: true });
+    const symOutside = join(isoRoot, 'sym-out');
+    symlinkSync(realOutside, symOutside);
+    expect(() =>
+      assertSafeNodeIsolatedTargetPath(
+        `${symOutside}/../escaped-sibling`,
+        'linux',
+        root,
+        isoRoot,
+        'container',
+      ),
+    ).toThrow(/outside isolated root|unsafe/i);
+    expect(() =>
+      assertSafeNodeIsolatedTargetPath(
+        `${symOutside}/../escaped-sibling/imcodes`,
+        'linux',
+        root,
+        isoRoot,
+        'entry',
+      ),
+    ).toThrow(/outside isolated root|unsafe/i);
+
+    // Positive control: bounded intra-isolated symlink chain succeeds
+    const realSub = join(isoRoot, 'real-sub');
+    const linkHolder = join(isoRoot, 'holder');
+    mkdirSync(realSub, { recursive: true });
+    mkdirSync(linkHolder, { recursive: true });
+    const relLink = join(linkHolder, 'to-real');
+    symlinkSync('../real-sub', relLink);
+    expect(() =>
+      assertSafeNodeIsolatedTargetPath(join(relLink, 'state'), 'linux', root, isoRoot, 'container'),
+    ).not.toThrow();
   });
 });

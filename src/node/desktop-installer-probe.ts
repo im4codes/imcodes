@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import {
@@ -93,36 +93,92 @@ function safeRealpath(targetPath: string): string {
   }
 }
 
+function splitCanonicalSegments(rawPath: string, root: string): string[] {
+  return rawPath
+    .slice(root.length)
+    .split(/[/\\]+/)
+    .filter(Boolean);
+}
+
+function splitEntryTargetPath(targetPath: string): { parent: string; entryName: string } | null {
+  let trimmed = targetPath;
+  while (trimmed.length > 1 && (trimmed.endsWith('/') || trimmed.endsWith('\\'))) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  const root = parse(trimmed).root;
+  if (!trimmed || trimmed === root) return null;
+  const entryName = basename(trimmed);
+  if (!entryName || entryName === '.' || entryName === '..') return null;
+  return { parent: dirname(trimmed), entryName };
+}
+
 /**
- * Resolve the canonical path even if intermediate or leaf segments do not yet exist,
- * resolving symlinks on the nearest existing ancestor so symlink escapes cannot bypass guards.
+ * Resolve the canonical path iteratively component-by-component with a single
+ * bounded symlink-hop budget (<= 32) across all leaf and ancestor hops, handling
+ * `.` / `..` after symlink dereference so ancestor cycles or escapes cannot bypass guards.
  */
-export function resolveCanonicalTargetPath(targetPath: string, depth = 0): string {
-  if (depth > 32) {
-    throw new Error(`canonical_path_symlink_loop: ${targetPath}`);
+export function resolveCanonicalTargetPath(targetPath: string): string {
+  if (!targetPath) {
+    throw new Error('canonical_path_empty');
   }
-  let cur = resolve(targetPath);
-  const missingTail: string[] = [];
-  while (!safeLstat(cur)) {
-    const parent = dirname(cur);
-    if (parent === cur) break;
-    missingTail.unshift(basename(cur));
-    cur = parent;
-  }
-  let canonicalAncestor: string;
-  try {
-    canonicalAncestor = realpathSync(cur);
-  } catch {
-    const lst = safeLstat(cur);
-    if (lst?.isSymbolicLink()) {
-      const linkTarget = readlinkSync(cur);
-      const nextPath = resolve(dirname(cur), linkTarget);
-      canonicalAncestor = resolveCanonicalTargetPath(nextPath, depth + 1);
-    } else {
-      canonicalAncestor = resolve(cur);
+  const anchored = isAbsolute(targetPath) ? targetPath : join(process.cwd(), targetPath);
+  let root = parse(anchored).root;
+  const queue = splitCanonicalSegments(anchored, root);
+  let builtSegs: string[] = [];
+  let hops = 0;
+
+  while (queue.length > 0) {
+    const seg = queue.shift()!;
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      builtSegs.pop();
+      continue;
+    }
+    const cand = builtSegs.length > 0 ? join(root, ...builtSegs, seg) : join(root, seg);
+    let lst: ReturnType<typeof lstatSync> | null = null;
+    try {
+      lst = lstatSync(cand);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        builtSegs.push(seg);
+        continue;
+      }
+      throw new Error(`canonical_path_unreadable: ${cand} (${code ?? 'unknown'})`);
+    }
+    if (lst.isSymbolicLink()) {
+      hops += 1;
+      if (hops > 32) {
+        throw new Error(`canonical_path_symlink_loop: ${targetPath}`);
+      }
+      const linkTarget = readlinkSync(cand);
+      if (!linkTarget) {
+        throw new Error(`canonical_path_unresolvable_symlink: ${cand}`);
+      }
+      if (isAbsolute(linkTarget)) {
+        root = parse(linkTarget).root || root;
+        builtSegs = [];
+        queue.unshift(...splitCanonicalSegments(linkTarget, parse(linkTarget).root));
+      } else {
+        queue.unshift(...linkTarget.split(/[/\\]+/).filter(Boolean));
+      }
+      continue;
+    }
+    try {
+      const rp = realpathSync(cand);
+      const parsed = parse(rp);
+      root = parsed.root || root;
+      builtSegs = splitCanonicalSegments(rp, parsed.root);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'ELOOP') {
+        throw new Error(`canonical_path_symlink_loop: ${targetPath}`);
+      }
+      builtSegs.push(seg);
     }
   }
-  return missingTail.length > 0 ? join(canonicalAncestor, ...missingTail) : canonicalAncestor;
+
+  return builtSegs.length > 0 ? join(root, ...builtSegs) : root;
 }
 
 export function assertSafeNodeIsolatedTargetPath(
@@ -133,9 +189,10 @@ export function assertSafeNodeIsolatedTargetPath(
   mode: 'container' | 'entry' = 'container',
 ): void {
   const lexical = resolve(targetPath);
+  const entryParts = mode === 'entry' ? splitEntryTargetPath(targetPath) : null;
   const canonical =
-    mode === 'entry'
-      ? join(resolveCanonicalTargetPath(dirname(lexical)), basename(lexical))
+    mode === 'entry' && entryParts
+      ? join(resolveCanonicalTargetPath(entryParts.parent), entryParts.entryName)
       : resolveCanonicalTargetPath(targetPath);
   const resolvedIso = isolatedRoot ? resolve(isolatedRoot) : undefined;
   const canonicalIso = isolatedRoot ? resolveCanonicalTargetPath(isolatedRoot) : undefined;

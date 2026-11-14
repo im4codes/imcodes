@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -1111,5 +1111,106 @@ process.exit(0);
     expect(macStateAfter['system/cc.imcodes.node.watchdog']).toBeUndefined();
     expect(readFileSync(join(macPlistDir, 'imcodes.daemon.plist'), 'utf8')).toBe(oldMacPlist);
     expect(readFileSync(launchLogFile, 'utf8')).toContain(`bootout ${daemonLabel}`);
+  });
+
+  it('rejects POSIX ancestor/leaf symlink cycles and ..-after-symlink escapes cleanly without hanging on Linux and macOS runners (F6-R3)', async () => {
+    const root = makeTempDir('imcodes-f6-r3-');
+    const linuxRt = createFakeRuntimeDir(root, 'linux', '0.9.5');
+    const linuxBuild = await buildLinuxInstallers({
+      arch: 'x64',
+      version: '0.9.5',
+      runtimeDir: linuxRt,
+      nodeExe: join(linuxRt, 'bin', 'node'),
+      outDir: join(root, 'out-lin'),
+      skipDeb: true,
+    });
+    const macRt = createFakeRuntimeDir(root, 'darwin', '0.9.5');
+    const macStage = await buildMacosInstaller({
+      arch: 'arm64',
+      version: '0.9.5',
+      runtimeDir: macRt,
+      nodeExe: join(macRt, 'bin', 'node'),
+      outDir: join(root, 'out-mac'),
+      stageDir: join(root, 'mac-f6-stage'),
+      emitStageOnly: true,
+    });
+
+    const runners = [
+      { platform: 'linux', runner: linuxBuild.shPath },
+      { platform: 'darwin', runner: join(macStage.scriptsDir, 'phase-a-runner.sh') },
+    ] as const;
+
+    for (const { platform, runner } of runners) {
+      const iso = join(root, `iso-${platform}`);
+      const callerHome = join(root, `caller-home-${platform}`);
+      const callerSub = join(callerHome, 'sub');
+      const realHome = join(iso, 'real-home');
+      mkdirSync(realHome, { recursive: true });
+      mkdirSync(callerSub, { recursive: true });
+
+      // Leaf cycle: leaf-a <-> leaf-b
+      symlinkSync(join(iso, 'leaf-b'), join(iso, 'leaf-a'));
+      symlinkSync(join(iso, 'leaf-a'), join(iso, 'leaf-b'));
+
+      // Ancestor suffix cycle (R3 counterexample): anc-a -> anc-b/child, anc-b -> anc-a/child
+      symlinkSync(join('anc-b', 'child'), join(iso, 'anc-a'));
+      symlinkSync(join('anc-a', 'child'), join(iso, 'anc-b'));
+
+      // Multi-hop relative ancestor cycle: dir1/hop2 -> ../hop1/child, hop1 -> dir1/hop2
+      mkdirSync(join(iso, 'dir1'), { recursive: true });
+      symlinkSync(join('dir1', 'hop2'), join(iso, 'hop1'));
+      symlinkSync(join('..', 'hop1', 'child'), join(iso, 'dir1', 'hop2'));
+
+      // `..` after symlink escaping into protected real home subdir (lexically looks like <iso>/.imcodes)
+      symlinkSync(callerSub, join(iso, 'sym-real'));
+
+      // Bounded intra-isolated symlink chain positive control
+      symlinkSync('real-home', join(iso, 'link-2'));
+      symlinkSync('link-2', join(iso, 'link-1'));
+
+      const negativeCases = [
+        { label: `${platform}:leaf-cycle`, homeArg: join(iso, 'leaf-a'), expectMsg: /symlink loop/i },
+        { label: `${platform}:ancestor-suffix-cycle`, homeArg: join(iso, 'anc-a'), expectMsg: /symlink loop/i },
+        { label: `${platform}:ancestor-suffix-nested`, homeArg: join(iso, 'anc-a', 'nested'), expectMsg: /symlink loop/i },
+        { label: `${platform}:multihop-rel-cycle`, homeArg: join(iso, 'hop1'), expectMsg: /symlink loop/i },
+        {
+          label: `${platform}:dotdot-after-symlink-escape`,
+          homeArg: `${join(iso, 'sym-real')}/../.imcodes`,
+          expectMsg: /real home subdir|unsafe isolated target/i,
+        },
+      ];
+
+      for (const tc of negativeCases) {
+        const started = Date.now();
+        const res = spawnSync(
+          runner,
+          ['--isolated-root', iso, '--home', tc.homeArg, '--no-service-control', '--dry-run'],
+          {
+            encoding: 'utf8',
+            timeout: 2500,
+            env: { ...process.env, HOME: callerHome },
+          },
+        );
+        const elapsedMs = Date.now() - started;
+        expect(res.signal, tc.label).toBeNull();
+        expect(res.status, tc.label).not.toBe(0);
+        expect(elapsedMs, tc.label).toBeLessThan(2000);
+        expect(res.stderr, tc.label).toMatch(tc.expectMsg);
+        expect(existsSync(join(iso, 'rollback-snapshots')), tc.label).toBe(false);
+        expect(existsSync(join(iso, 'daemon-runtime')), tc.label).toBe(false);
+      }
+
+      const posRes = spawnSync(
+        runner,
+        ['--isolated-root', iso, '--home', join(iso, 'link-1'), '--no-service-control', '--dry-run'],
+        {
+          encoding: 'utf8',
+          timeout: 2500,
+          env: { ...process.env, HOME: callerHome },
+        },
+      );
+      expect(posRes.signal, `${platform}:positive-bounded-chain`).toBeNull();
+      expect(posRes.status, `${platform}:positive-bounded-chain:${posRes.stderr}`).toBe(0);
+    }
   });
 });

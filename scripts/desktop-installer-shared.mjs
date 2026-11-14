@@ -344,61 +344,66 @@ normalize_lexical_posix() {
 }
 
 canonicalize_posix_path() {
-  p="$(normalize_lexical_posix "$1")"
+  orig_p="$1"
+  [ -n "$orig_p" ] || { echo "Refusing empty path during canonicalization" >&2; return 2; }
+  case "$orig_p" in
+    /*) queue="$orig_p" ;;
+    *) queue="$(pwd -P)/$orig_p" ;;
+  esac
   hops=0
-  while [ "$hops" -lt 32 ]; do
-    if [ -L "$p" ]; then
-      hops=$((hops + 1))
-      link_t="$(readlink "$p" 2>/dev/null || true)"
-      [ -n "$link_t" ] || { echo "Refusing unresolvable symlink target: $p" >&2; exit 2; }
-      case "$link_t" in
-        /*) p="$(normalize_lexical_posix "$link_t")" ;;
-        *) p="$(normalize_lexical_posix "$(dirname -- "$p")/$link_t")" ;;
+  built=""
+  while [ -n "$queue" ]; do
+    case "$queue" in
+      /*)
+        queue="\${queue#/}"
+        continue
+        ;;
+      */*)
+        seg="\${queue%%/*}"
+        queue="\${queue#*/}"
+        ;;
+      *)
+        seg="$queue"
+        queue=""
+        ;;
+    esac
+    case "$seg" in
+      ""|".") continue ;;
+    esac
+    if [ -n "$built" ] && [ -d "$built" ] && [ ! -x "$built" ]; then
+      echo "Refusing unsearchable directory during canonicalization: $built" >&2
+      return 2
+    fi
+    if [ "$seg" = ".." ]; then
+      case "$built" in
+        "") ;;
+        */*) built="\${built%/*}" ;;
+        *) built="" ;;
       esac
       continue
     fi
-    break
-  done
-  if [ -L "$p" ] && [ "$hops" -ge 32 ]; then
-    echo "Refusing symlink loop resolving path: $1" >&2
-    exit 2
-  fi
-  cur="$p"
-  tail_segs=""
-  while [ "$cur" != "/" ] && [ ! -e "$cur" ] && [ ! -L "$cur" ]; do
-    seg="$(basename -- "$cur")"
-    if [ -n "$tail_segs" ]; then
-      tail_segs="$seg/$tail_segs"
-    else
-      tail_segs="$seg"
+    cand="$built/$seg"
+    if [ -L "$cand" ]; then
+      hops=$((hops + 1))
+      if [ "$hops" -gt 32 ]; then
+        echo "Refusing symlink loop resolving path: $orig_p" >&2
+        return 2
+      fi
+      lt="$(readlink "$cand" 2>/dev/null || true)"
+      [ -n "$lt" ] || { echo "Refusing unresolvable symlink target: $cand" >&2; return 2; }
+      case "$lt" in
+        /*) built="" ;;
+      esac
+      if [ -n "$queue" ]; then
+        queue="$lt/$queue"
+      else
+        queue="$lt"
+      fi
+      continue
     fi
-    cur="$(dirname -- "$cur")"
+    built="$cand"
   done
-  if [ -L "$cur" ]; then
-    lt="$(readlink "$cur" 2>/dev/null || true)"
-    [ -n "$lt" ] || { echo "Refusing unresolvable symlink target: $cur" >&2; exit 2; }
-    case "$lt" in
-      /*) resolved_cur="$(canonicalize_posix_path "$lt")" ;;
-      *) resolved_cur="$(canonicalize_posix_path "$(dirname -- "$cur")/$lt")" ;;
-    esac
-  elif [ -d "$cur" ]; then
-    resolved_cur="$(cd "$cur" 2>/dev/null && pwd -P)" || { echo "Refusing unreadable directory during canonicalization: $cur" >&2; exit 2; }
-  elif [ -e "$cur" ]; then
-    c_dir="$(dirname -- "$cur")"
-    c_base="$(basename -- "$cur")"
-    c_real_dir="$(cd "$c_dir" 2>/dev/null && pwd -P)" || { echo "Refusing unreadable parent directory during canonicalization: $c_dir" >&2; exit 2; }
-    resolved_cur="$c_real_dir/$c_base"
-  else
-    resolved_cur="$cur"
-  fi
-  if [ -n "$tail_segs" ]; then
-    case "$resolved_cur" in
-      /) normalize_lexical_posix "/$tail_segs" ;;
-      *) normalize_lexical_posix "$resolved_cur/$tail_segs" ;;
-    esac
-  else
-    normalize_lexical_posix "$resolved_cur"
-  fi
+  [ -n "$built" ] && printf '%s\\n' "$built" || printf '/\\n'
 }
 
 is_same_or_child_path() {
@@ -453,15 +458,30 @@ else
 fi
 
 canonicalize_entry_posix_path() {
-  lex="$(normalize_lexical_posix "$1")"
-  parent_canon="$(canonicalize_posix_path "$(dirname -- "$lex")")"
-  base="$(basename -- "$lex")"
-  if [ "$lex" = "/" ]; then
-    printf '/\n'
-  elif [ "$parent_canon" = "/" ]; then
-    printf '/%s\n' "$base"
+  raw="$1"
+  [ -n "$raw" ] || { echo "Refusing empty path during canonicalization" >&2; return 2; }
+  while [ "$raw" != "/" ]; do
+    case "$raw" in
+      */) raw="\${raw%/}" ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$raw" ] || raw="/"
+  if [ "$raw" = "/" ]; then
+    printf '/\\n'
+    return 0
+  fi
+  base="$(basename -- "$raw")"
+  if [ "$base" = "." ] || [ "$base" = ".." ]; then
+    canonicalize_posix_path "$1"
+    return $?
+  fi
+  raw_dir="$(dirname -- "$raw")"
+  parent_canon="$(canonicalize_posix_path "$raw_dir")" || return $?
+  if [ "$parent_canon" = "/" ]; then
+    printf '/%s\\n' "$base"
   else
-    normalize_lexical_posix "$parent_canon/$base"
+    printf '%s/%s\\n' "$parent_canon" "$base"
   fi
 }
 
@@ -469,9 +489,9 @@ assert_safe_isolated_target() {
   raw_target="$1"
   mode="\${2:-container}"
   if [ "$mode" = "entry" ]; then
-    canon_target="$(canonicalize_entry_posix_path "$raw_target")"
+    canon_target="$(canonicalize_entry_posix_path "$raw_target")" || exit 2
   else
-    canon_target="$(canonicalize_posix_path "$raw_target")"
+    canon_target="$(canonicalize_posix_path "$raw_target")" || exit 2
   fi
   for bad in \
     "/var/lib/imcodes-node" \
@@ -489,7 +509,7 @@ assert_safe_isolated_target() {
     fi
   done
   if [ -n "$REAL_HOME_BASE" ]; then
-    canon_real_home="$(canonicalize_posix_path "$REAL_HOME_BASE")"
+    canon_real_home="$(canonicalize_posix_path "$REAL_HOME_BASE")" || exit 2
     if [ "$canon_target" = "$canon_real_home" ]; then
       echo "Refusing unsafe isolated target equal to real home: $raw_target" >&2
       exit 2
@@ -502,8 +522,8 @@ assert_safe_isolated_target() {
     done
   fi
   if [ -n "$ISOLATED_ROOT" ]; then
-    canon_iso="$(canonicalize_posix_path "$ISOLATED_ROOT")"
-    canon_eff="$(canonicalize_posix_path "\${EFF_HOME:-$ISOLATED_ROOT/home}")"
+    canon_iso="$(canonicalize_posix_path "$ISOLATED_ROOT")" || exit 2
+    canon_eff="$(canonicalize_posix_path "\${EFF_HOME:-$ISOLATED_ROOT/home}")" || exit 2
     if ! is_same_or_child_path "$canon_target" "$canon_iso" && ! is_same_or_child_path "$canon_target" "$canon_eff"; then
       echo "Refusing isolated target escaping isolated root ($canon_iso) and isolated home ($canon_eff): $raw_target ($canon_target)" >&2
       exit 2
@@ -516,11 +536,11 @@ assert_within_base() {
   raw_base="$2"
   mode="\${3:-container}"
   if [ "$mode" = "entry" ]; then
-    canon_target="$(canonicalize_entry_posix_path "$raw_target")"
+    canon_target="$(canonicalize_entry_posix_path "$raw_target")" || exit 2
   else
-    canon_target="$(canonicalize_posix_path "$raw_target")"
+    canon_target="$(canonicalize_posix_path "$raw_target")" || exit 2
   fi
-  canon_base="$(canonicalize_posix_path "$raw_base")"
+  canon_base="$(canonicalize_posix_path "$raw_base")" || exit 2
   if ! is_same_or_child_path "$canon_target" "$canon_base"; then
     echo "Refusing target escaping expected base ($canon_base): $raw_target ($canon_target)" >&2
     exit 2
@@ -683,7 +703,7 @@ hash_file_sha256() {
 is_git_checkout_path() {
   target="$1"
   [ -n "$target" ] || return 1
-  real="$(canonicalize_posix_path "$target")"
+  real="$(canonicalize_posix_path "$target")" || return 1
   dir="$(dirname -- "$real" 2>/dev/null || printf '%s' "$real")"
   i=0
   while [ "$i" -lt 12 ]; do
@@ -718,7 +738,8 @@ compare_semver() {
 }
 
 find_pkg_version_near() {
-  d="$(dirname -- "$(canonicalize_posix_path "$1")")"
+  canon_pkg_target="$(canonicalize_posix_path "$1")" || return 1
+  d="$(dirname -- "$canon_pkg_target")"
   i=0
   while [ "$i" -lt 6 ]; do
     if [ -f "$d/package.json" ] && grep -q '"name"[[:space:]]*:[[:space:]]*"imcodes"' "$d/package.json" 2>/dev/null; then
