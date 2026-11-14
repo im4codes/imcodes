@@ -20550,12 +20550,13 @@ button.quick-agent-delegation-preset.active {
 }
 
 @media (prefers-color-scheme: light) {
-  .mobile-swipe-hud-card {
+  .mobile-swipe-hud-card,
+  .mobile-swipe-hud-card.is-server {
     background:
       radial-gradient(circle at 50% 48%, rgba(2, 132, 199, 0.08), transparent 60%),
       linear-gradient(rgba(2, 132, 199, 0.05) 1px, transparent 1px),
       linear-gradient(90deg, rgba(2, 132, 199, 0.05) 1px, transparent 1px),
-      rgba(248, 250, 252, 0.93);
+      rgba(248, 250, 252, 0.94);
     background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
     border-color: rgba(2, 132, 199, 0.30);
     box-shadow:
@@ -20573,6 +20574,12 @@ button.quick-agent-delegation-preset.active {
 
   .mobile-swipe-hud-card.is-session {
     border-color: rgba(5, 150, 105, 0.42);
+    background:
+      radial-gradient(circle at 50% 48%, rgba(5, 150, 105, 0.08), transparent 60%),
+      linear-gradient(rgba(5, 150, 105, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(5, 150, 105, 0.05) 1px, transparent 1px),
+      rgba(248, 250, 252, 0.94);
+    background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
   }
 
   .mobile-swipe-hud-card.is-session.is-armed {
@@ -20590,19 +20597,32 @@ button.quick-agent-delegation-preset.active {
     border-color: rgba(217, 119, 6, 0.92);
   }
 
-  .mobile-swipe-hud-card.is-session .mobile-swipe-hud-corner {
-    border-color: rgba(5, 150, 105, 0.65);
+  .mobile-swipe-hud-card.is-session .mobile-swipe-hud-corner,
+  .mobile-swipe-hud-card.is-session.is-armed .mobile-swipe-hud-corner {
+    border-color: rgba(5, 150, 105, 0.78);
   }
 
   .mobile-swipe-hud-header,
   .mobile-swipe-hud-hint {
-    color: rgba(51, 65, 85, 0.9);
+    color: rgba(51, 65, 85, 0.94);
   }
 
   .mobile-swipe-hud-pct {
-    background: rgba(226, 232, 240, 0.85);
-    border-color: rgba(2, 132, 199, 0.28);
-    color: rgba(15, 23, 42, 0.95);
+    background: rgba(226, 232, 240, 0.9);
+    border-color: rgba(2, 132, 199, 0.34);
+    color: rgba(15, 23, 42, 0.96);
+  }
+
+  .mobile-swipe-hud-card.is-server.is-armed .mobile-swipe-hud-pct {
+    background: rgba(254, 243, 199, 0.92);
+    border-color: rgba(217, 119, 6, 0.65);
+    color: rgba(120, 53, 15, 0.98);
+  }
+
+  .mobile-swipe-hud-card.is-session.is-armed .mobile-swipe-hud-pct {
+    background: rgba(209, 250, 229, 0.92);
+    border-color: rgba(5, 150, 105, 0.65);
+    color: rgba(6, 78, 59, 0.98);
   }
 
   .mobile-swipe-hud-center-badge,
@@ -20923,6 +20943,7 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 }
 
 :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card,
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card.is-server,
 :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card.is-session {
   background:
     radial-gradient(circle at 50% 48%, rgba(56, 189, 248, 0.12), transparent 60%),
@@ -20950,6 +20971,7 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
   }
 
   :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card,
+  :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card.is-server,
   :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card.is-session {
     background:
       radial-gradient(circle at 50% 48%, rgba(2, 132, 199, 0.07), transparent 60%),

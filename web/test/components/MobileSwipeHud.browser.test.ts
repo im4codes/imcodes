@@ -262,4 +262,163 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
       await browser.close();
     }
   });
+
+  it('maintains theme surface polarity, readable WCAG contrast, and native backdrop overrides across dark/light, server/session, armed/unarmed, and native classes', { timeout: 30000 }, async () => {
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright') as typeof import('playwright');
+    if (!existsSync(chromium.executablePath())) {
+      return;
+    }
+    const { buildSync } = require('esbuild') as typeof import('esbuild');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const componentPath = resolve(here, '../../src/components/MobileSwipeHud.tsx');
+    const i18nPath = resolve(here, '../../src/i18n/index.ts');
+    const css = readFileSync(resolve(here, '../../src/styles.css'), 'utf8');
+
+    const compiled = buildSync({
+      stdin: {
+        contents: `
+          import { render } from 'preact';
+          import i18n from ${JSON.stringify(i18nPath)};
+          import { MobileSwipeHud } from ${JSON.stringify(componentPath)};
+          window.__mountSwipeHud = async (locale, progress, targets) => {
+            await i18n.changeLanguage(locale);
+            render(<MobileSwipeHud progress={progress} targets={targets} />, document.getElementById('root'));
+          };
+        `,
+        resolveDir: resolve(here, '../..'),
+        loader: 'tsx',
+      },
+      bundle: true,
+      write: false,
+      jsx: 'automatic',
+      jsxImportSource: 'preact',
+      platform: 'browser',
+      alias: {
+        react: 'preact/compat',
+        'react-dom': 'preact/compat',
+      },
+    });
+    const bundleCode = compiled.outputFiles[0].text;
+
+    const parseRgba = (raw: string): [number, number, number, number] => {
+      const m = raw.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i);
+      if (!m) throw new Error(`Unexpected CSS color format: ${raw}`);
+      return [Number(m[1]), Number(m[2]), Number(m[3]), m[4] === undefined ? 1 : Number(m[4])];
+    };
+    const relLuminance = ([r, g, b]: [number, number, number]) => {
+      const lin = [r, g, b].map((c) => {
+        const s = c / 255;
+        return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * lin[0]! + 0.7152 * lin[1]! + 0.0722 * lin[2]!;
+    };
+    const compositeOver = (fg: [number, number, number, number], bg: [number, number, number]): [number, number, number] => {
+      const a = fg[3];
+      return [
+        fg[0] * a + bg[0] * (1 - a),
+        fg[1] * a + bg[1] * (1 - a),
+        fg[2] * a + bg[2] * (1 - a),
+      ];
+    };
+    const contrast = (a: [number, number, number], b: [number, number, number]) => {
+      const la = relLuminance(a);
+      const lb = relLuminance(b);
+      return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    };
+
+    const states = [
+      { name: 'neutral', progress: { dx: 6, dy: 0, direction: null, action: null, distance: 6, threshold: 56, progress: 0.1, armed: false } },
+      { name: 'server-unarmed', progress: { dx: 0, dy: -32, direction: 'up', action: 'serverPrev', distance: 32, threshold: 56, progress: 0.57, armed: false } },
+      { name: 'server-armed', progress: { dx: 0, dy: 64, direction: 'down', action: 'serverNext', distance: 64, threshold: 56, progress: 1, armed: true } },
+      { name: 'session-unarmed', progress: { dx: -32, dy: 0, direction: 'left', action: 'tabPrev', distance: 32, threshold: 56, progress: 0.57, armed: false } },
+      { name: 'session-armed', progress: { dx: 64, dy: 0, direction: 'right', action: 'tabNext', distance: 64, threshold: 56, progress: 1, armed: true } },
+    ] as const;
+
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'light',
+        reducedMotion: 'reduce',
+      });
+      await page.setContent(`<style>${css}</style><div id="root"></div>`);
+      await page.addScriptTag({ content: bundleCode });
+
+      for (const scheme of ['light', 'dark'] as const) {
+        await page.emulateMedia({ colorScheme: scheme, reducedMotion: 'reduce' });
+        const backdropRgb: [number, number, number] = scheme === 'light' ? [241, 245, 249] : [10, 15, 28];
+
+        for (const htmlClass of ['', 'native-ios-mac', 'native-mac-desktop'] as const) {
+          await page.evaluate((cls) => {
+            document.documentElement.className = cls;
+          }, htmlClass);
+
+          for (const st of states) {
+            await page.evaluate(
+              ({ progress }) =>
+                (window as unknown as {
+                  __mountSwipeHud: (l: string, p: unknown, t: unknown) => Promise<void>;
+                }).__mountSwipeHud('en', progress, {
+                  up: 'mini-2',
+                  down: 'prod-01',
+                  left: 'cd',
+                  right: 'clawd',
+                }),
+              { progress: st.progress },
+            );
+
+            const styles = await page.evaluate(() => {
+              const card = document.querySelector('.mobile-swipe-hud-card') as HTMLElement;
+              const header = document.querySelector('.mobile-swipe-hud-header') as HTMLElement;
+              const pct = document.querySelector('.mobile-swipe-hud-pct') as HTMLElement;
+              const hint = document.querySelector('.mobile-swipe-hud-hint') as HTMLElement;
+              const activeDir = (document.querySelector('.mobile-swipe-hud-dir.is-active') ?? document.querySelector('.mobile-swipe-hud-dir')) as HTMLElement;
+              const activeTarget = activeDir.querySelector('.mobile-swipe-hud-dir-target') as HTMLElement;
+              const cardStyle = getComputedStyle(card);
+              const pctStyle = getComputedStyle(pct);
+              const activeDirStyle = getComputedStyle(activeDir);
+              return {
+                cardBg: cardStyle.backgroundColor,
+                cardBackdrop: cardStyle.backdropFilter,
+                headerColor: getComputedStyle(header).color,
+                pctColor: pctStyle.color,
+                pctBg: pctStyle.backgroundColor,
+                hintColor: getComputedStyle(hint).color,
+                dirBg: activeDirStyle.backgroundColor,
+                targetColor: getComputedStyle(activeTarget).color,
+              };
+            });
+
+            const tag = `${scheme}/${htmlClass || 'browser'}/${st.name}`;
+            const cardRgb = compositeOver(parseRgba(styles.cardBg), backdropRgb);
+            const cardLum = relLuminance(cardRgb);
+            if (scheme === 'light') {
+              expect(cardLum, `${tag}: card surface must stay light`).toBeGreaterThan(0.7);
+            } else {
+              expect(cardLum, `${tag}: card surface must stay dark`).toBeLessThan(0.2);
+            }
+
+            if (htmlClass) {
+              expect(styles.cardBackdrop, `${tag}: native class disables backdrop-filter`).toBe('none');
+            }
+
+            const headerRgb = compositeOver(parseRgba(styles.headerColor), cardRgb);
+            const hintRgb = compositeOver(parseRgba(styles.hintColor), cardRgb);
+            const pctBgRgb = compositeOver(parseRgba(styles.pctBg), cardRgb);
+            const pctFgRgb = compositeOver(parseRgba(styles.pctColor), pctBgRgb);
+            const dirBgRgb = compositeOver(parseRgba(styles.dirBg), cardRgb);
+            const targetFgRgb = compositeOver(parseRgba(styles.targetColor), dirBgRgb);
+
+            expect(contrast(headerRgb, cardRgb), `${tag}: header contrast`).toBeGreaterThanOrEqual(4.5);
+            expect(contrast(hintRgb, cardRgb), `${tag}: hint contrast`).toBeGreaterThanOrEqual(4.5);
+            expect(contrast(pctFgRgb, pctBgRgb), `${tag}: pct badge contrast`).toBeGreaterThanOrEqual(4.5);
+            expect(contrast(targetFgRgb, dirBgRgb), `${tag}: target contrast`).toBeGreaterThanOrEqual(4.5);
+          }
+        }
+      }
+    } finally {
+      await browser.close();
+    }
+  });
 });
