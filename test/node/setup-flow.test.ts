@@ -27,14 +27,14 @@ import {
 } from '../../shared/remote-desktop-local-management.js';
 
 async function createFakeBundleAsync(root: string, version: string, platform: NodeJS.Platform): Promise<string> {
-  const bundleDir = join(root, 'bundle');
+  const bundleDir = join(root, 'daemon-runtime');
   const distDir = join(bundleDir, 'package', 'dist', 'src');
-  const binDir = join(bundleDir, 'daemon-runtime', 'bin');
+  const exeDir = platform === 'win32' ? bundleDir : join(bundleDir, 'bin');
   await mkdir(distDir, { recursive: true });
-  await mkdir(binDir, { recursive: true });
-  await writeFile(join(bundleDir, 'package', 'package.json'), JSON.stringify({ version }), 'utf8');
+  await mkdir(exeDir, { recursive: true });
+  await writeFile(join(bundleDir, 'package', 'package.json'), JSON.stringify({ name: 'imcodes', version }), 'utf8');
   await writeFile(join(distDir, 'index.js'), 'console.log("daemon");\n', 'utf8');
-  const exe = join(binDir, platform === 'win32' ? 'node.exe' : 'node');
+  const exe = join(exeDir, platform === 'win32' ? 'node.exe' : 'node');
   await writeFile(exe, '#!/bin/sh\necho fake\n', 'utf8');
   if (platform !== 'win32') await chmod(exe, 0o755);
   return bundleDir;
@@ -441,6 +441,7 @@ describe('executePendingDesktopSetup chained bind + enroll', () => {
       env: {},
       procRoot,
       bundleDirs: [bundleDir],
+      cliCandidates: [],
       currentUid: () => process.getuid!(),
       currentGid: () => process.getgid!(),
       activeUser: { platform: 'linux', username: 'alice', home, uid: process.getuid!(), gid: process.getgid!() },
@@ -523,6 +524,7 @@ describe('executePendingDesktopSetup chained bind + enroll', () => {
       env: {},
       procRoot,
       bundleDirs: [bundleDir],
+      cliCandidates: [],
       currentUid: () => process.getuid!(),
       currentGid: () => process.getgid!(),
       activeUser: { platform: 'linux', username: 'alice', home, uid: process.getuid!(), gid: process.getgid!() },
@@ -864,6 +866,7 @@ describe('executePendingDesktopSetup chained bind + enroll', () => {
         env: {},
         procRoot,
         bundleDirs: [bundleDir],
+        cliCandidates: [],
         currentUid: () => process.getuid!(),
         currentGid: () => process.getgid!(),
         activeUser: { platform: 'linux', username: 'alice', home, uid: process.getuid!(), gid: process.getgid!() },
@@ -919,6 +922,7 @@ describe('executePendingDesktopSetup chained bind + enroll', () => {
       env: {},
       procRoot,
       bundleDirs: [bundleDir],
+      cliCandidates: [],
       currentUid: () => process.getuid!(),
       currentGid: () => process.getgid!(),
       activeUser: { platform: 'linux', username: 'bob', home: join(dir, 'bob-home'), uid: process.getuid!(), gid: process.getgid!() },
