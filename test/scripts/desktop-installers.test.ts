@@ -685,6 +685,8 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     expect(ps1Text).toContain('[string]$SchtasksExe = \'\'');
     expect(ps1Text).toContain('userDaemonWasRunning');
     expect(ps1Text).toContain('canonical_path_symlink_loop');
+    // PowerShell 5.1 non-BOM UTF-8 guard: generated .ps1 must remain pure ASCII
+    expect(ps1Text).not.toMatch(/[^\x00-\x7f]/);
   });
 
   it('verifies lock startToken ownership on POSIX: ignores stale PID reuse, stops matching owner, and fails closed on unknown/unprobeable tokens (F3-R2)', async () => {

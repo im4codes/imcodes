@@ -747,18 +747,24 @@ function Get-WindowsServicesSnapshot {
           $qStat = Invoke-Schtasks @('/Query', '/TN', $tn, '/FO', 'LIST', '/V')
           if ($qStat.exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($qStat.output)) {
             $outText = [string]$qStat.output
+            $lblStZh = '' + [char]0x72B6 + [char]0x6001
+            $valRunZh = '' + [char]0x6B63 + [char]0x5728 + [char]0x8FD0 + [char]0x884C
+            $lblTsZh = '' + [char]0x8BA1 + [char]0x5212 + [char]0x4EFB + [char]0x52A1 + [char]0x72B6 + [char]0x6001
+            $valDisZh = '' + [char]0x5DF2 + [char]0x7981 + [char]0x7528
+            $valEnZh = '' + [char]0x5DF2 + [char]0x542F + [char]0x7528
+            $valEnShortZh = '' + [char]0x542F + [char]0x7528
             if (-not $runningKnown) {
-              $entry.running = ($outText -match '(?im)^\\s*(?:Status|状态)\\s*:\\s*(?:Running|正在运行)\\b')
+              $entry.running = ($outText -match ("(?im)^\\s*(?:Status|$lblStZh)\\s*:\\s*(?:Running|$valRunZh)\\b"))
               $runningKnown = $true
             }
             if (-not $enabledKnown) {
-              if ($outText -match '(?im)^\\s*(?:Scheduled Task State|计划任务状态)\\s*:\\s*(?:Disabled|已禁用)\\b') {
+              if ($outText -match ("(?im)^\\s*(?:Scheduled Task State|$lblTsZh)\\s*:\\s*(?:Disabled|$valDisZh)\\b")) {
                 $entry.enabled = $false
                 $enabledKnown = $true
-              } elseif ($outText -match '(?im)^\\s*(?:Scheduled Task State|计划任务状态)\\s*:\\s*(?:Enabled|已启用|启用)\\b') {
+              } elseif ($outText -match ("(?im)^\\s*(?:Scheduled Task State|$lblTsZh)\\s*:\\s*(?:Enabled|$valEnZh|$valEnShortZh)\\b")) {
                 $entry.enabled = $true
                 $enabledKnown = $true
-              } elseif ($outText -match '(?im)^\\s*(?:Status|状态)\\s*:\\s*(?:Disabled|已禁用)\\b') {
+              } elseif ($outText -match ("(?im)^\\s*(?:Status|$lblStZh)\\s*:\\s*(?:Disabled|$valDisZh)\\b")) {
                 $entry.enabled = $false
                 $enabledKnown = $true
               }
@@ -1048,7 +1054,7 @@ function Register-WindowsServices($Plan, [bool]$RestartDaemon) {
   if ((-not $Plan.preserveUserDaemonAutostart) -or $RestartDaemon) {
     $handledDaemon = Invoke-ServiceAction 'ActivateUserDaemon' @{ autostartPath = $AutostartPath; currentDir = $CurrentDir }
     if (-not $handledDaemon -and (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
-      Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $AutostartPath) -WindowStyle Hidden | Out-Null
+      Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c call "' + $AutostartPath + '"') -WindowStyle Hidden | Out-Null
     }
   }
 }
@@ -1166,7 +1172,7 @@ if ($Mode -eq 'Rollback') {
         }
       }
       if ($snap.services -and $snap.services.userDaemonWasRunning -and (-not $daemonTaskStarted) -and (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
-        Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $AutostartPath) -WindowStyle Hidden | Out-Null
+        Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c call "' + $AutostartPath + '"') -WindowStyle Hidden | Out-Null
       }
     }
   }
