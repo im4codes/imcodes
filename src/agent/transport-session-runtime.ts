@@ -1220,8 +1220,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       if (!this._activeDispatchCancelled && this._status === 'idle' && this.hasActiveTurnWork()) {
         this.setStatus('streaming');
       }
-      if (!backgroundedSubagent) this._activeDispatchHasSideEffectEvidence = true;
-      if (this._activeDispatchId === null || !this._activeTurn) return;
+      if (!backgroundedSubagent && !tool.terminalSynthetic) this._activeDispatchHasSideEffectEvidence = true;
+      if (this._activeDispatchId === null || !this._activeTurn || tool.terminalSynthetic) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
       // callback boundary yet. STOP must then delegate to provider.cancel so

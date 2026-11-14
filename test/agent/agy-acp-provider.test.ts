@@ -1773,4 +1773,266 @@ rl.on('line', (line) => {
       busyReasons: [],
     });
   });
+
+  it('retires provisional tools from TransportSessionRuntime on useAgyNativeOutput, blocks non-terminal late frames, and drains/dispatches appends immediately', async () => {
+    resetTransportQueueStoreForTests();
+    const { provider, requests, root } = await setup();
+    const id = 'deck_test_agy_provisional_runtime_handoff';
+    const toolEvents: ToolCallEvent[] = [];
+    const completed: Array<{ content: string }> = [];
+    provider.onToolCall((sid, evt) => { if (sid === id) toolEvents.push(evt); });
+    const runtime = new TransportSessionRuntime(provider, id);
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'warm-rt-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Prepare native transcript log so post-handoff turns attribute cleanly.
+      const nativeLogFile = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+      await mkdir(path.dirname(nativeLogFile), { recursive: true });
+      await appendFile(
+        nativeLogFile,
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'warm' }) + '\n'
+        + JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'warm ok' }) + '\n',
+      );
+
+      // Provisional ACP tool opens an autonomous generation while idle; a concurrent send queues.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'provisional-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+      expect(state.promptInFlight).toBe(true);
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBeGreaterThan(0);
+      expect(runtime.send('queued during provisional', 'handoff-queued-1')).toBe('queued');
+      expect(runtime.pendingEntries).toHaveLength(1);
+
+      // Native output handoff retires the provisional generation, closes Runtime._openTools, and drains queue immediately.
+      (provider as any).useAgyNativeOutput(state);
+
+      const syntheticEnd = toolEvents.find((e) => e.id === 'provisional-tool' && e.status !== 'running');
+      expect(syntheticEnd).toMatchObject({
+        id: 'provisional-tool',
+        status: 'complete',
+        terminalStatus: 'abandoned',
+        terminalReason: 'generation_rollover',
+        terminalSynthetic: true,
+        terminalSource: 'provider_snapshot',
+      });
+
+      await vi.waitFor(async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+      await appendFile(
+        nativeLogFile,
+        JSON.stringify({ step_index: 2, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'queued during provisional' }) + '\n'
+        + JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'NATIVE DRAINED ON ROLLOVER' }) + '\n',
+      );
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(completed[1]?.content).toBe('NATIVE DRAINED ON ROLLOVER');
+
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 0,
+        backgroundWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        backgroundWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Late explicit non-terminal frames (tool_call_update in_progress / pending, delayed tool_call re-entry,
+      // and unowned orphan in_progress update) must NOT reopen state.toolCalls or Runtime._openTools.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'provisional-tool',
+          status: 'in_progress',
+        },
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'provisional-tool',
+          status: 'pending',
+        },
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'provisional-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'orphan-nonterminal-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+
+      expect(state.promptInFlight).toBe(false);
+      expect(state.toolCalls.size).toBe(0);
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Plain-text active append dispatches immediately without sticking in queue.
+      expect(runtime.send('plain append after handoff', 'handoff-plain-1', undefined, undefined, {
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      })).toBe('sent');
+      await vi.waitFor(async () => expect((await requests()).filter((r) => r.method === 'session/prompt')).toHaveLength(3), { timeout: 5000 });
+      await appendFile(
+        nativeLogFile,
+        JSON.stringify({ step_index: 4, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: 'plain append after handoff' }) + '\n'
+        + JSON.stringify({ step_index: 5, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'NATIVE AFTER HANDOFF' }) + '\n',
+      );
+      await vi.waitFor(() => expect(completed).toHaveLength(3), { timeout: 5000 });
+      expect(completed[2]?.content).toBe('NATIVE AFTER HANDOFF');
+      expect(runtime.pendingEntries).toEqual([]);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('retires open tools on non-turn-completion cancel(!promptInFlight) across provider and runtime while preserving real active-turn & background gates', async () => {
+    resetTransportQueueStoreForTests();
+    const { provider } = await setup();
+    const id = 'deck_test_agy_non_turn_cancel_and_controls';
+    const completed: Array<{ content: string }> = [];
+    const runtime = new TransportSessionRuntime(provider, id);
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'warm-rt-2')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Mark foreground authoritative and inject an unowned idle running tool (no promptInFlight).
+      (state.agyForeground ??= {} as any).authoritative = true;
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'idle-open-tool',
+          title: 'Read',
+          status: 'in_progress',
+        },
+      });
+      expect(state.promptInFlight).toBe(false);
+      expect(runtime.getActivitySnapshot().busyReasons).toContain('open_tool_call');
+
+      // Cancelling while !promptInFlight must close Runtime._openTools and suppress late reopening.
+      await provider.cancel(id);
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'idle-open-tool',
+          status: 'in_progress',
+        },
+      });
+      expect(state.toolCalls.size).toBe(0);
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+      // clearSessionWorkAfterFailure while !promptInFlight also closes Runtime._openTools and retires IDs.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'failure-open-tool',
+          title: 'Bash',
+          status: 'in_progress',
+        },
+      });
+      expect(runtime.getActivitySnapshot().busyReasons).toContain('open_tool_call');
+      (provider as any).clearSessionWorkAfterFailure(id, state);
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        blockingWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'failure-open-tool',
+          status: 'in_progress',
+        },
+      });
+      expect(state.toolCalls.size).toBe(0);
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+      // Positive control 1: genuine active turn + open tool preserves blocking telemetry.
+      (state.agyForeground as any).authoritative = false;
+      expect(runtime.send('real turn', 'real-turn-1')).toBe('sent');
+      await vi.waitFor(() => expect(state.promptInFlight || completed.length >= 2).toBe(true), { timeout: 5000 });
+      if (state.promptInFlight) {
+        (provider as any).handleSessionUpdate({
+          sessionId: nativeId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'real-active-tool',
+            title: 'Edit',
+            status: 'in_progress',
+          },
+        });
+        expect(runtime.getActivitySnapshot().blockingWorkCount).toBeGreaterThan(0);
+        expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBe(1);
+        (provider as any).handleSessionUpdate({
+          sessionId: nativeId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'real-active-tool',
+            status: 'completed',
+          },
+        });
+      }
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+
+      // Positive control 2: background_monitor stays non-blocking on provider/runtime while turn is idle.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-bg-ctrl`,
+        toolName: 'run_command',
+      });
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 1,
+        backgroundWorkCount: 1,
+        activeToolCount: 0,
+        busyReasons: ['background_monitor'],
+      });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+    } finally {
+      await runtime.kill();
+    }
+  });
 });

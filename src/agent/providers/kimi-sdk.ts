@@ -126,7 +126,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
-import type { ProviderActiveWorkSnapshot } from '../../../shared/session-activity-types.js';
+import type { ProviderActiveWorkSnapshot, ToolTerminalReason, ToolTerminalStatus } from '../../../shared/session-activity-types.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
 import {
@@ -291,6 +291,8 @@ interface KimiSdkSessionState {
   toolCalls: Map<string, MergedToolCall>;
   /** Track last emitted signature per tool to deduplicate identical updates. */
   emittedToolSignatures: Map<string, string>;
+  /** Bounded set of retired/settled ACP toolCallIds whose late updates must not reopen tool tracking. */
+  retiredToolCallIds?: Set<string>;
   lastStatusSignature: string | null;
   /** Stable IM.codes context already injected into this ACP history. */
   sessionSystemTextInjected?: string;
@@ -904,7 +906,82 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  private useAgyNativeOutput(state: KimiSdkSessionState): void {
+  private recordRetiredToolCallIds(state: KimiSdkSessionState, ids: Iterable<string>): void {
+    const retired = (state.retiredToolCallIds ??= new Set());
+    for (const id of ids) {
+      retired.delete(id);
+      retired.add(id);
+    }
+    while (retired.size > 512) {
+      const oldest = retired.values().next().value;
+      if (oldest === undefined) break;
+      retired.delete(oldest);
+    }
+  }
+
+  private retireOpenToolCalls(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    opts: {
+      terminalStatus: ToolTerminalStatus;
+      terminalReason: ToolTerminalReason;
+      decisionReason: string;
+      excludeToolId?: string;
+    },
+  ): void {
+    const retiredIds: string[] = [];
+    const retiredEvents: ToolCallEvent[] = [];
+    const preserved = new Map<string, MergedToolCall>();
+    const preservedSignatures = new Map<string, string>();
+    for (const [toolCallId, merged] of state.toolCalls.entries()) {
+      if (opts.excludeToolId !== undefined && toolCallId === opts.excludeToolId) {
+        preserved.set(toolCallId, merged);
+        const sig = state.emittedToolSignatures.get(toolCallId);
+        if (sig !== undefined) preservedSignatures.set(toolCallId, sig);
+        continue;
+      }
+      retiredIds.push(toolCallId);
+      if (mapToolStatus(merged.status) === 'running') {
+        retiredEvents.push({
+          id: toolCallId,
+          name: merged.title,
+          status: opts.terminalStatus === 'errored' ? 'error' : 'complete',
+          ...(merged.rawInput !== undefined ? { input: merged.rawInput } : {}),
+          terminalStatus: opts.terminalStatus,
+          terminalReason: opts.terminalReason,
+          terminalSynthetic: true,
+          terminalSource: 'provider_snapshot',
+          terminalDecisionReason: opts.decisionReason,
+          terminalIdempotencyKey: `acp-retire:${sessionId}:${toolCallId}:${opts.terminalReason}`,
+        });
+      }
+    }
+    this.recordRetiredToolCallIds(state, retiredIds);
+    state.toolCalls.clear();
+    state.emittedToolSignatures.clear();
+    for (const [id, merged] of preserved) state.toolCalls.set(id, merged);
+    for (const [id, sig] of preservedSignatures) state.emittedToolSignatures.set(id, sig);
+    for (const evt of retiredEvents) {
+      for (const cb of this.toolCallCallbacks) cb(sessionId, evt);
+    }
+  }
+
+  private shouldIgnoreRetiredOrOrphanToolUpdate(
+    state: KimiSdkSessionState,
+    update: Extract<SessionUpdate, { sessionUpdate: 'tool_call' | 'tool_call_update' }> & {
+      toolCallId: string;
+      status?: string | null;
+    },
+  ): boolean {
+    if (state.toolCalls.has(update.toolCallId)) return false;
+    if (state.retiredToolCallIds?.has(update.toolCallId)) return true;
+    if (update.sessionUpdate === 'tool_call_update' && !state.promptInFlight) {
+      return mapToolStatus(update.status ?? 'completed') === 'running';
+    }
+    return false;
+  }
+
+  private useAgyNativeOutput(state: KimiSdkSessionState, excludeToolId?: string): void {
     if (this.id !== AGY_SDK_PROVIDER_ID) return;
     (state.agyForeground ??= new AgyForegroundOwnership()).authoritative = true;
     state.agyNativeAcks = [];
@@ -917,8 +994,13 @@ export class KimiSdkProvider implements TransportProvider {
       if ((state.activePromptGenerations?.size ?? 0) === 0) {
         state.promptInFlight = false;
         state.promptSubmittedGeneration = null;
-        state.toolCalls.clear();
-        state.emittedToolSignatures.clear();
+        this.clearStatus(state.routeId, state);
+        this.retireOpenToolCalls(state.routeId, state, {
+          terminalStatus: 'abandoned',
+          terminalReason: 'generation_rollover',
+          decisionReason: 'provisional_native_handoff',
+          excludeToolId,
+        });
       }
       state.currentText = ''; state.currentMessageId = null;
       this.steeringRunTerminals.get(state)?.complete();
@@ -1266,8 +1348,11 @@ export class KimiSdkProvider implements TransportProvider {
     // history as `agent_message_chunk` notifications, and if we cleared before
     // resume those replay chunks would accumulate into currentText and be
     // re-emitted as the new turn's content.
-    state.toolCalls.clear();
-    state.emittedToolSignatures.clear();
+    this.retireOpenToolCalls(sessionId, state, {
+      terminalStatus: 'abandoned',
+      terminalReason: 'generation_rollover',
+      decisionReason: 'new_turn_started',
+    });
     state.lastStatusSignature = null;
 
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
@@ -1321,8 +1406,11 @@ export class KimiSdkProvider implements TransportProvider {
     for (const event of state.agySubagents?.interrupt() ?? []) {
       for (const cb of this.toolCallCallbacks) cb(sessionId, event);
     }
-    state.toolCalls.clear();
-    state.emittedToolSignatures.clear();
+    this.retireOpenToolCalls(sessionId, state, {
+      terminalStatus: 'cancelled',
+      terminalReason: 'user_cancelled',
+      decisionReason: state.promptInFlight ? 'session_cancelled' : 'session_cancelled_idle',
+    });
     if (!state.promptInFlight) {
       if (hadBackgroundOrOpenTools) {
         state.lastStatusSignature = null;
@@ -2117,8 +2205,11 @@ export class KimiSdkProvider implements TransportProvider {
     state.promptSubmittedGeneration = null;
     state.cancelled = false;
     state.stoppedByCancel = true;
-    state.toolCalls.clear();
-    state.emittedToolSignatures.clear();
+    this.retireOpenToolCalls(sessionId, state, {
+      terminalStatus: 'errored',
+      terminalReason: 'provider_error',
+      decisionReason: 'turn_failed',
+    });
     state.sessionSystemTextInjected = undefined;
     this.cancelPendingApprovals(sessionId);
     this.clearStatus(sessionId, state);
@@ -2494,8 +2585,25 @@ export class KimiSdkProvider implements TransportProvider {
     const messageId = state.currentMessageId ?? `${sessionId}:${randomUUID()}`;
     state.currentText = '';
     state.currentMessageId = null;
-    state.toolCalls.clear();
-    state.emittedToolSignatures.clear();
+    const settleTerminalStatus: ToolTerminalStatus = steeringFailure !== undefined || stopReason === 'refusal'
+      ? 'errored'
+      : (stopReason === 'cancelled' || state.cancelled)
+        ? 'cancelled'
+        : 'abandoned';
+    const settleTerminalReason: ToolTerminalReason = steeringFailure !== undefined || stopReason === 'refusal'
+      ? 'provider_error'
+      : (stopReason === 'cancelled' || state.cancelled)
+        ? 'provider_cancelled'
+        : 'provider_result';
+    this.retireOpenToolCalls(sessionId, state, {
+      terminalStatus: settleTerminalStatus,
+      terminalReason: settleTerminalReason,
+      decisionReason: settleTerminalStatus === 'errored'
+        ? 'turn_failed'
+        : settleTerminalStatus === 'cancelled'
+          ? 'turn_cancelled'
+          : 'turn_completed_open_tool',
+    });
     this.cancelPendingApprovals(sessionId);
     // All native RPCs are now terminal and busy/text/tools are cleared. Resolve
     // only this captured run; callbacks may already have started a successor.
@@ -2673,6 +2781,10 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.replaying) {
       return;
     }
+    if ((update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
+      && this.shouldIgnoreRetiredOrOrphanToolUpdate(state, update)) {
+      return;
+    }
     if (this.id === AGY_SDK_PROVIDER_ID && state.agyForeground?.authoritative) {
       if (update.sessionUpdate === 'agent_message_chunk') {
         const text = extractTextFromContent(update.content);
@@ -2811,8 +2923,11 @@ export class KimiSdkProvider implements TransportProvider {
     state.steeringFailure = undefined;
     state.currentText = '';
     state.currentMessageId = null;
-    state.toolCalls.clear();
-    state.emittedToolSignatures.clear();
+    this.retireOpenToolCalls(sessionId, state, {
+      terminalStatus: 'abandoned',
+      terminalReason: 'generation_rollover',
+      decisionReason: 'new_turn_started',
+    });
     state.lastStatusSignature = null;
     state.turnModel = this.profile.strictModelSelection ? (state.confirmedModel ?? state.model) : undefined;
     (state.activePromptGenerations ??= new Set()).clear();
@@ -2901,6 +3016,7 @@ export class KimiSdkProvider implements TransportProvider {
     state: KimiSdkSessionState,
     update: Extract<SessionUpdate, { sessionUpdate: 'tool_call' }> & ToolCall,
   ): void {
+    if (this.shouldIgnoreRetiredOrOrphanToolUpdate(state, update)) return;
     this.clearStatus(sessionId, state);
     const merged: MergedToolCall = {
       toolCallId: update.toolCallId,
@@ -2920,6 +3036,7 @@ export class KimiSdkProvider implements TransportProvider {
     state: KimiSdkSessionState,
     update: Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }> & ToolCallUpdate,
   ): void {
+    if (this.shouldIgnoreRetiredOrOrphanToolUpdate(state, update)) return;
     const existing = state.toolCalls.get(update.toolCallId);
     // ACP spec: every field on ToolCallUpdate is optional and replaces the
     // corresponding field on the original tool_call. We synthesize a stub if
@@ -2985,7 +3102,7 @@ export class KimiSdkProvider implements TransportProvider {
       },
     };
     if (this.id === AGY_SDK_PROVIDER_ID) {
-      if (/^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title))) this.useAgyNativeOutput(state);
+      if (/^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title))) this.useAgyNativeOutput(state, merged.toolCallId);
       const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
       const outputValue = normalizedStatus === 'running'
         ? undefined
@@ -3281,8 +3398,11 @@ export class KimiSdkProvider implements TransportProvider {
     state.stoppedByCancel = true;
     state.currentMessageId = null;
     state.currentText = '';
-    state.toolCalls.clear();
-    state.emittedToolSignatures.clear();
+    this.retireOpenToolCalls(routeId, state, {
+      terminalStatus: 'abandoned',
+      terminalReason: 'no_current_work_disconnect',
+      decisionReason: 'session_work_cleared_after_failure',
+    });
     this.clearStatus(routeId, state);
     run?.complete();
     return hadActiveWork;
