@@ -133,3 +133,6 @@ export type AgyNativeSessionState = typeof AGY_NATIVE_SESSION_STATE[keyof typeof
 
 /** Local adapter evidence: persistence failed before any native process/input. */
 export const AGY_NATIVE_START_NOT_ATTEMPTED = 'agyNativeStartNotAttempted' as const;
+
+/** An RPC rejection without a returned native id is not proof of non-creation. */
+export const AGY_NATIVE_START_RECOVERY_HINT = 'Use Start over (session_restart reset=true) to explicitly create a new conversation. The previous native creation outcome is unknown; automatic fresh retry is disabled.';

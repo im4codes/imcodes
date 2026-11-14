@@ -22,3 +22,13 @@ export const PROVIDER_ERROR_CODES = {
 } as const;
 
 export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
+
+/** Fixed, privacy-safe ACP diagnostic phases (never derived from upstream text). */
+export const ACP_ERROR_PHASE = {
+  NEW_SESSION: 'newSession',
+  LOAD_SESSION: 'loadSession',
+  RESUME_SESSION: 'resumeSession',
+  CONFIRM_MODEL: 'confirmStrictSessionModel',
+  PROMPT: 'prompt',
+} as const;
+export type AcpErrorPhase = typeof ACP_ERROR_PHASE[keyof typeof ACP_ERROR_PHASE];

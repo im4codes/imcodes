@@ -1,4 +1,4 @@
-import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
+import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED, AGY_NATIVE_START_RECOVERY_HINT } from '../../shared/agy-agent.js';
 import { PROVIDER_ERROR_CODES } from '../../shared/provider-error-codes.js';
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { flushStore, getSession, upsertSession, listSessions, type SessionRecord } from '../store/session-store.js';
@@ -31,7 +31,7 @@ export async function persistAgyNativeSessionStart(
     throw agyNativeStartNotAttemptedError('AG resume id belongs to another local session', PROVIDER_ERROR_CODES.CONFIG_ERROR);
   }
   if (!record.providerResumeId && record.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
-    throw agyNativeStartNotAttemptedError('AG conversation has no trusted resume id or unused proof', PROVIDER_ERROR_CODES.CONFIG_ERROR);
+    throw agyNativeStartNotAttemptedError(`AG conversation has no trusted resume id or unused proof. ${AGY_NATIVE_START_RECOVERY_HINT}`, PROVIDER_ERROR_CODES.CONFIG_ERROR);
   }
   upsertSession({ ...record, agyNativeSessionState: AGY_NATIVE_SESSION_STATE.STARTED });
   try {

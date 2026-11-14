@@ -86,6 +86,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   switch (req.method) {
     case 'initialize': return ok(req.id, { protocolVersion: 1, agentInfo: { name: process.env.AGY_ACP_FIXTURE_AGENT_NAME, version: '1.5.4' }, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {}, list: {} } } });
     case 'session/new': {
+      if (scenario === 'new-crash-once' && !fs.existsSync(logPath + '.new-failed')) {
+        fs.writeFileSync(logPath + '.new-failed', 'unknown'); process.exit(1);
+      }
       if (scenario === 'new-error-once' && !fs.existsSync(logPath + '.new-failed')) {
         fs.writeFileSync(logPath + '.new-failed', 'failed'); return error(req.id, 'native creation unavailable');
       }

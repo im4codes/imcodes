@@ -75,7 +75,16 @@ export class AgyAcpProvider extends KimiSdkProvider {
     return super.createSession({ ...config, ...(barrier ? {
       beforeNativeSessionStart: async () => {
         try { await barrier(); }
-        catch {
+        catch (error) {
+          // Our durable barrier already supplies a bounded, actionable error.
+          // Keep its CONFIG_ERROR/CANCELLED category and no-start evidence.
+          if (error && typeof error === 'object'
+            && 'details' in error && error.details && typeof error.details === 'object'
+            && AGY_NATIVE_START_NOT_ATTEMPTED in error.details
+            && error.details[AGY_NATIVE_START_NOT_ATTEMPTED] === true
+            && 'code' in error && typeof error.code === 'string'
+            && 'message' in error && typeof error.message === 'string'
+            && 'recoverable' in error && typeof error.recoverable === 'boolean') throw error;
           throw {
             code: PROVIDER_ERROR_CODES.CANCELLED,
             message: 'AG native session start was not attempted because its durable owner check failed.',

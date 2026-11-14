@@ -1,3 +1,6 @@
+import logger from '../../src/util/logger.js';
+import { agyNativeStartNotAttemptedError } from '../../src/agent/agy-session-persistence.js';
+import { ACP_ERROR_PHASE } from '../../shared/provider-error-codes.js';
 import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { readFileSync } from 'node:fs';
@@ -523,6 +526,61 @@ describe('AG native ACP', () => {
       expect((await requests()).some(x => x.method === 'session/cancel')).toBe(false);
     } finally { off(); }
   });
+  it.each([
+    [PROVIDER_ERROR_CODES.CONFIG_ERROR, 'AG conversation has no trusted resume id or unused proof'],
+    [PROVIDER_ERROR_CODES.CONFIG_ERROR, 'Cannot persist AG native start; no process was started'],
+    [PROVIDER_ERROR_CODES.CANCELLED, 'AG start owner changed'],
+  ])('preserves structured durable barrier error %s: %s', async (code, message) => {
+    const error = agyNativeStartNotAttemptedError(message, code);
+    const { provider, requests } = await setup();
+    const id = await route(provider, undefined, { beforeNativeSessionStart: async () => { throw error; } });
+    await expect(provider.send(id, 'A')).rejects.toBe(error);
+    expect((await requests()).some(x => x.method === 'session/new')).toBe(false);
+  });
+
+  it.each([
+    [ACP_ERROR_PHASE.NEW_SESSION, 'newSession'],
+    [ACP_ERROR_PHASE.RESUME_SESSION, 'resumeSession'],
+    [ACP_ERROR_PHASE.LOAD_SESSION, 'loadSession'],
+    [ACP_ERROR_PHASE.CONFIRM_MODEL, 'unstable_setSessionModel'],
+    [ACP_ERROR_PHASE.PROMPT, 'prompt'],
+  ])('logs only safe structured ACP diagnostics during %s', async (phase, method) => {
+    const { provider } = await setup();
+    // Exercise the shared ACP engine's load option as well as AG's resume option.
+    if (phase === ACP_ERROR_PHASE.LOAD_SESSION) {
+      Object.defineProperty(provider, 'profile', { value: { ...(provider as any).profile, resumeWithoutReplay: false } });
+    }
+    const raw = 'PRIVATE_PROMPT /Users/private/path secret-token-value';
+    const error = Object.assign(new Error(raw), { code: -32602, data: { prompt: raw, path: raw } });
+    vi.spyOn((provider as any).connection, method).mockRejectedValue(error);
+    const warnings = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const errors = vi.fn(); provider.onError(errors);
+    try {
+      const id = await route(provider, undefined, phase === ACP_ERROR_PHASE.RESUME_SESSION || phase === ACP_ERROR_PHASE.LOAD_SESSION
+        ? { resumeId: 'native-existing' } : phase === ACP_ERROR_PHASE.CONFIRM_MODEL ? { agentId: 'model-b' } : {});
+      await provider.send(id, 'user prompt').catch(() => {});
+      await vi.waitFor(() => expect(errors).toHaveBeenCalled(), { timeout: 5000 });
+      expect(warnings.mock.calls.some(([fields]) => (fields as any)?.acpPhase === phase
+        && (fields as any)?.rpcCode === -32602 && (fields as any)?.errorCode === '-32602')).toBe(true);
+      const exposed = JSON.stringify({ warnings: warnings.mock.calls, errors: errors.mock.calls });
+      for (const secret of ['PRIVATE_PROMPT', '/Users/private/path', 'secret-token-value']) expect(exposed).not.toContain(secret);
+      if (phase === ACP_ERROR_PHASE.NEW_SESSION) expect(errors.mock.calls[0][1].message).toContain('session_restart reset=true');
+    } finally { warnings.mockRestore(); }
+  });
+
+  it('does not log arbitrary upstream error codes as safe identifiers', async () => {
+    const { provider } = await setup();
+    vi.spyOn((provider as any).connection, 'newSession').mockRejectedValue(Object.assign(new Error('private text'), { code: 'secret-token-value' }));
+    const warnings = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const id = await route(provider);
+      await expect(provider.send(id, 'A')).rejects.toMatchObject({ details: { acpPhase: ACP_ERROR_PHASE.NEW_SESSION, errorCode: 'unknown' } });
+      expect(warnings.mock.calls.some(([fields]) => (fields as any)?.acpPhase === ACP_ERROR_PHASE.NEW_SESSION
+        && (fields as any)?.errorCode === 'unknown' && !('rpcCode' in (fields as any)))).toBe(true);
+      expect(JSON.stringify(warnings.mock.calls)).not.toContain('secret-token-value');
+    } finally { warnings.mockRestore(); }
+  });
+
   it('holds session/new behind durable ownership and preserves queued no-start evidence', async () => {
     const { provider, requests } = await setup(); const id = await route(provider, undefined, { beforeNativeSessionStart: async () => { throw new Error('disk failed'); } });
     await expect(provider.send(id, 'A')).rejects.toMatchObject({ details: { [AGY_NATIVE_START_NOT_ATTEMPTED]: true } });

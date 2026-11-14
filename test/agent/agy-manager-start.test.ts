@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { switchSessionModelNow, restartSessionNow, handoffSessionConversation } from '../../src/daemon/command-handler.js';
+import { PROVIDER_ERROR_CODES } from '../../shared/provider-error-codes.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
@@ -393,14 +394,28 @@ describe('AG provider-switch failure recovery', () => {
     await send(name, 'reset');
     expect(store.getSession(name)?.providerResumeId).not.toBe(native);
   });
-  it('keeps uncertain native creation closed to implicit retry but makes explicit reset recoverable', async () => {
-    await acp('new-error-once'); const name = names[1];
+  it.each(['new-error-once', 'new-crash-once'])('keeps uncertain native creation (%s) closed to implicit retry but makes explicit reset recoverable', async scenario => {
+    await acp(scenario); const name = names[1];
     await launchTransportSession({ name, projectName: 'realproj', role: 'w1', agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture' });
     const runtime = getTransportRuntime(name)!; runtime.send('first', 'creation-failed');
     await vi.waitFor(() => expect(runtime.lastProviderError).toBeTruthy(), { timeout: 5000 });
     expect(store.getSession(name)?.providerResumeId).toBeUndefined();
+    const failedRoute = store.getSession(name)!.providerSessionId;
+    expect(store.getSession(name)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.STARTED);
+    expect(runtime.lastProviderError?.message).toContain('session_restart reset=true');
+    // A second ordinary message cannot silently duplicate upstream creation.
+    runtime.send('implicit retry', 'creation-retry');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(runtime.lastProviderError).toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    expect(runtime.lastProviderError?.message).toContain('no trusted resume id or unused proof');
+    expect(runtime.lastProviderError?.message).not.toContain('durable owner check failed');
+    expect(rows().filter(row => row.method === 'session/new')).toHaveLength(1);
     await expect(restartSessionNow(name, { reset: false })).rejects.toThrow(/start over|reset=true/i);
-    await restartSessionNow(name, { reset: true }); await send(name, 'after-reset');
+    await restartSessionNow(name, { reset: true });
+    expect(store.getSession(name)?.providerSessionId).not.toBe(failedRoute);
+    expect(store.getSession(name)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
+    await send(name, 'after-reset');
+    expect(store.getSession(name)?.providerResumeId).toBeTruthy();
     expect(rows().filter(row => row.method === 'session/new')).toHaveLength(2);
   });
   it('treats fresh as authoritative even if its caller carries a stale native handle', async () => {

@@ -2,7 +2,8 @@ import { AgyForegroundOwnership } from '../agy-foreground-ownership.js';
 import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptCursor, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
 import { AgySubagentTracker, extractAgySubagentEvidenceChildIds, isAgySubagentTool, normalizeAgyToolName, stableJson } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
-import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_RECOVERY_HINT } from '../../../shared/agy-agent.js';
+import { ACP_ERROR_PHASE, type AcpErrorPhase } from '../../../shared/provider-error-codes.js';
 import { AgyContextUsage } from '../agy-context-usage.js';
 import {
   createAgyIncognitoEnvSync,
@@ -351,6 +352,7 @@ interface MergedToolCall {
 }
 
 export class KimiSdkProvider implements TransportProvider {
+  private readonly acpErrorPhases = new WeakMap<object, AcpErrorPhase>();
   readonly id: string;
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
@@ -1168,6 +1170,7 @@ export class KimiSdkProvider implements TransportProvider {
           try {
             await setter.call(connection, { sessionId: nativeId, modelId: model });
           } catch (error) {
+            this.logAcpFailure(error, ACP_ERROR_PHASE.CONFIRM_MODEL);
             // Report only our own bounded model guidance, never raw ACP diagnostics.
             if (error instanceof RequestError && /unknown model|unsupported model|model.*not supported/i.test(error.message)) {
               throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR,
@@ -1196,11 +1199,14 @@ export class KimiSdkProvider implements TransportProvider {
       // Share an in-flight confirmation, not a permanently rejected Promise.
       // A transient first-turn RPC failure must permit the same model to retry.
       if (state.modelApplyRequest === request) state.modelApplyRequest = undefined;
+      if (!this.acpDiagnosticFields(error).acpPhase) this.logAcpFailure(error, ACP_ERROR_PHASE.CONFIRM_MODEL);
       throw error;
     }
     if (outcome.timedOut) {
       if (state.modelRevision === revision) { state.modelRevision++; state.confirmedModel = undefined; }
-      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'ACP model selection was not confirmed before its deadline', true);
+      const error = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'ACP model selection was not confirmed before its deadline', true);
+      this.logAcpFailure(error, ACP_ERROR_PHASE.CONFIRM_MODEL);
+      throw error;
     }
     assertOwner();
   }
@@ -1426,7 +1432,7 @@ export class KimiSdkProvider implements TransportProvider {
           continuationCursor,
         );
       }
-      const queuedPrompt = connection.prompt({
+      const queuedPrompt = this.withAcpDiagnostics(ACP_ERROR_PHASE.PROMPT, () => connection.prompt({
         sessionId: state.acpSessionId,
         prompt: [{ type: 'text', text: activePromptText }],
         // ACP's canonical unstable messageId is the only provider-visible
@@ -1435,7 +1441,7 @@ export class KimiSdkProvider implements TransportProvider {
         // admission map handles local retries, while capable ACP agents may use
         // this id to correlate a replay across their own history.
         messageId: stableAcpMessageId(notification.notificationId),
-      });
+      }));
       this.promptTerminals.set(state, queuedPrompt);
       this.trackPromptSettlement(
         connection,
@@ -1968,11 +1974,11 @@ export class KimiSdkProvider implements TransportProvider {
           companionAliases,
         );
       }
-      const turn = connection.prompt({
+      const turn = this.withAcpDiagnostics(ACP_ERROR_PHASE.PROMPT, () => connection.prompt({
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
         messageId: randomUUID(),
-      });
+      }));
       this.promptTerminals.set(state, turn);
       this.trackPromptSettlement(
         connection,
@@ -2168,11 +2174,12 @@ export class KimiSdkProvider implements TransportProvider {
             state.replaying = true;
             let loadResult: LoadSessionResponse | undefined;
             try {
-              loadResult = await loader.call(connection, {
+              loadResult = await this.withAcpDiagnostics(this.profile.resumeWithoutReplay
+                ? ACP_ERROR_PHASE.RESUME_SESSION : ACP_ERROR_PHASE.LOAD_SESSION, () => loader.call(connection, {
                 sessionId: state.acpSessionId,
                 cwd: state.cwd,
                 mcpServers: this.mcpServersForState(state),
-              });
+              }));
               if (state.wireOrderTail) await state.wireOrderTail;
             } finally {
               state.replaying = false;
@@ -2246,10 +2253,19 @@ export class KimiSdkProvider implements TransportProvider {
   private async createFreshAcpSession(sessionId: string, state: KimiSdkSessionState): Promise<void> {
     this.assertCurrentSession(sessionId, state);
     const connection = this.connectionForState(state)!;
-    const result: NewSessionResponse = await connection.newSession({
-      cwd: state.cwd,
-      mcpServers: this.mcpServersForState(state),
-    });
+    let result: NewSessionResponse;
+    try {
+      result = await this.withAcpDiagnostics(ACP_ERROR_PHASE.NEW_SESSION, () => connection.newSession({
+        cwd: state.cwd,
+        mcpServers: this.mcpServersForState(state),
+      }));
+    } catch (error) {
+      // Even a clean RPC rejection need not mean the upstream did not persist
+      // a conversation. Never undo the durable start proof or retry fresh.
+      if (this.id !== AGY_SDK_PROVIDER_ID || state.incognito) throw error;
+      const normalized = this.normalizeError(error);
+      throw { ...normalized, message: `${normalized.message} ${AGY_NATIVE_START_RECOVERY_HINT}` };
+    }
     if (this.sessions.get(sessionId) !== state || state.cancelled || this.connectionForState(state) !== connection) {
       // session/new crossed the native boundary before Stop/rebind. Release
       // only this newly created worker, never publish its ID to a newer owner.
@@ -3068,12 +3084,46 @@ export class KimiSdkProvider implements TransportProvider {
    */
   private errorLogFields(error: unknown, rawField: 'err' | 'error' = 'error'): Record<string, unknown> {
     if (this.profile.privacySafeErrors) {
-      return { errorCode: getPrivacySafeErrorCode(error) };
+      return { errorCode: getPrivacySafeErrorCode(error), ...this.acpDiagnosticFields(error) };
     }
     return { [rawField]: error };
   }
 
   private normalizeError(err: unknown): ProviderError {
+    const normalized = this.normalizeErrorCore(err);
+    const diagnostics = this.acpDiagnosticFields(err);
+    return this.profile.privacySafeErrors && diagnostics.acpPhase
+      ? { ...normalized, details: { ...diagnostics, errorCode: getPrivacySafeErrorCode(err) } }
+      : normalized;
+  }
+
+  private acpDiagnosticFields(error: unknown): { acpPhase?: AcpErrorPhase; rpcCode?: number } {
+    if (this.id !== AGY_SDK_PROVIDER_ID) return {};
+    const phase = error && typeof error === 'object' ? this.acpErrorPhases.get(error) : undefined;
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+    return { ...(phase ? { acpPhase: phase } : {}),
+      ...(typeof code === 'number' && Number.isSafeInteger(code) ? { rpcCode: code } : {}) };
+  }
+
+  private logAcpFailure(error: unknown, phase: AcpErrorPhase): void {
+    if (this.id !== AGY_SDK_PROVIDER_ID) return;
+    if (error && typeof error === 'object') this.acpErrorPhases.set(error, phase);
+    logger.warn({ provider: this.id, acpPhase: phase, ...this.errorLogFields(error) },
+      `${this.profile.displayName} ACP request failed`);
+  }
+
+  private withAcpDiagnostics<T>(phase: AcpErrorPhase, request: () => Promise<T>): Promise<T> {
+    // Preserve the original Promise and timing for every other ACP profile.
+    if (this.id !== AGY_SDK_PROVIDER_ID) return request();
+    try {
+      return request().catch(error => { this.logAcpFailure(error, phase); throw error; });
+    } catch (error) {
+      this.logAcpFailure(error, phase);
+      throw error;
+    }
+  }
+
+  private normalizeErrorCore(err: unknown): ProviderError {
     if (err && typeof err === 'object' && 'code' in err && 'message' in err && 'recoverable' in err) {
       // Already a ProviderError.
       return err as ProviderError;
@@ -3105,7 +3155,10 @@ export class KimiSdkProvider implements TransportProvider {
       }
       return this.makeError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-        `${this.profile.displayName} ACP request failed.`,
+        this.id === AGY_SDK_PROVIDER_ID
+          ? `${this.profile.displayName} ACP request failed${this.acpDiagnosticFields(err).acpPhase
+            ? ` during ${this.acpDiagnosticFields(err).acpPhase}` : ''}. Check the official CLI login, model and connection settings before retrying.`
+          : `${this.profile.displayName} ACP request failed.`,
         false,
       );
     }
