@@ -1399,4 +1399,113 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('supports synchronous primeWebGesture adoption, silent short-tap cancel, and buffered pre-adopt errors/results', async () => {
+    const instances = browser({ autoStart: false });
+    const origTouch = Object.getOwnPropertyDescriptor(navigator, 'maxTouchPoints');
+    Object.defineProperty(navigator, 'maxTouchPoints', { value: 5, configurable: true });
+    try {
+      // 1. Short tap: prime synchronously in pointerdown, then cancelWebGesturePrime() before hold activates -> aborts with 0 errors
+      const globalErr = vi.fn();
+      VoiceInput.onRecognitionError(globalErr);
+      expect(VoiceInput.primeWebGesture({ deferAudioPause: true })).toBe(true);
+      expect(instances).toHaveLength(1);
+      expect(instances[0].start).toHaveBeenCalledTimes(1);
+      VoiceInput.cancelWebGesturePrime();
+      expect(instances[0].abort).toHaveBeenCalledTimes(1);
+      expect(globalErr).not.toHaveBeenCalled();
+
+      // 2. Real hold / overlay open: prime synchronously, then startListening adopts the SAME instance without abort/re-create
+      expect(VoiceInput.primeWebGesture({ deferAudioPause: true })).toBe(true);
+      expect(instances).toHaveLength(2);
+      const primedRec = instances[1];
+      primedRec.onstart?.();
+      primedRec.onresult?.({
+        results: {
+          length: 1,
+          0: { 0: { transcript: 'early hello' }, isFinal: false },
+        },
+      });
+      const results: Array<[string, boolean]> = [];
+      const listening: boolean[] = [];
+      const errors: string[] = [];
+      await expect(VoiceInput.startListening(
+        (text, isFinal) => results.push([text, isFinal]),
+        (v) => listening.push(v),
+        (err) => errors.push(err),
+      )).resolves.toBe(true);
+      expect(instances).toHaveLength(2);
+      expect(primedRec.abort).not.toHaveBeenCalled();
+      expect(listening).toEqual([true]);
+      expect(results).toEqual([['early hello', false]]);
+      // cancelWebGesturePrime() is a no-op once adopted
+      VoiceInput.cancelWebGesturePrime();
+      expect(primedRec.abort).not.toHaveBeenCalled();
+      const stopped = VoiceInput.stopListening();
+      primedRec.onend?.();
+      await stopped;
+      // Interim-only transcript promoted to final on clean stop
+      expect(results).toEqual([['early hello', false], ['early hello', true]]);
+      expect(errors).toEqual([]);
+
+      // 3. Buffered early not-allowed during prime stays silent until adopted, then reports cleanly
+      expect(VoiceInput.primeWebGesture({ deferAudioPause: true })).toBe(true);
+      expect(instances).toHaveLength(3);
+      instances[2].onerror?.({ error: 'not-allowed' });
+      expect(globalErr).not.toHaveBeenCalled();
+      const errResults: string[] = [];
+      await expect(VoiceInput.startListening(
+        vi.fn(),
+        undefined,
+        (err) => errResults.push(err),
+      )).resolves.toBe(false);
+      expect(errResults).toEqual(['permission_denied']);
+    } finally {
+      VoiceInput.onRecognitionError(null);
+      await VoiceInput.stopListening({ abort: true });
+      if (origTouch) Object.defineProperty(navigator, 'maxTouchPoints', origTouch);
+      else delete (navigator as any).maxTouchPoints;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('promotes interim-only result to final on natural rec.onend and resolves subsequent stopListening immediately without 10s drain wait', async () => {
+    vi.useFakeTimers();
+    const instances = browser({ autoStart: false });
+    const origTouch = Object.getOwnPropertyDescriptor(navigator, 'maxTouchPoints');
+    Object.defineProperty(navigator, 'maxTouchPoints', { value: 5, configurable: true });
+    try {
+      const results: Array<[string, boolean]> = [];
+      const listening: boolean[] = [];
+      await expect(VoiceInput.startListening(
+        (text, isFinal) => results.push([text, isFinal]),
+        (v) => listening.push(v),
+      )).resolves.toBe(true);
+      const rec = instances[0];
+      rec.onstart?.();
+      rec.onresult?.({
+        results: {
+          length: 1,
+          0: { 0: { transcript: 'mobile speech works' }, isFinal: false },
+        },
+      });
+      // Browser auto-ends (e.g. iOS Safari) before user calls stopListening
+      rec.onend?.();
+      expect(results).toEqual([['mobile speech works', false], ['mobile speech works', true]]);
+      expect(listening).toEqual([true, false]);
+
+      // Subsequent stopListening() resolves immediately without calling rec.stop() or waiting WEB_FINAL_DRAIN_MS
+      let resolved = false;
+      const stopPromise = VoiceInput.stopListening().then(() => { resolved = true; });
+      await stopPromise;
+      expect(resolved).toBe(true);
+      expect(rec.stop).not.toHaveBeenCalled();
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      vi.useRealTimers();
+      if (origTouch) Object.defineProperty(navigator, 'maxTouchPoints', origTouch);
+      else delete (navigator as any).maxTouchPoints;
+      vi.unstubAllGlobals();
+    }
+  });
+
 });

@@ -58,6 +58,8 @@ import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { boundedVisualViewportHeight } from '../visual-viewport.js';
+import { getMobileKeyboardState } from '../mobile-keyboard.js';
 import { buildExecutionTemplateLabel } from '../execution-template-label.js';
 import { formatLabel, formatSessionTabLabel } from '../format-label.js';
 import {
@@ -241,6 +243,18 @@ function prewarmVoiceInput(options?: { requestPermission?: boolean }): void {
   if (typeof fn === 'function') {
     void fn(options);
   }
+}
+
+function primeVoiceInputGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'primeWebGesture')) return false;
+  const fn = (VoiceInput as { primeWebGesture?: (opts?: { deferAudioPause?: boolean }) => boolean }).primeWebGesture;
+  return typeof fn === 'function' ? fn(options) : false;
+}
+
+function cancelVoiceInputGesturePrime(): void {
+  if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelWebGesturePrime')) return;
+  const fn = (VoiceInput as { cancelWebGesturePrime?: () => void }).cancelWebGesturePrime;
+  if (typeof fn === 'function') fn();
 }
 /**
  * Floor for the shared desktop composer height, matching the three-row resting
@@ -1628,6 +1642,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const touchTapCompatShieldCleanupRef = useRef<(() => void) | null>(null);
   const suppressComposerClickFocusRef = useRef(false);
   const suppressComposerClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const suppressNextVoiceButtonClickRef = useRef(false);
+  const suppressNextVoiceButtonClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceOpenRef = useRef(voiceOpen);
+  voiceOpenRef.current = voiceOpen;
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
@@ -2205,6 +2223,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (inputDisabledRef.current || voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
       return false;
     }
+    cancelVoiceInputGesturePrime();
     clearComposerVoiceTouchLock(el, false);
     composerFocusedRef.current = true;
     setComposerFocused(true);
@@ -5494,10 +5513,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [buildSendPayload, requestSend]);
 
   const openStandardVoiceOverlay = useCallback(() => {
+    if (inputDisabledRef.current) return;
+    if (!hasVoiceNotepadDraft && VoiceInput.isAvailable()) {
+      primeVoiceInputGesture({ deferAudioPause: false });
+    }
     setVoiceOverlayInitialText(null);
     setVoiceOverlayAutoStart(true);
     setVoiceOpen(true);
-  }, []);
+  }, [hasVoiceNotepadDraft]);
 
   const clearVoiceHoldTimers = useCallback(() => {
     if (voiceHoldTimerRef.current !== null) {
@@ -5624,6 +5647,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   /** Restore editability and focus the composer on any short tap or failed hold. */
   const fallbackToComposerClick = useCallback((pointerType?: string) => {
     pendingMobileInitialEndFocusRef.current = null;
+    cancelVoiceInputGesturePrime();
     if (!mountedRef.current || inputDisabledRef.current) return;
     suppressComposerClickFocusRef.current = false;
     if (suppressComposerClickTimerRef.current !== null) {
@@ -5819,16 +5843,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
     if (!tx) {
+      cancelVoiceInputGesturePrime();
       resetVoiceHoldInteractionState();
       fallbackToComposerClick(ptr.pointerType);
       return;
     }
-    if (!tx.didStartRecording && (event.buttons ?? 0) === 0) {
-      void finalizeVoiceHold(tx, 'failed');
-      return;
-    }
     ptr.captureLost = true;
-  }, [fallbackToComposerClick, finalizeVoiceHold, resetVoiceHoldInteractionState]);
+  }, [fallbackToComposerClick, resetVoiceHoldInteractionState]);
 
   /** Transition a pending pointer press into active voice capture (shared by hold timer and slide promotion). */
   const activateComposerVoiceHold = useCallback((
@@ -6038,6 +6059,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setVoiceHoldPending(true);
     applyComposerVoiceTouchLock(el, false);
     attachComposerVoiceWindowListeners();
+    if (voiceHoldTxRef.current === null) {
+      primeVoiceInputGesture({ deferAudioPause: true });
+    }
 
     if (voiceHoldTimerRef.current !== null) clearTimeout(voiceHoldTimerRef.current);
     voiceHoldTimerRef.current = setTimeout(() => {
@@ -6111,6 +6135,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         const isStrongVerticalScroll =
           Math.abs(dy) >= VOICE_HOLD_SCROLL_ABORT_PX
           && Math.abs(dy) > Math.abs(dx) * 1.5;
+        cancelVoiceInputGesturePrime();
         resetVoiceHoldInteractionState();
         if (!isStrongVerticalScroll) {
           fallbackToComposerClick(ptr.pointerType);
@@ -6162,6 +6187,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (voiceHoldTimerRef.current !== null || voiceHoldSlideTimerRef.current !== null || !tx) {
       clearVoiceHoldTimers();
       clearComposerVoiceWindowListeners();
+      cancelVoiceInputGesturePrime();
       // Any short release or pending pointercancel before active recording falls back to typing focus.
       fallbackToComposerClick(resolvedPointerType);
       return;
@@ -6232,10 +6258,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         clearTimeout(suppressComposerClickTimerRef.current);
         suppressComposerClickTimerRef.current = null;
       }
+      if (suppressNextVoiceButtonClickTimerRef.current !== null) {
+        clearTimeout(suppressNextVoiceButtonClickTimerRef.current);
+        suppressNextVoiceButtonClickTimerRef.current = null;
+      }
+      suppressNextVoiceButtonClickRef.current = false;
       suppressComposerClickFocusRef.current = false;
       disarmTouchTapCompatMouseShield();
       clearVoiceHoldTimers();
       clearComposerVoiceWindowListeners();
+      cancelVoiceInputGesturePrime();
       voiceHoldPointerRef.current = null;
       voiceHoldPendingRef.current = false;
       clearComposerVoiceTouchLock(divRef.current ?? initialEl, inputDisabledRef.current);
@@ -7233,6 +7265,85 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       prewarmVoiceInput({ requestPermission: false });
     }
   }, [voiceHoldReady, composerFocused]);
+
+  useEffect(() => {
+    if (!isMobileLayout || typeof window === 'undefined' || typeof document === 'undefined') return;
+    const vv = window.visualViewport;
+    let baselineWidth = window.innerWidth;
+    let baselineHeight = window.innerHeight;
+    let hadKeyboardOpen = false;
+    let wasKbOpen = false;
+
+    const syncKeyboardDismiss = () => {
+      const el = divRef.current;
+      if (!el) {
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+        baselineWidth = window.innerWidth;
+        baselineHeight = window.innerHeight;
+        return;
+      }
+      if (window.innerWidth !== baselineWidth) {
+        baselineWidth = window.innerWidth;
+        baselineHeight = window.innerHeight;
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+      }
+      const active = document.activeElement;
+      const composerHasFocus = active === el || (active !== null && el.contains(active));
+      if (!composerHasFocus) {
+        baselineHeight = window.innerHeight;
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+        return;
+      }
+      baselineHeight = Math.max(baselineHeight, window.innerHeight);
+      const viewportHeight = vv
+        ? boundedVisualViewportHeight(vv.height, window.innerHeight, document.documentElement.clientHeight)
+        : window.innerHeight;
+      if (viewportHeight === null) return;
+      const layoutHeight = Math.max(baselineHeight, window.innerHeight);
+      const shrink = Math.max(0, layoutHeight - viewportHeight);
+      const state = getMobileKeyboardState(true, shrink, hadKeyboardOpen);
+      const dismissed = wasKbOpen && state.hadKeyboardOpen && !state.kbOpen;
+      hadKeyboardOpen = state.hadKeyboardOpen;
+      wasKbOpen = state.kbOpen;
+      if (!dismissed) return;
+      if (voiceHoldPendingRef.current || voiceHoldActiveRef.current || voiceOpenRef.current) return;
+
+      // Mobile browsers/WebViews often collapse the soft keyboard without blurring
+      // document.activeElement. Exit edit mode explicitly so Hold-to-Talk recovers.
+      pendingMobileInitialEndFocusRef.current = null;
+      hadKeyboardOpen = false;
+      wasKbOpen = false;
+      composerFocusedRef.current = false;
+      setComposerFocused(false);
+      try {
+        el.blur();
+      } catch { /* ignore */ }
+      clearComposerVoiceTouchLock(
+        el,
+        inputDisabledRef.current || voiceHoldReadyRef.current,
+      );
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const el = divRef.current;
+      const target = e.target as Node | null;
+      if (!el || !target || (target !== el && !el.contains(target))) return;
+      syncKeyboardDismiss();
+    };
+
+    vv?.addEventListener('resize', syncKeyboardDismiss);
+    window.addEventListener('resize', syncKeyboardDismiss);
+    document.addEventListener('focusin', onFocusIn);
+    syncKeyboardDismiss();
+    return () => {
+      vv?.removeEventListener('resize', syncKeyboardDismiss);
+      window.removeEventListener('resize', syncKeyboardDismiss);
+      document.removeEventListener('focusin', onFocusIn);
+    };
+  }, [isMobileLayout]);
 
   return (
     <>
@@ -9344,9 +9455,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   class="btn btn-voice btn-voice-embedded"
                   // Open on pointerdown (fires synchronously at touch-start) so the
                   // tap is never lost to the ~300ms click delay or to a re-render
-                  // unmounting this conditionally-rendered button mid-gesture.
-                  onPointerDown={(e) => { e.preventDefault(); openStandardVoiceOverlay(); }}
-                  onClick={() => openStandardVoiceOverlay()}
+                  // unmounting this conditionally-rendered button mid-gesture, and
+                  // suppress the trailing synthetic click on the same tap.
+                  onPointerDown={(e) => {
+                    if (e.button !== undefined && e.button !== 0) return;
+                    e.preventDefault();
+                    suppressNextVoiceButtonClickRef.current = true;
+                    if (suppressNextVoiceButtonClickTimerRef.current !== null) {
+                      clearTimeout(suppressNextVoiceButtonClickTimerRef.current);
+                    }
+                    suppressNextVoiceButtonClickTimerRef.current = setTimeout(() => {
+                      suppressNextVoiceButtonClickTimerRef.current = null;
+                      suppressNextVoiceButtonClickRef.current = false;
+                    }, 400);
+                    openStandardVoiceOverlay();
+                  }}
+                  onClick={() => {
+                    if (suppressNextVoiceButtonClickRef.current) {
+                      suppressNextVoiceButtonClickRef.current = false;
+                      if (suppressNextVoiceButtonClickTimerRef.current !== null) {
+                        clearTimeout(suppressNextVoiceButtonClickTimerRef.current);
+                        suppressNextVoiceButtonClickTimerRef.current = null;
+                      }
+                      return;
+                    }
+                    openStandardVoiceOverlay();
+                  }}
                   disabled={inputDisabled}
                   data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
                   title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}

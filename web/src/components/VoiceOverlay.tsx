@@ -361,6 +361,9 @@ export function VoiceOverlay({
     // own would talk over the offer to resume it.
     if (!recoverable && autoStartListening) {
       void startSession(init.length);
+    } else if (Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelWebGesturePrime')) {
+      const cancelPrime = (VoiceInput as { cancelWebGesturePrime?: () => void }).cancelWebGesturePrime;
+      if (typeof cancelPrime === 'function') cancelPrime();
     }
     return () => {
       clearRestartTimer();

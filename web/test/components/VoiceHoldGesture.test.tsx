@@ -1646,7 +1646,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             build.onLoad({ filter: /.*/, namespace: 'stub' }, (args) => {
               if (args.path === 'voice-input-stub') {
                 return {
-                  contents: 'export const isAvailable=()=>true;export const prewarm=(o)=>window.__voiceMock.prewarm(o);export const startListening=(...a)=>window.__voiceMock.startListening(...a);export const stopListening=()=>window.__voiceMock.stopListening();export const onAudioLevel=(cb)=>window.__voiceMock.onAudioLevel(cb);',
+                  contents: 'export const isAvailable=()=>true;export const prewarm=(o)=>window.__voiceMock.prewarm(o);export const primeWebGesture=(o)=>window.__voiceMock.primeWebGesture?.(o)??false;export const cancelWebGesturePrime=()=>window.__voiceMock.cancelWebGesturePrime?.();export const startListening=(...a)=>window.__voiceMock.startListening(...a);export const stopListening=()=>window.__voiceMock.stopListening();export const onAudioLevel=(cb)=>window.__voiceMock.onAudioLevel(cb);',
                   loader: 'js',
                 };
               }
@@ -1700,11 +1700,51 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
       });
 
+      await page.addInitScript(() => {
+        const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+        let vvHeight = 844;
+        const fakeVv = {
+          get height() { return vvHeight; },
+          get width() { return window.innerWidth; },
+          offsetTop: 0,
+          offsetLeft: 0,
+          pageTop: 0,
+          pageLeft: 0,
+          scale: 1,
+          addEventListener: (type: string, fn: EventListenerOrEventListenerObject) => {
+            if (!listeners.has(type)) listeners.set(type, new Set());
+            listeners.get(type)!.add(fn);
+          },
+          removeEventListener: (type: string, fn: EventListenerOrEventListenerObject) => {
+            listeners.get(type)?.delete(fn);
+          },
+        };
+        Object.defineProperty(window, 'visualViewport', {
+          configurable: true,
+          get: () => fakeVv,
+        });
+        (window as any).__setFakeVvHeight = (h: number) => {
+          vvHeight = h;
+          const ev = new Event('resize');
+          listeners.get('resize')?.forEach((fn) => {
+            if (typeof fn === 'function') fn(ev);
+            else fn.handleEvent(ev);
+          });
+        };
+      });
+
       await page.goto('https://imcodes.test/');
       await page.evaluate(() => {
-        (window as any).__voiceCalls = { start: 0, stop: 0, nextStartResult: true };
+        (window as any).__voiceCalls = { start: 0, stop: 0, prime: 0, cancelPrime: 0, nextStartResult: true };
         (window as any).__voiceMock = {
           prewarm: async () => {},
+          primeWebGesture: () => {
+            (window as any).__voiceCalls.prime += 1;
+            return true;
+          },
+          cancelWebGesturePrime: () => {
+            (window as any).__voiceCalls.cancelPrime += 1;
+          },
           startListening: async (_onResult: unknown, onListeningChange?: (listening: boolean) => void) => {
             (window as any).__voiceCalls.start += 1;
             const ok = !!(window as any).__voiceCalls.nextStartResult;
@@ -1819,6 +1859,80 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(activeCancelResult.ce).toBe('false');
       expect(activeCancelResult.focused).toBe(false);
       expect(activeCancelResult.hudPresent).toBe(false);
+
+      // 4. Chromium check: soft keyboard open -> dismiss without blur restores contenteditable=false & hold-to-talk (plus lostpointercapture & embedded mic dedup)
+      const dismissResult = await page.evaluate(async ({ x, y }) => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 4, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 30));
+        el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 4, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+        await new Promise((r) => setTimeout(r, 20));
+        const focusedAfterTap = document.activeElement === el;
+        const ceAfterTap = el.getAttribute('contenteditable');
+
+        // Soft keyboard opens (844 -> 500): must keep composer focused & editable
+        (window as any).__setFakeVvHeight(500);
+        await new Promise((r) => setTimeout(r, 20));
+        const focusedWhileKbOpen = document.activeElement === el;
+        const ceWhileKbOpen = el.getAttribute('contenteditable');
+
+        // Soft keyboard dismisses via viewport restore WITHOUT firing blur: must blur & restore contenteditable=false
+        (window as any).__setFakeVvHeight(844);
+        await new Promise((r) => setTimeout(r, 20));
+        const focusedAfterDismiss = document.activeElement === el;
+        const ceAfterDismiss = el.getAttribute('contenteditable');
+
+        // Hold-to-talk recovers immediately (and survives lostpointercapture(buttons=0) before pointerup)
+        const startsBeforeHold = (window as any).__voiceCalls.start;
+        const stopsBeforeHold = (window as any).__voiceCalls.stop;
+        (window as any).__voiceCalls.nextStartResult = true;
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 5, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 120));
+        el.dispatchEvent(new PointerEvent('lostpointercapture', { bubbles: true, pointerId: 5, pointerType: 'touch', buttons: 0 }));
+        await new Promise((r) => setTimeout(r, 90));
+        const hudWhileHolding = !!document.querySelector('.voice-hold-hud');
+        const startsDuringHold = (window as any).__voiceCalls.start - startsBeforeHold;
+        window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 5, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+        await new Promise((r) => setTimeout(r, 20));
+        const stopsAfterRelease = (window as any).__voiceCalls.stop - stopsBeforeHold;
+
+        // Embedded mic button pointerdown + trailing click deduplicates to 1 prime
+        const micBtn = document.querySelector('.btn-voice-embedded') as HTMLButtonElement | null;
+        const primesBeforeMic = (window as any).__voiceCalls.prime;
+        if (micBtn) {
+          micBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 6, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+          micBtn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerId: 6, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+          micBtn.click();
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        const primesAfterMic = (window as any).__voiceCalls.prime - primesBeforeMic;
+
+        return {
+          focusedAfterTap,
+          ceAfterTap,
+          focusedWhileKbOpen,
+          ceWhileKbOpen,
+          focusedAfterDismiss,
+          ceAfterDismiss,
+          hudWhileHolding,
+          startsDuringHold,
+          stopsAfterRelease,
+          hasMicBtn: !!micBtn,
+          primesAfterMic,
+        };
+      }, { x: cx, y: cy });
+      expect(dismissResult.focusedAfterTap).toBe(true);
+      expect(dismissResult.ceAfterTap).toBe('true');
+      expect(dismissResult.focusedWhileKbOpen).toBe(true);
+      expect(dismissResult.ceWhileKbOpen).toBe('true');
+      expect(dismissResult.focusedAfterDismiss).toBe(false);
+      expect(dismissResult.ceAfterDismiss).toBe('false');
+      expect(dismissResult.hudWhileHolding).toBe(true);
+      expect(dismissResult.startsDuringHold).toBe(1);
+      expect(dismissResult.stopsAfterRelease).toBe(1);
+      if (dismissResult.hasMicBtn) {
+        expect(dismissResult.primesAfterMic).toBe(1);
+      }
 
       await context.close();
     } finally {
@@ -2391,23 +2505,52 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(input.getAttribute('contenteditable')).toBe('false');
     };
 
-    // F1-A: lostpointercapture during starting (!didStartRecording, buttons=0, no pointerup) must abort & focus immediately
+    // F1-A: lostpointercapture during starting (!didStartRecording, buttons=0 from blur/setPointerCapture)
+    // must keep the hold alive on window listeners; window pointerup completes/sends once started,
+    // and only actual start failure falls back to typing focus.
     let resolveLateStart!: (ok: boolean) => void;
-    voiceMock.startListening.mockImplementationOnce(() => new Promise<boolean>((r) => { resolveLateStart = r; }));
+    voiceMock.startListening.mockImplementationOnce((
+      onResult: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+      onError?: (error: string) => void,
+    ) => {
+      voiceMock.partialHandler = onResult;
+      voiceMock.listeningHandler = onListeningChange ?? null;
+      voiceMock.errorHandler = onError ?? null;
+      return new Promise<boolean>((r) => { resolveLateStart = r; });
+    });
     dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 11, 1);
     await vi.advanceTimersByTimeAsync(175);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
     dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 11, 0);
     await vi.advanceTimersByTimeAsync(0);
+    // Hold stays alive on window listeners even though lostpointercapture had buttons=0
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+    expect(voiceMock.stopListening).not.toHaveBeenCalled();
+    resolveLateStart(true);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('captured despite lostpointercapture');
+    await vi.advanceTimersByTimeAsync(0);
+    dispatchPrimaryPointer(window, 'pointerup', 180, 500, 11, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceMock.stopListening).toHaveBeenCalled();
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'captured despite lostpointercapture',
+    }));
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    expect(document.activeElement).not.toBe(input);
+
+    // F1-A2: If start actually fails (resolve(false)) while captureLost=true, still restores focus cleanly
+    let resolveFailStart!: (ok: boolean) => void;
+    voiceMock.startListening.mockImplementationOnce(() => new Promise<boolean>((r) => { resolveFailStart = r; }));
+    dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 110, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 110, 0);
+    resolveFailStart(false);
+    await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
     expect(document.activeElement).toBe(input);
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
-    // Late resolution must stop safely without re-locking or stealing focus
-    resolveLateStart(true);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(voiceMock.stopListening).toHaveBeenCalled();
-    expect(input.getAttribute('contenteditable')).toBe('true');
-    expect(document.activeElement).toBe(input);
     await resetToUnfocused();
 
     // F1-B: lostpointercapture during pending (!tx, buttons=0, no pointerup) must clear timers & focus immediately
@@ -2762,5 +2905,101 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(window.getSelection()?.focusNode).toBe(textNode);
     expect(window.getSelection()?.focusOffset).toBe(4);
+  });
+
+  it('recovers hold-to-talk when soft keyboard dismisses without blur while leaving hardware-keyboard and open-IME focus untouched', async () => {
+    const origVV = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const origInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const vv = new EventTarget() as EventTarget & { height: number; offsetTop: number };
+    vv.height = 844;
+    vv.offsetTop = 0;
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: vv });
+
+    voiceMock.startListening.mockImplementation(async (
+      onResult: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+      onError?: (error: string) => void,
+    ) => {
+      voiceMock.partialHandler = onResult;
+      voiceMock.listeningHandler = onListeningChange ?? null;
+      voiceMock.errorHandler = onError ?? null;
+      onListeningChange?.(true);
+      return true;
+    });
+
+    try {
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+
+      const input = document.querySelector('.controls-input') as HTMLElement;
+      expect(input.getAttribute('contenteditable')).toBe('false');
+      const sendTouchPointer = (target: EventTarget, type: string, pointerId: number, buttons: number) => {
+        const ev = new Event(type, { bubbles: true, cancelable: true });
+        Object.assign(ev, { clientX: 120, clientY: 500, pointerId, button: 0, buttons, pointerType: 'touch', isPrimary: true });
+        fireEvent(target, ev);
+      };
+
+      // 1. Tap to open edit mode; hardware keyboard case (shrink stays 0) must NEVER auto-blur
+      sendTouchPointer(input, 'pointerdown', 1, 1);
+      await vi.advanceTimersByTimeAsync(40);
+      sendTouchPointer(input, 'pointerup', 1, 0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.activeElement).toBe(input);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+
+      vv.height = 844;
+      vv.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.activeElement).toBe(input);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+
+      // 2. Soft keyboard opens (844 -> 500) and resizes candidate bar (500 -> 470): must remain focused & editable
+      vv.height = 500;
+      vv.dispatchEvent(new Event('resize'));
+      vv.height = 470;
+      vv.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.activeElement).toBe(input);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+
+      // Long press while keyboard is open still stays native (must NOT hijack to voice)
+      sendTouchPointer(input, 'pointerdown', 2, 1);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(voiceMock.startListening).not.toHaveBeenCalled();
+      sendTouchPointer(input, 'pointerup', 2, 0);
+
+      // 3. User dismisses soft keyboard (470 -> 844) WITHOUT browser firing blur(): composer must exit edit mode & re-arm hold-to-talk
+      vv.height = 844;
+      vv.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.activeElement).not.toBe(input);
+      expect(input.getAttribute('contenteditable')).toBe('false');
+
+      // Subsequent hold-to-talk works cleanly and sends transcript
+      sendTouchPointer(input, 'pointerdown', 3, 1);
+      await vi.advanceTimersByTimeAsync(175);
+      expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+      voiceMock.partialHandler?.('recovered after keyboard dismiss');
+      sendTouchPointer(window, 'pointerup', 3, 0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        text: 'recovered after keyboard dismiss',
+      }));
+    } finally {
+      if (origVV) Object.defineProperty(window, 'visualViewport', origVV);
+      else Reflect.deleteProperty(window, 'visualViewport');
+      if (origInnerHeight) Object.defineProperty(window, 'innerHeight', origInnerHeight);
+      else Reflect.deleteProperty(window, 'innerHeight');
+    }
   });
 });
