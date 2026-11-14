@@ -15,6 +15,32 @@ import {
 } from '../voice-recognition-backend.js';
 import type { PluginListenerHandle } from '@capacitor/core';
 
+export type VoiceLanguageMode = 'follow' | 'auto';
+export const VOICE_LANG_STORAGE_KEY = 'imcodes_voice_lang';
+
+/** Read the persisted speech recognition language mode ('follow' UI language by default, or 'auto'). */
+export function getVoiceLanguageMode(): VoiceLanguageMode {
+  try {
+    const saved = globalThis.localStorage?.getItem(VOICE_LANG_STORAGE_KEY);
+    return saved === 'auto' ? 'auto' : 'follow';
+  } catch {
+    return 'follow';
+  }
+}
+
+/** Persist the speech recognition language mode ('follow' or 'auto'). */
+export function setVoiceLanguageMode(mode: VoiceLanguageMode): void {
+  try {
+    globalThis.localStorage?.setItem(VOICE_LANG_STORAGE_KEY, mode);
+  } catch { /* localStorage may be unavailable in restricted contexts */ }
+}
+
+/** Resolve the native speech-recognition locale for the active voice mode, or undefined in auto-detect mode. */
+export function pickRecognitionLocale(preferredLang?: string): string | undefined {
+  if (getVoiceLanguageMode() === 'auto') return undefined;
+  return pickLocale(preferredLang);
+}
+
 /** Resolve the user's active UI language preference first, then fall back to system navigator.language. */
 function resolvePreferredLanguageTag(preferredLang?: string): string {
   if (typeof preferredLang === 'string' && preferredLang.trim()) {
@@ -705,16 +731,17 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       return false;
     }
 
-    const locale = pickLocale();
+    const locale = pickRecognitionLocale();
+    const startOpts = {
+      ...(locale ? { language: locale } : {}),
+      partialResults: true,
+      popup: false,
+      addPunctuation: true,
+    };
     pauseBackgroundAudio();
     try {
       await withTimeout(
-        recognition.start({
-          language: locale,
-          partialResults: true,
-          popup: false,
-          addPunctuation: true,
-        }),
+        recognition.start({ ...startOpts }),
         NATIVE_START_TIMEOUT_MS,
         'Speech recognition timed out',
       );
@@ -744,12 +771,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
             return false;
           }
           await withTimeout(
-            recognition.start({
-              language: locale,
-              partialResults: true,
-              popup: false,
-              addPunctuation: true,
-            }),
+            recognition.start({ ...startOpts }),
             NATIVE_START_TIMEOUT_MS,
             'Speech recognition timed out',
           );
@@ -936,7 +958,7 @@ function startWebListening(
         void startWebLevelMeter(generation);
       }
     };
-    rec.lang = pickWebLocale();
+    rec.lang = getVoiceLanguageMode() === 'auto' ? '' : pickWebLocale();
     rec.continuous = true;
     rec.interimResults = true;
     rec.maxAlternatives = 1;

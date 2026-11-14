@@ -4,6 +4,7 @@ import { ApiKeyManager } from '../components/ApiKeyManager.js';
 import { ServerList } from '../components/ServerList.js';
 import { GettingStarted } from '../components/GettingStarted.js';
 import { LanguageSwitcher } from '../components/LanguageSwitcher.js';
+import { VoiceLanguageSwitcher } from '../components/VoiceLanguageSwitcher.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
 import { DeleteAccount } from '../components/DeleteAccount.js';
 import { SharedEntriesPanel } from '../components/SharedEntriesPanel.js';
@@ -149,6 +150,7 @@ export function DashboardPage({
             {t('usageSummary.title')}
           </button>
           <LanguageSwitcher />
+          <VoiceLanguageSwitcher />
           <button type="button" class="btn btn-secondary dashboard-header-btn" onClick={onLogout}>
             {t('dashboard.logout')}
           </button>

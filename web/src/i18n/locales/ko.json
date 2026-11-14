@@ -1450,6 +1450,11 @@
     "ja": "日本語",
     "ko": "한국어"
   },
+  "voiceLang": {
+    "label": "음성 인식 언어",
+    "follow": "음성: UI 언어",
+    "auto": "음성: 자동 감지"
+  },
   "login": {
     "subtitle": "AI 코딩 에이전트를 원격 제어",
     "passkey_signin": "패스키로 로그인",

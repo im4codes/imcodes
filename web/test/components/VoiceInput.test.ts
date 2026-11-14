@@ -1849,4 +1849,57 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('passes dynamic UI language in follow mode (including fallback and post-prewarm updates) and omits language in auto-detect mode on native and Web Speech', async () => {
+    const mockStorage = (() => {
+      const store = new Map<string, string>();
+      return {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => { store.set(k, v); },
+        removeItem: (k: string) => { store.delete(k); },
+      };
+    })();
+    vi.stubGlobal('localStorage', mockStorage);
+    try {
+      // 1. Default mode is 'follow': prewarm first, then change UI language to ja -> native start receives ja-JP
+      expect(VoiceInput.getVoiceLanguageMode()).toBe('follow');
+      await VoiceInput.prewarm({ requestPermission: false });
+      mockStorage.setItem('imcodes_lang', 'ja');
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledWith(expect.objectContaining({ language: 'ja-JP' }));
+      await VoiceInput.stopListening({ abort: true });
+
+      // 2. Switching UI language to zh-TW updates next start without re-prewarm
+      speechApi.start.mockClear();
+      mockStorage.setItem('imcodes_lang', 'zh-TW');
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledWith(expect.objectContaining({ language: 'zh-Hant' }));
+      await VoiceInput.stopListening({ abort: true });
+
+      // 3. Auto-detect mode omits language property completely on native start
+      speechApi.start.mockClear();
+      VoiceInput.setVoiceLanguageMode('auto');
+      expect(VoiceInput.getVoiceLanguageMode()).toBe('auto');
+      expect(VoiceInput.pickRecognitionLocale()).toBeUndefined();
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      const autoArgs = speechApi.start.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect('language' in autoArgs).toBe(false);
+      await VoiceInput.stopListening({ abort: true });
+
+      // 4. Web Speech follows UI language in 'follow' mode and sets empty lang in 'auto' mode
+      const instances = browser();
+      VoiceInput.setVoiceLanguageMode('follow');
+      mockStorage.setItem('imcodes_lang', 'ja');
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(instances[0].lang).toBe('ja-JP');
+      await VoiceInput.stopListening({ abort: true });
+
+      VoiceInput.setVoiceLanguageMode('auto');
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(instances[1].lang).toBe('');
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
 });

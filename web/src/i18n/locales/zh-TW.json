@@ -1450,6 +1450,11 @@
     "ja": "日本語",
     "ko": "한국어"
   },
+  "voiceLang": {
+    "label": "語音辨識語言",
+    "follow": "語音：跟隨介面",
+    "auto": "語音：自動辨識"
+  },
   "login": {
     "subtitle": "遠端控制你的 AI 程式設計 Agent",
     "passkey_signin": "使用 Passkey 登入",

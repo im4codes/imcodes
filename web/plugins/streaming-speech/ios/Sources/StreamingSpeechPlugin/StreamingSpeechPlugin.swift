@@ -871,11 +871,12 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             let expectedCall = call
             self.startingCall = call
+            let targetLanguage = Qwen3LanguageMapper.resolve(call.getString("language"))
             let owner = self.coordinator.beginStart(
                 makeDecode: { [weak self] in
                     guard let self = self,
                           let recognizer = self.ensureRecognizer(),
-                          let decoder = SpeechDecoder(recognizer: recognizer) else { return nil }
+                          let decoder = SpeechDecoder(recognizer: recognizer, language: targetLanguage) else { return nil }
                     return SpeechCoordinator.Decoder(
                         decode: { samples, prefixTokens, shouldContinue in
                             decoder.decode(samples: samples, prefixTokens: prefixTokens, shouldContinue: shouldContinue)
@@ -1122,7 +1123,11 @@ final class SpeechRecognizer {
 
 final class SpeechDecoder {
     let recognizer: SpeechRecognizer
-    init?(recognizer: SpeechRecognizer) { self.recognizer = recognizer }
+    let language: String?
+    init?(recognizer: SpeechRecognizer, language: String? = nil) {
+        self.recognizer = recognizer
+        self.language = language
+    }
     func decode(
         samples: [Float],
         prefixTokens: [Int32] = [],
@@ -1130,7 +1135,7 @@ final class SpeechDecoder {
     ) -> (text: String, tokens: [Int32])? {
         if samples.isEmpty { return ("", prefixTokens) }
         guard shouldContinue() else { return nil }
-        let options = Qwen3DecodingOptions(maxTokens: 192, language: nil, context: recognizer.hotwords)
+        let options = Qwen3DecodingOptions(maxTokens: 192, language: language, context: recognizer.hotwords)
         do {
             let result = try recognizer.model.transcribeSegmentWithCancellation(
                 audio: samples,

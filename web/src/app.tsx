@@ -65,6 +65,7 @@ import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { MobileServerMenu } from './components/MobileServerMenu.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
+import { VoiceLanguageSwitcher } from './components/VoiceLanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { isActiveTurnFinishedError } from './session-live-status.js';
 import { SessionTabs } from './components/SessionTabs.js';
@@ -8706,8 +8707,8 @@ function InternalMainApp() {
           <div style={{ fontSize: 10, color: '#475569', marginBottom: 8, textAlign: 'center' }}>
             {(() => { try { const d = new Date(__BUILD_TIME__); return `Build: ${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
           </div>
-          <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
-            <LanguageSwitcher /><R2RelayToggle />
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+            <LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle />
           </div>
           <button class="btn btn-secondary" style={{ width: '100%', fontSize: 11 }} onClick={handleLogout}>
             Log Out
@@ -8780,7 +8781,7 @@ function InternalMainApp() {
                 </button>
                 {showMobileServerMenu && (
                   <>
-                  <MobileServerMenu footer={<><LanguageSwitcher /><R2RelayToggle /></>}>
+                  <MobileServerMenu footer={<><LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle /></>}>
                     <MobileServerMenuToolbar
                       onHome={() => {
                         setShowMobileServerMenu(false);
@@ -9557,8 +9558,8 @@ function InternalMainApp() {
                   >⌚</button>
                 </div>
               )}
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                <LanguageSwitcher /><R2RelayToggle />
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                <LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle />
                 <span style={{ fontSize: 10, color: '#475569' }}>
                   {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
                 </span>

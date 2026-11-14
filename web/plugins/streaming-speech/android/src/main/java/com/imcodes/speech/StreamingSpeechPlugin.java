@@ -129,6 +129,7 @@ public class StreamingSpeechPlugin extends Plugin {
             samples,
             count,
             prefixTokens,
+            session.language,
             () -> !session.isDiscarded() && generation.get() == owner
         );
     }
@@ -227,7 +228,8 @@ public class StreamingSpeechPlugin extends Plugin {
                 return;
             }
             long owner = generation.incrementAndGet();
-            CaptureSession session = new CaptureSession(owner, audio, agc);
+            String language = Qwen3OnnxDecoder.resolveLanguage(call.getString("language"));
+            CaptureSession session = new CaptureSession(owner, audio, agc, language);
             activeSession = session;
             recorder = audio;
             listening = true;
@@ -455,6 +457,7 @@ public class StreamingSpeechPlugin extends Plugin {
     private static final class CaptureSession {
         final long owner;
         final AudioRecord audio;
+        final String language;
         private final Qwen3SpeechWindow.SpeechInbox inbox = new Qwen3SpeechWindow.SpeechInbox(new SpeechGain());
         private final CountDownLatch readerStarted = new CountDownLatch(1);
         private final CountDownLatch firstPassDone = new CountDownLatch(1);
@@ -466,10 +469,11 @@ public class StreamingSpeechPlugin extends Plugin {
         private boolean overflowed;
         private Exception readError;
 
-        CaptureSession(long owner, AudioRecord audio, AutomaticGainControl agc) {
+        CaptureSession(long owner, AudioRecord audio, AutomaticGainControl agc, String language) {
             this.owner = owner;
             this.audio = audio;
             this.agc = agc;
+            this.language = language;
         }
 
         synchronized void releaseAudioResources() {

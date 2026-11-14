@@ -33,6 +33,7 @@ public final class Qwen3SpeechTests {
         testSpeechWindowPrefixRollbackAndVad();
         testSpeechWindowLowestEnergySplit();
         testOnnxDecoderPureHelpers();
+        testLanguagePromptMappingAndEncoding();
         System.out.println("QWEN3_JAVA_UNIT_TESTS:PASS");
     }
 
@@ -451,5 +452,48 @@ public final class Qwen3SpeechTests {
             float tol = Math.max(1e-4f, Math.abs(v) * 1e-3f);
             check(Math.abs(rt - v) <= tol, "fp16 roundtrip mismatch for " + v + ": got " + rt);
         }
+    }
+
+    private static void testLanguagePromptMappingAndEncoding() throws Exception {
+        checkEquals("Japanese", Qwen3OnnxDecoder.resolveLanguage("ja-JP"), "ja-JP maps to Japanese");
+        checkEquals("Japanese", Qwen3OnnxDecoder.resolveLanguage("ja"), "ja maps to Japanese");
+        checkEquals("Chinese", Qwen3OnnxDecoder.resolveLanguage("zh-Hans"), "zh-Hans maps to Chinese");
+        checkEquals("Chinese", Qwen3OnnxDecoder.resolveLanguage("zh-Hant"), "zh-Hant maps to Chinese");
+        checkEquals("Chinese", Qwen3OnnxDecoder.resolveLanguage("zh_CN"), "zh_CN maps to Chinese");
+        checkEquals("English", Qwen3OnnxDecoder.resolveLanguage("en-US"), "en-US maps to English");
+        checkEquals("Korean", Qwen3OnnxDecoder.resolveLanguage("ko-KR"), "ko-KR maps to Korean");
+        checkEquals("Spanish", Qwen3OnnxDecoder.resolveLanguage("es-ES"), "es-ES maps to Spanish");
+        checkEquals("Russian", Qwen3OnnxDecoder.resolveLanguage("ru-RU"), "ru-RU maps to Russian");
+        checkEquals("Japanese", Qwen3OnnxDecoder.resolveLanguage("Japanese"), "canonical Japanese preserved");
+        checkEquals(null, Qwen3OnnxDecoder.resolveLanguage(null), "null -> auto (null)");
+        checkEquals(null, Qwen3OnnxDecoder.resolveLanguage("  "), "blank -> auto (null)");
+        checkEquals(null, Qwen3OnnxDecoder.resolveLanguage("auto"), "auto -> null");
+        checkEquals(null, Qwen3OnnxDecoder.resolveLanguage("AUTO"), "AUTO -> null");
+        checkEquals(null, Qwen3OnnxDecoder.resolveLanguage("xx-unknown"), "unknown -> null");
+
+        Qwen3Tokenizer tok = buildFixtureTokenizer();
+        int[] autoIds = Qwen3OnnxDecoder.encodePromptAfterIds(tok, null);
+        int[] explicitAutoIds = Qwen3OnnxDecoder.encodePromptAfterIds(tok, "auto");
+        check(Arrays.equals(autoIds, explicitAutoIds), "auto and null produce identical unconstrained suffix ids");
+        check(autoIds[autoIds.length - 1] != 151704, "auto suffix does not end with <asr_text>");
+        checkEquals("<|audio_end|>\nassistant\n",
+            tok.decode(autoIds, 0, autoIds.length, false), "auto suffix omits language scaffold");
+
+        int[] jaIds = Qwen3OnnxDecoder.encodePromptAfterIds(tok, "ja-JP");
+        checkEquals(151704, jaIds[jaIds.length - 1], "forced language suffix ends with <asr_text>");
+        checkEquals("<|audio_end|>\nassistant\nlanguage Japanese<asr_text>",
+            tok.decode(jaIds, 0, jaIds.length, false), "ja-JP encodes canonical Japanese prompt + <asr_text>");
+
+        int[] zhIds = Qwen3OnnxDecoder.encodePromptAfterIds(tok, "zh-Hans");
+        checkEquals(151704, zhIds[zhIds.length - 1], "zh-Hans suffix ends with <asr_text>");
+        checkEquals("<|audio_end|>\nassistant\nlanguage Chinese<asr_text>",
+            tok.decode(zhIds, 0, zhIds.length, false), "zh-Hans encodes canonical Chinese prompt + <asr_text>");
+
+        // When forced language puts <asr_text> in promptAfterIds, decoder generates transcript tokens directly
+        int[] generatedWithoutHeader = new int[] { 305, 306, 307, 151645 };
+        checkEquals("你好", tok.extractFinalText(generatedWithoutHeader), "extractFinalText decodes direct speech tokens");
+        // When auto-detect leaves <asr_text> out of prompt, decoder emits header + text which extractFinalText strips
+        int[] generatedWithHeader = new int[] { 300, 301, 151704, 305, 306, 307, 151645 };
+        checkEquals("你好", tok.extractFinalText(generatedWithHeader), "extractFinalText still strips auto-detected header");
     }
 }

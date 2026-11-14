@@ -1450,6 +1450,11 @@
     "ja": "日本語",
     "ko": "한국어"
   },
+  "voiceLang": {
+    "label": "语音识别语言",
+    "follow": "语音：跟随界面",
+    "auto": "语音：自动识别"
+  },
   "login": {
     "subtitle": "远程控制你的 AI 编程 Agent",
     "passkey_signin": "使用 Passkey 登录",

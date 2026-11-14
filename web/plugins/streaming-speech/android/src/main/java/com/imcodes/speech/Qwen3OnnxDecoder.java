@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
@@ -43,6 +44,98 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
     private static final String SYSTEM_PREFIX = "<|im_start|>system\n";
     private static final String SYSTEM_SUFFIX = "<|im_end|>\n<|im_start|>user\n<|audio_start|>";
     private static final String ASSISTANT_SUFFIX = "<|audio_end|><|im_end|>\n<|im_start|>assistant\n";
+
+    private static final Map<String, String> LANGUAGE_MAP = Map.ofEntries(
+        Map.entry("zh", "Chinese"),
+        Map.entry("cmn", "Chinese"),
+        Map.entry("chinese", "Chinese"),
+        Map.entry("yue", "Cantonese"),
+        Map.entry("cantonese", "Cantonese"),
+        Map.entry("en", "English"),
+        Map.entry("english", "English"),
+        Map.entry("ja", "Japanese"),
+        Map.entry("jp", "Japanese"),
+        Map.entry("japanese", "Japanese"),
+        Map.entry("ko", "Korean"),
+        Map.entry("korean", "Korean"),
+        Map.entry("es", "Spanish"),
+        Map.entry("spanish", "Spanish"),
+        Map.entry("ru", "Russian"),
+        Map.entry("russian", "Russian"),
+        Map.entry("fr", "French"),
+        Map.entry("french", "French"),
+        Map.entry("de", "German"),
+        Map.entry("german", "German"),
+        Map.entry("it", "Italian"),
+        Map.entry("italian", "Italian"),
+        Map.entry("pt", "Portuguese"),
+        Map.entry("portuguese", "Portuguese"),
+        Map.entry("ar", "Arabic"),
+        Map.entry("arabic", "Arabic"),
+        Map.entry("tr", "Turkish"),
+        Map.entry("turkish", "Turkish"),
+        Map.entry("vi", "Vietnamese"),
+        Map.entry("vietnamese", "Vietnamese"),
+        Map.entry("th", "Thai"),
+        Map.entry("thai", "Thai"),
+        Map.entry("id", "Indonesian"),
+        Map.entry("indonesian", "Indonesian"),
+        Map.entry("ms", "Malay"),
+        Map.entry("malay", "Malay"),
+        Map.entry("hi", "Hindi"),
+        Map.entry("hindi", "Hindi"),
+        Map.entry("nl", "Dutch"),
+        Map.entry("dutch", "Dutch"),
+        Map.entry("pl", "Polish"),
+        Map.entry("polish", "Polish"),
+        Map.entry("sv", "Swedish"),
+        Map.entry("swedish", "Swedish"),
+        Map.entry("da", "Danish"),
+        Map.entry("danish", "Danish"),
+        Map.entry("fi", "Finnish"),
+        Map.entry("finnish", "Finnish"),
+        Map.entry("cs", "Czech"),
+        Map.entry("czech", "Czech"),
+        Map.entry("el", "Greek"),
+        Map.entry("greek", "Greek"),
+        Map.entry("hu", "Hungarian"),
+        Map.entry("hungarian", "Hungarian"),
+        Map.entry("ro", "Romanian"),
+        Map.entry("romanian", "Romanian"),
+        Map.entry("fa", "Persian"),
+        Map.entry("persian", "Persian"),
+        Map.entry("fil", "Filipino"),
+        Map.entry("tl", "Filipino"),
+        Map.entry("filipino", "Filipino"),
+        Map.entry("mk", "Macedonian"),
+        Map.entry("macedonian", "Macedonian")
+    );
+
+    /**
+     * Maps a BCP-47 locale tag or canonical language name to the canonical Qwen3-ASR
+     * language string, or returns null for auto-detect (null, blank, "auto", or unknown).
+     */
+    public static String resolveLanguage(String raw) {
+        if (raw == null) return null;
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) return null;
+        String normalized = trimmed.replace('_', '-').toLowerCase(Locale.ROOT);
+        if ("auto".equals(normalized)) return null;
+        String exact = LANGUAGE_MAP.get(normalized);
+        if (exact != null) return exact;
+        int dash = normalized.indexOf('-');
+        String primary = dash > 0 ? normalized.substring(0, dash) : normalized;
+        return LANGUAGE_MAP.get(primary);
+    }
+
+    /** Builds the assistant prompt suffix, pinning a canonical language when requested or leaving it unconstrained for auto-detect. */
+    public static String buildAssistantSuffix(String rawLanguage) {
+        String canonical = resolveLanguage(rawLanguage);
+        if (canonical == null) {
+            return ASSISTANT_SUFFIX;
+        }
+        return ASSISTANT_SUFFIX + "language " + canonical + "<asr_text>";
+    }
 
     private final OrtEnvironment env;
     private final OrtSession convSession;
@@ -207,10 +300,25 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         return tokenizer.safePrefixTokensForRollback(tokens, rollbackCount);
     }
 
+    /** Encodes the assistant prompt suffix tokens for the given language (or default unconstrained auto-detect suffix). */
+    public static int[] encodePromptAfterIds(Qwen3Tokenizer tokenizer, String rawLanguage) {
+        return tokenizer.encode(buildAssistantSuffix(rawLanguage));
+    }
+
     public synchronized Qwen3SpeechWindow.DecodeResult transcribe(
         float[] audio,
         int length,
         int[] prefixTokens,
+        BooleanSupplier shouldContinue
+    ) throws OrtException {
+        return transcribe(audio, length, prefixTokens, null, shouldContinue);
+    }
+
+    public synchronized Qwen3SpeechWindow.DecodeResult transcribe(
+        float[] audio,
+        int length,
+        int[] prefixTokens,
+        String language,
         BooleanSupplier shouldContinue
     ) throws OrtException {
         if (closed || !shouldContinue.getAsBoolean()) return null;
@@ -292,8 +400,13 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
 
         if (!shouldContinue.getAsBoolean()) return null;
 
+        String canonicalLanguage = resolveLanguage(language);
+        int[] activePromptAfterIds = canonicalLanguage == null
+            ? promptAfterIds
+            : encodePromptAfterIds(tokenizer, canonicalLanguage);
+
         int[] activePrefix = prefixTokens != null ? prefixTokens : new int[0];
-        int scaffoldLen = promptBeforeIds.length + promptAfterIds.length;
+        int scaffoldLen = promptBeforeIds.length + activePromptAfterIds.length;
         int maxAudioRoom = Math.max(0, maxTotalLen - scaffoldLen - activePrefix.length - 1);
         if (maxAudioRoom == 0 && activePrefix.length > 0) {
             // Preserve audio capacity if unusually long hotwords + prefix tightens context.
@@ -313,7 +426,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         int p = 0;
         for (int id : promptBeforeIds) sourceIds[p++] = id;
         for (int i = 0; i < validAudioLen; i++) sourceIds[p++] = tokenizer.audioPadTokenId;
-        for (int id : promptAfterIds) sourceIds[p++] = id;
+        for (int id : activePromptAfterIds) sourceIds[p++] = id;
         for (int id : activePrefix) sourceIds[p++] = id;
 
         return runDecoderLoop(trimmedAudioFeatures, validAudioLen, hiddenDim, sourceIds, activePrefix, shouldContinue);
