@@ -27,7 +27,7 @@ describe('local panel strings', () => {
 
   it('only the languages that are not English actually differ from English for the visible labels', () => {
     for (const locale of UI_LOCALES.filter((value) => value !== 'en')) {
-      for (const key of ['navHome', 'allow', 'stopAll', 'emptyTitle', 'pausedTitle'] as const) {
+      for (const key of ['navHome', 'allow', 'stopAll', 'emptyTitle', 'pausedTitle', 'daemonTitle', 'daemonRunning', 'daemonStopped', 'daemonStart', 'daemonStop'] as const) {
         expect(LOCAL_PANEL_STRINGS[locale][key], `${locale}.${key}`).not.toBe(LOCAL_PANEL_STRINGS.en[key]);
       }
     }
@@ -40,6 +40,7 @@ describe('local panel strings', () => {
       ['navHome', 16], ['navSettings', 14], ['navAbout', 14],
       ['statusOnline', 14], ['statusBusy', 16], ['statusPaused', 16], ['statusOffline', 16],
       ['share', 14], ['resume', 16], ['stopAll', 22], ['disconnect', 16], ['copy', 14], ['control', 18], ['view', 14],
+      ['daemonStart', 16], ['daemonStop', 16], ['daemonRestart', 20], ['daemonBind', 16], ['daemonRebind', 20], ['daemonLogs', 16], ['close', 14],
     ];
     for (const locale of UI_LOCALES) {
       for (const [key, limit] of limits) expect(width(LOCAL_PANEL_STRINGS[locale][key]), `${locale}.${key}`).toBeLessThanOrEqual(limit);

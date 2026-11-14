@@ -145,3 +145,17 @@ describe('the server-connection banner', () => {
     }
   });
 });
+
+describe('the Coding Daemon card and modals', () => {
+  it('starts hidden and populates daemon metadata, errors, and logs strictly via textContent', () => {
+    expect(page).toContain('id="daemonCard"');
+    expect(page).toMatch(/id="daemonCard"[^>]*\shidden\b/u);
+    expect(page).toContain('id="daemonBindModal"');
+    expect(page).toMatch(/id="daemonBindModal"[^>]*\shidden>/u);
+    expect(page).toContain('id="daemonLogsModal"');
+    expect(page).toMatch(/id="daemonLogsModal"[^>]*\shidden>/u);
+    expect(LOCAL_PANEL_PAGE_SCRIPT).toContain("$('daemonMeta').textContent");
+    expect(LOCAL_PANEL_PAGE_SCRIPT).toContain('pre.textContent = data && data.text');
+    expect(LOCAL_PANEL_PAGE_SCRIPT).not.toMatch(/daemon(?:Meta|Hint|LogsPre|LogsMeta)'?\)\.innerHTML/u);
+  });
+});

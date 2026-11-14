@@ -22,6 +22,14 @@ export const LOCAL_PANEL_STRING_KEYS = [
   'cancel', 'confirm', 'disconnectTitle', 'disconnectText', 'stopTitle', 'stopText',
   'settingsTitle', 'language', 'languageSystem', 'languageHelp', 'appearanceNote',
   'aboutTitle', 'version', 'actionFailed',
+  'close',
+  'daemonTitle', 'daemonRunning', 'daemonStopped', 'daemonNotInstalled', 'daemonNoActiveUser', 'daemonUnbound', 'daemonUnavailable',
+  'daemonConnected', 'daemonConnecting', 'daemonDisconnected',
+  'daemonSourceBundle', 'daemonSourceCli', 'daemonUser', 'daemonServer',
+  'daemonStart', 'daemonStop', 'daemonRestart', 'daemonAutostart',
+  'daemonBind', 'daemonRebind', 'daemonBindTitle', 'daemonBindHelp', 'daemonBindLabel', 'daemonBindPlaceholder', 'daemonBindInvalid', 'daemonBindSubmit',
+  'daemonLogs', 'daemonLogsTitle', 'daemonLogsRefresh', 'daemonLogsEmpty', 'daemonLogsTruncated', 'daemonOpenWeb',
+  'daemonNotInstalledHint', 'daemonNoActiveUserHint',
 ] as const;
 export type LocalPanelStringKey = (typeof LOCAL_PANEL_STRING_KEYS)[number];
 export type LocalPanelStrings = Readonly<Record<LocalPanelStringKey, string>>;
@@ -75,6 +83,20 @@ const en: LocalPanelStrings = {
   languageHelp: 'Follow system uses your computer’s language. A language you pick here is remembered on this computer.',
   appearanceNote: 'Light or dark appearance follows your system.',
   aboutTitle: 'About', version: 'Version', actionFailed: 'That did not work. Try again.',
+  close: 'Close',
+  daemonTitle: 'Coding Daemon', daemonRunning: 'Running', daemonStopped: 'Stopped', daemonNotInstalled: 'Not installed',
+  daemonNoActiveUser: 'No signed-in user', daemonUnbound: 'Not bound', daemonUnavailable: 'Unavailable',
+  daemonConnected: 'Connected', daemonConnecting: 'Connecting', daemonDisconnected: 'Disconnected',
+  daemonSourceBundle: 'Desktop bundle', daemonSourceCli: 'CLI install', daemonUser: 'User', daemonServer: 'Server',
+  daemonStart: 'Start', daemonStop: 'Stop', daemonRestart: 'Restart', daemonAutostart: 'Launch at login',
+  daemonBind: 'Bind', daemonRebind: 'Rebind', daemonBindTitle: 'Bind Coding Daemon',
+  daemonBindHelp: 'Paste the full bind link from your IM.codes workspace. It is submitted once and never stored in this page.',
+  daemonBindLabel: 'Bind link', daemonBindPlaceholder: 'app.im.codes/bind/...', daemonBindInvalid: 'Enter a valid http or https bind link.', daemonBindSubmit: 'Bind now',
+  daemonLogs: 'Logs', daemonLogsTitle: 'Coding Daemon logs', daemonLogsRefresh: 'Refresh',
+  daemonLogsEmpty: 'No daemon logs recorded yet.', daemonLogsTruncated: 'Showing the latest log tail (up to 64 KiB). Credentials are redacted.',
+  daemonOpenWeb: 'Open Web UI',
+  daemonNotInstalledHint: 'No Coding Daemon runtime was found on this computer. Install the desktop bundle or IM.codes CLI to enable it.',
+  daemonNoActiveUserHint: 'Sign in to an interactive desktop user session to manage Coding Daemon.',
 };
 
 const zhCN: LocalPanelStrings = {
@@ -115,6 +137,20 @@ const zhCN: LocalPanelStrings = {
   languageHelp: '“跟随系统”使用电脑的语言。你在此选择的语言会记在这台电脑上。',
   appearanceNote: '浅色或深色外观跟随系统。',
   aboutTitle: '关于', version: '版本', actionFailed: '操作未成功，请重试。',
+  close: '关闭',
+  daemonTitle: '编码守护进程', daemonRunning: '运行中', daemonStopped: '已停止', daemonNotInstalled: '未安装',
+  daemonNoActiveUser: '无登录用户', daemonUnbound: '未绑定', daemonUnavailable: '不可用',
+  daemonConnected: '已连接', daemonConnecting: '连接中', daemonDisconnected: '已断开',
+  daemonSourceBundle: '桌面内置', daemonSourceCli: '本地 CLI', daemonUser: '用户', daemonServer: '服务器',
+  daemonStart: '启动', daemonStop: '停止', daemonRestart: '重启', daemonAutostart: '登录自启',
+  daemonBind: '绑定', daemonRebind: '重绑', daemonBindTitle: '绑定编码守护进程',
+  daemonBindHelp: '粘贴 IM.codes 工作区中的完整绑定链接。仅提交一次，不会保留在此页面中。',
+  daemonBindLabel: '绑定链接', daemonBindPlaceholder: 'app.im.codes/bind/...', daemonBindInvalid: '请输入有效的 http 或 https 绑定链接。', daemonBindSubmit: '立即绑定',
+  daemonLogs: '日志', daemonLogsTitle: '编码守护进程日志', daemonLogsRefresh: '刷新',
+  daemonLogsEmpty: '暂无守护进程日志。', daemonLogsTruncated: '仅显示最新日志尾部（最多 64 KiB），凭据已脱敏。',
+  daemonOpenWeb: '打开网页端',
+  daemonNotInstalledHint: '未在本机发现编码守护进程运行时。请安装桌面完整版或 IM.codes CLI 后使用。',
+  daemonNoActiveUserHint: '请先登录交互式桌面用户会话再管理编码守护进程。',
 };
 
 const zhTW: LocalPanelStrings = {
@@ -155,6 +191,20 @@ const zhTW: LocalPanelStrings = {
   languageHelp: '「跟隨系統」會使用電腦的語言。你在此選擇的語言會記在這台電腦上。',
   appearanceNote: '淺色或深色外觀跟隨系統。',
   aboutTitle: '關於', version: '版本', actionFailed: '操作未成功，請再試一次。',
+  close: '關閉',
+  daemonTitle: '編碼守護行程', daemonRunning: '執行中', daemonStopped: '已停止', daemonNotInstalled: '未安裝',
+  daemonNoActiveUser: '無登入使用者', daemonUnbound: '未綁定', daemonUnavailable: '無法使用',
+  daemonConnected: '已連線', daemonConnecting: '連線中', daemonDisconnected: '已中斷',
+  daemonSourceBundle: '桌面內建', daemonSourceCli: '本機 CLI', daemonUser: '使用者', daemonServer: '伺服器',
+  daemonStart: '啟動', daemonStop: '停止', daemonRestart: '重新啟動', daemonAutostart: '登入自動啟動',
+  daemonBind: '綁定', daemonRebind: '重新綁定', daemonBindTitle: '綁定編碼守護行程',
+  daemonBindHelp: '貼上 IM.codes 工作區的完整綁定連結。僅送出一次，不會儲存在此頁面中。',
+  daemonBindLabel: '綁定連結', daemonBindPlaceholder: 'app.im.codes/bind/...', daemonBindInvalid: '請輸入有效的 http 或 https 綁定連結。', daemonBindSubmit: '立即綁定',
+  daemonLogs: '日誌', daemonLogsTitle: '編碼守護行程日誌', daemonLogsRefresh: '重新整理',
+  daemonLogsEmpty: '目前尚無守護行程日誌。', daemonLogsTruncated: '僅顯示最新日誌尾端（最多 64 KiB），憑證已遮罩。',
+  daemonOpenWeb: '開啟網頁端',
+  daemonNotInstalledHint: '這台電腦尚未安裝編碼守護行程執行環境。請安裝桌面完整版或 IM.codes CLI。',
+  daemonNoActiveUserHint: '請先登入互動式桌面使用者工作階段後再管理編碼守護行程。',
 };
 
 const es: LocalPanelStrings = {
@@ -195,6 +245,20 @@ const es: LocalPanelStrings = {
   languageHelp: '«Seguir el sistema» usa el idioma de tu equipo. El idioma que elijas aquí se recuerda en este equipo.',
   appearanceNote: 'La apariencia clara u oscura sigue al sistema.',
   aboutTitle: 'Acerca de', version: 'Versión', actionFailed: 'No funcionó. Inténtalo de nuevo.',
+  close: 'Cerrar',
+  daemonTitle: 'Demonio de programación', daemonRunning: 'En ejecución', daemonStopped: 'Detenido', daemonNotInstalled: 'No instalado',
+  daemonNoActiveUser: 'Sin usuario activo', daemonUnbound: 'Sin vincular', daemonUnavailable: 'No disponible',
+  daemonConnected: 'Conectado', daemonConnecting: 'Conectando', daemonDisconnected: 'Desconectado',
+  daemonSourceBundle: 'Paquete integrado', daemonSourceCli: 'Instalación CLI', daemonUser: 'Usuario', daemonServer: 'Servidor',
+  daemonStart: 'Iniciar', daemonStop: 'Detener', daemonRestart: 'Reiniciar', daemonAutostart: 'Iniciar al iniciar sesión',
+  daemonBind: 'Vincular', daemonRebind: 'Revincular', daemonBindTitle: 'Vincular demonio de programación',
+  daemonBindHelp: 'Pega el enlace completo de vinculación de tu espacio IM.codes. Se envía una vez y nunca se guarda en esta página.',
+  daemonBindLabel: 'Enlace de vinculación', daemonBindPlaceholder: 'app.im.codes/bind/...', daemonBindInvalid: 'Introduce un enlace http o https válido.', daemonBindSubmit: 'Vincular ahora',
+  daemonLogs: 'Registros', daemonLogsTitle: 'Registros del demonio', daemonLogsRefresh: 'Actualizar',
+  daemonLogsEmpty: 'Todavía no hay registros del demonio.', daemonLogsTruncated: 'Se muestra el tramo final del registro (hasta 64 KiB). Credenciales ocultas.',
+  daemonOpenWeb: 'Abrir interfaz web',
+  daemonNotInstalledHint: 'No se encontró el entorno de ejecución del demonio en este equipo. Instala el paquete de escritorio o la CLI de IM.codes.',
+  daemonNoActiveUserHint: 'Inicia sesión en una sesión de escritorio interactiva para gestionar el demonio.',
 };
 
 const ru: LocalPanelStrings = {
@@ -235,6 +299,20 @@ const ru: LocalPanelStrings = {
   languageHelp: '«Как в системе» использует язык вашего компьютера. Выбранный здесь язык запоминается на этом компьютере.',
   appearanceNote: 'Светлое или тёмное оформление следует системе.',
   aboutTitle: 'О программе', version: 'Версия', actionFailed: 'Не получилось. Повторите попытку.',
+  close: 'Закрыть',
+  daemonTitle: 'Служба разработки', daemonRunning: 'Работает', daemonStopped: 'Остановлена', daemonNotInstalled: 'Не установлена',
+  daemonNoActiveUser: 'Нет активного пользователя', daemonUnbound: 'Не привязана', daemonUnavailable: 'Недоступна',
+  daemonConnected: 'Подключена', daemonConnecting: 'Подключение', daemonDisconnected: 'Отключена',
+  daemonSourceBundle: 'Встроенная среда', daemonSourceCli: 'Установка CLI', daemonUser: 'Пользователь', daemonServer: 'Сервер',
+  daemonStart: 'Запустить', daemonStop: 'Остановить', daemonRestart: 'Перезапустить', daemonAutostart: 'Автозапуск при входе',
+  daemonBind: 'Привязать', daemonRebind: 'Перепривязать', daemonBindTitle: 'Привязать службу разработки',
+  daemonBindHelp: 'Вставьте полную ссылку привязки из рабочего пространства IM.codes. Она отправляется один раз и не сохраняется на этой странице.',
+  daemonBindLabel: 'Ссылка привязки', daemonBindPlaceholder: 'app.im.codes/bind/...', daemonBindInvalid: 'Введите корректную ссылку http или https.', daemonBindSubmit: 'Привязать',
+  daemonLogs: 'Журнал', daemonLogsTitle: 'Журнал службы разработки', daemonLogsRefresh: 'Обновить',
+  daemonLogsEmpty: 'Записей журнала пока нет.', daemonLogsTruncated: 'Показан конец журнала (до 64 КиБ). Секреты скрыты.',
+  daemonOpenWeb: 'Открыть веб-интерфейс',
+  daemonNotInstalledHint: 'Среда выполнения службы разработки не найдена на этом компьютере. Установите комплект рабочего стола или IM.codes CLI.',
+  daemonNoActiveUserHint: 'Войдите в интерактивный сеанс рабочего стола для управления службой.',
 };
 
 const ja: LocalPanelStrings = {
@@ -275,6 +353,20 @@ const ja: LocalPanelStrings = {
   languageHelp: '「システムに従う」はコンピュータの言語を使います。ここで選んだ言語はこのコンピュータに記憶されます。',
   appearanceNote: 'ライト／ダークの外観はシステムに従います。',
   aboutTitle: '情報', version: 'バージョン', actionFailed: 'うまくいきませんでした。もう一度お試しください。',
+  close: '閉じる',
+  daemonTitle: 'コーディングデーモン', daemonRunning: '実行中', daemonStopped: '停止中', daemonNotInstalled: '未インストール',
+  daemonNoActiveUser: 'サインイン中のユーザーなし', daemonUnbound: '未連携', daemonUnavailable: '利用不可',
+  daemonConnected: '接続済み', daemonConnecting: '接続中', daemonDisconnected: '切断',
+  daemonSourceBundle: 'デスクトップ同梱', daemonSourceCli: 'CLI インストール', daemonUser: 'ユーザー', daemonServer: 'サーバー',
+  daemonStart: '開始', daemonStop: '停止', daemonRestart: '再起動', daemonAutostart: 'ログイン時に自動起動',
+  daemonBind: '連携', daemonRebind: '再連携', daemonBindTitle: 'コーディングデーモンの連携',
+  daemonBindHelp: 'IM.codes ワークスペースの完全な連携リンクを貼り付けてください。1回のみ送信され、このページには保存されません。',
+  daemonBindLabel: '連携リンク', daemonBindPlaceholder: 'app.im.codes/bind/...', daemonBindInvalid: '有効な http または https の連携リンクを入力してください。', daemonBindSubmit: '今すぐ連携',
+  daemonLogs: 'ログ', daemonLogsTitle: 'コーディングデーモンのログ', daemonLogsRefresh: '更新',
+  daemonLogsEmpty: 'デーモンのログはまだ記録されていません。', daemonLogsTruncated: '最新のログ末尾（最大 64 KiB）を表示しています。認証情報はマスク済みです。',
+  daemonOpenWeb: 'Web UI を開く',
+  daemonNotInstalledHint: 'このコンピュータにコーディングデーモンのランタイムが見つかりません。デスクトップ同梱版または IM.codes CLI をインストールしてください。',
+  daemonNoActiveUserHint: 'コーディングデーモンを管理するには、対話型デスクトップセッションにサインインしてください。',
 };
 
 const ko: LocalPanelStrings = {
@@ -315,6 +407,20 @@ const ko: LocalPanelStrings = {
   languageHelp: '“시스템 따르기”는 컴퓨터의 언어를 사용합니다. 여기서 고른 언어는 이 컴퓨터에 기억됩니다.',
   appearanceNote: '밝은/어두운 모양은 시스템을 따릅니다.',
   aboutTitle: '정보', version: '버전', actionFailed: '실패했습니다. 다시 시도하세요.',
+  close: '닫기',
+  daemonTitle: '코딩 데몬', daemonRunning: '실행 중', daemonStopped: '중지됨', daemonNotInstalled: '설치되지 않음',
+  daemonNoActiveUser: '로그인된 사용자 없음', daemonUnbound: '연결되지 않음', daemonUnavailable: '사용 불가',
+  daemonConnected: '연결됨', daemonConnecting: '연결 중', daemonDisconnected: '연결 끊김',
+  daemonSourceBundle: '데스크톱 내장', daemonSourceCli: 'CLI 설치', daemonUser: '사용자', daemonServer: '서버',
+  daemonStart: '시작', daemonStop: '중지', daemonRestart: '다시 시작', daemonAutostart: '로그인 시 자동 실행',
+  daemonBind: '연결', daemonRebind: '다시 연결', daemonBindTitle: '코딩 데몬 연결',
+  daemonBindHelp: 'IM.codes 작업 공간의 전체 연결 링크를 붙여넣으세요. 한 번만 전송되며 이 페이지에 저장되지 않습니다.',
+  daemonBindLabel: '연결 링크', daemonBindPlaceholder: 'app.im.codes/bind/...', daemonBindInvalid: '유효한 http 또는 https 연결 링크를 입력하세요.', daemonBindSubmit: '지금 연결',
+  daemonLogs: '로그', daemonLogsTitle: '코딩 데몬 로그', daemonLogsRefresh: '새로고침',
+  daemonLogsEmpty: '아직 기록된 데몬 로그가 없습니다.', daemonLogsTruncated: '최신 로그 끝부분(최대 64 KiB)을 표시합니다. 자격 증명은 가려집니다.',
+  daemonOpenWeb: '웹 UI 열기',
+  daemonNotInstalledHint: '이 컴퓨터에서 코딩 데몬 런타임을 찾지 못했습니다. 데스크톱 통합 패키지 또는 IM.codes CLI를 설치하세요.',
+  daemonNoActiveUserHint: '코딩 데몬을 관리하려면 대화형 데스크톱 사용자 세션에 로그인하세요.',
 };
 
 export const LOCAL_PANEL_STRINGS: Readonly<Record<UiLocale, LocalPanelStrings>> = {

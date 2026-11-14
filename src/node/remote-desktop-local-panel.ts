@@ -3,13 +3,18 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS } from '../../shared/local-panel-window.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
+  REMOTE_DESKTOP_LOCAL_DAEMON_ACTION,
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
   type RemoteDesktopLocalAction,
+  type RemoteDesktopLocalDaemonAction,
+  type RemoteDesktopLocalDaemonLogs,
+  type RemoteDesktopLocalDaemonStatus,
   type RemoteDesktopLocalExtras,
   type RemoteDesktopLocalPermissionTarget,
   isRemoteDesktopLocalPermissionTarget,
   type RemoteDesktopLocalStatus,
+  sanitizeRemoteDesktopLocalDaemonStatus,
   sanitizeRemoteDesktopLocalExtras,
   type RemoteDesktopLocalWebAction,
 } from '../../shared/remote-desktop-local-management.js';
@@ -45,6 +50,13 @@ export interface RemoteDesktopLocalPanelOptions {
   openWindow?(): Promise<{ ok: boolean; reason: string }>;
   /** Test seam: how long /open-window waits for the open before answering `in_progress` (default LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS). */
   openWindowAnswerBudgetMs?: number;
+  /** Optional Coding Daemon state provider, action dispatcher, and sanitized log reader. Absent: omitted from state and endpoints answer 501. */
+  daemon?(): Promise<RemoteDesktopLocalDaemonStatus> | RemoteDesktopLocalDaemonStatus;
+  daemonAction?(
+    action: RemoteDesktopLocalDaemonAction,
+    payload?: { bindUrl?: unknown; serverName?: unknown },
+  ): Promise<{ ok: boolean; statusCode?: number; error?: string }>;
+  daemonLogs?(): Promise<RemoteDesktopLocalDaemonLogs> | RemoteDesktopLocalDaemonLogs;
   host?: string;
   port?: number;
 }
@@ -176,7 +188,35 @@ export async function startRemoteDesktopLocalPanel(
     if (request.method === 'GET' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH) {
       let extras: RemoteDesktopLocalExtras = {};
       try { extras = sanitizeRemoteDesktopLocalExtras(options.extras?.()); } catch { /* the panel works without them */ }
-      return reply(response, 200, JSON.stringify({ publicNodeId: options.publicNodeId, ...options.status(), ...extras }), 'application/json; charset=utf-8');
+      let daemon: RemoteDesktopLocalDaemonStatus | undefined;
+      if (options.daemon) {
+        try {
+          daemon = sanitizeRemoteDesktopLocalDaemonStatus(await options.daemon());
+        } catch {
+          /* omit malformed or failing daemon status */
+        }
+      }
+      const payload = {
+        publicNodeId: options.publicNodeId,
+        ...options.status(),
+        ...extras,
+        ...(daemon ? { daemon } : {}),
+      };
+      return reply(response, 200, JSON.stringify(payload), 'application/json; charset=utf-8');
+    }
+    if (request.method === 'GET' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH) {
+      if (!options.daemonLogs) return reply(response, 501, 'not_implemented');
+      try {
+        const raw = await options.daemonLogs();
+        const logs: RemoteDesktopLocalDaemonLogs = {
+          text: typeof raw?.text === 'string' ? raw.text.slice(-65536) : '',
+          truncated: Boolean(raw?.truncated),
+          ...(typeof raw?.source === 'string' && raw.source ? { source: raw.source } : {}),
+        };
+        return reply(response, 200, JSON.stringify(logs), 'application/json; charset=utf-8');
+      } catch {
+        return reply(response, 500, 'logs_failed');
+      }
     }
     if (request.method === 'POST' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH) {
       const csrfHeader = request.headers[REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER];
@@ -186,7 +226,9 @@ export async function startRemoteDesktopLocalPanel(
         return reply(response, 403, 'forbidden');
       }
       const body = await readJson(request);
-      const action = body?.action as RemoteDesktopLocalAction | undefined;
+      const action = body?.action as string | undefined;
+      const isDaemonAction = typeof action === 'string'
+        && (Object.values(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION) as string[]).includes(action);
       let found = true;
       try {
         if (action === REMOTE_DESKTOP_LOCAL_ACTION.PAUSE) {
@@ -198,6 +240,23 @@ export async function startRemoteDesktopLocalPanel(
         } else if (action === REMOTE_DESKTOP_LOCAL_ACTION.DISCONNECT && typeof body?.id === 'string') {
           await mutate(async () => { found = await options.disconnect(body.id as string); });
           if (!found) return reply(response, 404, 'not_found');
+        } else if (isDaemonAction) {
+          if (!options.daemonAction) return reply(response, 501, 'not_implemented');
+          let result: { ok: boolean; statusCode?: number; error?: string } = { ok: false, statusCode: 500, error: 'action_failed' };
+          await mutate(async () => {
+            result = await options.daemonAction!(action as RemoteDesktopLocalDaemonAction, {
+              bindUrl: body?.bindUrl,
+              serverName: body?.serverName,
+            });
+          });
+          if (!result.ok) {
+            return reply(
+              response,
+              result.statusCode ?? 400,
+              JSON.stringify({ ok: false, error: result.error ?? 'action_failed' }),
+              'application/json; charset=utf-8',
+            );
+          }
         } else return reply(response, 400, 'invalid_action');
       } catch {
         return reply(response, 500, 'action_failed');

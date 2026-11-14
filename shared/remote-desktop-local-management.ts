@@ -8,6 +8,7 @@ export const REMOTE_DESKTOP_LOCAL_MANAGEMENT = Object.freeze({
   PORT: 43751,
   ROOT_PATH: '/',
   STATE_PATH: '/api/state',
+  DAEMON_LOGS_PATH: '/api/daemon/logs',
   /** POST {target: a REMOTE_DESKTOP_LOCAL_PERMISSION value}: open that pane of macOS System Settings in the signed-in user's session (a fixed mapping; the page never names a URL). */
   OPEN_SETTINGS_PATH: '/open-settings',
   ACTION_PATH: '/api/action',
@@ -44,6 +45,83 @@ export const REMOTE_DESKTOP_LOCAL_WORKER_MSG = Object.freeze({
 export type RemoteDesktopLocalAction = typeof REMOTE_DESKTOP_LOCAL_ACTION[
   keyof typeof REMOTE_DESKTOP_LOCAL_ACTION
 ];
+
+export const REMOTE_DESKTOP_LOCAL_DAEMON_ACTION = Object.freeze({
+  START: 'daemon_start',
+  STOP: 'daemon_stop',
+  RESTART: 'daemon_restart',
+  ENABLE_AUTOSTART: 'daemon_enable_autostart',
+  DISABLE_AUTOSTART: 'daemon_disable_autostart',
+  BIND: 'daemon_bind',
+} as const);
+
+export type RemoteDesktopLocalDaemonAction =
+  typeof REMOTE_DESKTOP_LOCAL_DAEMON_ACTION[keyof typeof REMOTE_DESKTOP_LOCAL_DAEMON_ACTION];
+
+export const REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE = Object.freeze({
+  BUNDLE: 'bundle',
+  CLI: 'cli',
+  NONE: 'none',
+} as const);
+
+export type RemoteDesktopLocalDaemonRuntimeSource =
+  typeof REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE[keyof typeof REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE];
+
+export const REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART = Object.freeze({
+  ENABLED: 'enabled',
+  DISABLED: 'disabled',
+  UNAVAILABLE: 'unavailable',
+} as const);
+
+export type RemoteDesktopLocalDaemonAutostartState =
+  typeof REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART[keyof typeof REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART];
+
+export const REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE = Object.freeze({
+  CONNECTED: 'connected',
+  CONNECTING: 'connecting',
+  DISCONNECTED: 'disconnected',
+  UNKNOWN: 'unknown',
+} as const);
+
+export type RemoteDesktopLocalDaemonConnectionState =
+  typeof REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE[keyof typeof REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE];
+
+export const REMOTE_DESKTOP_LOCAL_DAEMON_REASON = Object.freeze({
+  NO_ACTIVE_USER: 'no_active_user',
+  NOT_INSTALLED: 'not_installed',
+  NOT_BOUND: 'not_bound',
+  UNAVAILABLE: 'unavailable',
+} as const);
+
+export type RemoteDesktopLocalDaemonReason =
+  typeof REMOTE_DESKTOP_LOCAL_DAEMON_REASON[keyof typeof REMOTE_DESKTOP_LOCAL_DAEMON_REASON];
+
+export interface RemoteDesktopLocalDaemonStatus {
+  available: boolean;
+  installed: boolean;
+  bound: boolean;
+  running: boolean;
+  connectionState: RemoteDesktopLocalDaemonConnectionState;
+  autostart: RemoteDesktopLocalDaemonAutostartState;
+  runtimeSource: RemoteDesktopLocalDaemonRuntimeSource;
+  version?: string;
+  pid?: number;
+  serverId?: string;
+  serverHost?: string;
+  serverOrigin?: string;
+  userName?: string;
+  lastError?: string;
+  reason?: RemoteDesktopLocalDaemonReason;
+  canControl: boolean;
+  canBind: boolean;
+  canViewLogs: boolean;
+}
+
+export interface RemoteDesktopLocalDaemonLogs {
+  text: string;
+  truncated: boolean;
+  source?: string;
+}
 
 /**
  * What the local panel may additionally show: the node's host name and, on macOS, the state of the permissions remote
@@ -95,12 +173,81 @@ export interface RemoteDesktopLocalExtras {
   /** The node's own version, shown on the About page. */
   version?: string;
   permissions?: RemoteDesktopLocalPermissions;
+  daemon?: RemoteDesktopLocalDaemonStatus;
+}
+
+const REMOTE_DESKTOP_LOCAL_DAEMON_ERROR_MAX_CHARS = 240;
+
+function stripDaemonControlChars(value: string, maxChars: number): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, maxChars);
+}
+
+/** Sanitize Coding Daemon status before returning it over the local management API; never forwards credentials or arbitrary URLs. */
+export function sanitizeRemoteDesktopLocalDaemonStatus(value: unknown): RemoteDesktopLocalDaemonStatus | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const connStates = new Set<unknown>(Object.values(REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE));
+  const autostartStates = new Set<unknown>(Object.values(REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART));
+  const runtimeSources = new Set<unknown>(Object.values(REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE));
+  const reasons = new Set<unknown>(Object.values(REMOTE_DESKTOP_LOCAL_DAEMON_REASON));
+
+  const out: RemoteDesktopLocalDaemonStatus = {
+    available: Boolean(raw.available),
+    installed: Boolean(raw.installed),
+    bound: Boolean(raw.bound),
+    running: Boolean(raw.running),
+    connectionState: connStates.has(raw.connectionState)
+      ? raw.connectionState as RemoteDesktopLocalDaemonConnectionState
+      : REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.UNKNOWN,
+    autostart: autostartStates.has(raw.autostart)
+      ? raw.autostart as RemoteDesktopLocalDaemonAutostartState
+      : REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.UNAVAILABLE,
+    runtimeSource: runtimeSources.has(raw.runtimeSource)
+      ? raw.runtimeSource as RemoteDesktopLocalDaemonRuntimeSource
+      : REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.NONE,
+    canControl: Boolean(raw.canControl),
+    canBind: Boolean(raw.canBind),
+    canViewLogs: Boolean(raw.canViewLogs),
+  };
+  if (typeof raw.version === 'string') {
+    const version = raw.version.trim();
+    if (/^[\w.+-]{1,64}$/u.test(version)) out.version = version;
+  }
+  if (typeof raw.pid === 'number' && Number.isSafeInteger(raw.pid) && raw.pid > 0) {
+    out.pid = raw.pid;
+  }
+  if (typeof raw.serverId === 'string') {
+    const serverId = raw.serverId.trim();
+    if (/^[A-Za-z0-9._-]{1,128}$/u.test(serverId)) out.serverId = serverId;
+  }
+  if (typeof raw.serverHost === 'string') {
+    const host = raw.serverHost.trim();
+    if (/^[A-Za-z0-9.-]{1,253}(?::\d{1,5})?$/u.test(host)) out.serverHost = host;
+  }
+  if (typeof raw.serverOrigin === 'string') {
+    const origin = raw.serverOrigin.trim();
+    if (/^https?:\/\/[A-Za-z0-9.-]{1,253}(?::\d{1,5})?$/u.test(origin)) out.serverOrigin = origin;
+  }
+  if (typeof raw.userName === 'string') {
+    const userName = stripDaemonControlChars(raw.userName, 64);
+    if (userName) out.userName = userName;
+  }
+  if (typeof raw.lastError === 'string') {
+    const lastError = stripDaemonControlChars(raw.lastError, REMOTE_DESKTOP_LOCAL_DAEMON_ERROR_MAX_CHARS)
+      .replace(/(?:Bearer\s+|token\s*[:=]\s*|\/bind\/)[^\s,;]+/giu, '[redacted]');
+    if (lastError) out.lastError = lastError;
+  }
+  if (reasons.has(raw.reason)) {
+    out.reason = raw.reason as RemoteDesktopLocalDaemonReason;
+  }
+  return out;
 }
 
 /** Keep only what is well formed: a trimmed printable host name, known permission keys with known states. Anything else is dropped. */
 export function sanitizeRemoteDesktopLocalExtras(value: unknown): RemoteDesktopLocalExtras {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const raw = value as { deviceName?: unknown; permissions?: unknown; version?: unknown };
+  const raw = value as { deviceName?: unknown; permissions?: unknown; version?: unknown; daemon?: unknown };
   const out: RemoteDesktopLocalExtras = {};
   if (typeof raw.deviceName === 'string') {
     // eslint-disable-next-line no-control-regex
@@ -128,6 +275,10 @@ export function sanitizeRemoteDesktopLocalExtras(value: unknown): RemoteDesktopL
     }
     if (Object.keys(permissions).length > 0) out.permissions = permissions;
   }
+  if (raw.daemon !== undefined) {
+    const daemon = sanitizeRemoteDesktopLocalDaemonStatus(raw.daemon);
+    if (daemon) out.daemon = daemon;
+  }
   return out;
 }
 
@@ -146,6 +297,7 @@ export interface RemoteDesktopLocalStatus {
   traffic?: RemoteDesktopTrafficHistory;
   paused: boolean;
   connections: readonly RemoteDesktopLocalConnection[];
+  daemon?: RemoteDesktopLocalDaemonStatus;
 }
 
 export function isRemoteDesktopLocalMode(value: unknown): value is RemoteDesktopAccessMode {

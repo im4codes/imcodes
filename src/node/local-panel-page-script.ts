@@ -50,6 +50,8 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     for (var j = 0; j < labelled.length; j += 1) labelled[j].setAttribute('aria-label', T(labelled[j].getAttribute('data-t-label')));
     var titled = document.querySelectorAll('[data-t-title]');
     for (var k = 0; k < titled.length; k += 1) titled[k].setAttribute('title', T(titled[k].getAttribute('data-t-title')));
+    var placeholdered = document.querySelectorAll('[data-t-placeholder]');
+    for (var p = 0; p < placeholdered.length; p += 1) placeholdered[p].setAttribute('placeholder', T(placeholdered[p].getAttribute('data-t-placeholder')));
     buildLanguageOptions();
   }
 
@@ -257,9 +259,106 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     }
   }
 
+  function renderDaemon() {
+    var card = $('daemonCard');
+    var d = state && state.daemon ? state.daemon : null;
+    if (!d) { card.hidden = true; return; }
+    card.hidden = false;
+
+    var pill = $('daemonPill');
+    var statusText = $('daemonStatusText');
+    if (d.reason === B.daemonReason.NO_ACTIVE_USER) {
+      pill.className = 'pill';
+      statusText.textContent = T('daemonNoActiveUser');
+    } else if (!d.installed) {
+      pill.className = 'pill';
+      statusText.textContent = T('daemonNotInstalled');
+    } else if (d.running) {
+      pill.className = 'pill online';
+      statusText.textContent = T('daemonRunning');
+    } else if (!d.bound) {
+      pill.className = 'pill paused';
+      statusText.textContent = T('daemonUnbound');
+    } else {
+      pill.className = 'pill paused';
+      statusText.textContent = T('daemonStopped');
+    }
+
+    var srcBadge = $('daemonSourceBadge');
+    if (d.runtimeSource === B.daemonSource.BUNDLE) {
+      srcBadge.hidden = false;
+      srcBadge.textContent = T('daemonSourceBundle');
+    } else if (d.runtimeSource === B.daemonSource.CLI) {
+      srcBadge.hidden = false;
+      srcBadge.textContent = T('daemonSourceCli');
+    } else {
+      srcBadge.hidden = true;
+    }
+
+    var connBadge = $('daemonConnBadge');
+    if (d.bound && d.running && d.connectionState !== B.daemonConn.UNKNOWN) {
+      connBadge.hidden = false;
+      if (d.connectionState === B.daemonConn.CONNECTED) {
+        connBadge.className = 'chip';
+        connBadge.textContent = T('daemonConnected');
+      } else if (d.connectionState === B.daemonConn.CONNECTING) {
+        connBadge.className = 'chip';
+        connBadge.textContent = T('daemonConnecting');
+      } else {
+        connBadge.className = 'chip ctl';
+        connBadge.textContent = T('daemonDisconnected');
+      }
+    } else {
+      connBadge.hidden = true;
+    }
+
+    $('daemonStart').disabled = busy || !d.canControl || d.running;
+    $('daemonStop').disabled = busy || !d.running;
+    $('daemonRestart').disabled = busy || !d.canControl || !d.bound;
+    $('daemonLogsBtn').disabled = busy || !d.canViewLogs;
+    var bindBtn = $('daemonBindBtn');
+    bindBtn.textContent = T(d.bound ? 'daemonRebind' : 'daemonBind');
+    bindBtn.disabled = busy || !d.canBind;
+    var openWebBtn = $('daemonOpenWeb');
+    openWebBtn.hidden = !(d.bound && d.serverOrigin);
+    openWebBtn.disabled = busy;
+
+    var autoKnown = d.autostart !== B.daemonAutostart.UNAVAILABLE && d.installed && d.canBind;
+    $('daemonAutostartWrap').hidden = !autoKnown;
+    var autoSw = $('daemonAutostartSwitch');
+    autoSw.setAttribute('aria-checked', String(d.autostart === B.daemonAutostart.ENABLED));
+    autoSw.disabled = !autoKnown;
+    autoSw.setAttribute('aria-busy', String(busy));
+    $('daemonSwOn').textContent = T('switchOn');
+    $('daemonSwOff').textContent = T('switchOff');
+
+    var parts = [];
+    if (d.userName) parts.push(T('daemonUser') + ': ' + d.userName);
+    if (d.serverHost) parts.push(T('daemonServer') + ': ' + d.serverHost);
+    if (d.version) parts.push('v' + d.version);
+    if (d.pid) parts.push('PID ' + String(d.pid));
+    $('daemonMeta').textContent = parts.join(' · ');
+
+    var hint = $('daemonHint');
+    if (d.lastError) {
+      hint.hidden = false;
+      hint.textContent = d.lastError;
+    } else if (d.reason === B.daemonReason.NO_ACTIVE_USER) {
+      hint.hidden = false;
+      hint.textContent = T('daemonNoActiveUserHint');
+    } else if (d.reason === B.daemonReason.NOT_INSTALLED) {
+      hint.hidden = false;
+      hint.textContent = T('daemonNotInstalledHint');
+    } else {
+      hint.hidden = true;
+      hint.textContent = '';
+    }
+  }
+
   function renderAll() {
     renderStatus();
     renderPermissions();
+    renderDaemon();
     renderConnections();
     renderTraffic();
   }
@@ -293,14 +392,48 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       body: JSON.stringify(body)
     });
   }
-  function act(action, id) {
+  function act(action, id, extra) {
     busy = true;
     renderStatus();
-    return post(B.actionPath, { action: action, id: id }).then(function (response) {
+    renderDaemon();
+    var body = { action: action };
+    if (id !== undefined) body.id = id;
+    if (extra) {
+      for (var k in extra) if (Object.prototype.hasOwnProperty.call(extra, k)) body[k] = extra[k];
+    }
+    return post(B.actionPath, body).then(function (response) {
       if (!response.ok) toast(T('actionFailed'));
-    }).catch(function () { toast(T('actionFailed')); }).then(function () {
+      return response.ok;
+    }).catch(function () {
+      toast(T('actionFailed'));
+      return false;
+    }).then(function (ok) {
       busy = false;
-      return load();
+      return load().then(function () { return ok; });
+    });
+  }
+  function isValidBindInput(raw) {
+    var trimmed = String(raw || '').trim();
+    if (!trimmed) return false;
+    var parsed;
+    try { parsed = new URL(trimmed); } catch (e) { return false; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    var segs = parsed.pathname.split('/').filter(Boolean);
+    return segs.length === 2 && segs[0] === 'bind' && segs[1].length >= 4;
+  }
+  function loadDaemonLogs() {
+    var pre = $('daemonLogsPre');
+    var meta = $('daemonLogsMeta');
+    pre.textContent = '...';
+    meta.textContent = '';
+    return fetch(B.daemonLogsPath, { cache: 'no-store' }).then(function (response) {
+      if (!response.ok) throw new Error('logs');
+      return response.json();
+    }).then(function (data) {
+      pre.textContent = data && data.text ? data.text : T('daemonLogsEmpty');
+      meta.textContent = data && data.truncated ? T('daemonLogsTruncated') : (data && data.source ? data.source : '');
+    }).catch(function () {
+      pre.textContent = T('actionFailed');
     });
   }
   function openExternal(target, fallbackUrl) {
@@ -314,9 +447,15 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     }).catch(function () { toast(T('actionFailed')); });
   }
 
-  // ---- confirm dialog ---------------------------------------------------
-  function focusables() {
-    return $('dialog').querySelectorAll('button');
+  // ---- confirm & daemon modals -----------------------------------------
+  function activeModal() {
+    if (!$('modal').hidden) return { modal: $('modal'), box: $('dialog'), close: closeModal };
+    if (!$('daemonBindModal').hidden) return { modal: $('daemonBindModal'), box: $('daemonBindForm'), close: closeBindModal };
+    if (!$('daemonLogsModal').hidden) return { modal: $('daemonLogsModal'), box: $('daemonLogsDialog'), close: closeLogsModal };
+    return null;
+  }
+  function focusables(box) {
+    return (box || $('dialog')).querySelectorAll('button,input');
   }
   function ask(action, id) {
     pendingAction = { action: action, id: id };
@@ -330,6 +469,31 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
   function closeModal() {
     pendingAction = null;
     $('modal').hidden = true;
+    if (lastFocus && lastFocus.focus) lastFocus.focus();
+  }
+  function openBindModal() {
+    lastFocus = document.activeElement;
+    $('daemonBindInput').value = '';
+    $('daemonBindErr').hidden = true;
+    $('daemonBindErr').textContent = '';
+    $('daemonBindModal').hidden = false;
+    $('daemonBindInput').focus();
+  }
+  function closeBindModal() {
+    $('daemonBindInput').value = '';
+    $('daemonBindErr').hidden = true;
+    $('daemonBindErr').textContent = '';
+    $('daemonBindModal').hidden = true;
+    if (lastFocus && lastFocus.focus) lastFocus.focus();
+  }
+  function openLogsModal() {
+    lastFocus = document.activeElement;
+    $('daemonLogsModal').hidden = false;
+    loadDaemonLogs();
+    $('daemonLogsClose').focus();
+  }
+  function closeLogsModal() {
+    $('daemonLogsModal').hidden = true;
     if (lastFocus && lastFocus.focus) lastFocus.focus();
   }
 
@@ -397,13 +561,56 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       if (chosen) act(chosen.action, chosen.id);
     };
     $('modal').addEventListener('mousedown', function (event) { if (event.target === $('modal')) closeModal(); });
+    $('daemonStart').onclick = function () { if (!busy) act(B.daemonActions.START); };
+    $('daemonStop').onclick = function () { if (!busy) act(B.daemonActions.STOP); };
+    $('daemonRestart').onclick = function () { if (!busy) act(B.daemonActions.RESTART); };
+    $('daemonAutostartSwitch').onclick = function () {
+      if (!state || !state.daemon || busy) return;
+      var enabled = state.daemon.autostart === B.daemonAutostart.ENABLED;
+      act(enabled ? B.daemonActions.DISABLE_AUTOSTART : B.daemonActions.ENABLE_AUTOSTART);
+    };
+    $('daemonBindBtn').onclick = function () { if (!busy) openBindModal(); };
+    $('daemonBindCancel').onclick = closeBindModal;
+    $('daemonBindModal').addEventListener('mousedown', function (event) { if (event.target === $('daemonBindModal')) closeBindModal(); });
+    $('daemonBindForm').onsubmit = function (event) {
+      event.preventDefault();
+      if (busy) return;
+      var input = $('daemonBindInput');
+      var raw = input.value;
+      input.value = '';
+      if (!isValidBindInput(raw)) {
+        $('daemonBindErr').textContent = T('daemonBindInvalid');
+        $('daemonBindErr').hidden = false;
+        input.focus();
+        return;
+      }
+      closeBindModal();
+      act(B.daemonActions.BIND, undefined, { bindUrl: raw.trim() });
+    };
+    $('daemonLogsBtn').onclick = openLogsModal;
+    $('daemonLogsRefresh').onclick = loadDaemonLogs;
+    $('daemonLogsClose').onclick = closeLogsModal;
+    $('daemonLogsModal').addEventListener('mousedown', function (event) { if (event.target === $('daemonLogsModal')) closeLogsModal(); });
+    $('daemonOpenWeb').onclick = function () {
+      var d = state && state.daemon ? state.daemon : null;
+      if (!d || !d.serverOrigin) return;
+      try {
+        if (new URL(B.manageUrl).origin === d.serverOrigin) {
+          openExternal('manage', B.manageUrl);
+          return;
+        }
+      } catch (e) { /* fall through to direct window.open */ }
+      window.open(d.serverOrigin, '_blank', 'noopener,noreferrer');
+    };
     document.addEventListener('keydown', function (event) {
-      if ($('modal').hidden) return;
-      if (event.key === 'Escape') { event.preventDefault(); closeModal(); return; }
+      var cur = activeModal();
+      if (!cur) return;
+      if (event.key === 'Escape') { event.preventDefault(); cur.close(); return; }
       if (event.key !== 'Tab') return;
-      var items = focusables();
+      var items = focusables(cur.box);
       var first = items[0];
       var last = items[items.length - 1];
+      if (!first || !last) return;
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     });

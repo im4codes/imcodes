@@ -8,6 +8,10 @@ import { AIDESK_PRODUCT_NAME } from '../../shared/aidesk-product.js';
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
+  REMOTE_DESKTOP_LOCAL_DAEMON_ACTION,
+  REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART,
+  REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE,
+  REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE,
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
 } from '../../shared/remote-desktop-local-management.js';
 import {
@@ -674,6 +678,210 @@ describe('remote desktop local panel: open-settings', () => {
     expect(response.headers.get('cache-control')).toBe('no-store');
     const url = new URL(panel.url);
     expect(url.hostname).toBe('127.0.0.1');
+  });
+});
+
+describe('local panel Coding Daemon endpoints and UI', () => {
+  async function startWithDaemon(extra?: Partial<Parameters<typeof startRemoteDesktopLocalPanel>[0]>) {
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '1234567890',
+      serverUrl: 'https://example.test/',
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => true,
+      port: 0,
+      ...extra,
+    });
+    panels.push(panel);
+    const page = await fetch(panel.url);
+    const html = await page.text();
+    return {
+      panel,
+      html,
+      cookie: (page.headers.get('set-cookie') ?? '').split(';')[0]!,
+      csrf: /"csrf":"([^"]+)"/u.exec(html)![1]!,
+      origin: new URL(panel.url).origin,
+    };
+  }
+
+  it('keeps /api/state free of daemon and answers 501 on daemon routes when handlers are omitted', async () => {
+    const { panel, cookie, csrf, origin } = await startWithDaemon();
+    const stateRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), {
+      headers: { cookie },
+    });
+    expect(stateRes.status).toBe(200);
+    const state = await stateRes.json() as Record<string, unknown>;
+    expect('daemon' in state).toBe(false);
+
+    const logsRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url), {
+      headers: { cookie },
+    });
+    expect(logsRes.status).toBe(501);
+
+    const actionRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START }),
+    });
+    expect(actionRes.status).toBe(501);
+  });
+
+  it('gates daemon actions and logs behind session cookie, Origin, CSRF, and sanitizes state', async () => {
+    const daemonAction = vi.fn(async (action: string, payload?: { bindUrl?: unknown }) => {
+      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && payload?.bindUrl === 'bad') {
+        return { ok: false, statusCode: 400, error: 'invalid_bind_url' };
+      }
+      return { ok: true, statusCode: 200 };
+    });
+    const daemonLogs = vi.fn(async () => ({ text: 'daemon line 1\ndaemon line 2\n', truncated: false, source: 'logs/daemon.log' }));
+    const { panel, cookie, csrf, origin } = await startWithDaemon({
+      daemon: async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        version: '1.2.3',
+        pid: 4242,
+        serverId: 'srv_1',
+        serverHost: 'app.example.test',
+        serverOrigin: 'https://app.example.test',
+        userName: 'alice',
+        lastError: 'Bearer hidden_tok_999 failed',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      }),
+      daemonAction,
+      daemonLogs,
+    });
+
+    // State includes sanitized daemon snapshot
+    const stateRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), { headers: { cookie } });
+    expect(stateRes.status).toBe(200);
+    const state = await stateRes.json() as { daemon?: { lastError?: string; userName?: string } };
+    expect(state.daemon?.userName).toBe('alice');
+    expect(state.daemon?.lastError).not.toContain('hidden_tok_999');
+
+    // Logs require cookie
+    expect((await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url))).status).toBe(401);
+    const logsOk = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url), { headers: { cookie } });
+    expect(logsOk.status).toBe(200);
+    expect(await logsOk.json()).toMatchObject({ text: 'daemon line 1\ndaemon line 2\n', truncated: false });
+
+    // CSRF/Origin gate on daemon actions
+    expect((await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin: 'https://evil.test', [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART }),
+    })).status).toBe(403);
+    expect((await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART }),
+    })).status).toBe(403);
+
+    // Valid daemon action succeeds; rejected bind returns mapped status code
+    const restartOk = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART }),
+    });
+    expect(restartOk.status).toBe(200);
+    const badBind = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND, bindUrl: 'bad' }),
+    });
+    expect(badBind.status).toBe(400);
+    expect(daemonAction).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders daemon card, clears bind URL input immediately upon submit, and loads sanitized logs in DOM', async () => {
+    let running = false;
+    const dispatched: Array<{ action: string; bindUrl?: unknown }> = [];
+    const { panel, html, cookie } = await startWithDaemon({
+      daemon: async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running,
+        connectionState: running
+          ? REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED
+          : REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.DISCONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.DISABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        version: '1.2.3',
+        userName: 'alice',
+        serverHost: 'app.example.test',
+        serverOrigin: 'https://app.example.test',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      }),
+      daemonAction: async (action, payload) => {
+        dispatched.push({ action, bindUrl: payload?.bindUrl });
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START) running = true;
+        return { ok: true, statusCode: 200 };
+      },
+      daemonLogs: async () => ({ text: 'hello from daemon log\n', truncated: false, source: 'logs/daemon.log' }),
+    });
+
+    const nodeFetch = globalThis.fetch;
+    const authedFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      const target = typeof input === 'string' ? new URL(input, panel.url).toString() : input;
+      const headers = new Headers(init?.headers);
+      headers.set('cookie', cookie);
+      if (init?.method === 'POST') headers.set('origin', new URL(panel.url).origin);
+      return nodeFetch(target, { ...init, headers });
+    };
+
+    const dom = new JSDOM(html, {
+      url: panel.url,
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(win) {
+        (win as unknown as { fetch: typeof authedFetch }).fetch = authedFetch;
+        Object.defineProperty(win.navigator, 'languages', { value: ['en-US'], configurable: true });
+      },
+    });
+    const doc = dom.window.document;
+    await new Promise((r) => setTimeout(r, 80));
+
+    const daemonCard = doc.getElementById('daemonCard') as HTMLElement;
+    expect(daemonCard.hidden).toBe(false);
+    expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Stopped');
+
+    // Start action updates card state
+    (doc.getElementById('daemonStart') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START)).toBe(true);
+    expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Running');
+
+    // Bind modal clears secret input immediately upon submit
+    (doc.getElementById('daemonBindBtn') as HTMLButtonElement).click();
+    const bindInput = doc.getElementById('daemonBindInput') as HTMLInputElement;
+    bindInput.value = 'https://app.example.test/bind/secret_key_xyz';
+    const form = doc.getElementById('daemonBindForm') as HTMLFormElement;
+    form.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+    expect(bindInput.value).toBe('');
+    await new Promise((r) => setTimeout(r, 80));
+    expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && d.bindUrl === 'https://app.example.test/bind/secret_key_xyz')).toBe(true);
+
+    // Logs modal fetches and shows textContent cleanly
+    (doc.getElementById('daemonLogsBtn') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('hello from daemon log');
+
+    dom.window.close();
   });
 });
 

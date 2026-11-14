@@ -8,6 +8,7 @@ import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPa
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
 import { createMacosRemoteDesktopProductionDependencies } from './macos-remote-desktop-production.js';
 import { createControlledNodeRuntime } from './runtime.js';
+import { createLocalDaemonController } from './local-daemon-control.js';
 import { readPreviousUpgradeFailure } from './self-upgrade.js';
 import {
   createRemoteDesktopSignedShellLauncher,
@@ -396,6 +397,7 @@ async function main(): Promise<void> {
   let localPanel: Awaited<ReturnType<typeof startRemoteDesktopLocalPanel>> | null = null;
   let localIpc: Awaited<ReturnType<typeof startAideskLocalIpcServer>> | null = null;
   async function startLocalManagement(nodeId: string): Promise<void> {
+    const daemonController = createLocalDaemonController();
     localPanel = await startRemoteDesktopLocalPanel({
       publicNodeId: nodeId,
       serverUrl: bootstrap.credential.serverUrl,
@@ -417,6 +419,9 @@ async function main(): Promise<void> {
       ),
       stopAll: () => runtime.stopAllRemoteDesktopConnections(),
       disconnect: (publicId) => runtime.stopRemoteDesktopConnection(publicId),
+      daemon: () => daemonController.status(),
+      daemonAction: (action, payload) => daemonController.performAction(action, payload),
+      daemonLogs: () => daemonController.logs(),
       ...localPanelWindowHandlers(bootstrap.credential.serverUrl, nodeId),
     }).catch((error) => {
       logger.warn({ err: error, host: REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST, port: REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT },
