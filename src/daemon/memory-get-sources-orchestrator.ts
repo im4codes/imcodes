@@ -231,23 +231,34 @@ export async function getMemorySourcesOrchestrated(
 
   const credentials = await (deps.loadCredentials ?? defaultLoadCredentials)();
   const localServerId = credentials?.serverId ?? null;
-  let sharedMachineAuthority: string | null = null;
-  if (deps.loadSharedMachineAuthority) {
+  // Authority lookup is only required when making cloud/remote HTTP requests
+  // (or enforcing fail-closed session context when credentials exist for remote calls).
+  // Pure local SQLite reads without credentials / remote HTTP must not be blocked
+  // by standalone stdio MCP environments lacking daemon hook-port env.
+  let loadedSharedMachineAuthority: string | null | undefined;
+  const loadAuthorityOnce = async (): Promise<{ ok: true; authority: string | null } | { ok: false }> => {
+    if (!deps.loadSharedMachineAuthority) return { ok: true, authority: null };
+    if (loadedSharedMachineAuthority !== undefined) return { ok: true, authority: loadedSharedMachineAuthority };
     try {
-      sharedMachineAuthority = await deps.loadSharedMachineAuthority();
+      loadedSharedMachineAuthority = await deps.loadSharedMachineAuthority();
+      return { ok: true, authority: loadedSharedMachineAuthority };
     } catch {
-      return { status: 'error', reason: 'scope_forbidden', projectionId: trimmed };
+      return { ok: false };
     }
-  }
+  };
 
   // Step 1: resolve owner.
   let owner: string | null = cache.get(trimmed) ?? null;
   if (!owner && credentials && !deps.skipCloudLookup) {
+    const authority = await loadAuthorityOnce();
+    if (!authority.ok) {
+      return { status: 'error', reason: 'scope_forbidden', projectionId: trimmed };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     timer.unref?.();
     try {
-      owner = await resolveOwnerFromCloud(trimmed, projectId, credentials, fetchImpl, controller.signal, sharedMachineAuthority);
+      owner = await resolveOwnerFromCloud(trimmed, projectId, credentials, fetchImpl, controller.signal, authority.authority);
     } finally {
       clearTimeout(timer);
     }
@@ -256,9 +267,9 @@ export async function getMemorySourcesOrchestrated(
 
   // Step 2: dispatch.
   //   - owner equals local serverId  → local SQLite path
-  //   - owner is something else      → remote pod-sticky path
+  //   - owner is something else      → remote pod-sticky path (when credentials exist)
   //   - owner could not be resolved  → fall back to local (legacy behaviour)
-  const goLocal = !owner || (localServerId && owner === localServerId);
+  const goLocal = !owner || !credentials || (localServerId && owner === localServerId);
   if (goLocal) {
     let local: MemoryGetSourcesResult;
     try {
@@ -274,12 +285,16 @@ export async function getMemorySourcesOrchestrated(
     };
   }
 
-  // Remote path. The owner is non-null here.
+  // Remote path. Both owner and credentials are non-null here.
+  const authority = await loadAuthorityOnce();
+  if (!authority.ok) {
+    return { status: 'error', reason: 'scope_forbidden', projectionId: trimmed };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
-    return await fetchRemoteSources(trimmed, projectId, owner!, credentials!, fetchImpl, controller.signal, sharedMachineAuthority);
+    return await fetchRemoteSources(trimmed, projectId, owner!, credentials, fetchImpl, controller.signal, authority.authority);
   } finally {
     clearTimeout(timer);
   }

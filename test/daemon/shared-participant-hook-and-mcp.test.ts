@@ -48,6 +48,8 @@ import { messagePinMcpList } from '../../src/daemon/message-pin-mcp-client.js';
 import { cronMcpList } from '../../src/daemon/cron-mcp-client.js';
 import { searchMcpMemoryRecall } from '../../src/daemon/memory-mcp-search.js';
 import { getMemorySourcesOrchestrated } from '../../src/daemon/memory-get-sources-orchestrator.js';
+import { createProjectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
+import { createSessionSharedMachineAuthorityLoader } from '../../src/daemon/shared-machine-authority.js';
 import { ServerCapabilityService } from '../../src/capability/server-capability-service.js';
 
 function requestHook(
@@ -354,6 +356,59 @@ describe('daemon MCP HTTP clients propagate shared-machine authority and fail cl
     const r5 = await capSvc.list({ scope: 'account' });
     expect(r5).toMatchObject({ status: 'error' });
 
+    const r6 = await getMemorySourcesOrchestrated('proj_fail_1', {
+      namespace: { scope: 'personal', projectId: 'proj' },
+    }, {
+      loadCredentials: async () => endpoint,
+      fetchImpl: fetchNever,
+      loadSharedMachineAuthority: failingLoader,
+    });
+    expect(r6).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+
+    const remoteCache = createProjectionOwnerCache();
+    remoteCache.set('proj_fail_cached_remote', 'srv_other');
+    const r7 = await getMemorySourcesOrchestrated('proj_fail_cached_remote', {
+      namespace: { scope: 'personal', projectId: 'proj' },
+    }, {
+      cache: remoteCache,
+      skipCloudLookup: true,
+      loadCredentials: async () => endpoint,
+      fetchImpl: fetchNever,
+      loadSharedMachineAuthority: failingLoader,
+    });
+    expect(r7).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+
     expect(fetchNever).not.toHaveBeenCalled();
+  });
+
+  it('allows local get_memory_sources without credentials when loadSharedMachineAuthority throws, and allows un-scoped standalone stdio MCP without hook port', async () => {
+    const fetchNever = mockOkFetch();
+    const localGetSources = vi.fn(async (projectionId: string) => ({
+      projectionId,
+      sourceEventCount: 1,
+      sources: [{ eventId: 'evt-local-1', status: 'archived' as const, content: 'local source', eventType: 'chat.assistant', createdAt: 1 }],
+    }));
+    const localOnly = await getMemorySourcesOrchestrated('proj_local_only', {
+      namespace: { scope: 'personal', projectId: 'proj', userId: 'u1' },
+    }, {
+      loadCredentials: async () => null,
+      fetchImpl: fetchNever,
+      localGetSources,
+      loadSharedMachineAuthority: async () => {
+        throw new Error('shared_machine_authority_incomplete_session_context');
+      },
+    });
+    expect(localOnly).toMatchObject({ status: 'ok', projectionId: 'proj_local_only', sourceEventCount: 1 });
+    expect(localGetSources).toHaveBeenCalledOnce();
+    expect(fetchNever).not.toHaveBeenCalled();
+
+    // Outside session context (standalone stdio MCP without hook port or session env),
+    // the loader resolves null cleanly without sending a forged header.
+    const standaloneLoader = createSessionSharedMachineAuthorityLoader({ env: {}, callerSessionName: null, resourceOwner: null });
+    expect(await standaloneLoader()).toBeNull();
+    const fAlias = mockOkFetch();
+    const aliasResult = await aliasMcpList({ endpoint, fetchImpl: fAlias, loadSharedMachineAuthority: standaloneLoader });
+    expect(aliasResult.status).toBe('ok');
+    expect(extractHeader(fAlias, SHARED_MACHINE_AUTHORITY_HEADER)).toBeNull();
   });
 });

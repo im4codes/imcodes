@@ -936,7 +936,13 @@ describe('a shared-session participant reaches only the machines shared with the
       'content-type': 'application/json',
       [SHARED_MACHINE_AUTHORITY_HEADER]: authority as string,
     };
+    const ownerSource = await fullCredential(ownerId);
     const ownerTurn = {
+      'X-Server-Id': ownerSource.serverId,
+      authorization: `Bearer ${ownerSource.token}`,
+      'content-type': 'application/json',
+    };
+    const sharedSourceBare = {
       'X-Server-Id': source.serverId,
       authorization: `Bearer ${source.token}`,
       'content-type': 'application/json',
@@ -950,7 +956,7 @@ describe('a shared-session participant reaches only the machines shared with the
     const desk = await createDesk(ownerId);
     await joinDesk(desk, participantId);
     expect((await bindDesk(app, ownerId, grouped, desk)).status).toBe(200);
-    return { app, ownerId, participantId, source, delegated, ownerTurn, unshared, participantShared, viewerShared, grouped, sessionShare, sessionName };
+    return { app, ownerId, participantId, source, ownerSource, delegated, ownerTurn, sharedSourceBare, unshared, participantShared, viewerShared, grouped, sessionShare, sessionName };
   }
 
   const listed = async (app: ReturnType<typeof buildApp>, headers: Record<string, string>) => {
@@ -1088,9 +1094,12 @@ describe('a shared-session participant reaches only the machines shared with the
   it('leaves the owner\'s own turns unchanged: every node, no participant involved', async () => {
     const t = await scene();
     expect(await listed(t.app, t.ownerTurn)).toEqual([t.grouped, t.participantShared, t.unshared, t.viewerShared].sort());
+    expect(await app403List(t.app, t.sharedSourceBare)).toBe(403);
     for (const target of [t.unshared, t.viewerShared, t.participantShared, t.grouped]) {
       expect((await exec(t.app, t.ownerTurn, target)).status, `owner exec ${target}`).toBe(200);
       expect((await computerUse(t.app, t.ownerTurn, target)).status, `owner computer-use ${target}`).toBe(200);
+      expect((await exec(t.app, t.sharedSourceBare, target)).status, `shared bare exec ${target}`).toBe(403);
+      expect((await computerUse(t.app, t.sharedSourceBare, target)).status, `shared bare computer-use ${target}`).toBe(403);
     }
   });
 
@@ -1163,12 +1172,12 @@ describe('a shared-session participant reaches only the machines shared with the
       [t.source.serverId, t.participantShared, t.participantId],
     );
     expect(participantAudit).toEqual({ reason: null, outcome: 'completed' });
-    // An owner turn is audited as the owner (allowed), with no delegated actor.
+    // An unshared owner turn is audited as the owner (allowed), with no delegated actor.
     expect((await exec(audited as never, t.ownerTurn, t.participantShared)).status).toBe(200);
     const allowed = await db.queryOne<{ user_id: string; delegated_actor_user_id: string | null; decision: string }>(
       `SELECT user_id, delegated_actor_user_id, decision FROM machine_exec_audit
         WHERE source_server_id = $1 AND target_server_id = $2 AND decision = 'allowed'`,
-      [t.source.serverId, t.participantShared],
+      [t.ownerSource.serverId, t.participantShared],
     );
     expect(allowed).toEqual({ user_id: t.ownerId, delegated_actor_user_id: null, decision: 'allowed' });
     // A target that is not shared with the participant at all is refused as no_access, and that is audited too.
@@ -1249,6 +1258,7 @@ describe('a shared-session participant reaches only the machines shared with the
       }
       expect(n.socket.sent).toHaveLength(before);
       expect((await t.app.request(base + '/download', { headers: t.ownerTurn })).status).toBe(200);
+      expect((await t.app.request(base + '/download', { headers: t.sharedSourceBare })).status).toBe(403);
       expect((await fileHandle(t.app, other, t.participantShared)).status).toBe(200);
       expect((await t.app.request(base + '/download', { headers: other })).status).toBe(200);
     } finally { n.socket.close(); }
@@ -1345,6 +1355,7 @@ describe('a shared-session participant reaches only the machines shared with the
       expect(foreign.status).toBe(409);
       expect(await foreign.json()).toMatchObject({ committedBytes: 0 });
       expect((await chunk(t.ownerTurn, 3)).status).toBe(409);
+      expect((await chunk(t.sharedSourceBare, 3)).status).toBe(403);
       expect(await (await chunk(t.delegated, 3)).json()).toMatchObject({ complete: false, committedBytes: 6 });
       expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.UPLOAD_FETCH)).toHaveLength(0);
       await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
