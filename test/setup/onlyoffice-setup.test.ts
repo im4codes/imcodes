@@ -968,4 +968,77 @@ describe('scripts/setup-onlyoffice.sh standalone non-destructive add-on script',
       rmSync(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it('configures immutable static caching and bootstrap revalidation in fresh and patched Caddyfiles without poisoning dynamic routes', async () => {
+    const { ensureCaddyfileHasOnlyOffice } = await import('../../src/setup/setup-flow.js');
+    const tmpRoot = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'oo-caddy-cache-'));
+    try {
+      const bin = join(tmpRoot, 'bin');
+      const freshProject = join(tmpRoot, 'fresh');
+      const patchedProject = join(tmpRoot, 'patched');
+      const log = join(tmpRoot, 'docker.log');
+      mkdirSync(bin, { recursive: true });
+      mkdirSync(freshProject, { recursive: true });
+      mkdirSync(patchedProject, { recursive: true });
+      writeFileSync(log, '');
+
+      const dockerStub = join(bin, 'docker');
+      writeFileSync(
+        dockerStub,
+        `#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "${log}"
+case "\${1:-} \${2:-}" in
+  "compose version") exit 0 ;;
+  "info ") exit 0 ;;
+  "ps --format") exit 0 ;;
+  "compose up") exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+      );
+      chmodSync(dockerStub, 0o755);
+
+      const baseEnv = 'DOMAIN=docs.example.com\nPOSTGRES_PASSWORD=pgpass\nJWT_SIGNING_KEY=jwtkey\n';
+      const baseCompose = 'services:\n  server:\n    image: example/server:1\n  caddy:\n    image: caddy:2-alpine\n';
+      writeFileSync(join(freshProject, '.env'), baseEnv);
+      writeFileSync(join(freshProject, 'docker-compose.yml'), baseCompose);
+      // No Caddyfile in freshProject -> exercises fresh-create path
+
+      writeFileSync(join(patchedProject, '.env'), baseEnv);
+      writeFileSync(join(patchedProject, 'docker-compose.yml'), baseCompose);
+      writeFileSync(
+        join(patchedProject, 'Caddyfile'),
+        'docs.example.com {\n\treverse_proxy server:19138\n}\n',
+      );
+
+      const scriptPath = join(repoRoot, 'scripts/setup-onlyoffice.sh');
+      for (const dir of [freshProject, patchedProject]) {
+        const res = spawnSync(scriptPath, [dir], {
+          encoding: 'utf8',
+          timeout: 10000,
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+        });
+        expect(res.status).toBe(0);
+        const caddy = readFileSync(join(dir, 'Caddyfile'), 'utf8');
+        expect(caddy).toContain('@onlyoffice_static {');
+        expect(caddy).toContain('path_regexp ^/v?[0-9]+\\.[0-9]+\\.[0-9]+[.-][^/]+/(web-apps|sdkjs|sdkjs-plugins|fonts|dictionaries)/');
+        expect(caddy).toContain('not path /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html');
+        expect(caddy).toContain('header @onlyoffice_static >Cache-Control "public, max-age=31536000, immutable"');
+        expect(caddy).toContain('@onlyoffice_bootstrap {');
+        expect(caddy).toContain('header @onlyoffice_bootstrap >Cache-Control "no-cache, must-revalidate"');
+        expect(caddy).toContain('handle_path /onlyoffice/* {');
+        expect(caddy).not.toContain('header * >Cache-Control');
+
+        // Disabling via ensureCaddyfileHasOnlyOffice removes matchers and handle_path cleanly
+        const stripped = ensureCaddyfileHasOnlyOffice(caddy, 'docs.example.com', false);
+        expect(stripped).not.toContain('@onlyoffice_static');
+        expect(stripped).not.toContain('@onlyoffice_bootstrap');
+        expect(stripped).not.toContain('handle_path /onlyoffice/*');
+        expect(stripped).toContain('reverse_proxy server:19138');
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });

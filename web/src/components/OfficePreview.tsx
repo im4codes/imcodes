@@ -12,6 +12,9 @@ import {
   mintCloudDocDownloadUrl,
   type OnlyOfficeConfigResponse,
 } from '../api.js';
+import { loadOnlyOfficeScript } from '../onlyoffice-preload.js';
+
+export { loadOnlyOfficeScript };
 
 export interface OfficePreviewProps {
   /**
@@ -41,60 +44,10 @@ export interface OfficePreviewProps {
   onOpenShare?: () => void;
 }
 
-declare global {
-  interface Window {
-    DocsAPI?: {
-      DocEditor: new (placeholderId: string, config: Record<string, unknown>) => {
-        destroyEditor?: () => void;
-      };
-    };
-  }
-}
-
 async function fetchArrayBuffer(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
   const res = await fetch(url, { credentials: 'include', signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.arrayBuffer();
-}
-
-const scriptLoadPromises = new Map<string, Promise<void>>();
-
-export function loadOnlyOfficeScript(scriptUrl: string): Promise<void> {
-  if (typeof window !== 'undefined' && window.DocsAPI?.DocEditor) {
-    return Promise.resolve();
-  }
-  const existing = scriptLoadPromises.get(scriptUrl);
-  if (existing) return existing;
-
-  const promise = new Promise<void>((resolve, reject) => {
-    if (typeof document === 'undefined') {
-      scriptLoadPromises.delete(scriptUrl);
-      reject(new Error('Document is unavailable'));
-      return;
-    }
-    if (window.DocsAPI?.DocEditor) {
-      resolve();
-      return;
-    }
-    const existingTag = document.querySelector(`script[data-onlyoffice-src="${scriptUrl}"]`) as HTMLScriptElement | null;
-    if (existingTag) {
-      existingTag.remove();
-    }
-    const script = document.createElement('script');
-    script.src = scriptUrl;
-    script.async = true;
-    script.dataset.onlyofficeSrc = scriptUrl;
-    script.onload = () => resolve();
-    script.onerror = () => {
-      scriptLoadPromises.delete(scriptUrl);
-      script.remove();
-      reject(new Error('Failed to load ONLYOFFICE API script'));
-    };
-    document.head.appendChild(script);
-  });
-
-  scriptLoadPromises.set(scriptUrl, promise);
-  return promise;
 }
 
 export function isLocallyPreviewableFormat(filePath: string, mimeType: string): boolean {

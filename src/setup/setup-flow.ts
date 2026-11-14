@@ -22,6 +22,7 @@ import { parse, stringify } from 'yaml';
 import {
   dockerComposeTemplate,
   caddyfileTemplate,
+  onlyofficeCaddyRouteBlock,
   envTemplate,
   turnEntrypointTemplate,
   turnserverConfigTemplate,
@@ -1054,6 +1055,40 @@ export function ensureComposeHasOnlyOffice(
  * proxy block while preserving existing site address (`{$DOMAIN}` or literal
  * domain) and custom directives.
  */
+function stripCaddyDirectiveBlock(content: string, headerRegex: RegExp): string {
+  const lines = content.split('\n');
+  const out: string[] = [];
+  let depth = 0;
+  let skipping = false;
+  for (const line of lines) {
+    if (!skipping && headerRegex.test(line)) {
+      skipping = true;
+      for (const ch of line) {
+        if (ch === '{') depth += 1;
+        else if (ch === '}') depth -= 1;
+      }
+      if (depth <= 0) {
+        skipping = false;
+        depth = 0;
+      }
+      continue;
+    }
+    if (skipping) {
+      for (const ch of line) {
+        if (ch === '{') depth += 1;
+        else if (ch === '}') depth -= 1;
+      }
+      if (depth <= 0) {
+        skipping = false;
+        depth = 0;
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 export function ensureCaddyfileHasOnlyOffice(
   existingCaddyfile: string | undefined,
   domain: string,
@@ -1070,21 +1105,18 @@ export function ensureCaddyfileHasOnlyOffice(
     if (!activeRouteRegex.test(existingCaddyfile)) {
       return existingCaddyfile;
     }
-    return existingCaddyfile.replace(
-      new RegExp(`(?:^|\\n)[ \\t]*handle_path\\s+${escapedSubpath}/\\*[\\s\\S]*?\\n[ \\t]*\\}\\n?`),
-      '\n',
+    let next = stripCaddyDirectiveBlock(
+      existingCaddyfile,
+      new RegExp(`^[ \\t]*handle_path\\s+${escapedSubpath}/\\*`),
     );
+    next = stripCaddyDirectiveBlock(next, /^[ \t]*@onlyoffice_static\b/);
+    next = stripCaddyDirectiveBlock(next, /^[ \t]*@onlyoffice_bootstrap\b/);
+    return next;
   }
   if (activeRouteRegex.test(existingCaddyfile)) {
     return existingCaddyfile;
   }
-  const handleBlock = `\thandle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/* {\n`
-    + `\t\treverse_proxy onlyoffice:80 {\n`
-    + `\t\t\theader_up X-Forwarded-Proto {scheme}\n`
-    + `\t\t\theader_up X-Forwarded-Host {host}\n`
-    + `\t\t\theader_up X-Forwarded-Prefix ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}\n`
-    + `\t\t}\n`
-    + `\t}\n`;
+  const handleBlock = onlyofficeCaddyRouteBlock();
 
   const proxyRegex = /^([ \t]*reverse_proxy\s+(?:https?:\/\/)?(?:\S+)?19138[^\n]*)$/m;
   if (proxyRegex.test(existingCaddyfile)) {

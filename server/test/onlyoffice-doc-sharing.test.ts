@@ -3327,3 +3327,74 @@ describe('Document sharing: Controlled Node Groups (team:<teamId>) isolation, li
     expect(unboundCreate.status).toBe(201);
   });
 });
+
+describe('GET /api/onlyoffice/status', () => {
+  const bearer = (userId: string) =>
+    `Bearer ${signJwt({ sub: userId, role: 'member' }, JWT_KEY, 3600)}`;
+
+  it('requires authentication and rejects anonymous callers with 401', async () => {
+    const store = createInMemoryDb();
+    const app = buildApp(makeEnv(store.db));
+    const res = await app.request('/api/onlyoffice/status');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns enabled:false without publicUrl/scriptUrl or secrets when ONLYOFFICE is disabled', async () => {
+    const store = createInMemoryDb();
+    const app = buildApp(makeEnv(store.db, {
+      ONLYOFFICE_ENABLED: 'false',
+      ONLYOFFICE_PUBLIC_URL: 'https://docs.example.com/onlyoffice',
+      ONLYOFFICE_INTERNAL_URL: 'http://onlyoffice-secret:80',
+      ONLYOFFICE_JWT_SECRET: 'super-secret-jwt',
+    }));
+    const res = await app.request('/api/onlyoffice/status', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ enabled: false });
+    expect(JSON.stringify(body)).not.toContain('onlyoffice-secret');
+    expect(JSON.stringify(body)).not.toContain('super-secret-jwt');
+  });
+
+  it('returns derived publicUrl and scriptUrl from SERVER_URL by default without internal secrets', async () => {
+    const store = createInMemoryDb();
+    const app = buildApp(makeEnv(store.db, {
+      ONLYOFFICE_ENABLED: 'true',
+      SERVER_URL: 'https://im.example.com/',
+      ONLYOFFICE_PUBLIC_URL: '',
+      ONLYOFFICE_INTERNAL_URL: 'http://onlyoffice-internal:80',
+      ONLYOFFICE_JWT_SECRET: 'super-secret-jwt',
+    }));
+    const res = await app.request('/api/onlyoffice/status', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({
+      enabled: true,
+      publicUrl: 'https://im.example.com/onlyoffice',
+      scriptUrl: 'https://im.example.com/onlyoffice/web-apps/apps/api/documents/api.js',
+    });
+    expect(JSON.stringify(body)).not.toContain('onlyoffice-internal');
+    expect(JSON.stringify(body)).not.toContain('super-secret-jwt');
+  });
+
+  it('honors custom ONLYOFFICE_PUBLIC_URL when configured', async () => {
+    const store = createInMemoryDb();
+    const app = buildApp(makeEnv(store.db, {
+      ONLYOFFICE_ENABLED: 'true',
+      SERVER_URL: 'https://im.example.com',
+      ONLYOFFICE_PUBLIC_URL: 'https://cdn-docs.example.com/ds/',
+    }));
+    const res = await app.request('/api/onlyoffice/status', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      enabled: true,
+      publicUrl: 'https://cdn-docs.example.com/ds',
+      scriptUrl: 'https://cdn-docs.example.com/ds/web-apps/apps/api/documents/api.js',
+    });
+  });
+});

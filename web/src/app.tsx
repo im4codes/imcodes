@@ -84,6 +84,7 @@ import {
 } from './supervision-task-console-cache.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { ExternalDocShareSpace } from './components/DocShareDialog.js';
+import { resetOnlyOfficePrewarm, scheduleOnlyOfficePrewarm } from './onlyoffice-preload.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
 import { MobileServerMenuToolbar, type MobileServerMenuTab } from './components/MobileServerMenuToolbar.js';
@@ -1752,13 +1753,20 @@ function InternalMainApp() {
   // Configure API client when auth changes; start/stop proactive refresh timer
   useEffect(() => {
     configureExpectedUserId(auth?.userId ?? null);
+    let cancelPrewarm = () => {};
     if (auth) {
       configureApi(auth.baseUrl);
       startProactiveRefresh();
+      resetOnlyOfficePrewarm();
+      cancelPrewarm = scheduleOnlyOfficePrewarm();
     } else {
       stopProactiveRefresh();
+      resetOnlyOfficePrewarm();
     }
-    return () => stopProactiveRefresh();
+    return () => {
+      cancelPrewarm();
+      stopProactiveRefresh();
+    };
   }, [auth]);
 
   // Refresh session whenever the tab becomes visible again (mobile browsers pause

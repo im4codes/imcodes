@@ -41,6 +41,7 @@ import {
 } from '@shared/cloud-docs.js';
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
+import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
 
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 
@@ -500,6 +501,7 @@ export function CloudDocsPanel({
 
   useEffect(() => {
     mountedRef.current = true;
+    void prewarmOnlyOfficeComponents();
     return () => {
       mountedRef.current = false;
       loadAbortRef.current?.abort();

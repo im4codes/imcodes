@@ -6,7 +6,7 @@ import type { Context } from 'hono';
 import { getCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
-import { resolveAuthOutcome } from '../security/authorization.js';
+import { authFailureResponse, resolveAuthOutcome } from '../security/authorization.js';
 import {
   getDocumentShareById,
   isPathWithinSharedFolder,
@@ -1343,6 +1343,29 @@ export function resolveTrustedOnlyOfficeDownloadUrl(
   return null;
 }
 
+/** Resolve public browser-facing ONLYOFFICE URLs without exposing internal service addresses. */
+export function resolveOnlyOfficePublicUrls(
+  env: Pick<Env, 'SERVER_URL' | 'ONLYOFFICE_PUBLIC_URL'>,
+): { serverBaseUrl: string; publicUrl: string; scriptUrl: string } {
+  const serverBaseUrl = (env.SERVER_URL || 'http://localhost:19138').replace(/\/$/, '');
+  const publicUrl = (env.ONLYOFFICE_PUBLIC_URL || `${serverBaseUrl}/onlyoffice`).replace(/\/$/, '');
+  const scriptUrl = `${publicUrl}/web-apps/apps/api/documents/api.js`;
+  return { serverBaseUrl, publicUrl, scriptUrl };
+}
+
+// GET /api/onlyoffice/status — lightweight prewarm status for authenticated users
+onlyofficeRoutes.get('/onlyoffice/status', async (c): Promise<Response> => {
+  const outcome = await resolveAuthOutcome(c);
+  if (!outcome.auth) {
+    return authFailureResponse(c, outcome);
+  }
+  if (c.env.ONLYOFFICE_ENABLED !== 'true') {
+    return c.json({ enabled: false });
+  }
+  const { publicUrl, scriptUrl } = resolveOnlyOfficePublicUrls(c.env);
+  return c.json({ enabled: true, publicUrl, scriptUrl });
+});
+
 // GET /api/server/:id/onlyoffice/config?path=<encodedPath>&mode=<view|edit>&shareToken=<optionalToken>&sessionName=<optionalSession>
 onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Response> => {
   const serverId = c.req.param('id') ?? '';
@@ -1437,9 +1460,7 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
     4 * 3600,
   );
 
-  const serverBaseUrl = (c.env.SERVER_URL || 'http://localhost:19138').replace(/\/$/, '');
-  const publicUrl = (c.env.ONLYOFFICE_PUBLIC_URL || `${serverBaseUrl}/onlyoffice`).replace(/\/$/, '');
-  const scriptUrl = `${publicUrl}/web-apps/apps/api/documents/api.js`;
+  const { serverBaseUrl, publicUrl, scriptUrl } = resolveOnlyOfficePublicUrls(c.env);
 
   // Include explicit ?serverId= on both file and callback URLs to satisfy pod-sticky routing
   const fileUrl = `${serverBaseUrl}/api/onlyoffice/file/${docToken}?serverId=${encodeURIComponent(serverId)}`;

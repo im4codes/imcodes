@@ -3228,6 +3228,12 @@ export type DocShareRole = 'viewer' | 'editor';
 export type DocShareMode = 'user' | 'team' | 'external_link' | 'magic_invite';
 export type DocShareTargetKind = 'file' | 'folder';
 
+export interface OnlyOfficeStatusResponse {
+  enabled: boolean;
+  publicUrl?: string;
+  scriptUrl?: string;
+}
+
 export interface OnlyOfficeConfigResponse {
   enabled: boolean;
   role: DocShareRole;
@@ -3333,6 +3339,10 @@ export interface DocShareBrowseEntry {
   mtime?: number;
   role: DocShareRole | null;
   allowDownload: boolean;
+}
+
+export async function fetchOnlyOfficeStatus(): Promise<OnlyOfficeStatusResponse> {
+  return apiFetch<OnlyOfficeStatusResponse>('/api/onlyoffice/status');
 }
 
 export async function fetchOnlyOfficeConfig(

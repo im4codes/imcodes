@@ -94,6 +94,7 @@ import {
 import { filePreviewStatesEqual } from '../file-preview-state.js';
 import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
 import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 const PREF_KEY = 'fb_prefer_editor';
@@ -813,6 +814,13 @@ export function FileBrowser({
   const historyRef = useRef<string[]>([startPath]);
   const historyIdxRef = useRef(0);
   const [canGoBack, setCanGoBack] = useState(false);
+
+  useEffect(() => {
+    if (externalShareToken || mode === 'dir-only' || (!serverId && !activeSharedDocServerId)) {
+      return;
+    }
+    void prewarmOnlyOfficeComponents();
+  }, [externalShareToken, mode, serverId, activeSharedDocServerId]);
 
   useEffect(() => {
     mountedRef.current = true;

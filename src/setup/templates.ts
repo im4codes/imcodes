@@ -261,6 +261,28 @@ volumes:
 /** @deprecated Use dockerComposeTemplate() instead. */
 export const DOCKER_COMPOSE_TEMPLATE = dockerComposeTemplate();
 
+/** Caddy ONLYOFFICE route block with static bundle caching and bootstrap revalidation. */
+export function onlyofficeCaddyRouteBlock(): string {
+  return (
+    `\t@onlyoffice_static {\n` +
+    `\t\tpath_regexp ^/v?[0-9]+\\.[0-9]+\\.[0-9]+[.-][^/]+/(web-apps|sdkjs|sdkjs-plugins|fonts|dictionaries)/\n` +
+    `\t\tnot path /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html\n` +
+    `\t}\n` +
+    `\t@onlyoffice_bootstrap {\n` +
+    `\t\tpath /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html\n` +
+    `\t}\n` +
+    `\thandle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/* {\n` +
+    `\t\theader @onlyoffice_static >Cache-Control "public, max-age=31536000, immutable"\n` +
+    `\t\theader @onlyoffice_bootstrap >Cache-Control "no-cache, must-revalidate"\n` +
+    `\t\treverse_proxy onlyoffice:80 {\n` +
+    `\t\t\theader_up X-Forwarded-Proto {scheme}\n` +
+    `\t\t\theader_up X-Forwarded-Host {host}\n` +
+    `\t\t\theader_up X-Forwarded-Prefix ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}\n` +
+    `\t\t}\n` +
+    `\t}\n`
+  );
+}
+
 export function caddyfileTemplate(domain: string, opts?: { onlyoffice?: boolean }): string {
   const onlyofficeEnabled = opts?.onlyoffice !== false;
   if (!onlyofficeEnabled) {
@@ -270,14 +292,7 @@ export function caddyfileTemplate(domain: string, opts?: { onlyoffice?: boolean 
 `;
   }
   return `${domain} {
-\thandle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/* {
-\t\treverse_proxy onlyoffice:80 {
-\t\t\theader_up X-Forwarded-Proto {scheme}
-\t\t\theader_up X-Forwarded-Host {host}
-\t\t\theader_up X-Forwarded-Prefix ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}
-\t\t}
-\t}
-\treverse_proxy server:19138
+${onlyofficeCaddyRouteBlock()}\treverse_proxy server:19138
 }
 `;
 }

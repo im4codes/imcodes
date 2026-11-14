@@ -586,7 +586,16 @@ if [ ! -f "$CADDY_FILE" ]; then
   TMP_CADDY="$(mktemp "$TARGET_DIR/.caddy.onlyoffice.XXXXXX")"
   cat > "$TMP_CADDY" <<EOF
 ${CLEAN_DOMAIN} {
+	@onlyoffice_static {
+		path_regexp ^/v?[0-9]+\.[0-9]+\.[0-9]+[.-][^/]+/(web-apps|sdkjs|sdkjs-plugins|fonts|dictionaries)/
+		not path /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html
+	}
+	@onlyoffice_bootstrap {
+		path /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html
+	}
 	handle_path /onlyoffice/* {
+		header @onlyoffice_static >Cache-Control "public, max-age=31536000, immutable"
+		header @onlyoffice_bootstrap >Cache-Control "no-cache, must-revalidate"
 		reverse_proxy onlyoffice:80 {
 			header_up X-Forwarded-Proto {scheme}
 			header_up X-Forwarded-Host {host}
@@ -604,7 +613,16 @@ elif ! grep -Eq '^[[:space:]]*handle_path[[:space:]]+/onlyoffice/\*' "$CADDY_FIL
       trimmed = line
       sub(/^[[:space:]]+/, "", trimmed)
       if (trimmed ~ /^reverse_proxy([[:space:]]|$)/ && trimmed ~ /19138/ && !inserted) {
+        print "\t@onlyoffice_static {"
+        print "\t\tpath_regexp ^/v?[0-9]+\\.[0-9]+\\.[0-9]+[.-][^/]+/(web-apps|sdkjs|sdkjs-plugins|fonts|dictionaries)/"
+        print "\t\tnot path /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html"
+        print "\t}"
+        print "\t@onlyoffice_bootstrap {"
+        print "\t\tpath /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html"
+        print "\t}"
         print "\thandle_path /onlyoffice/* {"
+        print "\t\theader @onlyoffice_static >Cache-Control \"public, max-age=31536000, immutable\""
+        print "\t\theader @onlyoffice_bootstrap >Cache-Control \"no-cache, must-revalidate\""
         print "\t\treverse_proxy onlyoffice:80 {"
         print "\t\t\theader_up X-Forwarded-Proto {scheme}"
         print "\t\t\theader_up X-Forwarded-Host {host}"
