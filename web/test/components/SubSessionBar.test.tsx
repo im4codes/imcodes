@@ -2394,4 +2394,183 @@ describe('SubSessionBar', () => {
     expect(expandedView.getByTestId('subsession-overflow-pills').querySelector('[data-testid="subsession-seq-seq-26"]')?.textContent).toBe('26');
     expandedView.unmount();
   });
+
+  it('renders a bottom-right T subscript on compact sub-session buttons for Team members without flowing p2p-tag', () => {
+    const teamSub = makeSubSession({ id: 'team-1', sessionName: 'deck_sub_team-1', label: 'coder', activeModel: 'gpt-6.1-sol' });
+    const soloSub = makeSubSession({ id: 'solo-2', sessionName: 'deck_sub_solo-2', label: 'helper', activeModel: 'gpt-6.1-sol' });
+    const usageMap = new Map([
+      ['deck_sub_team-1', { inputTokens: 120_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gpt-6.1-sol' }],
+      ['deck_sub_solo-2', { inputTokens: 120_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gpt-6.1-sol' }],
+    ]);
+    const p2pSet = new Set([teamSub.sessionName]);
+
+    const cssPath = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/styles.css');
+    const css = readFileSync(cssPath, 'utf8');
+    const cardCssRules = [
+      css.match(/\.subsession-card\s*\{[^}]*\}/)?.[0],
+      css.match(/\.subsession-card-seq\s*\{[^}]*\}/)?.[0],
+      css.match(/\.subsession-card-team\s*\{[^}]*\}/)?.[0],
+      css.match(/\.subsession-card-rail\s*\{[^}]*\}/)?.[0],
+    ].filter(Boolean).join('\n');
+    const styleEl = document.createElement('style');
+    styleEl.textContent = cardCssRules;
+    document.head.appendChild(styleEl);
+    try {
+      // 1. Collapsed bottom bar (includes mobile class, seq badge, and ctx bar)
+      const collapsedView = render(
+        <SubSessionBar
+          subSessions={[teamSub, soloSub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          p2pSessionLabels={p2pSet}
+          subUsages={usageMap}
+          sharedSubSessionStates={new Map([[teamSub.id, 'running' as any]])}
+        />,
+      );
+
+      const teamBtn = collapsedView.container.querySelector('[data-sub-id="team-1"]') as HTMLButtonElement;
+      const soloBtn = collapsedView.container.querySelector('[data-sub-id="solo-2"]') as HTMLButtonElement;
+      expect(teamBtn).toBeTruthy();
+      expect(soloBtn).toBeTruthy();
+
+      // Team subscript replaces in-flow .p2p-tag on the button while keeping seq + ctx + accessibility labels
+      expect(teamBtn.querySelector('.p2p-tag')).toBeNull();
+      expect(soloBtn.querySelector('.p2p-tag')).toBeNull();
+      const teamBadge = teamBtn.querySelector('[data-testid="subsession-team-team-1"]') as HTMLElement;
+      expect(teamBadge).toBeTruthy();
+      expect(teamBadge.tagName).toBe('SUB');
+      expect(teamBadge.classList.contains('subsession-card-team')).toBe(true);
+      expect(teamBadge.textContent?.trim()).toBe('T');
+      expect(teamBadge.getAttribute('aria-hidden')).toBe('true');
+      expect(soloBtn.querySelector('[data-testid="subsession-team-solo-2"]')).toBeNull();
+      expect(teamBtn.querySelector('[data-testid="subsession-seq-team-1"]')?.textContent).toBe('1');
+      expect(teamBtn.querySelector('.subsession-card-ctx')).toBeTruthy();
+      expect(teamBtn.title).toContain('session.p2p_tag');
+      expect(teamBtn.getAttribute('aria-label')).toContain('session.p2p_tag');
+      expect(soloBtn.title).not.toContain('session.p2p_tag');
+
+      // Computed style parity: Team subscript is out-of-flow (position: absolute) with zero card minHeight/padding delta
+      const teamComputed = window.getComputedStyle(teamBtn);
+      const soloComputed = window.getComputedStyle(soloBtn);
+      const teamBadgeComputed = window.getComputedStyle(teamBadge);
+      expect(teamBadgeComputed.position).toBe('absolute');
+      expect(teamBadgeComputed.bottom).toBe('2px');
+      expect(teamBadgeComputed.right).toBe('3px');
+      expect(teamComputed.minHeight).toBe('54px');
+      expect(teamComputed.minHeight).toBe(soloComputed.minHeight);
+      expect(teamComputed.paddingTop).toBe(soloComputed.paddingTop);
+      expect(teamComputed.paddingBottom).toBe(soloComputed.paddingBottom);
+      expect(teamBtn.style.height).toBe('');
+      expect(teamBtn.style.minHeight).toBe('');
+      expect(teamBtn.style.padding).toBe('');
+      expect(teamBtn.getAttribute('style')).toMatch(/^--subsession-accent-color:\s*#[0-9a-f]+;$/i);
+      expect(soloBtn.getAttribute('style')).toMatch(/^--subsession-accent-color:\s*#[0-9a-f]+;$/i);
+      expect(teamBtn.className).toBe(soloBtn.className);
+
+      // Rerendering without p2p membership removes the T badge cleanly
+      collapsedView.rerender(
+        <SubSessionBar
+          subSessions={[teamSub, soloSub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          p2pSessionLabels={new Set()}
+          subUsages={usageMap}
+        />,
+      );
+      expect(teamBtn.querySelector('[data-testid="subsession-team-team-1"]')).toBeNull();
+      expect(teamBtn.getAttribute('aria-label')).toBeNull();
+      collapsedView.unmount();
+
+      // 2. Desktop vertical rail reuses CollapsedSubSessionButtonImpl (.subsession-card-rail)
+      const railHost = document.createElement('aside');
+      document.body.append(railHost);
+      try {
+        const railView = render(
+          <SubSessionBar
+            subSessions={[teamSub, soloSub]}
+            openIds={new Set()}
+            collapsed
+            desktopLayoutCapable
+            desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+            verticalRailHost={railHost}
+            onOpen={vi.fn()}
+            onClose={vi.fn()}
+            onRestart={vi.fn()}
+            ws={null}
+            connected
+            onDiff={vi.fn()}
+            onHistory={vi.fn()}
+            p2pSessionLabels={p2pSet}
+            subUsages={usageMap}
+          />,
+        );
+        const railTeamBtn = railHost.querySelector('[data-sub-id="team-1"]') as HTMLButtonElement;
+        const railSoloBtn = railHost.querySelector('[data-sub-id="solo-2"]') as HTMLButtonElement;
+        expect(railTeamBtn.classList.contains('subsession-card-rail')).toBe(true);
+        expect(railTeamBtn.querySelector('.p2p-tag')).toBeNull();
+        expect(railTeamBtn.querySelector('.subsession-card-team')?.textContent?.trim()).toBe('T');
+        expect(railSoloBtn.querySelector('.subsession-card-team')).toBeNull();
+        expect(railTeamBtn.className).toBe(railSoloBtn.className);
+        const railTeamComputed = window.getComputedStyle(railTeamBtn);
+        const railSoloComputed = window.getComputedStyle(railSoloBtn);
+        expect(railTeamComputed.minHeight).toBe('48px');
+        expect(railTeamComputed.minHeight).toBe(railSoloComputed.minHeight);
+        expect(railTeamComputed.paddingTop).toBe(railSoloComputed.paddingTop);
+        expect(railTeamComputed.paddingBottom).toBe(railSoloComputed.paddingBottom);
+        railView.unmount();
+      } finally {
+        railHost.remove();
+      }
+
+      // 3. Expanded mode keeps overflow pill button compact with T, while placeholder cards retain .p2p-tag
+      const twentySixSubs = Array.from({ length: 26 }, (_, idx) => makeSubSession({
+        id: `exp-${idx + 1}`,
+        sessionName: `deck_sub_exp-${idx + 1}`,
+        label: `w-${idx + 1}`,
+      }));
+      const expandedView = render(
+        <SubSessionBar
+          subSessions={twentySixSubs}
+          openIds={new Set(['exp-1'])}
+          collapsed={false}
+          desktopLayoutCapable
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          p2pSessionLabels={new Set(['deck_sub_exp-24', 'deck_sub_exp-25'])}
+        />,
+      );
+      const overflowBar = expandedView.getByTestId('subsession-overflow-pills');
+      const overflowTeamBtn = overflowBar.querySelector('[data-sub-id="exp-25"]') as HTMLButtonElement;
+      expect(overflowTeamBtn.querySelector('.p2p-tag')).toBeNull();
+      expect(overflowTeamBtn.querySelector('.subsession-card-team')?.textContent?.trim()).toBe('T');
+      expect(overflowBar.querySelector('[data-sub-id="exp-26"] .subsession-card-team')).toBeNull();
+      // Placeholder card (non-button, unhydrated slot #24) still uses .p2p-tag
+      const placeholder = expandedView.container.querySelector('.subcard-preview-placeholder .p2p-tag');
+      expect(placeholder?.textContent).toBe('session.p2p_tag');
+      expandedView.unmount();
+    } finally {
+      styleEl.remove();
+    }
+  });
 });

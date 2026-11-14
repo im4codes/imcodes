@@ -418,6 +418,12 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, sequenceNumber, isOpe
     ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
   }
 
+  const p2pTagLabel = inP2p ? t('session.p2p_tag') : '';
+  const buttonTitle = label
+    + (modelTitle ? ` · ${modelTitle}` : '')
+    + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')
+    + (p2pTagLabel ? ` · ${p2pTagLabel}` : '');
+
   return (
     <button
       key={sub.id}
@@ -432,7 +438,8 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, sequenceNumber, isOpe
       onDragOver={(event) => onEntryDragOver(sub.id, event)}
       onDragEnd={(event) => onEntryDragEnd(sub.id, event)}
       onContextMenu={(event) => onContextMenu(sub.id, event)}
-      title={label + (modelTitle ? ` · ${modelTitle}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
+      title={buttonTitle}
+      aria-label={inP2p ? buttonTitle : undefined}
       style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
@@ -443,7 +450,11 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, sequenceNumber, isOpe
       )}
       <span class="subsession-card-icon">{abbr}</span>
       <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
-      {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+      {inP2p && (
+        <sub class="subsession-card-team" data-testid={`subsession-team-${sub.id}`} aria-hidden="true">
+          T
+        </sub>
+      )}
       <SharedStateIndicator state={sharedState} iconOnly />
       {compactModel && <span class="subsession-card-model" title={modelTitle}>{compactModel}</span>}
       {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}

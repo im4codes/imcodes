@@ -165,6 +165,47 @@ describe('styles.css regression contracts', () => {
     expect(seqRule).toMatch(/pointer-events:\s*none/);
   });
 
+  it('floats the compact Team T subscript at bottom-right symmetrically with seq without increasing card height', () => {
+    const teamRule = cssWithoutComments.match(/\.subsession-card-team\s*\{[^}]*\}/)?.[0];
+    expect(teamRule).toBeTruthy();
+    expect(teamRule).toMatch(/position:\s*absolute/);
+    expect(teamRule).toMatch(/bottom:\s*2px/);
+    expect(teamRule).toMatch(/right:\s*3px/);
+    expect(teamRule).toMatch(/font-size:\s*9px/);
+    expect(teamRule).toMatch(/font-weight:\s*700/);
+    expect(teamRule).toMatch(/line-height:\s*1/);
+    expect(teamRule).toMatch(/z-index:\s*3/);
+    expect(teamRule).toMatch(/pointer-events:\s*none/);
+    expect(teamRule).toMatch(/box-sizing:\s*border-box/);
+    expect(teamRule).toMatch(/color:\s*#dbeafe/);
+    expect(teamRule).toMatch(/background:/);
+
+    // Must not collide with top-right share indicator or alter desktop/rail/mobile card height or padding
+    const shareRule = cssWithoutComments.match(/\.subsession-card\s*>\s*\.share-state-indicator\s*\{[^}]*\}/)?.[0];
+    expect(shareRule).toMatch(/top:\s*2px/);
+    expect(shareRule).toMatch(/right:\s*2px/);
+
+    const bottomCardRule = cssWithoutComments.match(/\.subsession-card\s*\{[^}]*\}/)?.[0];
+    expect(bottomCardRule).toMatch(/min-height:\s*54px/);
+    expect(bottomCardRule).toMatch(/padding:\s*6px\s+2px\s+9px/);
+
+    const railCardRule = cssWithoutComments.match(/\.subsession-card-rail\s*\{[^}]*\}/)?.[0];
+    expect(railCardRule).toMatch(/min-height:\s*48px/);
+    expect(railCardRule).toMatch(/padding:\s*4px\s+1px\s+5px/);
+
+    const mobileBottomCardRule = cssWithoutComments.match(
+      /@media\s*\(max-width:\s*640px\)\s*\{\s*\.subsession-card:not\(\.subsession-card-rail\)\s*\{[^}]*\}/,
+    )?.[0];
+    expect(mobileBottomCardRule).toMatch(/min-height:\s*42px/);
+    expect(mobileBottomCardRule).toMatch(/padding:\s*2px\s+1px/);
+
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card\.(?:has-team|in-p2p|team)[^{]*\{[^}]*(?:min-height|padding|height)/);
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card-rail\.(?:has-team|in-p2p|team)[^{]*\{[^}]*(?:min-height|padding|height)/);
+    expect(teamRule).not.toMatch(/(?:^|[;\s{])(?:min-)?height:/);
+    // Keep non-button .p2p-tag style intact for cards/tabs/dialogs
+    expect(cssWithoutComments).toMatch(/\.p2p-tag\s*\{/);
+  });
+
   it('keeps the Team discussion rail narrow, in root flex flow, and independently scrollable', () => {
     const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
     expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*17vw,\s*220px\)/);
