@@ -262,4 +262,126 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
       text: '按住说话成功出字',
     }));
   });
+
+  it('keeps primed hold alive across 50ms pending lostpointercapture(buttons=0), adopts same recognizer at 175ms, and still cancels cleanly on window pointerup/cancel', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+
+    // 1. Prime -> onstart -> 50ms pending lostpointercapture(buttons=0) MUST NOT abort; 175ms adopts same instance and sends
+    inUserGesture = true;
+    fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      clientX: 160, clientY: 500, pointerId: 10, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+    }));
+    inUserGesture = false;
+    expect(instances).toHaveLength(1);
+    const rec1 = instances[0];
+    rec1.onstart?.();
+
+    await vi.advanceTimersByTimeAsync(50);
+    fireEvent(input, Object.assign(new Event('lostpointercapture', { bubbles: true, cancelable: true }), {
+      clientX: 160, clientY: 500, pointerId: 10, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+    }));
+    expect(rec1.abort).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(125); // 50 + 125 = 175ms
+    expect(instances).toHaveLength(1);
+    expect(rec1.abort).not.toHaveBeenCalled();
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+
+    rec1.onresult?.({
+      results: {
+        length: 1,
+        0: { 0: { transcript: '预热期内丢捕获仍出字' }, isFinal: true },
+      },
+    });
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+      clientX: 160, clientY: 500, pointerId: 10, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rec1.stop).toHaveBeenCalledTimes(1);
+    rec1.onend?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: '预热期内丢捕获仍出字',
+    }));
+
+    // 2. Pending lostpointercapture at 50ms + window pointerup/cancel at 70ms silently aborts prime & focuses composer
+    for (const [idx, endType] of (['pointerup', 'pointercancel'] as const).entries()) {
+      const pid = 11 + idx;
+      input.blur();
+      fireEvent.blur(input);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('false');
+
+      const beforeLen = instances.length;
+      fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+        clientX: 160, clientY: 500, pointerId: pid, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      expect(instances).toHaveLength(beforeLen + 1);
+      const rec = instances[beforeLen];
+      await vi.advanceTimersByTimeAsync(50);
+      fireEvent(input, Object.assign(new Event('lostpointercapture', { bubbles: true, cancelable: true }), {
+        clientX: 160, clientY: 500, pointerId: pid, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+      }));
+      expect(rec.abort).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20);
+      fireEvent(window, Object.assign(new Event(endType, { bubbles: true, cancelable: true }), {
+        clientX: 160, clientY: 500, pointerId: pid, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rec.abort).toHaveBeenCalledTimes(1);
+      expect(document.querySelector('.voice-hold-hud')).toBeNull();
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(document.activeElement).toBe(input);
+    }
+  });
+
+  it('leaves VoiceOverlay editable (not stuck listening) when primed capture ends with transcript before startListening adopts', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const micBtn = document.querySelector('.btn-voice-embedded') as HTMLButtonElement;
+    // Simulate synchronous onstart + interim result + onend happening inside rec.start() before VoiceOverlay useEffect runs
+    inUserGesture = true;
+    fireEvent.pointerDown(micBtn, { pointerId: 21, button: 0, pointerType: 'touch', isPrimary: true });
+    inUserGesture = false;
+    expect(instances).toHaveLength(1);
+    const rec = instances[0];
+    rec.onstart?.();
+    rec.onresult?.({
+      results: {
+        length: 1,
+        0: { 0: { transcript: '预热提前结束仍可编辑' }, isFinal: false },
+      },
+    });
+    rec.onend?.();
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const textarea = document.querySelector('.voice-overlay-text') as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull();
+    expect(textarea.value).toBe('预热提前结束仍可编辑');
+    expect(textarea.readOnly).toBe(false);
+    expect(document.querySelector('.voice-overlay-mic-active')).toBeNull();
+  });
 });

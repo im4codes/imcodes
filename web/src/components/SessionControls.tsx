@@ -58,7 +58,7 @@ import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
-import { boundedVisualViewportHeight } from '../visual-viewport.js';
+import { boundedVisualViewportHeight, createSettledViewportUpdater } from '../visual-viewport.js';
 import { getMobileKeyboardState } from '../mobile-keyboard.js';
 import { buildExecutionTemplateLabel } from '../execution-template-label.js';
 import { formatLabel, formatSessionTabLabel } from '../format-label.js';
@@ -5828,6 +5828,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       void finalizeVoiceHold(orphanTx, 'cancel');
       return;
     }
+    cancelVoiceInputGesturePrime();
     resetVoiceHoldInteractionState();
   }, [finalizeVoiceHold, resetVoiceHoldInteractionState]);
 
@@ -5842,14 +5843,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (tx && (tx.settled || tx.phase === 'draining' || tx.drainPromise !== null)) {
       return;
     }
-    if (!tx) {
-      cancelVoiceInputGesturePrime();
-      resetVoiceHoldInteractionState();
-      fallbackToComposerClick(ptr.pointerType);
-      return;
-    }
+    // Capture loss is non-terminal across pending/primed/starting/recording:
+    // keep the hold timer, primed capture, and window pointerup/cancel tracking alive.
     ptr.captureLost = true;
-  }, [fallbackToComposerClick, resetVoiceHoldInteractionState]);
+  }, []);
 
   /** Transition a pending pointer press into active voice capture (shared by hold timer and slide promotion). */
   const activateComposerVoiceHold = useCallback((
@@ -7269,8 +7266,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (!isMobileLayout || typeof window === 'undefined' || typeof document === 'undefined') return;
     const vv = window.visualViewport;
-    let baselineWidth = window.innerWidth;
-    let baselineHeight = window.innerHeight;
+    if (!vv) return;
+    let lastWidth = window.innerWidth;
     let hadKeyboardOpen = false;
     let wasKbOpen = false;
 
@@ -7279,31 +7276,28 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (!el) {
         hadKeyboardOpen = false;
         wasKbOpen = false;
-        baselineWidth = window.innerWidth;
-        baselineHeight = window.innerHeight;
+        lastWidth = window.innerWidth;
         return;
       }
-      if (window.innerWidth !== baselineWidth) {
-        baselineWidth = window.innerWidth;
-        baselineHeight = window.innerHeight;
+      if (window.innerWidth !== lastWidth) {
+        lastWidth = window.innerWidth;
         hadKeyboardOpen = false;
         wasKbOpen = false;
       }
       const active = document.activeElement;
       const composerHasFocus = active === el || (active !== null && el.contains(active));
       if (!composerHasFocus) {
-        baselineHeight = window.innerHeight;
         hadKeyboardOpen = false;
         wasKbOpen = false;
         return;
       }
-      baselineHeight = Math.max(baselineHeight, window.innerHeight);
-      const viewportHeight = vv
-        ? boundedVisualViewportHeight(vv.height, window.innerHeight, document.documentElement.clientHeight)
-        : window.innerHeight;
+      const viewportHeight = boundedVisualViewportHeight(
+        vv.height,
+        window.innerHeight,
+        document.documentElement.clientHeight,
+      );
       if (viewportHeight === null) return;
-      const layoutHeight = Math.max(baselineHeight, window.innerHeight);
-      const shrink = Math.max(0, layoutHeight - viewportHeight);
+      const shrink = Math.max(0, window.innerHeight - viewportHeight);
       const state = getMobileKeyboardState(true, shrink, hadKeyboardOpen);
       const dismissed = wasKbOpen && state.hadKeyboardOpen && !state.kbOpen;
       hadKeyboardOpen = state.hadKeyboardOpen;
@@ -7327,21 +7321,38 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       );
     };
 
+    const settledViewportUpdater = createSettledViewportUpdater(syncKeyboardDismiss);
+    const schedule = settledViewportUpdater.schedule;
     const onFocusIn = (e: FocusEvent) => {
       const el = divRef.current;
       const target = e.target as Node | null;
       if (!el || !target || (target !== el && !el.contains(target))) return;
-      syncKeyboardDismiss();
+      schedule();
+    };
+    const onFocusOut = () => {
+      const el = divRef.current;
+      const active = document.activeElement;
+      if (!el || (active !== el && !(active !== null && el.contains(active)))) {
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+      }
     };
 
-    vv?.addEventListener('resize', syncKeyboardDismiss);
-    window.addEventListener('resize', syncKeyboardDismiss);
+    vv.addEventListener('resize', schedule);
+    vv.addEventListener('scroll', schedule);
+    window.addEventListener('resize', schedule);
+    window.addEventListener('pageshow', schedule);
     document.addEventListener('focusin', onFocusIn);
-    syncKeyboardDismiss();
+    document.addEventListener('focusout', onFocusOut);
+    schedule();
     return () => {
-      vv?.removeEventListener('resize', syncKeyboardDismiss);
-      window.removeEventListener('resize', syncKeyboardDismiss);
+      settledViewportUpdater.cancel();
+      vv.removeEventListener('resize', schedule);
+      vv.removeEventListener('scroll', schedule);
+      window.removeEventListener('resize', schedule);
+      window.removeEventListener('pageshow', schedule);
       document.removeEventListener('focusin', onFocusIn);
+      document.removeEventListener('focusout', onFocusOut);
     };
   }, [isMobileLayout]);
 

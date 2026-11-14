@@ -480,6 +480,7 @@ export function VoiceOverlay({
     setVoiceError(null);
 
     let sessionActive = false;
+    let lastReportedListening: boolean | null = null;
     try {
       const ok = await VoiceInput.startListening((partial) => {
         // Discard if session token changed (stale callback from old session)
@@ -517,6 +518,7 @@ export function VoiceOverlay({
       }, (next) => {
         if (sessionTokenRef.current !== token) return;
         if (!openRef.current && next) return;
+        lastReportedListening = next;
         if (next) sessionActive = true;
         setListeningState(next);
         // A stop with a still-current token was not requested by the user
@@ -539,8 +541,12 @@ export function VoiceOverlay({
       });
       // Check guards after async — overlay may have closed or session may have changed
       if (ok && sessionTokenRef.current === token && flushingTokenRef.current !== token && openRef.current) {
-        sessionActive = true;
-        setListeningState(true);
+        if (lastReportedListening === false) {
+          setListeningState(false);
+        } else {
+          sessionActive = true;
+          setListeningState(true);
+        }
       } else if (!ok && sessionTokenRef.current === token && flushingTokenRef.current !== token && openRef.current) {
         setListeningState(false);
         stopNotepadAutoRestart();

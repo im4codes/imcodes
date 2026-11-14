@@ -2553,12 +2553,38 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
     await resetToUnfocused();
 
-    // F1-B: lostpointercapture during pending (!tx, buttons=0, no pointerup) must clear timers & focus immediately
+    // F1-B: lostpointercapture during pending (!tx, buttons=0) is non-terminal: keeps hold alive on window listeners,
+    // adopts at 175ms, while window short-tap pointerup/cancel or direct click still focuses composer cleanly
     voiceMock.startListening.mockClear();
     dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 12, 1);
     await vi.advanceTimersByTimeAsync(50);
     dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 12, 0);
-    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(125); // 50 + 125 = 175ms
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    dispatchPrimaryPointer(window, 'pointerup', 180, 500, 12, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    await resetToUnfocused();
+
+    // Pending lostpointercapture at 50ms + window short-tap pointerup at 70ms silently cancels & focuses
+    voiceMock.startListening.mockClear();
+    dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 13, 1);
+    await vi.advanceTimersByTimeAsync(50);
+    dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 13, 0);
+    await vi.advanceTimersByTimeAsync(20);
+    dispatchPrimaryPointer(window, 'pointerup', 180, 500, 13, 0);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    await resetToUnfocused();
+
+    // Pending orphaned lostpointercapture (no pointerup) + direct click retires & focuses
+    voiceMock.startListening.mockClear();
+    dispatchPrimaryPointer(input, 'pointerdown', 180, 500, 14, 1);
+    await vi.advanceTimersByTimeAsync(50);
+    dispatchPrimaryPointer(input, 'lostpointercapture', 180, 500, 14, 0);
+    fireEvent.click(input);
+    await vi.advanceTimersByTimeAsync(200);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(input.getAttribute('contenteditable')).toBe('true');
     expect(document.activeElement).toBe(input);
@@ -2930,7 +2956,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     try {
       const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
-      render(
+      const { unmount } = render(
         <SessionControls
           ws={ws}
           activeSession={makeSession()}
@@ -2949,7 +2975,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         fireEvent(target, ev);
       };
 
-      // 1. Tap to open edit mode; hardware keyboard case (shrink stays 0) must NEVER auto-blur
+      // 1. Tap to open edit mode; hardware keyboard + synchronous browser-chrome resize (844 -> 780 -> 844) must NEVER auto-blur
       sendTouchPointer(input, 'pointerdown', 1, 1);
       await vi.advanceTimersByTimeAsync(40);
       sendTouchPointer(input, 'pointerup', 1, 0);
@@ -2957,9 +2983,19 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(document.activeElement).toBe(input);
       expect(input.getAttribute('contenteditable')).toBe('true');
 
-      vv.height = 844;
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 780 });
+      vv.height = 780;
+      window.dispatchEvent(new Event('resize'));
       vv.dispatchEvent(new Event('resize'));
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(document.activeElement).toBe(input);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+      vv.height = 844;
+      window.dispatchEvent(new Event('resize'));
+      vv.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(250);
       expect(document.activeElement).toBe(input);
       expect(input.getAttribute('contenteditable')).toBe('true');
 
@@ -2968,7 +3004,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       vv.dispatchEvent(new Event('resize'));
       vv.height = 470;
       vv.dispatchEvent(new Event('resize'));
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(250);
       expect(document.activeElement).toBe(input);
       expect(input.getAttribute('contenteditable')).toBe('true');
 
@@ -2978,10 +3014,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(voiceMock.startListening).not.toHaveBeenCalled();
       sendTouchPointer(input, 'pointerup', 2, 0);
 
-      // 3. User dismisses soft keyboard (470 -> 844) WITHOUT browser firing blur(): composer must exit edit mode & re-arm hold-to-talk
-      vv.height = 844;
-      vv.dispatchEvent(new Event('resize'));
-      await vi.advanceTimersByTimeAsync(0);
+      // 3. WebKit delayed height update on dismiss: resize fires BEFORE vv.height flips back to 844 (no 2nd event)
+      vv.dispatchEvent(new Event('resize')); // vv.height is still 470 when event arrives
+      vv.height = 844; // geometry updates asynchronously after callback without a second resize event
+      await vi.advanceTimersByTimeAsync(250);
       expect(document.activeElement).not.toBe(input);
       expect(input.getAttribute('contenteditable')).toBe('false');
 
@@ -2995,6 +3031,21 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
         text: 'recovered after keyboard dismiss',
       }));
+
+      // 4. Cleanup cancels pending settle timer/frames on unmount without calling blur after unmount
+      sendTouchPointer(input, 'pointerdown', 4, 1);
+      await vi.advanceTimersByTimeAsync(40);
+      sendTouchPointer(input, 'pointerup', 4, 0);
+      await vi.advanceTimersByTimeAsync(0);
+      vv.height = 500;
+      vv.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(250);
+      const blurSpy = vi.spyOn(input, 'blur');
+      vv.dispatchEvent(new Event('resize')); // queues rAF + 200ms settle timer
+      vv.height = 844;
+      unmount();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(blurSpy).not.toHaveBeenCalled();
     } finally {
       if (origVV) Object.defineProperty(window, 'visualViewport', origVV);
       else Reflect.deleteProperty(window, 'visualViewport');
