@@ -110,14 +110,14 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     cleanup();
     render(<KeyboardShortcutsSection isMacOverride={true} />);
     expect(screen.getByText('macOS defaults')).toBeDefined();
-    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('⌃');
-    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('W');
-    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('⌃');
-    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('S');
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌃');
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('A');
-    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('⌃');
-    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('D');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('⌥');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('I');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('⌥');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('K');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌥');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('⌥');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
     const resetTabPrev = screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement;
     expect(resetTabPrev.disabled).toBe(true);
 
@@ -128,11 +128,11 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('←');
     expect((screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement).disabled).toBe(false);
 
-    // Re-recording Ctrl+a matches macOS default and clears the override
+    // Re-recording Option+j (even as macOS dead-key/Option glyph) matches macOS default and clears the override
     fireEvent.click(screen.getByTestId('shortcut-record-tabPrev'));
-    fireEvent.keyDown(document, { key: 'a', code: 'KeyA', ctrlKey: true });
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌃');
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('A');
+    fireEvent.keyDown(document, { key: 'Dead', code: 'KeyJ', altKey: true });
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌥');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
     expect((screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement).disabled).toBe(true);
   });
 

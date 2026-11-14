@@ -133,16 +133,9 @@ export function isMacPlatform(nav?: {
   return /Macintosh|Mac OS/i.test(userAgent);
 }
 
-/** Platform default shortcut map: macOS keeps Ctrl+W/S/A/D; Windows/Linux use Alt+I/K/J/L to avoid browser Ctrl+W/Alt+D/Alt+S conflicts. */
+/** Unified default shortcut map across all desktop platforms (macOS, Windows, Linux): Alt+I/K/J/L avoids macOS system Ctrl+A/D/W/S Emacs/readline & browser tab conflicts. */
 export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
-  if (isMac) {
-    return {
-      serverPrev: 'Ctrl+w',
-      serverNext: 'Ctrl+s',
-      tabPrev: 'Ctrl+a',
-      tabNext: 'Ctrl+d',
-    };
-  }
+  void isMac;
   return {
     serverPrev: 'Alt+i',
     serverNext: 'Alt+k',
