@@ -194,6 +194,7 @@ const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
 const VOICE_HOLD_SLIDE_MAX_PX = 84;
 const VOICE_HOLD_START_TIMEOUT_MS = 10_000;
 const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
+const VOICE_HOLD_DROP_ANIMATION_MS = 300;
 const VOICE_HOLD_BAR_COUNT = 28;
 
 function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEditable: boolean): void {
@@ -236,6 +237,31 @@ function clearComposerVoiceTouchLock(el: HTMLDivElement | null, disabled: boolea
   style.webkitTouchCallout = '';
   style.webkitUserModify = '';
   el.setAttribute('contenteditable', disabled ? 'false' : 'true');
+}
+
+function prefersVoiceHoldReducedMotion(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+
+function computeVoiceHoldDropOffsetPx(
+  transcriptEl: HTMLElement | null,
+  composerEl: HTMLElement | null,
+): number | null {
+  if (!transcriptEl || !composerEl) return null;
+  const tRect = transcriptEl.getBoundingClientRect();
+  const cRect = composerEl.getBoundingClientRect();
+  if (!tRect || !cRect || (tRect.height <= 0 && tRect.width <= 0) || (cRect.height <= 0 && cRect.width <= 0)) {
+    return null;
+  }
+  const tCenterY = tRect.top + tRect.height / 2;
+  const cCenterY = cRect.top + cRect.height / 2;
+  const delta = Math.round(cCenterY - tCenterY);
+  return delta > 24 ? Math.min(delta, 560) : null;
 }
 
 function prewarmVoiceInput(options?: { requestPermission?: boolean }): void {
@@ -1588,10 +1614,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceOverlayAutoStart, setVoiceOverlayAutoStart] = useState(true);
   const [voiceHoldPending, setVoiceHoldPending] = useState(false);
   const [voiceHoldActive, setVoiceHoldActive] = useState(false);
+  const [voiceHoldHudActive, setVoiceHoldHudActive] = useState(false);
   const [voiceHoldZone, setVoiceHoldZone] = useState<'send' | 'cancel' | 'edit'>('send');
   const [voiceHoldDragX, setVoiceHoldDragX] = useState(0);
+  const [voiceHoldDropY, setVoiceHoldDropY] = useState<number | null>(null);
   const [voiceHoldText, setVoiceHoldText] = useState('');
-  const [voiceHoldPhase, setVoiceHoldPhase] = useState<'starting' | 'recording' | 'ended'>('starting');
+  const [voiceHoldPhase, setVoiceHoldPhase] = useState<'starting' | 'recording' | 'ended' | 'draining' | 'dropping'>('starting');
   const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
   const [voiceHoldLiveAudio, setVoiceHoldLiveAudio] = useState(false);
   const [voiceHoldError, setVoiceHoldError] = useState<string | null>(null);
@@ -1601,6 +1629,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const voiceHoldStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldStartTimeoutOwnerRef = useRef<NonNullable<typeof voiceHoldTxRef.current> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldDropTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldDropCancelRef = useRef<(() => void) | null>(null);
   const voiceHoldPointerRef = useRef<{
     id: number;
     startX: number;
@@ -1627,7 +1657,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     baseText: string;
     transcript: string;
     zone: 'send' | 'cancel' | 'edit';
-    phase: 'starting' | 'recording' | 'ended' | 'draining' | 'failed' | 'settled';
+    phase: 'starting' | 'recording' | 'ended' | 'draining' | 'dropping' | 'failed' | 'settled';
     error: string | null;
     pointerType: string;
     didStartRecording: boolean;
@@ -5576,6 +5606,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldStartTimeoutOwnerRef.current = null;
   }, []);
 
+  const clearVoiceHoldDropTimer = useCallback(() => {
+    if (voiceHoldDropTimerRef.current !== null) {
+      clearTimeout(voiceHoldDropTimerRef.current);
+      voiceHoldDropTimerRef.current = null;
+    }
+    if (voiceHoldDropCancelRef.current !== null) {
+      const cancel = voiceHoldDropCancelRef.current;
+      voiceHoldDropCancelRef.current = null;
+      cancel();
+    }
+  }, []);
+
   const clearVoiceHoldTimers = useCallback(() => {
     if (voiceHoldTimerRef.current !== null) {
       clearTimeout(voiceHoldTimerRef.current);
@@ -5590,7 +5632,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearTimeout(voiceHoldRecognizingTimerRef.current);
       voiceHoldRecognizingTimerRef.current = null;
     }
-  }, [clearVoiceHoldStartTimeout]);
+    clearVoiceHoldDropTimer();
+  }, [clearVoiceHoldDropTimer, clearVoiceHoldStartTimeout]);
 
   const clearComposerVoiceWindowListeners = useCallback(() => {
     voiceWindowCleanupRef.current?.();
@@ -5633,7 +5676,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }, durationMs);
   }, []);
 
-  const resetVoiceHoldInteractionState = useCallback(() => {
+  const releaseVoiceHoldInteraction = useCallback(() => {
     voiceHoldPointerRef.current = null;
     voiceHoldPendingRef.current = false;
     voiceHoldActiveRef.current = false;
@@ -5647,14 +5690,30 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     VoiceInput.onAudioLevel(null);
     if (mountedRef.current) {
       setVoiceHoldPending(false);
-      setVoiceHoldPhase('starting');
       setVoiceHoldLiveAudio(false);
       setVoiceHoldRecognizing(false);
       setVoiceHoldActive(false);
-      setVoiceHoldZone('send');
-      setVoiceHoldDragX(0);
     }
   }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers]);
+
+  const closeVoiceHoldHud = useCallback(() => {
+    clearVoiceHoldDropTimer();
+    const zeroBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
+    voiceHoldBarsRef.current = zeroBars;
+    if (mountedRef.current) {
+      setVoiceHoldHudActive(false);
+      setVoiceHoldPhase('starting');
+      setVoiceHoldZone('send');
+      setVoiceHoldDragX(0);
+      setVoiceHoldDropY(null);
+      setVoiceHoldBars(zeroBars);
+    }
+  }, [clearVoiceHoldDropTimer]);
+
+  const resetVoiceHoldInteractionState = useCallback(() => {
+    releaseVoiceHoldInteraction();
+    closeVoiceHoldHud();
+  }, [closeVoiceHoldHud, releaseVoiceHoldInteraction]);
 
   const disarmTouchTapCompatMouseShield = useCallback(() => {
     touchTapCompatShieldCleanupRef.current?.();
@@ -5755,12 +5814,51 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
   }, []);
 
+  const waitForVoiceHoldDrop = useCallback((): Promise<boolean> => {
+    clearVoiceHoldDropTimer();
+    if (prefersVoiceHoldReducedMotion()) {
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolve) => {
+      let finished = false;
+      const cancel = () => {
+        if (finished) return;
+        finished = true;
+        resolve(false);
+      };
+      voiceHoldDropCancelRef.current = cancel;
+      voiceHoldDropTimerRef.current = setTimeout(() => {
+        voiceHoldDropTimerRef.current = null;
+        if (voiceHoldDropCancelRef.current === cancel) {
+          voiceHoldDropCancelRef.current = null;
+        }
+        if (!finished) {
+          finished = true;
+          resolve(true);
+        }
+      }, VOICE_HOLD_DROP_ANIMATION_MS);
+    });
+  }, [clearVoiceHoldDropTimer]);
+
   const finalizeVoiceHold = useCallback((
     tx: NonNullable<typeof voiceHoldTxRef.current>,
     outcome: 'send' | 'cancel' | 'edit' | 'failed',
   ): Promise<void> => {
     if (tx.drainPromise !== null) return tx.drainPromise;
-    resetVoiceHoldInteractionState();
+
+    const shouldKeepHudForDrain = outcome === 'send' || outcome === 'edit';
+    if (shouldKeepHudForDrain) {
+      releaseVoiceHoldInteraction();
+      const zeroBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
+      voiceHoldBarsRef.current = zeroBars;
+      if (mountedRef.current) {
+        setVoiceHoldPhase('draining');
+        setVoiceHoldHudActive(true);
+        setVoiceHoldBars(zeroBars);
+      }
+    } else {
+      resetVoiceHoldInteractionState();
+    }
 
     // Any hold that never succeeded in active capture falls back to typing focus
     // (regardless of slide zone), whereas explicit slide-to-cancel after active
@@ -5856,10 +5954,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           }
           tx.settled = true;
           tx.phase = 'settled';
+          closeVoiceHoldHud();
           return;
         }
-        tx.settled = true;
-        tx.phase = 'settled';
 
         const spoken = tx.transcript.trim();
         const base = tx.baseText;
@@ -5868,20 +5965,46 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           : spoken;
 
         if (outcome === 'edit') {
+          tx.settled = true;
+          tx.phase = 'settled';
+          closeVoiceHoldHud();
           setVoiceOverlayInitialText(combined);
           setVoiceOverlayAutoStart(false);
           setVoiceOpen(true);
           return;
         }
         if (spoken && combined.trim()) {
+          const dropY = computeVoiceHoldDropOffsetPx(voiceHoldTranscriptRef.current, divRef.current);
+          tx.phase = 'dropping';
+          if (mountedRef.current) {
+            setVoiceHoldDropY(dropY);
+            setVoiceHoldPhase('dropping');
+          }
+          const completed = await waitForVoiceHoldDrop();
+          if (!completed || tx.settled || !mountedRef.current) {
+            return;
+          }
+          tx.settled = true;
+          tx.phase = 'settled';
+          closeVoiceHoldHud();
           handleVoiceSend(combined.trim());
+          return;
         }
+        tx.settled = true;
+        tx.phase = 'settled';
+        closeVoiceHoldHud();
       } finally {
         if (drainTimer !== null) {
           clearTimeout(drainTimer);
           drainTimer = null;
         }
-        tx.settled = true;
+        if (!tx.settled) {
+          tx.settled = true;
+          tx.phase = 'settled';
+        }
+        if (mountedRef.current && voiceHoldTxRef.current === tx) {
+          closeVoiceHoldHud();
+        }
         if (voiceHoldTxRef.current === tx) {
           voiceHoldTxRef.current = null;
         }
@@ -5889,7 +6012,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     })();
 
     return tx.drainPromise;
-  }, [fallbackToComposerClick, handleVoiceSend, resetVoiceHoldInteractionState]);
+  }, [
+    closeVoiceHoldHud,
+    fallbackToComposerClick,
+    handleVoiceSend,
+    releaseVoiceHoldInteraction,
+    resetVoiceHoldInteractionState,
+    waitForVoiceHoldDrop,
+  ]);
 
   const retireOrphanedVoiceHold = useCallback(() => {
     const orphanTx = voiceHoldTxRef.current;
@@ -5903,8 +6033,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
     cancelVoiceInputGesturePrime();
+    if (orphanTx && !orphanTx.settled && orphanTx.drainPromise !== null) {
+      releaseVoiceHoldInteraction();
+      return;
+    }
     resetVoiceHoldInteractionState();
-  }, [finalizeVoiceHold, resetVoiceHoldInteractionState]);
+  }, [finalizeVoiceHold, releaseVoiceHoldInteraction, resetVoiceHoldInteractionState]);
 
   const handleComposerVoiceLostPointerCapture = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
@@ -5914,7 +6048,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (!ptr) return;
     if (event.pointerId !== undefined && event.pointerId !== ptr.id) return;
     const tx = voiceHoldTxRef.current;
-    if (tx && (tx.settled || tx.phase === 'draining' || tx.drainPromise !== null)) {
+    if (tx && (tx.settled || tx.phase === 'draining' || tx.phase === 'dropping' || tx.drainPromise !== null)) {
       return;
     }
     // Capture loss is non-terminal across pending/primed/starting/recording:
@@ -5966,7 +6100,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       baseText: base,
       transcript: '',
       zone: 'send' as 'send' | 'cancel' | 'edit',
-      phase: 'starting' as 'starting' | 'recording' | 'ended' | 'draining' | 'failed' | 'settled',
+      phase: 'starting' as 'starting' | 'recording' | 'ended' | 'draining' | 'dropping' | 'failed' | 'settled',
       error: null as string | null,
       pointerType: ptr.pointerType,
       didStartRecording: false,
@@ -5985,10 +6119,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setVoiceHoldText('');
     setVoiceHoldZone('send');
     setVoiceHoldDragX(0);
+    setVoiceHoldDropY(null);
     setVoiceHoldPhase('starting');
     setVoiceHoldLiveAudio(false);
     setVoiceHoldRecognizing(false);
     setVoiceHoldActive(true);
+    setVoiceHoldHudActive(true);
     if (initialDx !== 0) {
       updateVoiceHoldZoneFromDx(tx, initialDx, false);
     }
@@ -6000,6 +6136,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       tx.error = errCode || 'permission_denied';
       if (mountedRef.current) {
         setVoiceHoldError(tx.error);
+      }
+      if (tx.drainPromise !== null) {
+        closeVoiceHoldHud();
+        return;
       }
       void finalizeVoiceHold(tx, 'failed');
     };
@@ -6052,9 +6192,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             setVoiceHoldPhase('recording');
           }
         }
-        if (mountedRef.current && voiceHoldTxRef.current === tx && (tx.phase === 'starting' || tx.phase === 'recording')) {
+        if (
+          mountedRef.current
+          && voiceHoldTxRef.current === tx
+          && (tx.phase === 'starting' || tx.phase === 'recording' || tx.phase === 'draining')
+        ) {
           setVoiceHoldText(partial);
-          pulseVoiceHoldRecognizing(900);
+          if (tx.phase === 'starting' || tx.phase === 'recording') {
+            pulseVoiceHoldRecognizing(900);
+          }
         }
       },
       (listening) => {
@@ -6126,6 +6272,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [
     clearComposerVoiceWindowListeners,
     clearVoiceHoldStartTimeout,
+    closeVoiceHoldHud,
     fallbackToComposerClick,
     finalizeVoiceHold,
     pulseVoiceHoldRecognizing,
@@ -6435,11 +6582,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, disarmTouchTapCompatMouseShield]);
 
   useLayoutEffect(() => {
-    if (!voiceHoldActive) return;
+    if (!voiceHoldHudActive || voiceHoldPhase === 'dropping') return;
     const el = voiceHoldTranscriptRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [voiceHoldActive, voiceHoldText]);
+  }, [voiceHoldHudActive, voiceHoldPhase, voiceHoldText]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
@@ -9237,17 +9384,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        {voiceHoldActive && typeof document !== 'undefined' && (() => {
+        {voiceHoldHudActive && typeof document !== 'undefined' && (() => {
           const voiceHoldRecording = voiceHoldPhase === 'recording';
           const voiceHoldEnded = voiceHoldPhase === 'ended';
-          const voiceHoldActuallyRecognizing = voiceHoldRecording && voiceHoldRecognizing;
+          const voiceHoldDraining = voiceHoldPhase === 'draining';
+          const voiceHoldDropping = voiceHoldPhase === 'dropping';
+          const voiceHoldActuallyRecognizing = (voiceHoldRecording && voiceHoldRecognizing) || voiceHoldDraining;
           const voiceHoldTranscriptDisplay = voiceHoldText.trim()
             ? voiceHoldText
             : voiceHoldEnded
               ? t('voice.no_speech')
-              : voiceHoldRecording
-                ? (voiceHoldActuallyRecognizing ? t('voice.buffering_hint') : t('voice.speak_now'))
-                : t('voice.starting');
+              : voiceHoldDraining
+                ? t('voice.buffering_hint')
+                : voiceHoldRecording
+                  ? (voiceHoldActuallyRecognizing ? t('voice.buffering_hint') : t('voice.speak_now'))
+                  : t('voice.starting');
           const voiceHoldStatusLabel = voiceHoldEnded
             ? (voiceHoldText.trim() ? t('voice.ended') : t('voice.no_speech'))
             : voiceHoldPhase === 'starting'
@@ -9257,10 +9408,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 : t('voice.listening');
           return createPortal(
           <div
-            class={`voice-hold-hud voice-hold-hud-zone-${voiceHoldZone}`}
+            class={`voice-hold-hud voice-hold-hud-zone-${voiceHoldZone}${voiceHoldDropping ? ' is-dropping' : ''}`}
             data-zone={voiceHoldZone}
             data-phase={voiceHoldPhase}
-            style={{ '--voice-slide-x': `${voiceHoldDragX}px` } as JSX.CSSProperties}
+            style={{
+              '--voice-slide-x': `${voiceHoldDragX}px`,
+              ...(voiceHoldDropY !== null ? { '--voice-drop-y': `${voiceHoldDropY}px` } : {}),
+            } as JSX.CSSProperties}
             role="status"
             aria-live="polite"
           >
@@ -9278,10 +9432,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <div class="voice-hold-hud-header">
                 <span class={`voice-hold-hud-recognizing${voiceHoldActuallyRecognizing ? ' is-recognizing' : ''}${voiceHoldEnded ? ' is-ended' : ''}`}>
                   <span
-                    class={`voice-status-dot${voiceHoldRecording ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
+                    class={`voice-status-dot${voiceHoldRecording || voiceHoldDraining ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
                     aria-hidden="true"
                   />
-                  {voiceHoldRecording && (
+                  {(voiceHoldRecording || voiceHoldDraining) && (
                     <span class="voice-recognizing-dots" aria-hidden="true">
                       <i /><i /><i />
                     </span>
@@ -9387,7 +9541,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           document.body,
         );
         })()}
-        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}`}>
+        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}${voiceHoldHudActive && voiceHoldPhase === 'dropping' ? ' controls-composer-voice-dropping' : ''}`}>
           {!isMobileLayout && !compact && (
             <>
               <div

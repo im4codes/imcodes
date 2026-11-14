@@ -3802,6 +3802,68 @@ html.native-ios-mac .chat-dl-btn {
   filter: drop-shadow(0 0 12px rgba(52, 211, 153, 0.58));
   transform: scale(1.04);
 }
+.voice-hold-hud[data-phase="draining"] .voice-hold-hud-waveform,
+.voice-hold-hud[data-phase="draining"] .voice-hold-hud-active-hint,
+.voice-hold-hud[data-phase="draining"] .voice-hold-hud-zones,
+.voice-hold-hud.is-dropping .voice-hold-hud-waveform,
+.voice-hold-hud.is-dropping .voice-hold-hud-active-hint,
+.voice-hold-hud.is-dropping .voice-hold-hud-zones {
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+.voice-hold-hud.is-dropping {
+  background: transparent;
+  transition: background 0.24s ease;
+}
+.voice-hold-hud.is-dropping .voice-hold-hud-atmosphere,
+.voice-hold-hud.is-dropping .voice-hold-hud-card {
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+@keyframes voice-hold-transcript-drop {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 1;
+  }
+  45% {
+    transform: translate3d(0, calc(var(--voice-drop-y, 160px) * 0.42), 0) scale(0.7);
+    opacity: 0.98;
+  }
+  78% {
+    transform: translate3d(0, calc(var(--voice-drop-y, 160px) * 0.82), 0) scale(0.46);
+    opacity: 0.72;
+  }
+  100% {
+    transform: translate3d(0, var(--voice-drop-y, 160px), 0) scale(0.35);
+    opacity: 0;
+  }
+}
+.voice-hold-hud.is-dropping .voice-hold-hud-transcript {
+  transform-origin: center center;
+  will-change: transform, opacity;
+  animation: voice-hold-transcript-drop 300ms cubic-bezier(0.32, 0.04, 0.24, 1) forwards;
+}
+@keyframes voice-composer-drop-receive {
+  0% {
+    border-color: rgba(56, 189, 248, 0.42);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 14px rgba(34, 211, 238, 0.12);
+  }
+  60% {
+    border-color: rgba(56, 189, 248, 0.92);
+    box-shadow:
+      inset 0 0 24px rgba(56, 189, 248, 0.24),
+      0 0 20px rgba(56, 189, 248, 0.34);
+  }
+  100% {
+    border-color: rgba(56, 189, 248, 0.65);
+    box-shadow:
+      inset 0 0 16px rgba(56, 189, 248, 0.14),
+      0 0 14px rgba(34, 211, 238, 0.22);
+  }
+}
+.controls-composer-voice-dropping .controls-input {
+  animation: voice-composer-drop-receive 300ms ease-out forwards;
+}
 @container (max-height: 420px) {
   .voice-hold-hud-transcript-stage {
     padding: 4px 16px 6px;
@@ -3920,6 +3982,8 @@ html.native-ios-mac .chat-dl-btn {
   .controls-composer-voice-pending::after,
   .controls-composer-voice-holding::after,
   .controls-composer-voice-holding .controls-input,
+  .controls-composer-voice-dropping .controls-input,
+  .voice-hold-hud.is-dropping .voice-hold-hud-transcript,
   .voice-streaming-robot-cursor.is-active,
   .voice-streaming-robot-cursor.is-active .voice-robot-antenna,
   .voice-streaming-robot-cursor.is-active .voice-robot-aura,
@@ -3932,6 +3996,9 @@ html.native-ios-mac .chat-dl-btn {
   .voice-hold-hud-atmosphere,
   .voice-hold-hud-aurora,
   .voice-hold-hud-aurora-core,
+  .voice-hold-hud-card,
+  .voice-hold-hud-waveform,
+  .voice-hold-hud-zones,
   .voice-hold-hud-transcript,
   .voice-hold-hud-bar,
   .voice-hold-hud-active-hint,

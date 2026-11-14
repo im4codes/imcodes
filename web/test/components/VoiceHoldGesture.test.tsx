@@ -359,12 +359,12 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(transcriptEl.textContent).toBe('你好 IM.codes');
     expect(transcriptEl.querySelector('.voice-streaming-robot-cursor')).not.toBeNull();
 
-    // Release in center zone drains stopListening and sends immediately, returning unfocused composer to contenteditable="false"
+    // Release in center zone drains stopListening, animates drop-into-composer, and sends, returning unfocused composer to contenteditable="false"
     voiceMock.stopListening.mockImplementationOnce(async () => {
       voiceMock.partialHandler?.('你好 IM.codes 最终');
     });
     dispatchPointer(input, 'pointerup', 180);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
 
     expect(voiceMock.stopListening).toHaveBeenCalledTimes(1);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
@@ -516,7 +516,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(350);
 
     releaseDrain();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
 
     expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
@@ -2144,7 +2144,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     // Release drain still delivers the first hold's final tail once without starting a second recording
     releaseDrain();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
     expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
@@ -2198,7 +2198,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     // Deliver trailing final tail and complete stop drain -> delivered intact once!
     voiceMock.partialHandler?.('initial speech with final tail');
     completeStop();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(outcome === 'send' ? 300 : 0);
 
     if (outcome === 'send') {
       expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
@@ -2298,7 +2298,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     Object.assign(trailingLost, { pointerId: 5, pointerType: 'touch', isPrimary: true, buttons: 0 });
     fireEvent(input, trailingLost);
     releaseSendDrain();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: 'Recovered via click tail survives trailing lostcapture',
     }));
@@ -2453,7 +2453,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.activeElement).toBe(input);
     dispatchPointer(input, 'pointerup', 180, 500, 6);
     resolveSlowStop();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: 'first drain phrase',
     }));
@@ -2533,7 +2533,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     voiceMock.partialHandler?.('captured despite lostpointercapture');
     await vi.advanceTimersByTimeAsync(0);
     dispatchPrimaryPointer(window, 'pointerup', 180, 500, 11, 0);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(voiceMock.stopListening).toHaveBeenCalled();
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: 'captured despite lostpointercapture',
@@ -2847,7 +2847,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     voiceMock.listeningHandler?.(true);
     voiceMock.partialHandler?.('voice text ok');
     dispatchPrimary(input, 'pointerup', 180, 500, 23, 0);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
   });
 
@@ -3028,7 +3028,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
       voiceMock.partialHandler?.('recovered after keyboard dismiss');
       sendTouchPointer(window, 'pointerup', 3, 0);
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(300);
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
         text: 'recovered after keyboard dismiss',
       }));
@@ -3216,7 +3216,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-phase')).toBe('recording');
 
     dispatchPointer(input, 'pointerup', 180, 500, 2);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: 'hello mobile',
     }));
@@ -3299,5 +3299,197 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('keeps HUD & transcript bubble alive in data-phase="draining" while stopListening drains, updates trailing partials live, animates progressive drop-into-composer over 300ms, then sends', async () => {
+    let releaseStop!: () => void;
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseStop = r; }));
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const composer = document.querySelector('.controls-composer') as HTMLElement;
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    vi.spyOn(input, 'getBoundingClientRect').mockReturnValue({
+      x: 16, y: 740, left: 16, top: 740, right: 336, bottom: 788, width: 320, height: 48, toJSON: () => ({}),
+    } as DOMRect);
+
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('初始语音');
+    await vi.advanceTimersByTimeAsync(0);
+
+    const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
+    const transcriptEl = hud.querySelector('.voice-hold-hud-transcript') as HTMLElement;
+    expect(transcriptEl.textContent).toBe('初始语音');
+    vi.spyOn(transcriptEl, 'getBoundingClientRect').mockReturnValue({
+      x: 40, y: 240, left: 40, top: 240, right: 320, bottom: 300, width: 280, height: 60, toJSON: () => ({}),
+    } as DOMRect);
+
+    // Release finger while stopListening is still pending -> MUST remain open in data-phase="draining"
+    dispatchPointer(input, 'pointerup', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
+    expect(document.querySelector('.voice-hold-hud')).toBe(hud);
+    expect(hud.getAttribute('data-phase')).toBe('draining');
+    expect(hud.classList.contains('is-dropping')).toBe(false);
+    expect(hud.querySelector('.voice-hold-hud-recognizing.is-recognizing')).not.toBeNull();
+    expect(hud.querySelector('.voice-recognizing-dots')).not.toBeNull();
+    expect(transcriptEl.textContent).toBe('初始语音');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // Late trailing partial arrives during draining -> bubble updates live
+    voiceMock.partialHandler?.('初始语音 加上末尾识别词');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transcriptEl.textContent).toBe('初始语音 加上末尾识别词');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // stopListening resolves -> transitions to data-phase="dropping" (.is-dropping) sliding down toward composer (764 - 270 = 494px)
+    releaseStop();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(document.querySelector('.voice-hold-hud')).toBe(hud);
+    expect(hud.getAttribute('data-phase')).toBe('dropping');
+    expect(hud.classList.contains('is-dropping')).toBe(true);
+    expect(hud.style.getPropertyValue('--voice-drop-y')).toBe('494px');
+    expect(composer.classList.contains('controls-composer-voice-dropping')).toBe(true);
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // Still dropping at 299ms
+    await vi.advanceTimersByTimeAsync(299);
+    expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-phase')).toBe('dropping');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // Completes at 300ms -> closes HUD and sends final text
+    await vi.advanceTimersByTimeAsync(1);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(composer.classList.contains('controls-composer-voice-dropping')).toBe(false);
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: '初始语音 加上末尾识别词',
+    }));
+  });
+
+  it('keeps draining HUD alive for edit release with trailing partials, skips drop on empty speech/unmount, and respects prefers-reduced-motion CSS & timing', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const view = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = document.querySelector('.controls-input') as HTMLElement;
+
+    // 1. Edit release: draining stays visible and updates trailing partials before opening VoiceOverlay
+    let releaseEditStop!: () => void;
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseEditStop = r; }));
+    dispatchPointer(input, 'pointerdown', 160, 500, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('编辑草稿');
+    dispatchPointer(input, 'pointermove', 240, 500, 1); // edit zone
+    dispatchPointer(input, 'pointerup', 240, 500, 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const editHud = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(editHud).not.toBeNull();
+    expect(editHud.getAttribute('data-phase')).toBe('draining');
+    voiceMock.partialHandler?.('编辑草稿 完整尾句');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(editHud.querySelector('.voice-hold-hud-transcript')?.textContent).toBe('编辑草稿 完整尾句');
+    expect(document.querySelector('.mock-voice-overlay')).toBeNull();
+
+    releaseEditStop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(document.querySelector('.mock-voice-overlay')?.getAttribute('data-initial-text')).toBe('编辑草稿 完整尾句');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // Close overlay cleanly before next scenario (advance past Preact useEffect rAF flush)
+    overlaySpy.lastProps?.onClose?.();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(document.querySelector('.mock-voice-overlay')).toBeNull();
+
+    // 2. Empty speech release in send zone closes cleanly without dropping or sending
+    let releaseEmptyStop!: () => void;
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseEmptyStop = r; }));
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-phase')).toBe('draining');
+    releaseEmptyStop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // 3. prefers-reduced-motion: reduce skips 300ms wait cleanly and sends immediately when drain finishes
+    const matchMediaSpy = vi.spyOn(window, 'matchMedia').mockImplementation((query: string) => ({
+      matches: query === '(prefers-reduced-motion: reduce)',
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }) as MediaQueryList);
+    try {
+      dispatchPointer(input, 'pointerdown', 180, 500, 3);
+      await vi.advanceTimersByTimeAsync(175);
+      voiceMock.listeningHandler?.(true);
+      voiceMock.partialHandler?.('reduced motion voice');
+      dispatchPointer(input, 'pointerup', 180, 500, 3);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('.voice-hold-hud')).toBeNull();
+      expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        text: 'reduced motion voice',
+      }));
+    } finally {
+      matchMediaSpy.mockRestore();
+    }
+
+    // 4. Unmount mid-dropping clears 300ms timer cleanly and never fires stale handleVoiceSend
+    let releaseDropUnmountStop!: () => void;
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseDropUnmountStop = r; }));
+    dispatchPointer(input, 'pointerdown', 180, 500, 4);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('should cancel on unmount');
+    dispatchPointer(input, 'pointerup', 180, 500, 4);
+    await vi.advanceTimersByTimeAsync(0);
+    releaseDropUnmountStop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-phase')).toBe('dropping');
+    await vi.advanceTimersByTimeAsync(150);
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+    view.unmount();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+
+    // 5. CSS keyframe progressive shrink (scale(1) -> scale(0.7) -> scale(0.46) -> scale(0.35) over 300ms) & reduced-motion disable rule
+    const stylesPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/styles.css');
+    const css = readFileSync(stylesPath, 'utf8');
+    expect(css).toContain('@keyframes voice-hold-transcript-drop');
+    expect(css).toContain('scale(0.7)');
+    expect(css).toContain('scale(0.35)');
+    expect(css).toContain('animation: voice-hold-transcript-drop 300ms');
+    expect(css).toContain('.voice-hold-hud.is-dropping .voice-hold-hud-transcript');
   });
 });

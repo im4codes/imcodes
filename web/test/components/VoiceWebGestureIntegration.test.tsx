@@ -257,7 +257,7 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
     fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
       clientX: 160, clientY: 500, pointerId: 2, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
     }));
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: '按住说话成功出字',
     }));
@@ -311,7 +311,7 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
     await vi.advanceTimersByTimeAsync(0);
     expect(rec1.stop).toHaveBeenCalledTimes(1);
     rec1.onend?.();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: '预热期内丢捕获仍出字',
     }));
@@ -687,7 +687,7 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
     Object.assign(ev2Up, { clientX: 180, clientY: 500, pointerId: 11, button: 0, pointerType: 'touch', isPrimary: true });
     fireEvent(window, ev2Up);
     instances[1].onend?.();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: 'recovered second attempt',
     }));
