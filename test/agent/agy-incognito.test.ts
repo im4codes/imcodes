@@ -983,4 +983,104 @@ process.kill(process.pid, 'SIGKILL');
       try { origKill(guarded.pid!, 'SIGKILL'); } catch { /* noop */ }
     }
   });
+
+  it('treats a child that exits between isPidAlive and identity read as dead (reaping its group) while keeping live unreadable processes inconclusive', async () => {
+    const customTmp = makeTempDir('agy-incog-toctou-');
+
+    // 1. Spawn a detached group leader that spawns a same-group background worker, then kill the leader
+    //    so its same-group descendant survives under pgid=leader.pid.
+    const workerScript = path.join(customTmp, 'group-worker.mjs');
+    writeFileSync(workerScript, 'setInterval(() => {}, 1000);\n');
+    const leader = spawn(process.execPath, [
+      '--input-type=module',
+      '-e',
+      `
+        import { spawn } from 'node:child_process';
+        const w = spawn(process.execPath, [${JSON.stringify(workerScript)}], { stdio: 'ignore' });
+        process.stdout.write(String(w.pid) + '\\n');
+        setInterval(() => {}, 1000);
+      `,
+    ], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    strayPids.push(leader.pid!);
+    let leaderOut = '';
+    leader.stdout.on('data', (chunk) => { leaderOut += chunk.toString('utf8'); });
+    await vi.waitFor(() => expect(leaderOut.trim()).toMatch(/^\d+$/), { timeout: 5000 });
+    const workerPid = Number(leaderOut.trim());
+    strayPids.push(workerPid);
+    expect(pidAlive(workerPid)).toBe(true);
+
+    const orphanDir = path.join(customTmp, 'imcodes-agy-incog-toctou-dead-leader');
+    mkdirSync(orphanDir, { recursive: true });
+    let meta: Record<string, unknown> = {
+      version: 1,
+      pid: 999_999_999,
+      createdAt: Date.now() - 10_000,
+      childPid: leader.pid,
+      ownsProcessGroup: true,
+    };
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${leader.pid}/stat`, 'utf8');
+      meta = { ...meta, childStartTicks: stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)[19] };
+    } else {
+      const s = spawnSync('ps', ['-o', 'lstart=', '-p', String(leader.pid!)], { encoding: 'utf8' });
+      meta = { ...meta, childProcessStart: s.stdout.trim() };
+    }
+    writeFileSync(path.join(orphanDir, '.imcodes-owner.json'), JSON.stringify(meta));
+
+    // Kill and reap only the group leader; workerPid stays alive in pgid=leader.pid.
+    leader.kill('SIGKILL');
+    await new Promise((resolve) => leader.once('exit', resolve));
+    expect(pidAlive(leader.pid!)).toBe(false);
+    expect(pidAlive(workerPid)).toBe(true);
+
+    // Simulate the race where initial isPidAlive(leader.pid) returned true, then leader exited
+    // right before /proc or `ps` ran (next kill(leader.pid, 0) sees ESRCH).
+    const origKill = process.kill.bind(process);
+    let initialProbeFaked = false;
+    const toctouSpy = vi.spyOn(process, 'kill').mockImplementation((pid: number, sig?: string | number) => {
+      if (pid === leader.pid && sig === 0 && !initialProbeFaked) {
+        initialProbeFaked = true;
+        return true;
+      }
+      return origKill(pid, sig as NodeJS.Signals);
+    });
+    try {
+      expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(1);
+    } finally {
+      toctouSpy.mockRestore();
+    }
+    expect(initialProbeFaked).toBe(true);
+    expect(pidAlive(workerPid)).toBe(false);
+    expect(existsSync(orphanDir)).toBe(false);
+
+    // 2. Negative control: when the child IS still alive and `ps` is unavailable (non-Linux PATH=''),
+    //    checkProcessIdentityAsync must still return 'inconclusive' and preserve the directory.
+    if (process.platform !== 'linux') {
+      const liveChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      strayPids.push(liveChild.pid!);
+      const liveDir = path.join(customTmp, 'imcodes-agy-incog-live-unreadable');
+      mkdirSync(liveDir, { recursive: true });
+      const s = spawnSync('ps', ['-o', 'lstart=', '-p', String(liveChild.pid!)], { encoding: 'utf8' });
+      writeFileSync(path.join(liveDir, '.imcodes-owner.json'), JSON.stringify({
+        version: 1,
+        pid: 999_999_999,
+        createdAt: Date.now() - 10_000,
+        childPid: liveChild.pid,
+        childProcessStart: s.stdout.trim(),
+        ownsProcessGroup: true,
+      }));
+      vi.stubEnv('PATH', '');
+      expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(0);
+      vi.unstubAllEnvs();
+      expect(pidAlive(liveChild.pid!)).toBe(true);
+      expect(existsSync(liveDir)).toBe(true);
+      try { origKill(liveChild.pid!, 'SIGKILL'); } catch { /* noop */ }
+    }
+  });
 });

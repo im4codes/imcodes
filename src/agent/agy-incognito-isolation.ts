@@ -161,6 +161,18 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+function classifyProcessIdentity(
+  pid: number,
+  liveIdentity: string | undefined,
+  expectedIdentity: string,
+): ProcessIdentityStatus {
+  // Re-check liveness after an empty identity read: if the process exited between
+  // isPidAlive() and reading /proc or spawning ps, it is dead rather than inconclusive.
+  // Live processes whose identity still cannot be read remain fail-closed ('inconclusive').
+  if (!liveIdentity) return isPidAlive(pid) ? 'inconclusive' : 'dead';
+  return liveIdentity === expectedIdentity ? 'alive' : 'recycled';
+}
+
 function checkProcessIdentitySync(
   pid: number,
   expectedStartTicks: string | undefined,
@@ -168,14 +180,10 @@ function checkProcessIdentitySync(
 ): ProcessIdentityStatus {
   if (!isPidAlive(pid)) return 'dead';
   if (expectedStartTicks && process.platform === 'linux') {
-    const liveTicks = readLinuxProcessStartTicks(pid);
-    if (!liveTicks) return 'inconclusive';
-    return liveTicks === expectedStartTicks ? 'alive' : 'recycled';
+    return classifyProcessIdentity(pid, readLinuxProcessStartTicks(pid), expectedStartTicks);
   }
   if (expectedProcessStart) {
-    const liveStart = readProcessStartSync(pid);
-    if (!liveStart) return 'inconclusive';
-    return liveStart === expectedProcessStart ? 'alive' : 'recycled';
+    return classifyProcessIdentity(pid, readProcessStartSync(pid), expectedProcessStart);
   }
   return 'inconclusive';
 }
@@ -187,14 +195,10 @@ async function checkProcessIdentityAsync(
 ): Promise<ProcessIdentityStatus> {
   if (!isPidAlive(pid)) return 'dead';
   if (expectedStartTicks && process.platform === 'linux') {
-    const liveTicks = readLinuxProcessStartTicks(pid);
-    if (!liveTicks) return 'inconclusive';
-    return liveTicks === expectedStartTicks ? 'alive' : 'recycled';
+    return classifyProcessIdentity(pid, readLinuxProcessStartTicks(pid), expectedStartTicks);
   }
   if (expectedProcessStart) {
-    const liveStart = await readProcessStart(pid);
-    if (!liveStart) return 'inconclusive';
-    return liveStart === expectedProcessStart ? 'alive' : 'recycled';
+    return classifyProcessIdentity(pid, await readProcessStart(pid), expectedProcessStart);
   }
   return 'inconclusive';
 }
