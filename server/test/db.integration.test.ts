@@ -257,6 +257,26 @@ describe('runMigrations', () => {
     );
     expect(idx?.indexname).toBe('idx_session_text_tail_cache_updated_at');
   });
+
+  it('cron_jobs and cron_executions have dispatch scheduler indexes (migration 109)', async () => {
+    const jobsIdx = await db.queryOne<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef FROM pg_indexes
+       WHERE tablename = 'cron_jobs'
+         AND indexname = 'idx_cron_jobs_active_next_run'`,
+      [],
+    );
+    expect(jobsIdx?.indexname).toBe('idx_cron_jobs_active_next_run');
+    expect(jobsIdx?.indexdef).toContain("WHERE (status = 'active'::text)");
+
+    const execIdx = await db.queryOne<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef FROM pg_indexes
+       WHERE tablename = 'cron_executions'
+         AND indexname = 'idx_cron_executions_status_created'`,
+      [],
+    );
+    expect(execIdx?.indexname).toBe('idx_cron_executions_status_created');
+    expect(execIdx?.indexdef).toContain('(status, created_at)');
+  });
 });
 
 // ── 2. Database wrapper ─────────────────────────────────────────────────────
@@ -405,6 +425,42 @@ describe('session_text_tail_cache', () => {
         text: 'rebuilt',
       },
     ]);
+  });
+
+  it('handles concurrent upserts, equal-ts tie-breaks, and updates latest_ts atomically', async () => {
+    const concurrentSession = `${sessionName}-concurrent`;
+    await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, concurrentSession]);
+
+    await Promise.all(
+      Array.from({ length: 12 }, (_, idx) =>
+        upsertSessionTextTailCacheEvent(db, serverId, {
+          eventId: `c-${String(idx).padStart(2, '0')}`,
+          sessionId: concurrentSession,
+          ts: 1000 + Math.floor(idx / 3),
+          type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+          payload: { text: `concurrent ${idx}` },
+        })),
+    );
+
+    const events = await getSessionTextTailCache(db, serverId, concurrentSession);
+    expect(events).toHaveLength(12);
+    expect(events.map((e) => e.eventId)).toEqual(
+      Array.from({ length: 12 }, (_, idx) => `c-${String(idx).padStart(2, '0')}`),
+    );
+
+    // Overwriting the highest-ts event with an earlier ts must lower latest_ts accurately.
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: 'c-11',
+      sessionId: concurrentSession,
+      ts: 500,
+      type: 'assistant.text',
+      payload: { text: 'moved earlier' },
+    });
+    const row = await db.queryOne<{ latest_ts: number }>(
+      'SELECT latest_ts FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2',
+      [serverId, concurrentSession],
+    );
+    expect(row?.latest_ts).toBe(1003);
   });
 });
 

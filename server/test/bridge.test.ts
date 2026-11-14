@@ -9565,8 +9565,12 @@ describe('WsBridge', () => {
     it('fails open when session_text_tail_cache update throws', async () => {
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();
-      const db = makeDb('valid-hash') as import('../src/db/client.js').Database & { transaction: ReturnType<typeof vi.fn> };
-      db.transaction = vi.fn(async () => { throw new Error('write failed'); }) as never;
+      const db = makeDb('valid-hash') as import('../src/db/client.js').Database & { execute: ReturnType<typeof vi.fn> };
+      const origExecute = db.execute.bind(db);
+      db.execute = vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('session_text_tail_cache')) throw new Error('write failed');
+        return origExecute(sql, params);
+      }) as never;
       const browserWs = new MockWs();
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 

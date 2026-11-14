@@ -114,6 +114,16 @@ export interface EnvConfig {
   /** Host that serves the landing page instead of the app (e.g. im.codes). */
   LANDING_HOST?: string;
 
+  // Database pool
+  /** Maximum PostgreSQL pool connections (default: 25). */
+  DB_POOL_MAX?: string;
+  /** PostgreSQL pool acquire timeout in ms (default: 5000). */
+  DB_POOL_CONNECTION_TIMEOUT_MS?: string;
+  /** PostgreSQL idle client timeout in ms (default: 30000). */
+  DB_POOL_IDLE_TIMEOUT_MS?: string;
+  /** PostgreSQL per-statement timeout in ms (default: 15000). */
+  DB_STATEMENT_TIMEOUT_MS?: string;
+
   // Runtime
   NODE_ENV?: string;
   ENVIRONMENT?: string;
@@ -181,6 +191,10 @@ export function loadEnv(): EnvConfig {
     PUSH_RELAY_URL: process.env.PUSH_RELAY_URL,
     DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD,
     LANDING_HOST: process.env.LANDING_HOST,
+    DB_POOL_MAX: process.env.DB_POOL_MAX,
+    DB_POOL_CONNECTION_TIMEOUT_MS: process.env.DB_POOL_CONNECTION_TIMEOUT_MS,
+    DB_POOL_IDLE_TIMEOUT_MS: process.env.DB_POOL_IDLE_TIMEOUT_MS,
+    DB_STATEMENT_TIMEOUT_MS: process.env.DB_STATEMENT_TIMEOUT_MS,
     NODE_ENV: process.env.NODE_ENV,
     ENVIRONMENT: process.env.ENVIRONMENT,
   };

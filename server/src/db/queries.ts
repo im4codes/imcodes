@@ -196,22 +196,6 @@ function parseSessionTextTailCacheEvents(
   return items;
 }
 
-function mergeSessionTextTailCacheEvents(
-  existing: SessionTextTailCacheItem[],
-  incoming: SessionTextTailCacheItem,
-): SessionTextTailCacheItem[] {
-  const deduped = new Map<string, SessionTextTailCacheItem>();
-  for (const item of existing) deduped.set(item.eventId, item);
-  deduped.set(incoming.eventId, incoming);
-  const merged = [...deduped.values()].sort((a, b) => {
-    if (a.ts !== b.ts) return a.ts - b.ts;
-    return a.eventId.localeCompare(b.eventId);
-  });
-  return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
-    ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
-    : merged;
-}
-
 export function mergeSessionTextTailCacheItems(
   existing: SessionTextTailCacheItem[],
   incoming: SessionTextTailCacheItem[],
@@ -832,25 +816,51 @@ export async function upsertSessionTextTailCacheEvent(
 ): Promise<void> {
   const classified = classifySessionTextTailEvent(rawEvent);
   if (!classified) return;
-  await db.transaction(async (tx) => {
-    const row = await tx.queryOne<Pick<DbSessionTextTailCacheRow, 'events'>>(
-      `SELECT events
-         FROM session_text_tail_cache
-        WHERE server_id = $1 AND session_name = $2
-        FOR UPDATE`,
-      [serverId, classified.sessionName],
-    );
-    const existing = parseSessionTextTailCacheEvents(row?.events ?? null);
-    const events = mergeSessionTextTailCacheEvents(existing, classified.item);
-    const latestTs = events.length > 0 ? events[events.length - 1]!.ts : null;
-    await tx.execute(
-      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
-       VALUES ($1, $2, $3::jsonb, $4, NOW())
-       ON CONFLICT (server_id, session_name)
-       DO UPDATE SET events = EXCLUDED.events, latest_ts = EXCLUDED.latest_ts, updated_at = NOW()`,
-      [serverId, classified.sessionName, JSON.stringify(events), latestTs],
-    );
-  });
+  const serializedItem = JSON.stringify(classified.item);
+  await db.execute(
+    `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+     VALUES ($1, $2, jsonb_build_array($3::jsonb), $4, NOW())
+     ON CONFLICT (server_id, session_name)
+     DO UPDATE SET (events, latest_ts, updated_at) = (
+       SELECT
+         COALESCE(jsonb_agg(t.item ORDER BY t.ts ASC, t.event_id COLLATE "C" ASC), '[]'::jsonb),
+         MAX(t.ts),
+         NOW()
+       FROM (
+         SELECT
+           combined.elem AS item,
+           (combined.elem->>'ts')::bigint AS ts,
+           (combined.elem->>'eventId') AS event_id
+         FROM (
+           SELECT elem
+           FROM jsonb_array_elements(
+             CASE
+               WHEN jsonb_typeof(session_text_tail_cache.events) = 'array'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(session_text_tail_cache.events) AS chk
+                  WHERE jsonb_typeof(chk) <> 'object'
+                     OR jsonb_typeof(chk->'eventId') <> 'string'
+                     OR jsonb_typeof(chk->'ts') <> 'number'
+                     OR NOT ((chk->>'ts') ~ '^-?[0-9]+$')
+                     OR (chk->>'type') NOT IN ('user.message', 'assistant.text')
+                     OR jsonb_typeof(chk->'text') <> 'string'
+                     OR btrim(chk->>'text') = ''
+                )
+               THEN session_text_tail_cache.events
+               ELSE '[]'::jsonb
+             END
+           ) AS elem
+           WHERE (elem->>'eventId') <> ($3::jsonb->>'eventId')
+           UNION ALL
+           SELECT $3::jsonb AS elem
+         ) AS combined
+         ORDER BY (combined.elem->>'ts')::bigint DESC, (combined.elem->>'eventId') COLLATE "C" DESC
+         LIMIT $5
+       ) AS t
+     )`,
+    [serverId, classified.sessionName, serializedItem, classified.item.ts, SESSION_TEXT_TAIL_CACHE_LIMIT],
+  );
 }
 
 export async function getSessionTextTailCache(

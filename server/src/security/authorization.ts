@@ -86,7 +86,25 @@ export function isAllowedDocCollaboratorRoute(method: string, rawPath: string): 
   return false;
 }
 
-export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
+interface MemoizedAuthEntry {
+  cookieHeader: string;
+  authHeader: string;
+  serverIdHeader: string;
+  method: string;
+  path: string;
+  db: Database;
+  signingKey: string;
+  promise: Promise<AuthResolution>;
+}
+
+/**
+ * Single-request memoization for resolveAuthOutcome/resolveAuth.
+ * Keyed by the underlying Request object (or fallback Context object when synthetic)
+ * plus auth input fingerprints so it never leaks auth state across requests.
+ */
+const authOutcomeRequestCache = new WeakMap<object, MemoizedAuthEntry>();
+
+async function computeAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
   // Task 1: Try HttpOnly session cookie first (browser sessions)
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
@@ -97,6 +115,45 @@ export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 're
   }
 
   return resolveBearerOutcome(c);
+}
+
+export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
+  const rawReq = (c.req as { raw?: unknown }).raw;
+  const cacheKey: object = rawReq && typeof rawReq === 'object' ? rawReq : (c as object);
+  const cookieHeader = c.req.header('Cookie') ?? '';
+  const authHeader = c.req.header('Authorization') ?? '';
+  const serverIdHeader = c.req.header(SERVER_ID_HEADER) ?? '';
+  const method = c.req.method ?? '';
+  const path = c.req.path ?? '';
+  const db = c.env.DB;
+  const signingKey = c.env.JWT_SIGNING_KEY ?? '';
+
+  const cached = authOutcomeRequestCache.get(cacheKey);
+  if (
+    cached
+    && cached.cookieHeader === cookieHeader
+    && cached.authHeader === authHeader
+    && cached.serverIdHeader === serverIdHeader
+    && cached.method === method
+    && cached.path === path
+    && cached.db === db
+    && cached.signingKey === signingKey
+  ) {
+    return cached.promise;
+  }
+
+  const promise = computeAuthOutcome(c);
+  authOutcomeRequestCache.set(cacheKey, {
+    cookieHeader,
+    authHeader,
+    serverIdHeader,
+    method,
+    path,
+    db,
+    signingKey,
+    promise,
+  });
+  return promise;
 }
 
 export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthContext | null> {

@@ -4,10 +4,62 @@
  */
 
 import pg from 'pg';
+import logger from '../util/logger.js';
 const { Pool } = pg;
 
 export type { Pool };
 type Queryable = Pick<pg.Pool, 'query'>;
+
+export const DEFAULT_DB_POOL_MAX = 25;
+export const DEFAULT_DB_POOL_CONNECTION_TIMEOUT_MS = 5_000;
+export const DEFAULT_DB_POOL_IDLE_TIMEOUT_MS = 30_000;
+export const DEFAULT_DB_STATEMENT_TIMEOUT_MS = 15_000;
+
+export interface DatabasePoolOptions {
+  max?: number;
+  connectionTimeoutMillis?: number;
+  idleTimeoutMillis?: number;
+  statementTimeoutMs?: number;
+}
+
+function parsePositiveInt(value: string | number | undefined, fallback: number, min = 1, max = 600_000): number {
+  if (value === undefined) return fallback;
+  const parsed = typeof value === 'number' ? value : Number(String(value).trim());
+  if (!Number.isFinite(parsed)) return fallback;
+  const int = Math.trunc(parsed);
+  if (int < min || int > max) return fallback;
+  return int;
+}
+
+/** Resolve pg.Pool configuration from explicit options, environment overrides, and safe defaults. */
+export function resolveDatabasePoolConfig(
+  databaseUrl: string,
+  options?: DatabasePoolOptions,
+  env: NodeJS.ProcessEnv = process.env,
+): pg.PoolConfig {
+  return {
+    connectionString: databaseUrl,
+    max: parsePositiveInt(options?.max ?? env.DB_POOL_MAX, DEFAULT_DB_POOL_MAX, 1, 500),
+    connectionTimeoutMillis: parsePositiveInt(
+      options?.connectionTimeoutMillis ?? env.DB_POOL_CONNECTION_TIMEOUT_MS,
+      DEFAULT_DB_POOL_CONNECTION_TIMEOUT_MS,
+      100,
+      120_000,
+    ),
+    idleTimeoutMillis: parsePositiveInt(
+      options?.idleTimeoutMillis ?? env.DB_POOL_IDLE_TIMEOUT_MS,
+      DEFAULT_DB_POOL_IDLE_TIMEOUT_MS,
+      1_000,
+      3_600_000,
+    ),
+    statement_timeout: parsePositiveInt(
+      options?.statementTimeoutMs ?? env.DB_STATEMENT_TIMEOUT_MS,
+      DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+      100,
+      600_000,
+    ),
+  };
+}
 
 /**
  * Lightweight database wrapper backed by pg.Pool.
@@ -67,13 +119,16 @@ export class Database {
   }
 }
 
-/** Create a Database from a DATABASE_URL. */
-export function createDatabase(databaseUrl: string): Database {
+/** Create a Database from a DATABASE_URL with tuned pool bounds and error handling. */
+export function createDatabase(databaseUrl: string, options?: DatabasePoolOptions): Database {
   // pg returns BIGINT (INT8) as string by default to avoid precision loss.
   // Our timestamps are Date.now() values (~13 digits), safely within JS integers,
   // so parse them as numbers for convenience.
   pg.types.setTypeParser(pg.types.builtins.INT8, (val: string) => parseInt(val, 10));
 
-  const pool = new Pool({ connectionString: databaseUrl });
+  const pool = new Pool(resolveDatabasePoolConfig(databaseUrl, options));
+  pool.on('error', (err) => {
+    logger.error({ err }, 'Unexpected PostgreSQL pool error');
+  });
   return new Database(pool, pool);
 }

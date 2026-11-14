@@ -386,7 +386,8 @@ describe('db queries contracts', () => {
       { eventId: 'evt-2', ts: 2, type: 'assistant.text', text: 'answer' },
     ]);
 
-    db.queryOne.mockResolvedValueOnce({ events: '[]' });
+    db.execute.mockClear();
+    db.queryOne.mockClear();
     await queries.upsertSessionTextTailCacheEvent(db, 'srv-1', {
       sessionId: 'deck_alpha_brain',
       eventId: 'evt-3',
@@ -402,6 +403,21 @@ describe('db queries contracts', () => {
       payload: { text: 'partial', streaming: true },
     });
 
-    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.queryOne).not.toHaveBeenCalled();
+    expect(db.execute).toHaveBeenCalledTimes(1);
+    const [upsertSql, upsertParams] = db.execute.mock.calls[0]!;
+    expect(upsertSql).toContain('INSERT INTO session_text_tail_cache');
+    expect(upsertSql).toContain('ON CONFLICT (server_id, session_name)');
+    expect(upsertParams?.[0]).toBe('srv-1');
+    expect(upsertParams?.[1]).toBe('deck_alpha_brain');
+    expect(JSON.parse(upsertParams?.[2] as string)).toEqual({
+      eventId: 'evt-3',
+      ts: 3,
+      type: 'assistant.text',
+      text: 'final answer',
+    });
+    expect(upsertParams?.[3]).toBe(3);
+    expect(upsertParams?.[4]).toBe(queries.SESSION_TEXT_TAIL_CACHE_LIMIT);
   });
 });
