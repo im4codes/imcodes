@@ -146,11 +146,13 @@ import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { resolveEffectiveIdentityPrompt } from '../daemon/session-identity-resolver.js';
 import { identityPromptHash } from '../util/identity-prompt-hash.js';
 import {
+  claimProcessRestartContinuationRecovery,
   clearSessionRestartContinuation,
   consumeRestartContinuation,
   dispatchProcessRestartContinuation,
   dispatchTransportRestartContinuation,
   emitSystemContinueUserMessage,
+  hasActiveProcessRestartContinuationRecovery,
   hasPendingRestartContinuation,
   retireRestartContinuation,
   shouldAutoRespawnDeadProcessSubSession,
@@ -765,7 +767,9 @@ export async function restoreFromStore(): Promise<void> {
         }
         continue;
       }
-      consumeRestartContinuation(s.name);
+      if (!hasActiveProcessRestartContinuationRecovery(s.name, s.runtimeEpoch)) {
+        consumeRestartContinuation(s.name);
+      }
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
         startCCWatcher(s.name, s.projectDir, s.ccSessionId);
       } else if (s.agentType === 'codex' && s.codexSessionId && !isCodexWatching(s.name)) {
@@ -877,7 +881,9 @@ export async function restoreFromStore(): Promise<void> {
       }
     } else {
       // Live CLI process survived daemon restart intact — discard any captured marker so it is never nudged.
-      consumeRestartContinuation(hydrated.name);
+      if (!hasActiveProcessRestartContinuationRecovery(hydrated.name, hydrated.runtimeEpoch)) {
+        consumeRestartContinuation(hydrated.name);
+      }
       if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
         startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);
@@ -1146,78 +1152,92 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
   }
+  const releaseRecovery = (record.agentType !== 'shell' && record.agentType !== 'script')
+    ? claimProcessRestartContinuationRecovery(record.name, resourceRuntimeEpoch)
+    : undefined;
+  let recoveryHandedOff = false;
   try {
-    if (BACKEND === 'conpty') {
-      await respawnPane(record.name, cmd, { env: mergedEnv });
-    } else {
-      const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-      const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
-      await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+    try {
+      if (BACKEND === 'conpty') {
+        await respawnPane(record.name, cmd, { env: mergedEnv });
+      } else {
+        const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+        const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
+        await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+      }
+    } catch (error) {
+      throw markLaunchFailure(record, error);
     }
-  } catch (error) {
-    throw markLaunchFailure(record, error);
-  }
 
-  // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
-  const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
-  void terminalStreamer.rebindSession(record.name);
+    // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
+    const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
+    void terminalStreamer.rebindSession(record.name);
 
-  const updated: SessionRecord = {
-    ...effectiveRecord,
-    restarts: record.restarts + 1,
-    restartTimestamps: [...recentRestarts, now],
-    state: 'idle',
-    sessionInstanceId: resourceSessionInstanceId,
-    runtimeEpoch: resourceRuntimeEpoch,
-    hookCredential,
-    // The proof names exactly the instance and epoch this process was launched for.
-    nativeAgentLaunchFence: {
-      fence: processLaunchFence(effectiveRecord.agentType, { nativeAgentsFenced, resumesExistingConversation: true }),
+    const updated: SessionRecord = {
+      ...effectiveRecord,
+      restarts: record.restarts + 1,
+      restartTimestamps: [...recentRestarts, now],
+      state: 'idle',
       sessionInstanceId: resourceSessionInstanceId,
       runtimeEpoch: resourceRuntimeEpoch,
-      decidedAt: now,
-    },
-    updatedAt: now,
-  };
-  upsertSession(updated);
-  const persistedRecord = getSession(record.name);
-  if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
+      hookCredential,
+      // The proof names exactly the instance and epoch this process was launched for.
+      nativeAgentLaunchFence: {
+        fence: processLaunchFence(effectiveRecord.agentType, { nativeAgentsFenced, resumesExistingConversation: true }),
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
+        decidedAt: now,
+      },
+      updatedAt: now,
+    };
+    upsertSession(updated);
+    const persistedRecord = getSession(record.name);
+    if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
 
-  startStructuredWatcher(record.name, effectiveRecord.agentType as AgentType, projectDir, {
-    ccSessionId,
-    codexSessionId: effectiveRecord.codexSessionId,
-    geminiSessionId: effectiveRecord.geminiSessionId,
-    opencodeSessionId: effectiveRecord.opencodeSessionId,
-  });
+    startStructuredWatcher(record.name, effectiveRecord.agentType as AgentType, projectDir, {
+      ccSessionId,
+      codexSessionId: effectiveRecord.codexSessionId,
+      geminiSessionId: effectiveRecord.geminiSessionId,
+      opencodeSessionId: effectiveRecord.opencodeSessionId,
+    });
 
-  // postLaunch (auto-dismiss startup prompts) + init message injection
-  const injectInit = async () => {
-    if (driver.postLaunch) {
-      await driver.postLaunch(
-        () => capturePane(record.name),
-        (key: string) => sendKey(record.name, key),
-      ).catch(() => {});
-    }
-    const initParts: string[] = [];
-    if (record.description) initParts.push(record.description);
-    const identityPrompt = await resolveEffectiveIdentityPrompt(record);
-    if (identityPrompt) initParts.push(identityPrompt);
-    if (record.ccPreset && record.agentType === 'claude-code') {
-      const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
-      const preset = await getPreset(record.ccPreset);
-      if (preset) initParts.push(getPresetInitMessage(preset));
-    }
-    if (initParts.length > 0) {
-      const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
-      try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
-    }
-    try {
-      await maybeDispatchProcessRestartContinuation(record.name);
-    } catch (err) {
-      logger.warn({ err, session: record.name }, 'Process respawn restart continuation failed');
-    }
-  };
-  void injectInit();
+    // postLaunch (auto-dismiss startup prompts) + init message injection
+    const injectInit = async () => {
+      try {
+        if (driver.postLaunch) {
+          await driver.postLaunch(
+            () => capturePane(record.name),
+            (key: string) => sendKey(record.name, key),
+          ).catch(() => {});
+        }
+        const initParts: string[] = [];
+        if (record.description) initParts.push(record.description);
+        const identityPrompt = await resolveEffectiveIdentityPrompt(record);
+        if (identityPrompt) initParts.push(identityPrompt);
+        if (record.ccPreset && record.agentType === 'claude-code') {
+          const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
+          const preset = await getPreset(record.ccPreset);
+          if (preset) initParts.push(getPresetInitMessage(preset));
+        }
+        if (initParts.length > 0) {
+          const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
+          try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
+        }
+        try {
+          await maybeDispatchProcessRestartContinuation(record.name);
+        } catch (err) {
+          logger.warn({ err, session: record.name }, 'Process respawn restart continuation failed');
+        }
+      } finally {
+        releaseRecovery?.();
+      }
+    };
+    recoveryHandedOff = true;
+    void injectInit();
+  } catch (error) {
+    if (!recoveryHandedOff) releaseRecovery?.();
+    throw error;
+  }
 
   logger.info({ session: record.name, agentType: record.agentType, ccPreset: record.ccPreset }, 'Respawned session');
   return true;
@@ -4483,9 +4503,14 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     geminiSessionId,
   }));
 
+  const releaseRecovery = (!fresh && !exists && opts.onPostLaunchReady && agentType !== 'shell' && agentType !== 'script')
+    ? claimProcessRestartContinuationRecovery(name, resourceRuntimeEpoch)
+    : undefined;
+  let recoveryHandedOff = false;
   let nativeAgentsFenced = false;
   let launchedNativeAgentFence: SessionRecord['nativeAgentLaunchFence'];
-  if (!exists) {
+  try {
+    if (!exists) {
     if (storedBeforeLaunch) {
       const previousResources = await releaseSessionResources(storedBeforeLaunch);
       if (previousResources.failed > 0) {
@@ -4652,67 +4677,79 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   // Start structured-event watchers for supported agent types
   startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
 
-  // Auto-dismiss startup prompts before delivering the initial context. A
-  // selected identity file has already been resolved to bytes by the UI/MCP;
-  // process agents must receive those same bytes on their first launch rather
-  // than only after a later respawn.
-  void (async () => {
-    if (driver.postLaunch) {
-      await driver.postLaunch(
-        () => capturePane(name),
-        (key) => sendKey(name, key),
-      ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
-    }
-    if (pendingHandoffOnRestart) {
-      try {
-        const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
-        let injected = false;
-        await runWithProcessSessionSendLock(name, async () => {
-          const current = getSession(name);
-          if (!current?.crossVendorHandoff?.pending
-            || current.crossVendorHandoff.pending.cutoff.epoch !== pendingHandoffOnRestart.cutoff.epoch
-            || current.crossVendorHandoff.pending.cutoff.seq !== pendingHandoffOnRestart.cutoff.seq) return;
-          const writePrivate = await prepareProcessSessionPrivateWriter(name);
-          writePrivate(pendingHandoffOnRestart.text);
-          injected = true;
-        });
-        if (injected) {
-          const current = getSession(name);
-          if (current?.crossVendorHandoff?.pending?.cutoff.epoch === pendingHandoffOnRestart.cutoff.epoch
-            && current.crossVendorHandoff.pending.cutoff.seq === pendingHandoffOnRestart.cutoff.seq) {
-            const state = current.crossVendorHandoff;
-            upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: pendingHandoffOnRestart.cutoff } }, updatedAt: Date.now() });
-          }
-          incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
-        }
-      } catch (error) {
-        logger.warn({ err: error, session: name }, 'Persisted cross-vendor handoff restore failed');
-        incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
-      }
-    }
-    if (agentType === 'shell' || agentType === 'script') return;
     if (fresh) {
       retireRestartContinuation(name);
     }
-    // The same session reference as a restore uses: its PROJECT-scope identity is keyed by the context namespace's project id
-    // when the session has one, so leaving it out would look up the project NAME and miss that profile.
-    const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: storedBeforeLaunch?.contextNamespace });
-    const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
-    if (initialContext) {
+    // Auto-dismiss startup prompts before delivering the initial context. A
+    // selected identity file has already been resolved to bytes by the UI/MCP;
+    // process agents must receive those same bytes on their first launch rather
+    // than only after a later respawn.
+    recoveryHandedOff = true;
+    void (async () => {
       try {
-        await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
-      } catch (error) {
-        logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
+        if (driver.postLaunch) {
+          await driver.postLaunch(
+            () => capturePane(name),
+            (key) => sendKey(name, key),
+          ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
+        }
+        if (pendingHandoffOnRestart) {
+          try {
+            const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
+            let injected = false;
+            await runWithProcessSessionSendLock(name, async () => {
+              const current = getSession(name);
+              if (!current?.crossVendorHandoff?.pending
+                || current.crossVendorHandoff.pending.cutoff.epoch !== pendingHandoffOnRestart.cutoff.epoch
+                || current.crossVendorHandoff.pending.cutoff.seq !== pendingHandoffOnRestart.cutoff.seq) return;
+              const writePrivate = await prepareProcessSessionPrivateWriter(name);
+              writePrivate(pendingHandoffOnRestart.text);
+              injected = true;
+            });
+            if (injected) {
+              const current = getSession(name);
+              if (current?.crossVendorHandoff?.pending?.cutoff.epoch === pendingHandoffOnRestart.cutoff.epoch
+                && current.crossVendorHandoff.pending.cutoff.seq === pendingHandoffOnRestart.cutoff.seq) {
+                const state = current.crossVendorHandoff;
+                upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: pendingHandoffOnRestart.cutoff } }, updatedAt: Date.now() });
+              }
+              incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+            }
+          } catch (error) {
+            logger.warn({ err: error, session: name }, 'Persisted cross-vendor handoff restore failed');
+            incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+          }
+        }
+        if (agentType === 'shell' || agentType === 'script') return;
+        if (fresh) {
+          retireRestartContinuation(name);
+        }
+        // The same session reference as a restore uses: its PROJECT-scope identity is keyed by the context namespace's project id
+        // when the session has one, so leaving it out would look up the project NAME and miss that profile.
+        const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: storedBeforeLaunch?.contextNamespace });
+        const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
+        if (initialContext) {
+          try {
+            await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
+          } catch (error) {
+            logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
+          }
+        }
+        if (!fresh && opts.onPostLaunchReady) {
+          try {
+            await opts.onPostLaunchReady();
+          } catch (err) {
+            logger.warn({ err, session: name }, 'Post-launch continuation hook failed');
+          }
+        }
+      } finally {
+        releaseRecovery?.();
       }
-    }
-    if (!fresh && opts.onPostLaunchReady) {
-      try {
-        await opts.onPostLaunchReady();
-      } catch (err) {
-        logger.warn({ err, session: name }, 'Post-launch continuation hook failed');
-      }
-    }
-  })();
+    })();
+  } catch (error) {
+    if (!recoveryHandedOff) releaseRecovery?.();
+    throw error;
+  }
 }
 
 /** Bound ops for a session (used by status poller / response collector). */

@@ -185,6 +185,15 @@ vi.mock('../../src/daemon/memory-inject.js', () => ({
   injectGeminiMemoryWithTimeline: vi.fn(async () => undefined),
 }));
 
+vi.mock('../../src/agent/signal.js', () => ({
+  setupCCStopHook: vi.fn(async () => {}),
+}));
+
+vi.mock('../../src/agent/notify-setup.js', () => ({
+  setupCodexNotify: vi.fn(async () => {}),
+  setupOpenCodePlugin: vi.fn(async () => {}),
+}));
+
 vi.mock('../../src/agent/runtime-context-bootstrap.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/agent/runtime-context-bootstrap.js')>();
   return {
@@ -710,4 +719,136 @@ describe('restoreFromStore & restoreTransportSessions restart continuation wirin
     expect(mocks.tmuxPaneAlive.has('deck_sub_deadstandalone1')).toBe(true);
     expect(mocks.sendKeysCalls.filter((c) => c.session === 'deck_sub_deadstandalone1' && c.keys === 'continue')).toHaveLength(1);
   });
+
+  it('delayed-ready process restore & rebuild replays: keeps marker pending until real postLaunch finishes, then sends continue once', async () => {
+    const subDeadCc = makeRecord({
+      name: 'deck_sub_cc_dead',
+      role: 'w1',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111101',
+    });
+    const subDeadStandaloneCc = makeRecord({
+      name: 'deck_sub_cc_dead_sa',
+      role: 'w1',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111102',
+    });
+    const subMissingCc = makeRecord({
+      name: 'deck_sub_cc_miss',
+      role: 'w1',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111103',
+    });
+    const subLiveCc = makeRecord({
+      name: 'deck_sub_cc_live',
+      role: 'w1',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111104',
+    });
+    const subStoppedCc = makeRecord({
+      name: 'deck_sub_cc_stop',
+      role: 'w1',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'stopped',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111105',
+    });
+    const mainDeadCc = makeRecord({
+      name: 'deck_cc_main_dead',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111106',
+    });
+    const mainMissingCc = makeRecord({
+      name: 'deck_cc_main_miss',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111107',
+    });
+
+    const initialRestoreSet = [subDeadCc, subLiveCc, subStoppedCc, mainDeadCc, mainMissingCc];
+    for (const r of initialRestoreSet) mocks.store.set(r.name, r);
+
+    // Dead panes exist in tmux with dead pane; surviving live sub-session has alive pane; mainMissingCc has no tmux session.
+    mocks.tmuxLive.add(subDeadCc.name);
+    mocks.tmuxLive.add(subStoppedCc.name);
+    mocks.tmuxLive.add(mainDeadCc.name);
+    mocks.tmuxLive.add(subLiveCc.name);
+    mocks.tmuxPaneAlive.add(subLiveCc.name);
+
+    captureRestartContinuationsBeforeShutdown({
+      sessions: [...initialRestoreSet, subDeadStandaloneCc, subMissingCc],
+      getRuntime: () => undefined,
+      epoch: 'ep-delayed-ready-cc',
+    });
+
+    // 1) Startup restoreFromStore spawns/respawns replacement panes and enters real ClaudeDriver.postLaunch (~1500ms).
+    await restoreFromStore();
+
+    // Add standalone dead-pane and missing sub-session right before rebuild replays.
+    mocks.store.set(subDeadStandaloneCc.name, subDeadStandaloneCc);
+    mocks.tmuxLive.add(subDeadStandaloneCc.name);
+    mocks.store.set(subMissingCc.name, subMissingCc);
+
+    const dtos: Parameters<typeof rebuildSubSessions>[0] = [
+      { id: 'cc_dead', type: 'claude-code', cwd: '/tmp/proj', ccSessionId: subDeadCc.ccSessionId },
+      { id: 'cc_dead_sa', type: 'claude-code', cwd: '/tmp/proj', ccSessionId: subDeadStandaloneCc.ccSessionId },
+      { id: 'cc_miss', type: 'claude-code', cwd: '/tmp/proj', ccSessionId: subMissingCc.ccSessionId },
+      { id: 'cc_live', type: 'claude-code', cwd: '/tmp/proj', ccSessionId: subLiveCc.ccSessionId },
+    ];
+
+    // 2) Immediate replay of rebuildSubSessions (2x) and restoreFromStore while postLaunch is still pending.
+    await rebuildSubSessions(dtos);
+    await rebuildSubSessions(dtos);
+    await restoreFromStore();
+
+    // During the pre-ready window, replacement panes MUST retain pending continuation markers (not prematurely consumed).
+    for (const s of [subDeadCc, subDeadStandaloneCc, subMissingCc, mainDeadCc, mainMissingCc]) {
+      expect(hasPendingRestartContinuation(s.name), `${s.name} must stay pending until postLaunch finishes`).toBe(true);
+    }
+    expect(mocks.sendKeysCalls.filter((c) => c.keys === 'continue')).toHaveLength(0);
+    // Genuine cross-restart surviving pane already discarded its marker on restore.
+    expect(hasPendingRestartContinuation(subLiveCc.name)).toBe(false);
+
+    // 3) Wait for real ClaudeDriver.postLaunch (~1500ms) to finish and emit exactly 1 'continue' per recovered session.
+    await vi.waitFor(() => {
+      const sent = mocks.sendKeysCalls.filter((c) => c.keys === 'continue').map((c) => c.session).sort();
+      expect(sent).toEqual([
+        mainDeadCc.name,
+        mainMissingCc.name,
+        subDeadCc.name,
+        subDeadStandaloneCc.name,
+        subMissingCc.name,
+      ].sort());
+    }, { timeout: 5_000, interval: 50 });
+
+    // Replaying rebuildSubSessions again post-ready must remain idempotent (0 extra continues, 0 extra respawns).
+    await rebuildSubSessions(dtos);
+    expect(mocks.sendKeysCalls.filter((c) => c.keys === 'continue')).toHaveLength(5);
+    expect(mocks.respawnCalls.filter((n) => n === subDeadCc.name)).toHaveLength(1);
+    expect(mocks.respawnCalls.filter((n) => n === subDeadStandaloneCc.name)).toHaveLength(1);
+    expect(mocks.respawnCalls.filter((n) => n === mainDeadCc.name)).toHaveLength(1);
+    expect(mocks.respawnCalls.filter((n) => n === subLiveCc.name || n === subStoppedCc.name)).toHaveLength(0);
+    expect(mocks.sendKeysCalls.filter((c) => c.session === subLiveCc.name || c.session === subStoppedCc.name)).toHaveLength(0);
+    expect(mocks.tmuxPaneAlive.has(subStoppedCc.name)).toBe(false);
+  }, 10_000);
 });

@@ -13,12 +13,14 @@ import {
   captureRestartContinuationsBeforeShutdownDetailed,
   captureUncleanRestartContinuations,
   captureUncleanRestartContinuationsDetailed,
+  claimProcessRestartContinuationRecovery,
   clearSessionRestartContinuation,
   consumeRestartContinuation,
   dispatchProcessRestartContinuation,
   dispatchTransportRestartContinuation,
   emitSystemContinueUserMessage,
   getPendingRestartContinuation,
+  hasActiveProcessRestartContinuationRecovery,
   hasPendingRestartContinuation,
   markSessionUserStopped,
   restartContinuationPath,
@@ -574,5 +576,32 @@ describe('restart-continuation dispatch & safety guards', () => {
     expect(uncleanOk.persisted).toBe(true);
     expect(uncleanOk.captured).toHaveLength(1);
     expect(hasPendingRestartContinuation('deck_cap_fail_2', now + 200)).toBe(true);
+  });
+
+  it('tracks process recovery ownership by session + runtimeEpoch and clears it on release or cancel', () => {
+    const release = claimProcessRestartContinuationRecovery('deck_sub_latch', 'epoch-new');
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch')).toBe(true);
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch', 'epoch-new')).toBe(true);
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch', 'epoch-old')).toBe(false);
+
+    // Releasing an older claim token cannot clobber a newer claim on the same session.
+    const release2 = claimProcessRestartContinuationRecovery('deck_sub_latch', 'epoch-newer');
+    release();
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch', 'epoch-newer')).toBe(true);
+    release2();
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch', 'epoch-newer')).toBe(false);
+
+    // markSessionUserStopped / retireRestartContinuation immediately clear any active recovery claim.
+    const releaseStop = claimProcessRestartContinuationRecovery('deck_sub_latch_stop', 'epoch-stop');
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch_stop', 'epoch-stop')).toBe(true);
+    expect(markSessionUserStopped('deck_sub_latch_stop', 800_000)).toBe(true);
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch_stop', 'epoch-stop')).toBe(false);
+    releaseStop();
+
+    const releaseRetire = claimProcessRestartContinuationRecovery('deck_sub_latch_retire', 'epoch-ret');
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch_retire', 'epoch-ret')).toBe(true);
+    expect(retireRestartContinuation('deck_sub_latch_retire', 800_100)).toBe(true);
+    expect(hasActiveProcessRestartContinuationRecovery('deck_sub_latch_retire', 'epoch-ret')).toBe(false);
+    releaseRetire();
   });
 });

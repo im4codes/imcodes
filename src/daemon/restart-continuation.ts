@@ -188,6 +188,7 @@ export function isEligibleRestartContinuationSession(session: SessionRecord | un
  */
 export function markSessionUserStopped(sessionName: string, now = Date.now(), path = restartContinuationPath()): boolean {
   if (!sessionName) return false;
+  pendingProcessRecoveryTokens.delete(sessionName);
   const data = readStore(now, path);
   data.userStopped[sessionName] = now;
   delete data.pending[sessionName];
@@ -201,6 +202,7 @@ export function markSessionUserStopped(sessionName: string, now = Date.now(), pa
  */
 export function retireRestartContinuation(sessionName: string, now = Date.now(), path = restartContinuationPath()): boolean {
   if (!sessionName) return false;
+  pendingProcessRecoveryTokens.delete(sessionName);
   const data = readStore(now, path);
   const hadPending = Object.prototype.hasOwnProperty.call(data.pending, sessionName);
   const hadStopped = Object.prototype.hasOwnProperty.call(data.userStopped, sessionName);
@@ -241,6 +243,42 @@ export function hasPendingRestartContinuation(
   path = restartContinuationPath(),
 ): boolean {
   return getPendingRestartContinuation(sessionName, now, path) !== null;
+}
+
+const pendingProcessRecoveryTokens = new Map<string, { token: symbol; runtimeEpoch?: string }>();
+
+/**
+ * Claim in-flight post-launch continuation ownership for a newly launched or
+ * respawned process pane before returning from `launchSession` / `respawnSession` /
+ * `startSubSession`. Until the returned release callback runs once post-launch
+ * readiness completes (or launch fails), restore/rebuild replays must NOT treat
+ * the replacement pane as a surviving pre-restart process and prematurely consume
+ * its continuation marker.
+ */
+export function claimProcessRestartContinuationRecovery(
+  sessionName: string,
+  runtimeEpoch?: string,
+): () => void {
+  const token = Symbol(sessionName);
+  pendingProcessRecoveryTokens.set(sessionName, { token, runtimeEpoch });
+  return () => {
+    const cur = pendingProcessRecoveryTokens.get(sessionName);
+    if (cur?.token === token) {
+      pendingProcessRecoveryTokens.delete(sessionName);
+    }
+  };
+}
+
+export function hasActiveProcessRestartContinuationRecovery(
+  sessionName: string,
+  runtimeEpoch?: string,
+): boolean {
+  const cur = pendingProcessRecoveryTokens.get(sessionName);
+  if (!cur) return false;
+  if (runtimeEpoch && cur.runtimeEpoch && cur.runtimeEpoch !== runtimeEpoch) {
+    return false;
+  }
+  return true;
 }
 
 /** Whether a dead-pane process sub-session should be auto-respawned on restore. */
