@@ -9,7 +9,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep, win32 as win32Path } from 'node:path';
@@ -42,6 +42,59 @@ export const DAEMON_RUNTIME_CRITICAL_ENTRIES = Object.freeze([
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const NODE_VERSION_RE = /^v\d+\.\d+\.\d+$/;
 const ARCHIVE_FORMATS = new Set(['tar.gz', 'zip']);
+const PERMISSION_RETRY_ERRORS = new Set(['EACCES', 'EPERM', 'ENOTEMPTY']);
+
+/**
+ * Force-remove a directory tree even if Windows `.zip` extraction or tool caches
+ * left read-only (`0o555`/`0o444`) entries behind. Never follows or chmods symlinks.
+ */
+export function removeDirForceSync(targetDir) {
+  try {
+    rmSync(targetDir, { recursive: true, force: true });
+    return;
+  } catch (err) {
+    if (!PERMISSION_RETRY_ERRORS.has(err?.code)) {
+      throw err;
+    }
+  }
+
+  let rootStat;
+  try {
+    rootStat = lstatSync(targetDir);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return;
+    throw err;
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    rmSync(targetDir, { force: true });
+    return;
+  }
+
+  const stack = [targetDir];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    let lst;
+    try {
+      lst = lstatSync(cur);
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      throw err;
+    }
+    if (lst.isSymbolicLink()) continue;
+    if (lst.isDirectory()) {
+      if (process.platform !== 'win32') {
+        chmodSync(cur, (lst.mode & 0o777) | 0o700);
+      }
+      for (const name of readdirSync(cur)) {
+        stack.push(join(cur, name));
+      }
+    } else if (lst.isFile() && (lst.mode & 0o200) === 0) {
+      chmodSync(cur, (lst.mode & 0o777) | 0o200);
+    }
+  }
+
+  rmSync(targetDir, { recursive: true, force: true });
+}
 
 const ONNXRUNTIME_GPU_STRIP_RULES = Object.freeze([
   {
@@ -176,7 +229,7 @@ export function pruneStagedNodeModulesForTarget(nodeModulesDir, target, options 
         for (const name of readdirSync(cur)) stack.push(join(cur, name));
       }
     }
-    rmSync(absPath, { recursive: true, force: true });
+    removeDirForceSync(absPath);
   };
 
   // 1. Remove symlinks and build/cache artifacts (.bin, transformers .cache).
@@ -783,7 +836,7 @@ export async function verifyDaemonRuntimeArchive(manifestPath, options = {}) {
         checkExecutableBit: manifest.artifact.os !== 'win32' && process.platform !== 'win32',
       });
     } finally {
-      rmSync(extractDir, { recursive: true, force: true });
+      removeDirForceSync(extractDir);
     }
   }
   return manifest;

@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -27,6 +28,7 @@ import {
   extractArchiveToDir,
   parseDaemonRuntimeTarget,
   pruneStagedNodeModulesForTarget,
+  removeDirForceSync,
   resolvePlatformCommand,
   sanitizeBundleRelativePath,
   shouldKeepPackageLockEntry,
@@ -49,6 +51,78 @@ function tempDir(prefix = 'imcodes-dr-test-'): string {
 
 function sha256(content: string | Buffer): string {
   return createHash('sha256').update(content).digest('hex');
+}
+
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) {
+    crc ^= buf[i];
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 1) !== 0 ? ((crc >>> 1) ^ 0xedb88320) : (crc >>> 1);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function buildDosStoredZip(entries: Array<{ name: string; data?: Buffer; externalAttr: number }>): Buffer {
+  const localChunks: Buffer[] = [];
+  const centralChunks: Buffer[] = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBuf = Buffer.from(entry.name, 'utf8');
+    const data = entry.data ?? Buffer.alloc(0);
+    const sum = crc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4); // version needed
+    local.writeUInt16LE(0x0800, 6); // UTF-8
+    local.writeUInt16LE(0, 8); // method 0 = stored
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0x5421, 12);
+    local.writeUInt32LE(sum, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+    localChunks.push(local, nameBuf, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(0x0014, 4); // version made by: 0 (MS-DOS/FAT), spec 2.0
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8); // UTF-8
+    central.writeUInt16LE(0, 10); // method 0 = stored
+    central.writeUInt16LE(0, 12);
+    central.writeUInt16LE(0x5421, 14);
+    central.writeUInt32LE(sum, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(entry.externalAttr >>> 0, 38);
+    central.writeUInt32LE(offset, 42);
+    centralChunks.push(central, nameBuf);
+
+    offset += local.length + nameBuf.length + data.length;
+  }
+
+  const centralDir = Buffer.concat(centralChunks);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralDir.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localChunks, centralDir, eocd]);
 }
 
 function createFakeBundle(root: string, os: 'linux' | 'darwin' | 'win32' = 'linux') {
@@ -500,6 +574,122 @@ describe('Windows zip PowerShell -File invocation without -Command/$args', () =>
     const verified = await verifyDaemonRuntimeArchive(manifestPath, { requireOfficialNode: false });
     expect(verified.artifact.format).toBe('zip');
     expect(verified.fileCount).toBe(manifest.fileCount);
+  });
+
+  it('removeDirForceSync cleans read-only directories safely without following symlinks and is idempotent', () => {
+    const missing = join(tempDir(), 'never-existed');
+    expect(() => removeDirForceSync(missing)).not.toThrow();
+
+    if (process.platform === 'win32') return;
+
+    const root = tempDir('imcodes-dr-ro-cleanup-');
+    const targetDir = join(root, 'target');
+    const roSub = join(targetDir, 'ro-sub');
+    const lockedSub = join(targetDir, 'locked-sub');
+    const externalDir = join(root, 'external-dir');
+    const externalFile = join(externalDir, 'keep.txt');
+
+    mkdirSync(roSub, { recursive: true });
+    mkdirSync(lockedSub, { recursive: true });
+    mkdirSync(externalDir, { recursive: true });
+    writeFileSync(join(roSub, 'ro.txt'), 'readonly');
+    writeFileSync(join(lockedSub, 'inner.txt'), 'locked');
+    writeFileSync(externalFile, 'do-not-touch');
+
+    chmodSync(join(roSub, 'ro.txt'), 0o444);
+    chmodSync(externalFile, 0o444);
+    symlinkSync(externalDir, join(roSub, 'link-dir'));
+    symlinkSync(externalFile, join(roSub, 'link-file'));
+    chmodSync(roSub, 0o555);
+    chmodSync(lockedSub, 0o000);
+    chmodSync(externalDir, 0o555);
+
+    try {
+      if (process.platform === 'linux') {
+        expect(() => rmSync(targetDir, { recursive: true, force: true })).toThrow(/EACCES|EPERM|ENOTEMPTY/);
+      }
+
+      removeDirForceSync(targetDir);
+      expect(existsSync(targetDir)).toBe(false);
+      expect(existsSync(externalDir)).toBe(true);
+      expect(existsSync(externalFile)).toBe(true);
+      expect(statSync(externalDir).mode & 0o777).toBe(0o555);
+      expect(statSync(externalFile).mode & 0o777).toBe(0o444);
+    } finally {
+      chmodSync(externalDir, 0o755);
+      chmodSync(externalFile, 0o644);
+    }
+  });
+
+  it('verifies a win32-x64 .zip containing DOS read-only directories (0x11) and leaves zero temp verify dirs', async () => {
+    if (process.platform === 'win32') return;
+
+    const root = tempDir('imcodes-dr-dos0x11-');
+    const bundleRoot = join(root, 'bundle');
+    const outDir = join(root, 'out');
+    mkdirSync(outDir, { recursive: true });
+    createFakeBundle(bundleRoot, 'win32');
+
+    const localOpts = {
+      bundleRoot,
+      os: 'win32',
+      arch: 'x64',
+      nodeVersion: 'v24.16.0',
+      nodeProvider: 'local-node-bin',
+      nodeBinarySha256: sha256('local-node'),
+      buildCommit: 'e'.repeat(40),
+      buildVersion: '0.1.4',
+    };
+    const filesDoc = await createDaemonRuntimeFilesDocument(localOpts);
+    await writeDaemonRuntimeJson(join(bundleRoot, DAEMON_RUNTIME_FILES_FILENAME), filesDoc);
+
+    // Build a real .zip where every directory entry carries DOS FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY (0x11)
+    // and files carry FILE_ATTRIBUTE_READONLY (0x01), which Linux `unzip` extracts as mode 0o555 / 0o444.
+    const allEntries = await collectBundleFileEntries(bundleRoot, 'win32');
+    const dirSet = new Set<string>();
+    for (const file of allEntries) {
+      const parts = file.path.split('/');
+      for (let i = 1; i < parts.length; i += 1) {
+        dirSet.add(`${parts.slice(0, i).join('/')}/`);
+      }
+    }
+    const zipEntries = [
+      ...[...dirSet].sort().map((dirName) => ({ name: dirName, externalAttr: 0x11 })),
+      ...allEntries.map((file) => ({
+        name: file.path,
+        data: readFileSync(join(bundleRoot, ...file.path.split('/'))),
+        externalAttr: 0x01,
+      })),
+    ];
+
+    const archivePath = join(outDir, 'daemon-runtime-win32-x64.zip');
+    writeFileSync(archivePath, buildDosStoredZip(zipEntries));
+
+    // Confirm raw `unzip -q` extracts 0o555 directory under Linux/macOS and raw `rmSync` would fail on Linux.
+    const probeExtract = join(root, 'probe-unzip');
+    mkdirSync(probeExtract, { recursive: true });
+    execFileSync('unzip', ['-q', archivePath, '-d', probeExtract], { stdio: 'pipe' });
+    expect(statSync(join(probeExtract, 'package', 'node_modules')).mode & 0o777).toBe(0o555);
+    if (process.platform === 'linux') {
+      expect(() => rmSync(probeExtract, { recursive: true, force: true })).toThrow(/EACCES|EPERM|ENOTEMPTY/);
+    }
+    removeDirForceSync(probeExtract);
+    expect(existsSync(probeExtract)).toBe(false);
+
+    const { manifest } = await createDaemonRuntimeManifest({ ...localOpts, archivePath });
+    const manifestPath = join(outDir, 'daemon-runtime-win32-x64.manifest.json');
+    await writeDaemonRuntimeJson(manifestPath, manifest);
+
+    const beforeVerifyDirs = new Set(
+      readdirSync(tmpdir()).filter((name) => name.startsWith('imcodes-daemon-runtime-verify-')),
+    );
+    const verified = await verifyDaemonRuntimeArchive(manifestPath, { requireOfficialNode: false });
+    const afterVerifyDirs = readdirSync(tmpdir()).filter((name) => name.startsWith('imcodes-daemon-runtime-verify-'));
+    const leaked = afterVerifyDirs.filter((name) => !beforeVerifyDirs.has(name));
+
+    expect(verified.artifact.os).toBe('win32');
+    expect(verified.fileCount).toBe(manifest.fileCount);
+    expect(leaked).toEqual([]);
   });
 });
 

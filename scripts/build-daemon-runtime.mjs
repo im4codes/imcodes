@@ -40,6 +40,7 @@ import {
   extractArchiveToDir,
   parseDaemonRuntimeTarget,
   pruneStagedNodeModulesForTarget,
+  removeDirForceSync,
   resolvePlatformCommand,
   shouldKeepPackageLockEntry,
   verifyDaemonRuntimeArchive,
@@ -176,7 +177,7 @@ async function resolveNodeBinary({ targetInfo, nodeVersion, nodeBinOverride, wor
     await readFile(shasumsPath, 'utf8'),
   );
 
-  await rm(join(cacheRoot, dirName), { recursive: true, force: true });
+  removeDirForceSync(join(cacheRoot, dirName));
   extractArchiveToDir(archivePath, targetInfo.isWindows ? 'zip' : 'tar.gz', cacheRoot, {
     stdio: 'inherit',
   });
@@ -427,7 +428,7 @@ async function main() {
   const workDir = mkdtempSync(join(tmpdir(), `imcodes-daemon-runtime-${targetInfo.target}-`));
   const stageDir = opts.stageDir || join(workDir, 'stage');
   try {
-    rmSync(stageDir, { recursive: true, force: true });
+    removeDirForceSync(stageDir);
     mkdirSync(stageDir, { recursive: true });
     mkdirSync(opts.outDir, { recursive: true });
 
@@ -520,7 +521,7 @@ async function main() {
     );
   } finally {
     if (!opts.keepStaging) {
-      rmSync(workDir, { recursive: true, force: true });
+      removeDirForceSync(workDir);
     }
   }
 }
