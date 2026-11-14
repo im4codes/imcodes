@@ -5591,7 +5591,9 @@ function ToolActivitySummary({
   // a timer alive, and the shared ticker stops once its last listener leaves.
   const nowMs = useNowTicker(visible && counts.running > 0);
   const last = getLastToolActivity(events, nowMs);
-  const lastStartTime = last?.startedAt != null ? formatChatDateTime(last.startedAt, nowMs, locale) : null;
+  // A completed group stops its elapsed ticker. Calendar labels must still
+  // use the current day whenever rendering again (e.g. opening a peek tomorrow).
+  const lastStartTime = last?.startedAt != null ? formatChatDateTime(last.startedAt, Date.now(), locale) : null;
   const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
   // Same one-line preview the full row shows, so this reads as a miniature of it
   // rather than a different rendering of the same data.

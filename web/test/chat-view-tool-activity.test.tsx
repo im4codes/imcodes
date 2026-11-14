@@ -115,6 +115,32 @@ describe('ChatView compact tool activity', () => {
     expect(peekStart?.nextElementSibling).toBe(document.querySelector('.chat-tool-peek-duration'));
   });
 
+  it.each(['mouse', 'keyboard'] as const)('refreshes a finished tool’s calendar date after midnight on %s peek open', (input) => {
+    const beforeMidnight = new Date(2026, 10, 14, 23, 59, 50).getTime();
+    const afterMidnight = new Date(2026, 10, 15, 0, 0, 10).getTime();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(beforeMidnight);
+    stubHover(true);
+    const startedAt = new Date(2026, 10, 14, 23, 59, 0).getTime();
+    const call = { ...makeEvent('midnight-call', 'tool.call', { tool: 'Bash', input: { command: 'build' } }, 1), ts: startedAt };
+    const result = { ...makeEvent('midnight-result', 'tool.result', { output: 'done' }, 2), ts: startedAt + 1_500 };
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+    expect(container.querySelector('.chat-tool-activity-start-time')?.textContent)
+      .toBe(formatChatDateTime(startedAt, beforeMidnight));
+
+    // Completed groups do not tick. Opening a fresh peek still needs TODAY’s
+    // calendar reference, not the last value of that inactive elapsed ticker.
+    clock.mockReturnValue(afterMidnight);
+    const chip = container.querySelector('.chat-tool-activity')!;
+    if (input === 'mouse') fireEvent.mouseEnter(chip);
+    else act(() => { (chip as HTMLElement).focus(); });
+    const expected = formatChatDateTime(startedAt, afterMidnight);
+    expect(expected).not.toBe(formatChatDateTime(startedAt, beforeMidnight));
+    expect(container.querySelector('.chat-tool-activity-start-time')?.textContent).toBe(expected);
+    expect(document.querySelector('.chat-tool-peek-start-time')?.textContent).toBe(expected);
+    expect(container.querySelector('.chat-tool-activity-time')?.textContent).toBe('1.5s');
+    expect(document.querySelector('.chat-tool-peek-duration')?.textContent).toBe('1.5s');
+  });
+
   it('includes yesterday’s date and keeps a start time when a finished call has no duration', () => {
     const now = new Date(2026, 10, 14, 0, 0, 10).getTime();
     vi.spyOn(Date, 'now').mockReturnValue(now);
