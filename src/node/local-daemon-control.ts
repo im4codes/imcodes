@@ -1,9 +1,12 @@
 import { execFile, spawn, type SpawnOptions } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   chownSync,
   closeSync,
+  constants as fsConstants,
   existsSync,
+  fchmodSync,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -15,7 +18,7 @@ import {
   renameSync,
   rmSync,
   statSync,
-  writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { homedir, hostname, tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
@@ -26,6 +29,7 @@ import {
   REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE,
   REMOTE_DESKTOP_LOCAL_DAEMON_REASON,
   REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE,
+  redactRemoteDesktopLocalSecrets,
   sanitizeRemoteDesktopLocalDaemonStatus,
   type RemoteDesktopLocalDaemonAction,
   type RemoteDesktopLocalDaemonAutostartState,
@@ -35,7 +39,7 @@ import {
 } from '../../shared/remote-desktop-local-management.js';
 import { xmlEscapeText } from '../../shared/macos-daemon-launch.js';
 import { readDaemonRuntimeStatus } from '../util/daemon-status.js';
-import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
+import { IMCODES_HOME_ENV, imcodesStateDir, imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
 import { resolveActiveLinuxDesktopUser, resolveLinuxDesktopSessionEnv } from './linux-desktop-session.js';
 import {
@@ -50,6 +54,8 @@ const execFileAsync = promisify(execFile);
 
 export const CODING_DAEMON_LOG_MAX_BYTES = 64 * 1024;
 const DEFAULT_STOP_WAIT_MS = 1_500;
+const DEFAULT_BIND_TIMEOUT_MS = 15_000;
+const DEFAULT_WINDOWS_LAUNCH_SETTLE_MS = 50;
 const WINDOWS_TASK_NAME = 'IMCodes Daemon';
 const WINDOWS_STARTUP_SCRIPT_NAME = 'imcodes-daemon.cmd';
 
@@ -102,6 +108,10 @@ export interface LocalDaemonControlDeps {
   ) => void;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  chown?: (filePath: string, uid: number, gid: number) => void;
+  bindTimeoutMs?: number;
+  stopWaitMs?: number;
+  windowsLaunchSettleMs?: number;
 }
 
 export interface LocalDaemonController {
@@ -190,10 +200,15 @@ function findImcodesVersionFromPath(entryPath: string): string | undefined {
         // ignore
       }
     }
-    const nmPkgPath = join(dir, 'lib', 'node_modules', 'imcodes', 'package.json');
-    if (existsSync(nmPkgPath)) {
-      const v = readPackageVersion(nmPkgPath);
-      if (v) return v;
+    const nmPkgPaths = [
+      join(dir, 'lib', 'node_modules', 'imcodes', 'package.json'),
+      join(dir, 'node_modules', 'imcodes', 'package.json'),
+    ];
+    for (const nmPkgPath of nmPkgPaths) {
+      if (existsSync(nmPkgPath)) {
+        const v = readPackageVersion(nmPkgPath);
+        if (v) return v;
+      }
     }
     const parent = dirname(dir);
     if (parent === dir) break;
@@ -273,12 +288,25 @@ export function discoverCodingDaemonRuntime(options: {
   const cliCandidates: Array<string | undefined> = options.cliCandidates !== undefined ? [...options.cliCandidates] : [];
   if (options.cliCandidates === undefined) {
     if (platform === 'win32') {
-      const appData = env.APPDATA || (options.userHome ? join(options.userHome, 'AppData', 'Roaming') : undefined);
-      if (appData) cliCandidates.push(join(appData, 'npm', 'imcodes.cmd'));
-      cliCandidates.push(join(env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'imcodes.cmd'));
+      if (options.userHome) {
+        const userAppData = join(options.userHome, 'AppData', 'Roaming');
+        cliCandidates.push(
+          join(userAppData, 'npm', 'imcodes.exe'),
+          join(userAppData, 'npm', 'imcodes.cmd'),
+          join(options.userHome, 'AppData', 'Local', 'Programs', 'nodejs', 'imcodes.cmd'),
+        );
+      }
+      if (env.APPDATA && !env.APPDATA.toLowerCase().includes('\\systemprofile\\')) {
+        cliCandidates.push(
+          join(env.APPDATA, 'npm', 'imcodes.exe'),
+          join(env.APPDATA, 'npm', 'imcodes.cmd'),
+        );
+      }
+      cliCandidates.push(
+        join(env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'imcodes.exe'),
+        join(env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'imcodes.cmd'),
+      );
     } else {
-      if (platform === 'darwin') cliCandidates.push('/opt/homebrew/bin/imcodes');
-      cliCandidates.push('/usr/local/bin/imcodes', '/usr/bin/imcodes');
       if (options.userHome) {
         cliCandidates.push(
           join(options.userHome, '.local', 'bin', 'imcodes'),
@@ -297,6 +325,8 @@ export function discoverCodingDaemonRuntime(options: {
           // ignore unreadable nvm directory
         }
       }
+      if (platform === 'darwin') cliCandidates.push('/opt/homebrew/bin/imcodes');
+      cliCandidates.push('/usr/local/bin/imcodes', '/usr/bin/imcodes');
     }
 
     const pathVar = env.PATH ?? '';
@@ -318,11 +348,13 @@ export function discoverCodingDaemonRuntime(options: {
     if (platform === 'win32' && /\.(?:cmd|bat)$/iu.test(candidate)) {
       const cmdDir = dirname(candidate);
       const distEntry = join(cmdDir, 'node_modules', 'imcodes', 'dist', 'src', 'index.js');
-      const siblingNode = join(cmdDir, 'node.exe');
-      const programFilesNode = join(env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe');
-      const resolvedNode = isExecutableFile(siblingNode, 'win32')
-        ? siblingNode
-        : (isExecutableFile(programFilesNode, 'win32') ? programFilesNode : undefined);
+      const nodeCandidates: Array<string | undefined> = [
+        join(cmdDir, 'node.exe'),
+        options.userHome ? join(options.userHome, 'AppData', 'Local', 'Programs', 'nodejs', 'node.exe') : undefined,
+        join(env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'node.exe'),
+        ...(env.PATH ?? '').split(';').filter(Boolean).map((dir) => join(dir.trim(), 'node.exe')),
+      ];
+      const resolvedNode = uniquePaths(nodeCandidates).find((nodeCandidate) => isExecutableFile(nodeCandidate, 'win32'));
       if (resolvedNode && existsSync(distEntry)) {
         return {
           source: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.CLI,
@@ -355,19 +387,11 @@ export function discoverCodingDaemonRuntime(options: {
 
 /** Redact tokens, bearer headers, and bind URLs before displaying daemon errors or logs. */
 export function redactDaemonSecrets(input: string): string {
-  // eslint-disable-next-line no-control-regex
-  const withoutAnsi = input
-    // eslint-disable-next-line no-control-regex
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, '')
-    // eslint-disable-next-line no-control-regex
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/gu, '');
-  // eslint-disable-next-line no-control-regex
-  const cleanControls = withoutAnsi.replace(/[\u0000-\u0008\u000b-\u001f\u007f]+/gu, ' ');
-  return cleanControls
-    .replace(/(\/bind\/)[^\s"'`?#]+/giu, '$1[redacted]')
-    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/giu, '$1[redacted]')
-    .replace(/([?"&'\s,](?:token|api[_-]?key|secret)\s*[:=]\s*"?)[^\s"',&}]+/giu, '$1[redacted]')
-    .replace(/^((?:token|api[_-]?key|secret)\s*[:=]\s*"?)[^\s"',&}]+/gimu, '$1[redacted]');
+  return redactRemoteDesktopLocalSecrets(input, { preserveNewlines: true });
+}
+
+function isRealServiceControlBlockedInTest(): boolean {
+  return Boolean(process.env.VITEST) && process.env.IMCODES_ALLOW_REAL_SERVICE_CONTROL !== '1';
 }
 
 function defaultExecText(
@@ -375,6 +399,9 @@ function defaultExecText(
   args: readonly string[],
   opts?: { timeoutMs?: number; env?: NodeJS.ProcessEnv; uid?: number; gid?: number },
 ): Promise<{ stdout: string; stderr: string }> {
+  if (isRealServiceControlBlockedInTest()) {
+    return Promise.reject(new Error(`refused_real_exec_in_vitest: ${file} ${args.join(' ')}`));
+  }
   return execFileAsync(file, [...args], {
     timeout: opts?.timeoutMs ?? 15_000,
     encoding: 'utf8',
@@ -528,11 +555,174 @@ async function resolveDefaultActiveUser(
   return null;
 }
 
-function readServerCredentials(stateDir: string): StoredServerCredentials | null {
-  const filePath = join(stateDir, 'server.json');
+function assertCleanRelativeParts(relativeParts: readonly string[]): void {
+  if (relativeParts.length === 0) throw new Error('unsafe_path');
+  for (const part of relativeParts) {
+    if (!part || part === '.' || part === '..' || part.includes('/') || part.includes('\\')) {
+      throw new Error('unsafe_path');
+    }
+  }
+}
+
+function isWithinCanonicalRoot(candidateRealPath: string, canonicalRoot: string): boolean {
+  return candidateRealPath === canonicalRoot || candidateRealPath.startsWith(`${canonicalRoot}${sep}`);
+}
+
+function applyPathOwnership(
+  targetPath: string,
+  user: ActiveDesktopUser,
+  currentUid: number,
+  chownOverride?: (filePath: string, uid: number, gid: number) => void,
+): void {
+  if (user.platform === 'win32' || currentUid !== 0) return;
+  if (typeof user.uid !== 'number' || typeof user.gid !== 'number') {
+    throw new Error('missing_target_user_ids');
+  }
+  const chownFn = chownOverride ?? chownSync;
+  const realUid = typeof process.getuid === 'function' ? process.getuid() : -1;
   try {
-    if (!existsSync(filePath)) return null;
-    const raw = JSON.parse(readFileSync(filePath, 'utf8')) as {
+    chownFn(targetPath, user.uid, user.gid);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (!chownOverride && realUid !== 0 && code === 'EPERM') {
+      return;
+    }
+    throw err;
+  }
+}
+
+function assertSafeDirRoot(
+  rootDir: string,
+  options: {
+    createIfMissing?: boolean;
+    dirMode?: number;
+    user?: ActiveDesktopUser;
+    currentUid?: number;
+    ownExisting?: boolean;
+    chownOverride?: (filePath: string, uid: number, gid: number) => void;
+  } = {},
+): string | null {
+  let exists = false;
+  try {
+    const st = lstatSync(rootDir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return null;
+    exists = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') return null;
+  }
+  if (!exists) {
+    if (!options.createIfMissing) return null;
+    mkdirSync(rootDir, { recursive: true, mode: options.dirMode ?? 0o700 });
+    if (options.user && typeof options.currentUid === 'number') {
+      applyPathOwnership(rootDir, options.user, options.currentUid, options.chownOverride);
+    }
+  } else if (options.ownExisting && options.user && typeof options.currentUid === 'number') {
+    applyPathOwnership(rootDir, options.user, options.currentUid, options.chownOverride);
+  }
+  try {
+    return realpathSync(rootDir);
+  } catch {
+    return null;
+  }
+}
+
+function openSafeContainedReadFd(rootDir: string, relativeParts: readonly string[]): number | null {
+  try {
+    assertCleanRelativeParts(relativeParts);
+  } catch {
+    return null;
+  }
+  const canonicalRoot = assertSafeDirRoot(rootDir);
+  if (!canonicalRoot) return null;
+
+  let curDir = rootDir;
+  for (const part of relativeParts.slice(0, -1)) {
+    curDir = join(curDir, part);
+    try {
+      const lst = lstatSync(curDir);
+      if (lst.isSymbolicLink() || !lst.isDirectory()) return null;
+      const realDir = realpathSync(curDir);
+      if (!isWithinCanonicalRoot(realDir, canonicalRoot)) return null;
+    } catch {
+      return null;
+    }
+  }
+
+  const targetPath = join(curDir, relativeParts[relativeParts.length - 1]!);
+  try {
+    const lst = lstatSync(targetPath);
+    if (lst.isSymbolicLink() || !lst.isFile()) return null;
+    const fd = openSync(targetPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile()) {
+        closeSync(fd);
+        return null;
+      }
+      const realParent = realpathSync(curDir);
+      if (!isWithinCanonicalRoot(realParent, canonicalRoot)) {
+        closeSync(fd);
+        return null;
+      }
+      return fd;
+    } catch {
+      closeSync(fd);
+      return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+function readSafeSmallUtf8(rootDir: string, relativeParts: readonly string[], maxBytes = 64 * 1024): string | null {
+  const fd = openSafeContainedReadFd(rootDir, relativeParts);
+  if (fd === null) return null;
+  try {
+    const st = fstatSync(fd);
+    if (st.size <= 0 || st.size > maxBytes) return st.size === 0 ? '' : null;
+    const buffer = Buffer.allocUnsafe(st.size);
+    let offset = 0;
+    while (offset < st.size) {
+      const n = readSync(fd, buffer, offset, st.size - offset, offset);
+      if (n <= 0) break;
+      offset += n;
+    }
+    return buffer.subarray(0, offset).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function removeSafeContainedFile(rootDir: string, relativeParts: readonly string[]): void {
+  try {
+    assertCleanRelativeParts(relativeParts);
+  } catch {
+    return;
+  }
+  const canonicalRoot = assertSafeDirRoot(rootDir);
+  if (!canonicalRoot) return;
+  let curDir = rootDir;
+  for (const part of relativeParts.slice(0, -1)) {
+    curDir = join(curDir, part);
+    try {
+      const lst = lstatSync(curDir);
+      if (lst.isSymbolicLink() || !lst.isDirectory()) return;
+      if (!isWithinCanonicalRoot(realpathSync(curDir), canonicalRoot)) return;
+    } catch {
+      return;
+    }
+  }
+  const targetPath = join(curDir, relativeParts[relativeParts.length - 1]!);
+  rmSync(targetPath, { force: true });
+}
+
+function readServerCredentials(stateDir: string): StoredServerCredentials | null {
+  try {
+    const rawText = readSafeSmallUtf8(stateDir, ['server.json']);
+    if (!rawText) return null;
+    const raw = JSON.parse(rawText) as {
       serverId?: unknown;
       workerUrl?: unknown;
       token?: unknown;
@@ -557,66 +747,184 @@ function readServerCredentials(stateDir: string): StoredServerCredentials | null
 }
 
 function readPidFile(stateDir: string): number | null {
-  const pidFile = join(stateDir, 'daemon.pid');
   try {
-    if (!existsSync(pidFile)) return null;
-    const parsed = Number.parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+    const rawText = readSafeSmallUtf8(stateDir, ['daemon.pid'], 1024);
+    if (!rawText) return null;
+    const parsed = Number.parseInt(rawText.trim(), 10);
     return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
   } catch {
     return null;
   }
 }
 
-function ensureOwnedDir(dirPath: string, user: ActiveDesktopUser, currentUid: number, mode = 0o700): void {
-  mkdirSync(dirPath, { recursive: true, mode });
-  if (user.platform !== 'win32' && currentUid === 0 && typeof user.uid === 'number' && typeof user.gid === 'number') {
-    try {
-      chownSync(dirPath, user.uid, user.gid);
-    } catch {
-      // ignore if unsupported on virtual fs
+function readSafeDaemonRuntimeStatus(stateDir: string): ReturnType<typeof readDaemonRuntimeStatus> {
+  const fd = openSafeContainedReadFd(stateDir, ['daemon-runtime.json']);
+  if (fd === null) return null;
+  closeSync(fd);
+  return readDaemonRuntimeStatus(stateDir);
+}
+
+function ensureOwnedDir(
+  rootDir: string,
+  relativeParts: readonly string[],
+  user: ActiveDesktopUser,
+  currentUid: number,
+  mode = 0o700,
+  ownExistingRoot = true,
+  chownOverride?: (filePath: string, uid: number, gid: number) => void,
+): string {
+  const canonicalRoot = assertSafeDirRoot(rootDir, {
+    createIfMissing: true,
+    dirMode: mode,
+    user,
+    currentUid,
+    ownExisting: ownExistingRoot,
+    chownOverride,
+  });
+  if (!canonicalRoot) throw new Error('unsafe_path');
+
+  let curDir = rootDir;
+  for (const part of relativeParts) {
+    if (!part || part === '.' || part === '..' || part.includes('/') || part.includes('\\')) {
+      throw new Error('unsafe_path');
     }
+    curDir = join(curDir, part);
+    let existed = false;
+    try {
+      const lst = lstatSync(curDir);
+      if (lst.isSymbolicLink() || !lst.isDirectory()) throw new Error('unsafe_path');
+      existed = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    }
+    if (!existed) {
+      mkdirSync(curDir, { mode });
+    }
+    applyPathOwnership(curDir, user, currentUid, chownOverride);
+    const realCur = realpathSync(curDir);
+    if (!isWithinCanonicalRoot(realCur, canonicalRoot)) throw new Error('unsafe_path');
   }
+  return curDir;
 }
 
 function writeOwnedFile(
-  filePath: string,
+  rootDir: string,
+  relativeParts: readonly string[],
   content: string,
   user: ActiveDesktopUser,
   currentUid: number,
   mode: number,
+  ownExistingRoot: boolean,
+  chownOverride?: (filePath: string, uid: number, gid: number) => void,
 ): void {
-  ensureOwnedDir(dirname(filePath), user, currentUid, mode === 0o600 ? 0o700 : 0o755);
-  const tmpPath = `${filePath}.${process.pid}.tmp`;
-  writeFileSync(tmpPath, content, { encoding: 'utf8', mode });
-  chmodSync(tmpPath, mode);
-  if (user.platform !== 'win32' && currentUid === 0 && typeof user.uid === 'number' && typeof user.gid === 'number') {
+  assertCleanRelativeParts(relativeParts);
+  const dirMode = mode === 0o600 ? 0o700 : 0o755;
+  const parentDir = ensureOwnedDir(
+    rootDir,
+    relativeParts.slice(0, -1),
+    user,
+    currentUid,
+    dirMode,
+    ownExistingRoot,
+    chownOverride,
+  );
+  const canonicalRoot = realpathSync(rootDir);
+  const leafName = relativeParts[relativeParts.length - 1]!;
+  const filePath = join(parentDir, leafName);
+
+  try {
+    const existing = lstatSync(filePath);
+    if (existing.isSymbolicLink() || existing.isDirectory()) throw new Error('unsafe_path');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+  }
+
+  const tmpPath = join(parentDir, `${leafName}.${randomBytes(8).toString('hex')}.tmp`);
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
+  const fd = openSync(tmpPath, flags, mode);
+  try {
     try {
-      chownSync(tmpPath, user.uid, user.gid);
+      const buf = Buffer.from(content, 'utf8');
+      let written = 0;
+      while (written < buf.length) {
+        written += writeSync(fd, buf, written, buf.length - written);
+      }
+      if (user.platform !== 'win32') {
+        fchmodSync(fd, mode);
+      } else {
+        chmodSync(tmpPath, mode);
+      }
+    } finally {
+      closeSync(fd);
+    }
+    applyPathOwnership(tmpPath, user, currentUid, chownOverride);
+    if (!isWithinCanonicalRoot(realpathSync(parentDir), canonicalRoot)) {
+      throw new Error('unsafe_path');
+    }
+    try {
+      const targetLst = lstatSync(filePath);
+      if (targetLst.isSymbolicLink() || targetLst.isDirectory()) throw new Error('unsafe_path');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    }
+    renameSync(tmpPath, filePath);
+  } catch (err) {
+    rmSync(tmpPath, { force: true });
+    throw err;
+  }
+}
+
+function buildUserServicePath(
+  runtime: DiscoveredCodingDaemonRuntime | null,
+  user: ActiveDesktopUser,
+  platform: NodeJS.Platform,
+  existingPath?: string,
+): string {
+  if (platform === 'win32') return existingPath ?? '';
+  const dirs: Array<string | undefined> = [];
+  if (runtime) {
+    dirs.push(dirname(runtime.executable));
+    try {
+      dirs.push(dirname(realpathSync(runtime.executable)));
     } catch {
-      // ignore
+      // ignore unresolvable executable symlink
     }
   }
-  renameSync(tmpPath, filePath);
+  dirs.push(
+    join(user.home, '.local', 'bin'),
+    join(user.home, '.npm-global', 'bin'),
+    join(user.home, 'bin'),
+  );
+  if (platform === 'darwin') dirs.push('/opt/homebrew/bin');
+  dirs.push('/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin');
+  if (existingPath) {
+    for (const seg of existingPath.split(':')) {
+      if (seg.trim()) dirs.push(seg.trim());
+    }
+  }
+  return uniquePaths(dirs).join(':');
 }
 
 function renderMacosDaemonPlist(
+  label: string,
   runtime: DiscoveredCodingDaemonRuntime,
   user: ActiveDesktopUser,
   stateDir: string,
   autostart: boolean,
+  baseEnvPath?: string,
 ): string {
   const programArgs = [runtime.executable, ...runtime.foregroundArgs]
     .map((arg) => `    <string>${xmlEscapeText(arg)}</string>`)
     .join('\n');
   const logPath = join(stateDir, 'daemon.log');
-  const pathEnv = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+  const pathEnv = buildUserServicePath(runtime, user, 'darwin', baseEnvPath);
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
     '<plist version="1.0">',
     '<dict>',
     '  <key>Label</key>',
-    '  <string>imcodes.daemon</string>',
+    `  <string>${xmlEscapeText(label)}</string>`,
     '  <key>ProgramArguments</key>',
     '  <array>',
     programArgs,
@@ -649,13 +957,21 @@ function formatSystemdToken(arg: string): string {
   return `"${arg.replace(/\\/gu, '\\\\').replace(/"/gu, '\\"')}"`;
 }
 
+function formatSystemdEnvAssignment(key: string, value: string): string {
+  const raw = `${key}=${value}`;
+  if (/^[A-Za-z0-9_./:=+-]+$/u.test(raw)) return raw;
+  return `"${raw.replace(/\\/gu, '\\\\').replace(/"/gu, '\\"')}"`;
+}
+
 function renderLinuxSystemdUnit(
   runtime: DiscoveredCodingDaemonRuntime,
   user: ActiveDesktopUser,
   stateDir: string,
+  baseEnvPath?: string,
 ): string {
   const execStart = [runtime.executable, ...runtime.foregroundArgs].map(formatSystemdToken).join(' ');
   const logPath = join(stateDir, 'daemon.log');
+  const pathEnv = buildUserServicePath(runtime, user, 'linux', baseEnvPath);
   return [
     '[Unit]',
     'Description=IM.codes Coding Daemon',
@@ -667,9 +983,9 @@ function renderLinuxSystemdUnit(
     `ExecStart=${execStart}`,
     'Restart=always',
     'RestartSec=5',
-    `Environment=HOME=${user.home}`,
-    `Environment=IMCODES_HOME=${stateDir}`,
-    `Environment=PATH=${join(user.home, '.local/bin')}:/usr/local/bin:/usr/bin:/bin`,
+    `Environment=${formatSystemdEnvAssignment('HOME', user.home)}`,
+    `Environment=${formatSystemdEnvAssignment('IMCODES_HOME', stateDir)}`,
+    `Environment=${formatSystemdEnvAssignment('PATH', pathEnv)}`,
     `StandardOutput=append:${logPath}`,
     `StandardError=append:${logPath}`,
     '',
@@ -685,21 +1001,49 @@ function parsePlistRunAtLoad(plistText: string): boolean | null {
   return match[1].toLowerCase() === 'true';
 }
 
+function setPlistAutostartFlags(plistText: string, enabled: boolean): string {
+  const flag = enabled ? '<true/>' : '<false/>';
+  return plistText
+    .replace(/(<key>RunAtLoad<\/key>\s*)<(?:true|false)\s*\/>/iu, `$1${flag}`)
+    .replace(/(<key>KeepAlive<\/key>\s*)<(?:true|false)\s*\/>/iu, `$1${flag}`);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
 function posixServicePathsForUser(
   user: ActiveDesktopUser,
   env: NodeJS.ProcessEnv,
-): { launchAgentLabel: string; launchAgentPath: string; systemdUnitName: string; systemdUnitPath: string; scoped: boolean } {
+): {
+  launchAgentLabel: string;
+  launchAgentPath: string;
+  launchAgentRelParts: readonly string[];
+  systemdUnitName: string;
+  systemdUnitPath: string;
+  systemdUnitRelParts: readonly string[];
+  scoped: boolean;
+} {
   const base = resolvePosixDaemonServicePaths({ ...env, HOME: user.home });
+  const launchAgentRelParts = ['Library', 'LaunchAgents', `${base.launchAgentLabel}.plist`] as const;
+  const systemdUnitRelParts = ['.config', 'systemd', 'user', base.systemdUnitName] as const;
   return {
     scoped: base.scoped,
     launchAgentLabel: base.launchAgentLabel,
-    launchAgentPath: join(user.home, 'Library', 'LaunchAgents', `${base.launchAgentLabel}.plist`),
+    launchAgentPath: join(user.home, ...launchAgentRelParts),
+    launchAgentRelParts,
     systemdUnitName: base.systemdUnitName,
-    systemdUnitPath: join(user.home, '.config', 'systemd', 'user', base.systemdUnitName),
+    systemdUnitPath: join(user.home, ...systemdUnitRelParts),
+    systemdUnitRelParts,
   };
 }
 
-function linuxUserServiceEnv(user: ActiveDesktopUser, baseEnv: NodeJS.ProcessEnv, stateDir: string): NodeJS.ProcessEnv {
+function linuxUserServiceEnv(
+  user: ActiveDesktopUser,
+  baseEnv: NodeJS.ProcessEnv,
+  stateDir: string,
+  runtime: DiscoveredCodingDaemonRuntime | null = null,
+): NodeJS.ProcessEnv {
   const uid = user.uid ?? 1000;
   const sessionEnv = resolveLinuxDesktopSessionEnv(baseEnv, {
     user: {
@@ -715,69 +1059,51 @@ function linuxUserServiceEnv(user: ActiveDesktopUser, baseEnv: NodeJS.ProcessEnv
     DBUS_SESSION_BUS_ADDRESS: sessionEnv.DBUS_SESSION_BUS_ADDRESS || `unix:path=/run/user/${uid}/bus`,
     HOME: user.home,
     IMCODES_HOME: stateDir,
+    PATH: buildUserServicePath(runtime, user, 'linux', sessionEnv.PATH),
   };
 }
 
 function readBoundedTailLog(stateDir: string): RemoteDesktopLocalDaemonLogs {
-  const canonicalRoot = (() => {
-    try {
-      return existsSync(stateDir) ? realpathSync(stateDir) : resolve(stateDir);
-    } catch {
-      return resolve(stateDir);
-    }
-  })();
-
-  const candidateFiles = [
-    { path: join(stateDir, 'logs', 'daemon.log'), label: 'logs/daemon.log' },
-    { path: join(stateDir, 'daemon.log'), label: 'daemon.log' },
+  const candidates: Array<{ parts: readonly string[]; label: string }> = [
+    { parts: ['logs', 'daemon.log'], label: 'logs/daemon.log' },
+    { parts: ['daemon.log'], label: 'daemon.log' },
   ];
 
-  for (const candidate of candidateFiles) {
+  for (const candidate of candidates) {
+    const fd = openSafeContainedReadFd(stateDir, candidate.parts);
+    if (fd === null) continue;
     try {
-      const resolvedPath = resolve(candidate.path);
-      if (resolvedPath !== canonicalRoot && !resolvedPath.startsWith(`${canonicalRoot}${sep}`)) continue;
-      const lst = lstatSync(resolvedPath);
-      if (lst.isSymbolicLink()) {
-        const real = realpathSync(resolvedPath);
-        if (!real.startsWith(`${canonicalRoot}${sep}`)) continue;
-      } else if (!lst.isFile()) {
-        continue;
+      const st = fstatSync(fd);
+      const totalBytes = st.size;
+      if (totalBytes <= 0) {
+        return { text: '', truncated: false, source: candidate.label };
       }
-
-      const fd = openSync(resolvedPath, 'r');
-      try {
-        const st = fstatSync(fd);
-        const totalBytes = st.size;
-        if (totalBytes <= 0) {
-          return { text: '', truncated: false, source: candidate.label };
-        }
-        const truncated = totalBytes > CODING_DAEMON_LOG_MAX_BYTES;
-        const readBytes = Math.min(totalBytes, CODING_DAEMON_LOG_MAX_BYTES);
-        const startOffset = Math.max(0, totalBytes - readBytes);
-        const buffer = Buffer.allocUnsafe(readBytes);
-        let offset = 0;
-        while (offset < readBytes) {
-          const n = readSync(fd, buffer, offset, readBytes - offset, startOffset + offset);
-          if (n <= 0) break;
-          offset += n;
-        }
-        let text = buffer.subarray(0, offset).toString('utf8');
-        if (truncated) {
-          const firstNewline = text.indexOf('\n');
-          if (firstNewline >= 0 && firstNewline < text.length - 1) {
-            text = text.slice(firstNewline + 1);
-          }
-        }
-        return {
-          text: redactDaemonSecrets(text),
-          truncated,
-          source: candidate.label,
-        };
-      } finally {
-        closeSync(fd);
+      const truncated = totalBytes > CODING_DAEMON_LOG_MAX_BYTES;
+      const readBytes = Math.min(totalBytes, CODING_DAEMON_LOG_MAX_BYTES);
+      const startOffset = Math.max(0, totalBytes - readBytes);
+      const buffer = Buffer.allocUnsafe(readBytes);
+      let offset = 0;
+      while (offset < readBytes) {
+        const n = readSync(fd, buffer, offset, readBytes - offset, startOffset + offset);
+        if (n <= 0) break;
+        offset += n;
       }
+      let text = buffer.subarray(0, offset).toString('utf8');
+      if (truncated) {
+        const firstNewline = text.indexOf('\n');
+        if (firstNewline >= 0 && firstNewline < text.length - 1) {
+          text = text.slice(firstNewline + 1);
+        }
+      }
+      return {
+        text: redactDaemonSecrets(text),
+        truncated,
+        source: candidate.label,
+      };
     } catch {
       // try next candidate
+    } finally {
+      closeSync(fd);
     }
   }
 
@@ -821,13 +1147,46 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
   const hostNameFn = deps.hostName ?? hostname;
   const execText = deps.execText ?? defaultExecText;
   const isPidAlive = deps.isPidAlive ?? ((pid: number) => defaultIsPidAlive(pid, platform));
-  const killProcess = deps.killProcess ?? ((pid: number, sig: NodeJS.Signals | number) => { process.kill(pid, sig); });
+  const killProcess = deps.killProcess ?? ((pid: number, sig: NodeJS.Signals | number) => {
+    if (isRealServiceControlBlockedInTest()) {
+      throw new Error(`refused_real_kill_in_vitest: ${pid} ${String(sig)}`);
+    }
+    process.kill(pid, sig);
+  });
   const spawnDetached = deps.spawnDetached ?? ((file, args, opts) => {
+    if (isRealServiceControlBlockedInTest()) {
+      throw new Error(`refused_real_spawn_in_vitest: ${file}`);
+    }
     const child = spawn(file, [...args], opts);
     child.unref();
   });
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const bindTimeoutMs = deps.bindTimeoutMs ?? DEFAULT_BIND_TIMEOUT_MS;
+  const stopWaitMs = deps.stopWaitMs ?? DEFAULT_STOP_WAIT_MS;
+  const windowsLaunchSettleMs = deps.windowsLaunchSettleMs ?? DEFAULT_WINDOWS_LAUNCH_SETTLE_MS;
+
+  function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) {
+      return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('bind_timeout'));
+    }
+    return new Promise<T>((resolvePromise, rejectPromise) => {
+      const onAbort = () => {
+        rejectPromise(signal.reason instanceof Error ? signal.reason : new Error('bind_timeout'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          resolvePromise(value);
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          rejectPromise(err);
+        },
+      );
+    });
+  }
 
   async function resolveUser(): Promise<ActiveDesktopUser | null> {
     if (typeof deps.activeUser === 'function') return deps.activeUser();
@@ -836,7 +1195,135 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
   }
 
   function stateDirForUser(user: ActiveDesktopUser): string {
+    if (env[IMCODES_HOME_ENV]?.trim()) {
+      return imcodesStateDir(env);
+    }
     return imcodesStateDirForHome(user.home, env);
+  }
+
+  async function runWindowsUserLaunch(executable: string, argsLine: string): Promise<void> {
+    await new Promise<void>((resolveLaunch, rejectLaunch) => {
+      let settled = false;
+      let spawnCalled = false;
+      let settleTimer: NodeJS.Timeout | undefined;
+      const finishResolve = () => {
+        if (settled) return;
+        settled = true;
+        if (settleTimer) clearTimeout(settleTimer);
+        resolveLaunch();
+      };
+      const finishReject = (detail: string) => {
+        if (settled) return;
+        settled = true;
+        if (settleTimer) clearTimeout(settleTimer);
+        rejectLaunch(new Error(detail || 'windows_user_launch_failed'));
+      };
+      const wrappedSpawn: typeof spawn = ((...spawnArgs: Parameters<typeof spawn>) => {
+        spawnCalled = true;
+        const child = spawn(...spawnArgs);
+        child.once('error', (err) => finishReject(err instanceof Error ? err.message : String(err)));
+        child.once('exit', (code) => {
+          if (code === 0) {
+            queueMicrotask(finishResolve);
+          } else {
+            finishReject(`powershell exit ${code ?? 'unknown'}`);
+          }
+        });
+        return child;
+      }) as typeof spawn;
+
+      try {
+        launchWindowsActiveUserCommand(
+          executable,
+          argsLine,
+          wrappedSpawn,
+          false,
+          false,
+          false,
+          (detail) => {
+            finishReject(detail);
+          },
+        );
+      } catch (err) {
+        finishReject(err instanceof Error ? err.message : String(err));
+        return;
+      }
+
+      if (!spawnCalled) {
+        settleTimer = setTimeout(finishResolve, windowsLaunchSettleMs);
+      } else {
+        settleTimer = setTimeout(() => finishReject('windows_user_launch_timeout'), 15_000);
+        settleTimer.unref?.();
+      }
+    });
+  }
+
+  async function verifyDaemonPidForUser(pid: number, user: ActiveDesktopUser): Promise<'match' | 'mismatch' | 'unknown'> {
+    if (platform === 'linux') {
+      const procDir = `/proc/${pid}`;
+      if (existsSync(procDir)) {
+        try {
+          const st = statSync(procDir);
+          if (typeof user.uid === 'number' && st.uid !== user.uid) {
+            return 'mismatch';
+          }
+          const cmdline = readFileSync(`${procDir}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
+          if (cmdline && !/(?:imcodes|dist\/src\/index\.js|src\/index\.ts)/iu.test(cmdline)) {
+            return 'mismatch';
+          }
+          return 'match';
+        } catch {
+          return 'unknown';
+        }
+      }
+      return 'unknown';
+    }
+
+    if (platform === 'darwin') {
+      try {
+        const { stdout } = await execText('ps', ['-p', String(pid), '-o', 'uid=,command='], { timeoutMs: 2_000, env });
+        const line = stdout.trim();
+        if (!line) return 'unknown';
+        const match = line.match(/^(\d+)\s+(.+)$/u);
+        if (!match) return 'unknown';
+        const procUid = Number.parseInt(match[1]!, 10);
+        const cmd = match[2]!;
+        if (typeof user.uid === 'number' && procUid !== user.uid) return 'mismatch';
+        if (!/(?:imcodes|dist\/src\/index\.js|src\/index\.ts)/iu.test(cmd)) return 'mismatch';
+        return 'match';
+      } catch {
+        return 'unknown';
+      }
+    }
+
+    if (platform === 'win32') {
+      const psScript = [
+        `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction SilentlyContinue`,
+        'if (-not $p) { exit 0 }',
+        '$o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue',
+        'Write-Output (($o.User -as [string]) + "|" + ($p.CommandLine -as [string]))',
+      ].join('; ');
+      try {
+        const { stdout } = await execText(
+          'powershell',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
+          { timeoutMs: 3_000, env },
+        );
+        const line = stdout.trim();
+        if (!line || !line.includes('|')) return 'unknown';
+        const sepIdx = line.indexOf('|');
+        const owner = line.slice(0, sepIdx).trim().split('\\').pop()?.toLowerCase() ?? '';
+        const cmd = line.slice(sepIdx + 1).trim();
+        const expectedUser = user.username.trim().split('\\').pop()?.toLowerCase() ?? '';
+        if (owner && expectedUser && owner !== expectedUser) return 'mismatch';
+        if (cmd && !/(?:imcodes|dist[\\/]src[\\/]index\.js|daemon-runtime)/iu.test(cmd)) return 'mismatch';
+        if (owner || cmd) return 'match';
+      } catch {
+        return 'unknown';
+      }
+    }
+
+    return 'unknown';
   }
 
   async function detectAutostart(
@@ -846,12 +1333,11 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
   ): Promise<RemoteDesktopLocalDaemonAutostartState> {
     if (platform === 'darwin') {
       const paths = posixServicePathsForUser(user, env);
-      if (paths.scoped) return REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.UNAVAILABLE;
       try {
-        if (!existsSync(paths.launchAgentPath)) {
+        const plistText = readSafeSmallUtf8(user.home, paths.launchAgentRelParts);
+        if (plistText === null) {
           return runtime ? REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.DISABLED : REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.UNAVAILABLE;
         }
-        const plistText = readFileSync(paths.launchAgentPath, 'utf8');
         const runAtLoad = parsePlistRunAtLoad(plistText);
         if (runAtLoad === false) return REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.DISABLED;
         if (typeof user.uid === 'number') {
@@ -861,7 +1347,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
               ['print-disabled', `gui/${user.uid}`],
               { timeoutMs: 4_000, env },
             );
-            if (/["']imcodes\.daemon["']\s*=>\s*disabled/iu.test(stdout)) {
+            const disabledRe = new RegExp(`["']${escapeRegExp(paths.launchAgentLabel)}["']\\s*=>\\s*disabled`, 'iu');
+            if (disabledRe.test(stdout)) {
               return REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.DISABLED;
             }
           } catch {
@@ -876,9 +1363,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
 
     if (platform === 'linux') {
       const paths = posixServicePathsForUser(user, env);
-      if (paths.scoped) return REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.UNAVAILABLE;
       const currentUid = currentUidFn();
-      const userEnv = linuxUserServiceEnv(user, env, stateDir);
+      const userEnv = linuxUserServiceEnv(user, env, stateDir, runtime);
       try {
         const { stdout } = await execText('systemctl', ['--user', 'is-enabled', paths.systemdUnitName], {
           timeoutMs: 4_000,
@@ -898,8 +1384,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     }
 
     if (platform === 'win32') {
-      const startupFile = join(
-        user.home,
+      const startupFd = openSafeContainedReadFd(user.home, [
         'AppData',
         'Roaming',
         'Microsoft',
@@ -908,16 +1393,15 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         'Programs',
         'Startup',
         WINDOWS_STARTUP_SCRIPT_NAME,
-      );
-      if (existsSync(startupFile)) return REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED;
+      ]);
+      if (startupFd !== null) {
+        closeSync(startupFd);
+        return REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED;
+      }
       try {
         await execText('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME], { timeoutMs: 4_000, env });
         return REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED;
-      } catch (err) {
-        const msg = `${(err as { stderr?: string })?.stderr ?? ''}${(err as Error)?.message ?? ''}`;
-        if (/cannot find|does not exist|not found/iu.test(msg)) {
-          return runtime ? REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.DISABLED : REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.UNAVAILABLE;
-        }
+      } catch {
         return runtime ? REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.DISABLED : REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.UNAVAILABLE;
       }
     }
@@ -956,7 +1440,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     const stateDir = stateDirForUser(user);
     const creds = readServerCredentials(stateDir);
     const bound = Boolean(creds);
-    const runtimeStatus = readDaemonRuntimeStatus(stateDir);
+    const runtimeStatus = readSafeDaemonRuntimeStatus(stateDir);
     const filePid = readPidFile(stateDir);
     const candidatePid = filePid ?? (runtimeStatus?.pid && runtimeStatus.pid > 0 ? runtimeStatus.pid : null);
     const running = candidatePid !== null && isPidAlive(candidatePid);
@@ -1003,62 +1487,99 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     })!;
   }
 
-  async function stopUserDaemon(user: ActiveDesktopUser, stateDir: string): Promise<void> {
+  async function stopUserDaemon(user: ActiveDesktopUser, stateDir: string): Promise<boolean> {
     const currentUid = currentUidFn();
-    const pid = readPidFile(stateDir) ?? readDaemonRuntimeStatus(stateDir)?.pid ?? null;
+    const pid = readPidFile(stateDir) ?? readSafeDaemonRuntimeStatus(stateDir)?.pid ?? null;
+
+    if (pid && isPidAlive(pid)) {
+      const identity = await verifyDaemonPidForUser(pid, user);
+      if (identity === 'mismatch') {
+        return false;
+      }
+    }
 
     if (platform === 'darwin' && typeof user.uid === 'number') {
-      await execText(MACOS_LAUNCHCTL_PATH, ['bootout', `gui/${user.uid}/imcodes.daemon`], {
+      const paths = posixServicePathsForUser(user, env);
+      await execText(MACOS_LAUNCHCTL_PATH, ['bootout', `gui/${user.uid}/${paths.launchAgentLabel}`], {
         timeoutMs: 8_000,
         env,
       }).catch(() => undefined);
     } else if (platform === 'linux') {
+      const paths = posixServicePathsForUser(user, env);
       const userEnv = linuxUserServiceEnv(user, env, stateDir);
-      await execText('systemctl', ['--user', 'stop', 'imcodes.service'], {
+      await execText('systemctl', ['--user', 'stop', paths.systemdUnitName], {
         timeoutMs: 8_000,
         env: userEnv,
         ...(currentUid === 0 && typeof user.uid === 'number' ? { uid: user.uid, gid: user.gid ?? user.uid } : {}),
       }).catch(() => undefined);
     } else if (platform === 'win32') {
-      await execText('schtasks', ['/End', '/TN', WINDOWS_TASK_NAME], { timeoutMs: 5_000, env }).catch(() => undefined);
-      if (pid && isPidAlive(pid)) {
-        await execText('taskkill', ['/PID', String(pid), '/T', '/F'], { timeoutMs: 5_000, env }).catch(() => undefined);
+      const currentName = (() => {
+        try { return userInfo().username; } catch { return env.USERNAME || ''; }
+      })();
+      if (!isWindowsSystemProcess(env, currentName)) {
+        await execText('schtasks', ['/End', '/TN', WINDOWS_TASK_NAME], { timeoutMs: 5_000, env }).catch(() => undefined);
+        if (pid && isPidAlive(pid)) {
+          await execText('taskkill', ['/PID', String(pid), '/T', '/F'], { timeoutMs: 5_000, env }).catch(() => undefined);
+        }
+      } else if (pid && isPidAlive(pid)) {
+        await runWindowsUserLaunch('taskkill.exe', `/PID ${pid} /T /F`).catch(() => undefined);
       }
     }
 
     if (pid && isPidAlive(pid)) {
       try {
-        if (platform === 'darwin' && currentUid === 0 && typeof user.uid === 'number') {
-          const macUser: MacosUserSession = {
-            uid: user.uid,
-            gid: user.gid ?? user.uid,
-            name: user.username,
-            home: user.home,
-            tempDir: user.tempDir || tmpdir(),
-          };
-          await runMacosUserSessionCommand(macUser, {
-            executable: '/bin/kill',
-            args: ['-TERM', String(pid)],
-          }, 5_000, async (file, args, timeoutMs) => {
-            const res = await execText(file, args, { timeoutMs, env });
-            return res.stdout;
-          }).catch(() => killProcess(pid, 'SIGTERM'));
-        } else {
-          killProcess(pid, 'SIGTERM');
+        if (platform === 'darwin') {
+          if (currentUid === 0) {
+            if (typeof user.uid === 'number') {
+              const macUser: MacosUserSession = {
+                uid: user.uid,
+                gid: user.gid ?? user.uid,
+                name: user.username,
+                home: user.home,
+                tempDir: user.tempDir || tmpdir(),
+              };
+              await runMacosUserSessionCommand(macUser, {
+                executable: '/bin/kill',
+                args: ['-TERM', String(pid)],
+              }, 5_000, async (file, args, timeoutMs) => {
+                const res = await execText(file, args, { timeoutMs, env });
+                return res.stdout;
+              });
+            }
+          } else if (typeof user.uid !== 'number' || user.uid === currentUid) {
+            killProcess(pid, 'SIGTERM');
+          }
+        } else if (platform === 'linux') {
+          if (currentUid === 0) {
+            if (typeof user.uid === 'number') {
+              const killBin = existsSync('/bin/kill') ? '/bin/kill' : 'kill';
+              await execText(killBin, ['-TERM', String(pid)], {
+                timeoutMs: 5_000,
+                env: linuxUserServiceEnv(user, env, stateDir),
+                uid: user.uid,
+                gid: user.gid ?? user.uid,
+              });
+            }
+          } else if (typeof user.uid !== 'number' || user.uid === currentUid) {
+            killProcess(pid, 'SIGTERM');
+          }
         }
       } catch {
-        // process may already have exited
+        // never escalate to host root/SYSTEM when user-session kill fails
       }
 
-      const deadline = Date.now() + DEFAULT_STOP_WAIT_MS;
+      const deadline = Date.now() + stopWaitMs;
       while (Date.now() < deadline && isPidAlive(pid)) {
         await sleep(100);
       }
     }
 
-    if (!pid || !isPidAlive(pid)) {
-      rmSync(join(stateDir, 'daemon.pid'), { force: true });
+    const stillAlive = pid !== null && isPidAlive(pid);
+    if (!stillAlive) {
+      removeSafeContainedFile(stateDir, ['daemon.pid']);
+      return true;
     }
+    return false;
   }
 
   async function startUserDaemon(
@@ -1075,10 +1596,15 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       if (typeof user.uid !== 'number') throw new Error('missing_macos_uid');
       const paths = posixServicePathsForUser(user, env);
       const currentAutostart = (await detectAutostart(user, stateDir, runtime)) === REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED;
-      const plist = renderMacosDaemonPlist(runtime, user, stateDir, currentAutostart);
-      writeOwnedFile(paths.launchAgentPath, plist, user, currentUid, 0o644);
-      ensureOwnedDir(stateDir, user, currentUid, 0o700);
-      await execText(MACOS_LAUNCHCTL_PATH, ['bootout', `gui/${user.uid}/imcodes.daemon`], {
+      const plist = renderMacosDaemonPlist(paths.launchAgentLabel, runtime, user, stateDir, currentAutostart, env.PATH);
+      writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.chown);
+      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.chown);
+      const serviceTarget = `gui/${user.uid}/${paths.launchAgentLabel}`;
+      await execText(MACOS_LAUNCHCTL_PATH, ['bootout', serviceTarget], {
+        timeoutMs: 5_000,
+        env,
+      }).catch(() => undefined);
+      await execText(MACOS_LAUNCHCTL_PATH, ['enable', serviceTarget], {
         timeoutMs: 5_000,
         env,
       }).catch(() => undefined);
@@ -1087,7 +1613,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         env,
       });
       if (!currentAutostart) {
-        await execText(MACOS_LAUNCHCTL_PATH, ['kickstart', '-k', `gui/${user.uid}/imcodes.daemon`], {
+        await execText(MACOS_LAUNCHCTL_PATH, ['kickstart', '-k', serviceTarget], {
           timeoutMs: 8_000,
           env,
         });
@@ -1096,8 +1622,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     }
 
     if (platform === 'linux') {
-      ensureOwnedDir(stateDir, user, currentUid, 0o700);
-      const userEnv = linuxUserServiceEnv(user, env, stateDir);
+      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.chown);
+      const userEnv = linuxUserServiceEnv(user, env, stateDir, runtime);
       const runOpts = currentUid === 0 && typeof user.uid === 'number'
         ? { timeoutMs: 8_000, env: userEnv, uid: user.uid, gid: user.gid ?? user.uid }
         : { timeoutMs: 8_000, env: userEnv };
@@ -1108,22 +1634,30 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
 
       if (systemdUsable) {
         const paths = posixServicePathsForUser(user, env);
-        const unit = renderLinuxSystemdUnit(runtime, user, stateDir);
-        writeOwnedFile(paths.systemdUnitPath, unit, user, currentUid, 0o644);
+        const unit = renderLinuxSystemdUnit(runtime, user, stateDir, userEnv.PATH);
+        writeOwnedFile(user.home, paths.systemdUnitRelParts, unit, user, currentUid, 0o644, false, deps.chown);
         await execText('systemctl', ['--user', 'daemon-reload'], runOpts);
-        await execText('systemctl', ['--user', 'start', 'imcodes.service'], runOpts);
+        await execText('systemctl', ['--user', 'start', paths.systemdUnitName], runOpts);
         return;
       }
 
       // Container / headless / non-systemd fallback: spawn directly with target user's uid/gid, NEVER root.
-      const logsDir = join(stateDir, 'logs');
-      ensureOwnedDir(logsDir, user, currentUid, 0o700);
+      ensureOwnedDir(stateDir, ['logs'], user, currentUid, 0o700, true, deps.chown);
       const logPath = join(stateDir, 'daemon.log');
-      const logFd = openSync(logPath, 'a', 0o600);
-      if (currentUid === 0 && typeof user.uid === 'number' && typeof user.gid === 'number') {
-        try { chownSync(logPath, user.uid, user.gid); } catch { /* ignore */ }
-      }
       try {
+        const lst = lstatSync(logPath);
+        if (lst.isSymbolicLink() || lst.isDirectory()) throw new Error('unsafe_path');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+      }
+      const logFd = openSync(
+        logPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | (fsConstants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      try {
+        fchmodSync(logFd, 0o600);
+        applyPathOwnership(logPath, user, currentUid, deps.chown);
         spawnDetached(runtime.executable, runtime.foregroundArgs, {
           detached: true,
           cwd: user.home,
@@ -1138,28 +1672,13 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     }
 
     if (platform === 'win32') {
-      ensureOwnedDir(stateDir, user, currentUid, 0o700);
+      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.chown);
       const argsLine = runtime.foregroundArgs.map(quoteWindowsArgument).join(' ');
       const currentName = (() => {
         try { return userInfo().username; } catch { return env.USERNAME || ''; }
       })();
       if (isWindowsSystemProcess(env, currentName)) {
-        await new Promise<void>((resolveLaunch, rejectLaunch) => {
-          let failed = false;
-          launchWindowsActiveUserCommand(
-            runtime.executable,
-            argsLine,
-            undefined,
-            false,
-            false,
-            false,
-            (detail) => {
-              failed = true;
-              rejectLaunch(new Error(detail));
-            },
-          );
-          if (!failed) resolveLaunch();
-        });
+        await runWindowsUserLaunch(runtime.executable, argsLine);
         return;
       }
       spawnDetached(runtime.executable, runtime.foregroundArgs, {
@@ -1186,57 +1705,79 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     if (platform === 'darwin') {
       if (typeof user.uid !== 'number') return { ok: false, statusCode: 409, error: 'no_active_user' };
       const paths = posixServicePathsForUser(user, env);
+      const serviceTarget = `gui/${user.uid}/${paths.launchAgentLabel}`;
       if (enabled) {
         if (!runtime) return { ok: false, statusCode: 409, error: 'not_installed' };
-        const plist = renderMacosDaemonPlist(runtime, user, stateDir, true);
-        writeOwnedFile(paths.launchAgentPath, plist, user, currentUid, 0o644);
-        await execText(MACOS_LAUNCHCTL_PATH, ['enable', `gui/${user.uid}/imcodes.daemon`], { timeoutMs: 8_000, env })
+        const plist = renderMacosDaemonPlist(paths.launchAgentLabel, runtime, user, stateDir, true, env.PATH);
+        writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.chown);
+        await execText(MACOS_LAUNCHCTL_PATH, ['enable', serviceTarget], { timeoutMs: 8_000, env })
           .catch(() => undefined);
         await execText(MACOS_LAUNCHCTL_PATH, ['bootstrap', `gui/${user.uid}`, paths.launchAgentPath], { timeoutMs: 8_000, env })
           .catch(() => undefined);
       } else {
-        await execText(MACOS_LAUNCHCTL_PATH, ['disable', `gui/${user.uid}/imcodes.daemon`], { timeoutMs: 8_000, env })
-          .catch(() => undefined);
+        // Clear RunAtLoad/KeepAlive without calling `launchctl disable`, keeping manual START/RESTART operable.
         if (runtime) {
-          const plist = renderMacosDaemonPlist(runtime, user, stateDir, false);
-          writeOwnedFile(paths.launchAgentPath, plist, user, currentUid, 0o644);
+          const plist = renderMacosDaemonPlist(paths.launchAgentLabel, runtime, user, stateDir, false, env.PATH);
+          writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.chown);
+        } else {
+          const existing = readSafeSmallUtf8(user.home, paths.launchAgentRelParts);
+          if (existing !== null) {
+            writeOwnedFile(
+              user.home,
+              paths.launchAgentRelParts,
+              setPlistAutostartFlags(existing, false),
+              user,
+              currentUid,
+              0o644,
+              false,
+              deps.chown,
+            );
+          }
         }
       }
       return { ok: true, statusCode: 200 };
     }
 
     if (platform === 'linux') {
-      const userEnv = linuxUserServiceEnv(user, env, stateDir);
+      const userEnv = linuxUserServiceEnv(user, env, stateDir, runtime);
       const runOpts = currentUid === 0 && typeof user.uid === 'number'
         ? { timeoutMs: 8_000, env: userEnv, uid: user.uid, gid: user.gid ?? user.uid }
         : { timeoutMs: 8_000, env: userEnv };
       const paths = posixServicePathsForUser(user, env);
       if (enabled) {
         if (!runtime) return { ok: false, statusCode: 409, error: 'not_installed' };
-        const unit = renderLinuxSystemdUnit(runtime, user, stateDir);
-        writeOwnedFile(paths.systemdUnitPath, unit, user, currentUid, 0o644);
+        const unit = renderLinuxSystemdUnit(runtime, user, stateDir, userEnv.PATH);
+        writeOwnedFile(user.home, paths.systemdUnitRelParts, unit, user, currentUid, 0o644, false, deps.chown);
         try {
           await execText('systemctl', ['--user', 'daemon-reload'], runOpts);
-          await execText('systemctl', ['--user', 'enable', 'imcodes.service'], runOpts);
+          await execText('systemctl', ['--user', 'enable', paths.systemdUnitName], runOpts);
         } catch {
           return { ok: false, statusCode: 409, error: 'autostart_unavailable' };
         }
       } else {
-        await execText('systemctl', ['--user', 'disable', 'imcodes.service'], runOpts).catch(() => undefined);
+        await execText('systemctl', ['--user', 'disable', paths.systemdUnitName], runOpts).catch(() => undefined);
       }
       return { ok: true, statusCode: 200 };
     }
 
     if (platform === 'win32') {
-      const startupDir = join(user.home, 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
-      const startupFile = join(startupDir, WINDOWS_STARTUP_SCRIPT_NAME);
+      const startupRelParts = [
+        'AppData',
+        'Roaming',
+        'Microsoft',
+        'Windows',
+        'Start Menu',
+        'Programs',
+        'Startup',
+        WINDOWS_STARTUP_SCRIPT_NAME,
+      ] as const;
       if (enabled) {
         if (!runtime) return { ok: false, statusCode: 409, error: 'not_installed' };
         const cmdArgs = runtime.foregroundArgs.map(quoteWindowsArgument).join(' ');
         const cmd = `@echo off\r\nstart "" /min ${quoteWindowsArgument(runtime.executable)} ${cmdArgs}\r\n`;
-        writeOwnedFile(startupFile, cmd, user, currentUid, 0o644);
+        writeOwnedFile(user.home, startupRelParts, cmd, user, currentUid, 0o644, false, deps.chown);
       } else {
-        rmSync(startupFile, { force: true });
+        removeSafeContainedFile(user.home, startupRelParts);
         await execText('schtasks', ['/Delete', '/TN', WINDOWS_TASK_NAME, '/F'], { timeoutMs: 5_000, env }).catch(() => undefined);
       }
       return { ok: true, statusCode: 200 };
@@ -1265,68 +1806,112 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     let serverId: string | undefined;
     let token: string | undefined;
 
-    if (existing && existing.workerUrl === workerUrl && existing.token) {
-      const verifyRes = await fetchImpl(`${workerUrl}/api/bind/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ serverId: existing.serverId, token: existing.token }),
-      }).catch(() => null);
-      if (verifyRes?.ok) {
-        const rebindRes = await fetchImpl(`${workerUrl}/api/bind/rebind`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({ serverId: existing.serverId, serverName: deviceName }),
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(new Error('bind_timeout')), bindTimeoutMs);
+
+    try {
+      if (existing && existing.workerUrl === workerUrl && existing.token) {
+        const verifyRes = await withAbort(
+          fetchImpl(`${workerUrl}/api/bind/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ serverId: existing.serverId, token: existing.token }),
+            signal: ac.signal,
+          }),
+          ac.signal,
+        ).catch((err) => {
+          if (ac.signal.aborted) throw err;
+          return null;
         });
-        if (!rebindRes.ok) {
-          return { ok: false, statusCode: 502, error: 'bind_failed' };
+        if (verifyRes?.ok) {
+          const rebindRes = await withAbort(
+            fetchImpl(`${workerUrl}/api/bind/rebind`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${apiKey}`,
+              },
+              body: JSON.stringify({ serverId: existing.serverId, serverName: deviceName }),
+              signal: ac.signal,
+            }),
+            ac.signal,
+          );
+          if (!rebindRes.ok) {
+            return { ok: false, statusCode: 502, error: 'bind_failed' };
+          }
+          const rebindBody = await withAbort(
+            rebindRes.json() as Promise<{ token?: unknown }>,
+            ac.signal,
+          );
+          if (typeof rebindBody.token !== 'string' || !rebindBody.token) {
+            return { ok: false, statusCode: 502, error: 'bind_failed' };
+          }
+          serverId = existing.serverId;
+          token = rebindBody.token;
         }
-        const rebindBody = await rebindRes.json() as { token?: unknown };
-        if (typeof rebindBody.token !== 'string' || !rebindBody.token) {
-          return { ok: false, statusCode: 502, error: 'bind_failed' };
-        }
-        serverId = existing.serverId;
-        token = rebindBody.token;
       }
-    }
 
-    if (!serverId || !token) {
-      const directRes = await fetchImpl(`${workerUrl}/api/bind/direct`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
+      if (!serverId || !token) {
+        const directRes = await withAbort(
+          fetchImpl(`${workerUrl}/api/bind/direct`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({ serverName: deviceName }),
+            signal: ac.signal,
+          }),
+          ac.signal,
+        );
+        if (!directRes.ok) {
+          return { ok: false, statusCode: 502, error: 'bind_failed' };
+        }
+        const directBody = await withAbort(
+          directRes.json() as Promise<{ serverId?: unknown; token?: unknown }>,
+          ac.signal,
+        );
+        if (typeof directBody.serverId !== 'string' || !directBody.serverId || typeof directBody.token !== 'string' || !directBody.token) {
+          return { ok: false, statusCode: 502, error: 'bind_failed' };
+        }
+        serverId = directBody.serverId;
+        token = directBody.token;
+      }
+
+      if (ac.signal.aborted) {
+        return { ok: false, statusCode: 504, error: 'bind_timeout' };
+      }
+
+      const credsPayload = JSON.stringify(
+        {
+          serverId,
+          token,
+          workerUrl,
+          serverName: deviceName,
+          boundAt: Date.now(),
         },
-        body: JSON.stringify({ serverName: deviceName }),
-      });
-      if (!directRes.ok) {
-        return { ok: false, statusCode: 502, error: 'bind_failed' };
+        null,
+        2,
+      );
+      writeOwnedFile(stateDir, ['server.json'], credsPayload, user, currentUid, 0o600, true, deps.chown);
+    } catch {
+      if (ac.signal.aborted) {
+        return { ok: false, statusCode: 504, error: 'bind_timeout' };
       }
-      const directBody = await directRes.json() as { serverId?: unknown; token?: unknown };
-      if (typeof directBody.serverId !== 'string' || !directBody.serverId || typeof directBody.token !== 'string' || !directBody.token) {
-        return { ok: false, statusCode: 502, error: 'bind_failed' };
-      }
-      serverId = directBody.serverId;
-      token = directBody.token;
+      return { ok: false, statusCode: 502, error: 'bind_failed' };
+    } finally {
+      clearTimeout(timer);
     }
 
-    const credsPayload = JSON.stringify(
-      {
-        serverId,
-        token,
-        workerUrl,
-        serverName: deviceName,
-        boundAt: Date.now(),
-      },
-      null,
-      2,
-    );
-    writeOwnedFile(join(stateDir, 'server.json'), credsPayload, user, currentUid, 0o600);
-
-    await stopUserDaemon(user, stateDir).catch(() => undefined);
-    await startUserDaemon(user, stateDir, runtime);
+    const stopped = await stopUserDaemon(user, stateDir);
+    if (!stopped) {
+      return { ok: false, statusCode: 500, error: 'stop_failed', status: await inspectStatus() };
+    }
+    try {
+      await startUserDaemon(user, stateDir, runtime);
+    } catch {
+      return { ok: false, statusCode: 500, error: 'start_failed', status: await inspectStatus() };
+    }
     return { ok: true, statusCode: 200, status: await inspectStatus() };
   }
 
@@ -1359,49 +1944,59 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         cliCandidates: deps.cliCandidates,
       });
 
-      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND) {
-        if (!runtime) return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
-        return bindUserDaemon(user, stateDir, runtime, payload);
-      }
-
-      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.ENABLE_AUTOSTART) {
-        const res = await setAutostart(user, stateDir, runtime, true);
-        return res.ok ? { ok: true, statusCode: 200, status: await inspectStatus() } : res;
-      }
-
-      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.DISABLE_AUTOSTART) {
-        const res = await setAutostart(user, stateDir, runtime, false);
-        return res.ok ? { ok: true, statusCode: 200, status: await inspectStatus() } : res;
-      }
-
-      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP) {
-        await stopUserDaemon(user, stateDir);
-        return { ok: true, statusCode: 200, status: await inspectStatus() };
-      }
-
-      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START) {
-        if (!runtime) return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
-        if (!readServerCredentials(stateDir)) {
-          return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_BOUND };
+      try {
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND) {
+          if (!runtime) return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
+          return await bindUserDaemon(user, stateDir, runtime, payload);
         }
-        const pid = readPidFile(stateDir) ?? readDaemonRuntimeStatus(stateDir)?.pid ?? null;
-        if (!pid || !isPidAlive(pid)) {
+
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.ENABLE_AUTOSTART) {
+          const res = await setAutostart(user, stateDir, runtime, true);
+          return res.ok ? { ok: true, statusCode: 200, status: await inspectStatus() } : res;
+        }
+
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.DISABLE_AUTOSTART) {
+          const res = await setAutostart(user, stateDir, runtime, false);
+          return res.ok ? { ok: true, statusCode: 200, status: await inspectStatus() } : res;
+        }
+
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP) {
+          const stopped = await stopUserDaemon(user, stateDir);
+          if (!stopped) {
+            return { ok: false, statusCode: 500, error: 'stop_failed', status: await inspectStatus() };
+          }
+          return { ok: true, statusCode: 200, status: await inspectStatus() };
+        }
+
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START) {
+          if (!runtime) return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
+          if (!readServerCredentials(stateDir)) {
+            return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_BOUND };
+          }
+          const pid = readPidFile(stateDir) ?? readSafeDaemonRuntimeStatus(stateDir)?.pid ?? null;
+          if (!pid || !isPidAlive(pid)) {
+            await startUserDaemon(user, stateDir, runtime);
+          }
+          return { ok: true, statusCode: 200, status: await inspectStatus() };
+        }
+
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART) {
+          if (!runtime) return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
+          if (!readServerCredentials(stateDir)) {
+            return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_BOUND };
+          }
+          const stopped = await stopUserDaemon(user, stateDir);
+          if (!stopped) {
+            return { ok: false, statusCode: 500, error: 'stop_failed', status: await inspectStatus() };
+          }
           await startUserDaemon(user, stateDir, runtime);
+          return { ok: true, statusCode: 200, status: await inspectStatus() };
         }
-        return { ok: true, statusCode: 200, status: await inspectStatus() };
-      }
 
-      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART) {
-        if (!runtime) return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
-        if (!readServerCredentials(stateDir)) {
-          return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_BOUND };
-        }
-        await stopUserDaemon(user, stateDir);
-        await startUserDaemon(user, stateDir, runtime);
-        return { ok: true, statusCode: 200, status: await inspectStatus() };
+        return { ok: false, statusCode: 400, error: 'invalid_action' };
+      } catch {
+        return { ok: false, statusCode: 500, error: 'action_failed', status: await inspectStatus() };
       }
-
-      return { ok: false, statusCode: 400, error: 'invalid_action' };
     }),
   };
 }

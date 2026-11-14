@@ -883,5 +883,101 @@ describe('local panel Coding Daemon endpoints and UI', () => {
 
     dom.window.close();
   });
+
+  it('redacts JSON/KV/Bearer secrets in /api/state, /api/daemon/logs, and DOM, and keeps Remote Desktop actions non-blocked during hung bind', async () => {
+    let releaseBind!: () => void;
+    const bindGate = new Promise<void>((resolve) => { releaseBind = resolve; });
+    let paused = false;
+
+    const { panel, html, cookie, csrf } = await startWithDaemon({
+      state: () => ({ paused, connections: [] }),
+      setPaused: async (next) => { paused = next; },
+      daemon: async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        userName: 'alice',
+        lastError: '{"token":"state-json-secret","apiKey":"state-apikey-secret"} tokenizer ready',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      }),
+      daemonLogs: async () => ({
+        text: 'log line {"bindKey":"dom-json-secret"} token count: 7 Bearer dom-bearer-secret\n',
+        truncated: false,
+        source: 'logs/daemon.log',
+      }),
+      daemonAction: async (action) => {
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND) {
+          await bindGate;
+        }
+        return { ok: true, statusCode: 200 };
+      },
+    });
+
+    const origin = new URL(panel.url).origin;
+    const stateRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), { headers: { cookie } });
+    const stateBody = await stateRes.json() as { daemon?: { lastError?: string } };
+    expect(stateBody.daemon?.lastError).toContain('tokenizer ready');
+    expect(stateBody.daemon?.lastError).not.toContain('state-json-secret');
+    expect(stateBody.daemon?.lastError).not.toContain('state-apikey-secret');
+
+    const logsRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url), { headers: { cookie } });
+    const logsBody = await logsRes.json() as { text: string };
+    expect(logsBody.text).toContain('token count: 7');
+    expect(logsBody.text).not.toContain('dom-json-secret');
+    expect(logsBody.text).not.toContain('dom-bearer-secret');
+
+    // JSDOM check on redacted textContent
+    const nodeFetch = globalThis.fetch;
+    const authedFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      const target = typeof input === 'string' ? new URL(input, panel.url).toString() : input;
+      const headers = new Headers(init?.headers);
+      headers.set('cookie', cookie);
+      return nodeFetch(target, { ...init, headers });
+    };
+    const dom = new JSDOM(html, {
+      url: panel.url,
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(win) {
+        (win as unknown as { fetch: typeof authedFetch }).fetch = authedFetch;
+        Object.defineProperty(win.navigator, 'languages', { value: ['en-US'], configurable: true });
+      },
+    });
+    const doc = dom.window.document;
+    await new Promise((r) => setTimeout(r, 80));
+    expect(doc.getElementById('daemonHint')?.textContent).toContain('tokenizer ready');
+    expect(doc.getElementById('daemonHint')?.textContent).not.toContain('state-json-secret');
+    (doc.getElementById('daemonLogsBtn') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('token count: 7');
+    expect(doc.getElementById('daemonLogsPre')?.textContent).not.toContain('dom-json-secret');
+    dom.window.close();
+
+    // Concurrency isolation: start a blocked daemon bind, verify Remote Desktop pause finishes immediately
+    const hungBindPromise = fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND, bindUrl: 'https://app.example.test/bind/abc123' }),
+    });
+    const pauseRes = await Promise.race([
+      fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+        body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_ACTION.PAUSE }),
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('pause blocked behind daemon bind')), 500)),
+    ]);
+    expect(pauseRes.status).toBe(200);
+    expect(paused).toBe(true);
+    releaseBind();
+    const settledBind = await hungBindPromise;
+    expect(settledBind.status).toBe(200);
+  });
 });
 

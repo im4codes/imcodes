@@ -13,6 +13,7 @@ import {
   type RemoteDesktopLocalExtras,
   type RemoteDesktopLocalPermissionTarget,
   isRemoteDesktopLocalPermissionTarget,
+  redactRemoteDesktopLocalSecrets,
   type RemoteDesktopLocalStatus,
   sanitizeRemoteDesktopLocalDaemonStatus,
   sanitizeRemoteDesktopLocalExtras,
@@ -130,10 +131,16 @@ export async function startRemoteDesktopLocalPanel(
   let expectedHost = `${host}:${port}`;
   let origin = `http://${expectedHost}`;
   let mutation: Promise<void> = Promise.resolve();
+  let daemonMutation: Promise<void> = Promise.resolve();
   let openWindowInFlight: Promise<{ ok: boolean; reason: string }> | undefined;
   const mutate = async (action: () => Promise<void>): Promise<void> => {
     const current = mutation.then(action, action);
     mutation = current.catch(() => {});
+    await current;
+  };
+  const mutateDaemon = async (action: () => Promise<void>): Promise<void> => {
+    const current = daemonMutation.then(action, action);
+    daemonMutation = current.catch(() => {});
     await current;
   };
   const server: Server = createServer(async (request, response) => {
@@ -208,8 +215,11 @@ export async function startRemoteDesktopLocalPanel(
       if (!options.daemonLogs) return reply(response, 501, 'not_implemented');
       try {
         const raw = await options.daemonLogs();
+        const redacted = typeof raw?.text === 'string'
+          ? redactRemoteDesktopLocalSecrets(raw.text, { preserveNewlines: true }).slice(-65536)
+          : '';
         const logs: RemoteDesktopLocalDaemonLogs = {
-          text: typeof raw?.text === 'string' ? raw.text.slice(-65536) : '',
+          text: redacted,
           truncated: Boolean(raw?.truncated),
           ...(typeof raw?.source === 'string' && raw.source ? { source: raw.source } : {}),
         };
@@ -243,17 +253,18 @@ export async function startRemoteDesktopLocalPanel(
         } else if (isDaemonAction) {
           if (!options.daemonAction) return reply(response, 501, 'not_implemented');
           let result: { ok: boolean; statusCode?: number; error?: string } = { ok: false, statusCode: 500, error: 'action_failed' };
-          await mutate(async () => {
+          await mutateDaemon(async () => {
             result = await options.daemonAction!(action as RemoteDesktopLocalDaemonAction, {
               bindUrl: body?.bindUrl,
               serverName: body?.serverName,
             });
           });
           if (!result.ok) {
+            const safeError = redactRemoteDesktopLocalSecrets(result.error ?? 'action_failed', { maxChars: 120 }) || 'action_failed';
             return reply(
               response,
               result.statusCode ?? 400,
-              JSON.stringify({ ok: false, error: result.error ?? 'action_failed' }),
+              JSON.stringify({ ok: false, error: safeError }),
               'application/json; charset=utf-8',
             );
           }

@@ -178,6 +178,45 @@ export interface RemoteDesktopLocalExtras {
 
 const REMOTE_DESKTOP_LOCAL_DAEMON_ERROR_MAX_CHARS = 240;
 
+const DAEMON_SECRET_KEYS_RE =
+  'token|api[_-]?key|secret|bind[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|worker[_-]?token|client[_-]?secret|password|passwd';
+const QUOTED_KEY_AND_QUOTED_VAL_RE = new RegExp(
+  `((?:["'])(?:${DAEMON_SECRET_KEYS_RE})["']\\s*:\\s*["'])(?:[^"'\\\\]|\\\\.)*(["'])`,
+  'giu',
+);
+const KEY_AND_QUOTED_VAL_RE = new RegExp(
+  `(\\b(?:${DAEMON_SECRET_KEYS_RE})\\s*[:=]\\s*["'])(?:[^"'\\\\]|\\\\.)*(["'])`,
+  'giu',
+);
+const KEY_AND_UNQUOTED_VAL_RE = new RegExp(
+  `((?:^|[\\s?&;,{(])["']?(?:${DAEMON_SECRET_KEYS_RE})["']?\\s*[:=]\\s*)([^\\s"'&,;)}\\]]+)`,
+  'gimu',
+);
+
+export function redactRemoteDesktopLocalSecrets(
+  input: string,
+  options: { preserveNewlines?: boolean; maxChars?: number } = {},
+): string {
+  // eslint-disable-next-line no-control-regex
+  const withoutAnsi = input
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/gu, '');
+  const cleanControls = options.preserveNewlines
+    // eslint-disable-next-line no-control-regex
+    ? withoutAnsi.replace(/[\u0000-\u0008\u000b-\u001f\u007f]+/gu, ' ')
+    // eslint-disable-next-line no-control-regex
+    : withoutAnsi.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim();
+  const redacted = cleanControls
+    .replace(/(\/bind\/)[^\s"'`?#,;)\]}]+/giu, '$1[redacted]')
+    .replace(/\b(Bearer\s+|Authorization\s*[:=]\s*["']?(?:Bearer\s+)?)[^\s"',;}\]]+/giu, '$1[redacted]')
+    .replace(QUOTED_KEY_AND_QUOTED_VAL_RE, '$1[redacted]$2')
+    .replace(KEY_AND_QUOTED_VAL_RE, '$1[redacted]$2')
+    .replace(KEY_AND_UNQUOTED_VAL_RE, '$1[redacted]');
+  return typeof options.maxChars === 'number' ? redacted.slice(0, options.maxChars) : redacted;
+}
+
 function stripDaemonControlChars(value: string, maxChars: number): string {
   // eslint-disable-next-line no-control-regex
   return value.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, maxChars);
@@ -234,8 +273,9 @@ export function sanitizeRemoteDesktopLocalDaemonStatus(value: unknown): RemoteDe
     if (userName) out.userName = userName;
   }
   if (typeof raw.lastError === 'string') {
-    const lastError = stripDaemonControlChars(raw.lastError, REMOTE_DESKTOP_LOCAL_DAEMON_ERROR_MAX_CHARS)
-      .replace(/(?:Bearer\s+|token\s*[:=]\s*|\/bind\/)[^\s,;]+/giu, '[redacted]');
+    const lastError = redactRemoteDesktopLocalSecrets(raw.lastError, {
+      maxChars: REMOTE_DESKTOP_LOCAL_DAEMON_ERROR_MAX_CHARS,
+    });
     if (lastError) out.lastError = lastError;
   }
   if (reasons.has(raw.reason)) {
