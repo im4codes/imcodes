@@ -2964,6 +2964,9 @@ export class WsBridge {
   private hasActiveMainSessionSnapshot = false;
   /** Bounded LRU+TTL positive cache of DB-verified main session names scoped strictly to this serverId. */
   private verifiedMainSessionOwnership = new Map<string, number>();
+  /** Monotonic epoch incremented on any session ownership/snapshot invalidation to fence stale in-flight DB reads. */
+  private sessionOwnershipEpoch = 0;
+  private disposed = false;
   /**
    * Project-identity scope key per session, exactly as the daemon derives it
    * (sessionIdentityProjectKey). Browser session lists for share recipients
@@ -6357,7 +6360,7 @@ export class WsBridge {
         this.incognitoSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
-        this.verifiedMainSessionOwnership.clear();
+        this.invalidateSessionOwnershipCache();
         this.hasActiveMainSessionSnapshot = false;
         // This connection's own credentials are verified: a controlled node's heartbeat may be acknowledged now.
         const credentialMs = Date.now() - authStartedAt;
@@ -6964,7 +6967,7 @@ export class WsBridge {
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
-        this.verifiedMainSessionOwnership.clear();
+        this.invalidateSessionOwnershipCache();
         this.hasActiveMainSessionSnapshot = false;
         this.clearAutoUpgradeRetryTimer();
         this.rejectAllPendingFileTransfers('daemon_disconnected');
@@ -7245,14 +7248,14 @@ export class WsBridge {
     // Synchronous, before any await: from here no socket's cached coverage serves a command.
     this.shareCoverageEpoch += 1;
     if (target.kind === 'main') {
-      this.verifiedMainSessionOwnership.delete(target.sessionName);
+      this.invalidateSessionOwnershipCache(target.sessionName);
       this.activeMainSessions.delete(target.sessionName);
     } else if (target.kind === 'subsession') {
       const subName = `deck_sub_${target.subSessionId}`;
-      this.verifiedMainSessionOwnership.delete(subName);
+      this.invalidateSessionOwnershipCache(subName);
       this.activeSubSessions.delete(subName);
     } else if (target.kind === 'server') {
-      this.verifiedMainSessionOwnership.clear();
+      this.invalidateSessionOwnershipCache();
     }
     const sockets = [...this.browserShareStates]
       .filter(([, state]) => (
@@ -9435,7 +9438,7 @@ export class WsBridge {
     if (type === 'session_event') {
       if (typeof msg.session === 'string' && msg.session
         && (msg.event === 'stopped' || msg.event === 'deleted' || msg.event === 'removed' || msg.event === 'closed')) {
-        this.verifiedMainSessionOwnership.delete(msg.session);
+        this.invalidateSessionOwnershipCache(msg.session);
         if (msg.event === 'deleted' || msg.event === 'removed') {
           this.activeMainSessions.delete(msg.session);
         }
@@ -9721,6 +9724,7 @@ export class WsBridge {
             const sessionName = `deck_sub_${id}`;
             this.recentTextBySession.delete(sessionName);
             this.activeSubSessions.delete(sessionName);
+            this.invalidateSessionOwnershipCache(sessionName);
             this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
             // Revoke the grants as well, not just the live sockets. Closing
             // masks coverage (`targetExists` needs `closed_at IS NULL`) but the
@@ -10072,7 +10076,12 @@ export class WsBridge {
     this.activeMainSessions.clear();
     this.mainIdentityProjectKeys.clear();
     this.hasActiveMainSessionSnapshot = true;
-    if (!Array.isArray(rawSessions)) return;
+    if (!Array.isArray(rawSessions)) {
+      this.invalidateSessionOwnershipCache();
+      this.syncCoveredProjectDirsAcrossShareSockets();
+      this.scheduleAutoUpgradeFlushAtIdleBoundary();
+      return;
+    }
     for (const item of rawSessions) {
       if (!item || typeof item !== 'object') continue;
       const row = item as Record<string, unknown>;
@@ -10093,11 +10102,7 @@ export class WsBridge {
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
-    for (const cachedSession of this.verifiedMainSessionOwnership.keys()) {
-      if (!this.activeMainSessions.has(cachedSession)) {
-        this.verifiedMainSessionOwnership.delete(cachedSession);
-      }
-    }
+    this.pruneSessionOwnershipCacheToActive(this.activeMainSessions);
     this.syncCoveredProjectDirsAcrossShareSockets();
     this.scheduleAutoUpgradeFlushAtIdleBoundary();
   }
@@ -10882,8 +10887,27 @@ export class WsBridge {
     }
   }
 
-  private cacheVerifiedMainSessionOwnership(sessionName: string): void {
+  private invalidateSessionOwnershipCache(sessionName?: string): void {
+    this.sessionOwnershipEpoch += 1;
+    if (sessionName !== undefined) {
+      this.verifiedMainSessionOwnership.delete(sessionName);
+      return;
+    }
+    this.verifiedMainSessionOwnership.clear();
+  }
+
+  private pruneSessionOwnershipCacheToActive(activeSessions: ReadonlyMap<string, unknown>): void {
+    this.sessionOwnershipEpoch += 1;
+    for (const cachedSession of this.verifiedMainSessionOwnership.keys()) {
+      if (!activeSessions.has(cachedSession)) {
+        this.verifiedMainSessionOwnership.delete(cachedSession);
+      }
+    }
+  }
+
+  private cacheVerifiedMainSessionOwnership(sessionName: string, expectedEpoch: number): void {
     if (sessionName.startsWith('deck_sub_')) return;
+    if (this.disposed || expectedEpoch !== this.sessionOwnershipEpoch) return;
     this.verifiedMainSessionOwnership.delete(sessionName);
     this.verifiedMainSessionOwnership.set(sessionName, Date.now());
     while (this.verifiedMainSessionOwnership.size > SESSION_OWNERSHIP_CACHE_MAX_ENTRIES) {
@@ -10897,7 +10921,8 @@ export class WsBridge {
    * Verify that a session name belongs to this server.
    * Checks both regular sessions and sub-sessions.
    */
-  private async verifySessionOwnership(sessionName: string): Promise<boolean> {
+  private async verifySessionOwnership(sessionName: string, attempt = 0): Promise<boolean> {
+    if (this.disposed) return false;
     if (!this.db) return true; // no db = dev/test mode, allow all
     if (this.activeSubSessions.has(sessionName)) return true;
     if (this.authenticated
@@ -10914,14 +10939,19 @@ export class WsBridge {
       }
       this.verifiedMainSessionOwnership.delete(sessionName);
     }
+    const observedEpoch = this.sessionOwnershipEpoch;
     try {
       // Check regular sessions
       const row = await this.db.queryOne<Record<string, unknown>>(
         'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
         [this.serverId, sessionName],
       );
+      if (this.disposed) return false;
+      if (observedEpoch !== this.sessionOwnershipEpoch) {
+        return attempt === 0 ? this.verifySessionOwnership(sessionName, 1) : false;
+      }
       if (row) {
-        this.cacheVerifiedMainSessionOwnership(sessionName);
+        this.cacheVerifiedMainSessionOwnership(sessionName, observedEpoch);
         return true;
       }
 
@@ -10933,6 +10963,10 @@ export class WsBridge {
           'SELECT 1 FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
           [this.serverId, subId],
         );
+        if (this.disposed) return false;
+        if (observedEpoch !== this.sessionOwnershipEpoch) {
+          return attempt === 0 ? this.verifySessionOwnership(sessionName, 1) : false;
+        }
         if (subRow) return true;
       }
 
@@ -14871,7 +14905,8 @@ export class WsBridge {
     this.remoteDesktopNodeContextCache = null;
     this.remoteDesktopNodeContextLastUnavailableGeneration = null;
     this.remoteDesktopNodeContextInFlight = null;
-    this.verifiedMainSessionOwnership.clear();
+    this.disposed = true;
+    this.invalidateSessionOwnershipCache();
     WsBridge.instances.delete(this.serverId);
     WsBridge.syncShareExpirySweepTimer();
     if (WsBridge.instances.size === 0 && cleanupSweepHandle) {

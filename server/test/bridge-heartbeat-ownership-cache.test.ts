@@ -385,6 +385,170 @@ describe('WsBridge Batch B-2: heartbeat throttling, node context cache, ownershi
       // bridge.dispose() clears cached ownership.
       bridgeA.dispose();
     });
+
+    it('never repopulates or accepts stale in-flight DB ownership results after concurrent invalidation (revalidate, snapshot, lifecycle, disconnect, dispose)', async () => {
+      type DeferredRow = { resolve: (val: Record<string, unknown> | null) => void; session: string };
+      const runRaceScenario = async (
+        scenario: 'revalidate' | 'snapshot_empty' | 'snapshot_invalid' | 'session_event_deleted' | 'disconnect' | 'dispose',
+      ) => {
+        WsBridge.disposeAll();
+        const serverId = `srv-own-race-${scenario}`;
+        let dbRowExists = true;
+        let sessionQueries = 0;
+        const deferred: DeferredRow[] = [];
+
+        const db: Database = {
+          queryOne: async (sql: string, params?: unknown[]) => {
+            if (sql.includes('FROM servers')) {
+              return {
+                token_hash: tokenHash,
+                user_id: 'owner-1',
+                owner_status: 'active',
+                node_role: 'full',
+                revoked_at: null,
+              };
+            }
+            if (sql.includes('FROM sessions')) {
+              sessionQueries += 1;
+              const session = String(params?.[1] ?? '');
+              if (sessionQueries === 1) {
+                return await new Promise<Record<string, unknown> | null>((resolve) => {
+                  deferred.push({ resolve, session });
+                });
+              }
+              return dbRowExists ? { '?column?': 1 } : null;
+            }
+            return null;
+          },
+          query: async () => [],
+          execute: async () => ({ changes: 1 }),
+          exec: async () => {},
+          transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(db),
+          close: () => {},
+        } as unknown as Database;
+
+        const bridge = WsBridge.get(serverId);
+        const daemon = new MockWs();
+        bridge.handleDaemonConnection(daemon as never, db, {} as never);
+        daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'test-token' }));
+        await flush();
+
+        const browser1 = new MockWs();
+        bridge.handleBrowserConnection(browser1 as never, 'owner-1', db);
+        browser1.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_project_brain' }));
+        await flush();
+        expect(sessionQueries).toBe(1);
+        expect(deferred).toHaveLength(1);
+
+        // Concurrent deletion / invalidation happens while first DB query is still in flight.
+        dbRowExists = false;
+        if (scenario === 'revalidate') {
+          await bridge.revalidateShareSocketsForTarget({
+            kind: 'main',
+            serverId,
+            sessionName: 'deck_project_brain',
+          });
+        } else if (scenario === 'snapshot_empty') {
+          daemon.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+        } else if (scenario === 'snapshot_invalid') {
+          daemon.emit('message', JSON.stringify({ type: 'session_list', sessions: 'not-an-array' }));
+        } else if (scenario === 'session_event_deleted') {
+          daemon.emit('message', JSON.stringify({ type: 'session_event', session: 'deck_project_brain', event: 'deleted' }));
+        } else if (scenario === 'disconnect') {
+          daemon.close();
+        } else if (scenario === 'dispose') {
+          bridge.dispose();
+        }
+        await flush();
+
+        // Release the pre-invalidation positive row; stale result must not grant access or poison cache.
+        deferred[0]!.resolve({ '?column?': 1 });
+        await flush();
+
+        expect(daemon.sentFrames.some((f) => f.type === 'terminal.subscribe' && f.session === 'deck_project_brain')).toBe(false);
+        expect(((bridge as unknown as { verifiedMainSessionOwnership: Map<string, number> }).verifiedMainSessionOwnership).size).toBe(0);
+
+        if (scenario !== 'dispose') {
+          const browser2 = new MockWs();
+          bridge.handleBrowserConnection(browser2 as never, 'owner-1', db);
+          browser2.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_project_brain' }));
+          await flush();
+          expect(daemon.sentFrames.some((f) => f.type === 'terminal.subscribe' && f.session === 'deck_project_brain')).toBe(false);
+          expect(((bridge as unknown as { verifiedMainSessionOwnership: Map<string, number> }).verifiedMainSessionOwnership).size).toBe(0);
+        }
+      };
+
+      await runRaceScenario('revalidate');
+      await runRaceScenario('snapshot_empty');
+      await runRaceScenario('snapshot_invalid');
+      await runRaceScenario('session_event_deleted');
+      await runRaceScenario('disconnect');
+      await runRaceScenario('dispose');
+    });
+
+    it('allows one bounded retry and caches validly when an unrelated snapshot happens while a valid DB session still exists, while offline sessions remain verifiable', async () => {
+      const serverId = 'srv-own-retry-ok';
+      let sessionQueries = 0;
+      let releaseFirst!: (val: Record<string, unknown> | null) => void;
+
+      const db: Database = {
+        queryOne: async (sql: string, params?: unknown[]) => {
+          if (sql.includes('FROM servers')) {
+            return {
+              token_hash: tokenHash,
+              user_id: 'owner-1',
+              owner_status: 'active',
+              node_role: 'full',
+              revoked_at: null,
+            };
+          }
+          if (sql.includes('FROM sessions') && params?.[1] === 'deck_historical_brain') {
+            sessionQueries += 1;
+            if (sessionQueries === 1) {
+              return await new Promise<Record<string, unknown> | null>((resolve) => {
+                releaseFirst = resolve;
+              });
+            }
+            return { '?column?': 1 };
+          }
+          return null;
+        },
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(db),
+        close: () => {},
+      } as unknown as Database;
+
+      const bridge = WsBridge.get(serverId);
+      const daemon = new MockWs();
+      bridge.handleDaemonConnection(daemon as never, db, {} as never);
+      daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'test-token' }));
+      await flush();
+
+      const browser1 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'owner-1', db);
+      browser1.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_historical_brain' }));
+      await flush();
+      expect(sessionQueries).toBe(1);
+
+      // Unrelated session_list arrives while historical session DB query is in flight.
+      daemon.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'deck_other_brain' }] }));
+      await flush();
+
+      // Release first query -> bounded single retry at new epoch succeeds & populates cache.
+      releaseFirst({ '?column?': 1 });
+      await flush();
+      expect(sessionQueries).toBe(2);
+      expect(daemon.sentFrames.some((f) => f.type === 'terminal.subscribe' && f.session === 'deck_historical_brain')).toBe(true);
+
+      // Next subscribe hits the newly populated positive cache without hitting DB again.
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser2 as never, 'owner-1', db);
+      browser2.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_historical_brain' }));
+      await flush();
+      expect(sessionQueries).toBe(2);
+    });
   });
 
   describe('4. Parallel post-auth reads & single process-wide shareExpirySweepHandle', () => {
