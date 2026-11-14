@@ -3,11 +3,16 @@
  */
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import {
+  MOBILE_LONG_PRESS_DRAG_START_PX,
+  MOBILE_LONG_PRESS_MS,
+  MOBILE_LONG_PRESS_STILL_TOLERANCE_PX,
+  MOBILE_NAV_GESTURE_ACTIVE_CLASS,
   MOBILE_NAVIGATION_GESTURE_KEYCAPS,
   MOBILE_SWIPE_PRIMARY_THRESHOLD_PX,
   TwoFingerSwipeTracker,
   attachMobileNavigationGestures,
   canHandleMobileNavigationGesture,
+  isMobileNavigationGestureActive,
   type MobileNavigationGestureProgress,
   type TouchPointSnapshot,
 } from '../src/mobile-navigation-gestures.js';
@@ -17,7 +22,7 @@ function dispatchTouch(
   type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
   touches: TouchPointSnapshot[],
   changedTouches: TouchPointSnapshot[] = [],
-): void {
+): Event {
   const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
     touches: TouchPointSnapshot[];
     changedTouches: TouchPointSnapshot[];
@@ -25,11 +30,14 @@ function dispatchTouch(
   Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
   Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
   target.dispatchEvent(evt);
+  return evt;
 }
 
 describe('mobile-navigation-gestures', () => {
   afterEach(() => {
+    vi.useRealTimers();
     document.body.innerHTML = '';
+    document.documentElement.className = '';
     Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: null });
   });
 
@@ -822,6 +830,133 @@ describe('mobile-navigation-gestures', () => {
     ]);
     dispatchTouch(stayPane, 'touchend', []);
     expect(actions).toEqual(['tabPrev', 'tabNext', 'serverPrev', 'serverNext', 'tabPrev']);
+    detach();
+  });
+
+  it('calls preventDefault and sets active class during 2-finger swipe while leaving normal 1-finger scroll unintercepted', () => {
+    const pane = document.createElement('div');
+    pane.className = 'chat-view';
+    document.body.appendChild(pane);
+
+    const actions: string[] = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (a) => actions.push(a),
+    });
+
+    // Normal 1-finger scroll (immediate slide > 12px): NEVER calls preventDefault
+    const s1 = dispatchTouch(pane, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 300 }]);
+    const m1 = dispatchTouch(pane, 'touchmove', [{ identifier: 1, clientX: 100, clientY: 200 }]);
+    const e1 = dispatchTouch(pane, 'touchend', [], [{ identifier: 1, clientX: 100, clientY: 180 }]);
+    expect(s1.defaultPrevented).toBe(false);
+    expect(m1.defaultPrevented).toBe(false);
+    expect(e1.defaultPrevented).toBe(false);
+    expect(isMobileNavigationGestureActive(document)).toBe(false);
+    expect(actions).toEqual([]);
+
+    // Active 2-finger swipe: touchstart, touchmove, and touchend (both sequential fingers) ARE prevented
+    const s2 = dispatchTouch(pane, 'touchstart', [
+      { identifier: 1, clientX: 100, clientY: 300 },
+      { identifier: 2, clientX: 160, clientY: 300 },
+    ]);
+    expect(s2.defaultPrevented).toBe(true);
+    expect(document.documentElement.classList.contains(MOBILE_NAV_GESTURE_ACTIVE_CLASS)).toBe(true);
+
+    const m2 = dispatchTouch(pane, 'touchmove', [
+      { identifier: 1, clientX: 100, clientY: 210 },
+      { identifier: 2, clientX: 160, clientY: 210 },
+    ]);
+    expect(m2.defaultPrevented).toBe(true);
+
+    // First finger lifts -> triggers action and stays active until second finger lifts
+    const e2a = dispatchTouch(
+      pane,
+      'touchend',
+      [{ identifier: 2, clientX: 160, clientY: 210 }],
+      [{ identifier: 1, clientX: 100, clientY: 210 }],
+    );
+    expect(e2a.defaultPrevented).toBe(true);
+    expect(actions).toEqual(['serverPrev']);
+    expect(isMobileNavigationGestureActive(document)).toBe(true);
+
+    const e2b = dispatchTouch(pane, 'touchend', [], [{ identifier: 2, clientX: 160, clientY: 210 }]);
+    expect(e2b.defaultPrevented).toBe(true);
+    expect(isMobileNavigationGestureActive(document)).toBe(false);
+
+    detach();
+  });
+
+  it.each([
+    { label: 'up -> serverPrev', dx: 0, dy: -80, direction: 'up', expected: 'serverPrev' },
+    { label: 'down -> serverNext', dx: 0, dy: 80, direction: 'down', expected: 'serverNext' },
+    { label: 'left -> tabPrev', dx: -80, dy: 0, direction: 'left', expected: 'tabPrev' },
+    { label: 'right -> tabNext', dx: 80, dy: 0, direction: 'right', expected: 'tabNext' },
+  ])('supports 1-finger long-press + drag $label outside inputs/controls and repeats cleanly', ({ dx, dy, direction, expected }) => {
+    vi.useFakeTimers();
+    const pane = document.createElement('div');
+    pane.className = 'chat-view';
+    document.body.appendChild(pane);
+
+    const actions: string[] = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (a) => actions.push(a),
+      onProgress: (p) => progressLog.push(p),
+    });
+
+    for (let round = 1; round <= 2; round++) {
+      const startX = 160;
+      const startY = 300;
+      const startEvt = dispatchTouch(pane, 'touchstart', [{ identifier: 7, clientX: startX, clientY: startY }]);
+      expect(startEvt.defaultPrevented).toBe(false);
+      expect(isMobileNavigationGestureActive(document)).toBe(false);
+
+      // Small hand jitter within tolerance during hold does NOT cancel long-press
+      const jitterEvt = dispatchTouch(pane, 'touchmove', [{ identifier: 7, clientX: startX + 3, clientY: startY - 3 }]);
+      expect(jitterEvt.defaultPrevented).toBe(false);
+
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      // Still not active until drag exceeds dragStartPx
+      expect(isMobileNavigationGestureActive(document)).toBe(false);
+      expect(progressLog.filter(Boolean)).toHaveLength(0);
+
+      // Move just over dragStartPx -> enters tracking + prevents default + updates HUD
+      const stepScale = (MOBILE_LONG_PRESS_DRAG_START_PX + 6) / Math.hypot(dx, dy);
+      const dragStartEvt = dispatchTouch(pane, 'touchmove', [{
+        identifier: 7,
+        clientX: startX + 3 + dx * stepScale,
+        clientY: startY - 3 + dy * stepScale,
+      }]);
+      expect(dragStartEvt.defaultPrevented).toBe(true);
+      expect(isMobileNavigationGestureActive(document)).toBe(true);
+      expect(progressLog.at(-1)?.direction).toBe(direction);
+      expect(progressLog.at(-1)?.armed).toBe(false);
+
+      // Drag past threshold
+      const dragArmEvt = dispatchTouch(pane, 'touchmove', [{
+        identifier: 7,
+        clientX: startX + 3 + dx,
+        clientY: startY - 3 + dy,
+      }]);
+      expect(dragArmEvt.defaultPrevented).toBe(true);
+      expect(progressLog.at(-1)?.direction).toBe(direction);
+      expect(progressLog.at(-1)?.armed).toBe(true);
+      expect(actions).toHaveLength(round - 1);
+
+      // Lift triggers navigation once & clears active state + HUD
+      const endEvt = dispatchTouch(pane, 'touchend', [], [{
+        identifier: 7,
+        clientX: startX + 3 + dx,
+        clientY: startY - 3 + dy,
+      }]);
+      expect(endEvt.defaultPrevented).toBe(true);
+      expect(actions).toHaveLength(round);
+      expect(actions.at(-1)).toBe(expected);
+      expect(isMobileNavigationGestureActive(document)).toBe(false);
+      expect(progressLog.at(-1)).toBeNull();
+      progressLog.length = 0;
+    }
 
     detach();
   });
@@ -921,6 +1056,70 @@ describe('mobile-navigation-gestures', () => {
     expect(progressLog.at(-1)?.armed).toBe(true);
     dispatchTouch(host, 'touchend', []);
     expect(actions).toEqual(['serverNext', 'tabNext', 'serverPrev']);
+    detach();
+  });
+
+  it('never triggers on long-press without swipe, sub-threshold drag, diagonal drag, or immediate swipe before long-press', () => {
+    vi.useFakeTimers();
+    const pane = document.createElement('div');
+    pane.className = 'chat-view';
+    document.body.appendChild(pane);
+
+    const actions: string[] = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (a) => actions.push(a),
+      onProgress: (p) => progressLog.push(p),
+    });
+
+    // 1) Long-press 600ms with NO move -> no action, no HUD, no active class
+    dispatchTouch(pane, 'touchstart', [{ identifier: 1, clientX: 150, clientY: 300 }]);
+    vi.advanceTimersByTime(600);
+    const endNoMove = dispatchTouch(pane, 'touchend', []);
+    expect(endNoMove.defaultPrevented).toBe(false);
+    expect(isMobileNavigationGestureActive(document)).toBe(false);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+
+    // 2) Long-press 500ms + move < MOBILE_LONG_PRESS_DRAG_START_PX -> no action, no HUD
+    dispatchTouch(pane, 'touchstart', [{ identifier: 2, clientX: 150, clientY: 300 }]);
+    vi.advanceTimersByTime(500);
+    dispatchTouch(pane, 'touchmove', [{ identifier: 2, clientX: 150, clientY: 300 - (MOBILE_LONG_PRESS_DRAG_START_PX - 3) }]);
+    dispatchTouch(pane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+
+    // 3) Long-press + drag below MOBILE_SWIPE_PRIMARY_THRESHOLD_PX -> shows progress, then hides cleanly on release without action
+    dispatchTouch(pane, 'touchstart', [{ identifier: 3, clientX: 150, clientY: 300 }]);
+    vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+    dispatchTouch(pane, 'touchmove', [{ identifier: 3, clientX: 150, clientY: 300 - (MOBILE_SWIPE_PRIMARY_THRESHOLD_PX - 12) }]);
+    expect(progressLog.at(-1)?.armed).toBe(false);
+    dispatchTouch(pane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog.at(-1)).toBeNull();
+    expect(isMobileNavigationGestureActive(document)).toBe(false);
+
+    // 4) Long-press + ambiguous diagonal drag -> never arms/triggers
+    progressLog.length = 0;
+    dispatchTouch(pane, 'touchstart', [{ identifier: 4, clientX: 150, clientY: 300 }]);
+    vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+    dispatchTouch(pane, 'touchmove', [{ identifier: 4, clientX: 230, clientY: 380 }]);
+    expect(progressLog.at(-1)?.armed).toBe(false);
+    dispatchTouch(pane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog.at(-1)).toBeNull();
+
+    // 5) Immediate move > STILL_TOLERANCE before timer fires -> locks out for rest of sequence
+    progressLog.length = 0;
+    dispatchTouch(pane, 'touchstart', [{ identifier: 5, clientX: 150, clientY: 300 }]);
+    vi.advanceTimersByTime(100);
+    dispatchTouch(pane, 'touchmove', [{ identifier: 5, clientX: 150, clientY: 300 - (MOBILE_LONG_PRESS_STILL_TOLERANCE_PX + 10) }]);
+    vi.advanceTimersByTime(500);
+    dispatchTouch(pane, 'touchmove', [{ identifier: 5, clientX: 150, clientY: 160 }]);
+    dispatchTouch(pane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
 
     detach();
   });
@@ -1093,5 +1292,83 @@ describe('mobile-navigation-gestures', () => {
     expect(actions).toEqual(['tabPrev', 'tabNext']);
 
     detach();
+  });
+
+  it('ignores 1-finger long-press + drag inside inputs, controls, and editable elements', () => {
+    vi.useFakeTimers();
+    const controls = document.createElement('div');
+    controls.className = 'controls-wrapper';
+    const controlsInput = document.createElement('div');
+    controlsInput.className = 'controls-input';
+    controls.appendChild(controlsInput);
+
+    const standaloneInput = document.createElement('input');
+    const standaloneTextarea = document.createElement('textarea');
+    const standaloneSelect = document.createElement('select');
+    const editableDiv = document.createElement('div');
+    editableDiv.setAttribute('contenteditable', 'true');
+
+    document.body.append(controls, standaloneInput, standaloneTextarea, standaloneSelect, editableDiv);
+
+    const actions: string[] = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (a) => actions.push(a),
+      onProgress: (p) => progressLog.push(p),
+    });
+
+    for (const el of [controls, controlsInput, standaloneInput, standaloneTextarea, standaloneSelect, editableDiv]) {
+      expect(canHandleMobileNavigationGesture(el, { isMobile: true, document })).toBe(false);
+      const s = dispatchTouch(el, 'touchstart', [{ identifier: 1, clientX: 120, clientY: 300 }]);
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS + 50);
+      const m = dispatchTouch(el, 'touchmove', [{ identifier: 1, clientX: 120, clientY: 180 }]);
+      const e = dispatchTouch(el, 'touchend', []);
+      expect(s.defaultPrevented).toBe(false);
+      expect(m.defaultPrevented).toBe(false);
+      expect(e.defaultPrevented).toBe(false);
+      expect(isMobileNavigationGestureActive(document)).toBe(false);
+    }
+
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+    detach();
+  });
+
+  it('transitions smoothly from 1-finger long-press hold to 2-finger tracking and cleans timers on cancel/detach', () => {
+    vi.useFakeTimers();
+    const pane = document.createElement('div');
+    pane.className = 'chat-view';
+    document.body.appendChild(pane);
+
+    const actions: string[] = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (a) => actions.push(a),
+    });
+
+    // Finger 1 holds briefly, Finger 2 lands -> transitions to 2-finger tracking seamlessly
+    dispatchTouch(pane, 'touchstart', [{ identifier: 1, clientX: 120, clientY: 300 }]);
+    vi.advanceTimersByTime(150);
+    const secondStart = dispatchTouch(pane, 'touchstart', [
+      { identifier: 1, clientX: 120, clientY: 300 },
+      { identifier: 2, clientX: 180, clientY: 300 },
+    ]);
+    expect(secondStart.defaultPrevented).toBe(true);
+    expect(isMobileNavigationGestureActive(document)).toBe(true);
+    dispatchTouch(pane, 'touchmove', [
+      { identifier: 1, clientX: 120, clientY: 220 },
+      { identifier: 2, clientX: 180, clientY: 220 },
+    ]);
+    dispatchTouch(pane, 'touchend', []);
+    expect(actions).toEqual(['serverPrev']);
+    expect(isMobileNavigationGestureActive(document)).toBe(false);
+
+    // Detach while long-press pending cancels timer cleanly without throwing or locking
+    dispatchTouch(pane, 'touchstart', [{ identifier: 9, clientX: 120, clientY: 300 }]);
+    vi.advanceTimersByTime(100);
+    detach();
+    vi.advanceTimersByTime(500);
+    expect(isMobileNavigationGestureActive(document)).toBe(false);
   });
 });

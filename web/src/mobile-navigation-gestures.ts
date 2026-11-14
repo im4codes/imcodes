@@ -31,7 +31,52 @@ export const MOBILE_SWIPE_PRIMARY_THRESHOLD_PX = 56;
 export const MOBILE_SWIPE_PER_FINGER_MIN_PX = 28;
 export const MOBILE_SWIPE_DOMINANCE_RATIO = 1.35;
 export const MOBILE_SWIPE_PINCH_OPPOSING_MIN_PX = 12;
+export const MOBILE_LONG_PRESS_MS = 380;
+export const MOBILE_LONG_PRESS_STILL_TOLERANCE_PX = 12;
+export const MOBILE_LONG_PRESS_DRAG_START_PX = 10;
+export const MOBILE_NAV_GESTURE_ACTIVE_CLASS = 'mobile-nav-gesture-active';
+export const MOBILE_NAV_GESTURE_ACTIVE_EVENT = 'imcodes:mobile-nav-gesture-active';
 const MOBILE_SWIPE_DIRECTION_DEADZONE_PX = 4;
+const MOBILE_GESTURE_RECENT_WINDOW_MS = 350;
+
+const lastCompletedGestureAtByDoc = new WeakMap<Document, number>();
+let lastCompletedGestureAtFallback = 0;
+
+function resolveTargetDocument(doc?: Document): Document | undefined {
+  return doc ?? (typeof document !== 'undefined' ? document : undefined);
+}
+
+export function isMobileNavigationGestureActive(doc?: Document): boolean {
+  const resolved = resolveTargetDocument(doc);
+  return resolved?.documentElement?.classList?.contains(MOBILE_NAV_GESTURE_ACTIVE_CLASS) ?? false;
+}
+
+export function wasMobileNavigationGestureRecentlyActive(
+  doc?: Document,
+  windowMs: number = MOBILE_GESTURE_RECENT_WINDOW_MS,
+): boolean {
+  const resolved = resolveTargetDocument(doc);
+  const ts = resolved ? (lastCompletedGestureAtByDoc.get(resolved) ?? 0) : lastCompletedGestureAtFallback;
+  return ts > 0 && Date.now() - ts < windowMs;
+}
+
+function markMobileNavigationGestureCompleted(doc?: Document): void {
+  const now = Date.now();
+  const resolved = resolveTargetDocument(doc);
+  if (resolved) {
+    lastCompletedGestureAtByDoc.set(resolved, now);
+  } else {
+    lastCompletedGestureAtFallback = now;
+  }
+}
+
+function setMobileNavigationGestureActiveState(doc: Document | undefined, active: boolean): void {
+  if (!doc) return;
+  doc.documentElement?.classList?.toggle(MOBILE_NAV_GESTURE_ACTIVE_CLASS, active);
+  if (typeof CustomEvent === 'function' && typeof doc.dispatchEvent === 'function') {
+    doc.dispatchEvent(new CustomEvent(MOBILE_NAV_GESTURE_ACTIVE_EVENT, { detail: { active } }));
+  }
+}
 
 const DIRECTION_TO_ACTION: Record<MobileNavigationDirection, MobileNavigationAction> = {
   up: 'serverPrev',
@@ -104,6 +149,13 @@ const MOBILE_GESTURE_BLOCKING_TARGET_SELECTOR = [
   '.modal-overlay',
   '.dialog-backdrop',
   '.dialog-overlay',
+  'input',
+  'textarea',
+  'select',
+  '[contenteditable="true"]',
+  '[contenteditable=""]',
+  '[contenteditable="plaintext-only"]',
+  '.controls-input',
 ].join(', ');
 
 export interface MobileNavigationGestureGuardOptions {
@@ -194,11 +246,25 @@ function isOpposingFingerMovement(dx1: number, dy1: number, dx2: number, dy2: nu
   return false;
 }
 
-type TrackerPhase = 'idle' | 'tracking' | 'triggered' | 'locked_out';
+type TrackerPhase =
+  | 'idle'
+  | 'long_press_pending'
+  | 'long_press_ready'
+  | 'tracking'
+  | 'triggered'
+  | 'locked_out';
+
+type ActiveTrackingMode = 'one_finger' | 'two_finger' | null;
 
 export interface TwoFingerSwipeTrackerOptions {
   readonly canTrack?: (target: EventTarget | null | undefined) => boolean;
   readonly onProgress?: (progress: MobileNavigationGestureProgress | null) => void;
+  readonly onActiveChange?: (active: boolean) => void;
+  readonly longPressMs?: number;
+  readonly stillTolerancePx?: number;
+  readonly dragStartPx?: number;
+  readonly setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  readonly clearTimer?: (id: ReturnType<typeof setTimeout>) => void;
 }
 
 interface GestureEvaluation {
@@ -208,24 +274,57 @@ interface GestureEvaluation {
 }
 
 /**
- * Pure two-finger 4-direction swipe recognizer.
- * Emits live threshold/direction progress during active 2-finger drag, triggers
+ * Mobile 4-direction navigation swipe recognizer supporting:
+ * 1) Two-finger swipe anywhere outside overlays and bottom control bars;
+ * 2) One-finger long-press + combined drag outside input/control bars.
+ *
+ * Emits live threshold/direction progress during active tracking, triggers
  * navigation only upon `touchend` while armed past threshold, rejects pinch/spread
- * zoom, 1-finger scrolling, 3+ finger touches, bottom control surfaces, and
- * diagonal ambiguity, and emits at most one navigation action until all touches lift.
+ * zoom, normal 1-finger scrolling, long-press without drag, 3+ finger touches,
+ * bottom control/input surfaces, and diagonal ambiguity.
  */
 export class TwoFingerSwipeTracker {
   private phase: TrackerPhase = 'idle';
+  private activeMode: ActiveTrackingMode = null;
   private startPoints = new Map<number, { x: number; y: number }>();
   private lastPoints = new Map<number, { x: number; y: number }>();
   private lockedTouches = new Map<number, EventTarget | null>();
+  private pendingTouchId: number | null = null;
+  private pendingStartPoint: { x: number; y: number } | null = null;
+  private pendingLastPoint: { x: number; y: number } | null = null;
+  private longPressAnchor: { x: number; y: number } | null = null;
+  private pendingTarget: EventTarget | null = null;
+  private longPressTimer: ReturnType<typeof setTimeout> | null = null;
   private hudVisible = false;
+  private activeNotified = false;
   private readonly canTrack: (target: EventTarget | null | undefined) => boolean;
   private readonly onProgress?: (progress: MobileNavigationGestureProgress | null) => void;
+  private readonly onActiveChange?: (active: boolean) => void;
+  private readonly longPressMs: number;
+  private readonly stillTolerancePx: number;
+  private readonly dragStartPx: number;
+  private readonly setTimer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private readonly clearTimer: (id: ReturnType<typeof setTimeout>) => void;
 
   constructor(options: TwoFingerSwipeTrackerOptions = {}) {
     this.canTrack = options.canTrack ?? (() => true);
     this.onProgress = options.onProgress;
+    this.onActiveChange = options.onActiveChange;
+    this.longPressMs = options.longPressMs ?? MOBILE_LONG_PRESS_MS;
+    this.stillTolerancePx = options.stillTolerancePx ?? MOBILE_LONG_PRESS_STILL_TOLERANCE_PX;
+    this.dragStartPx = options.dragStartPx ?? MOBILE_LONG_PRESS_DRAG_START_PX;
+    this.setTimer = options.setTimer ?? ((fn, ms) => globalThis.setTimeout(fn, ms));
+    this.clearTimer = options.clearTimer ?? ((id) => globalThis.clearTimeout(id));
+  }
+
+  isActive(): boolean {
+    return this.phase === 'tracking' || this.phase === 'triggered';
+  }
+
+  private setActive(active: boolean): void {
+    if (this.activeNotified === active) return;
+    this.activeNotified = active;
+    this.onActiveChange?.(active);
   }
 
   private emitProgress(next: MobileNavigationGestureProgress | null): void {
@@ -257,9 +356,38 @@ export class TwoFingerSwipeTracker {
     return true;
   }
 
+  private clearLongPressTimer(): void {
+    if (this.longPressTimer !== null) {
+      this.clearTimer(this.longPressTimer);
+      this.longPressTimer = null;
+    }
+  }
+
+  private clearPendingOneFinger(): void {
+    this.clearLongPressTimer();
+    this.pendingTouchId = null;
+    this.pendingStartPoint = null;
+    this.pendingLastPoint = null;
+    this.longPressAnchor = null;
+    this.pendingTarget = null;
+  }
+
   private clearTrackedPoints(): void {
     this.startPoints.clear();
     this.lastPoints.clear();
+    this.activeMode = null;
+  }
+
+  private findTouchById(
+    touches: ArrayLike<TouchPointSnapshot> | undefined,
+    identifier: number | null,
+  ): TouchPointSnapshot | null {
+    if (!touches || identifier === null) return null;
+    for (let i = 0; i < touches.length; i++) {
+      const point = touches[i];
+      if (point && point.identifier === identifier) return point;
+    }
+    return null;
   }
 
   private snapshotLockedTouches(event: TouchEventLike): void {
@@ -305,10 +433,14 @@ export class TwoFingerSwipeTracker {
   }
 
   private enterStopPhase(phase: 'triggered' | 'locked_out', event: TouchEventLike): void {
+    this.clearPendingOneFinger();
     this.phase = phase;
     this.clearTrackedPoints();
     this.snapshotLockedTouches(event);
     this.emitProgress(null);
+    if (phase === 'locked_out') {
+      this.setActive(false);
+    }
   }
 
   private updateTrackedPositions(touches?: ArrayLike<TouchPointSnapshot>): void {
@@ -320,28 +452,19 @@ export class TwoFingerSwipeTracker {
     }
   }
 
-  private evaluateTrackedState(): GestureEvaluation {
-    const ids = Array.from(this.startPoints.keys());
-    if (ids.length !== 2) return { opposing: false, progress: null, action: null };
-    const id1 = ids[0]!;
-    const id2 = ids[1]!;
-    const start1 = this.startPoints.get(id1);
-    const start2 = this.startPoints.get(id2);
-    const end1 = this.lastPoints.get(id1);
-    const end2 = this.lastPoints.get(id2);
-    if (!start1 || !start2 || !end1 || !end2) return { opposing: false, progress: null, action: null };
-
-    const dx1 = end1.x - start1.x;
-    const dy1 = end1.y - start1.y;
-    const dx2 = end2.x - start2.x;
-    const dy2 = end2.y - start2.y;
-
-    if (isOpposingFingerMovement(dx1, dy1, dx2, dy2)) {
+  private buildEvaluation(
+    primary1: number,
+    primary2: number,
+    cross1: number,
+    cross2: number,
+    dx: number,
+    dy: number,
+    opposing: boolean,
+  ): GestureEvaluation {
+    if (opposing) {
       return { opposing: true, progress: null, action: null };
     }
 
-    const dx = (dx1 + dx2) / 2;
-    const dy = (dy1 + dy2) / 2;
     const absAvgDx = Math.abs(dx);
     const absAvgDy = Math.abs(dy);
     const isVertical = absAvgDy >= absAvgDx;
@@ -362,8 +485,8 @@ export class TwoFingerSwipeTracker {
     }
 
     const committedAction = isVertical
-      ? classifySingleAxisSwipe(dy1, dy2, absAvgDx, 'serverPrev', 'serverNext')
-      : classifySingleAxisSwipe(dx1, dx2, absAvgDy, 'tabPrev', 'tabNext');
+      ? classifySingleAxisSwipe(primary1, primary2, absAvgDx, 'serverPrev', 'serverNext')
+      : classifySingleAxisSwipe(cross1, cross2, absAvgDy, 'tabPrev', 'tabNext');
     const armed = committedAction !== null;
     const distance = direction ? absPrimary : 0;
     const progress = armed
@@ -386,32 +509,96 @@ export class TwoFingerSwipeTracker {
     };
   }
 
+  private evaluateTrackedState(): GestureEvaluation {
+    const ids = Array.from(this.startPoints.keys());
+    if (this.activeMode === 'one_finger') {
+      if (ids.length !== 1) return { opposing: false, progress: null, action: null };
+      const id = ids[0]!;
+      const start = this.startPoints.get(id);
+      const end = this.lastPoints.get(id);
+      if (!start || !end) return { opposing: false, progress: null, action: null };
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      return this.buildEvaluation(dy, dy, dx, dx, dx, dy, false);
+    }
+
+    if (ids.length !== 2) return { opposing: false, progress: null, action: null };
+    const id1 = ids[0]!;
+    const id2 = ids[1]!;
+    const start1 = this.startPoints.get(id1);
+    const start2 = this.startPoints.get(id2);
+    const end1 = this.lastPoints.get(id1);
+    const end2 = this.lastPoints.get(id2);
+    if (!start1 || !start2 || !end1 || !end2) return { opposing: false, progress: null, action: null };
+
+    const dx1 = end1.x - start1.x;
+    const dy1 = end1.y - start1.y;
+    const dx2 = end2.x - start2.x;
+    const dy2 = end2.y - start2.y;
+    const dx = (dx1 + dx2) / 2;
+    const dy = (dy1 + dy2) / 2;
+    return this.buildEvaluation(
+      dy1,
+      dy2,
+      dx1,
+      dx2,
+      dx,
+      dy,
+      isOpposingFingerMovement(dx1, dy1, dx2, dy2),
+    );
+  }
+
+  private lockOutActiveGesture(event: TouchEventLike): void {
+    this.enterStopPhase('locked_out', event);
+  }
+
   reset(): void {
+    this.clearPendingOneFinger();
     this.phase = 'idle';
     this.clearTrackedPoints();
     this.lockedTouches.clear();
     this.emitProgress(null);
+    this.setActive(false);
   }
 
   onTouchStart(event: TouchEventLike): void {
     const count = event.touches.length;
     if (count > 2) {
-      this.enterStopPhase('locked_out', event);
+      this.lockOutActiveGesture(event);
       return;
     }
     if (count === 1) {
       if (this.phase !== 'idle') {
         this.reset();
       }
-      if (!this.canTrackEvent(event)) {
+      const first = event.touches[0];
+      if (!first || !this.canTrackEvent(event)) {
         this.enterStopPhase('locked_out', event);
+        return;
       }
+      this.pendingTouchId = first.identifier;
+      this.pendingStartPoint = { x: first.clientX, y: first.clientY };
+      this.pendingLastPoint = { x: first.clientX, y: first.clientY };
+      this.longPressAnchor = null;
+      this.pendingTarget = first.target ?? event.target ?? null;
+      this.phase = 'long_press_pending';
+      this.longPressTimer = this.setTimer(() => {
+        this.longPressTimer = null;
+        if (this.phase !== 'long_press_pending') return;
+        if (this.pendingTarget && !this.canTrack(this.pendingTarget)) {
+          this.clearPendingOneFinger();
+          this.phase = 'locked_out';
+          return;
+        }
+        this.longPressAnchor = this.pendingLastPoint ?? this.pendingStartPoint;
+        this.phase = 'long_press_ready';
+      }, this.longPressMs);
       return;
     }
     if (count === 2) {
-      if (this.phase !== 'idle') {
+      if (this.phase !== 'idle' && this.phase !== 'long_press_pending' && this.phase !== 'long_press_ready') {
         if (this.phase === 'tracking') {
-          this.enterStopPhase('locked_out', event);
+          this.lockOutActiveGesture(event);
           return;
         }
         if (!this.shouldRecoverStaleLockOnTwoFingerStart(event)) {
@@ -420,23 +607,26 @@ export class TwoFingerSwipeTracker {
         }
         this.reset();
       }
+      this.clearPendingOneFinger();
       if (!this.canTrackEvent(event)) {
-        this.enterStopPhase('locked_out', event);
+        this.lockOutActiveGesture(event);
         return;
       }
       const first = event.touches[0];
       const second = event.touches[1];
       if (!first || !second || first.identifier === second.identifier) {
-        this.enterStopPhase('locked_out', event);
+        this.lockOutActiveGesture(event);
         return;
       }
       this.clearTrackedPoints();
       this.lockedTouches.clear();
+      this.activeMode = 'two_finger';
       this.startPoints.set(first.identifier, { x: first.clientX, y: first.clientY });
       this.startPoints.set(second.identifier, { x: second.clientX, y: second.clientY });
       this.lastPoints.set(first.identifier, { x: first.clientX, y: first.clientY });
       this.lastPoints.set(second.identifier, { x: second.clientX, y: second.clientY });
       this.phase = 'tracking';
+      this.setActive(true);
       this.emitProgress({
         dx: 0,
         dy: 0,
@@ -456,6 +646,63 @@ export class TwoFingerSwipeTracker {
       this.reset();
       return null;
     }
+
+    if (this.phase === 'long_press_pending') {
+      if (count !== 1 || !this.canTrackEvent(event)) {
+        this.clearPendingOneFinger();
+        this.phase = 'locked_out';
+        return null;
+      }
+      const touch = this.findTouchById(event.touches, this.pendingTouchId);
+      if (!touch || !this.pendingStartPoint) {
+        this.clearPendingOneFinger();
+        this.phase = 'locked_out';
+        return null;
+      }
+      const moveDist = Math.hypot(
+        touch.clientX - this.pendingStartPoint.x,
+        touch.clientY - this.pendingStartPoint.y,
+      );
+      if (moveDist > this.stillTolerancePx) {
+        // User is scrolling/dragging before long-press armed: cancel & lock out for this touch sequence.
+        this.clearPendingOneFinger();
+        this.phase = 'locked_out';
+        return null;
+      }
+      this.pendingLastPoint = { x: touch.clientX, y: touch.clientY };
+      return null;
+    }
+
+    if (this.phase === 'long_press_ready') {
+      if (count !== 1 || !this.canTrackEvent(event)) {
+        this.clearPendingOneFinger();
+        this.phase = 'locked_out';
+        return null;
+      }
+      const touch = this.findTouchById(event.touches, this.pendingTouchId);
+      const anchor = this.longPressAnchor ?? this.pendingStartPoint;
+      if (!touch || !anchor) {
+        this.clearPendingOneFinger();
+        this.phase = 'locked_out';
+        return null;
+      }
+      this.pendingLastPoint = { x: touch.clientX, y: touch.clientY };
+      const dragDist = Math.hypot(touch.clientX - anchor.x, touch.clientY - anchor.y);
+      if (dragDist < this.dragStartPx) {
+        return null;
+      }
+      this.clearPendingOneFinger();
+      this.clearTrackedPoints();
+      this.activeMode = 'one_finger';
+      this.startPoints.set(touch.identifier, anchor);
+      this.lastPoints.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+      this.phase = 'tracking';
+      this.setActive(true);
+      const evaluation = this.evaluateTrackedState();
+      this.emitProgress(evaluation.progress);
+      return null;
+    }
+
     if (this.phase !== 'tracking') {
       if (count > 2 && this.phase === 'idle') {
         this.enterStopPhase('locked_out', event);
@@ -467,21 +714,38 @@ export class TwoFingerSwipeTracker {
       }
       return null;
     }
+
+    if (this.activeMode === 'one_finger') {
+      if (count !== 1 || !this.canTrackEvent(event)) {
+        this.lockOutActiveGesture(event);
+        return null;
+      }
+      const first = event.touches[0];
+      if (!first || !this.startPoints.has(first.identifier)) {
+        this.lockOutActiveGesture(event);
+        return null;
+      }
+      this.updateTrackedPositions(event.touches);
+      const evaluation = this.evaluateTrackedState();
+      this.emitProgress(evaluation.progress);
+      return null;
+    }
+
     if (count !== 2 || !this.canTrackEvent(event)) {
-      this.enterStopPhase('locked_out', event);
+      this.lockOutActiveGesture(event);
       return null;
     }
     const first = event.touches[0];
     const second = event.touches[1];
     if (!first || !second || !this.startPoints.has(first.identifier) || !this.startPoints.has(second.identifier)) {
-      this.enterStopPhase('locked_out', event);
+      this.lockOutActiveGesture(event);
       return null;
     }
 
     this.updateTrackedPositions(event.touches);
     const evaluation = this.evaluateTrackedState();
     if (evaluation.opposing) {
-      this.enterStopPhase('locked_out', event);
+      this.lockOutActiveGesture(event);
       return null;
     }
 
@@ -494,6 +758,11 @@ export class TwoFingerSwipeTracker {
     if (this.phase !== 'tracking') {
       if (remainingCount === 0) {
         this.reset();
+      } else if (this.phase === 'long_press_pending' || this.phase === 'long_press_ready') {
+        if (!this.findTouchById(event.touches, this.pendingTouchId)) {
+          this.clearPendingOneFinger();
+          this.phase = 'locked_out';
+        }
       } else if (this.phase === 'idle' && remainingCount > 2) {
         this.enterStopPhase('locked_out', event);
       } else {
@@ -502,11 +771,12 @@ export class TwoFingerSwipeTracker {
       return null;
     }
 
-    if (remainingCount > 2 || !this.canTrackEvent(event)) {
+    const expectedMaxRemaining = this.activeMode === 'one_finger' ? 1 : 2;
+    if (remainingCount > expectedMaxRemaining || !this.canTrackEvent(event)) {
       if (remainingCount === 0) {
         this.reset();
       } else {
-        this.enterStopPhase('locked_out', event);
+        this.lockOutActiveGesture(event);
       }
       return null;
     }
@@ -527,7 +797,7 @@ export class TwoFingerSwipeTracker {
     if (remainingCount === 0) {
       this.reset();
     } else {
-      this.enterStopPhase('locked_out', event);
+      this.lockOutActiveGesture(event);
     }
     return null;
   }
@@ -544,14 +814,21 @@ export interface AttachMobileNavigationGesturesOptions {
   readonly isBlocked?: () => boolean;
   readonly onAction: (action: MobileNavigationAction) => void;
   readonly onProgress?: (progress: MobileNavigationGestureProgress | null) => void;
+  readonly longPressMs?: number;
 }
 
 export function attachMobileNavigationGestures(options: AttachMobileNavigationGesturesOptions): () => void {
   if (!options.isMobile) return () => {};
   const win = options.windowTarget ?? (typeof window !== 'undefined' ? window : undefined);
   if (!win) return () => {};
-
   const doc = options.document ?? win.document;
+
+  const preventTouchDefault = (e: TouchEvent) => {
+    if (e.cancelable !== false && typeof e.preventDefault === 'function') {
+      e.preventDefault();
+    }
+  };
+
   const tracker = new TwoFingerSwipeTracker({
     canTrack: (target) => canHandleMobileNavigationGesture(target, {
       isMobile: options.isMobile,
@@ -559,18 +836,42 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
       document: doc,
     }),
     onProgress: options.onProgress,
+    onActiveChange: (active) => setMobileNavigationGestureActiveState(doc, active),
+    longPressMs: options.longPressMs,
   });
 
-  const handleTouchStart = (e: TouchEvent) => tracker.onTouchStart(e);
+  const handleTouchStart = (e: TouchEvent) => {
+    tracker.onTouchStart(e);
+    if (tracker.isActive()) {
+      preventTouchDefault(e);
+    }
+  };
   const handleTouchMove = (e: TouchEvent) => {
     const action = tracker.onTouchMove(e);
+    if (tracker.isActive()) {
+      preventTouchDefault(e);
+    }
     if (action) options.onAction(action);
   };
   const handleTouchEnd = (e: TouchEvent) => {
+    const wasActive = tracker.isActive();
     const action = tracker.onTouchEnd(e);
+    if (wasActive) {
+      preventTouchDefault(e);
+      if (e.touches.length === 0) {
+        markMobileNavigationGestureCompleted(doc);
+      }
+    }
     if (action) options.onAction(action);
   };
-  const handleTouchCancel = () => tracker.onTouchCancel();
+  const handleTouchCancel = (e: TouchEvent) => {
+    const wasActive = tracker.isActive();
+    tracker.onTouchCancel();
+    if (wasActive) {
+      preventTouchDefault(e);
+      markMobileNavigationGestureCompleted(doc);
+    }
+  };
   const handleWindowBlur = () => tracker.reset();
   const handleVisibilityChange = () => {
     if (doc && doc.visibilityState !== 'visible') {
@@ -578,7 +879,7 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
     }
   };
 
-  const listenerOpts: AddEventListenerOptions = { passive: true, capture: true };
+  const listenerOpts: AddEventListenerOptions = { passive: false, capture: true };
   win.addEventListener('touchstart', handleTouchStart, listenerOpts);
   win.addEventListener('touchmove', handleTouchMove, listenerOpts);
   win.addEventListener('touchend', handleTouchEnd, listenerOpts);

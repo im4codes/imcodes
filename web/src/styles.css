@@ -7293,6 +7293,18 @@ html.native-ios-mac .chat-dl-btn {
     touch-action: manipulation;
   }
 }
+/* Lock chat surface interactions while an active 2-finger or 1-finger long-press-drag
+   mobile navigation gesture is tracking/completing so it never scrolls, selects text,
+   or opens browser/app long-press callouts. */
+html.mobile-nav-gesture-active .chat-view,
+html.mobile-nav-gesture-active .chat-view * {
+  touch-action: none !important;
+  overscroll-behavior: none;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  -webkit-touch-callout: none !important;
+  -webkit-tap-highlight-color: transparent;
+}
 .chat-sel-btn { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: background 0.15s; }
 .chat-sel-btn:hover { background: #334155; }
 .chat-sel-btn.copied { background: #166534; border-color: #16a34a; color: #86efac; }

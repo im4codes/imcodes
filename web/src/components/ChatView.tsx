@@ -47,6 +47,11 @@ import {
   setDownloadTransferRetry,
 } from '../download-transfer-store.js';
 import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
+import {
+  isMobileNavigationGestureActive,
+  MOBILE_NAV_GESTURE_ACTIVE_EVENT,
+  wasMobileNavigationGestureRecentlyActive,
+} from '../mobile-navigation-gestures.js';
 import { h, type ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
@@ -2889,6 +2894,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // Y of the active touch's start, for detecting an explicit finger-down
   // (content scrolls up) gesture that should pause follow-mode immediately.
   const touchStartYRef = useRef(0);
+  const touchNavSuppressedRef = useRef(false);
   // Epoch ms of the last "LAST SENT" pin-banner show/hide. The banner is a
   // flow sibling of `.chat-view`, so toggling it resizes the scroll area by
   // ~60px and fires the ResizeObserver — which must NOT re-pin to bottom (the
@@ -4142,13 +4148,34 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (e.deltaY < 0) handleUserScrollUpIntent();
   };
   const handleTouchStart = (e: TouchEvent) => {
-    touchStartYRef.current = e.touches[0]?.clientY ?? 0;
+    const doc = scrollRef.current?.ownerDocument;
+    if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+      touchNavSuppressedRef.current = true;
+      touchStartYRef.current = 0;
+      return;
+    }
+    if (e.touches.length === 1) {
+      touchNavSuppressedRef.current = false;
+      touchStartYRef.current = e.touches[0]?.clientY ?? 0;
+    }
   };
   const handleTouchMove = (e: TouchEvent) => {
+    const doc = scrollRef.current?.ownerDocument;
+    if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+      touchNavSuppressedRef.current = true;
+      return;
+    }
+    if (touchNavSuppressedRef.current) return;
+    if (highlightElRef.current || ctxMenu) return;
     const y = e.touches[0]?.clientY ?? 0;
     // Finger moving DOWN (clientY increases) drags content UP toward older
     // history. 6px deadzone avoids reacting to taps / micro-jitter.
     if (y - touchStartYRef.current > 6) handleUserScrollUpIntent();
+  };
+  const handleTouchEndOrCancel = (e: TouchEvent) => {
+    if (e.touches.length === 0) {
+      touchNavSuppressedRef.current = false;
+    }
   };
 
   const handleScroll = () => {
@@ -4425,6 +4452,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const openCtxMenu = useCallback((target: HTMLElement, clientX: number, clientY: number) => {
     if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
     target.classList.add('chat-highlight');
+    highlightElRef.current = target;
     setHighlightEl(target);
     const text = extractChatEventText(target);
     if (!text) return;
@@ -4474,6 +4502,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
     if (!container) return;
+    const doc = container.ownerDocument;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let startX = 0, startY = 0;
     let startTarget: HTMLElement | null = null;
@@ -4483,17 +4512,46 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     // Telegram pattern: eat the touchend + subsequent click after menu opens
     const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
 
+    const clearPendingLongPress = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const dismissTouchHighlightAndMenu = () => {
+      if (highlightElRef.current) {
+        highlightElRef.current.classList.remove('chat-highlight');
+        highlightElRef.current = null;
+      }
+      container.querySelectorAll('.chat-highlight').forEach((el) => el.classList.remove('chat-highlight'));
+      setHighlightEl(null);
+      setCtxMenu(null);
+    };
+
+    const onNavGestureActive = (e: Event) => {
+      const active = Boolean((e as CustomEvent<{ active?: boolean }>).detail?.active);
+      if (!active) return;
+      clearPendingLongPress();
+      container.removeEventListener('touchend', cancelEvent, { capture: true } as EventListenerOptions);
+      lastTapEventId = '';
+      lastTapTs = 0;
+      dismissTouchHighlightAndMenu();
+    };
+
     const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length > 1) {
-        // multi-touch → cancel any in-flight tap tracking; this is a pinch/scroll
-        if (timer) { clearTimeout(timer); timer = null; }
+      if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+        // multi-touch or active mobile nav gesture → cancel any in-flight tap/long-press tracking
+        clearPendingLongPress();
         return;
       }
       const t = e.touches[0];
       startX = t.clientX; startY = t.clientY;
       startTarget = e.target as HTMLElement;
+      clearPendingLongPress();
       timer = setTimeout(() => {
         timer = null;
+        if (isMobileNavigationGestureActive(doc)) return;
         const chatEvent = startTarget?.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
         openCtxMenu(chatEvent, startX, startY);
@@ -4503,20 +4561,28 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     };
 
     const onTouchMove = (e: TouchEvent) => {
+      if (isMobileNavigationGestureActive(doc)) {
+        clearPendingLongPress();
+        return;
+      }
       if (!timer) return;
       const t = e.touches[0];
       if (Math.abs(t.clientX - startX) > TAP_MOVE_TOLERANCE_PX || Math.abs(t.clientY - startY) > TAP_MOVE_TOLERANCE_PX) {
-        clearTimeout(timer); timer = null;
+        clearPendingLongPress();
       }
     };
 
     const onTouchEnd = () => {
       // Long-press fired or finger moved? clear timer; double-tap pairing
       // is handled in onClick (which won't fire if cancelEvent ran).
-      if (timer) { clearTimeout(timer); timer = null; }
+      clearPendingLongPress();
     };
 
     const onClick = (e: MouseEvent) => {
+      if (isMobileNavigationGestureActive(doc) || wasMobileNavigationGestureRecentlyActive(doc)) {
+        lastTapEventId = ''; lastTapTs = 0;
+        return;
+      }
       const target = e.target as HTMLElement | null;
       const bubble = target?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
       if (!bubble) {
@@ -4537,13 +4603,15 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       }
     };
 
+    doc.addEventListener(MOBILE_NAV_GESTURE_ACTIVE_EVENT, onNavGestureActive);
     container.addEventListener('touchstart', onTouchStart, { passive: true });
     container.addEventListener('touchmove', onTouchMove, { passive: true });
     container.addEventListener('touchend', onTouchEnd, { passive: true });
     container.addEventListener('touchcancel', onTouchEnd, { passive: true });
     container.addEventListener('click', onClick);
     return () => {
-      if (timer) clearTimeout(timer);
+      clearPendingLongPress();
+      doc.removeEventListener(MOBILE_NAV_GESTURE_ACTIVE_EVENT, onNavGestureActive);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
       container.removeEventListener('touchend', onTouchEnd);
@@ -4798,6 +4866,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           onWheel={preview ? undefined : handleWheel}
           onTouchStart={preview ? undefined : handleTouchStart}
           onTouchMove={preview ? undefined : handleTouchMove}
+          onTouchEnd={preview ? undefined : handleTouchEndOrCancel}
+          onTouchCancel={preview ? undefined : handleTouchEndOrCancel}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.
