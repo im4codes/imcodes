@@ -308,20 +308,35 @@ describe('manifest generation and verification', () => {
 });
 
 describe('daemon-runtime CI wiring and macOS entitlements', () => {
-  it('wires daemon-runtime build, verification, smoke test, and archive upload into build-node-exe.yml', () => {
-    const workflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
-    expect(workflow).toContain('scripts/build-daemon-runtime.mjs');
-    expect(workflow).toContain('scripts/daemon-runtime-artifacts.mjs verify');
-    expect(workflow).toContain('dist-node-exe/daemon-runtime/**');
-    expect(workflow).toContain('chmod -R a-w "$SMOKE_ROOT"');
-    expect(workflow).toContain('Build, verify and smoke-test Windows daemon-runtime bundle');
-    expect(workflow).toContain('daemon-runtime-win32-x64.zip');
-    const buildStep = workflow.indexOf('Build, verify and smoke-test POSIX daemon-runtime bundle');
-    const uploadStep = workflow.indexOf('Upload executable artifact');
-    const cleanupStep = workflow.indexOf('Remove macOS release-signing material');
-    expect(buildStep).toBeGreaterThan(-1);
-    expect(buildStep).toBeLessThan(uploadStep);
-    expect(buildStep).toBeLessThan(cleanupStep);
+  it('wires daemon-runtime build, verification, smoke test, and archive upload into build-node-exe.yml and ci.yml', () => {
+    for (const spec of [
+      {
+        file: '.github/workflows/build-node-exe.yml',
+        uploadName: 'Upload executable artifact',
+      },
+      {
+        file: '.github/workflows/ci.yml',
+        uploadName: 'Upload controlled-node executable',
+      },
+    ]) {
+      const workflow = readFileSync(spec.file, 'utf8');
+      expect(workflow, spec.file).toContain('scripts/build-daemon-runtime.mjs');
+      expect(workflow, spec.file).toContain('scripts/daemon-runtime-artifacts.mjs verify');
+      expect(workflow, spec.file).toContain('dist-node-exe/daemon-runtime/**');
+      expect(workflow, spec.file).toContain('chmod -R a-w "$SMOKE_ROOT"');
+      expect(workflow, spec.file).toContain('Build, verify and smoke-test Windows daemon-runtime bundle');
+      expect(workflow, spec.file).toContain('daemon-runtime-win32-x64.zip');
+      const buildStep = workflow.indexOf('Build, verify and smoke-test POSIX daemon-runtime bundle');
+      const uploadStep = workflow.indexOf(spec.uploadName);
+      const cleanupStep = workflow.indexOf('Remove macOS release-signing material');
+      expect(buildStep, spec.file).toBeGreaterThan(-1);
+      expect(buildStep, spec.file).toBeLessThan(uploadStep);
+      expect(buildStep, spec.file).toBeLessThan(cleanupStep);
+    }
+
+    const ciWorkflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+    expect(ciWorkflow).toContain('Verify daemon-runtime bundles for every desktop target');
+    expect(ciWorkflow).toContain('server/controlled-node-artifacts/daemon-runtime/daemon-runtime-${target}.manifest.json');
   });
 
   it('ships valid daemon-runtime macOS entitlements without XML comments', () => {

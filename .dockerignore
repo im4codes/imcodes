@@ -17,3 +17,4 @@ tmp
 *.sqlite-shm
 *.sqlite-wal
 **/._*
+server/controlled-node-artifacts/installers

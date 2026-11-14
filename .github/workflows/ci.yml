@@ -1287,6 +1287,213 @@ jobs:
       - name: Qualify signed Windows self-upgrade and rollback
         if: runner.os == 'Windows'
         run: npx tsx scripts/qualify-windows-self-upgrade.ts
+      - name: Build, verify and smoke-test POSIX daemon-runtime bundle
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGET="darwin-arm64"
+          else
+            TARGET="linux-x64"
+          fi
+          node scripts/build-daemon-runtime.mjs \
+            --target "$TARGET" \
+            --out-dir dist-node-exe/daemon-runtime \
+            --build-version "$IMCODES_BUILD_VERSION"
+          node scripts/daemon-runtime-artifacts.mjs verify \
+            "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.manifest.json" \
+            --expected-version "$IMCODES_BUILD_VERSION"
+          SMOKE_ROOT=""
+          HOME_ROOT=""
+          trap 'chmod -R u+w "$SMOKE_ROOT" 2>/dev/null || true; rm -rf "$SMOKE_ROOT" "$HOME_ROOT"' EXIT
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-smoke.XXXXXX")"
+          HOME_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-home.XXXXXX")"
+          tar -xzf "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.tar.gz" -C "$SMOKE_ROOT"
+          chmod -R a-w "$SMOKE_ROOT"
+          env -i HOME="$HOME_ROOT" IMCODES_HOME="$HOME_ROOT/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+            "$SMOKE_ROOT/bin/node" "$SMOKE_ROOT/package/dist/src/index.js" --version
+      - name: Build, verify and smoke-test Windows daemon-runtime bundle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          node scripts/build-daemon-runtime.mjs `
+            --target win32-x64 `
+            --out-dir dist-node-exe/daemon-runtime `
+            --build-version $env:IMCODES_BUILD_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime build failed.' }
+          node scripts/daemon-runtime-artifacts.mjs verify `
+            dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.manifest.json `
+            --expected-version $env:IMCODES_BUILD_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime manifest verification failed.' }
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-smoke'
+          $homeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-home'
+          Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $homeRoot | Out-Null
+          try {
+            Expand-Archive -LiteralPath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' -DestinationPath $smokeRoot -Force
+            & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath (Join-Path $smokeRoot 'node.exe') -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+            $prevHome = $env:IMCODES_HOME
+            $env:IMCODES_HOME = Join-Path $homeRoot '.imcodes'
+            try {
+              & (Join-Path $smokeRoot 'node.exe') (Join-Path $smokeRoot 'package\dist\src\index.js') --version
+              if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke execution failed.' }
+            } finally {
+              $env:IMCODES_HOME = $prevHome
+            }
+          } finally {
+            Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Build and smoke-test Linux unified installers (.deb + .sh)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/build-linux-installer.mjs \
+            --arch x64 \
+            --version "$IMCODES_BUILD_VERSION" \
+            --runtime-archive dist-node-exe/daemon-runtime/daemon-runtime-linux-x64.tar.gz \
+            --node-exe dist-node-exe/imcodes-node-linux \
+            --remote-desktop-dir dist-node-exe/remote-desktop-worker/linux-x64 \
+            --computer-use-dir dist-node-exe/computer-use-helper/linux-x64 \
+            --out-dir dist-node-exe/installers
+          DEB="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb"
+          SH="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh"
+          dpkg-deb --info "$DEB"
+          DEB_CONTENTS_TMP="$(mktemp "${RUNNER_TEMP}/imcodes-deb-contents.XXXXXX")"
+          dpkg-deb --contents "$DEB" > "$DEB_CONTENTS_TMP"
+          head -n 40 "$DEB_CONTENTS_TMP"
+          rm -f "$DEB_CONTENTS_TMP"
+          ISO_ROOT="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-iso.XXXXXX")"
+          ISO_HOME="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-home.XXXXXX")"
+          trap 'rm -rf "$ISO_ROOT" "$ISO_HOME"' EXIT
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --check
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --no-service-control
+          env -i HOME="$ISO_HOME" IMCODES_HOME="$ISO_HOME/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+            "$ISO_ROOT/bin/imcodes" --version
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --rollback "$ISO_ROOT/rollback-snapshot"
+      - name: Build, sign/notarize (when installer cert available), and verify macOS .pkg installer
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          IMCODES_MACOS_INSTALLER_P12_BASE64: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_BASE64 }}
+          IMCODES_MACOS_INSTALLER_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          node scripts/build-macos-installer.mjs \
+            --arch arm64 \
+            --version "$IMCODES_BUILD_VERSION" \
+            --runtime-archive dist-node-exe/daemon-runtime/daemon-runtime-darwin-arm64.tar.gz \
+            --app-bundle "dist-node-exe/aiDesk.to by IM.codes.app" \
+            --node-exe dist-node-exe/imcodes-node-macos \
+            --remote-desktop-dir dist-node-exe/remote-desktop-worker/darwin-arm64 \
+            --computer-use-dir dist-node-exe/computer-use-helper/darwin-universal \
+            --out-dir dist-node-exe/installers
+          PKG="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg"
+          EXPAND_DIR="$(mktemp -d "${RUNNER_TEMP}/imcodes-pkg-expand.XXXXXX")"
+          trap 'rm -rf "$EXPAND_DIR"' EXIT
+          pkgutil --expand-full "$PKG" "$EXPAND_DIR/pkg"
+          APP_INSIDE="$(find "$EXPAND_DIR/pkg" -maxdepth 4 -name "aiDesk.to by IM.codes.app" -type d | head -n 1)"
+          codesign --verify --strict --verbose=2 "$APP_INSIDE"
+          if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ] || security find-identity -v "$RUNNER_TEMP/imcodes-macos-release-signing.keychain-db" 2>/dev/null | grep -q "Developer ID Installer:"; then
+            if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ]; then
+              node scripts/macos-release-signing.mjs import-installer >/dev/null
+            fi
+            node scripts/macos-release-signing.mjs sign-pkg "$PKG"
+            node scripts/macos-release-signing.mjs notarize "$PKG"
+            node scripts/build-macos-installer.mjs \
+              --refresh-manifest "$PKG" \
+              --arch arm64 \
+              --version "$IMCODES_BUILD_VERSION" \
+              --signed \
+              --notarized \
+              --has-app-bundle \
+              --has-node-binary
+          fi
+      - name: Build, sign, and smoke-test Windows Inno Setup (.iss/.exe) installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $isccPath = $null
+          foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+            if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+          }
+          if (-not $isccPath -and (Get-Command choco -ErrorAction SilentlyContinue)) {
+            choco install innosetup --no-progress -y | Out-Null
+            foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+              if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+            }
+          }
+          $localUiDir = if (Test-Path -LiteralPath 'dist-node-exe\aidesk-local-ui\win32-x64' -PathType Container) { 'dist-node-exe\aidesk-local-ui\win32-x64' } else { 'dist-node-exe\aidesk-local-ui' }
+          $buildArgs = @(
+            'scripts\build-windows-installer.mjs',
+            '--version', $env:IMCODES_BUILD_VERSION,
+            '--runtime-archive', 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip',
+            '--node-exe', 'dist-node-exe\imcodes-node.exe',
+            '--remote-desktop-dir', 'dist-node-exe\remote-desktop-worker\win32-x64',
+            '--computer-use-dir', 'dist-node-exe\computer-use-helper\win32-x64',
+            '--local-ui-dir', $localUiDir,
+            '--out-dir', 'dist-node-exe\installers',
+            '--require-iscc'
+          )
+          if ($isccPath) { $buildArgs += @('--iscc-path', $isccPath) }
+          node @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer build failed.' }
+          $exeInstaller = "dist-node-exe\installers\imcodes-desktop-$($env:IMCODES_BUILD_VERSION)-win32-x64.exe"
+          if (-not (Test-Path -LiteralPath $exeInstaller -PathType Leaf)) { throw "Missing compiled Windows installer: $exeInstaller" }
+          $isoRoot = Join-Path $env:RUNNER_TEMP ('imcodes-win-inst-' + [guid]::NewGuid().ToString('N'))
+          $isoHome = Join-Path $isoRoot 'home'
+          New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
+          try {
+            & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode PostInstall -Version $env:IMCODES_BUILD_VERSION -IsolatedRoot $isoRoot -HomeDir $isoHome -StagedCliWrapper 'dist-node-exe\installers\imcodes.cmd' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Windows isolated PostInstall failed.' }
+            & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode Rollback -IsolatedRoot $isoRoot -HomeDir $isoHome | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Windows isolated Rollback failed.' }
+          } finally {
+            Remove-Item -LiteralPath $isoRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Build and verify unified desktop release manifest (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGET="darwin-arm64"
+          else
+            TARGET="linux-x64"
+          fi
+          node scripts/desktop-release-manifest.mjs build \
+            --target "$TARGET" \
+            --dist-dir dist-node-exe \
+            --release-version "$IMCODES_BUILD_VERSION" \
+            --git-sha "$GITHUB_SHA"
+          node scripts/desktop-release-manifest.mjs verify \
+            "dist-node-exe/desktop-release-${TARGET}.manifest.json" \
+            --dist-dir dist-node-exe \
+            --expected-version "$IMCODES_BUILD_VERSION" \
+            --expected-git-sha "$GITHUB_SHA" \
+            --target "$TARGET"
+      - name: Build and verify unified desktop release manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          node scripts/desktop-release-manifest.mjs build `
+            --target win32-x64 `
+            --dist-dir dist-node-exe `
+            --release-version $env:IMCODES_BUILD_VERSION `
+            --git-sha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest build failed.' }
+          node scripts/desktop-release-manifest.mjs verify `
+            dist-node-exe\desktop-release-win32-x64.manifest.json `
+            --dist-dir dist-node-exe `
+            --expected-version $env:IMCODES_BUILD_VERSION `
+            --expected-git-sha $env:GITHUB_SHA `
+            --target win32-x64
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest verification failed.' }
       - name: Record exact source revision in the platform artifact
         # A shell-escaped newline becomes a literal `\\n` under PowerShell;
         # writing the bare SHA keeps the marker byte-identical on every runner.
@@ -1298,11 +1505,14 @@ jobs:
           path: |
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/desktop-release*.manifest.json
             dist-node-exe/source-commit-${{ matrix.key }}.txt
             dist-node-exe/computer-use-helper/**
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
             dist-node-exe/aidesk-local-ui/**
+            dist-node-exe/daemon-runtime/**
+            dist-node-exe/installers/**
           if-no-files-found: error
           retention-days: 30
       - name: Remove macOS release-signing material
@@ -1403,6 +1613,8 @@ jobs:
           set -euo pipefail
           find server/controlled-node-artifacts -type f \
             ! -name '*.json' ! -name '*.zip' ! -name '*.dmg' ! -name '*.dll' ! -name '*.cat' \
+            ! -name '*.deb' ! -name '*.pkg' ! -name '*.iss' ! -name '*.ps1' ! -name '*.cmd' ! -name '*.txt' \
+            ! -name '*.tar.gz' \
             -exec chmod +x {} +
 
       - name: Verify controlled-node executable set
@@ -1484,6 +1696,17 @@ jobs:
           node scripts/remote-desktop-worker-artifacts.mjs verify \
             server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" linux x64
 
+      - name: Verify daemon-runtime bundles for every desktop target
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          for target in linux-x64 darwin-arm64 win32-x64; do
+            node scripts/daemon-runtime-artifacts.mjs verify \
+              "server/controlled-node-artifacts/daemon-runtime/daemon-runtime-${target}.manifest.json" \
+              --expected-version "$IMCODES_BUILD_VERSION"
+          done
+
       - name: Generate controlled-node release artifacts manifest and stage flat release assets
         env:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
@@ -1493,6 +1716,18 @@ jobs:
             server/controlled-node-artifacts \
             --version "$IMCODES_BUILD_VERSION" \
             --stage-dir dist-controlled-node-release
+          for f in \
+            "desktop-release.manifest.json" \
+            "desktop-release-linux-x64.manifest.json" \
+            "desktop-release-darwin-arm64.manifest.json" \
+            "desktop-release-win32-x64.manifest.json" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe"; do
+            test -s "dist-controlled-node-release/$f"
+          done
+          test -s "server/controlled-node-artifacts/desktop-release.manifest.json"
 
       - name: Get build timestamp
         id: ts
@@ -1641,6 +1876,49 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/remote-desktop-worker-artifacts.mjs verify \
             /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" linux x64
+          # Verify desktop release manifests & daemon-runtime bundles are shipped in image, while full installers are excluded.
+          docker run --rm \
+            -e IMCODES_BUILD_VERSION="${{ needs.release_version.outputs.app_version }}" \
+            -e SOURCE_COMMIT="${{ github.sha }}" \
+            --entrypoint node imcodes-smoke:test -e "
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const path = require('node:path');
+            const root = '/app/controlled-node-executables';
+            if (fs.existsSync(path.join(root, 'installers'))) {
+              throw new Error('full desktop installers must not be baked into server Docker image');
+            }
+            import('/app/dist/shared/desktop-release-manifest.js').then((mod) => {
+              const expectedVer = process.env.IMCODES_BUILD_VERSION;
+              const expectedSha = process.env.SOURCE_COMMIT;
+              const targets = ['linux-x64', 'darwin-arm64', 'win32-x64'];
+              for (const t of targets) {
+                const perTarget = mod.validateDesktopReleaseManifest(JSON.parse(fs.readFileSync(path.join(root, 'desktop-release-' + t + '.manifest.json'), 'utf8')));
+                if (perTarget.releaseVersion !== expectedVer || perTarget.gitSha !== expectedSha || !perTarget.targets[t]) {
+                  throw new Error('per-target desktop release manifest mismatch: ' + t);
+                }
+                const drComp = perTarget.targets[t].components['daemon-runtime'];
+                const drAbs = path.join(root, drComp.relativePath || ('daemon-runtime/' + drComp.fileName));
+                const drBytes = fs.readFileSync(drAbs);
+                const drSha = crypto.createHash('sha256').update(drBytes).digest('hex');
+                if (drBytes.length !== drComp.sizeBytes || drSha !== drComp.sha256) {
+                  throw new Error('daemon-runtime archive integrity mismatch inside image: ' + t);
+                }
+                const drManifest = mod.validateDaemonRuntimeManifest(JSON.parse(fs.readFileSync(path.join(root, 'daemon-runtime', drComp.manifestFileName), 'utf8')));
+                if (drManifest.build.version !== expectedVer || drManifest.artifact.sha256 !== drSha) {
+                  throw new Error('daemon-runtime manifest mismatch inside image: ' + t);
+                }
+              }
+              const merged = mod.validateDesktopReleaseManifest(JSON.parse(fs.readFileSync(path.join(root, 'desktop-release.manifest.json'), 'utf8')));
+              if (merged.releaseVersion !== expectedVer || merged.gitSha !== expectedSha) {
+                throw new Error('merged desktop-release.manifest.json mismatch');
+              }
+              for (const t of targets) {
+                if (!merged.targets[t]) throw new Error('merged manifest missing target: ' + t);
+              }
+              console.log('Verified desktop-release*.manifest.json, daemon-runtime, and installers exclusion in image');
+            }).catch((err) => { console.error(err); process.exit(1); });
+            "
 
       - name: Build and push (cache hit — only pushes layers)
         id: build_push

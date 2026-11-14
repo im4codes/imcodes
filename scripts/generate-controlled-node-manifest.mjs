@@ -73,12 +73,88 @@ function addStaticFileEntry(artifacts, artifactsDir, stageDir, spec) {
 }
 
 const RUNTIME_TARGETS = [
-  { target: 'win-x64', os: 'win', arch: 'x64' },
+  { target: 'win32-x64', os: 'win', arch: 'x64' },
   { target: 'darwin-arm64', os: 'mac', arch: 'arm64' },
   { target: 'darwin-x64', os: 'mac', arch: 'x64' },
   { target: 'linux-x64', os: 'linux', arch: 'x64' },
   { target: 'linux-arm64', os: 'linux', arch: 'arm64' },
 ];
+
+const SHA256_RE = /^[0-9a-f]{64}$/i;
+const GIT_SHA_RE = /^[0-9a-f]{40}$/i;
+
+function isSafeRelativeAssetPath(relPath) {
+  if (typeof relPath !== 'string' || !relPath || relPath.startsWith('/') || relPath.startsWith('\\')) {
+    return false;
+  }
+  const normalized = relPath.replace(/\\/gu, '/');
+  return !normalized.split('/').some((seg) => !seg || seg === '.' || seg === '..');
+}
+
+function canonicalInstallerSpecs(target, os, version) {
+  if (!version) return [];
+  if (os === 'linux') {
+    const rawArch = target.endsWith('-arm64') ? 'arm64' : 'x64';
+    const debArch = rawArch === 'arm64' ? 'arm64' : 'amd64';
+    return [
+      { kind: 'deb', relativePath: `installers/imcodes-desktop-${version}-linux-${debArch}.deb` },
+      { kind: 'sh', relativePath: `installers/imcodes-desktop-${version}-linux-${rawArch}.sh` },
+    ];
+  }
+  if (os === 'mac') {
+    const rawArch = target.endsWith('-x64') ? 'x64' : 'arm64';
+    return [{ kind: 'pkg', relativePath: `installers/imcodes-desktop-${version}-darwin-${rawArch}.pkg` }];
+  }
+  if (os === 'win') {
+    return [{ kind: 'exe', relativePath: `installers/imcodes-desktop-${version}-win32-x64.exe` }];
+  }
+  return [];
+}
+
+function mergeTargetReleaseManifests(targetManifests) {
+  const first = targetManifests[0].json;
+  const releaseVersion = first.releaseVersion.trim();
+  const gitSha = first.gitSha.trim().toLowerCase();
+  const targets = {};
+  const compatRules = [];
+  const seenRuleKeys = new Set();
+
+  for (const { target, json } of targetManifests) {
+    const itemVersion = json.releaseVersion.trim();
+    const itemGitSha = json.gitSha.trim().toLowerCase();
+    if (itemVersion !== releaseVersion) {
+      throw new Error(`desktop_release_manifest_version_mismatch:${target}:${itemVersion}:${releaseVersion}`);
+    }
+    if (itemGitSha !== gitSha) {
+      throw new Error(`desktop_release_manifest_git_sha_mismatch:${target}:${itemGitSha}:${gitSha}`);
+    }
+    if (Array.isArray(json.compatRules)) {
+      for (const rule of json.compatRules) {
+        if (!rule || typeof rule !== 'object' || Array.isArray(rule)) continue;
+        const ruleKey = `${rule.component}:${rule.target ?? '*'}:${rule.allowedVersion}`;
+        if (!seenRuleKeys.has(ruleKey)) {
+          seenRuleKeys.add(ruleKey);
+          compatRules.push(rule);
+        }
+      }
+    }
+    for (const [bundleTarget, bundle] of Object.entries(json.targets ?? {})) {
+      if (targets[bundleTarget]) {
+        throw new Error(`desktop_release_manifest_duplicate_target:${bundleTarget}`);
+      }
+      targets[bundleTarget] = bundle;
+    }
+  }
+
+  return {
+    schemaVersion: 1,
+    releaseVersion,
+    gitSha,
+    generatedAt: new Date().toISOString(),
+    ...(compatRules.length > 0 ? { compatRules } : {}),
+    targets,
+  };
+}
 
 export function generateControlledNodeReleaseManifest({
   artifactsDir,
@@ -165,7 +241,11 @@ export function generateControlledNodeReleaseManifest({
     addStaticFileEntry(artifacts, absDir, absStageDir, spec);
   }
 
+  const expectedVersion = typeof version === 'string' && version.trim() ? version.trim() : undefined;
+  const targetReleaseManifests = [];
+
   for (const rt of RUNTIME_TARGETS) {
+    let daemonRuntimeEntry = null;
     const manifestRel = `daemon-runtime/daemon-runtime-${rt.target}.manifest.json`;
     const rtManifest = readJsonIfRegular(join(absDir, manifestRel));
     if (rtManifest && typeof rtManifest.artifact?.fileName === 'string' && typeof rtManifest.build?.version === 'string') {
@@ -183,40 +263,182 @@ export function generateControlledNodeReleaseManifest({
         ...(signer ? { authenticodeSignerSha256: signer } : {}),
       });
       const archiveName = basename(rtManifest.artifact.fileName);
-      addStaticFileEntry(artifacts, absDir, absStageDir, {
+      const archiveRel = `daemon-runtime/${archiveName}`;
+      daemonRuntimeEntry = addStaticFileEntry(artifacts, absDir, absStageDir, {
         asset: 'daemon-runtime',
         os: rt.os,
         arch: rt.arch,
-        relativePath: `daemon-runtime/${archiveName}`,
+        relativePath: archiveRel,
         assetFilename: archiveName,
         version: rtVersion,
         ...(signer ? { authenticodeSignerSha256: signer } : {}),
       });
+      if (!daemonRuntimeEntry) {
+        throw new Error(`missing_daemon_runtime_archive:${archiveRel}`);
+      }
+      if (typeof rtManifest.artifact.sha256 === 'string'
+        && rtManifest.artifact.sha256.toLowerCase() !== daemonRuntimeEntry.sha256) {
+        throw new Error(`daemon_runtime_manifest_sha256_mismatch:${archiveRel}`);
+      }
+      if (typeof rtManifest.artifact.size === 'number'
+        && rtManifest.artifact.size !== daemonRuntimeEntry.sizeBytes) {
+        throw new Error(`daemon_runtime_manifest_size_mismatch:${archiveRel}`);
+      }
     }
 
     const targetReleaseManifestRel = `desktop-release-${rt.target}.manifest.json`;
-    const targetReleaseJson = readJsonIfRegular(join(absDir, targetReleaseManifestRel));
-    if (targetReleaseJson && typeof targetReleaseJson.releaseVersion === 'string') {
-      if (!detectedVersion) detectedVersion = targetReleaseJson.releaseVersion.trim();
+    const targetReleaseAbs = join(absDir, targetReleaseManifestRel);
+    const targetReleaseJson = readJsonIfRegular(targetReleaseAbs);
+    if (existsSync(targetReleaseAbs) && !targetReleaseJson) {
+      throw new Error(`invalid_desktop_release_manifest:${targetReleaseManifestRel}`);
+    }
+    let targetBundle = null;
+    if (targetReleaseJson) {
+      if (targetReleaseJson.schemaVersion !== 1
+        || typeof targetReleaseJson.releaseVersion !== 'string'
+        || !targetReleaseJson.releaseVersion.trim()
+        || typeof targetReleaseJson.gitSha !== 'string'
+        || !GIT_SHA_RE.test(targetReleaseJson.gitSha.trim())) {
+        throw new Error(`invalid_desktop_release_manifest:${targetReleaseManifestRel}`);
+      }
+      const relVer = targetReleaseJson.releaseVersion.trim();
+      if (expectedVersion && relVer !== expectedVersion) {
+        throw new Error(`desktop_release_manifest_version_mismatch:${rt.target}:${relVer}:${expectedVersion}`);
+      }
+      targetBundle = targetReleaseJson.targets?.[rt.target];
+      if (!targetBundle || typeof targetBundle !== 'object' || Array.isArray(targetBundle)) {
+        throw new Error(`desktop_release_manifest_missing_target:${rt.target}`);
+      }
+      const drComponent = targetBundle.components?.['daemon-runtime'];
+      if (drComponent && daemonRuntimeEntry) {
+        if (typeof drComponent.sha256 === 'string'
+          && drComponent.sha256.toLowerCase() !== daemonRuntimeEntry.sha256) {
+          throw new Error(`desktop_release_component_sha256_mismatch:${rt.target}:daemon-runtime`);
+        }
+        if (typeof drComponent.sizeBytes === 'number' && drComponent.sizeBytes !== daemonRuntimeEntry.sizeBytes) {
+          throw new Error(`desktop_release_component_size_mismatch:${rt.target}:daemon-runtime`);
+        }
+      }
+      if (!detectedVersion) detectedVersion = relVer;
+      targetReleaseManifests.push({ target: rt.target, json: targetReleaseJson });
       addStaticFileEntry(artifacts, absDir, absStageDir, {
         asset: 'desktop-release-manifest',
         os: rt.os,
         arch: rt.arch,
         relativePath: targetReleaseManifestRel,
         assetFilename: targetReleaseManifestRel,
-        version: targetReleaseJson.releaseVersion.trim(),
+        version: relVer,
       });
+    }
+
+    const verifyInstallerSidecar = (relPath, entry, explicitSidecarRel) => {
+      const sidecarCandidates = [
+        ...(explicitSidecarRel ? [explicitSidecarRel] : []),
+        `${relPath}.manifest.json`,
+      ];
+      for (const candidateRel of sidecarCandidates) {
+        if (!isSafeRelativeAssetPath(candidateRel)) {
+          throw new Error(`invalid_installer_sidecar_path:${candidateRel}`);
+        }
+        const sidecarJson = readJsonIfRegular(join(absDir, candidateRel));
+        if (!sidecarJson) continue;
+        if (typeof sidecarJson.artifact?.sha256 === 'string'
+          && sidecarJson.artifact.sha256.toLowerCase() !== entry.sha256) {
+          throw new Error(`desktop_installer_sidecar_sha256_mismatch:${relPath}`);
+        }
+        if (typeof sidecarJson.artifact?.size === 'number'
+          && sidecarJson.artifact.size !== entry.sizeBytes) {
+          throw new Error(`desktop_installer_sidecar_size_mismatch:${relPath}`);
+        }
+        break;
+      }
+    };
+
+    const seenInstallerPaths = new Set();
+    if (Array.isArray(targetBundle?.installers)) {
+      for (const inst of targetBundle.installers) {
+        if (!inst || typeof inst !== 'object' || Array.isArray(inst) || typeof inst.kind !== 'string' || !inst.kind) {
+          throw new Error(`invalid_desktop_installer_entry:${rt.target}`);
+        }
+        const relPath = String(inst.relativePath ?? `installers/${inst.fileName ?? ''}`).replace(/\\/gu, '/');
+        if (!isSafeRelativeAssetPath(relPath)) {
+          throw new Error(`invalid_desktop_installer_path:${relPath}`);
+        }
+        const instVersion = typeof inst.version === 'string' && inst.version.trim()
+          ? inst.version.trim()
+          : targetReleaseJson.releaseVersion.trim();
+        const entry = addStaticFileEntry(artifacts, absDir, absStageDir, {
+          asset: `desktop-installer-${inst.kind}`,
+          os: rt.os,
+          arch: rt.arch,
+          relativePath: relPath,
+          assetFilename: basename(relPath),
+          version: instVersion,
+        });
+        if (!entry) {
+          throw new Error(`missing_desktop_installer:${relPath}`);
+        }
+        if (typeof inst.sha256 !== 'string' || !SHA256_RE.test(inst.sha256) || inst.sha256.toLowerCase() !== entry.sha256) {
+          throw new Error(`desktop_installer_sha256_mismatch:${relPath}`);
+        }
+        if (typeof inst.sizeBytes !== 'number' || inst.sizeBytes !== entry.sizeBytes) {
+          throw new Error(`desktop_installer_size_mismatch:${relPath}`);
+        }
+        const explicitSidecarRel = typeof inst.manifestFileName === 'string' && inst.manifestFileName
+          ? `installers/${basename(inst.manifestFileName)}`
+          : undefined;
+        verifyInstallerSidecar(relPath, entry, explicitSidecarRel);
+        seenInstallerPaths.add(relPath);
+      }
+    }
+
+    const fallbackInstVersion = targetReleaseJson?.releaseVersion?.trim() || detectedVersion;
+    for (const spec of canonicalInstallerSpecs(rt.target, rt.os, fallbackInstVersion)) {
+      if (seenInstallerPaths.has(spec.relativePath)) continue;
+      const entry = addStaticFileEntry(artifacts, absDir, absStageDir, {
+        asset: `desktop-installer-${spec.kind}`,
+        os: rt.os,
+        arch: rt.arch,
+        relativePath: spec.relativePath,
+        assetFilename: basename(spec.relativePath),
+        version: fallbackInstVersion,
+      });
+      if (entry) {
+        verifyInstallerSidecar(spec.relativePath, entry);
+      }
     }
   }
 
-  const globalReleaseJson = readJsonIfRegular(join(absDir, 'desktop-release.manifest.json'));
+  const globalReleaseAbs = join(absDir, 'desktop-release.manifest.json');
+  let globalReleaseJson = readJsonIfRegular(globalReleaseAbs);
+  if (existsSync(globalReleaseAbs) && !globalReleaseJson) {
+    throw new Error('invalid_desktop_release_manifest:desktop-release.manifest.json');
+  }
+  if (!globalReleaseJson && targetReleaseManifests.length > 0) {
+    globalReleaseJson = mergeTargetReleaseManifests(targetReleaseManifests);
+    writeFileSync(globalReleaseAbs, `${JSON.stringify(globalReleaseJson, null, 2)}\n`, 'utf8');
+  } else if (globalReleaseJson && targetReleaseManifests.length > 0) {
+    const firstTarget = targetReleaseManifests[0].json;
+    if (typeof globalReleaseJson.releaseVersion !== 'string'
+      || globalReleaseJson.releaseVersion.trim() !== firstTarget.releaseVersion.trim()) {
+      throw new Error('desktop_release_manifest_version_mismatch:global');
+    }
+    if (typeof globalReleaseJson.gitSha !== 'string'
+      || globalReleaseJson.gitSha.trim().toLowerCase() !== firstTarget.gitSha.trim().toLowerCase()) {
+      throw new Error('desktop_release_manifest_git_sha_mismatch:global');
+    }
+  }
   if (globalReleaseJson && typeof globalReleaseJson.releaseVersion === 'string') {
-    if (!detectedVersion) detectedVersion = globalReleaseJson.releaseVersion.trim();
+    const globalVer = globalReleaseJson.releaseVersion.trim();
+    if (expectedVersion && globalVer !== expectedVersion) {
+      throw new Error(`desktop_release_manifest_version_mismatch:global:${globalVer}:${expectedVersion}`);
+    }
+    if (!detectedVersion) detectedVersion = globalVer;
     addStaticFileEntry(artifacts, absDir, absStageDir, {
       asset: 'desktop-release-manifest',
       relativePath: 'desktop-release.manifest.json',
       assetFilename: 'desktop-release.manifest.json',
-      version: globalReleaseJson.releaseVersion.trim(),
+      version: globalVer,
     });
   }
 

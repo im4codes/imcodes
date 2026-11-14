@@ -415,27 +415,51 @@ ${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
     expect(readFileSync(res.ps1Path, 'utf8')).toContain('legacy_broken_takeover');
   });
 
-  it('integrates Linux, macOS, and Windows unified installer steps into .github/workflows/build-node-exe.yml', () => {
-    const raw = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
-    const parsed = parseYaml(raw) as {
-      jobs: { build: { steps: Array<{ name?: string; run?: string; with?: { path?: string } }> } };
-    };
-    const names = parsed.jobs.build.steps.map((s) => s.name ?? '');
-    expect(names.some((n) => n.includes('Linux unified installers'))).toBe(true);
-    expect(names.some((n) => n.includes('macOS .pkg installer'))).toBe(true);
-    expect(names.some((n) => n.includes('Windows Inno Setup'))).toBe(true);
-    const uploadStep = parsed.jobs.build.steps.find((s) => s.name === 'Upload executable artifact');
-    expect(uploadStep?.with?.path).toContain('dist-node-exe/installers/**');
+  it('integrates Linux, macOS, and Windows unified installer steps into .github/workflows/build-node-exe.yml and ci.yml', () => {
+    for (const spec of [
+      {
+        file: '.github/workflows/build-node-exe.yml',
+        jobKey: 'build',
+        uploadName: 'Upload executable artifact',
+      },
+      {
+        file: '.github/workflows/ci.yml',
+        jobKey: 'controlled-node-executables',
+        uploadName: 'Upload controlled-node executable',
+      },
+    ]) {
+      const raw = readFileSync(spec.file, 'utf8');
+      const parsed = parseYaml(raw) as {
+        jobs: Record<string, { steps: Array<{ name?: string; run?: string; with?: { path?: string } }> }>;
+      };
+      const steps = parsed.jobs[spec.jobKey].steps;
+      const names = steps.map((s) => s.name ?? '');
+      expect(names.some((n) => n.includes('Linux unified installers')), spec.file).toBe(true);
+      expect(names.some((n) => n.includes('macOS .pkg installer')), spec.file).toBe(true);
+      expect(names.some((n) => n.includes('Windows Inno Setup')), spec.file).toBe(true);
+      const uploadStep = steps.find((s) => s.name === spec.uploadName);
+      expect(uploadStep?.with?.path, spec.file).toContain('dist-node-exe/installers/**');
+      expect(uploadStep?.with?.path, spec.file).toContain('dist-node-exe/desktop-release*.manifest.json');
 
-    // F7: macOS CI workflow refreshes pkg manifest after signing and notarizing
-    const macStep = parsed.jobs.build.steps.find((s) => (s.name ?? '').includes('macOS .pkg installer'));
-    expect(macStep?.run).toContain('--refresh-manifest');
-    expect(macStep?.run).toContain('--notarized');
+      // F7: macOS CI workflow refreshes pkg manifest after signing and notarizing
+      const macStep = steps.find((s) => (s.name ?? '').includes('macOS .pkg installer'));
+      expect(macStep?.run, spec.file).toContain('--refresh-manifest');
+      expect(macStep?.run, spec.file).toContain('--notarized');
 
-    // F8: Linux CI workflow avoids dpkg-deb --contents | head SIGPIPE under pipefail
-    const linuxStep = parsed.jobs.build.steps.find((s) => (s.name ?? '').includes('Linux unified installers'));
-    expect(linuxStep?.run).not.toMatch(/dpkg-deb --contents[^\n]*\|\s*head/u);
-    expect(linuxStep?.run).toContain('DEB_CONTENTS_TMP=');
+      // F8: Linux CI workflow avoids dpkg-deb --contents | head SIGPIPE under pipefail
+      const linuxStep = steps.find((s) => (s.name ?? '').includes('Linux unified installers'));
+      expect(linuxStep?.run, spec.file).not.toMatch(/dpkg-deb --contents[^\n]*\|\s*head/u);
+      expect(linuxStep?.run, spec.file).toContain('DEB_CONTENTS_TMP=');
+    }
+
+    const ciWinSteps = (
+      parseYaml(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
+        jobs: { 'controlled-node-executables': { steps: Array<{ name?: string; run?: string }> } };
+      }
+    ).jobs['controlled-node-executables'].steps;
+    const ciWinStep = ciWinSteps.find((s) => (s.name ?? '').includes('Windows Inno Setup'));
+    expect(ciWinStep?.run).toContain('--require-iscc');
+    expect(readFileSync('.dockerignore', 'utf8')).toContain('server/controlled-node-artifacts/installers');
   });
 
   it('embeds self-contained preinst in .deb and cleans up offline .sh extraction TMPDIR (F1, F9)', async () => {

@@ -669,4 +669,42 @@ describe('headless compatibility release wiring', () => {
     expect(workflow).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217');
     expect(workflow).toContain('controlled-node-compat');
   });
+
+  it('wires unified desktop client manifests/runtime into Docker smoke while excluding full installers from the image', () => {
+    const workflow = parseYaml(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
+      jobs: {
+        docker: {
+          steps: Array<{ name?: string; run?: string; with?: Record<string, string> }>;
+        };
+      };
+    };
+    const dockerSteps = workflow.jobs.docker.steps;
+    const chmodStep = dockerSteps.find((s) => s.name === 'Restore executable bits actions/download-artifact drops');
+    expect(chmodStep?.run).toContain("! -name '*.deb'");
+    expect(chmodStep?.run).toContain("! -name '*.pkg'");
+    expect(chmodStep?.run).toContain("! -name '*.iss'");
+    expect(chmodStep?.run).toContain("! -name '*.ps1'");
+    expect(chmodStep?.run).toContain("! -name '*.cmd'");
+    expect(chmodStep?.run).toContain("! -name '*.txt'");
+    expect(chmodStep?.run).not.toContain("! -name '*.sh'");
+
+    const manifestStageStep = dockerSteps.find(
+      (s) => s.name === 'Generate controlled-node release artifacts manifest and stage flat release assets',
+    );
+    expect(manifestStageStep?.run).toContain('desktop-release.manifest.json');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe');
+
+    const smokeStep = dockerSteps.find((s) => s.name === 'Container startup smoke test');
+    expect(smokeStep?.run).toContain("fs.existsSync(path.join(root, 'installers'))");
+    expect(smokeStep?.run).toContain('validateDesktopReleaseManifest');
+    expect(smokeStep?.run).toContain('validateDaemonRuntimeManifest');
+
+    const dockerignore = readFileSync('.dockerignore', 'utf8')
+      .split(/\r?\n/u)
+      .map((line) => line.trim());
+    expect(dockerignore).toContain('server/controlled-node-artifacts/installers');
+  });
 });
