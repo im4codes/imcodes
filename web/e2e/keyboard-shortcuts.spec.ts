@@ -177,31 +177,31 @@ test('macOS defaults use Ctrl+w/s/a/d for servers & tabs, work in composer & sid
   expect(errors).toEqual([]);
 });
 
-test('non-macOS defaults keep unified Ctrl+a/d and Ctrl+w/s working', async ({ page }) => {
+test('non-macOS defaults use Alt+i/k/j/l and do not intercept Ctrl+w/s/a/d', async ({ page }) => {
   const { errors } = await openDesktopApp(page, 'Linux x86_64');
 
   await page.locator('button.server-icon[title="Settings"]').click();
   await page.locator('#settings-tab-shortcuts').click();
-  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('Ctrl');
-  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('A');
-  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('Ctrl');
-  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('D');
-  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('Ctrl');
-  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('W');
-  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('Ctrl');
-  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('S');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('Alt');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('J');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('Alt');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('L');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('Alt');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('I');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('Alt');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('K');
   await page.locator('.settings-back-btn').click();
 
   await page.locator('.controls-input').first().click();
-  await page.keyboard.press('Control+d');
+  await page.keyboard.press('Alt+l');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
-  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Alt+j');
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
-  await page.keyboard.press('Control+s');
+  await page.keyboard.press('Alt+k');
   await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Beta Server');
   await expect(page.locator('.tab.active')).toContainText('Second Server Tab');
-  await page.keyboard.press('Control+w');
+  await page.keyboard.press('Alt+i');
   await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Alpha Server');
   expect(errors).toEqual([]);
 });

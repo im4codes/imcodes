@@ -37,10 +37,10 @@ describe('keyboard-shortcuts core helpers', () => {
     });
 
     expect(getDefaultShortcuts(false)).toEqual({
-      serverPrev: 'Ctrl+w',
-      serverNext: 'Ctrl+s',
-      tabPrev: 'Ctrl+a',
-      tabNext: 'Ctrl+d',
+      serverPrev: 'Alt+i',
+      serverNext: 'Alt+k',
+      tabPrev: 'Alt+j',
+      tabNext: 'Alt+l',
     });
   });
 
@@ -78,6 +78,11 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(formatShortcutKeycaps('Ctrl+s', false)).toEqual(['Ctrl', 'S']);
     expect(formatShortcutKeycaps('Ctrl+a', false)).toEqual(['Ctrl', 'A']);
     expect(formatShortcutKeycaps('Ctrl+d', false)).toEqual(['Ctrl', 'D']);
+    expect(formatShortcutKeycaps('Alt+i', false)).toEqual(['Alt', 'I']);
+    expect(formatShortcutKeycaps('Alt+k', false)).toEqual(['Alt', 'K']);
+    expect(formatShortcutKeycaps('Alt+j', false)).toEqual(['Alt', 'J']);
+    expect(formatShortcutKeycaps('Alt+l', false)).toEqual(['Alt', 'L']);
+    expect(formatShortcutKeycaps('Alt+i', true)).toEqual(['⌥', 'I']);
     expect(formatShortcutKeycaps('Meta+ArrowUp', true)).toEqual(['⌘', '↑']);
     expect(formatShortcutKeycaps('Meta+Shift+ArrowLeft', true)).toEqual(['⇧', '⌘', '←']);
     expect(formatShortcutKeycaps('Meta+Shift+ArrowRight', true)).toEqual(['⇧', '⌘', '→']);
@@ -116,8 +121,8 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(resolveKeyboardShortcuts(clean, false)).toEqual({
       serverPrev: 'Alt+ArrowUp',
       serverNext: null,
-      tabPrev: 'Ctrl+a',
-      tabNext: 'Ctrl+d',
+      tabPrev: 'Alt+j',
+      tabNext: 'Alt+l',
     });
   });
 
@@ -145,6 +150,13 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(chordFromKeyboardEvent({ key: 'ArrowRight', code: 'ArrowRight', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true })).toBe('Meta+Shift+ArrowRight');
     expect(chordFromKeyboardEvent({ key: 'ArrowRight', code: 'ArrowRight', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true })).toBe('Ctrl+Shift+ArrowRight');
     expect(chordFromKeyboardEvent({ key: '˚', code: 'KeyK', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false })).toBe('Alt+k');
+    // Dead-key Option/Alt+letter (e.g. macOS Option+i -> Dead with code KeyI) still recovers physical letter
+    expect(chordFromKeyboardEvent({ key: 'Dead', code: 'KeyI', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false })).toBe('Alt+i');
+    // Bare dead key without Alt stays ignored
+    expect(chordFromKeyboardEvent({ key: 'Dead', code: 'BracketLeft', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBeNull();
+    // Uppercase/IME glyph under Alt+key on non-Mac still normalizes cleanly via physical code
+    expect(chordFromKeyboardEvent({ key: 'I', code: 'KeyI', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false })).toBe('Alt+i');
+    expect(chordFromKeyboardEvent({ key: 'ш', code: 'KeyI', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false })).toBe('Alt+i');
 
     // Plus separator key round-trips cleanly across capture -> sanitize -> JSON storage -> match
     const plusEvt = { key: '+', code: 'Equal', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true };
@@ -165,7 +177,7 @@ describe('keyboard-shortcuts core helpers', () => {
   it('matches exact modifier combinations and detects conflicts', () => {
     const macShortcuts = getDefaultShortcuts(true);
     const nonMacShortcuts = getDefaultShortcuts(false);
-    expect(macShortcuts).toEqual(nonMacShortcuts);
+    expect(macShortcuts).not.toEqual(nonMacShortcuts);
     expect(matchNavigationShortcutAction(
       { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
       macShortcuts,
@@ -182,6 +194,48 @@ describe('keyboard-shortcuts core helpers', () => {
       { key: 'd', code: 'KeyD', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
       macShortcuts,
     )).toBe('tabNext');
+
+    // Non-macOS (Windows/Linux) defaults match Alt+i/k/j/l and do NOT intercept Ctrl+w/s/a/d
+    expect(matchNavigationShortcutAction(
+      { key: 'i', code: 'KeyI', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      nonMacShortcuts,
+    )).toBe('serverPrev');
+    expect(matchNavigationShortcutAction(
+      { key: 'k', code: 'KeyK', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      nonMacShortcuts,
+    )).toBe('serverNext');
+    expect(matchNavigationShortcutAction(
+      { key: 'j', code: 'KeyJ', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      nonMacShortcuts,
+    )).toBe('tabPrev');
+    expect(matchNavigationShortcutAction(
+      { key: 'l', code: 'KeyL', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      nonMacShortcuts,
+    )).toBe('tabNext');
+    expect(matchNavigationShortcutAction(
+      { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      nonMacShortcuts,
+    )).toBeNull();
+    expect(matchNavigationShortcutAction(
+      { key: 's', code: 'KeyS', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      nonMacShortcuts,
+    )).toBeNull();
+    expect(matchNavigationShortcutAction(
+      { key: 'a', code: 'KeyA', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      nonMacShortcuts,
+    )).toBeNull();
+    expect(matchNavigationShortcutAction(
+      { key: 'd', code: 'KeyD', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      nonMacShortcuts,
+    )).toBeNull();
+
+    // Explicit non-Mac user override to Ctrl+w still matches when configured
+    const nonMacWithCtrlW = resolveKeyboardShortcuts({ serverPrev: 'Ctrl+w' }, false);
+    expect(matchNavigationShortcutAction(
+      { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      nonMacWithCtrlW,
+    )).toBe('serverPrev');
+
     expect(matchNavigationShortcutAction(
       { key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
       macShortcuts,
@@ -195,7 +249,7 @@ describe('keyboard-shortcuts core helpers', () => {
       macShortcuts,
     )).toBeNull();
     expect(matchNavigationShortcutAction(
-      { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false },
+      { key: 'i', code: 'KeyI', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false },
       nonMacShortcuts,
     )).toBeNull();
     expect(matchesShortcutChord(

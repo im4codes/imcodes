@@ -128,7 +128,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('←');
     expect((screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement).disabled).toBe(false);
 
-    // Re-recording Ctrl+a matches unified default and clears the override
+    // Re-recording Ctrl+a matches macOS default and clears the override
     fireEvent.click(screen.getByTestId('shortcut-record-tabPrev'));
     fireEvent.keyDown(document, { key: 'a', code: 'KeyA', ctrlKey: true });
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌃');
@@ -139,14 +139,14 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
   it('records custom shortcut via keydown, handles Esc cancel, rejects plain typing key, clears conflicts, and persists via useSyncedPreference', () => {
     render(<KeyboardShortcutsSection isMacOverride={false} />);
     expect(screen.getByText('Windows / Linux defaults')).toBeDefined();
-    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('W');
-    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('S');
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('A');
-    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('D');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('I');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('K');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
 
     // Start recording tabPrev -> press Escape to cancel without mutating
     const tabPrevBtn = screen.getByTestId('shortcut-record-tabPrev');
@@ -156,8 +156,8 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
 
     fireEvent.keyDown(document, { key: 'Escape', code: 'Escape' });
     expect(tabPrevBtn.getAttribute('data-shortcut-recording')).toBeNull();
-    expect(tabPrevBtn.textContent).toContain('Ctrl');
-    expect(tabPrevBtn.textContent).toContain('A');
+    expect(tabPrevBtn.textContent).toContain('Alt');
+    expect(tabPrevBtn.textContent).toContain('J');
 
     // Start recording tabPrev -> bare modifier ignored, plain letter rejected with hint, then Alt+Shift+k accepted
     fireEvent.click(tabPrevBtn);
@@ -190,21 +190,25 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('Not set');
     expect(screen.getByTestId('shortcuts-status-notice').textContent).toContain('Previous Tab');
 
-    // Single reset restores tabPrev to default
+    // Single reset restores tabPrev to Windows/Linux default (Alt+J)
     fireEvent.click(screen.getByTestId('shortcut-reset-tabPrev'));
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('A');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
 
     // Clear serverPrev disables it
     fireEvent.click(screen.getByTestId('shortcut-clear-serverPrev'));
     expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Not set');
 
-    // Reset all restores everything to platform defaults
+    // Reset all restores everything to Windows/Linux platform defaults (Alt+I/K/J/L)
     fireEvent.click(screen.getByTestId('shortcuts-reset-all'));
-    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('W');
-    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('D');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('I');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('K');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('Alt');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
   });
 
   it('records Ctrl+Shift++ and bare/Shift navigation keys, rejects Shift+typing, and retains bindings across reload', () => {

@@ -8300,7 +8300,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     });
   });
 
-  it('navigates tabs in visual SessionTabs order (pinned + tab_order) and servers via Ctrl+WASD while .controls-input has focus, auto-focusing target composers', async () => {
+  it('navigates tabs in visual SessionTabs order (pinned + tab_order) and servers via non-Mac Alt+IKJL while .controls-input has focus, without intercepting Ctrl+W/S/A/D', async () => {
     // Visual order should be: deck_gamma_brain (pinned), deck_beta_brain (first in tab_order), deck_alpha_brain
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
@@ -8317,8 +8317,69 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const gammaComposer = await screen.findByTestId('pane-composer-deck_gamma_brain');
       await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
 
-      // Ctrl+d from inside .controls-input switches to next visual tab (deck_beta_brain) & calls preventDefault()
-      const rightEvt = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      // Ctrl+w / Ctrl+d MUST NOT intercept on Windows/Linux (avoids closing/conflicting with browser tabs)
+      const ctrlWEvt = new KeyboardEvent('keydown', { key: 'w', code: 'KeyW', ctrlKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(ctrlWEvt);
+      expect(ctrlWEvt.defaultPrevented).toBe(false);
+      const ctrlDEvt = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(ctrlDEvt);
+      expect(ctrlDEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true');
+
+      // Alt+i/k/j/l defer properly inside .xterm, .remote-desktop-canvas, <input>, [contenteditable], and [data-shortcut-recording] on Windows/Linux
+      const xtermWrap = document.createElement('div');
+      xtermWrap.className = 'xterm';
+      const xtermInput = document.createElement('textarea');
+      xtermInput.className = 'xterm-helper-textarea';
+      xtermWrap.appendChild(xtermInput);
+      document.body.appendChild(xtermWrap);
+      xtermInput.focus();
+      const xtermAltL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      xtermInput.dispatchEvent(xtermAltL);
+      expect(xtermAltL.defaultPrevented).toBe(false);
+      xtermWrap.remove();
+
+      const rdCanvas = document.createElement('canvas');
+      rdCanvas.className = 'remote-desktop-canvas';
+      rdCanvas.tabIndex = 0;
+      document.body.appendChild(rdCanvas);
+      rdCanvas.focus();
+      const rdAltK = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      rdCanvas.dispatchEvent(rdAltK);
+      expect(rdAltK.defaultPrevented).toBe(false);
+      rdCanvas.remove();
+
+      const plainInput = document.createElement('input');
+      document.body.appendChild(plainInput);
+      plainInput.focus();
+      const inputAltJ = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      plainInput.dispatchEvent(inputAltJ);
+      expect(inputAltJ.defaultPrevented).toBe(false);
+      plainInput.remove();
+
+      const ceDiv = document.createElement('div');
+      ceDiv.contentEditable = 'true';
+      ceDiv.tabIndex = 0;
+      document.body.appendChild(ceDiv);
+      ceDiv.focus();
+      const ceAltI = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      ceDiv.dispatchEvent(ceAltI);
+      expect(ceAltI.defaultPrevented).toBe(false);
+      ceDiv.remove();
+
+      const recBtn = document.createElement('button');
+      recBtn.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recBtn);
+      recBtn.focus();
+      const recAltL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      recBtn.dispatchEvent(recAltL);
+      expect(recAltL.defaultPrevented).toBe(false);
+      recBtn.remove();
+
+      gammaComposer.focus();
+
+      // Alt+l from inside .controls-input switches to next visual tab (deck_beta_brain) & calls preventDefault()
+      const rightEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
       gammaComposer.dispatchEvent(rightEvt);
       expect(rightEvt.defaultPrevented).toBe(true);
 
@@ -8326,23 +8387,23 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
       await waitFor(() => expect(document.activeElement).toBe(betaComposer));
 
-      // Ctrl+a wraps/steps back to deck_gamma_brain
-      const leftEvt = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+      // Alt+j wraps/steps back to deck_gamma_brain
+      const leftEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
       betaComposer.dispatchEvent(leftEvt);
       expect(leftEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
       await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
 
-      // Ctrl+s switches to next server (srv-2 -> deck_delta_brain) and auto-focuses its composer
-      const downEvt = new KeyboardEvent('keydown', { key: 's', code: 'KeyS', ctrlKey: true, bubbles: true, cancelable: true });
+      // Alt+k switches to next server (srv-2 -> deck_delta_brain) and auto-focuses its composer
+      const downEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
       gammaComposer.dispatchEvent(downEvt);
       expect(downEvt.defaultPrevented).toBe(true);
 
       const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
       await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
 
-      // Ctrl+w switches back to srv-1
-      const upEvt = new KeyboardEvent('keydown', { key: 'w', code: 'KeyW', ctrlKey: true, bubbles: true, cancelable: true });
+      // Alt+i switches back to srv-1
+      const upEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
       deltaComposer.dispatchEvent(upEvt);
       expect(upEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy());
@@ -8701,7 +8762,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
       await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
 
-      // Open terminal subwindow -> focus its header chrome mode button -> Ctrl+d must NOT switch main tab
+      // Open terminal subwindow -> focus its header chrome mode button -> Alt+l must NOT switch main tab on Win32
       fireEvent.click(screen.getByText('subbar-open-sub-guard-term'));
       const termRoot = await screen.findByTestId('sub-session-window-sub-guard-term');
       expect(termRoot.getAttribute('data-view-mode')).toBe('terminal');
@@ -8709,20 +8770,20 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       headerBtn.focus();
       expect(document.activeElement).toBe(headerBtn);
 
-      const navFromHeader = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      const navFromHeader = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
       headerBtn.dispatchEvent(navFromHeader);
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
       // Also when focus moves to document.body while terminal subwindow stays active -> main tab stays unchanged
       headerBtn.blur();
-      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true }));
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true }));
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
-      // Open chat subwindow -> composer auto-focuses and Ctrl+d DOES navigate main tabs
+      // Open chat subwindow -> composer auto-focuses and Alt+l DOES navigate main tabs on Win32
       fireEvent.click(screen.getByText('subbar-open-sub-guard-chat'));
       const chatSubComposer = await screen.findByTestId('sub-window-controls-input-sub-guard-chat');
       await waitFor(() => expect(document.activeElement).toBe(chatSubComposer));
-      const chatNavEvt = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      const chatNavEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
       chatSubComposer.dispatchEvent(chatNavEvt);
       expect(chatNavEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
@@ -8785,8 +8846,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
       expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
 
-      // Switch to Server Two via Ctrl+s while srv-2 sessions are still loading
-      const downEvt = new KeyboardEvent('keydown', { key: 's', code: 'KeyS', ctrlKey: true, bubbles: true, cancelable: true });
+      // Switch to Server Two via Alt+k while srv-2 sessions are still loading
+      const downEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
       gammaComposer.dispatchEvent(downEvt);
       expect(downEvt.defaultPrevented).toBe(true);
 
@@ -8795,7 +8856,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
       expect(
         Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
-      ).toEqual(['Ctrl', 'S']);
+      ).toEqual(['Alt', 'K']);
       // Never leaks previous server's active session ('gamma') while switching
       const loadingSessionText = screen.getByTestId('server-switch-watermark-session').textContent ?? '';
       expect(loadingSessionText).not.toMatch(/gamma|alpha/i);
@@ -8815,8 +8876,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
       await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
 
-      // Rapid switch back to Server One via Ctrl+w updates the HUD & keycaps immediately and restarts the timer
-      const upEvt = new KeyboardEvent('keydown', { key: 'w', code: 'KeyW', ctrlKey: true, bubbles: true, cancelable: true });
+      // Rapid switch back to Server One via Alt+i updates the HUD & keycaps immediately and restarts the timer
+      const upEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
       deltaComposer.dispatchEvent(upEvt);
       expect(upEvt.defaultPrevented).toBe(true);
 
@@ -8825,7 +8886,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       });
       expect(
         Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
-      ).toEqual(['Ctrl', 'W']);
+      ).toEqual(['Alt', 'I']);
       await waitFor(() => {
         expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('gamma');
       });

@@ -133,16 +133,21 @@ export function isMacPlatform(nav?: {
   return /Macintosh|Mac OS/i.test(userAgent);
 }
 
-/** Platform default shortcut map (unified WASD Ctrl bindings across desktop platforms). */
-export function getDefaultShortcuts(_isMac = isMacPlatform()): Record<ShortcutActionId, string> {
-  // All desktop platforms (macOS, Windows, Linux) use single-hand CS/WASD
-  // Ctrl+W/S/A/D defaults: avoids macOS Mission Control / AppKit Cmd+Arrow
-  // conflicts and keeps tab/server switching consistent across platforms.
+/** Platform default shortcut map: macOS keeps Ctrl+W/S/A/D; Windows/Linux use Alt+I/K/J/L to avoid browser Ctrl+W/Alt+D/Alt+S conflicts. */
+export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
+  if (isMac) {
+    return {
+      serverPrev: 'Ctrl+w',
+      serverNext: 'Ctrl+s',
+      tabPrev: 'Ctrl+a',
+      tabNext: 'Ctrl+d',
+    };
+  }
   return {
-    serverPrev: 'Ctrl+w',
-    serverNext: 'Ctrl+s',
-    tabPrev: 'Ctrl+a',
-    tabNext: 'Ctrl+d',
+    serverPrev: 'Alt+i',
+    serverNext: 'Alt+k',
+    tabPrev: 'Alt+j',
+    tabNext: 'Alt+l',
   };
 }
 
@@ -171,10 +176,26 @@ export function isSupportedShortcutChord(parsed: ParsedShortcutChord): boolean {
   return isFunctionKeyName(parsed.key) || isNonTypingNavigationKey(parsed.key);
 }
 
+function recoverPhysicalAltToken(code: string | undefined): string | null {
+  if (!code) return null;
+  const letterMatch = /^Key([A-Z])$/.exec(code);
+  if (letterMatch) return letterMatch[1].toLowerCase();
+  const digitMatch = /^Digit([0-9])$/.exec(code);
+  if (digitMatch) return digitMatch[1];
+  return null;
+}
+
 /** Normalize a raw KeyboardEvent `key` / `code` token into our canonical key name. */
 export function normalizeKeyToken(rawKey: string, code?: string, altKey = false): string | null {
   if (!rawKey) return null;
-  if (IGNORED_KEYS.has(rawKey)) return null;
+  if (IGNORED_KEYS.has(rawKey)) {
+    // On macOS / international layouts, Option/Alt+letter (e.g. Option+i) can emit `key === 'Dead'`;
+    // still recover the physical ASCII letter/digit from `e.code` when Alt/Option is held.
+    if (rawKey === 'Dead' && altKey) {
+      return recoverPhysicalAltToken(code);
+    }
+    return null;
+  }
 
   const lower = rawKey.toLowerCase();
   if (SPECIAL_KEY_ALIASES[lower]) {
@@ -187,13 +208,11 @@ export function normalizeKeyToken(rawKey: string, code?: string, altKey = false)
     return rawKey.toUpperCase();
   }
 
-  // On macOS Option+letter/digit produces non-ASCII composed glyphs in `e.key`;
+  // On macOS Option+letter/digit (or non-Latin layouts under Alt) `e.key` can hold composed/non-ASCII glyphs;
   // recover the physical ASCII letter/digit from `e.code` when available.
-  if (altKey && code) {
-    const letterMatch = /^Key([A-Z])$/.exec(code);
-    if (letterMatch) return letterMatch[1].toLowerCase();
-    const digitMatch = /^Digit([0-9])$/.exec(code);
-    if (digitMatch) return digitMatch[1];
+  if (altKey) {
+    const recovered = recoverPhysicalAltToken(code);
+    if (recovered) return recovered;
   }
 
   if (rawKey.length === 1) {
@@ -488,7 +507,16 @@ function isDisallowedEditableOrFormElement(el: Element | null): boolean {
   const tag = htmlEl.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
   const contentEditableAttr = htmlEl.getAttribute?.('contenteditable');
-  if (htmlEl.isContentEditable || contentEditableAttr === 'true' || contentEditableAttr === '' || contentEditableAttr === 'plaintext-only') {
+  const contentEditableProp = htmlEl.contentEditable;
+  if (
+    htmlEl.isContentEditable
+    || contentEditableAttr === 'true'
+    || contentEditableAttr === ''
+    || contentEditableAttr === 'plaintext-only'
+    || contentEditableProp === 'true'
+    || contentEditableProp === ''
+    || contentEditableProp === 'plaintext-only'
+  ) {
     return true;
   }
   if (typeof htmlEl.closest === 'function' && htmlEl.closest('[contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .cm-editor, .fb-editor-cm')) {
