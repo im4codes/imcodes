@@ -9,7 +9,6 @@ import {
   REMOTE_DESKTOP_WINDOW_BLOCKED_NOTICE_MS,
   RemoteDesktopWindowBlockedNotice,
 } from '../src/components/RemoteDesktopWindowBlockedNotice.js';
-import { resetPwaInstallStateForTests } from '../src/pwa-install.js';
 import {
   openRemoteDesktopWallWindow,
   openRemoteDesktopWindow,
@@ -25,7 +24,6 @@ vi.mock('react-i18next', () => ({
 let displayMode: ReturnType<typeof stubDisplayMode>;
 
 beforeEach(() => {
-  resetPwaInstallStateForTests();
   resetRemoteDesktopWindowNoticeForTests();
   displayMode = stubDisplayMode('browser');
 });
@@ -40,7 +38,7 @@ afterEach(() => {
 const NOTICE = 'remote-desktop-window-blocked';
 
 describe('a blocked remote desktop window is never silent', () => {
-  it('tells the user, with both ways out, when the browser blocks a machine window', () => {
+  it('tells the user when a machine window is blocked, without installation guidance', () => {
     vi.spyOn(window, 'open').mockReturnValue(null);
     render(<RemoteDesktopWindowBlockedNotice />);
     expect(screen.queryByTestId(NOTICE)).toBeNull();
@@ -48,8 +46,10 @@ describe('a blocked remote desktop window is never silent', () => {
     const notice = screen.getByTestId(NOTICE);
     expect(notice.getAttribute('role')).toBe('alert');
     expect(notice.textContent).toContain('remote_desktop.window_blocked');
-    // the second way out: installing the app (an app window is not a pop-up)
-    expect(screen.getByTestId('remote-desktop-install-app')).not.toBeNull();
+    expect(screen.queryByTestId('remote-desktop-install-app')).toBeNull();
+    expect(screen.queryByTestId('remote-desktop-install-guide')).toBeNull();
+    expect(notice.querySelectorAll('button')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'remote_desktop.window_blocked_dismiss' })).toBeDefined();
   });
 
   it('tells the user when the browser blocks the wall window too', () => {
@@ -90,7 +90,7 @@ describe('a blocked remote desktop window is never silent', () => {
     expect(screen.queryByTestId(NOTICE)).toBeNull();
   });
 
-  it('does not offer to install an app from inside the installed app (the entry hides itself)', () => {
+  it('keeps the notice without installation actions inside the installed app', () => {
     displayMode.set('standalone');
     vi.spyOn(window, 'open').mockReturnValue(null);
     render(<RemoteDesktopWindowBlockedNotice />);

@@ -123,17 +123,14 @@ describe('RemoteDesktopWall', () => {
     expect(localStorage.getItem(key)).toBe(savedGeometry);
   });
 
-  it('puts the install-as-app entry in the wall header (icon only), and drops it inside the installed app', async () => {
+  it('never offers install-as-app in the wall header, in browser or standalone mode', async () => {
     const manager = { stop: vi.fn() } as unknown as RemoteDesktopConnectionManager;
     const displayMode = stubDisplayMode('browser');
     try {
       const inTab = render(<RemoteDesktopWall manager={manager} retainedHostKeys={new Set()} onOpenHost={vi.fn()} onHostKeysChange={vi.fn()} onClose={vi.fn()} />);
       await waitFor(() => expect(screen.getAllByRole('button', { name: 'remote_desktop.wall_add' })).toHaveLength(4));
-      const entry = inTab.container.querySelector('.remote-desktop-workspace-actions [data-testid="remote-desktop-install-app"]') as HTMLButtonElement;
-      expect(entry).not.toBeNull();
-      expect(entry.className).toContain('remote-desktop-workspace-chrome-button');
-      expect(entry.getAttribute('aria-label')).toBe('remote_desktop.install_app');
-      expect(entry.textContent).not.toContain('remote_desktop.install_app');
+      expect(inTab.container.querySelector('[data-testid="remote-desktop-install-app"]')).toBeNull();
+      expect(inTab.container.querySelector('[data-testid="remote-desktop-install-guide"]')).toBeNull();
       cleanup();
       displayMode.set('standalone');
       const inApp = render(<RemoteDesktopWall manager={manager} retainedHostKeys={new Set()} onOpenHost={vi.fn()} onHostKeysChange={vi.fn()} onClose={vi.fn()} />);

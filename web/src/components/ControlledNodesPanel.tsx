@@ -51,7 +51,6 @@ import { REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY } from '@shared/remote-de
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
-import { RemoteDesktopInstallEntry } from './RemoteDesktopInstallEntry.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
 import { TeamManagementPanel } from './TeamManagementPanel.js';
 import {
@@ -1090,7 +1089,6 @@ export function ControlledNodesPanel({
                 <span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}
               </button>
             )}
-            <RemoteDesktopInstallEntry />
             <button
               type="button"
               class="controlled-nodes-refresh"

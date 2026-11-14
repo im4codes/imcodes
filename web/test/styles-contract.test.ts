@@ -84,6 +84,14 @@ describe('styles.css regression contracts', () => {
     : '';
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('retains blocked-window dismissal styles without removed install UI styles', () => {
+    expect(css).toContain('.remote-desktop-window-blocked {');
+    expect(css).toContain('.remote-desktop-window-blocked-dismiss {');
+    expect(css).not.toContain('.remote-desktop-install-entry');
+    expect(css).not.toContain('.remote-desktop-install-guide');
+    expect(css).not.toContain('.remote-desktop-window-blocked-install');
+  });
+
   it('keeps compact decision copy a native five-line scrollport and contains only overflowing copy', () => {
     const text = css.match(/\.task-pair-decision-copy \.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
     expect(text).toMatch(/overflow-y:\s*auto/);

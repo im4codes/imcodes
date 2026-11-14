@@ -1069,7 +1069,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     opened.mockRestore();
   });
 
-  it('offers installing the remote desktop as an app next to the wall button, and hides it inside the installed app', async () => {
+  it('keeps wall and refresh actions without an install-as-app entry in browser or standalone mode', async () => {
     machines = [
       machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
     ];
@@ -1078,7 +1078,10 @@ describe('ControlledNodesPanel (12.3)', () => {
       const { container, unmount } = render(<ControlledNodesPanel onOpenRemoteDesktopWall={vi.fn()} />);
       await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-rd-split')).toHaveLength(1));
       const actions = container.querySelector('.controlled-nodes-machines-actions') as HTMLElement;
-      expect(actions.querySelector('[data-testid="remote-desktop-install-app"]')).not.toBeNull();
+      expect(actions.querySelector('[data-testid="remote-desktop-install-app"]')).toBeNull();
+      expect(actions.querySelector('[data-testid="remote-desktop-install-guide"]')).toBeNull();
+      expect(actions.querySelector('.controlled-nodes-wall')).not.toBeNull();
+      expect(actions.querySelector('.controlled-nodes-refresh')).not.toBeNull();
       unmount();
       displayMode.set('standalone');
       const inApp = render(<ControlledNodesPanel onOpenRemoteDesktopWall={vi.fn()} />);
