@@ -30,6 +30,7 @@ import type { Database } from '../db/client.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { isInternalUploadTempFilePath, isMarkdownFilePath } from '../../../shared/cloud-docs.js';
+import { buildOnlyOfficeEditorPresentation, parseOnlyOfficeMobileParam } from '../../../shared/onlyoffice-service.js';
 import { upsertRecentDocument } from '../db/cloud-docs.js';
 
 export const onlyofficeRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -1515,7 +1516,13 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
   const callbackUrl = `${serverBaseUrl}/api/onlyoffice/callback/${docToken}?serverId=${encodeURIComponent(serverId)}`;
 
   const canEditDocument = effectiveMode === 'edit' && access.role === 'editor';
+  const isMobile = parseOnlyOfficeMobileParam(c.req.query('mobile'));
+  const presentation = buildOnlyOfficeEditorPresentation({
+    mode: effectiveMode,
+    mobile: isMobile,
+  });
   const editorConfigPayload = {
+    ...(presentation.type ? { type: presentation.type } : {}),
     documentType: meta.documentType,
     document: {
       fileType: meta.fileType,
@@ -1539,10 +1546,7 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
         id: actorId,
         name: actorName,
       },
-      customization: {
-        forcesave: true,
-        compactHeader: true,
-      },
+      customization: presentation.customization,
     },
   };
 

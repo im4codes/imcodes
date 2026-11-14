@@ -1302,4 +1302,154 @@ describe('OfficePreview fallback document transitions', () => {
       vi.restoreAllMocks();
     }
   });
+
+  it('sends mobile=1 automatically on <=768px viewports, omits it on desktop, and marks has-mode-toggle only when editable', async () => {
+    const origInnerWidth = window.innerWidth;
+    const origMatchMedia = window.matchMedia;
+    const origDocsApi = (window as unknown as { DocsAPI?: unknown }).DocsAPI;
+    const requestedUrls: string[] = [];
+
+    const setViewport = (width: number) => {
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        writable: true,
+        value: width,
+      });
+      Object.defineProperty(window, 'matchMedia', {
+        configurable: true,
+        writable: true,
+        value: vi.fn((query: string) => ({
+          matches: query.includes('max-width: 768px') ? width <= 768 : false,
+          media: query,
+          onchange: null,
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        })),
+      });
+    };
+
+    try {
+      const docEditorSpy = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+      installOnlyOfficeScriptLoadMock(docEditorSpy);
+      const roleState = { role: 'editor' as 'editor' | 'viewer' };
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (url.includes('/onlyoffice/config')) {
+            requestedUrls.push(url);
+            const isView = url.includes('mode=view') || roleState.role === 'viewer';
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                enabled: true,
+                role: roleState.role,
+                allowDownload: true,
+                canManageShare: roleState.role === 'editor',
+                isOwner: roleState.role === 'editor',
+                mode: isView ? 'view' : 'edit',
+                publicUrl: 'https://im.example.com/onlyoffice',
+                scriptUrl: 'https://im.example.com/onlyoffice/web-apps/apps/api/documents/api.js',
+                docToken: 'doc_tok_mobile',
+                config: {
+                  type: url.includes('mobile=1') && isView ? 'mobile' : 'desktop',
+                  documentType: 'cell',
+                  document: {
+                    fileType: 'xlsx',
+                    key: `k_${requestedUrls.length}`,
+                    title: 'budget.xlsx',
+                    url: 'https://im.example.com/api/onlyoffice/file/doc_tok_mobile',
+                    permissions: { edit: !isView, download: true },
+                  },
+                  editorConfig: {
+                    mode: isView ? 'view' : 'edit',
+                    callbackUrl: 'https://im.example.com/api/onlyoffice/callback/doc_tok_mobile',
+                    lang: 'en',
+                    user: { id: 'u1', name: 'Alice' },
+                  },
+                  token: 'jwt_mobile',
+                },
+              }),
+            };
+          }
+          return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0]).buffer };
+        }),
+      );
+
+      const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+
+      const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+      // 1. Mobile viewport (375px) + Cloud Doc -> sends mobile=1 and sets has-mode-toggle when editor
+      setViewport(375);
+      const mobileCloud = render(
+        <OfficePreview
+          cloudDocId="cd-1"
+          mimeType={xlsxMime}
+          path="budget.xlsx"
+          onOpenShare={vi.fn()}
+        />,
+      );
+      await waitFor(() => expect(mobileCloud.getByTestId('onlyoffice-toolbar')).toBeTruthy());
+      expect(requestedUrls[0]).toContain('/api/cloud-docs/cd-1/onlyoffice/config');
+      expect(requestedUrls[0]).toContain('mobile=1');
+      expect(mobileCloud.getByTestId('onlyoffice-toolbar').classList.contains('has-mode-toggle')).toBe(true);
+      expect(mobileCloud.getByTestId('onlyoffice-mode-view')).toBeTruthy();
+      expect(mobileCloud.getByTestId('onlyoffice-mode-edit')).toBeTruthy();
+      expect(mobileCloud.getByTestId('onlyoffice-open-share')).toBeTruthy();
+      expect(mobileCloud.getByTestId('onlyoffice-download-link')).toBeTruthy();
+      expect(mobileCloud.getByTestId('onlyoffice-fallback-btn')).toBeTruthy();
+      expect(mobileCloud.getByTestId('onlyoffice-fullscreen-btn')).toBeTruthy();
+      mobileCloud.unmount();
+
+      // 2. Mobile viewport (375px) + server file read-only viewer -> sends mobile=1 and omits has-mode-toggle so read-only pill stays visible
+      roleState.role = 'viewer';
+      const mobileServerViewer = render(
+        <OfficePreview
+          serverId="srv-1"
+          mimeType={xlsxMime}
+          path="/shared/budget.xlsx"
+          readOnly
+        />,
+      );
+      await waitFor(() => expect(mobileServerViewer.getByTestId('onlyoffice-toolbar')).toBeTruthy());
+      expect(requestedUrls[1]).toContain('/api/server/srv-1/onlyoffice/config');
+      expect(requestedUrls[1]).toContain('mobile=1');
+      expect(mobileServerViewer.getByTestId('onlyoffice-toolbar').classList.contains('has-mode-toggle')).toBe(false);
+      mobileServerViewer.unmount();
+
+      // 3. Desktop viewport (1280px) -> does NOT send mobile=1
+      roleState.role = 'editor';
+      setViewport(1280);
+      const desktopView = render(
+        <OfficePreview
+          serverId="srv-1"
+          mimeType={xlsxMime}
+          path="/shared/budget.xlsx"
+        />,
+      );
+      await waitFor(() => expect(desktopView.getByTestId('onlyoffice-toolbar')).toBeTruthy());
+      expect(requestedUrls[2]).toContain('/api/server/srv-1/onlyoffice/config');
+      expect(requestedUrls[2]).not.toContain('mobile=1');
+      desktopView.unmount();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        writable: true,
+        value: origInnerWidth,
+      });
+      Object.defineProperty(window, 'matchMedia', {
+        configurable: true,
+        writable: true,
+        value: origMatchMedia,
+      });
+      (window as unknown as { DocsAPI?: unknown }).DocsAPI = origDocsApi;
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
 });

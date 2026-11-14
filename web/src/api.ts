@@ -3246,6 +3246,7 @@ export interface OnlyOfficeConfigResponse {
   docToken?: string;
   fileUrl?: string;
   config?: {
+    type?: 'desktop' | 'mobile' | 'embedded';
     documentType: 'word' | 'cell' | 'slide' | 'pdf';
     document: {
       fileType: string;
@@ -3354,6 +3355,7 @@ export async function fetchOnlyOfficeConfig(
     deviceToken?: string;
     sessionName?: string;
     lang?: string;
+    mobile?: boolean;
   },
 ): Promise<OnlyOfficeConfigResponse> {
   const qs = new URLSearchParams({ path: params.path });
@@ -3362,6 +3364,7 @@ export async function fetchOnlyOfficeConfig(
   if (params.deviceToken) qs.set('deviceToken', params.deviceToken);
   if (params.sessionName) qs.set('sessionName', params.sessionName);
   if (params.lang) qs.set('lang', params.lang);
+  if (params.mobile) qs.set('mobile', '1');
   return apiFetch<OnlyOfficeConfigResponse>(
     `/api/server/${encodeURIComponent(serverId)}/onlyoffice/config?${qs.toString()}`,
     { method: 'GET' },
@@ -3820,11 +3823,12 @@ export async function downloadCloudDocApi(docId: string, filename?: string): Pro
 
 export async function fetchCloudDocOnlyOfficeConfig(
   docId: string,
-  params?: { mode?: 'view' | 'edit'; lang?: string },
+  params?: { mode?: 'view' | 'edit'; lang?: string; mobile?: boolean },
 ): Promise<OnlyOfficeConfigResponse> {
   const qs = new URLSearchParams();
   if (params?.mode) qs.set('mode', params.mode);
   if (params?.lang) qs.set('lang', params.lang);
+  if (params?.mobile) qs.set('mobile', '1');
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
   return apiFetch<OnlyOfficeConfigResponse>(
     `/api/cloud-docs/${encodeURIComponent(docId)}/onlyoffice/config${suffix}`,

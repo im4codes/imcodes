@@ -1658,4 +1658,24 @@ describe('styles.css regression contracts', () => {
       /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\),\s*:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+body,\s*:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+#app\s*\{[^}]*background-color:\s*var\(--chrome-bg\)/,
     );
   });
+
+  it('keeps desktop Cloud Docs / ONLYOFFICE chrome intact and compacts <=767px mobile chrome while hiding redundant editor role pill', () => {
+    const media600Idx = cssWithoutComments.indexOf('@media (max-width: 600px)');
+    expect(media600Idx).toBeGreaterThan(-1);
+    const desktopCss = cssWithoutComments.slice(0, media600Idx);
+    expect(desktopCss).not.toContain('.office-preview-toolbar.has-mode-toggle .office-preview-role-pill');
+
+    const media767Blocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*767px\)/);
+    const mobilePreviewBlock = media767Blocks.find((block) => block.includes('.office-preview-toolbar'));
+    expect(mobilePreviewBlock).toBeTruthy();
+
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.cloud-docs-preview-header\s*/)).toMatch(/min-height:\s*30px/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.cloud-docs-preview-header\s*/)).toMatch(/padding:\s*2px 8px/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-toolbar\s*/)).toMatch(/min-height:\s*26px/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-toolbar\s*/)).toMatch(/padding:\s*2px 6px\s*!important/);
+    expect(
+      extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-toolbar\.has-mode-toggle\s+\.office-preview-role-pill\s*/),
+    ).toMatch(/display:\s*none/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-role-pill\s*/)).not.toMatch(/display:\s*none/);
+  });
 });

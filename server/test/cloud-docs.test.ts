@@ -8,7 +8,7 @@ import { WsBridge } from '../src/ws/bridge.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import { isMigrationFile } from '../src/db/migrate.js';
-import { signJwt, sha256Hex } from '../src/security/crypto.js';
+import { signJwt, sha256Hex, verifyJwt } from '../src/security/crypto.js';
 import { resolveOnlyOfficeJwtSecret } from '../src/routes/onlyoffice.js';
 import { issueSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
@@ -2343,5 +2343,85 @@ describe('cloud docs & recent documents', () => {
       name: 'BudgetFinal.xlsx',
       folderId: targetFolderId,
     });
+  });
+
+  it('builds and signs desktop, mobile view, and mobile edit Cloud Doc ONLYOFFICE configs consistently via ?mobile=1 / ?mobile=true', async () => {
+    const createRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'xlsx', name: 'MobileSheet.xlsx' }),
+    });
+    expect(createRes.status).toBe(201);
+    const { doc } = (await createRes.json()) as { doc: { id: string } };
+    const ooSecret = resolveOnlyOfficeJwtSecret({ ONLYOFFICE_JWT_SECRET: OO_SECRET, JWT_SIGNING_KEY: JWT_KEY });
+
+    // 1. Desktop default
+    const desktopRes = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config?mode=edit`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(desktopRes.status).toBe(200);
+    const desktopBody = (await desktopRes.json()) as {
+      config: { type?: string; editorConfig: { mode: string; customization: Record<string, unknown> }; token: string };
+    };
+    expect(desktopBody.config.type).toBeUndefined();
+    expect(desktopBody.config.editorConfig.customization).toEqual({
+      forcesave: true,
+      compactHeader: true,
+    });
+    const desktopClaims = verifyJwt(desktopBody.config.token, ooSecret) as Record<string, unknown>;
+    expect(desktopClaims.type).toBeUndefined();
+
+    // 2. Mobile + view
+    const mobileViewRes = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config?mode=view&mobile=1`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(mobileViewRes.status).toBe(200);
+    const mobileViewBody = (await mobileViewRes.json()) as {
+      config: { type?: string; editorConfig: { mode: string; customization: Record<string, unknown> }; token: string };
+    };
+    expect(mobileViewBody.config.type).toBe('mobile');
+    expect(mobileViewBody.config.editorConfig.mode).toBe('view');
+    expect(mobileViewBody.config.editorConfig.customization).toEqual({
+      forcesave: true,
+      compactHeader: true,
+      compactToolbar: true,
+      toolbarHideFileName: true,
+      help: false,
+      feedback: false,
+      chat: false,
+    });
+    const mobileViewClaims = verifyJwt(mobileViewBody.config.token, ooSecret) as Record<string, unknown>;
+    expect(mobileViewClaims.type).toBe('mobile');
+    expect((mobileViewClaims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
+      mobileViewBody.config.editorConfig.customization,
+    );
+
+    // 3. Mobile + edit (keeps desktop type for Community Edition editing compatibility)
+    const mobileEditRes = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config?mode=edit&mobile=true`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(mobileEditRes.status).toBe(200);
+    const mobileEditBody = (await mobileEditRes.json()) as {
+      config: { type?: string; editorConfig: { mode: string; customization: Record<string, unknown> }; token: string };
+    };
+    expect(mobileEditBody.config.type).toBe('desktop');
+    expect(mobileEditBody.config.editorConfig.mode).toBe('edit');
+    expect(mobileEditBody.config.editorConfig.customization).toEqual({
+      forcesave: true,
+      compactHeader: true,
+      compactToolbar: true,
+      toolbarNoTabs: true,
+      hideRightMenu: true,
+      hideRulers: true,
+      help: false,
+      feedback: false,
+      chat: false,
+      toolbarHideFileName: true,
+    });
+    const mobileEditClaims = verifyJwt(mobileEditBody.config.token, ooSecret) as Record<string, unknown>;
+    expect(mobileEditClaims.type).toBe('desktop');
+    expect((mobileEditClaims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
+      mobileEditBody.config.editorConfig.customization,
+    );
   });
 });

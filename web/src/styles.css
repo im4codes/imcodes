@@ -19491,6 +19491,159 @@ button.quick-agent-delegation-preset.active {
   }
 }
 
+@media (max-width: 767px) {
+  .cloud-docs-preview-header {
+    padding: 2px 8px;
+    gap: 4px;
+    min-height: 30px;
+    flex-wrap: nowrap;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .cloud-docs-preview-header::-webkit-scrollbar {
+    display: none;
+  }
+
+  .cloud-docs-preview-header > svg {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
+
+  .cloud-docs-preview-header .cloud-docs-btn {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .cloud-docs-preview-btn-label {
+    display: none;
+  }
+
+  .cloud-docs-preview-title-wrap {
+    flex: 1 1 0;
+    min-width: 72px;
+    gap: 4px;
+    overflow: hidden;
+  }
+
+  .cloud-docs-preview-title-input {
+    flex: 1 1 0;
+    min-width: 0;
+    width: 100%;
+    max-width: none;
+    height: 24px;
+    padding: 0 6px;
+    font-size: 12.5px;
+    box-sizing: border-box;
+  }
+
+  .cloud-docs-preview-title {
+    flex: 1 1 0;
+    min-width: 0;
+    font-size: 12.5px;
+    line-height: 24px;
+  }
+
+  .cloud-docs-preview-actions {
+    width: auto;
+    gap: 4px;
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+  }
+
+  .office-preview-embedded {
+    min-height: 0 !important;
+    min-width: 0;
+  }
+
+  .office-preview-editor-wrap {
+    min-height: 240px !important;
+  }
+
+  .office-preview-toolbar {
+    padding: 2px 6px !important;
+    gap: 4px !important;
+    min-height: 26px;
+    font-size: 11px !important;
+    flex-wrap: nowrap !important;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .office-preview-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .office-preview-toolbar-group,
+  .office-preview-toolbar-actions {
+    gap: 4px !important;
+    flex-wrap: nowrap !important;
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+
+  .office-preview-role-pill {
+    padding: 1px 6px !important;
+    font-size: 10.5px !important;
+    line-height: 16px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    max-width: 78px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .office-preview-toolbar.has-mode-toggle .office-preview-role-pill {
+    display: none;
+  }
+
+  .office-preview-mode-toggle {
+    flex-shrink: 0;
+  }
+
+  .office-preview-mode-btn,
+  .office-preview-tool-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 22px;
+    padding: 0 !important;
+    line-height: 1;
+    flex-shrink: 0;
+    box-sizing: border-box;
+  }
+
+  .office-preview-btn-label {
+    display: none;
+  }
+
+  .office-preview-btn-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .office-preview-toolbar.is-fallback {
+    gap: 6px !important;
+  }
+
+  .office-preview-fallback-text {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+  }
+}
+
 /* ── Server switch keyboard-shortcut floating HUD watermark ─────────────── */
 @keyframes server-switch-hud-in {
   from {

@@ -52,6 +52,14 @@ async function fetchArrayBuffer(url: string, signal: AbortSignal): Promise<Array
   return res.arrayBuffer();
 }
 
+export function isMobileOnlyOfficeViewport(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 768px)').matches) {
+    return true;
+  }
+  return typeof window.innerWidth === 'number' && window.innerWidth <= 768;
+}
+
 export function isLocallyPreviewableFormat(filePath: string, mimeType: string): boolean {
   const lowerPath = filePath.toLowerCase();
   if (mimeType === 'application/pdf' || lowerPath.endsWith('.pdf')) return true;
@@ -551,7 +559,7 @@ function OnlyOfficeEmbeddedEditor({
       }}
     >
       <div
-        className="office-preview-toolbar"
+        className={`office-preview-toolbar${canEdit ? ' has-mode-toggle' : ''}`}
         data-testid="onlyoffice-toolbar"
         style={{
           display: 'flex',
@@ -789,6 +797,19 @@ function OfficePreviewDocument({
   const effectiveInitialMode: 'view' | 'edit' = readOnly ? 'view' : (initialMode ?? 'edit');
   const [mode, setMode] = useState<'view' | 'edit'>(effectiveInitialMode);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(isMobileOnlyOfficeViewport);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const syncViewport = () => setIsMobileViewport(isMobileOnlyOfficeViewport());
+    const mql = typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 768px)') : null;
+    mql?.addEventListener?.('change', syncViewport);
+    window.addEventListener('resize', syncViewport);
+    return () => {
+      mql?.removeEventListener?.('change', syncViewport);
+      window.removeEventListener('resize', syncViewport);
+    };
+  }, []);
 
   // 1. When `cloudDocId` or `serverId` is provided, query ONLYOFFICE config first
   useEffect(() => {
@@ -807,13 +828,14 @@ function OfficePreviewDocument({
     setOoConfigError(null);
 
     const requestPromise = cloudDocId
-      ? fetchCloudDocOnlyOfficeConfig(cloudDocId, { mode: readOnly ? 'view' : mode })
+      ? fetchCloudDocOnlyOfficeConfig(cloudDocId, { mode: readOnly ? 'view' : mode, mobile: isMobileViewport })
       : fetchOnlyOfficeConfig(serverId!, {
           path,
           mode: readOnly ? 'view' : mode,
           shareToken,
           deviceToken,
           sessionName,
+          mobile: isMobileViewport,
         });
 
     requestPromise
@@ -870,7 +892,7 @@ function OfficePreviewDocument({
     return () => {
       cancelled = true;
     };
-  }, [hasRemoteTarget, cloudDocId, serverId, path, mode, shareToken, deviceToken, sessionName, readOnly, ooState.forceLocal, ooRetryKey]);
+  }, [hasRemoteTarget, cloudDocId, serverId, path, mode, shareToken, deviceToken, sessionName, readOnly, ooState.forceLocal, ooRetryKey, isMobileViewport]);
 
   const useOnlyOffice =
     hasRemoteTarget &&

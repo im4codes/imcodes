@@ -2650,6 +2650,101 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect.soft(store.rooms.get(mapKey)!.current_confirmed_hash, 'PG authority must recognize restored A, not pretend disk still contains B').toBe(sha256Hex(historicalTarget));
     expect.soft(store.rooms.get(mapKey)!.session_epoch, 'external restore is a fresh version regardless of an obsolete target hash').toBeGreaterThan(confirmed.session_epoch);
   });
+
+  it('builds and signs desktop, mobile view, and mobile edit ONLYOFFICE presentations consistently via ?mobile=1 / ?mobile=true', async () => {
+    const ooSecret = 'onlyoffice-jwt-secret-key-test!!';
+
+    // 1. Desktop (mobile omitted and mobile=0): omitted top-level type + minimal customization
+    for (const suffix of ['', '&mobile=0']) {
+      const res = await app.request(
+        `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit${suffix}`,
+        { headers: { Authorization: bearer('owner-1') } },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        token: string;
+        config: {
+          type?: string;
+          editorConfig: { mode: string; customization: Record<string, unknown> };
+          token: string;
+        };
+      };
+      expect(body.config.type).toBeUndefined();
+      expect(body.config.editorConfig.mode).toBe('edit');
+      expect(body.config.editorConfig.customization).toEqual({
+        forcesave: true,
+        compactHeader: true,
+      });
+      const claims = verifyJwt(body.config.token, ooSecret) as Record<string, unknown>;
+      expect(claims.type).toBeUndefined();
+      expect((claims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
+        body.config.editorConfig.customization,
+      );
+    }
+
+    // 2. Mobile + view (?mode=view&mobile=1): top-level type='mobile' + compact view customization signed in ooJwt
+    const mobileViewRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=view&mobile=1`,
+      { headers: { Authorization: bearer('owner-1') } },
+    );
+    expect(mobileViewRes.status).toBe(200);
+    const mobileViewBody = (await mobileViewRes.json()) as {
+      config: {
+        type?: string;
+        editorConfig: { mode: string; customization: Record<string, unknown> };
+        token: string;
+      };
+    };
+    expect(mobileViewBody.config.type).toBe('mobile');
+    expect(mobileViewBody.config.editorConfig.mode).toBe('view');
+    expect(mobileViewBody.config.editorConfig.customization).toEqual({
+      forcesave: true,
+      compactHeader: true,
+      compactToolbar: true,
+      toolbarHideFileName: true,
+      help: false,
+      feedback: false,
+      chat: false,
+    });
+    const mobileViewClaims = verifyJwt(mobileViewBody.config.token, ooSecret) as Record<string, unknown>;
+    expect(mobileViewClaims.type).toBe('mobile');
+    expect((mobileViewClaims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
+      mobileViewBody.config.editorConfig.customization,
+    );
+
+    // 3. Mobile + edit (?mode=edit&mobile=true): keeps type='desktop' for CE compatibility + compact single-row customization
+    const mobileEditRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit&mobile=true`,
+      { headers: { Authorization: bearer('owner-1') } },
+    );
+    expect(mobileEditRes.status).toBe(200);
+    const mobileEditBody = (await mobileEditRes.json()) as {
+      config: {
+        type?: string;
+        editorConfig: { mode: string; customization: Record<string, unknown> };
+        token: string;
+      };
+    };
+    expect(mobileEditBody.config.type).toBe('desktop');
+    expect(mobileEditBody.config.editorConfig.mode).toBe('edit');
+    expect(mobileEditBody.config.editorConfig.customization).toEqual({
+      forcesave: true,
+      compactHeader: true,
+      compactToolbar: true,
+      toolbarNoTabs: true,
+      hideRightMenu: true,
+      hideRulers: true,
+      help: false,
+      feedback: false,
+      chat: false,
+      toolbarHideFileName: true,
+    });
+    const mobileEditClaims = verifyJwt(mobileEditBody.config.token, ooSecret) as Record<string, unknown>;
+    expect(mobileEditClaims.type).toBe('desktop');
+    expect((mobileEditClaims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
+      mobileEditBody.config.editorConfig.customization,
+    );
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

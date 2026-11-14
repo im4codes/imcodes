@@ -14,6 +14,7 @@ import {
   resolveOnlyOfficeJwtSecret,
   resolveTrustedOnlyOfficeDownloadUrl,
 } from './onlyoffice.js';
+import { buildOnlyOfficeEditorPresentation, parseOnlyOfficeMobileParam } from '../../../shared/onlyoffice-service.js';
 import {
   CloudDocContentError,
   applyCloudDocContentEdit,
@@ -1481,7 +1482,13 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     }
 
     const canEdit = effectiveMode === 'edit' && canUserEdit;
+    const isMobile = parseOnlyOfficeMobileParam(c.req.query('mobile'));
+    const presentation = buildOnlyOfficeEditorPresentation({
+      mode: effectiveMode,
+      mobile: isMobile,
+    });
     const editorConfigPayload = {
+      ...(presentation.type ? { type: presentation.type } : {}),
       documentType: meta.documentType,
       document: {
         fileType: meta.fileType,
@@ -1505,10 +1512,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
           id: auth.userId,
           name: actorName,
         },
-        customization: {
-          forcesave: true,
-          compactHeader: true,
-        },
+        customization: presentation.customization,
       },
     };
 

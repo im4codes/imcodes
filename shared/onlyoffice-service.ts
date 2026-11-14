@@ -32,3 +32,69 @@ export function isOnlyOfficeEnabledValue(value: string | boolean | undefined | n
   if (!normalized) return true;
   return normalized !== 'false' && normalized !== '0' && normalized !== 'no' && normalized !== 'off';
 }
+
+export interface OnlyOfficeEditorPresentation {
+  type?: 'desktop' | 'mobile';
+  customization: {
+    forcesave: boolean;
+    compactHeader: boolean;
+    compactToolbar?: boolean;
+    toolbarNoTabs?: boolean;
+    toolbarHideFileName?: boolean;
+    hideRightMenu?: boolean;
+    hideRulers?: boolean;
+    help?: boolean;
+    feedback?: boolean;
+    chat?: boolean;
+  };
+}
+
+export function parseOnlyOfficeMobileParam(value: string | boolean | undefined | null): boolean {
+  if (typeof value === 'boolean') return value;
+  if (value === undefined || value === null) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true';
+}
+
+export function buildOnlyOfficeEditorPresentation(options: {
+  mode: 'view' | 'edit';
+  mobile: boolean;
+}): OnlyOfficeEditorPresentation {
+  if (!options.mobile) {
+    return {
+      customization: {
+        forcesave: true,
+        compactHeader: true,
+      },
+    };
+  }
+  if (options.mode === 'view') {
+    return {
+      type: 'mobile',
+      customization: {
+        forcesave: true,
+        compactHeader: true,
+        compactToolbar: true,
+        toolbarHideFileName: true,
+        help: false,
+        feedback: false,
+        chat: false,
+      },
+    };
+  }
+  return {
+    type: 'desktop',
+    customization: {
+      forcesave: true,
+      compactHeader: true,
+      compactToolbar: true,
+      toolbarNoTabs: true,
+      hideRightMenu: true,
+      hideRulers: true,
+      help: false,
+      feedback: false,
+      chat: false,
+      toolbarHideFileName: true,
+    },
+  };
+}
