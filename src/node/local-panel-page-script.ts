@@ -19,7 +19,11 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
   var listSignature = '';
   var permSignature = '';
   var toastTimer = null;
-  var busy = false;
+  var remoteBusyCount = 0;
+  var daemonBusyCount = 0;
+  var loadSeq = 0;
+  function isRemoteBusy() { return remoteBusyCount > 0; }
+  function isDaemonBusy() { return daemonBusyCount > 0; }
 
   function $(id) { return document.getElementById(id); }
   function T(key, params) { return localPanelText(locale, key, params); }
@@ -118,7 +122,7 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     sw.setAttribute('aria-checked', String(!paused));
     // Never disabled while an action runs: a disabled button loses keyboard focus. The click handler ignores clicks meanwhile.
     sw.disabled = !state;
-    sw.setAttribute('aria-busy', String(busy));
+    sw.setAttribute('aria-busy', String(isRemoteBusy()));
     $('swOn').textContent = T('switchOn');
     $('swOff').textContent = T('switchOff');
     $('allowHelp').textContent = paused ? T('allowOff') : T('allowOn');
@@ -221,7 +225,9 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       main.appendChild(traffic);
       var button = el('button', 'btn danger', T('disconnect'));
       button.type = 'button';
-      button.onclick = ask.bind(null, B.actions.DISCONNECT, c.id);
+      button.onclick = (function (connId) {
+        return function () { if (!isRemoteBusy()) ask(B.actions.DISCONNECT, connId); };
+      })(c.id);
       row.appendChild(main);
       row.appendChild(button);
       list.appendChild(row);
@@ -312,23 +318,24 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       connBadge.hidden = true;
     }
 
-    $('daemonStart').disabled = busy || !d.canControl || d.running;
-    $('daemonStop').disabled = busy || !d.running;
-    $('daemonRestart').disabled = busy || !d.canControl || !d.bound;
-    $('daemonLogsBtn').disabled = busy || !d.canViewLogs;
+    var dBusy = isDaemonBusy();
+    $('daemonStart').disabled = dBusy || !d.canControl || d.running;
+    $('daemonStop').disabled = dBusy || !d.running;
+    $('daemonRestart').disabled = dBusy || !d.canControl || !d.bound;
+    $('daemonLogsBtn').disabled = dBusy || !d.canViewLogs;
     var bindBtn = $('daemonBindBtn');
     bindBtn.textContent = T(d.bound ? 'daemonRebind' : 'daemonBind');
-    bindBtn.disabled = busy || !d.canBind;
+    bindBtn.disabled = dBusy || !d.canBind;
     var openWebBtn = $('daemonOpenWeb');
     openWebBtn.hidden = !(d.bound && d.serverOrigin);
-    openWebBtn.disabled = busy;
+    openWebBtn.disabled = dBusy;
 
     var autoKnown = d.autostart !== B.daemonAutostart.UNAVAILABLE && d.installed && d.canBind;
     $('daemonAutostartWrap').hidden = !autoKnown;
     var autoSw = $('daemonAutostartSwitch');
     autoSw.setAttribute('aria-checked', String(d.autostart === B.daemonAutostart.ENABLED));
     autoSw.disabled = !autoKnown;
-    autoSw.setAttribute('aria-busy', String(busy));
+    autoSw.setAttribute('aria-busy', String(dBusy));
     $('daemonSwOn').textContent = T('switchOn');
     $('daemonSwOff').textContent = T('switchOff');
 
@@ -362,25 +369,29 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     renderConnections();
     renderTraffic();
   }
+  function hasActiveDom() {
+    return typeof document !== 'undefined' && Boolean(document) && Boolean(document.body);
+  }
   function tick() {
-    if (!document || !document.body) return;
+    if (!hasActiveDom()) return;
     var nodes = document.querySelectorAll('[data-since]');
     for (var i = 0; i < nodes.length; i += 1) nodes[i].textContent = fmtDuration(Date.now() - Number(nodes[i].getAttribute('data-since')));
   }
 
   // ---- talking to the node ----------------------------------------------
   function load() {
-    if (!document || !document.body) return Promise.resolve();
+    if (!hasActiveDom()) return Promise.resolve();
+    var seq = ++loadSeq;
     return fetch(B.statePath, { cache: 'no-store' }).then(function (response) {
       if (!response.ok) throw new Error('state');
       return response.json();
     }).then(function (next) {
-      if (!document || !document.body) return;
+      if (!hasActiveDom() || seq < loadSeq) return;
       state = next;
       offline = false;
       renderAll();
     }).catch(function () {
-      if (!document || !document.body) return;
+      if (!hasActiveDom() || seq < loadSeq) return;
       offline = true;
       renderStatus();
     });
@@ -392,26 +403,38 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       body: JSON.stringify(body)
     });
   }
-  function act(action, id, extra) {
-    busy = true;
-    renderStatus();
-    renderDaemon();
+  function runDomainAct(domain, action, id, extra) {
+    if (domain === 'daemon') {
+      daemonBusyCount += 1;
+      if (hasActiveDom()) renderDaemon();
+    } else {
+      remoteBusyCount += 1;
+      if (hasActiveDom()) renderStatus();
+    }
     var body = { action: action };
     if (id !== undefined) body.id = id;
     if (extra) {
       for (var k in extra) if (Object.prototype.hasOwnProperty.call(extra, k)) body[k] = extra[k];
     }
     return post(B.actionPath, body).then(function (response) {
-      if (!response.ok) toast(T('actionFailed'));
+      if (!response.ok && hasActiveDom()) toast(T('actionFailed'));
       return response.ok;
     }).catch(function () {
-      toast(T('actionFailed'));
+      if (hasActiveDom()) toast(T('actionFailed'));
       return false;
     }).then(function (ok) {
-      busy = false;
+      if (domain === 'daemon') {
+        daemonBusyCount = Math.max(0, daemonBusyCount - 1);
+        if (hasActiveDom()) renderDaemon();
+      } else {
+        remoteBusyCount = Math.max(0, remoteBusyCount - 1);
+        if (hasActiveDom()) renderStatus();
+      }
       return load().then(function () { return ok; });
     });
   }
+  function remoteAct(action, id, extra) { return runDomainAct('remote', action, id, extra); }
+  function daemonAct(action, extra) { return runDomainAct('daemon', action, undefined, extra); }
   function isValidBindInput(raw) {
     var trimmed = String(raw || '').trim();
     if (!trimmed) return false;
@@ -547,34 +570,34 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     for (var i = 0; i < navs.length; i += 1) navs[i].onclick = showPage.bind(null, navs[i].getAttribute('data-page'));
     $('copy').onclick = copyId;
     $('allowSwitch').onclick = function () {
-      if (!state || busy) return;
-      act(state.paused ? B.actions.RESUME : B.actions.PAUSE);
+      if (!state || isRemoteBusy()) return;
+      remoteAct(state.paused ? B.actions.RESUME : B.actions.PAUSE);
     };
-    $('resume').onclick = function () { act(B.actions.RESUME); };
-    $('stopAll').onclick = function () { ask(B.actions.STOP_ALL); };
+    $('resume').onclick = function () { if (!isRemoteBusy()) remoteAct(B.actions.RESUME); };
+    $('stopAll').onclick = function () { if (!isRemoteBusy()) ask(B.actions.STOP_ALL); };
     $('share').onclick = function () { openExternal('share', B.shareUrl); };
     $('manage').onclick = function () { openExternal('manage', B.manageUrl); };
     $('cancel').onclick = closeModal;
     $('confirmAction').onclick = function () {
       var chosen = pendingAction;
       closeModal();
-      if (chosen) act(chosen.action, chosen.id);
+      if (chosen && !isRemoteBusy()) remoteAct(chosen.action, chosen.id);
     };
     $('modal').addEventListener('mousedown', function (event) { if (event.target === $('modal')) closeModal(); });
-    $('daemonStart').onclick = function () { if (!busy) act(B.daemonActions.START); };
-    $('daemonStop').onclick = function () { if (!busy) act(B.daemonActions.STOP); };
-    $('daemonRestart').onclick = function () { if (!busy) act(B.daemonActions.RESTART); };
+    $('daemonStart').onclick = function () { if (!isDaemonBusy()) daemonAct(B.daemonActions.START); };
+    $('daemonStop').onclick = function () { if (!isDaemonBusy()) daemonAct(B.daemonActions.STOP); };
+    $('daemonRestart').onclick = function () { if (!isDaemonBusy()) daemonAct(B.daemonActions.RESTART); };
     $('daemonAutostartSwitch').onclick = function () {
-      if (!state || !state.daemon || busy) return;
+      if (!state || !state.daemon || isDaemonBusy()) return;
       var enabled = state.daemon.autostart === B.daemonAutostart.ENABLED;
-      act(enabled ? B.daemonActions.DISABLE_AUTOSTART : B.daemonActions.ENABLE_AUTOSTART);
+      daemonAct(enabled ? B.daemonActions.DISABLE_AUTOSTART : B.daemonActions.ENABLE_AUTOSTART);
     };
-    $('daemonBindBtn').onclick = function () { if (!busy) openBindModal(); };
+    $('daemonBindBtn').onclick = function () { if (!isDaemonBusy()) openBindModal(); };
     $('daemonBindCancel').onclick = closeBindModal;
     $('daemonBindModal').addEventListener('mousedown', function (event) { if (event.target === $('daemonBindModal')) closeBindModal(); });
     $('daemonBindForm').onsubmit = function (event) {
       event.preventDefault();
-      if (busy) return;
+      if (isDaemonBusy()) return;
       var input = $('daemonBindInput');
       var raw = input.value;
       input.value = '';
@@ -585,7 +608,7 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
         return;
       }
       closeBindModal();
-      act(B.daemonActions.BIND, undefined, { bindUrl: raw.trim() });
+      daemonAct(B.daemonActions.BIND, { bindUrl: raw.trim() });
     };
     $('daemonLogsBtn').onclick = openLogsModal;
     $('daemonLogsRefresh').onclick = loadDaemonLogs;

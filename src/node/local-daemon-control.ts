@@ -2,11 +2,11 @@ import { execFile, spawn, type SpawnOptions } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
-  chownSync,
   closeSync,
   constants as fsConstants,
   existsSync,
   fchmodSync,
+  fchownSync,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -16,8 +16,8 @@ import {
   readSync,
   realpathSync,
   renameSync,
-  rmSync,
   statSync,
+  unlinkSync,
   writeSync,
 } from 'node:fs';
 import { homedir, hostname, tmpdir, userInfo } from 'node:os';
@@ -38,7 +38,7 @@ import {
   type RemoteDesktopLocalDaemonStatus,
 } from '../../shared/remote-desktop-local-management.js';
 import { xmlEscapeText } from '../../shared/macos-daemon-launch.js';
-import { readDaemonRuntimeStatus } from '../util/daemon-status.js';
+import { parseDaemonRuntimeStatus, type DaemonRuntimeStatus } from '../util/daemon-status.js';
 import { IMCODES_HOME_ENV, imcodesStateDir, imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
 import { resolveActiveLinuxDesktopUser, resolveLinuxDesktopSessionEnv } from './linux-desktop-session.js';
@@ -108,7 +108,9 @@ export interface LocalDaemonControlDeps {
   ) => void;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  /** @deprecated Unused at runtime; ownership always binds to validated open fds via `fchown`. */
   chown?: (filePath: string, uid: number, gid: number) => void;
+  fchown?: (fd: number, uid: number, gid: number) => void;
   bindTimeoutMs?: number;
   stopWaitMs?: number;
   windowsLaunchSettleMs?: number;
@@ -568,24 +570,43 @@ function isWithinCanonicalRoot(candidateRealPath: string, canonicalRoot: string)
   return candidateRealPath === canonicalRoot || candidateRealPath.startsWith(`${canonicalRoot}${sep}`);
 }
 
-function applyPathOwnership(
-  targetPath: string,
+function applyFdOwnership(
+  fd: number,
   user: ActiveDesktopUser,
   currentUid: number,
-  chownOverride?: (filePath: string, uid: number, gid: number) => void,
+  fchownOverride?: (fd: number, uid: number, gid: number) => void,
 ): void {
   if (user.platform === 'win32' || currentUid !== 0) return;
   if (typeof user.uid !== 'number' || typeof user.gid !== 'number') {
     throw new Error('missing_target_user_ids');
   }
-  const chownFn = chownOverride ?? chownSync;
+  const fchownFn = fchownOverride ?? fchownSync;
   const realUid = typeof process.getuid === 'function' ? process.getuid() : -1;
   try {
-    chownFn(targetPath, user.uid, user.gid);
+    fchownFn(fd, user.uid, user.gid);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
-    if (!chownOverride && realUid !== 0 && code === 'EPERM') {
+    if (!fchownOverride && realUid !== 0 && code === 'EPERM') {
       return;
+    }
+    throw err;
+  }
+}
+
+function openSafeDirFd(dirPath: string): number {
+  const dirFlags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
+  const fd = openSync(dirPath, dirFlags);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isDirectory()) {
+      throw new Error('unsafe_path');
+    }
+    return fd;
+  } catch (err) {
+    try {
+      closeSync(fd);
+    } catch {
+      // ignore
     }
     throw err;
   }
@@ -599,7 +620,7 @@ function assertSafeDirRoot(
     user?: ActiveDesktopUser;
     currentUid?: number;
     ownExisting?: boolean;
-    chownOverride?: (filePath: string, uid: number, gid: number) => void;
+    fchownOverride?: (fd: number, uid: number, gid: number) => void;
   } = {},
 ): string | null {
   let exists = false;
@@ -613,11 +634,26 @@ function assertSafeDirRoot(
   if (!exists) {
     if (!options.createIfMissing) return null;
     mkdirSync(rootDir, { recursive: true, mode: options.dirMode ?? 0o700 });
-    if (options.user && typeof options.currentUid === 'number') {
-      applyPathOwnership(rootDir, options.user, options.currentUid, options.chownOverride);
+    const createdLst = lstatSync(rootDir);
+    if (createdLst.isSymbolicLink() || !createdLst.isDirectory()) {
+      throw new Error('unsafe_path');
     }
-  } else if (options.ownExisting && options.user && typeof options.currentUid === 'number') {
-    applyPathOwnership(rootDir, options.user, options.currentUid, options.chownOverride);
+  }
+  const shouldOwn = Boolean(
+    options.user
+    && options.user.platform !== 'win32'
+    && typeof options.currentUid === 'number'
+    && options.currentUid === 0
+    && (!exists || options.ownExisting),
+  );
+  if (shouldOwn && options.user && typeof options.currentUid === 'number') {
+    const dirFd = openSafeDirFd(rootDir);
+    try {
+      applyFdOwnership(dirFd, options.user, options.currentUid, options.fchownOverride);
+      return realpathSync(rootDir);
+    } finally {
+      closeSync(dirFd);
+    }
   }
   try {
     return realpathSync(rootDir);
@@ -715,7 +751,13 @@ function removeSafeContainedFile(rootDir: string, relativeParts: readonly string
     }
   }
   const targetPath = join(curDir, relativeParts[relativeParts.length - 1]!);
-  rmSync(targetPath, { force: true });
+  try {
+    const targetLst = lstatSync(targetPath);
+    if (targetLst.isDirectory()) return;
+    unlinkSync(targetPath);
+  } catch {
+    // ENOENT or inaccessible target
+  }
 }
 
 function readServerCredentials(stateDir: string): StoredServerCredentials | null {
@@ -757,11 +799,10 @@ function readPidFile(stateDir: string): number | null {
   }
 }
 
-function readSafeDaemonRuntimeStatus(stateDir: string): ReturnType<typeof readDaemonRuntimeStatus> {
-  const fd = openSafeContainedReadFd(stateDir, ['daemon-runtime.json']);
-  if (fd === null) return null;
-  closeSync(fd);
-  return readDaemonRuntimeStatus(stateDir);
+function readSafeDaemonRuntimeStatus(stateDir: string): DaemonRuntimeStatus | null {
+  const rawText = readSafeSmallUtf8(stateDir, ['daemon-runtime.json'], 512 * 1024);
+  if (!rawText) return null;
+  return parseDaemonRuntimeStatus(rawText);
 }
 
 function ensureOwnedDir(
@@ -771,7 +812,7 @@ function ensureOwnedDir(
   currentUid: number,
   mode = 0o700,
   ownExistingRoot = true,
-  chownOverride?: (filePath: string, uid: number, gid: number) => void,
+  fchownOverride?: (fd: number, uid: number, gid: number) => void,
 ): string {
   const canonicalRoot = assertSafeDirRoot(rootDir, {
     createIfMissing: true,
@@ -779,7 +820,7 @@ function ensureOwnedDir(
     user,
     currentUid,
     ownExisting: ownExistingRoot,
-    chownOverride,
+    fchownOverride,
   });
   if (!canonicalRoot) throw new Error('unsafe_path');
 
@@ -800,9 +841,19 @@ function ensureOwnedDir(
     if (!existed) {
       mkdirSync(curDir, { mode });
     }
-    applyPathOwnership(curDir, user, currentUid, chownOverride);
-    const realCur = realpathSync(curDir);
-    if (!isWithinCanonicalRoot(realCur, canonicalRoot)) throw new Error('unsafe_path');
+    if (user.platform !== 'win32') {
+      const dirFd = openSafeDirFd(curDir);
+      try {
+        const realCur = realpathSync(curDir);
+        if (!isWithinCanonicalRoot(realCur, canonicalRoot)) throw new Error('unsafe_path');
+        applyFdOwnership(dirFd, user, currentUid, fchownOverride);
+      } finally {
+        closeSync(dirFd);
+      }
+    } else {
+      const realCur = realpathSync(curDir);
+      if (!isWithinCanonicalRoot(realCur, canonicalRoot)) throw new Error('unsafe_path');
+    }
   }
   return curDir;
 }
@@ -815,7 +866,7 @@ function writeOwnedFile(
   currentUid: number,
   mode: number,
   ownExistingRoot: boolean,
-  chownOverride?: (filePath: string, uid: number, gid: number) => void,
+  fchownOverride?: (fd: number, uid: number, gid: number) => void,
 ): void {
   assertCleanRelativeParts(relativeParts);
   const dirMode = mode === 0o600 ? 0o700 : 0o755;
@@ -826,7 +877,7 @@ function writeOwnedFile(
     currentUid,
     dirMode,
     ownExistingRoot,
-    chownOverride,
+    fchownOverride,
   );
   const canonicalRoot = realpathSync(rootDir);
   const leafName = relativeParts[relativeParts.length - 1]!;
@@ -842,23 +893,32 @@ function writeOwnedFile(
   const tmpPath = join(parentDir, `${leafName}.${randomBytes(8).toString('hex')}.tmp`);
   const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
   const fd = openSync(tmpPath, flags, mode);
-  try {
-    try {
-      const buf = Buffer.from(content, 'utf8');
-      let written = 0;
-      while (written < buf.length) {
-        written += writeSync(fd, buf, written, buf.length - written);
-      }
-      if (user.platform !== 'win32') {
-        fchmodSync(fd, mode);
-      } else {
-        chmodSync(tmpPath, mode);
-      }
-    } finally {
+  let fdClosed = false;
+  const closeOnce = () => {
+    if (!fdClosed) {
+      fdClosed = true;
       closeSync(fd);
     }
-    applyPathOwnership(tmpPath, user, currentUid, chownOverride);
+  };
+  try {
+    const fdStat = fstatSync(fd);
+    if (!fdStat.isFile()) throw new Error('unsafe_path');
+    const buf = Buffer.from(content, 'utf8');
+    let written = 0;
+    while (written < buf.length) {
+      written += writeSync(fd, buf, written, buf.length - written);
+    }
+    if (user.platform !== 'win32') {
+      fchmodSync(fd, mode);
+      applyFdOwnership(fd, user, currentUid, fchownOverride);
+    } else {
+      chmodSync(tmpPath, mode);
+    }
     if (!isWithinCanonicalRoot(realpathSync(parentDir), canonicalRoot)) {
+      throw new Error('unsafe_path');
+    }
+    const tmpLst = lstatSync(tmpPath);
+    if (tmpLst.isSymbolicLink() || !tmpLst.isFile() || tmpLst.dev !== fdStat.dev || tmpLst.ino !== fdStat.ino) {
       throw new Error('unsafe_path');
     }
     try {
@@ -867,9 +927,18 @@ function writeOwnedFile(
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
     }
+    if (user.platform === 'win32') {
+      closeOnce();
+    }
     renameSync(tmpPath, filePath);
+    closeOnce();
   } catch (err) {
-    rmSync(tmpPath, { force: true });
+    closeOnce();
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // ignore missing/already moved temp file
+    }
     throw err;
   }
 }
@@ -1268,7 +1337,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
             return 'mismatch';
           }
           const cmdline = readFileSync(`${procDir}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
-          if (cmdline && !/(?:imcodes|dist\/src\/index\.js|src\/index\.ts)/iu.test(cmdline)) {
+          if (!cmdline) return 'unknown';
+          if (!/(?:imcodes|dist\/src\/index\.js|src\/index\.ts|daemon-runtime)/iu.test(cmdline)) {
             return 'mismatch';
           }
           return 'match';
@@ -1289,7 +1359,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         const procUid = Number.parseInt(match[1]!, 10);
         const cmd = match[2]!;
         if (typeof user.uid === 'number' && procUid !== user.uid) return 'mismatch';
-        if (!/(?:imcodes|dist\/src\/index\.js|src\/index\.ts)/iu.test(cmd)) return 'mismatch';
+        if (!/(?:imcodes|dist\/src\/index\.js|src\/index\.ts|daemon-runtime)/iu.test(cmd)) return 'mismatch';
         return 'match';
       } catch {
         return 'unknown';
@@ -1316,14 +1386,56 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         const cmd = line.slice(sepIdx + 1).trim();
         const expectedUser = user.username.trim().split('\\').pop()?.toLowerCase() ?? '';
         if (owner && expectedUser && owner !== expectedUser) return 'mismatch';
-        if (cmd && !/(?:imcodes|dist[\\/]src[\\/]index\.js|daemon-runtime)/iu.test(cmd)) return 'mismatch';
-        if (owner || cmd) return 'match';
+        if (!cmd) return 'unknown';
+        if (!/(?:imcodes|dist[\\/]src[\\/]index\.js|src[\\/]index\.ts|daemon-runtime)/iu.test(cmd)) return 'mismatch';
+        return 'match';
       } catch {
         return 'unknown';
       }
     }
 
     return 'unknown';
+  }
+
+  type ResolvedDaemonProcess =
+    | { state: 'not_running'; pid: null; filePid: number | null; runtimeStatus: DaemonRuntimeStatus | null }
+    | { state: 'running'; pid: number; filePid: number | null; runtimeStatus: DaemonRuntimeStatus | null }
+    | { state: 'mismatch'; pid: null; mismatchedFilePid: number | null; filePid: number | null; runtimeStatus: DaemonRuntimeStatus | null }
+    | { state: 'unknown'; pid: number; filePid: number | null; runtimeStatus: DaemonRuntimeStatus | null };
+
+  async function resolveDaemonProcess(stateDir: string, user: ActiveDesktopUser): Promise<ResolvedDaemonProcess> {
+    const runtimeStatus = readSafeDaemonRuntimeStatus(stateDir);
+    const filePid = readPidFile(stateDir);
+    const runtimePid = runtimeStatus?.pid && runtimeStatus.pid > 0 ? runtimeStatus.pid : null;
+    const candidates: number[] = [];
+    if (filePid !== null) candidates.push(filePid);
+    if (runtimePid !== null && runtimePid !== filePid) candidates.push(runtimePid);
+
+    let sawMismatch = false;
+    let mismatchedFilePid: number | null = null;
+    let unknownPid: number | null = null;
+
+    for (const pid of candidates) {
+      if (!isPidAlive(pid)) continue;
+      const verdict = await verifyDaemonPidForUser(pid, user);
+      if (verdict === 'match') {
+        return { state: 'running', pid, filePid, runtimeStatus };
+      }
+      if (verdict === 'mismatch') {
+        sawMismatch = true;
+        if (pid === filePid) mismatchedFilePid = pid;
+      } else if (unknownPid === null) {
+        unknownPid = pid;
+      }
+    }
+
+    if (unknownPid !== null) {
+      return { state: 'unknown', pid: unknownPid, filePid, runtimeStatus };
+    }
+    if (sawMismatch) {
+      return { state: 'mismatch', pid: null, mismatchedFilePid, filePid, runtimeStatus };
+    }
+    return { state: 'not_running', pid: null, filePid, runtimeStatus };
   }
 
   async function detectAutostart(
@@ -1440,14 +1552,16 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     const stateDir = stateDirForUser(user);
     const creds = readServerCredentials(stateDir);
     const bound = Boolean(creds);
-    const runtimeStatus = readSafeDaemonRuntimeStatus(stateDir);
-    const filePid = readPidFile(stateDir);
-    const candidatePid = filePid ?? (runtimeStatus?.pid && runtimeStatus.pid > 0 ? runtimeStatus.pid : null);
-    const running = candidatePid !== null && isPidAlive(candidatePid);
+    const resolvedProc = await resolveDaemonProcess(stateDir, user);
+    const runtimeStatus = resolvedProc.runtimeStatus;
+    const running = resolvedProc.state === 'running';
+    const verifiedPid = resolvedProc.state === 'running' ? resolvedProc.pid : null;
 
     let connectionState: RemoteDesktopLocalDaemonStatus['connectionState'] =
       REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.DISCONNECTED;
-    if (!running) {
+    if (resolvedProc.state === 'unknown') {
+      connectionState = REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.UNKNOWN;
+    } else if (!running) {
       connectionState = REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.DISCONNECTED;
     } else if (runtimeStatus?.serverLink?.state) {
       connectionState = runtimeStatus.serverLink.state;
@@ -1462,6 +1576,11 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     const hasReason = !installed
       ? REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED
       : (!bound ? REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_BOUND : undefined);
+    const rawLastError = resolvedProc.state === 'unknown'
+      ? (runtimeStatus?.serverLink?.lastError
+        ? `${runtimeStatus.serverLink.lastError} (daemon_pid_unverified)`
+        : 'daemon_pid_unverified')
+      : runtimeStatus?.serverLink?.lastError;
 
     return sanitizeRemoteDesktopLocalDaemonStatus({
       available: installed && bound,
@@ -1472,14 +1591,14 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       autostart,
       runtimeSource: runtime?.source ?? REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.NONE,
       ...(version ? { version } : {}),
-      ...(running && candidatePid ? { pid: candidatePid } : {}),
+      ...(running && verifiedPid ? { pid: verifiedPid } : {}),
       ...(creds ? {
         serverId: creds.serverId,
         serverHost: creds.serverHost,
         ...(creds.serverOrigin ? { serverOrigin: creds.serverOrigin } : {}),
       } : {}),
       userName: user.username,
-      ...(runtimeStatus?.serverLink?.lastError ? { lastError: redactDaemonSecrets(runtimeStatus.serverLink.lastError) } : {}),
+      ...(rawLastError ? { lastError: redactDaemonSecrets(rawLastError) } : {}),
       ...(hasReason ? { reason: hasReason } : {}),
       canControl: installed && bound ? true : running,
       canBind: installed,
@@ -1487,16 +1606,11 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     })!;
   }
 
-  async function stopUserDaemon(user: ActiveDesktopUser, stateDir: string): Promise<boolean> {
+  async function stopUserDaemon(user: ActiveDesktopUser, stateDir: string): Promise<{ ok: boolean; error?: string }> {
     const currentUid = currentUidFn();
-    const pid = readPidFile(stateDir) ?? readSafeDaemonRuntimeStatus(stateDir)?.pid ?? null;
-
-    if (pid && isPidAlive(pid)) {
-      const identity = await verifyDaemonPidForUser(pid, user);
-      if (identity === 'mismatch') {
-        return false;
-      }
-    }
+    const resolved = await resolveDaemonProcess(stateDir, user);
+    const targetPid = resolved.state === 'running' ? resolved.pid : null;
+    const unverifiedPid = resolved.state === 'unknown' ? resolved.pid : null;
 
     if (platform === 'darwin' && typeof user.uid === 'number') {
       const paths = posixServicePathsForUser(user, env);
@@ -1518,15 +1632,39 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       })();
       if (!isWindowsSystemProcess(env, currentName)) {
         await execText('schtasks', ['/End', '/TN', WINDOWS_TASK_NAME], { timeoutMs: 5_000, env }).catch(() => undefined);
-        if (pid && isPidAlive(pid)) {
-          await execText('taskkill', ['/PID', String(pid), '/T', '/F'], { timeoutMs: 5_000, env }).catch(() => undefined);
+        if (targetPid && isPidAlive(targetPid)) {
+          await execText('taskkill', ['/PID', String(targetPid), '/T', '/F'], { timeoutMs: 5_000, env }).catch(() => undefined);
         }
-      } else if (pid && isPidAlive(pid)) {
-        await runWindowsUserLaunch('taskkill.exe', `/PID ${pid} /T /F`).catch(() => undefined);
+      } else if (targetPid && isPidAlive(targetPid)) {
+        await runWindowsUserLaunch('taskkill.exe', `/PID ${targetPid} /T /F`).catch(() => undefined);
       }
     }
 
-    if (pid && isPidAlive(pid)) {
+    if (resolved.state === 'not_running') {
+      if (resolved.filePid !== null && !isPidAlive(resolved.filePid)) {
+        removeSafeContainedFile(stateDir, ['daemon.pid']);
+      }
+      return { ok: true };
+    }
+
+    if (resolved.state === 'mismatch') {
+      // Never signal an unrelated live process; clear confirmed-stale daemon.pid so START/RESTART/BIND can proceed.
+      if (resolved.mismatchedFilePid !== null && resolved.mismatchedFilePid === resolved.filePid) {
+        removeSafeContainedFile(stateDir, ['daemon.pid']);
+      }
+      return { ok: true };
+    }
+
+    if (resolved.state === 'unknown') {
+      // Never kill an unverified live PID; succeed only if the named service stop itself terminated it.
+      if (unverifiedPid !== null && isPidAlive(unverifiedPid)) {
+        return { ok: false, error: 'stop_failed' };
+      }
+      removeSafeContainedFile(stateDir, ['daemon.pid']);
+      return { ok: true };
+    }
+
+    if (targetPid && isPidAlive(targetPid)) {
       try {
         if (platform === 'darwin') {
           if (currentUid === 0) {
@@ -1540,20 +1678,20 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
               };
               await runMacosUserSessionCommand(macUser, {
                 executable: '/bin/kill',
-                args: ['-TERM', String(pid)],
+                args: ['-TERM', String(targetPid)],
               }, 5_000, async (file, args, timeoutMs) => {
                 const res = await execText(file, args, { timeoutMs, env });
                 return res.stdout;
               });
             }
           } else if (typeof user.uid !== 'number' || user.uid === currentUid) {
-            killProcess(pid, 'SIGTERM');
+            killProcess(targetPid, 'SIGTERM');
           }
         } else if (platform === 'linux') {
           if (currentUid === 0) {
             if (typeof user.uid === 'number') {
               const killBin = existsSync('/bin/kill') ? '/bin/kill' : 'kill';
-              await execText(killBin, ['-TERM', String(pid)], {
+              await execText(killBin, ['-TERM', String(targetPid)], {
                 timeoutMs: 5_000,
                 env: linuxUserServiceEnv(user, env, stateDir),
                 uid: user.uid,
@@ -1561,7 +1699,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
               });
             }
           } else if (typeof user.uid !== 'number' || user.uid === currentUid) {
-            killProcess(pid, 'SIGTERM');
+            killProcess(targetPid, 'SIGTERM');
           }
         }
       } catch {
@@ -1569,17 +1707,17 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       }
 
       const deadline = Date.now() + stopWaitMs;
-      while (Date.now() < deadline && isPidAlive(pid)) {
+      while (Date.now() < deadline && isPidAlive(targetPid)) {
         await sleep(100);
       }
     }
 
-    const stillAlive = pid !== null && isPidAlive(pid);
+    const stillAlive = targetPid !== null && isPidAlive(targetPid);
     if (!stillAlive) {
       removeSafeContainedFile(stateDir, ['daemon.pid']);
-      return true;
+      return { ok: true };
     }
-    return false;
+    return { ok: false, error: 'stop_failed' };
   }
 
   async function startUserDaemon(
@@ -1597,8 +1735,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       const paths = posixServicePathsForUser(user, env);
       const currentAutostart = (await detectAutostart(user, stateDir, runtime)) === REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED;
       const plist = renderMacosDaemonPlist(paths.launchAgentLabel, runtime, user, stateDir, currentAutostart, env.PATH);
-      writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.chown);
-      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.chown);
+      writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.fchown);
+      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.fchown);
       const serviceTarget = `gui/${user.uid}/${paths.launchAgentLabel}`;
       await execText(MACOS_LAUNCHCTL_PATH, ['bootout', serviceTarget], {
         timeoutMs: 5_000,
@@ -1622,7 +1760,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     }
 
     if (platform === 'linux') {
-      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.chown);
+      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.fchown);
       const userEnv = linuxUserServiceEnv(user, env, stateDir, runtime);
       const runOpts = currentUid === 0 && typeof user.uid === 'number'
         ? { timeoutMs: 8_000, env: userEnv, uid: user.uid, gid: user.gid ?? user.uid }
@@ -1635,14 +1773,14 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       if (systemdUsable) {
         const paths = posixServicePathsForUser(user, env);
         const unit = renderLinuxSystemdUnit(runtime, user, stateDir, userEnv.PATH);
-        writeOwnedFile(user.home, paths.systemdUnitRelParts, unit, user, currentUid, 0o644, false, deps.chown);
+        writeOwnedFile(user.home, paths.systemdUnitRelParts, unit, user, currentUid, 0o644, false, deps.fchown);
         await execText('systemctl', ['--user', 'daemon-reload'], runOpts);
         await execText('systemctl', ['--user', 'start', paths.systemdUnitName], runOpts);
         return;
       }
 
       // Container / headless / non-systemd fallback: spawn directly with target user's uid/gid, NEVER root.
-      ensureOwnedDir(stateDir, ['logs'], user, currentUid, 0o700, true, deps.chown);
+      ensureOwnedDir(stateDir, ['logs'], user, currentUid, 0o700, true, deps.fchown);
       const logPath = join(stateDir, 'daemon.log');
       try {
         const lst = lstatSync(logPath);
@@ -1656,8 +1794,10 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         0o600,
       );
       try {
+        const logSt = fstatSync(logFd);
+        if (!logSt.isFile()) throw new Error('unsafe_path');
         fchmodSync(logFd, 0o600);
-        applyPathOwnership(logPath, user, currentUid, deps.chown);
+        applyFdOwnership(logFd, user, currentUid, deps.fchown);
         spawnDetached(runtime.executable, runtime.foregroundArgs, {
           detached: true,
           cwd: user.home,
@@ -1672,7 +1812,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     }
 
     if (platform === 'win32') {
-      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.chown);
+      ensureOwnedDir(stateDir, [], user, currentUid, 0o700, true, deps.fchown);
       const argsLine = runtime.foregroundArgs.map(quoteWindowsArgument).join(' ');
       const currentName = (() => {
         try { return userInfo().username; } catch { return env.USERNAME || ''; }
@@ -1709,7 +1849,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       if (enabled) {
         if (!runtime) return { ok: false, statusCode: 409, error: 'not_installed' };
         const plist = renderMacosDaemonPlist(paths.launchAgentLabel, runtime, user, stateDir, true, env.PATH);
-        writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.chown);
+        writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.fchown);
         await execText(MACOS_LAUNCHCTL_PATH, ['enable', serviceTarget], { timeoutMs: 8_000, env })
           .catch(() => undefined);
         await execText(MACOS_LAUNCHCTL_PATH, ['bootstrap', `gui/${user.uid}`, paths.launchAgentPath], { timeoutMs: 8_000, env })
@@ -1718,7 +1858,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         // Clear RunAtLoad/KeepAlive without calling `launchctl disable`, keeping manual START/RESTART operable.
         if (runtime) {
           const plist = renderMacosDaemonPlist(paths.launchAgentLabel, runtime, user, stateDir, false, env.PATH);
-          writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.chown);
+          writeOwnedFile(user.home, paths.launchAgentRelParts, plist, user, currentUid, 0o644, false, deps.fchown);
         } else {
           const existing = readSafeSmallUtf8(user.home, paths.launchAgentRelParts);
           if (existing !== null) {
@@ -1730,7 +1870,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
               currentUid,
               0o644,
               false,
-              deps.chown,
+              deps.fchown,
             );
           }
         }
@@ -1747,7 +1887,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       if (enabled) {
         if (!runtime) return { ok: false, statusCode: 409, error: 'not_installed' };
         const unit = renderLinuxSystemdUnit(runtime, user, stateDir, userEnv.PATH);
-        writeOwnedFile(user.home, paths.systemdUnitRelParts, unit, user, currentUid, 0o644, false, deps.chown);
+        writeOwnedFile(user.home, paths.systemdUnitRelParts, unit, user, currentUid, 0o644, false, deps.fchown);
         try {
           await execText('systemctl', ['--user', 'daemon-reload'], runOpts);
           await execText('systemctl', ['--user', 'enable', paths.systemdUnitName], runOpts);
@@ -1775,7 +1915,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         if (!runtime) return { ok: false, statusCode: 409, error: 'not_installed' };
         const cmdArgs = runtime.foregroundArgs.map(quoteWindowsArgument).join(' ');
         const cmd = `@echo off\r\nstart "" /min ${quoteWindowsArgument(runtime.executable)} ${cmdArgs}\r\n`;
-        writeOwnedFile(user.home, startupRelParts, cmd, user, currentUid, 0o644, false, deps.chown);
+        writeOwnedFile(user.home, startupRelParts, cmd, user, currentUid, 0o644, false, deps.fchown);
       } else {
         removeSafeContainedFile(user.home, startupRelParts);
         await execText('schtasks', ['/Delete', '/TN', WINDOWS_TASK_NAME, '/F'], { timeoutMs: 5_000, env }).catch(() => undefined);
@@ -1893,7 +2033,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         null,
         2,
       );
-      writeOwnedFile(stateDir, ['server.json'], credsPayload, user, currentUid, 0o600, true, deps.chown);
+      writeOwnedFile(stateDir, ['server.json'], credsPayload, user, currentUid, 0o600, true, deps.fchown);
     } catch {
       if (ac.signal.aborted) {
         return { ok: false, statusCode: 504, error: 'bind_timeout' };
@@ -1904,8 +2044,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     }
 
     const stopped = await stopUserDaemon(user, stateDir);
-    if (!stopped) {
-      return { ok: false, statusCode: 500, error: 'stop_failed', status: await inspectStatus() };
+    if (!stopped.ok) {
+      return { ok: false, statusCode: 500, error: stopped.error ?? 'stop_failed', status: await inspectStatus() };
     }
     try {
       await startUserDaemon(user, stateDir, runtime);
@@ -1962,8 +2102,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
 
         if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP) {
           const stopped = await stopUserDaemon(user, stateDir);
-          if (!stopped) {
-            return { ok: false, statusCode: 500, error: 'stop_failed', status: await inspectStatus() };
+          if (!stopped.ok) {
+            return { ok: false, statusCode: 500, error: stopped.error ?? 'stop_failed', status: await inspectStatus() };
           }
           return { ok: true, statusCode: 200, status: await inspectStatus() };
         }
@@ -1973,8 +2113,16 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
           if (!readServerCredentials(stateDir)) {
             return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_BOUND };
           }
-          const pid = readPidFile(stateDir) ?? readSafeDaemonRuntimeStatus(stateDir)?.pid ?? null;
-          if (!pid || !isPidAlive(pid)) {
+          const resolved = await resolveDaemonProcess(stateDir, user);
+          if (resolved.state === 'unknown') {
+            return { ok: false, statusCode: 409, error: 'daemon_pid_unverified', status: await inspectStatus() };
+          }
+          if (resolved.state !== 'running') {
+            if (resolved.state === 'mismatch' && resolved.mismatchedFilePid !== null && resolved.mismatchedFilePid === resolved.filePid) {
+              removeSafeContainedFile(stateDir, ['daemon.pid']);
+            } else if (resolved.state === 'not_running' && resolved.filePid !== null) {
+              removeSafeContainedFile(stateDir, ['daemon.pid']);
+            }
             await startUserDaemon(user, stateDir, runtime);
           }
           return { ok: true, statusCode: 200, status: await inspectStatus() };
@@ -1986,8 +2134,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
             return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_BOUND };
           }
           const stopped = await stopUserDaemon(user, stateDir);
-          if (!stopped) {
-            return { ok: false, statusCode: 500, error: 'stop_failed', status: await inspectStatus() };
+          if (!stopped.ok) {
+            return { ok: false, statusCode: 500, error: stopped.error ?? 'stop_failed', status: await inspectStatus() };
           }
           await startUserDaemon(user, stateDir, runtime);
           return { ok: true, statusCode: 200, status: await inspectStatus() };

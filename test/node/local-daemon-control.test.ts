@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -517,7 +518,7 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
     expect(bindSymlink.ok).toBe(false);
     expect(readFileSync(outsideTarget, 'utf8')).toBe('ORIGINAL_OUTSIDE_CONTENT');
 
-    // Fail-closed chown rejection when running privileged (currentUid === 0)
+    // Fail-closed fchown rejection when running privileged (currentUid === 0)
     rmSync(join(stateDir, 'server.json'), { force: true });
     const ctlChownFail = createLocalDaemonController({
       platform: 'linux',
@@ -530,8 +531,8 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
       execText: safeExecText,
       killProcess: safeKillProcess,
       spawnDetached: safeSpawnDetached,
-      chown: () => {
-        throw Object.assign(new Error('chown EPERM'), { code: 'EPERM' });
+      fchown: () => {
+        throw Object.assign(new Error('fchown EPERM'), { code: 'EPERM' });
       },
       fetchImpl: (async () => new Response(JSON.stringify({ serverId: 'srv_x', token: 'tok_x' }), {
         status: 200,
@@ -542,6 +543,7 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
       bindUrl: 'https://app.example.test/bind/key1234',
     });
     expect(chownFailRes.ok).toBe(false);
+    expect(existsSync(join(stateDir, 'server.json'))).toBe(false);
   });
 
   it('F1+F3: never escalates failed macOS/Linux user stop to host root kill and aborts STOP/RESTART truthfully', async () => {
@@ -584,8 +586,9 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
       killProcess: (pid) => {
         rootKills.push(pid);
       },
-      execText: async (_file, args) => {
+      execText: async (file, args) => {
         startedCommands.push([...args]);
+        if (file === 'ps') return { stdout: '501 /opt/imcodes/bin/imcodes start --foreground\n', stderr: '' };
         if (args[0] === 'bootout') throw new Error('bootout failed');
         return { stdout: '', stderr: '' };
       },
@@ -608,7 +611,7 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
     expect(rootKills).toEqual([]);
     expect(startedCommands.some((args) => args[0] === 'bootstrap')).toBe(false);
 
-    // Linux: privileged stop uses /bin/kill with uid/gid drop, never host killProcess
+    // Linux: privileged stop uses /bin/kill with uid/gid drop on verified daemon PID, never host killProcess
     const linuxStateDir = join(root, 'lin-home', '.imcodes');
     mkdirSync(linuxStateDir, { recursive: true });
     writeFileSync(join(linuxStateDir, 'server.json'), JSON.stringify({
@@ -616,36 +619,46 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
       token: 'tok',
       workerUrl: 'https://app.example.test',
     }));
-    writeFileSync(join(linuxStateDir, 'daemon.pid'), '525252\n');
-    const linuxKillCalls: Array<{ file: string; args: readonly string[]; uid?: number; gid?: number }> = [];
-    let linuxAlive = true;
-    const ctlLin = createLocalDaemonController({
-      platform: 'linux',
-      env: {},
-      bundleDirs: [bundleDir],
-      currentUid: () => 0,
-      currentGid: () => 0,
-      activeUser: { platform: 'linux', username: 'bob', home: join(root, 'lin-home'), uid: 1001, gid: 1001 },
-      isPidAlive: () => linuxAlive,
-      killProcess: (pid) => {
-        rootKills.push(pid);
-      },
-      execText: async (file, args, opts) => {
-        if (file === '/bin/kill' || file === 'kill') {
-          linuxKillCalls.push({ file, args, uid: opts?.uid, gid: opts?.gid });
-          linuxAlive = false;
-        }
-        return { stdout: '', stderr: '' };
-      },
-      spawnDetached: safeSpawnDetached,
-      sleep: async () => {},
+    const realUid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+    const realGid = typeof process.getgid === 'function' ? process.getgid() : 1000;
+    const dummyDaemon = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)', 'imcodes-daemon-dummy'], {
+      stdio: 'ignore',
     });
-    const linStop = await ctlLin.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP);
-    expect(linStop.ok).toBe(true);
-    expect(rootKills).toEqual([]);
-    expect(linuxKillCalls).toHaveLength(1);
-    expect(linuxKillCalls[0]?.uid).toBe(1001);
-    expect(linuxKillCalls[0]?.gid).toBe(1001);
+    try {
+      const dummyPid = dummyDaemon.pid!;
+      writeFileSync(join(linuxStateDir, 'daemon.pid'), `${dummyPid}\n`);
+      const linuxKillCalls: Array<{ file: string; args: readonly string[]; uid?: number; gid?: number }> = [];
+      let linuxAlive = true;
+      const ctlLin = createLocalDaemonController({
+        platform: 'linux',
+        env: {},
+        bundleDirs: [bundleDir],
+        currentUid: () => 0,
+        currentGid: () => 0,
+        activeUser: { platform: 'linux', username: 'bob', home: join(root, 'lin-home'), uid: realUid, gid: realGid },
+        isPidAlive: () => linuxAlive,
+        killProcess: (pid) => {
+          rootKills.push(pid);
+        },
+        execText: async (file, args, opts) => {
+          if (file === '/bin/kill' || file === 'kill') {
+            linuxKillCalls.push({ file, args, uid: opts?.uid, gid: opts?.gid });
+            linuxAlive = false;
+          }
+          return { stdout: '', stderr: '' };
+        },
+        spawnDetached: safeSpawnDetached,
+        sleep: async () => {},
+      });
+      const linStop = await ctlLin.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP);
+      expect(linStop.ok).toBe(true);
+      expect(rootKills).toEqual([]);
+      expect(linuxKillCalls).toHaveLength(1);
+      expect(linuxKillCalls[0]?.uid).toBe(realUid);
+      expect(linuxKillCalls[0]?.gid).toBe(realGid);
+    } finally {
+      dummyDaemon.kill('SIGKILL');
+    }
   });
 
   it('F2: redacts JSON, quoted, KV, Bearer, and bind secrets while preserving benign words', () => {
@@ -895,5 +908,260 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
     const res = await ctlNoMocks.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP);
     expect(res.ok).toBe(false);
     expect(res.error).toBe('stop_failed');
+  });
+
+  it('F1-R2(a): resolves daemon PID identity (match/mismatch/unknown) consistently across status, START, STOP, RESTART, and BIND', async () => {
+    const root = makeTempDir();
+    const home = join(root, 'Users', 'alice');
+    const stateDir = join(home, '.imcodes');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'server.json'), JSON.stringify({
+      serverId: 'srv_id',
+      token: 'tok',
+      workerUrl: 'https://app.example.test',
+    }));
+    const bundleDir = createFakeBundle(join(root, 'mac'), '1.4.0', 'darwin');
+    const commands: string[][] = [];
+    const kills: number[] = [];
+    let psLine = '501 /usr/bin/sleep 60\n';
+
+    const makeMacCtl = (aliveFn: (pid: number) => boolean) => createLocalDaemonController({
+      platform: 'darwin',
+      env: {},
+      bundleDirs: [bundleDir],
+      currentUid: () => 501,
+      currentGid: () => 20,
+      activeUser: { platform: 'darwin', username: 'alice', home, uid: 501, gid: 20, tempDir: root },
+      isPidAlive: aliveFn,
+      killProcess: (pid) => { kills.push(pid); },
+      execText: async (file, args) => {
+        commands.push([file, ...args]);
+        if (file === 'ps') return { stdout: psLine, stderr: '' };
+        return { stdout: '', stderr: '' };
+      },
+      spawnDetached: safeSpawnDetached,
+      fetchImpl: (async () => new Response(JSON.stringify({ serverId: 'srv_new', token: 'tok_new' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch,
+      sleep: async () => {},
+    });
+
+    // 1) Mismatch: live unrelated process (sleep) at stale daemon.pid must NOT look running, must NOT be killed, and must NOT block START/RESTART/BIND
+    writeFileSync(join(stateDir, 'daemon.pid'), '424242\n');
+    const ctlMismatch = makeMacCtl((pid) => pid === 424242);
+    const mismatchStatus = await ctlMismatch.status();
+    expect(mismatchStatus.running).toBe(false);
+    expect(mismatchStatus.pid).toBeUndefined();
+
+    const startFromMismatch = await ctlMismatch.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START);
+    expect(startFromMismatch.ok).toBe(true);
+    expect(kills).toEqual([]);
+    expect(commands.some((c) => c[1] === 'bootstrap')).toBe(true);
+    expect(existsSync(join(stateDir, 'daemon.pid'))).toBe(false);
+
+    commands.length = 0;
+    writeFileSync(join(stateDir, 'daemon.pid'), '424242\n');
+    const restartFromMismatch = await ctlMismatch.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART);
+    expect(restartFromMismatch.ok).toBe(true);
+    expect(kills).toEqual([]);
+    expect(commands.some((c) => c[1] === 'bootstrap')).toBe(true);
+
+    // 2) Match positive control + fallback from dead/mismatched daemon.pid to live matching daemon-runtime.json PID
+    psLine = '501 /opt/imcodes/daemon-runtime/bin/node /opt/imcodes/package/dist/src/index.js start --foreground\n';
+    writeFileSync(join(stateDir, 'daemon.pid'), '999991\n'); // dead filePid
+    writeFileSync(join(stateDir, 'daemon-runtime.json'), JSON.stringify({
+      pid: 313131,
+      startedAt: Date.now() - 1_000,
+      updatedAt: Date.now(),
+      restartCount: 0,
+      serverLink: { state: 'connected', updatedAt: Date.now() },
+    }));
+    const ctlMatch = createLocalDaemonController({
+      platform: 'darwin',
+      env: {},
+      bundleDirs: [bundleDir],
+      currentUid: () => 501,
+      currentGid: () => 20,
+      activeUser: { platform: 'darwin', username: 'alice', home, uid: 501, gid: 20, tempDir: root },
+      isPidAlive: (pid) => pid === 313131,
+      killProcess: (pid) => { kills.push(pid); },
+      execText: async (file, args) => {
+        commands.push([file, ...args]);
+        if (file === 'ps') return { stdout: psLine, stderr: '' };
+        return { stdout: '', stderr: '' };
+      },
+      spawnDetached: safeSpawnDetached,
+      sleep: async () => {},
+    });
+    const matchStatus = await ctlMatch.status();
+    expect(matchStatus.running).toBe(true);
+    expect(matchStatus.pid).toBe(313131);
+
+    commands.length = 0;
+    const startWhenRunning = await ctlMatch.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START);
+    expect(startWhenRunning.ok).toBe(true);
+    expect(commands.some((c) => c[1] === 'bootstrap')).toBe(false);
+
+    // 3) Unknown: unverified live PID returns conservative diagnostic & blocks duplicate START without killing PID
+    writeFileSync(join(stateDir, 'daemon.pid'), '555555\n');
+    psLine = '';
+    commands.length = 0;
+    const ctlUnknown = makeMacCtl((pid) => pid === 555555);
+    const unknownStatus = await ctlUnknown.status();
+    expect(unknownStatus.running).toBe(false);
+    expect(unknownStatus.pid).toBeUndefined();
+    expect(unknownStatus.connectionState).toBe(REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.UNKNOWN);
+    expect(unknownStatus.lastError).toContain('daemon_pid_unverified');
+
+    const startUnknown = await ctlUnknown.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START);
+    expect(startUnknown.ok).toBe(false);
+    expect(startUnknown.statusCode).toBe(409);
+    expect(startUnknown.error).toBe('daemon_pid_unverified');
+    expect(commands.some((c) => c[1] === 'bootstrap')).toBe(false);
+
+    const stopUnknown = await ctlUnknown.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP);
+    expect(stopUnknown.ok).toBe(false);
+    expect(kills).toEqual([]);
+
+    // 4) Linux real /proc mismatch: current test node PID is alive & owned by user, NOT imcodes daemon
+    const linHome = join(root, 'lin-proc-home');
+    const linState = join(linHome, '.imcodes');
+    mkdirSync(linState, { recursive: true });
+    writeFileSync(join(linState, 'server.json'), JSON.stringify({
+      serverId: 'srv_lin_p',
+      token: 'tok',
+      workerUrl: 'https://app.example.test',
+    }));
+    writeFileSync(join(linState, 'daemon.pid'), `${process.pid}\n`);
+    const linSpawned: string[] = [];
+    const linBundle = createFakeBundle(join(root, 'lin-p'), '1.4.0', 'linux');
+    const ctlLinProc = createLocalDaemonController({
+      platform: 'linux',
+      env: {},
+      bundleDirs: [linBundle],
+      currentUid: () => process.getuid!(),
+      currentGid: () => process.getgid!(),
+      activeUser: { platform: 'linux', username: 'alice', home: linHome, uid: process.getuid!(), gid: process.getgid!() },
+      isPidAlive: (pid) => pid === process.pid,
+      execText: async (file, args) => {
+        if (file === 'systemctl' && args[1] === 'show-environment') throw new Error('no systemd');
+        return { stdout: '', stderr: '' };
+      },
+      killProcess: (pid) => { kills.push(pid); },
+      spawnDetached: (file) => { linSpawned.push(file); },
+    });
+    expect((await ctlLinProc.status()).running).toBe(false);
+    const linStartMismatch = await ctlLinProc.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START);
+    expect(linStartMismatch.ok).toBe(true);
+    expect(linSpawned).toHaveLength(1);
+    expect(kills).toEqual([]);
+  });
+
+  it('F1-R2(b): binds file/dir/log ownership to open validated fds and rejects tmp swap, log symlink, and runtime status symlink', async () => {
+    const root = makeTempDir();
+    const home = join(root, 'home');
+    const stateDir = join(home, '.imcodes');
+    mkdirSync(stateDir, { recursive: true });
+    const outsideTarget = join(root, 'outside-protected');
+    writeFileSync(outsideTarget, 'OUTSIDE_UNTOUCHED');
+    const bundleDir = createFakeBundle(join(root, 'b'), '1.5.0', 'linux');
+
+    // 1) Even if an external actor swaps the .tmp file inside stateDir for an outside symlink during fchown,
+    //    ownership is bound to the open fd (never outsideTarget) and rename aborts fail-closed.
+    const fchownFds: number[] = [];
+    let swapped = false;
+    const legacyChown = vi.fn();
+    const ctlSwap = createLocalDaemonController({
+      platform: 'linux',
+      env: {},
+      bundleDirs: [bundleDir],
+      currentUid: () => 0,
+      currentGid: () => 0,
+      activeUser: { platform: 'linux', username: 'alice', home, uid: process.getuid!(), gid: process.getgid!() },
+      isPidAlive: () => false,
+      execText: async () => ({ stdout: 'enabled', stderr: '' }),
+      killProcess: safeKillProcess,
+      spawnDetached: safeSpawnDetached,
+      chown: legacyChown,
+      fchown: (fd) => {
+        fchownFds.push(fd);
+        if (!swapped) {
+          const entries = readdirSync(stateDir);
+          const tmpName = entries.find((n) => n.startsWith('server.json.') && n.endsWith('.tmp'));
+          if (tmpName) {
+            swapped = true;
+            rmSync(join(stateDir, tmpName));
+            symlinkSync(outsideTarget, join(stateDir, tmpName));
+          }
+        }
+      },
+      fetchImpl: (async () => new Response(JSON.stringify({ serverId: 'srv_swap', token: 'tok_swap' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch,
+    });
+    const swapBind = await ctlSwap.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND, {
+      bindUrl: 'https://app.example.test/bind/key_swap_1',
+    });
+    expect(swapBind.ok).toBe(false);
+    expect(swapped).toBe(true);
+    expect(legacyChown).not.toHaveBeenCalled();
+    expect(readFileSync(outsideTarget, 'utf8')).toBe('OUTSIDE_UNTOUCHED');
+    expect(existsSync(join(stateDir, 'server.json'))).toBe(false);
+
+    // 2) Outside symlink on daemon-runtime.json must not bypass readSafeDaemonRuntimeStatus
+    const outsideRuntime = join(root, 'outside-runtime.json');
+    writeFileSync(outsideRuntime, JSON.stringify({
+      pid: 777777,
+      startedAt: Date.now() - 1000,
+      updatedAt: Date.now(),
+      restartCount: 0,
+      serverLink: { state: 'connected', updatedAt: Date.now(), lastError: 'LEAKED_OUTSIDE_RUNTIME' },
+    }));
+    symlinkSync(outsideRuntime, join(stateDir, 'daemon-runtime.json'));
+    const statusWithSymlinkRuntime = await ctlSwap.status();
+    expect(statusWithSymlinkRuntime.lastError).toBeUndefined();
+
+    // 3) Outside symlink on fallback daemon.log must abort START cleanly; valid daemon.log uses fd-bound fchown only
+    rmSync(join(stateDir, 'daemon-runtime.json'), { force: true });
+    writeFileSync(join(stateDir, 'server.json'), JSON.stringify({
+      serverId: 'srv_log',
+      token: 'tok',
+      workerUrl: 'https://app.example.test',
+    }));
+    symlinkSync(outsideTarget, join(stateDir, 'daemon.log'));
+    const fallbackFchownFds: number[] = [];
+    const fallbackSpawned: string[] = [];
+    const ctlLog = createLocalDaemonController({
+      platform: 'linux',
+      env: {},
+      bundleDirs: [bundleDir],
+      currentUid: () => 0,
+      currentGid: () => 0,
+      activeUser: { platform: 'linux', username: 'alice', home, uid: process.getuid!(), gid: process.getgid!() },
+      isPidAlive: () => false,
+      execText: async (file, args) => {
+        if (file === 'systemctl' && args[1] === 'show-environment') throw new Error('no systemd');
+        return { stdout: '', stderr: '' };
+      },
+      killProcess: safeKillProcess,
+      spawnDetached: (file) => { fallbackSpawned.push(file); },
+      chown: legacyChown,
+      fchown: (fd) => { fallbackFchownFds.push(fd); },
+    });
+    const logSymlinkStart = await ctlLog.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START);
+    expect(logSymlinkStart.ok).toBe(false);
+    expect(fallbackSpawned).toEqual([]);
+    expect(readFileSync(outsideTarget, 'utf8')).toBe('OUTSIDE_UNTOUCHED');
+
+    // Positive control: normal fallback log creation uses fd ownership and launches cleanly
+    rmSync(join(stateDir, 'daemon.log'), { force: true });
+    fallbackFchownFds.length = 0;
+    const logOkStart = await ctlLog.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START);
+    expect(logOkStart.ok).toBe(true);
+    expect(fallbackFchownFds.length).toBeGreaterThanOrEqual(1);
+    expect(legacyChown).not.toHaveBeenCalled();
+    expect(fallbackSpawned).toHaveLength(1);
   });
 });

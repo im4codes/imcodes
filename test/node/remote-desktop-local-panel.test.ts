@@ -19,6 +19,7 @@ import {
   loadRemoteDesktopAccessPaused,
   persistRemoteDesktopAccessPaused,
 } from '../../src/node/remote-desktop-access-state.js';
+import { renderLocalPanelPage } from '../../src/node/local-panel-page.js';
 import { startRemoteDesktopLocalPanel, type RemoteDesktopLocalPanel } from '../../src/node/remote-desktop-local-panel.js';
 
 const roots: string[] = [];
@@ -978,6 +979,159 @@ describe('local panel Coding Daemon endpoints and UI', () => {
     releaseBind();
     const settledBind = await hungBindPromise;
     expect(settledBind.status).toBe(200);
+  });
+
+  it('F3-R2: isolates UI busy state per domain across real DOM clicks and both completion orders', async () => {
+    const html = renderLocalPanelPage({
+      publicNodeId: '1234567890',
+      csrf: 'csrf-f3',
+      manageUrl: 'https://example.test/m',
+      shareUrl: 'https://example.test/s',
+    });
+
+    let paused = false;
+    let conns = [{ id: 'c1', label: 'Viewer', mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, connectedAt: Date.now() - 1000 }];
+    const actions: string[] = [];
+    let releaseBind: (() => void) | undefined;
+    let releaseRemote: (() => void) | undefined;
+    let holdBind = true;
+    let holdRemote = false;
+
+    const currentState = () => ({
+      publicNodeId: '1234567890',
+      paused,
+      connections: conns,
+      daemon: {
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      },
+    });
+
+    const waitUntil = async (fn: () => boolean) => {
+      for (let i = 0; i < 100 && !fn(); i += 1) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(fn()).toBe(true);
+    };
+
+    const dom = new JSDOM(html, {
+      url: 'http://127.0.0.1:43751/',
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(win) {
+        (win as unknown as { fetch: typeof fetch }).fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+          if (init?.method === 'POST') {
+            const body = JSON.parse(String(init.body)) as { action: string };
+            actions.push(body.action);
+            if (body.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && holdBind) {
+              await new Promise<void>((r) => { releaseBind = r; });
+              return new Response('{}', { status: 200 });
+            }
+            if (body.action === REMOTE_DESKTOP_LOCAL_ACTION.PAUSE) {
+              if (holdRemote) await new Promise<void>((r) => { releaseRemote = r; });
+              paused = true;
+              return new Response('{}', { status: 200 });
+            }
+            if (body.action === REMOTE_DESKTOP_LOCAL_ACTION.RESUME) {
+              if (holdRemote) await new Promise<void>((r) => { releaseRemote = r; });
+              paused = false;
+              return new Response('{}', { status: 200 });
+            }
+            if (body.action === REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL) {
+              conns = [];
+              return new Response('{}', { status: 200 });
+            }
+            return new Response('{}', { status: 200 });
+          }
+          return new Response(JSON.stringify(currentState()), { status: 200 });
+        }) as unknown as typeof fetch;
+      },
+    });
+
+    try {
+      const doc = dom.window.document;
+      await waitUntil(() => !(doc.getElementById('daemonCard') as HTMLElement).hidden);
+
+      const allowSwitch = doc.getElementById('allowSwitch') as HTMLButtonElement;
+      const stopAll = doc.getElementById('stopAll') as HTMLButtonElement;
+      const confirmAction = doc.getElementById('confirmAction') as HTMLButtonElement;
+      const daemonBindBtn = doc.getElementById('daemonBindBtn') as HTMLButtonElement;
+      const daemonBindInput = doc.getElementById('daemonBindInput') as HTMLInputElement;
+      const daemonBindForm = doc.getElementById('daemonBindForm') as HTMLFormElement;
+      const daemonStop = doc.getElementById('daemonStop') as HTMLButtonElement;
+      const daemonAutostartSwitch = doc.getElementById('daemonAutostartSwitch') as HTMLButtonElement;
+
+      // 1) Start a pending daemon BIND via real DOM form submission
+      daemonBindBtn.click();
+      daemonBindInput.value = 'https://app.example.test/bind/real_dom_key';
+      daemonBindForm.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND));
+
+      expect(daemonBindBtn.disabled).toBe(true);
+      expect(daemonStop.disabled).toBe(true);
+      expect(daemonAutostartSwitch.getAttribute('aria-busy')).toBe('true');
+      expect(allowSwitch.disabled).toBe(false);
+      expect(allowSwitch.getAttribute('aria-busy')).toBe('false');
+
+      // Duplicate daemon clicks during daemon busy are ignored
+      daemonStop.click();
+      daemonAutostartSwitch.click();
+      expect(actions).toEqual([REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND]);
+
+      // 2) Real Remote Desktop click (#allowSwitch) fires PAUSE immediately while BIND stays pending,
+      //    and PAUSE finishing first does NOT clear daemon busy state.
+      allowSwitch.click();
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_ACTION.PAUSE));
+      await waitUntil(() => paused && allowSwitch.getAttribute('aria-busy') === 'false');
+      expect(daemonBindBtn.disabled).toBe(true);
+      expect(daemonAutostartSwitch.getAttribute('aria-busy')).toBe('true');
+
+      // Also verify #stopAll -> #confirmAction works while BIND is still pending
+      stopAll.click();
+      confirmAction.click();
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL));
+      expect(daemonBindBtn.disabled).toBe(true);
+
+      releaseBind?.();
+      await waitUntil(() => !daemonBindBtn.disabled && daemonAutostartSwitch.getAttribute('aria-busy') === 'false');
+
+      // 3) Reverse completion order: BIND finishes while RESUME is still pending;
+      //    remote domain MUST remain busy and deduplicate duplicate #allowSwitch clicks until RESUME finishes.
+      actions.length = 0;
+      holdRemote = true;
+      daemonBindBtn.click();
+      daemonBindInput.value = 'https://app.example.test/bind/real_dom_key_2';
+      daemonBindForm.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND));
+
+      allowSwitch.click();
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_ACTION.RESUME));
+      expect(allowSwitch.getAttribute('aria-busy')).toBe('true');
+
+      releaseBind?.();
+      await waitUntil(() => !daemonBindBtn.disabled);
+      expect(allowSwitch.getAttribute('aria-busy')).toBe('true');
+
+      // Same-domain duplicate click while RESUME is pending must still be dropped
+      allowSwitch.click();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(actions.filter((a) => a === REMOTE_DESKTOP_LOCAL_ACTION.RESUME)).toHaveLength(1);
+
+      releaseRemote?.();
+      await waitUntil(() => !paused && allowSwitch.getAttribute('aria-busy') === 'false');
+    } finally {
+      releaseBind?.();
+      releaseRemote?.();
+      dom.window.close();
+    }
   });
 });
 
