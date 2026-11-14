@@ -3450,9 +3450,9 @@ html.native-ios-mac .chat-dl-btn {
 .voice-hold-hud-zone-edit .voice-hold-hud-atmosphere {
   background: linear-gradient(
     to top,
-    rgba(16, 14, 52, 0.92) 0%,
-    rgba(38, 32, 104, 0.72) 40%,
-    rgba(64, 48, 148, 0.28) 74%,
+    rgba(6, 42, 28, 0.92) 0%,
+    rgba(12, 82, 54, 0.72) 40%,
+    rgba(16, 118, 76, 0.28) 74%,
     transparent 100%
   );
 }
@@ -3498,13 +3498,13 @@ html.native-ios-mac .chat-dl-btn {
 }
 .voice-hold-hud-zone-edit .voice-hold-hud-aurora {
   background:
-    radial-gradient(ellipse 56% 62% at 62% 88%, rgba(99, 102, 241, 0.78) 0%, rgba(59, 130, 246, 0.38) 44%, transparent 74%),
-    radial-gradient(ellipse 42% 52% at 74% 94%, rgba(167, 139, 250, 0.46) 0%, transparent 70%),
-    radial-gradient(ellipse 36% 48% at 36% 94%, rgba(56, 189, 248, 0.3) 0%, transparent 70%);
+    radial-gradient(ellipse 56% 62% at 62% 88%, rgba(16, 185, 129, 0.80) 0%, rgba(34, 197, 94, 0.42) 44%, transparent 74%),
+    radial-gradient(ellipse 42% 52% at 74% 94%, rgba(110, 231, 183, 0.48) 0%, transparent 70%),
+    radial-gradient(ellipse 36% 48% at 36% 94%, rgba(74, 222, 128, 0.34) 0%, transparent 70%);
 }
 .voice-hold-hud-zone-edit .voice-hold-hud-aurora-core {
   background:
-    radial-gradient(ellipse 46% 58% at 60% 92%, rgba(129, 140, 248, 0.58) 0%, rgba(59, 130, 246, 0.28) 48%, transparent 78%);
+    radial-gradient(ellipse 46% 58% at 60% 92%, rgba(52, 211, 153, 0.62) 0%, rgba(16, 185, 129, 0.28) 48%, transparent 78%);
 }
 @keyframes voice-aurora-drift {
   0% { opacity: 0.88; scale: 1 0.96; }
@@ -3578,7 +3578,7 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 0 10px rgba(251, 113, 133, 0.5);
 }
 .voice-hold-hud-zone-edit .voice-hold-hud-bar {
-  box-shadow: 0 0 10px rgba(167, 139, 250, 0.5);
+  box-shadow: 0 0 10px rgba(110, 231, 183, 0.55);
 }
 .voice-hold-hud-transcript {
   position: relative;
@@ -3621,7 +3621,7 @@ html.native-ios-mac .chat-dl-btn {
   color: #fecaca;
 }
 .voice-hold-hud-active-hint.is-edit {
-  color: #ddd6fe;
+  color: #a7f3d0;
 }
 .voice-hold-hud-zones {
   position: relative;
@@ -3671,7 +3671,7 @@ html.native-ios-mac .chat-dl-btn {
   color: rgba(224, 242, 254, 0.8);
 }
 .voice-hold-zone-edit {
-  color: rgba(221, 214, 254, 0.72);
+  color: rgba(167, 243, 208, 0.74);
 }
 .voice-hold-zone-cancel.is-active {
   color: #ffffff;
@@ -3687,8 +3687,8 @@ html.native-ios-mac .chat-dl-btn {
 }
 .voice-hold-zone-edit.is-active {
   color: #ffffff;
-  background: radial-gradient(ellipse at center, rgba(139, 92, 246, 0.34) 0%, transparent 74%);
-  filter: drop-shadow(0 0 12px rgba(139, 92, 246, 0.55));
+  background: radial-gradient(ellipse at center, rgba(16, 185, 129, 0.36) 0%, transparent 74%);
+  filter: drop-shadow(0 0 12px rgba(52, 211, 153, 0.58));
   transform: scale(1.04);
 }
 .voice-streaming-robot-cursor {

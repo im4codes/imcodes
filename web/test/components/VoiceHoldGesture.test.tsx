@@ -966,6 +966,43 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.body.querySelector('.voice-hold-hud')).toBeNull();
   });
 
+  it('uses distinct emerald-green aurora palette for edit zone contrasting send (blue) and cancel (red)', () => {
+    const stylesPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/styles.css');
+    const css = readFileSync(stylesPath, 'utf8');
+    const readRule = (selector: string): string => {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const match = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+      expect(match, `missing CSS rule for ${selector}`).not.toBeNull();
+      return match![1];
+    };
+
+    const atmosphere = readRule('.voice-hold-hud-zone-edit .voice-hold-hud-atmosphere');
+    expect(atmosphere).toContain('rgba(6, 42, 28');
+    expect(atmosphere).toContain('rgba(16, 118, 76');
+
+    const aurora = readRule('.voice-hold-hud-zone-edit .voice-hold-hud-aurora');
+    expect(aurora).toContain('rgba(16, 185, 129');
+    expect(aurora).toContain('rgba(110, 231, 183');
+    expect(aurora).not.toContain('99, 102, 241');
+    expect(aurora).not.toContain('59, 130, 246');
+
+    const auroraCore = readRule('.voice-hold-hud-zone-edit .voice-hold-hud-aurora-core');
+    expect(auroraCore).toContain('rgba(52, 211, 153');
+
+    const bar = readRule('.voice-hold-hud-zone-edit .voice-hold-hud-bar');
+    expect(bar).toContain('rgba(110, 231, 183');
+
+    const activeHint = readRule('.voice-hold-hud-active-hint.is-edit');
+    expect(activeHint).toContain('#a7f3d0');
+
+    const zoneEdit = readRule('.voice-hold-zone-edit');
+    expect(zoneEdit).toContain('rgba(167, 243, 208');
+
+    const zoneEditActive = readRule('.voice-hold-zone-edit.is-active');
+    expect(zoneEditActive).toContain('rgba(16, 185, 129');
+    expect(zoneEditActive).toContain('rgba(52, 211, 153');
+  });
+
   it('disables animations/transitions under prefers-reduced-motion, fits all 7 locales safely, and stacks above isolated session activity strips in chromium', { timeout: 60000 }, async () => {
     vi.useRealTimers();
     const require = createRequire(import.meta.url);
