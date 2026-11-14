@@ -1564,4 +1564,57 @@ rl.on('line', (line) => {
     expect(betaEvents[0].detail?.meta?.agentName).toBe('Beta');
     expect(state.agyNativeToolOrder).toEqual([]);
   });
+
+  it('cancel() when !promptInFlight clears background tasks, open tool calls, and waiting status without a synthetic error', async () => {
+    const { provider } = await setup();
+    const id = await route(provider);
+    const completed: Array<{ content: string }> = [];
+    const errors: unknown[] = [];
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onComplete((_sid, msg) => completed.push({ content: msg.content }));
+    provider.onError((_sid, err) => errors.push(err));
+    provider.onStatus((_sid, status) => statuses.push({ status: status.status, label: status.label }));
+
+    await provider.send(id, 'warm');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    expect(state.promptInFlight).toBe(false);
+
+    // Simulate active background task + non-in-flight open tool call + waiting status.
+    (provider as any).updateAgyBackgroundTasks(id, state, {
+      text: `Tool is running as a background task with task id: ${nativeId}/task-stale-bg`,
+      toolName: 'run_command',
+    });
+    (provider as any).handleToolCall(id, state, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'orphan-tool-call',
+      title: 'Bash',
+      status: 'in_progress',
+    });
+    expect(state.promptInFlight).toBe(false);
+
+    await vi.waitFor(() => {
+      const snap = provider.getActiveWorkSnapshot(id);
+      expect(snap?.activeWorkCount).toBeGreaterThan(0);
+      expect(snap?.busyReasons).toContain('background_monitor');
+      expect(snap?.busyReasons).toContain('open_tool_call');
+    }, { timeout: 5000 });
+
+    await provider.cancel(id);
+
+    expect(errors).toHaveLength(0);
+    expect(state.agyBackgroundTasks?.size ?? 0).toBe(0);
+    expect(state.toolCalls.size).toBe(0);
+    expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(statuses.at(-1)).toEqual({ status: null, label: null });
+
+    await provider.send(id, 'follow up');
+    await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+  });
 });

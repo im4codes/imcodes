@@ -973,6 +973,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeDispatchProviderStarted = false;
         this._activeDispatchId = null;
         this._activeDispatchStaleRecoveryStarted = false;
+        if (hadLocalActiveTurn) this._cancelledProviderErrorsToIgnore = 0;
         // Provider completion is authoritative terminal evidence for the
         // foreground turn. Some SDKs can deliver the final assistant message
         // without a matching final tool event for every previously-running
@@ -5034,6 +5035,14 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
           if (this._activeDispatchId === dispatchId) {
             this._activeDispatchProviderStarted = true;
+            if (this._externalCompletionSettlementsToIgnore > 0) {
+              // Turn 2 is now starting on the provider. Any unconsumed
+              // external-completion ignore budget from a silent cancel() must
+              // not swallow the new turn's legitimate onComplete (or real
+              // errors), while preserving late-CANCELLED suppression.
+              this._cancelledProviderErrorsToIgnore += this._externalCompletionSettlementsToIgnore;
+              this._externalCompletionSettlementsToIgnore = 0;
+            }
           }
         },
       });

@@ -7339,6 +7339,110 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
+  it('external completion with silent provider.cancel() does not swallow turn 2 onComplete or wedge future turns', async () => {
+    let providerActive = false;
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: providerActive ? 1 : 0,
+      activeToolCount: providerActive ? 1 : 0,
+      busyReasons: providerActive ? ['open_tool_call', 'background_monitor'] : [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      providerActive = false;
+      // Intentionally silent: emits neither onComplete nor onError (e.g. AgyAcpProvider when !promptInFlight).
+      return Promise.resolve();
+    });
+
+    runtime.send('turn 1 with background task', 'cmd-t1');
+    await waitForProviderSendCount(mock.provider, 1);
+    providerActive = true;
+    (runtime as unknown as { _activeDispatchProviderStarted: boolean })._activeDispatchProviderStarted = false;
+    runtime.send('turn 2 queued while stale', 'cmd-t2');
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+    await waitForProviderSendCount(mock.provider, 2);
+
+    // Turn 2 completes normally: must NOT be swallowed by turn 1's _externalCompletionSettlementsToIgnore.
+    mock.fireComplete('sess-1', {
+      id: 'msg-t2',
+      role: 'assistant',
+      content: 'turn 2 response',
+      timestamp: Date.now(),
+    });
+    await flushDispatch();
+
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getHistory().some((m) => m.id === 'msg-t2' && m.content === 'turn 2 response')).toBe(true);
+
+    // Subsequent turn 3 dispatches immediately instead of queuing forever, and also settles cleanly.
+    expect(runtime.send('turn 3 fresh send', 'cmd-t3')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 3);
+    mock.fireComplete('sess-1', {
+      id: 'msg-t3',
+      role: 'assistant',
+      content: 'turn 3 response',
+      timestamp: Date.now(),
+    });
+    await flushDispatch();
+
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getHistory().some((m) => m.id === 'msg-t3' && m.content === 'turn 3 response')).toBe(true);
+  });
+
+  it('external completion with silent cancel() clears stale ignore before idle-later turn 2 without breaking late CANCELLED suppression or turn 3 cancel', async () => {
+    runtime.send('turn 1 stale without queued follow-up', 'cmd-idle-t1');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    // Turn 2 starts after session went idle, receives a late CANCELLED from turn 1 (must stay active),
+    // then finishes normally with onComplete (must settle to idle).
+    expect(runtime.send('turn 2 after idle', 'cmd-idle-t2')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'late cancellation from settled turn 1', recoverable: true });
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    mock.fireComplete('sess-1', {
+      id: 'msg-idle-t2',
+      role: 'assistant',
+      content: 'turn 2 settled',
+      timestamp: Date.now(),
+    });
+    await flushDispatch();
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+
+    // Even if turn 1 never emitted CANCELLED, turn 2 onComplete clears any leftover ignore budget so
+    // a genuine CANCELLED in turn 3 is handled normally rather than silently ignored.
+    runtime.send('turn 1 silent cancel again', 'cmd-t3-prep');
+    await waitForProviderSendCount(mock.provider, 3);
+    expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+    await flushDispatch();
+
+    expect(runtime.send('turn 2 completes without late cancelled', 'cmd-t3-mid')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 4);
+    mock.fireComplete('sess-1', { id: 'msg-t3-mid', role: 'assistant', content: 'ok', timestamp: Date.now() });
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    expect(runtime.send('turn 3 genuine provider cancel', 'cmd-t3-cancel')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 5);
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'turn 3 cancelled by provider', recoverable: true });
+    await flushDispatch();
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+  });
+
   it('recoverable provider errors drain pending messages into the next turn', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);

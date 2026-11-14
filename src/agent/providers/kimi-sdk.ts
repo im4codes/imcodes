@@ -1297,12 +1297,26 @@ export class KimiSdkProvider implements TransportProvider {
     }
     state.modelRevision++;
     state.stoppedByCancel = true;
+    const hadBackgroundOrOpenTools = (state.agyBackgroundTasks?.size ?? 0) > 0
+      || state.toolCalls.size > 0
+      || [...this.pendingApprovals.values()].some((approval) => approval.routeId === sessionId);
     this.closeAgyBridges(state);
-    if (!state.promptInFlight) return;
+    this.cancelPendingApprovals(sessionId);
+    if (!state.promptInFlight) {
+      state.toolCalls.clear();
+      state.emittedToolSignatures.clear();
+      for (const event of state.agySubagents?.interrupt() ?? []) {
+        for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+      }
+      if (hadBackgroundOrOpenTools) {
+        state.lastStatusSignature = null;
+        this.clearStatus(sessionId, state);
+      }
+      return;
+    }
     state.cancelled = true;
     const connection = this.connectionForState(state);
     if (!state.acpSessionId || !connection) return;
-    this.cancelPendingApprovals(sessionId);
     // `cancel` is a one-shot notification; the pending prompt() Promise or
     // autonomous `turn_completed` terminal will settle the captured run when
     // native work actually stops. Never fabricate physical stop proof locally.
