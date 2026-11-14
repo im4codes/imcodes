@@ -924,4 +924,174 @@ describe('mobile-navigation-gestures', () => {
 
     detach();
   });
+
+  it('keeps triggered and locked_out latches when surviving finger stays down on a detached target, including after move before adding another finger', () => {
+    const actions: string[] = [];
+    let currentPane = document.createElement('div');
+    currentPane.className = 'session-pane';
+    document.body.appendChild(currentPane);
+
+    const remount = () => {
+      currentPane.remove();
+      currentPane = document.createElement('div');
+      currentPane.className = 'session-pane';
+      document.body.appendChild(currentPane);
+    };
+
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (action) => {
+        actions.push(action);
+        remount();
+      },
+    });
+
+    // 1) Triggered latch across DOM unmount + direct 2nd finger add on new pane -> must NOT fire a 2nd action.
+    const pane0 = currentPane;
+    dispatchTouch(
+      pane0,
+      'touchstart',
+      [
+        { identifier: 0, clientX: 260, clientY: 300, target: pane0 },
+        { identifier: 1, clientX: 265, clientY: 350, target: pane0 },
+      ],
+      [
+        { identifier: 0, clientX: 260, clientY: 300, target: pane0 },
+        { identifier: 1, clientX: 265, clientY: 350, target: pane0 },
+      ],
+    );
+    dispatchTouch(
+      pane0,
+      'touchmove',
+      [
+        { identifier: 0, clientX: 180, clientY: 300, target: pane0 },
+        { identifier: 1, clientX: 185, clientY: 350, target: pane0 },
+      ],
+    );
+    dispatchTouch(
+      pane0,
+      'touchend',
+      [{ identifier: 1, clientX: 185, clientY: 350, target: pane0 }],
+      [{ identifier: 0, clientX: 180, clientY: 300, target: pane0 }],
+    );
+    expect(actions).toEqual(['tabPrev']);
+    expect(pane0.isConnected).toBe(false);
+
+    // Held finger 1 moves while its original target pane0 is detached, then finger 2 joins on pane1.
+    const pane1 = currentPane;
+    dispatchTouch(
+      window,
+      'touchmove',
+      [{ identifier: 1, clientX: 190, clientY: 355, target: pane0 }],
+      [{ identifier: 1, clientX: 190, clientY: 355, target: pane0 }],
+    );
+    dispatchTouch(
+      pane1,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 190, clientY: 355, target: pane0 },
+        { identifier: 2, clientX: 260, clientY: 400, target: pane1 },
+      ],
+      [{ identifier: 2, clientX: 260, clientY: 400, target: pane1 }],
+    );
+    dispatchTouch(
+      pane1,
+      'touchmove',
+      [
+        { identifier: 1, clientX: 110, clientY: 355, target: pane0 },
+        { identifier: 2, clientX: 180, clientY: 400, target: pane1 },
+      ],
+    );
+    dispatchTouch(
+      pane1,
+      'touchend',
+      [{ identifier: 1, clientX: 110, clientY: 355, target: pane0 }],
+      [{ identifier: 2, clientX: 180, clientY: 400, target: pane1 }],
+    );
+    expect(actions).toEqual(['tabPrev']);
+
+    // Lift held finger 1 cleanly, then verify 3-finger locked_out across DOM detach behaves the same way.
+    dispatchTouch(window, 'touchend', [], [{ identifier: 1, clientX: 110, clientY: 355, target: pane0 }]);
+
+    dispatchTouch(
+      pane1,
+      'touchstart',
+      [
+        { identifier: 0, clientX: 100, clientY: 300, target: pane1 },
+        { identifier: 1, clientX: 150, clientY: 300, target: pane1 },
+        { identifier: 2, clientX: 200, clientY: 300, target: pane1 },
+      ],
+      [{ identifier: 2, clientX: 200, clientY: 300, target: pane1 }],
+    );
+    remount();
+    const pane2 = currentPane;
+    expect(pane1.isConnected).toBe(false);
+
+    // Move remaining locked finger 1 on detached pane1, then lift others and add finger 3 on pane2.
+    dispatchTouch(
+      window,
+      'touchend',
+      [{ identifier: 1, clientX: 150, clientY: 300, target: pane1 }],
+      [
+        { identifier: 0, clientX: 100, clientY: 300, target: pane1 },
+        { identifier: 2, clientX: 200, clientY: 300, target: pane1 },
+      ],
+    );
+    dispatchTouch(
+      window,
+      'touchmove',
+      [{ identifier: 1, clientX: 160, clientY: 305, target: pane1 }],
+      [{ identifier: 1, clientX: 160, clientY: 305, target: pane1 }],
+    );
+    dispatchTouch(
+      pane2,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 160, clientY: 305, target: pane1 },
+        { identifier: 3, clientX: 210, clientY: 310, target: pane2 },
+      ],
+      [{ identifier: 3, clientX: 210, clientY: 310, target: pane2 }],
+    );
+    dispatchTouch(
+      pane2,
+      'touchmove',
+      [
+        { identifier: 1, clientX: 240, clientY: 305, target: pane1 },
+        { identifier: 3, clientX: 290, clientY: 310, target: pane2 },
+      ],
+    );
+    dispatchTouch(
+      pane2,
+      'touchend',
+      [{ identifier: 1, clientX: 240, clientY: 305, target: pane1 }],
+      [{ identifier: 3, clientX: 290, clientY: 310, target: pane2 }],
+    );
+    expect(actions).toEqual(['tabPrev']);
+
+    // Even if finger 1's final touchend was dropped, a brand new 2-finger simultaneous gesture on pane2 recovers.
+    dispatchTouch(
+      pane2,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 100, clientY: 300, target: pane2 },
+        { identifier: 2, clientX: 150, clientY: 300, target: pane2 },
+      ],
+      [
+        { identifier: 1, clientX: 100, clientY: 300, target: pane2 },
+        { identifier: 2, clientX: 150, clientY: 300, target: pane2 },
+      ],
+    );
+    dispatchTouch(
+      pane2,
+      'touchmove',
+      [
+        { identifier: 1, clientX: 180, clientY: 300, target: pane2 },
+        { identifier: 2, clientX: 230, clientY: 300, target: pane2 },
+      ],
+    );
+    dispatchTouch(pane2, 'touchend', []);
+    expect(actions).toEqual(['tabPrev', 'tabNext']);
+
+    detach();
+  });
 });

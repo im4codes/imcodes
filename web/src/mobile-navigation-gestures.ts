@@ -263,21 +263,31 @@ export class TwoFingerSwipeTracker {
   }
 
   private snapshotLockedTouches(event: TouchEventLike): void {
-    this.lockedTouches.clear();
+    const next = new Map<number, EventTarget | null>();
     for (let i = 0; i < event.touches.length; i++) {
       const point = event.touches[i];
       if (!point) continue;
-      this.lockedTouches.set(point.identifier, point.target ?? event.target ?? null);
+      const target = point.target ?? this.lockedTouches.get(point.identifier) ?? event.target ?? null;
+      next.set(point.identifier, target);
     }
+    this.lockedTouches = next;
   }
 
-  private hasDisconnectedLockedTarget(): boolean {
-    for (const target of this.lockedTouches.values()) {
-      if (
-        target
-        && typeof (target as Node).isConnected === 'boolean'
-        && !(target as Node).isConnected
-      ) {
+  private matchesLockedTouch(point: TouchPointSnapshot): boolean {
+    if (!this.lockedTouches.has(point.identifier)) {
+      return false;
+    }
+    const lockedTarget = this.lockedTouches.get(point.identifier) ?? null;
+    if (point.target && lockedTarget && point.target !== lockedTarget) {
+      return false;
+    }
+    return true;
+  }
+
+  private hasMatchingLockedTouch(touches: ArrayLike<TouchPointSnapshot>): boolean {
+    for (let i = 0; i < touches.length; i++) {
+      const point = touches[i];
+      if (point && this.matchesLockedTouch(point)) {
         return true;
       }
     }
@@ -288,17 +298,8 @@ export class TwoFingerSwipeTracker {
     if (event.changedTouches && event.changedTouches.length >= 2) {
       return true;
     }
-    if (this.hasDisconnectedLockedTarget()) {
-      return true;
-    }
     if (this.lockedTouches.size > 0) {
-      for (let i = 0; i < event.touches.length; i++) {
-        const point = event.touches[i];
-        if (point && this.lockedTouches.has(point.identifier)) {
-          return false;
-        }
-      }
-      return true;
+      return !this.hasMatchingLockedTouch(event.touches);
     }
     return false;
   }
@@ -458,7 +459,10 @@ export class TwoFingerSwipeTracker {
     if (this.phase !== 'tracking') {
       if (count > 2 && this.phase === 'idle') {
         this.enterStopPhase('locked_out', event);
-      } else if (this.hasDisconnectedLockedTarget()) {
+      } else if (
+        this.lockedTouches.size > 0
+        && !this.hasMatchingLockedTouch(event.touches)
+      ) {
         this.reset();
       }
       return null;
