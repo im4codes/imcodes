@@ -70,6 +70,8 @@ import {
   decodeRemoteDesktopMacosComponentSetPrefix,
   REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES,
   remoteDesktopMacosComponentSetFilename,
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
 } from '../../shared/remote-desktop-worker.js';
@@ -3255,5 +3257,151 @@ describe('ABI enrollment, download and old-peer fences (real PostgreSQL)', () =>
     const { app, ticket } = await abiTicketFixture(CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND);
     expect((await app.request(`/api/enroll/v2/download?${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${profile}`, { headers: { authorization: `Bearer ${ticket.ticket}` } })).status).toBe(400);
     expect(await db.queryOne('SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id=$1', [ticket.ticketId])).toEqual({ consumed_count: 0 });
+  });
+});
+
+describe('HEAD /api/enroll/v2/node-artifact', () => {
+  it('returns matching version/sha256/size headers and zero body bytes for node, remote-desktop-worker, and remote-desktop-macos-component-set', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+
+    const linuxExeBytes = Buffer.from('FAKE_LINUX_NODE_EXE');
+    await writeFile(join(exeDir, 'imcodes-node-linux'), linuxExeBytes);
+    await writeManifest('imcodes-node-linux', 'linux', 'x64', linuxExeBytes, '2026.7.1234-dev.5');
+    await writeRemoteDesktopRelease('2026.7.1234-dev.5');
+    const linuxWorkerBytes = Buffer.from('FAKE_LINUX_RD_WORKER');
+    const linuxWorkerDir = join(exeDir, 'remote-desktop-worker', REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    await mkdir(linuxWorkerDir, { recursive: true });
+    await writeFile(join(linuxWorkerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME), linuxWorkerBytes);
+    await writeFile(
+      join(linuxWorkerDir, `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+      JSON.stringify({
+        schemaVersion: 1,
+        artifact: {
+          fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+          os: 'linux',
+          arch: 'x64',
+          size: linuxWorkerBytes.length,
+          sha256: sha256(linuxWorkerBytes),
+        },
+        build: { source: 'ci', version: '2026.7.1234-dev.5' },
+      }),
+    );
+    await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
+    await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal', FAKE_BINARY, '2026.7.1234-dev.5');
+    await writeMacosRemoteDesktopRelease('arm64', '2026.7.1234-dev.6');
+
+    const enrollNode = async (os: string, arch: string) => {
+      const token = hex(16);
+      const serverId = hex(8);
+      await db.execute(
+        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+         VALUES ($1, $2, $3, $4, 'online', $5, $6, TRUE, $7, $8, $9)`,
+        [serverId, userId, `head-${os}-${arch}`, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, os, arch, generateControlledNodeId()],
+      );
+      return { serverId, token };
+    };
+    const linuxNode = await enrollNode('linux', 'x64');
+    const winNode = await enrollNode('win', 'x64');
+    const macNode = await enrollNode('mac', 'arm64');
+    const full = await owner(userId);
+
+    const cases = [
+      {
+        label: 'linux node',
+        path: `/api/enroll/v2/node-artifact?serverId=${linuxNode.serverId}&os=linux&arch=x64`,
+        headers: { authorization: `Bearer ${linuxNode.token}`, 'X-Server-Id': linuxNode.serverId },
+      },
+      {
+        label: 'linux remote-desktop-worker',
+        path: `/api/enroll/v2/node-artifact?serverId=${linuxNode.serverId}&os=linux&arch=x64&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+        headers: {
+          authorization: `Bearer ${linuxNode.token}`,
+          'X-Server-Id': linuxNode.serverId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+      {
+        label: 'win remote-desktop-worker (controlled)',
+        path: `/api/enroll/v2/node-artifact?serverId=${winNode.serverId}&os=win&arch=x64&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+        headers: {
+          authorization: `Bearer ${winNode.token}`,
+          'X-Server-Id': winNode.serverId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+      {
+        label: 'win remote-desktop-worker (full daemon)',
+        path: `/api/enroll/v2/node-artifact?serverId=${full.serverId}&os=win&arch=x64&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+        headers: {
+          authorization: `Bearer ${full.token}`,
+          'X-Server-Id': full.serverId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+      {
+        label: 'mac remote-desktop-macos-component-set',
+        path: `/api/enroll/v2/node-artifact?serverId=${macNode.serverId}&os=mac&arch=arm64&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`,
+        headers: {
+          authorization: `Bearer ${macNode.token}`,
+          'X-Server-Id': macNode.serverId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+    ];
+
+    for (const c of cases) {
+      const headRes = await app.request(c.path, { method: 'HEAD', headers: c.headers });
+      const getRes = await app.request(c.path, { method: 'GET', headers: c.headers });
+      expect(headRes.status, c.label).toBe(200);
+      expect(getRes.status, c.label).toBe(200);
+      expect(Buffer.from(await headRes.arrayBuffer()).byteLength, `${c.label} zero body`).toBe(0);
+      const getBody = Buffer.from(await getRes.arrayBuffer());
+      expect(getBody.byteLength, `${c.label} non-empty GET body`).toBeGreaterThan(0);
+      for (const headerName of [
+        CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION,
+        CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256,
+        CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES,
+        CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME,
+        'content-length',
+      ]) {
+        expect(headRes.headers.get(headerName), `${c.label} ${headerName}`).toBe(getRes.headers.get(headerName));
+      }
+    }
+  });
+
+  it('enforces 401/403/400/503 on HEAD identically to GET', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'head-auth-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+
+    const checkPair = async (path: string, headers: Record<string, string>, expectedStatus: number) => {
+      const headRes = await app.request(path, { method: 'HEAD', headers });
+      const getRes = await app.request(path, { method: 'GET', headers });
+      expect(headRes.status, path).toBe(expectedStatus);
+      expect(getRes.status, path).toBe(expectedStatus);
+      expect(Buffer.from(await headRes.arrayBuffer()).byteLength, path).toBe(0);
+      await getRes.arrayBuffer();
+    };
+
+    const validHeaders = { authorization: `Bearer ${token}`, 'X-Server-Id': serverId };
+    await checkPair(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64`, { authorization: 'Bearer wrong-token' }, 401);
+    await checkPair(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, validHeaders, 403);
+    await checkPair(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=arm64`, validHeaders, 400);
+    await rm(join(exeDir, 'remote-desktop-worker', REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR), { recursive: true, force: true });
+    await checkPair(
+      `/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+      { ...validHeaders, [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2' },
+      503,
+    );
   });
 });

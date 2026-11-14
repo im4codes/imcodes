@@ -1272,7 +1272,7 @@ describe('controlled node enrollment and runtime', () => {
     const refreshRemoteDesktopWorker = vi.fn(async () => ({
       updated: false,
       installedVersion: '2026.9.5113-dev.5644',
-      reason: 'worker_current',
+      reason: 'worker_not_available',
     }));
     const remoteDesktopWorker = {
       available: vi.fn(() => true),
@@ -1297,7 +1297,7 @@ describe('controlled node enrollment and runtime', () => {
     await vi.waitFor(() => {
       const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((message) => message.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
       expect(statuses).toContainEqual(expect.objectContaining({
-        phase: 'failed', installedVersion: '2026.9.5113-dev.5644', reason: 'worker_current',
+        phase: 'failed', installedVersion: '2026.9.5113-dev.5644', reason: 'worker_not_available',
       }));
       expect(statuses.find((message) => message.phase === 'failed')).not.toHaveProperty('targetVersion');
     });
@@ -1426,6 +1426,94 @@ describe('controlled node enrollment and runtime', () => {
     now += 10_000;
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
+  it('backs off automatic worker checks for 6 hours after worker_current without emitting failed alerts, keeps 5-minute retry on transient failure, and runs immediately on manual refresh', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    let nextResult: { updated: boolean; installedVersion?: string; targetVersion?: string; reason?: string } = {
+      updated: false,
+      reason: 'worker_not_available',
+    };
+    const refreshRemoteDesktopWorker = vi.fn(async () => nextResult);
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      refreshRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+
+    // Past 10s auth grace -> transient failure retries after 5 minutes (not before).
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((m) => m.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.some((m) => m.phase === 'failed' && m.reason === 'worker_not_available')).toBe(true);
+    });
+
+    now += 4 * 60_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(refreshRemoteDesktopWorker).toHaveBeenCalledTimes(1);
+
+    // At +5 minutes -> retries and confirms worker_current -> emits succeeded (no new failed alert).
+    nextResult = {
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    };
+    now += 60_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((m) => m.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.filter((m) => m.phase === 'failed')).toHaveLength(1);
+      expect(statuses).toContainEqual(expect.objectContaining({
+        phase: 'succeeded',
+        installedVersion: '2026.9.5113-dev.5644',
+        targetVersion: '2026.9.5113-dev.5644',
+        reason: 'worker_current',
+      }));
+    });
+
+    // After 5m, 1h, and 5h59m: still backed off (no polling).
+    for (const deltaMs of [5 * 60_000, 60 * 60_000, 5 * 60 * 60_000 - 6 * 60_000]) {
+      now += deltaMs;
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await Promise.resolve();
+      expect(refreshRemoteDesktopWorker).toHaveBeenCalledTimes(2);
+    }
+
+    // Passing the 6-hour mark triggers the next automatic check.
+    now += 2 * 60_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledTimes(3));
+
+    // Manual refresh request bypasses the 6-hour backoff immediately.
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((m) => m.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.filter((m) => m.phase === 'succeeded')).toHaveLength(2);
+    });
+    socket.emit('message', JSON.stringify({ type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledTimes(4));
     runtime.stop();
   });
 

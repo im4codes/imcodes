@@ -655,6 +655,72 @@ function readHeader(headers: Headers, name: string): string | null {
   return headers.get(name) ?? headers.get(name.toLowerCase()) ?? headers.get(name.toUpperCase());
 }
 
+function buildControlledNodeArtifactRequestHeaders(credential: ArtifactDownloadCredential): Record<string, string> {
+  return {
+    Authorization: `Bearer ${credential.token}`,
+    'X-Server-Id': credential.serverId,
+    [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
+  };
+}
+
+export type ControlledNodeArtifactMetadataProbe =
+  | {
+      status: 'ok';
+      version?: string;
+      sha256?: string;
+      sizeBytes?: number;
+      filename?: string;
+    }
+  | {
+      status: 'unsupported';
+      httpStatus: number;
+    }
+  | {
+      status: 'unavailable';
+      httpStatus: number;
+    };
+
+/**
+ * Lightweight HEAD precheck against `/api/enroll/v2/node-artifact` to inspect
+ * the hosted version/digest headers without streaming multi-megabyte payloads.
+ */
+export async function probeControlledNodeArtifactMetadata(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  asset?: typeof CONTROLLED_NODE_ARTIFACT_ASSETS[keyof typeof CONTROLLED_NODE_ARTIFACT_ASSETS];
+  fetchImpl?: typeof fetch;
+}): Promise<ControlledNodeArtifactMetadataProbe> {
+  const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
+  const response = await (input.fetchImpl ?? fetch)(
+    controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset),
+    {
+      method: 'HEAD',
+      headers: buildControlledNodeArtifactRequestHeaders(input.credential),
+    },
+  );
+  await response.body?.cancel().catch(() => {});
+  if (response.status === 404 || response.status === 405 || response.status === 501) {
+    return { status: 'unsupported', httpStatus: response.status };
+  }
+  if (!response.ok) {
+    return { status: 'unavailable', httpStatus: response.status };
+  }
+  const version = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim() || undefined;
+  const sha256Header = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  const sha256 = sha256Header && /^[0-9a-f]{64}$/.test(sha256Header) ? sha256Header : undefined;
+  const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const parsedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : undefined;
+  const sizeBytes = parsedSize !== undefined && Number.isSafeInteger(parsedSize) ? parsedSize : undefined;
+  const filename = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME)?.trim() || undefined;
+  return {
+    status: 'ok',
+    ...(version ? { version } : {}),
+    ...(sha256 ? { sha256 } : {}),
+    ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+    ...(filename ? { filename } : {}),
+  };
+}
+
 async function streamResponseBodyToFile(input: {
   response: Response;
   path: string;
@@ -772,11 +838,7 @@ async function downloadArtifact(input: {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
   await input.onProgress?.('artifact_request_started');
   const response = await input.fetchImpl(controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset), {
-    headers: {
-      Authorization: `Bearer ${input.credential.token}`,
-      'X-Server-Id': input.credential.serverId,
-      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
-    },
+    headers: buildControlledNodeArtifactRequestHeaders(input.credential),
   });
   if (!response.ok) throw new Error(`download_failed_${response.status}`);
   const abiProfile = normalizeControlledNodeAbiProfile(input.target.abiProfile);
@@ -1958,6 +2020,86 @@ export async function extractWindowsRemoteDesktopVirtualDisplay(
  * controlled-node executable, so a daemon whose own version is unchanged can
  * still receive a newer worker at an authenticated idle/reconnect boundary.
  */
+function evaluateWorkerVersionUpgrade(
+  installedVersion: string,
+  targetVersion: string,
+  artifactSha256?: string,
+): ControlledNodeRemoteDesktopWorkerRefreshResult | null {
+  const releaseOrder = compareImcodesVersions(installedVersion, targetVersion);
+  if (releaseOrder === null) {
+    return {
+      updated: false,
+      installedVersion,
+      targetVersion,
+      ...(artifactSha256 ? { artifactSha256 } : {}),
+      reason: 'worker_version_unparseable',
+    };
+  }
+  if (releaseOrder >= 0) {
+    return {
+      updated: false,
+      installedVersion,
+      targetVersion,
+      ...(artifactSha256 ? { artifactSha256 } : {}),
+      reason: releaseOrder === 0 ? 'worker_current' : 'worker_downgrade_rejected',
+    };
+  }
+  return null;
+}
+
+async function probeRemoteDesktopWorkerVersionFallback(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  platform: 'win32' | 'linux';
+  fetchImpl: typeof fetch;
+}): Promise<
+  | { status: 'ok'; targetVersion: string; sha256?: string }
+  | { status: 'unavailable' | 'error' }
+> {
+  const response = await input.fetchImpl(
+    controlledNodeArtifactUpgradeUrl(
+      input.credential,
+      input.target,
+      CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+    ),
+    {
+      headers: buildControlledNodeArtifactRequestHeaders(input.credential),
+    },
+  );
+  if (response.status === 404 || response.status === 409 || response.status === 503) {
+    await response.body?.cancel().catch(() => {});
+    return { status: 'unavailable' };
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    return { status: 'error' };
+  }
+  const shaHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  try {
+    const raw = JSON.parse(await response.text()) as unknown;
+    if (input.platform === 'win32') {
+      const manifest = validateRemoteDesktopWorkerManifest(raw);
+      if (!manifest) return { status: 'error' };
+      return {
+        status: 'ok',
+        targetVersion: manifest.workerVersion,
+        ...(manifest.sha256 ? { sha256: manifest.sha256 } : {}),
+      };
+    }
+    const manifest = validateRemoteDesktopLinuxWorkerManifest(raw);
+    if (!manifest) return { status: 'error' };
+    return {
+      status: 'ok',
+      targetVersion: manifest.build.version,
+      ...(manifest.artifact.sha256
+        ? { sha256: manifest.artifact.sha256 }
+        : (shaHeader && /^[0-9a-f]{64}$/.test(shaHeader) ? { sha256: shaHeader } : {})),
+    };
+  } catch {
+    return { status: 'error' };
+  }
+}
+
 export async function refreshControlledNodeRemoteDesktopWorker(
   input: ControlledNodeRemoteDesktopWorkerRefreshDeps,
 ): Promise<ControlledNodeRemoteDesktopWorkerRefreshResult> {
@@ -1993,26 +2135,64 @@ export async function refreshControlledNodeRemoteDesktopWorker(
     return { updated: false, reason: 'installed_manifest_missing' };
   }
 
+  const target = platform === 'win32'
+    ? { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 }
+    : { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 };
+  const customDownloader = platform === 'win32' ? input.downloadWindowsWorker : input.downloadLinuxWorker;
+  const fetchImpl = input.fetchImpl ?? fetch;
+  if (input.fetchImpl || !customDownloader) {
+    let precheckedVersion: string | undefined;
+    let precheckedSha256: string | undefined;
+    const probe = await probeControlledNodeArtifactMetadata({
+      credential: input.credential,
+      target,
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
+      fetchImpl,
+    });
+    if (probe.status === 'ok' && probe.version) {
+      precheckedVersion = probe.version;
+      precheckedSha256 = probe.sha256;
+    } else if (probe.status === 'unavailable') {
+      if (!customDownloader) {
+        return { updated: false, installedVersion, reason: 'worker_not_available' };
+      }
+    } else {
+      const manifestProbe = await probeRemoteDesktopWorkerVersionFallback({
+        credential: input.credential,
+        target,
+        platform,
+        fetchImpl,
+      });
+      if (manifestProbe.status === 'ok') {
+        precheckedVersion = manifestProbe.targetVersion;
+        precheckedSha256 = manifestProbe.sha256;
+      } else if (manifestProbe.status === 'unavailable' && !customDownloader) {
+        return { updated: false, installedVersion, reason: 'worker_not_available' };
+      }
+    }
+    if (precheckedVersion) {
+      const precheckResult = evaluateWorkerVersionUpgrade(installedVersion, precheckedVersion, precheckedSha256);
+      if (precheckResult) return precheckResult;
+    }
+  }
+
   const stagingRoot = await mkdtemp(join(root, '.remote-desktop-worker-refresh-'));
   const cleanup = async (): Promise<void> => {
     await rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
   };
   try {
-    const target = platform === 'win32'
-      ? { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 }
-      : { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 };
     const downloaded = platform === 'win32'
       ? await (input.downloadWindowsWorker ?? downloadControlledNodeRemoteDesktopWorker)({
         credential: input.credential,
         target,
         dir: stagingRoot,
-        fetchImpl: input.fetchImpl ?? fetch,
+        fetchImpl,
       })
       : await (input.downloadLinuxWorker ?? downloadControlledNodeLinuxRemoteDesktopWorker)({
         credential: input.credential,
         target,
         dir: stagingRoot,
-        fetchImpl: input.fetchImpl ?? fetch,
+        fetchImpl,
       });
     if (!downloaded) return { updated: false, installedVersion, reason: 'worker_not_available' };
     const targetManifest = JSON.parse(await readFile(downloaded.manifestPath, 'utf8')) as Record<string, unknown>;
@@ -2020,13 +2200,8 @@ export async function refreshControlledNodeRemoteDesktopWorker(
       ? validateRemoteDesktopWorkerManifest(targetManifest)?.workerVersion
       : validateRemoteDesktopLinuxWorkerManifest(targetManifest)?.build.version;
     if (!targetVersion || !installedVersion) return { updated: false, reason: 'worker_version_missing' };
-    const releaseOrder = compareImcodesVersions(installedVersion, targetVersion);
-    if (releaseOrder === null) {
-      return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: 'worker_version_unparseable' };
-    }
-    if (releaseOrder >= 0) {
-      return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: releaseOrder === 0 ? 'worker_current' : 'worker_downgrade_rejected' };
-    }
+    const versionCheck = evaluateWorkerVersionUpgrade(installedVersion, targetVersion, downloaded.sha256);
+    if (versionCheck) return versionCheck;
     if (platform === 'win32') {
       const target = validateRemoteDesktopWorkerManifest(targetManifest);
       if (!target || !installedSigner || target.authenticodeSignerSha256 !== installedSigner) {

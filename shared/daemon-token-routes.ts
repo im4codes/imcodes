@@ -16,7 +16,7 @@ import { CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from './controlled-node-artifac
 import { USAGE_INGEST_ROUTE_SUFFIX } from './usage-analytics.js';
 
 export const DAEMON_TOKEN_ROUTE_NOT_ALLOWED = 'daemon_token_route_not_allowed';
-export type DaemonHttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+export type DaemonHttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export interface DaemonTokenRoute {
   method: DaemonHttpMethod;
   path: string;
@@ -65,6 +65,7 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('POST', '/api/embedding'),
   full('GET', '/api/machines'),
   full('GET', CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH),
+  full('HEAD', CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH),
   full('POST', '/api/machine/exec'),
   full('POST', '/api/machine/computer-use'),
   full('POST', `${server}/machine-direct-upload`),

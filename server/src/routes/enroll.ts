@@ -1575,11 +1575,13 @@ function buildMacosRemoteDesktopComponentSetStream(
 }
 
 /**
- * GET /api/enroll/v2/node-artifact — runtime self-upgrade download for an
- * already-enrolled controlled node. Auth uses the node's existing server token;
- * no user cookie, enrollment ticket, or fresh browser flow is required.
+ * GET / HEAD /api/enroll/v2/node-artifact — runtime self-upgrade download (and
+ * lightweight metadata precheck) for an already-enrolled controlled node. Auth
+ * uses the node's existing server token; no user cookie, enrollment ticket, or
+ * fresh browser flow is required.
  */
-enrollRoutes.get('/v2/node-artifact', async (c) => {
+enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
+  const isHead = c.req.method === 'HEAD';
   if (c.req.header('range')) {
     c.header('Content-Range', 'bytes */0');
     return c.body(null as unknown as ArrayBuffer, 416);
@@ -1742,6 +1744,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedReleaseManifest.sizeBytes));
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedReleaseManifest.filename);
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedReleaseManifest.version);
+    if (isHead) {
+      await openedReleaseManifest.close();
+      return c.body(null, 200);
+    }
     return c.body(buildBufferArtifactStream(openedReleaseManifest.bytes, openedReleaseManifest.close) as unknown as ReadableStream, 200);
   }
   if (isDaemonRuntimeArtifactAsset(asset)) {
@@ -1773,6 +1779,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     if (openedRuntime.releaseManifestSha256) {
       c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256, openedRuntime.releaseManifestSha256);
     }
+    if (isHead) {
+      await openedRuntime.close();
+      return c.body(null, 200);
+    }
     const stream = openedRuntime.bytes
       ? buildBufferArtifactStream(openedRuntime.bytes, openedRuntime.close)
       : buildBareArtifactStream(openedRuntime.handle!, openedRuntime.sizeBytes, openedRuntime.close);
@@ -1796,6 +1806,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, opened.sha256);
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(opened.sizeBytes));
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, opened.filename);
+    if (isHead) {
+      await opened.close();
+      return c.body(null, 200);
+    }
     return c.body(buildBareArtifactStream(opened.handle, opened.sizeBytes, opened.close) as unknown as ReadableStream, 200);
   }
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER) {
@@ -1811,6 +1825,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedHelper.sha256);
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedHelper.sizeBytes));
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedHelper.filename);
+    if (isHead) {
+      await openedHelper.close();
+      return c.body(null, 200);
+    }
     return c.body(buildBareArtifactStream(openedHelper.handle, openedHelper.sizeBytes, openedHelper.close) as unknown as ReadableStream, 200);
   }
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET) {
@@ -1848,6 +1866,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedSet.sizeBytes));
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedSet.filename);
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedSet.manifest.workerVersion);
+    if (isHead) {
+      await openedSet.close();
+      return c.body(null, 200);
+    }
     return c.body(
       buildMacosRemoteDesktopComponentSetStream(openedSet) as unknown as ReadableStream,
       200,
@@ -1908,6 +1930,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedWorker.sizeBytes));
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedWorker.filename);
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedWorker.version);
+    if (isHead) {
+      await openedWorker.close();
+      return c.body(null, 200);
+    }
     const stream = openedWorker.bytes
       ? buildBufferArtifactStream(openedWorker.bytes, openedWorker.close)
       : buildBareArtifactStream(openedWorker.handle!, openedWorker.sizeBytes, openedWorker.close);
@@ -1957,8 +1983,8 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
       nodeReleaseManifestSha256 = releaseCheck.sha256;
     }
   }
-  const opened = await artifactCatalog.openPinned(dir, v.descriptor);
-  if (!opened) {
+  const opened = isHead ? null : await artifactCatalog.openPinned(dir, v.descriptor);
+  if (!isHead && !opened) {
     artifactCatalog.invalidate(dir, artifactTarget.os, artifactTarget.arch, abiProfile);
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
@@ -1983,6 +2009,9 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
       CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
       v.descriptor.authenticodeSignerSha256,
     );
+  }
+  if (isHead || !opened) {
+    return c.body(null, 200);
   }
   return c.body(buildBareArtifactStream(opened.handle, v.descriptor.sizeBytes, opened.close) as unknown as ReadableStream, 200);
 });

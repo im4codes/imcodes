@@ -43,6 +43,7 @@ import {
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
   withArtifactDownloadRetries,
+  probeControlledNodeArtifactMetadata,
 } from '../../src/node/self-upgrade.js';
 import {
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
@@ -2370,5 +2371,289 @@ describe('self-upgrade ABI fence', () => {
     } })) as typeof fetch });
     expect(result).toBeDefined();
     expect(JSON.parse(await readFile(`${result!.artifactPath}.manifest.json`, 'utf8')).artifact.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+  });
+});
+
+describe('refreshControlledNodeRemoteDesktopWorker lightweight precheck', () => {
+  it('skips downloading the Linux worker binary when HEAD confirms worker_current or older version', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-head-linux-'));
+    dirs.push(root);
+    const workerDir = join(root, 'remote-desktop-worker', REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    await mkdir(workerDir, { recursive: true });
+    const workerBytes = Buffer.from('installed-linux-worker');
+    const workerPath = join(workerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    await writeFile(workerPath, workerBytes, { mode: 0o755 });
+    await writeFile(`${workerPath}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        os: 'linux',
+        arch: 'x64',
+        size: workerBytes.length,
+        sha256: createHash('sha256').update(workerBytes).digest('hex'),
+      },
+      build: { source: 'ci', version: '2026.9.5113-dev.5644' },
+    }));
+
+    const requests: Array<{ method: string; asset: string | null }> = [];
+    const downloadLinuxWorker = vi.fn();
+    const currentFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      requests.push({ method: init?.method ?? 'GET', asset: url.searchParams.get('asset') });
+      return new Response(null, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.5113-dev.5644',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: 'a'.repeat(64),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: '8000000',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        },
+      });
+    }) as typeof fetch;
+
+    const currentResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: currentFetch,
+      downloadLinuxWorker,
+    });
+    expect(currentResult).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    });
+    expect(requests).toEqual([{ method: 'HEAD', asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER }]);
+    expect(downloadLinuxWorker).not.toHaveBeenCalled();
+
+    const olderFetch = vi.fn(async () => new Response(null, {
+      status: 200,
+      headers: { [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.5000-dev.1' },
+    })) as typeof fetch;
+    const downgradeResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: olderFetch,
+      downloadLinuxWorker,
+    });
+    expect(downgradeResult).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5000-dev.1',
+      reason: 'worker_downgrade_rejected',
+    });
+    expect(downloadLinuxWorker).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the tiny manifest JSON when HEAD returns 405 and still skips the binary download when current, then upgrades when newer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-fallback-linux-'));
+    dirs.push(root);
+    const workerDir = join(root, 'remote-desktop-worker', REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    await mkdir(workerDir, { recursive: true });
+    const oldBytes = Buffer.from('old-linux-worker');
+    const oldPath = join(workerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    await writeFile(oldPath, oldBytes, { mode: 0o755 });
+    await writeFile(`${oldPath}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        os: 'linux',
+        arch: 'x64',
+        size: oldBytes.length,
+        sha256: createHash('sha256').update(oldBytes).digest('hex'),
+      },
+      build: { source: 'ci', version: '2026.9.5113-dev.5644' },
+    }));
+
+    const seenAssets: string[] = [];
+    const fallbackFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const asset = url.searchParams.get('asset') ?? '';
+      seenAssets.push(`${init?.method ?? 'GET'}:${asset}`);
+      if ((init?.method ?? 'GET') === 'HEAD') {
+        return new Response(null, { status: 405 });
+      }
+      if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST) {
+        const body = JSON.stringify({
+          schemaVersion: 1,
+          artifact: {
+            fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+            os: 'linux',
+            arch: 'x64',
+            size: oldBytes.length,
+            sha256: createHash('sha256').update(oldBytes).digest('hex'),
+          },
+          build: { source: 'ci', version: '2026.9.5113-dev.5644' },
+        });
+        return new Response(body, { status: 200 });
+      }
+      throw new Error(`unexpected binary download for ${asset}`);
+    }) as typeof fetch;
+
+    const currentResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: fallbackFetch,
+    });
+    expect(currentResult).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    });
+    expect(seenAssets).toEqual([
+      `HEAD:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+      `GET:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST}`,
+    ]);
+
+    const newBytes = Buffer.from('new-linux-worker-binary');
+    const newManifest = JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        os: 'linux',
+        arch: 'x64',
+        size: newBytes.length,
+        sha256: createHash('sha256').update(newBytes).digest('hex'),
+      },
+      build: { source: 'ci', version: '2026.10.5371-dev.5816' },
+    });
+    const upgradeAssets: string[] = [];
+    const upgradeFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const asset = url.searchParams.get('asset') ?? '';
+      upgradeAssets.push(`${init?.method ?? 'GET'}:${asset}`);
+      if ((init?.method ?? 'GET') === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: { [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.10.5371-dev.5816' },
+        });
+      }
+      if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER) {
+        return new Response(newBytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(newBytes).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(newBytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.10.5371-dev.5816',
+          },
+        });
+      }
+      if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST) {
+        return new Response(newManifest, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(newManifest).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(Buffer.byteLength(newManifest)),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.10.5371-dev.5816',
+          },
+        });
+      }
+      throw new Error(`unexpected asset ${asset}`);
+    }) as typeof fetch;
+
+    const upgradeResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: upgradeFetch,
+    });
+    expect(upgradeResult).toMatchObject({
+      updated: true,
+      installedVersion: '2026.10.5371-dev.5816',
+      targetVersion: '2026.10.5371-dev.5816',
+    });
+    expect(upgradeAssets).toEqual([
+      `HEAD:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+      `GET:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+      `GET:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST}`,
+    ]);
+    expect(await readFile(oldPath, 'utf8')).toBe('new-linux-worker-binary');
+  });
+
+  it('skips downloading Windows worker and virtual-display archives when HEAD or manifest confirms worker_current', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-head-win-'));
+    dirs.push(root);
+    const workerDir = join(root, 'remote-desktop-worker', 'win32-x64');
+    await mkdir(workerDir, { recursive: true });
+    const workerBytes = Buffer.from('installed-win-worker');
+    const vdBytes = Buffer.from('installed-vd-zip');
+    await writeFile(join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME), workerBytes);
+    await writeFile(
+      join(workerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+      JSON.stringify({
+        manifestVersion: 2,
+        workerVersion: '2026.9.5113-dev.5644',
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ipcVersion: 1,
+        os: 'win32',
+        arch: 'x64',
+        fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+        size: workerBytes.length,
+        sha256: createHash('sha256').update(workerBytes).digest('hex'),
+        authenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+        libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+        virtualDisplay: {
+          archiveFileName: 'imcodes-virtual-display.zip',
+          packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+          size: vdBytes.length,
+          sha256: createHash('sha256').update(vdBytes).digest('hex'),
+        },
+        toolchain: {
+          msvc: '14.44',
+          windowsSdk: '10.0.26100.0',
+          cmake: 'not-used-gn',
+          ninja: '1.13.1',
+          depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+        },
+      }),
+    );
+
+    const downloadWindowsWorker = vi.fn();
+    const methods: string[] = [];
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      methods.push(init?.method ?? 'GET');
+      return new Response(null, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.5113-dev.5644',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(workerBytes).digest('hex'),
+        },
+      });
+    }) as typeof fetch;
+
+    const result = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'win32',
+      arch: 'x64',
+      root,
+      fetchImpl,
+      downloadWindowsWorker,
+    });
+    expect(result).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    });
+    expect(methods).toEqual(['HEAD']);
+    expect(downloadWindowsWorker).not.toHaveBeenCalled();
+
+    const probe501 = await probeControlledNodeArtifactMetadata({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
+      fetchImpl: vi.fn(async () => new Response(null, { status: 501 })) as typeof fetch,
+    });
+    expect(probe501).toEqual({ status: 'unsupported', httpStatus: 501 });
   });
 });
