@@ -367,6 +367,61 @@ jobs:
       - name: Qualify signed Windows self-upgrade and rollback
         if: runner.os == 'Windows'
         run: npx tsx scripts/qualify-windows-self-upgrade.ts
+      - name: Build, verify and smoke-test POSIX daemon-runtime bundle
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGET="darwin-arm64"
+          else
+            TARGET="linux-x64"
+          fi
+          node scripts/build-daemon-runtime.mjs \
+            --target "$TARGET" \
+            --out-dir dist-node-exe/daemon-runtime \
+            --build-version "$IMCODES_BUILD_VERSION"
+          node scripts/daemon-runtime-artifacts.mjs verify \
+            "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.manifest.json" \
+            --expected-version "$IMCODES_BUILD_VERSION"
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-smoke.XXXXXX")"
+          HOME_ROOT="$(mkdtemp -d "${RUNNER_TEMP}/daemon-runtime-home.XXXXXX")"
+          trap 'chmod -R u+w "$SMOKE_ROOT" 2>/dev/null || true; rm -rf "$SMOKE_ROOT" "$HOME_ROOT"' EXIT
+          tar -xzf "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.tar.gz" -C "$SMOKE_ROOT"
+          chmod -R a-w "$SMOKE_ROOT"
+          env -i HOME="$HOME_ROOT" IMCODES_HOME="$HOME_ROOT/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+            "$SMOKE_ROOT/bin/node" "$SMOKE_ROOT/package/dist/src/index.js" --version
+      - name: Build, verify and smoke-test Windows daemon-runtime bundle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          node scripts/build-daemon-runtime.mjs `
+            --target win32-x64 `
+            --out-dir dist-node-exe/daemon-runtime `
+            --build-version $env:IMCODES_BUILD_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime build failed.' }
+          node scripts/daemon-runtime-artifacts.mjs verify `
+            dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.manifest.json `
+            --expected-version $env:IMCODES_BUILD_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime manifest verification failed.' }
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-smoke'
+          $homeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-home'
+          Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $homeRoot | Out-Null
+          try {
+            Expand-Archive -LiteralPath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' -DestinationPath $smokeRoot -Force
+            & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath (Join-Path $smokeRoot 'node.exe') -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+            $prevHome = $env:IMCODES_HOME
+            $env:IMCODES_HOME = Join-Path $homeRoot '.imcodes'
+            try {
+              & (Join-Path $smokeRoot 'node.exe') (Join-Path $smokeRoot 'package\dist\src\index.js') --version
+              if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke execution failed.' }
+            } finally {
+              $env:IMCODES_HOME = $prevHome
+            }
+          } finally {
+            Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
       - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
@@ -378,6 +433,7 @@ jobs:
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
             dist-node-exe/aidesk-local-ui/**
+            dist-node-exe/daemon-runtime/**
           if-no-files-found: error
           retention-days: 30
       - name: Remove macOS release-signing material
