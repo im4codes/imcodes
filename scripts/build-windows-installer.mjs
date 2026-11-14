@@ -489,6 +489,36 @@ function Write-TextAtomic([string]$TargetPath, [string]$Content, [System.Text.En
   }
 }
 
+function Remove-PathSafely([string]$TargetPath) {
+  if ([string]::IsNullOrWhiteSpace($TargetPath) -or -not (Test-Path -LiteralPath $TargetPath)) { return }
+  $item = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+  if (-not $item) { return }
+  if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    if ($item.PSIsContainer) {
+      [System.IO.Directory]::Delete($TargetPath, $false)
+    } else {
+      [System.IO.File]::Delete($TargetPath)
+    }
+    return
+  }
+  Remove-Item -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function New-WindowsReparsePoint([string]$Kind, [string]$LinkPath, [string]$TargetPath) {
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    if ($Kind -eq 'junction') {
+      & cmd.exe /c mklink /J "$LinkPath" "$TargetPath" 2>&1 | Out-Null
+    } else {
+      & cmd.exe /c mklink "$LinkPath" "$TargetPath" 2>&1 | Out-Null
+    }
+    return $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prevEap
+  }
+}
+
 function Invoke-ServiceAction([string]$Action, [hashtable]$Payload) {
   if (-not [string]::IsNullOrWhiteSpace($ServiceHookScript)) {
     $jsonArg = ($Payload | ConvertTo-Json -Compress -Depth 5)
@@ -567,7 +597,8 @@ function Save-RollbackSnapshot($Plan) {
     $item = Get-Item -LiteralPath $tp -Force
     if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
       $target = if ($item.Target) { [string]$item.Target[0] } else { '' }
-      $entries += [ordered]@{ kind = 'junction'; originalPath = $tp; target = $target }
+      $reparseKind = if ($item.PSIsContainer) { 'junction' } else { 'symlink' }
+      $entries += [ordered]@{ kind = $reparseKind; originalPath = $tp; target = $target }
     } elseif ($item.PSIsContainer) {
       $idx++
       $rel = Join-Path 'files' ("$idx-" + $item.Name)
@@ -735,10 +766,7 @@ if ($Mode -eq 'Rollback') {
     }
     if ($entry.kind -eq 'absent') {
       if (Test-Path -LiteralPath $entry.originalPath) {
-        if ((Get-Item -LiteralPath $entry.originalPath -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-          cmd /c rmdir "$($entry.originalPath)" 2>$null | Out-Null
-        }
-        Remove-Item -LiteralPath $entry.originalPath -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-PathSafely $entry.originalPath
         $removed++
       }
     } elseif ($entry.kind -eq 'file') {
@@ -748,27 +776,21 @@ if ($Mode -eq 'Rollback') {
       if (Test-Path -LiteralPath $entry.originalPath) {
         $ei = Get-Item -LiteralPath $entry.originalPath -Force -ErrorAction SilentlyContinue
         if ($ei -and ($ei.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-          Remove-Item -LiteralPath $entry.originalPath -Force
+          Remove-PathSafely $entry.originalPath
         }
       }
       Copy-Item -LiteralPath $backupAbs -Destination $entry.originalPath -Force
       $restored++
     } elseif ($entry.kind -eq 'dir') {
-      if (Test-Path -LiteralPath $entry.originalPath) {
-        cmd /c rmdir "$($entry.originalPath)" 2>$null | Out-Null
-        Remove-Item -LiteralPath $entry.originalPath -Recurse -Force -ErrorAction SilentlyContinue
-      }
+      Remove-PathSafely $entry.originalPath
       $backupAbs = Join-Path $snap.snapshotDir $entry.backupRelPath
       New-Item -ItemType Directory -Force -Path (Split-Path -Parent $entry.originalPath) | Out-Null
       Copy-Item -LiteralPath $backupAbs -Destination $entry.originalPath -Recurse -Force
       $restored++
-    } elseif ($entry.kind -eq 'junction') {
-      if (Test-Path -LiteralPath $entry.originalPath) {
-        cmd /c rmdir "$($entry.originalPath)" 2>$null | Out-Null
-        Remove-Item -LiteralPath $entry.originalPath -Recurse -Force -ErrorAction SilentlyContinue
-      }
+    } elseif ($entry.kind -eq 'junction' -or $entry.kind -eq 'symlink') {
+      Remove-PathSafely $entry.originalPath
       New-Item -ItemType Directory -Force -Path (Split-Path -Parent $entry.originalPath) | Out-Null
-      cmd /c mklink /J "$($entry.originalPath)" "$($entry.target)" | Out-Null
+      [void](New-WindowsReparsePoint $entry.kind $entry.originalPath $entry.target)
       $restored++
     }
   }
@@ -815,12 +837,9 @@ if ($plan.cleanExpiredTempArtifacts) {
 
 # 3. Point daemon-runtime\\current to releases\\<ver> when staged
 if (Test-Path -LiteralPath $ReleaseDir -PathType Container) {
-  if (Test-Path -LiteralPath $CurrentDir) {
-    cmd /c rmdir "$CurrentDir" 2>$null | Out-Null
-    Remove-Item -LiteralPath $CurrentDir -Recurse -Force -ErrorAction SilentlyContinue
-  }
-  cmd /c mklink /J "$CurrentDir" "$ReleaseDir" | Out-Null
-  if ($LASTEXITCODE -ne 0) {
+  Remove-PathSafely $CurrentDir
+  $mkExit = New-WindowsReparsePoint 'junction' $CurrentDir $ReleaseDir
+  if ($mkExit -ne 0) {
     Copy-Item -LiteralPath $ReleaseDir -Destination $CurrentDir -Recurse -Force
   }
 }

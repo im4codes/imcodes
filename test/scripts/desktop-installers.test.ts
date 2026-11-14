@@ -627,6 +627,11 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     expect(ps1Text).toContain("ValidateSet('Probe', 'Plan', 'PreInstall', 'PostInstall', 'CleanupTmp', 'Rollback')");
     expect(ps1Text).toContain('imcodes-node-watchdog');
     expect(ps1Text).toContain('Resolve-CanonicalWindowsPath');
+    // PowerShell 5.1 NativeCommandError regression: must remove junctions/symlinks/dirs via Remove-PathSafely, never cmd /c rmdir 2>$null
+    expect(ps1Text).toContain('function Remove-PathSafely');
+    expect(ps1Text).toContain('function New-WindowsReparsePoint');
+    expect(ps1Text).toContain("$reparseKind = if ($item.PSIsContainer) { 'junction' } else { 'symlink' }");
+    expect(ps1Text).not.toContain('cmd /c rmdir');
 
     const cmdText = readFileSync(res.cmdPath, 'utf8');
     expect(cmdText).toContain('goto :check_bundled');
