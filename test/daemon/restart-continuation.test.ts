@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
@@ -25,6 +25,7 @@ import {
   markSessionUserStopped,
   restartContinuationPath,
   retireRestartContinuation,
+  shouldAutoRespawnDeadProcessSubSession,
 } from '../../src/daemon/restart-continuation.js';
 import { TransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
@@ -71,6 +72,11 @@ describe('restart-continuation store & filtering', () => {
       makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'claude-code', runtimeType: 'process', state: 'running' }),
       // Excluded sessions:
       makeSession({ name: 'deck_idle_runtime', agentType: 'codex-sdk', providerId: 'codex-sdk', runtimeType: 'transport', state: 'running' }),
+      makeSession({ name: 'deck_pure_idle_rt', agentType: 'claude-code-sdk', providerId: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' }),
+      makeSession({ name: 'deck_pure_idle_t', agentType: 'claude-code-sdk', providerId: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' }),
+      makeSession({ name: 'deck_queued_t', agentType: 'claude-code-sdk', providerId: 'claude-code-sdk', runtimeType: 'transport', state: 'queued' as SessionRecord['state'] }),
+      makeSession({ name: 'deck_idle_p', agentType: 'claude-code', runtimeType: 'process', state: 'idle' }),
+      makeSession({ name: 'deck_queued_p', agentType: 'claude-code', runtimeType: 'process', state: 'queued' as SessionRecord['state'] }),
       makeSession({ name: 'deck_stale_phantom', agentType: 'claude-code-sdk', providerId: 'claude-code-sdk', runtimeType: 'transport', state: 'running' }),
       makeSession({ name: 'deck_stopped', state: 'stopped' }),
       makeSession({ name: 'deck_error', state: 'error' }),
@@ -98,12 +104,14 @@ describe('restart-continuation store & filtering', () => {
       ['deck_proj_brain', { sending: true, lastActivityAt: now - 5_000, getStatus: () => 'streaming' }],
       ['deck_sub_worker1', { sending: false, backgroundWorkCount: 1, getStatus: () => 'idle' }],
       ['deck_idle_runtime', { sending: false, backgroundWorkCount: 0, getStatus: () => 'idle' }],
+      ['deck_pure_idle_rt', { sending: false, backgroundWorkCount: 0, getStatus: () => 'idle' }],
       ['deck_stale_phantom', { sending: true, lastActivityAt: now - 20 * 60_000, getStatus: () => 'streaming' }],
     ]);
 
     const captured = captureRestartContinuationsBeforeShutdown({
       sessions,
       getRuntime: (name) => runtimes.get(name),
+      activeDispatchSessions: new Set(['deck_pure_idle_t']),
       now,
       epoch: 'epoch-1',
       staleTurnMs: 15 * 60_000,
@@ -114,10 +122,16 @@ describe('restart-continuation store & filtering', () => {
       'deck_sub_worker1',
       'deck_proj_w1',
     ]);
+    expect(getPendingRestartContinuation('deck_sub_worker1', now + 100)?.hadBackgroundWork).toBe(true);
     expect(hasPendingRestartContinuation('deck_proj_brain', now + 100)).toBe(true);
     expect(hasPendingRestartContinuation('deck_sub_worker1', now + 100)).toBe(true);
     expect(hasPendingRestartContinuation('deck_proj_w1', now + 100)).toBe(true);
     expect(hasPendingRestartContinuation('deck_idle_runtime', now + 100)).toBe(false);
+    expect(hasPendingRestartContinuation('deck_pure_idle_rt', now + 100)).toBe(false);
+    expect(hasPendingRestartContinuation('deck_pure_idle_t', now + 100)).toBe(false);
+    expect(hasPendingRestartContinuation('deck_queued_t', now + 100)).toBe(false);
+    expect(hasPendingRestartContinuation('deck_idle_p', now + 100)).toBe(false);
+    expect(hasPendingRestartContinuation('deck_queued_p', now + 100)).toBe(false);
     expect(hasPendingRestartContinuation('deck_stale_phantom', now + 100)).toBe(false);
     expect(hasPendingRestartContinuation('deck_stopped', now + 100)).toBe(false);
     expect(hasPendingRestartContinuation('deck_error', now + 100)).toBe(false);
@@ -138,12 +152,14 @@ describe('restart-continuation store & filtering', () => {
     expect(recaptured.map((c) => c.sessionName)).toEqual(['deck_user_stopped']);
   });
 
-  it('captures unclean crash sessions from persisted running/queued state and handoff_inflight rows, but skips clean restarts', () => {
+  it('captures ONLY persisted running sessions on unclean crash (excluding pure idle, queued, and stale handoff_inflight rows) and skips clean restarts', () => {
     const now = 200_000;
     const sessions: SessionRecord[] = [
       makeSession({ name: 'deck_crash_running', agentType: 'codex-sdk', providerId: 'codex-sdk', runtimeType: 'transport', state: 'running' }),
+      makeSession({ name: 'deck_crash_proc_running', agentType: 'codex', runtimeType: 'process', state: 'running' }),
       makeSession({ name: 'deck_crash_inflight', agentType: 'claude-code-sdk', providerId: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' }),
-      makeSession({ name: 'deck_crash_proc', agentType: 'codex', runtimeType: 'process', state: 'queued' }),
+      makeSession({ name: 'deck_crash_proc', agentType: 'codex', runtimeType: 'process', state: 'queued' as SessionRecord['state'] }),
+      makeSession({ name: 'deck_crash_idle_proc', agentType: 'claude-code', runtimeType: 'process', state: 'idle' }),
       makeSession({ name: 'deck_crash_stopped_by_user', agentType: 'codex', runtimeType: 'process', state: 'running' }),
     ];
     markSessionUserStopped('deck_crash_stopped_by_user', now - 500);
@@ -168,10 +184,12 @@ describe('restart-continuation store & filtering', () => {
     });
     expect(captured.map((c) => c.sessionName)).toEqual([
       'deck_crash_running',
-      'deck_crash_inflight',
-      'deck_crash_proc',
+      'deck_crash_proc_running',
     ]);
-    expect(getPendingRestartContinuation('deck_crash_inflight', now + 10)?.reason).toBe('unclean_exit');
+    expect(getPendingRestartContinuation('deck_crash_running', now + 10)?.reason).toBe('unclean_exit');
+    expect(hasPendingRestartContinuation('deck_crash_inflight', now + 10)).toBe(false);
+    expect(hasPendingRestartContinuation('deck_crash_proc', now + 10)).toBe(false);
+    expect(hasPendingRestartContinuation('deck_crash_idle_proc', now + 10)).toBe(false);
     expect(hasPendingRestartContinuation('deck_crash_stopped_by_user', now + 10)).toBe(false);
   });
 
@@ -387,6 +405,182 @@ describe('restart-continuation dispatch & safety guards', () => {
     expect(res2).toEqual({ dispatched: false, reason: 'none' });
     expect(sendKeys).toHaveBeenCalledTimes(1);
     expect(restartContinuationPath()).toContain(tempHome);
+  });
+
+  it('dispatches continue for idle transport with backgroundWorkCount>0, while blocking pure idle/queued/un-evidenced markers at dispatch', async () => {
+    const now = 550_000;
+    const bgWorker = makeSession({
+      name: 'deck_bg_worker',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+    });
+    captureRestartContinuationsBeforeShutdown({
+      sessions: [bgWorker],
+      getRuntime: () => ({ sending: false, backgroundWorkCount: 1, getStatus: () => 'idle' }),
+      now,
+      epoch: 'ep-bg',
+    });
+
+    const bgSend = vi.fn(() => 'sent');
+    const bgEmit = vi.fn();
+    const bgRes = await dispatchTransportRestartContinuation({
+      preRestoreSession: bgWorker,
+      currentSession: { ...bgWorker, state: 'idle' },
+      runtime: { sending: false, pendingCount: 0, getStatus: () => 'idle', send: bgSend },
+      getResendCount: () => 0,
+      hasQueuedDurableEntries: () => false,
+      emitUserMessage: (sName, commandId) => emitSystemContinueUserMessage(bgEmit, sName, commandId, 'transport'),
+      now: now + 100,
+    });
+    expect(bgRes.dispatched).toBe(true);
+    expect(bgSend).toHaveBeenCalledTimes(1);
+    expect(bgEmit).toHaveBeenCalledTimes(1);
+
+    // Seed stale/un-evidenced or pure-idle/queued disk markers to verify dispatch-boundary fail-closed guards.
+    const pureIdleT = makeSession({
+      name: 'deck_pure_idle_dispatch',
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+    });
+    const queuedT = makeSession({
+      name: 'deck_queued_dispatch',
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'queued' as SessionRecord['state'],
+    });
+    const idleP = makeSession({
+      name: 'deck_sub_idle_p',
+      role: 'w1',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'idle',
+    });
+    const queuedP = makeSession({
+      name: 'deck_sub_queued_p',
+      role: 'w2',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'queued' as SessionRecord['state'],
+    });
+    writeFileSync(
+      restartContinuationPath(),
+      JSON.stringify({
+        version: 1,
+        pending: {
+          deck_pure_idle_dispatch: {
+            sessionName: 'deck_pure_idle_dispatch',
+            runtimeType: 'transport',
+            agentType: 'claude-code-sdk',
+            providerId: 'claude-code-sdk',
+            capturedState: 'running',
+            epoch: 'ep-forged-idle-t',
+            reason: 'graceful_shutdown',
+            capturedAt: now,
+            expiresAt: now + 60_000,
+          },
+          deck_queued_dispatch: {
+            sessionName: 'deck_queued_dispatch',
+            runtimeType: 'transport',
+            agentType: 'claude-code-sdk',
+            providerId: 'claude-code-sdk',
+            capturedState: 'running',
+            hadBackgroundWork: true,
+            epoch: 'ep-forged-queued-t',
+            reason: 'graceful_shutdown',
+            capturedAt: now,
+            expiresAt: now + 60_000,
+          },
+          deck_sub_idle_p: {
+            sessionName: 'deck_sub_idle_p',
+            runtimeType: 'process',
+            agentType: 'claude-code',
+            capturedState: 'idle',
+            epoch: 'ep-forged-idle-p',
+            reason: 'graceful_shutdown',
+            capturedAt: now,
+            expiresAt: now + 60_000,
+          },
+          deck_sub_queued_p: {
+            sessionName: 'deck_sub_queued_p',
+            runtimeType: 'process',
+            agentType: 'claude-code',
+            capturedState: 'running',
+            epoch: 'ep-forged-queued-p',
+            reason: 'graceful_shutdown',
+            capturedAt: now,
+            expiresAt: now + 60_000,
+          },
+        },
+        userStopped: {},
+        consumedEpochs: [],
+      }),
+      'utf8',
+    );
+    // Double-check file parsed cleanly via readFileSync
+    expect(JSON.parse(readFileSync(restartContinuationPath(), 'utf8')).version).toBe(1);
+
+    const noopSend = vi.fn();
+    const noopSendKeys = vi.fn(async () => {});
+    const noopEmit = vi.fn();
+
+    const rIdleT = await dispatchTransportRestartContinuation({
+      preRestoreSession: pureIdleT,
+      currentSession: { ...pureIdleT, state: 'idle' },
+      runtime: { sending: false, pendingCount: 0, getStatus: () => 'idle', send: noopSend },
+      getResendCount: () => 0,
+      hasQueuedDurableEntries: () => false,
+      emitUserMessage: noopEmit,
+      now: now + 200,
+    });
+    expect(rIdleT).toEqual({ dispatched: false, reason: 'not_running' });
+    expect(hasPendingRestartContinuation('deck_pure_idle_dispatch', now + 200)).toBe(false);
+
+    const rQueuedT = await dispatchTransportRestartContinuation({
+      preRestoreSession: queuedT,
+      currentSession: { ...queuedT, state: 'idle' },
+      runtime: { sending: false, pendingCount: 0, getStatus: () => 'idle', send: noopSend },
+      getResendCount: () => 0,
+      hasQueuedDurableEntries: () => false,
+      emitUserMessage: noopEmit,
+      now: now + 200,
+    });
+    expect(rQueuedT).toEqual({ dispatched: false, reason: 'not_running' });
+    expect(hasPendingRestartContinuation('deck_queued_dispatch', now + 200)).toBe(false);
+
+    expect(shouldAutoRespawnDeadProcessSubSession(idleP, now + 200)).toBe(false);
+    expect(shouldAutoRespawnDeadProcessSubSession(queuedP, now + 200)).toBe(false);
+
+    const rIdleP = await dispatchProcessRestartContinuation({
+      sessionName: 'deck_sub_idle_p',
+      preRestoreSession: idleP,
+      currentSession: { ...idleP, state: 'idle' },
+      sendKeys: noopSendKeys,
+      emitUserMessage: noopEmit,
+      now: now + 200,
+    });
+    expect(rIdleP).toEqual({ dispatched: false, reason: 'not_running' });
+    expect(hasPendingRestartContinuation('deck_sub_idle_p', now + 200)).toBe(false);
+
+    const rQueuedP = await dispatchProcessRestartContinuation({
+      sessionName: 'deck_sub_queued_p',
+      preRestoreSession: queuedP,
+      currentSession: { ...queuedP, state: 'idle' },
+      sendKeys: noopSendKeys,
+      emitUserMessage: noopEmit,
+      now: now + 200,
+    });
+    expect(rQueuedP).toEqual({ dispatched: false, reason: 'not_running' });
+    expect(hasPendingRestartContinuation('deck_sub_queued_p', now + 200)).toBe(false);
+
+    expect(noopSend).not.toHaveBeenCalled();
+    expect(noopSendKeys).not.toHaveBeenCalled();
+    expect(noopEmit).not.toHaveBeenCalled();
   });
 
   it('propagates store persistence failure on consume/mutations and dispatches continue strictly once after recovery', async () => {

@@ -43,6 +43,9 @@ export interface PendingRestartContinuation {
   runtimeType: 'transport' | 'process';
   agentType: string;
   providerId?: string;
+  capturedState: 'running' | 'idle';
+  hadBackgroundWork?: boolean;
+  hadForegroundWork?: boolean;
   epoch: string;
   reason: 'graceful_shutdown' | 'unclean_exit';
   capturedAt: number;
@@ -86,7 +89,7 @@ const DEFAULT_STALE_TURN_MS = (() => {
 })();
 
 const TRANSPORT_ACTIVE_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
-const PROCESS_ACTIVE_STATES: ReadonlySet<string> = new Set(['running', 'queued']);
+const PROCESS_ACTIVE_STATES: ReadonlySet<string> = new Set(['running']);
 const EXCLUDED_AGENT_TYPES: ReadonlySet<string> = new Set(['shell', 'script']);
 const MAX_CONSUMED_EPOCHS = 200;
 
@@ -288,10 +291,12 @@ export function shouldAutoRespawnDeadProcessSubSession(
   filePath = restartContinuationPath(),
 ): boolean {
   if (!session?.name) return false;
+  if (session.state !== 'running') return false;
   if (session.runtimeType === 'transport' || isTransportAgent(session.agentType)) return false;
   if (!isEligibleRestartContinuationSession(session)) return false;
   if (isSessionUserStopped(session.name, now, filePath)) return false;
-  return hasPendingRestartContinuation(session.name, now, filePath);
+  const pending = getPendingRestartContinuation(session.name, now, filePath);
+  return pending?.capturedState === 'running';
 }
 
 type ConsumeOutcome = {
@@ -341,24 +346,27 @@ export function consumeRestartContinuation(
   return consumeRestartContinuationDetailed(sessionName, expectedEpoch, now, path).entry;
 }
 
-function isTransportRuntimeActiveAtShutdown(
+function inspectTransportRuntimeAtShutdown(
   runtime: RestartContinuationRuntimeProbe,
   now: number,
   staleTurnMs: number,
-): boolean {
+): { active: boolean; hadBackgroundWork: boolean; hadForegroundWork: boolean } {
   const status = runtime.getStatus();
   const backgroundWorkCount = Math.max(0, runtime.backgroundWorkCount ?? 0);
+  const hadBackgroundWork = backgroundWorkCount > 0;
   const hasForegroundWork = Boolean(runtime.sending || TRANSPORT_ACTIVE_STATUSES.has(status));
-  if (!hasForegroundWork && backgroundWorkCount === 0) return false;
+  if (!hasForegroundWork && !hadBackgroundWork) {
+    return { active: false, hadBackgroundWork: false, hadForegroundWork: false };
+  }
   if (
-    backgroundWorkCount === 0
+    !hadBackgroundWork
     && typeof runtime.lastActivityAt === 'number'
     && Number.isFinite(runtime.lastActivityAt)
     && now - runtime.lastActivityAt >= staleTurnMs
   ) {
-    return false;
+    return { active: false, hadBackgroundWork: false, hadForegroundWork: false };
   }
-  return true;
+  return { active: true, hadBackgroundWork, hadForegroundWork: hasForegroundWork };
 }
 
 export function captureRestartContinuationsBeforeShutdownDetailed(opts: {
@@ -381,7 +389,9 @@ export function captureRestartContinuationsBeforeShutdownDetailed(opts: {
   for (const session of opts.sessions) {
     const isEligible = isEligibleRestartContinuationSession(session);
     const isStoppedByUser = typeof data.userStopped[session.name] === 'number';
-    if (!isEligible || isStoppedByUser) {
+    const isTransport = session.runtimeType === 'transport' || isTransportAgent(session.agentType);
+    const canCheckIdleTransportRuntime = isTransport && session.state === 'idle';
+    if (!isEligible || isStoppedByUser || (session.state !== 'running' && !canCheckIdleTransportRuntime)) {
       if (data.pending[session.name]) {
         delete data.pending[session.name];
         dirty = true;
@@ -389,26 +399,39 @@ export function captureRestartContinuationsBeforeShutdownDetailed(opts: {
       continue;
     }
 
-    const isTransport = session.runtimeType === 'transport' || isTransportAgent(session.agentType);
     let active = false;
+    let hadBackgroundWork = false;
+    let hadForegroundWork = false;
     if (isTransport) {
       const runtime = opts.getRuntime(session.name);
       if (runtime) {
-        active = isTransportRuntimeActiveAtShutdown(runtime, now, staleTurnMs);
+        const inspected = inspectTransportRuntimeAtShutdown(runtime, now, staleTurnMs);
+        active = inspected.active;
+        hadBackgroundWork = inspected.hadBackgroundWork;
+        hadForegroundWork = inspected.hadForegroundWork;
       } else {
-        active = session.state === 'running' || Boolean(opts.activeDispatchSessions?.has(session.name));
+        active = session.state === 'running';
       }
     } else {
       active = PROCESS_ACTIVE_STATES.has(session.state);
     }
 
-    if (!active) continue;
+    if (!active) {
+      if (data.pending[session.name]) {
+        delete data.pending[session.name];
+        dirty = true;
+      }
+      continue;
+    }
 
     const entry: PendingRestartContinuation = {
       sessionName: session.name,
       runtimeType: isTransport ? 'transport' : 'process',
       agentType: session.agentType,
       ...(session.providerId ? { providerId: session.providerId } : {}),
+      capturedState: session.state === 'running' ? 'running' : 'idle',
+      ...(hadBackgroundWork ? { hadBackgroundWork: true } : {}),
+      ...(hadForegroundWork ? { hadForegroundWork: true } : {}),
       epoch,
       reason: 'graceful_shutdown',
       capturedAt: now,
@@ -474,20 +497,19 @@ export function captureUncleanRestartContinuationsDetailed(opts: {
 
   for (const session of opts.sessions) {
     if (!isEligibleRestartContinuationSession(session)) continue;
+    if (!PROCESS_ACTIVE_STATES.has(session.state)) continue;
     if (typeof data.userStopped[session.name] === 'number') continue;
     const existing = data.pending[session.name];
     if (existing && existing.expiresAt > now) continue;
 
     const isTransport = session.runtimeType === 'transport' || isTransportAgent(session.agentType);
-    const activeOnCrash = PROCESS_ACTIVE_STATES.has(session.state)
-      || (isTransport && Boolean(opts.activeDispatchSessions?.has(session.name)));
-    if (!activeOnCrash) continue;
 
     const entry: PendingRestartContinuation = {
       sessionName: session.name,
       runtimeType: isTransport ? 'transport' : 'process',
       agentType: session.agentType,
       ...(session.providerId ? { providerId: session.providerId } : {}),
+      capturedState: 'running',
       epoch,
       reason: 'unclean_exit',
       capturedAt: now,
@@ -536,6 +558,13 @@ export async function dispatchTransportRestartContinuation(opts: {
   if (!isEligibleRestartContinuationSession(effectiveSession)) {
     consumeRestartContinuation(sessionName, entry.epoch, now, path);
     return { dispatched: false, reason: 'ineligible' };
+  }
+  const hasValidCaptureEvidence = opts.preRestoreSession.state === 'running'
+    ? (entry.capturedState === 'running' || entry.hadBackgroundWork === true || entry.hadForegroundWork === true)
+    : (opts.preRestoreSession.state === 'idle' && (entry.hadBackgroundWork === true || entry.hadForegroundWork === true));
+  if (!hasValidCaptureEvidence) {
+    consumeRestartContinuation(sessionName, entry.epoch, now, path);
+    return { dispatched: false, reason: 'not_running' };
   }
   if (isSessionUserStopped(sessionName, now, path)) {
     consumeRestartContinuation(sessionName, entry.epoch, now, path);
@@ -587,6 +616,7 @@ export async function dispatchTransportRestartContinuation(opts: {
 
 export async function dispatchProcessRestartContinuation(opts: {
   sessionName: string;
+  preRestoreSession?: SessionRecord;
   currentSession?: SessionRecord;
   sendKeys: (sessionName: string, keys: string) => Promise<void>;
   emitUserMessage: (sessionName: string, commandId: string) => void;
@@ -603,6 +633,10 @@ export async function dispatchProcessRestartContinuation(opts: {
   if (!isEligibleRestartContinuationSession(session) || isSessionUserStopped(opts.sessionName, now, path)) {
     consumeRestartContinuation(opts.sessionName, entry.epoch, now, path);
     return { dispatched: false, reason: 'ineligible' };
+  }
+  if (entry.capturedState !== 'running' || (opts.preRestoreSession && opts.preRestoreSession.state !== 'running')) {
+    consumeRestartContinuation(opts.sessionName, entry.epoch, now, path);
+    return { dispatched: false, reason: 'not_running' };
   }
   if (session.state === 'running') {
     consumeRestartContinuation(opts.sessionName, entry.epoch, now, path);

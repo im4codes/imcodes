@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => {
   const providerSends: Array<{ sessionId: string; message: string }> = [];
   const resendQueues = new Map<string, Array<Record<string, unknown>>>();
   let codexRolloutCompleted = false;
+  let getPaneIdHook: ((name: string) => Promise<void>) | undefined;
 
   return {
     store,
@@ -25,6 +26,12 @@ const mocks = vi.hoisted(() => {
     timelineEvents,
     providerSends,
     resendQueues,
+    get getPaneIdHook() {
+      return getPaneIdHook;
+    },
+    set getPaneIdHook(fn: ((name: string) => Promise<void>) | undefined) {
+      getPaneIdHook = fn;
+    },
     get codexRolloutCompleted() {
       return codexRolloutCompleted;
     },
@@ -88,7 +95,10 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sendRawInput: vi.fn(async () => {}),
   resizeSession: vi.fn(async () => {}),
   getPaneCwd: vi.fn(async () => '/tmp/proj'),
-  getPaneId: vi.fn(async () => '%1'),
+  getPaneId: vi.fn(async (name: string) => {
+    if (mocks.getPaneIdHook) await mocks.getPaneIdHook(name);
+    return '%1';
+  }),
   getPanePids: vi.fn(async () => []),
   getPaneStartCommand: vi.fn(async () => 'claude --dangerously-skip-permissions'),
   showBuffer: vi.fn(async () => ''),
@@ -297,6 +307,7 @@ beforeEach(() => {
   mocks.providerSends.length = 0;
   mocks.resendQueues.clear();
   mocks.codexRolloutCompleted = false;
+  mocks.getPaneIdHook = undefined;
 });
 
 afterEach(async () => {
@@ -850,5 +861,102 @@ describe('restoreFromStore & restoreTransportSessions restart continuation wirin
     expect(mocks.respawnCalls.filter((n) => n === subLiveCc.name || n === subStoppedCc.name)).toHaveLength(0);
     expect(mocks.sendKeysCalls.filter((c) => c.session === subLiveCc.name || c.session === subStoppedCc.name)).toHaveLength(0);
     expect(mocks.tmuxPaneAlive.has(subStoppedCc.name)).toBe(false);
+  }, 10_000);
+
+  it('replay during old->new runtimeEpoch transition (between spawn and upsertSession) keeps continuation pending until ready', async () => {
+    const oldEpochSub = makeRecord({
+      name: 'deck_sub_cc_old_epoch',
+      role: 'w1',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      runtimeEpoch: 'persisted-before-restart-epoch',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111201',
+    });
+    const oldEpochMain = makeRecord({
+      name: 'deck_cc_main_old_epoch',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+      runtimeEpoch: 'persisted-before-restart-epoch',
+      updatedAt: Date.now(),
+      ccSessionId: '11111111-1111-4111-8111-111111111202',
+    });
+
+    mocks.store.set(oldEpochSub.name, oldEpochSub);
+    mocks.store.set(oldEpochMain.name, oldEpochMain);
+
+    captureRestartContinuationsBeforeShutdown({
+      sessions: [oldEpochSub, oldEpochMain],
+      getRuntime: () => undefined,
+      epoch: 'ep-old-to-new-epoch',
+    });
+
+    let resolveSubPaused!: () => void;
+    let resolveMainPaused!: () => void;
+    const subEnteredGetPaneId = new Promise<void>((r) => { resolveSubPaused = r; });
+    const mainEnteredGetPaneId = new Promise<void>((r) => { resolveMainPaused = r; });
+
+    let releaseSubGetPaneId!: () => void;
+    let releaseMainGetPaneId!: () => void;
+    const subGate = new Promise<void>((r) => { releaseSubGetPaneId = r; });
+    const mainGate = new Promise<void>((r) => { releaseMainGetPaneId = r; });
+
+    mocks.getPaneIdHook = async (name: string) => {
+      if (name === oldEpochSub.name) {
+        resolveSubPaused();
+        await subGate;
+      } else if (name === oldEpochMain.name) {
+        resolveMainPaused();
+        await mainGate;
+      }
+    };
+
+    const subDtos: Parameters<typeof rebuildSubSessions>[0] = [
+      { id: 'cc_old_epoch', type: 'claude-code', cwd: '/tmp/proj', ccSessionId: oldEpochSub.ccSessionId },
+    ];
+
+    try {
+      // 1) Pause BOTH rebuildSubSessions (sub-session missing launch) and restoreFromStore (main missing launch)
+      // right inside getPaneId — tmux pane is live, new runtimeEpoch is NOT published to store yet!
+      const firstRebuild = rebuildSubSessions(subDtos);
+      await subEnteredGetPaneId;
+
+      // Persisted store record still holds the pre-restart runtimeEpoch.
+      expect(mocks.store.get(oldEpochSub.name)?.runtimeEpoch).toBe('persisted-before-restart-epoch');
+      expect(mocks.tmuxPaneAlive.has(oldEpochSub.name)).toBe(true);
+
+      // Replaying rebuildSubSessions right now (stored.runtimeEpoch !== claim.runtimeEpoch) MUST NOT consume the marker.
+      await rebuildSubSessions(subDtos);
+      expect(hasPendingRestartContinuation(oldEpochSub.name)).toBe(true);
+
+      // Also test main session paused between newSession and upsertSession when a concurrent restoreFromStore runs.
+      const firstRestore = restoreFromStore();
+      await mainEnteredGetPaneId;
+      expect(mocks.store.get(oldEpochMain.name)?.runtimeEpoch).toBe('persisted-before-restart-epoch');
+      expect(mocks.tmuxPaneAlive.has(oldEpochMain.name)).toBe(true);
+
+      await restoreFromStore();
+      expect(hasPendingRestartContinuation(oldEpochMain.name)).toBe(true);
+
+      releaseSubGetPaneId();
+      releaseMainGetPaneId();
+      await firstRebuild;
+      await firstRestore;
+    } finally {
+      mocks.getPaneIdHook = undefined;
+    }
+
+    // Wait for real ClaudeDriver.postLaunch (~1500ms) on both replacement panes.
+    await vi.waitFor(() => {
+      const sent = mocks.sendKeysCalls.filter((c) => c.keys === 'continue').map((c) => c.session).sort();
+      expect(sent).toEqual([oldEpochMain.name, oldEpochSub.name].sort());
+    }, { timeout: 5_000, interval: 50 });
+
+    expect(mocks.sendKeysCalls.filter((c) => c.keys === 'continue')).toHaveLength(2);
+    expect(hasPendingRestartContinuation(oldEpochSub.name)).toBe(false);
+    expect(hasPendingRestartContinuation(oldEpochMain.name)).toBe(false);
   }, 10_000);
 });

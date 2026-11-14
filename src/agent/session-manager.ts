@@ -158,9 +158,13 @@ import {
   shouldAutoRespawnDeadProcessSubSession,
 } from '../daemon/restart-continuation.js';
 
-function maybeDispatchProcessRestartContinuation(sessionName: string): Promise<{ dispatched: boolean; reason: string; commandId?: string }> {
+function maybeDispatchProcessRestartContinuation(
+  sessionName: string,
+  preRestoreSession?: SessionRecord,
+): Promise<{ dispatched: boolean; reason: string; commandId?: string }> {
   return dispatchProcessRestartContinuation({
     sessionName,
+    preRestoreSession,
     currentSession: getSession(sessionName),
     sendKeys: (name, keys) => sendKeys(name, keys),
     emitUserMessage: (name, commandId) =>
@@ -767,7 +771,7 @@ export async function restoreFromStore(): Promise<void> {
         }
         continue;
       }
-      if (!hasActiveProcessRestartContinuationRecovery(s.name, s.runtimeEpoch)) {
+      if (!hasActiveProcessRestartContinuationRecovery(s.name)) {
         consumeRestartContinuation(s.name);
       }
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
@@ -881,7 +885,7 @@ export async function restoreFromStore(): Promise<void> {
       }
     } else {
       // Live CLI process survived daemon restart intact — discard any captured marker so it is never nudged.
-      if (!hasActiveProcessRestartContinuationRecovery(hydrated.name, hydrated.runtimeEpoch)) {
+      if (!hasActiveProcessRestartContinuationRecovery(hydrated.name)) {
         consumeRestartContinuation(hydrated.name);
       }
       if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
@@ -1052,7 +1056,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
       codexSessionId: effectiveRecord.codexSessionId,
       geminiSessionId: effectiveRecord.geminiSessionId,
       opencodeSessionId: effectiveRecord.opencodeSessionId,
-      onPostLaunchReady: () => maybeDispatchProcessRestartContinuation(effectiveRecord.name),
+      onPostLaunchReady: () => maybeDispatchProcessRestartContinuation(effectiveRecord.name, record),
     });
     } catch (error) {
       throw markLaunchFailure(record, error);
@@ -1224,7 +1228,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
           try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
         }
         try {
-          await maybeDispatchProcessRestartContinuation(record.name);
+          await maybeDispatchProcessRestartContinuation(record.name, record);
         } catch (err) {
           logger.warn({ err, session: record.name }, 'Process respawn restart continuation failed');
         }

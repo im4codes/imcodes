@@ -751,7 +751,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
           // script, userStopped, or no pending marker): never resurrect or attach watchers.
           continue;
         }
-      } else if (!isStoppedSubSession && paneAlive && !hasActiveProcessRestartContinuationRecovery(sessionName, stored?.runtimeEpoch)) {
+      } else if (!isStoppedSubSession && paneAlive && !hasActiveProcessRestartContinuationRecovery(sessionName)) {
         consumeRestartContinuation(sessionName);
       }
       const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
