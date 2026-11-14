@@ -1637,7 +1637,7 @@ describe('styles.css regression contracts', () => {
     );
 
     // remote-desktop-workspace.css context menu must also disable backdrop-filter under Mac host classes.
-    const rdCss = readFileSync(resolve(process.cwd(), 'src/components/remote-desktop-workspace.css'), 'utf8');
+    const rdCss = readFileSync(resolve(__dirname, '../src/components/remote-desktop-workspace.css'), 'utf8');
     expect(rdCss).toMatch(
       /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+\.remote-desktop-wall-context-menu\s*\{[^}]*backdrop-filter:\s*none/,
     );
