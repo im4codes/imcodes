@@ -176,6 +176,7 @@ import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js';
 import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
 import { RemoteDesktopWall, REMOTE_DESKTOP_WALL_WINDOW_ID } from './components/RemoteDesktopWall.js';
+import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
 import { RemoteDesktopConnectionManager } from './remote-desktop-connection-manager.js';
 import { openRemoteDesktopWallWindow } from './remote-desktop-window.js';
 import {
@@ -2993,6 +2994,7 @@ function InternalMainApp() {
   const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
   const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
   const [remoteDesktopWallHostKeys, setRemoteDesktopWallHostKeys] = useState<readonly string[]>([]);
+  const [remoteDesktopGuestAccess, setRemoteDesktopGuestAccess] = useState<{ publicNodeId?: string } | null>(null);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
   const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
@@ -3026,8 +3028,10 @@ function InternalMainApp() {
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
 
-  const openRemoteDesktopById = useCallback(() => {
-    window.open('/remote-desktop/access', '_blank', 'noopener,noreferrer');
+  const openRemoteDesktopById = useCallback((initialPublicNodeId?: string) => {
+    setRemoteDesktopGuestAccess({
+      publicNodeId: typeof initialPublicNodeId === 'string' ? initialPublicNodeId : undefined,
+    });
   }, []);
 
   const closeRemoteDesktopWall = useCallback((hostKeys: readonly string[]) => {
@@ -3054,6 +3058,7 @@ function InternalMainApp() {
     setRemoteDesktopWorkspaceMinimized(false);
     setRemoteDesktopWallOpen(false);
     setRemoteDesktopWallHostKeys([]);
+    setRemoteDesktopGuestAccess(null);
     removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
     removeDesktopWindow(REMOTE_DESKTOP_WALL_WINDOW_ID);
   }, [auth, remoteDesktopConnectionManager, removeDesktopWindow]);
@@ -9876,10 +9881,19 @@ function InternalMainApp() {
           onMinimize={() => setRemoteDesktopWallMinimized(true)}
           onRestore={() => setRemoteDesktopWallMinimized(false)}
           onOpenStandalone={openRemoteDesktopWallStandalone}
-          onConnectById={openRemoteDesktopById}
+          onConnectById={() => openRemoteDesktopById()}
           onOpenHost={openRemoteDesktop}
           onHostKeysChange={setRemoteDesktopWallHostKeys}
           onClose={closeRemoteDesktopWall}
+        />
+      )}
+
+      {remoteDesktopGuestAccess && (
+        <RemoteDesktopGuestAccess
+          standalone={false}
+          initialPublicNodeId={remoteDesktopGuestAccess.publicNodeId}
+          zIndex={20000}
+          onExit={() => setRemoteDesktopGuestAccess(null)}
         />
       )}
 

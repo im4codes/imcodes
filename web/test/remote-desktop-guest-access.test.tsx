@@ -207,4 +207,69 @@ describe('RemoteDesktopGuestAccess', () => {
     }));
     expect(screen.queryByRole('button', { name: 'remote_desktop.guest.save_device' })).toBeNull();
   });
+
+  it('supports embedded in-app overlay mode without mutating URL/history and supports authMode round-trips', async () => {
+    window.history.replaceState({ keep: true }, '', '/?foo=1');
+    const onExit = vi.fn();
+    const inviteView = render(
+      <RemoteDesktopGuestAccess
+        standalone={false}
+        zIndex={20000}
+        bootstrap={Promise.resolve({ status: 'invite', token: 'E'.repeat(43) })}
+        api={{
+          resolveInvite: vi.fn(async () => ({ status: 'auth_required' as const })),
+        } as unknown as RemoteDesktopAccessApi}
+        onExit={onExit}
+      />,
+    );
+
+    const overlay = inviteView.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+    expect(overlay).toBeTruthy();
+    expect(overlay.style.zIndex).toBe('20000');
+
+    expect(await screen.findByText('remote_desktop.guest.state_auth_required')).toBeTruthy();
+    expect(window.location.pathname).toBe('/');
+    expect(window.location.search).toBe('?foo=1');
+    expect(window.history.state).toEqual({ keep: true });
+
+    // Enter login authMode and navigate back to guest card cleanly.
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+    expect(await screen.findByText('login.subtitle')).toBeTruthy();
+    expect(inviteView.container.querySelector('.remote-desktop-guest-overlay')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /back_to_invitation/ }));
+    expect(await screen.findByText('remote_desktop.guest.state_auth_required')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.back_to_imcodes' }));
+    expect(onExit).toHaveBeenCalledOnce();
+    inviteView.unmount();
+
+    // Password (Connect by ID) flow in embedded mode keeps prefilled publicNodeId and returns to idle on try_again.
+    const provePassword = vi.fn(async () => ({ status: 'auth_required' as const }));
+    render(
+      <RemoteDesktopGuestAccess
+        standalone={false}
+        initialPublicNodeId="5987654321"
+        api={{ provePassword } as unknown as RemoteDesktopAccessApi}
+        onExit={onExit}
+      />,
+    );
+    const idInput = screen.getByLabelText(/public_id/) as HTMLInputElement;
+    expect(idInput.value).toBe('5987654321');
+    fireEvent.input(screen.getByLabelText(/password/), { target: { value: 'secret-password' } });
+    fireEvent.click(screen.getByRole('button', { name: /connect/ }));
+    expect(await screen.findByText('remote_desktop.guest.state_auth_required')).toBeTruthy();
+    expect(window.location.pathname).toBe('/');
+    expect(window.history.state).toEqual({ keep: true });
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.try_again' }));
+    expect((screen.getByLabelText(/public_id/) as HTMLInputElement).value).toBe('5987654321');
+    expect(window.location.pathname).toBe('/');
+  });
+
+  it('ignores non-matching initialPublicNodeId and host URL search in embedded mode', () => {
+    window.history.replaceState({ [REMOTE_DESKTOP_PUBLIC_ID_HISTORY_STATE_KEY]: '5111111111' }, '', '/?publicId=5222222222');
+    render(<RemoteDesktopGuestAccess standalone={false} initialPublicNodeId="invalid" />);
+    const idInput = screen.getByLabelText(/public_id/) as HTMLInputElement;
+    expect(idInput.value).toBe('');
+    expect(window.location.pathname).toBe('/');
+  });
 });

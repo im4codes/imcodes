@@ -503,4 +503,26 @@ describe('ControlledNodeQuickMenu group tabs', () => {
     open();
     expect(document.querySelector('[data-testid="controlled-node-quick-group-direct"]')).toBeNull();
   });
+
+  it('invokes onConnectById without window.open and closes the quick menu', async () => {
+    machines = [node({ serverId: 'node-1', displayName: 'Node One', accessRole: 'owner' })];
+    const openSpy = vi.spyOn(window, 'open');
+    const onConnectById = vi.fn();
+    render(
+      <ControlledNodeQuickMenu
+        onOpenRemoteDesktop={() => {}}
+        onOpenRemoteDesktopWall={() => {}}
+        onConnectById={onConnectById}
+        allowStandaloneWindow={false}
+      />,
+    );
+    open();
+    const connectBtn = await screen.findByRole('menuitem', { name: 'remote_desktop.connect_by_id' });
+    fireEvent.click(connectBtn);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(onConnectById).toHaveBeenCalledOnce();
+    expect(onConnectById).toHaveBeenCalledWith();
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    openSpy.mockRestore();
+  });
 });

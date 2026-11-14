@@ -11,6 +11,7 @@ import {
   openRemoteDesktopWorkspaceHost,
   reorderRemoteDesktopWorkspaceHost,
 } from '../remote-desktop-workspace-state.js';
+import { RemoteDesktopGuestAccess } from './RemoteDesktopGuestAccess.js';
 import { RemoteDesktopWall } from './RemoteDesktopWall.js';
 import { RemoteDesktopWorkspace } from './RemoteDesktopWorkspace.js';
 import { useQuickData } from './QuickInputPanel.js';
@@ -21,6 +22,7 @@ export function RemoteDesktopWallStandalone() {
   const managerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   const [wallHostKeys, setWallHostKeys] = useState<readonly string[]>([]);
   const [workspace, setWorkspace] = useState(createRemoteDesktopWorkspaceState);
+  const [connectByIdOpen, setConnectByIdOpen] = useState(false);
   const quickData = useQuickData();
   if (!managerRef.current) managerRef.current = new RemoteDesktopConnectionManager();
   const manager = managerRef.current;
@@ -52,7 +54,7 @@ export function RemoteDesktopWallStandalone() {
         standalone
         manager={manager}
         retainedHostKeys={retainedWorkspaceHostKeys}
-        onConnectById={() => window.open('/remote-desktop/access', '_blank', 'noopener,noreferrer')}
+        onConnectById={() => setConnectByIdOpen(true)}
         onOpenHost={(machine) => setWorkspace((current) => (
           openRemoteDesktopWorkspaceHost(current, machine)
         ))}
@@ -82,6 +84,13 @@ export function RemoteDesktopWallStandalone() {
           ))}
           onCloseWorkspace={() => setWorkspace((current) => closeRemoteDesktopWorkspace(current))}
           wallHostKeys={retainedWallHostKeys}
+        />
+      )}
+      {connectByIdOpen && (
+        <RemoteDesktopGuestAccess
+          standalone={false}
+          zIndex={20000}
+          onExit={() => setConnectByIdOpen(false)}
         />
       )}
     </>

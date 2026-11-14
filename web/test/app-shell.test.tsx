@@ -1004,7 +1004,7 @@ vi.mock('../src/components/SharedContextManagementPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/ControlledNodesPanel.js', () => ({
-  ControlledNodesPanel: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall }: any) => (
+  ControlledNodesPanel: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall, onConnectById }: any) => (
     <div>
       <button onClick={() => onOpenRemoteDesktop?.({
         serverId: 'desktop-1',
@@ -1017,11 +1017,12 @@ vi.mock('../src/components/ControlledNodesPanel.js', () => ({
         capabilities: [],
       })}>controlled-nodes-panel</button>
       <button onClick={onOpenRemoteDesktopWall}>controlled-nodes-wall</button>
+      <button onClick={() => onConnectById?.('5123456789')}>controlled-nodes-connect-by-id</button>
     </div>
   ),
 }));
 vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
-  ControlledNodeQuickMenu: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall }: any) => (
+  ControlledNodeQuickMenu: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall, onConnectById }: any) => (
     <>
       <button
         data-testid="controlled-node-quick-trigger"
@@ -1040,6 +1041,10 @@ vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
         data-testid="controlled-node-quick-wall"
         onClick={() => onOpenRemoteDesktopWall?.()}
       >controlled-node-quick-wall</button>
+      <button
+        data-testid="controlled-node-quick-connect-by-id"
+        onClick={() => onConnectById?.()}
+      >controlled-node-quick-connect-by-id</button>
     </>
   ),
 }));
@@ -1064,9 +1069,10 @@ vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
 }));
 vi.mock('../src/components/RemoteDesktopWall.js', () => ({
   REMOTE_DESKTOP_WALL_WINDOW_ID: 'remote-desktop-wall',
-  RemoteDesktopWall: ({ zIndex, onFocus, onClose }: any) => (
+  RemoteDesktopWall: ({ zIndex, onFocus, onClose, onConnectById }: any) => (
     <div data-testid="remote-desktop-wall" style={{ zIndex }} onMouseDown={onFocus}>
       remote-desktop-wall
+      <button onClick={() => onConnectById?.()}>remote-desktop-wall-connect-by-id</button>
       <button onClick={() => onClose?.([])}>remote-desktop-wall-close</button>
     </div>
   ),
@@ -10957,4 +10963,72 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     },
     15000,
   );
+
+  it('opens connect-by-id in-app above mobile panels without window.open or URL mutation and closes back cleanly', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    const openSpy = vi.spyOn(window, 'open');
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    window.history.replaceState({}, '', '/');
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+
+      // 1) Open from mobile header quick menu -> mounts RemoteDesktopGuestAccess overlay cleanly.
+      const quickConnectBtns = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickConnectBtns[quickConnectBtns.length - 1]!);
+      expect(openSpy).not.toHaveBeenCalled();
+
+      const overlay = view.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      expect(overlay).toBeTruthy();
+      expect(Number(overlay.style.zIndex)).toBeGreaterThanOrEqual(20000);
+      expect(window.location.pathname).toBe('/');
+
+      fireEvent.click(overlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+
+      // 2) Open from RemoteDesktopWall -> mounts above wall (zIndex 20000 > 7000) and returns to wall on exit.
+      const wallBtns = await screen.findAllByTestId('controlled-node-quick-wall');
+      fireEvent.click(wallBtns[wallBtns.length - 1]!);
+      const wall = await screen.findByTestId('remote-desktop-wall');
+      fireEvent.click(screen.getByRole('button', { name: 'remote-desktop-wall-connect-by-id' }));
+      expect(openSpy).not.toHaveBeenCalled();
+      const wallOverlay = view.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      expect(wallOverlay).toBeTruthy();
+      expect(Number(wallOverlay.style.zIndex)).toBeGreaterThan(Number((wall as HTMLElement).style.zIndex || 7000));
+      fireEvent.click(wallOverlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+      expect(screen.getByTestId('remote-desktop-wall')).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'remote-desktop-wall-close' }));
+
+      // 3) Open from ControlledNodesPanel saved device -> pre-fills publicNodeId and sits above FloatingPanel.
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const controlledNodesButton = await screen.findByRole('button', { name: 'controlled_nodes.title' });
+      fireEvent.click(controlledNodesButton);
+      const panelConnectBtn = await screen.findByRole('button', { name: 'controlled-nodes-connect-by-id' });
+      const panelFloating = panelConnectBtn.closest('.floating-panel') as HTMLElement | null;
+      fireEvent.click(panelConnectBtn);
+      expect(openSpy).not.toHaveBeenCalled();
+      const panelOverlay = view.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      expect(panelOverlay).toBeTruthy();
+      if (panelFloating?.style.zIndex) {
+        expect(Number(panelOverlay.style.zIndex)).toBeGreaterThan(Number(panelFloating.style.zIndex));
+      }
+      expect((panelOverlay.querySelector('input[inputmode="numeric"]') as HTMLInputElement).value).toBe('5123456789');
+      expect(window.location.pathname).toBe('/');
+      fireEvent.click(panelOverlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+    } finally {
+      openSpy.mockRestore();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
 });
