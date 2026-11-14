@@ -603,6 +603,37 @@ describe('session-store', () => {
       }
     });
 
+    it('does not probe sessions upserted immediately after loadStore on an empty store', async () => {
+      const detectStatus = vi.fn(async () => 'idle' as const);
+      vi.doMock('../../src/agent/detect.js', () => ({ detectStatusAsync: detectStatus }));
+      const { registerSessionStateProbeObserver } = await import('../../src/store/session-state-probe-events.js');
+      const observed = vi.fn();
+      const unregister = registerSessionStateProbeObserver(observed);
+      try {
+        const store = await importSessionStore();
+        await store.loadStore();
+        store.upsertSession({
+          name: 'deck_late_brain',
+          projectName: 'late',
+          role: 'brain',
+          agentType: 'claude-code',
+          projectDir: '/tmp/late',
+          state: 'running',
+          restarts: 0,
+          restartTimestamps: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        expect(detectStatus).not.toHaveBeenCalled();
+        expect(observed).not.toHaveBeenCalled();
+        expect(store.getSession('deck_late_brain')?.state).toBe('running');
+      } finally {
+        unregister();
+        vi.doUnmock('../../src/agent/detect.js');
+      }
+    });
+
     it('migrates missing identities once and preserves them across daemon reload', async () => {
       await writeSessionsFixture({
         sessions: {

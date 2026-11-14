@@ -1591,9 +1591,9 @@ export class KimiSdkProvider implements TransportProvider {
       windowsHide: true,
     });
     transport.child = child;
-    if (isolatedFor && typeof child.pid === 'number' && child.pid > 0) {
-      isolatedFor.incognitoEnv.registerChildProcess(child.pid, process.platform !== 'win32');
-    }
+    const childMetaWrite = isolatedFor && typeof child.pid === 'number' && child.pid > 0
+      ? isolatedFor.incognitoEnv.registerChildProcess(child.pid, process.platform !== 'win32')
+      : Promise.resolve();
     const spawnFailure = new Promise<never>((_resolve, reject) => {
       child.once('error', reject);
     });
@@ -1812,6 +1812,7 @@ export class KimiSdkProvider implements TransportProvider {
     });
     try {
       await Promise.race([initPromise, spawnFailure, initTimeout]);
+      await childMetaWrite;
     } catch (error) {
       if (isolatedFor) {
         await this.disposeIsolatedSession(isolatedFor.state);

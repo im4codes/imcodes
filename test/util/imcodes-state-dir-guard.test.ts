@@ -31,6 +31,7 @@ const ALLOWED: Record<string, string> = {
   'src/agent/muse-usage-quota.ts': 'tmpdir() store under test',
   'shared/skill-store.ts': 'getUserSkillRoot(homeDir, stateDir): the explicit-account-home default; shared/ cannot import src/',
   'shared/capability-management.ts': 'managed-skill root segments under an explicit account home',
+  'shared/cloud-docs.ts': 'isInternalUploadTempFilePath matches chat upload path segments by regex only; never resolves or accesses host state paths',
   'scripts/restart-daemon.sh': 'restarts the DEFAULT launchd service (label imcodes.daemon), which by definition lives in $HOME/.imcodes',
   'scripts/diagnose-windows-controlled-node.ps1': 'reads the default SYSTEM-profile service log of a controlled node',
 };

@@ -1120,7 +1120,7 @@ export async function runCloudDocsCli(
     .option('--folder <folderId>', 'Destination folderId')
     .option('--folder-id <folderId>', 'Alias for --folder')
     .option('--root', 'When used with --doc-id/--replace, move doc to owner root folder (folderId=null)')
-    .option('--doc-id <id>', 'Replace an existing Cloud Doc binary in-place (PUT /api/cloud-docs/:id/file)')
+    .option('--doc-id <id>', 'Replace an existing Cloud Doc binary in-place')
     .option('--replace <id>', 'Alias for --doc-id')
     .option('--version <n>', 'Optimistic CAS version check when replacing an existing Cloud Doc')
     .option('--expected-version <n>', 'Alias for --version')

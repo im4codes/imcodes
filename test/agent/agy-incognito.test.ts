@@ -768,9 +768,14 @@ if (process.env.SPAWN_CHILD !== '0') {
     detached: true,
     stdio: 'ignore',
   });
-  iso.registerChildProcess(child.pid, true);
+  await iso.registerChildProcess(child.pid, true);
   child.unref();
   childPid = child.pid;
+}
+if (process.env.BREAK_REAPER_PATH === '1') {
+  // Break PATH only after registerChildProcess records the child identity so non-Linux
+  // hosts still persist childProcessStart before exercising exit-hook ps failure.
+  process.env.PATH = '';
 }
 process.stdout.write(JSON.stringify({ home: iso.homeDir, pid: childPid }) + '\\n');
 setTimeout(() => process.exit(17), 120);
@@ -808,7 +813,7 @@ setTimeout(() => process.exit(17), 120);
 
     // Case 3: Verification/termination cannot be confirmed on exit (PATH='' breaks ps in POSIX reaper) ->
     // exit hook preserves directory and intact owner marker; subsequent cold reclaim kills writer and deletes home.
-    const res3 = await runExitingOwner({ SPAWN_CHILD: '1', PATH: '' });
+    const res3 = await runExitingOwner({ SPAWN_CHILD: '1', BREAK_REAPER_PATH: '1' });
     expect(res3.code).toBe(17);
     expect(res3.info.pid).toBeTruthy();
     expect(pidAlive(res3.info.pid!)).toBe(true);
@@ -816,15 +821,74 @@ setTimeout(() => process.exit(17), 120);
     const preservedMeta = JSON.parse(readFileSync(path.join(res3.info.home, '.imcodes-owner.json'), 'utf8')) as {
       childPid?: number;
       childStartTicks?: string;
+      childProcessStart?: string;
       ownsProcessGroup?: boolean;
     };
     expect(preservedMeta.childPid).toBe(res3.info.pid);
-    expect(preservedMeta.childStartTicks).toBeTruthy();
+    if (process.platform === 'linux') {
+      expect(preservedMeta.childStartTicks).toBeTruthy();
+    } else {
+      expect(preservedMeta.childProcessStart).toBeTruthy();
+    }
     expect(preservedMeta.ownsProcessGroup).toBe(true);
 
     expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(1);
     await new Promise((r) => setTimeout(r, 250));
     expect(pidAlive(res3.info.pid!)).toBe(false);
     expect(existsSync(res3.info.home)).toBe(false);
+  });
+
+  it('waits for async childProcessStart persistence when /proc start ticks are unavailable (non-Linux / darwin)', async () => {
+    const customTmp = makeTempDir('agy-incog-darwin-');
+    const loader = pathToFileURL(path.resolve(process.cwd(), 'node_modules/tsx/dist/loader.mjs')).href;
+    const isoUrl = pathToFileURL(path.resolve(process.cwd(), 'src/agent/agy-incognito-isolation.ts')).href;
+    const work = makeTempDir('agy-incog-darwin-work-');
+    const script = path.join(work, 'darwin-register.mjs');
+    writeFileSync(script, `
+Object.defineProperty(process, 'platform', { value: 'darwin' });
+const { spawn } = await import('node:child_process');
+const { createAgyIncognitoEnvSync, reclaimOrphanedAgyIncognitoHomes } = await import(${JSON.stringify(isoUrl)});
+const iso = createAgyIncognitoEnvSync();
+const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  detached: true,
+  stdio: 'ignore',
+});
+await iso.registerChildProcess(child.pid, true);
+child.unref();
+process.stdout.write(JSON.stringify({ home: iso.homeDir, pid: child.pid }) + '\\n');
+process.kill(process.pid, 'SIGKILL');
+`);
+
+    const proc = spawn(process.execPath, ['--import', loader, script], {
+      env: { ...process.env, TMPDIR: customTmp },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+    const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => {
+      proc.once('exit', (c, sig) => resolve([c, sig]));
+    });
+    expect(code).toBeNull();
+    expect(signal).toBe('SIGKILL');
+    const info = JSON.parse(stdout.trim()) as { home: string; pid: number };
+    strayPids.push(info.pid);
+    expect(pidAlive(info.pid)).toBe(true);
+    expect(existsSync(info.home)).toBe(true);
+
+    const meta = JSON.parse(readFileSync(path.join(info.home, '.imcodes-owner.json'), 'utf8')) as {
+      childPid?: number;
+      childStartTicks?: string;
+      childProcessStart?: string;
+      ownsProcessGroup?: boolean;
+    };
+    expect(meta.childPid).toBe(info.pid);
+    expect(meta.childStartTicks).toBeUndefined();
+    expect(meta.childProcessStart).toBeTruthy();
+    expect(meta.ownsProcessGroup).toBe(true);
+
+    expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(1);
+    await new Promise((r) => setTimeout(r, 250));
+    expect(pidAlive(info.pid)).toBe(false);
+    expect(existsSync(info.home)).toBe(false);
   });
 });

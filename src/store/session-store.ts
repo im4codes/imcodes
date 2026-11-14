@@ -904,15 +904,17 @@ function reconcilePersistedSessions(): boolean {
 
 /** After loadStore, detect actual state of each session from terminal and emit corrections. */
 async function probeSessionStates(targetPath: string): Promise<void> {
+  // Snapshot loaded non-transport running sessions before any await so sessions
+  // upserted immediately after `await loadStore()` are never probed by this pass.
+  const candidates = Object.values(store.sessions).filter(
+    (s) => s.state === 'running' && s.runtimeType !== 'transport',
+  );
+  if (candidates.length === 0) return;
   try {
     const { detectStatusAsync } = await import('../agent/detect.js');
     let mutated = false;
-    for (const s of Object.values(store.sessions)) {
-      if (s.state !== 'running') continue;
-      if (s.runtimeType === 'transport') {
-        // Transport sessions don't use tmux — skip terminal-based detection
-        continue;
-      }
+    for (const s of candidates) {
+      if (store.sessions[s.name] !== s || s.state !== 'running') continue;
       let newState: 'idle' | 'running' = 'running';
       try {
         const status = await detectStatusAsync(s.name, s.agentType as import('../agent/detect.js').AgentType);
@@ -921,7 +923,7 @@ async function probeSessionStates(targetPath: string): Promise<void> {
         // tmux session may not exist — mark idle
         newState = 'idle';
       }
-      if (newState !== s.state) {
+      if (store.sessions[s.name] === s && s.state === 'running' && newState !== s.state) {
         s.state = newState;
         s.updatedAt = Date.now();
         mutated = true;

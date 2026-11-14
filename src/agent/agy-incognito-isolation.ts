@@ -1,4 +1,4 @@
-import { execFile as execFileCb, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
   copyFileSync,
@@ -14,20 +14,17 @@ import {
 import { rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { AGY_CLI_FLAG } from '../../shared/agy-agent.js';
-import { execFileOffMainIdempotent } from '../util/exec-helper.js';
+import { execFileOffMain, execFileOffMainIdempotent } from '../util/exec-helper.js';
 import { readProcessStart } from '../util/process-start.js';
-
-const execFileP = promisify(execFileCb);
 
 export interface AgyIncognitoEnv {
   readonly homeDir: string;
   readonly logFile: string;
   readonly env: Record<string, string>;
   readonly acpFlags: string[];
-  /** Persist the spawned ACP process identity into `.imcodes-owner.json` so crash recovery reaps it before removing `homeDir`. */
-  registerChildProcess(childPid: number, ownsProcessGroup: boolean): void;
+  /** Persist the spawned ACP process identity into `.imcodes-owner.json` so crash recovery reaps it before removing `homeDir`. Resolves once any async start-time lookup finishes. */
+  registerChildProcess(childPid: number, ownsProcessGroup: boolean): Promise<void>;
   cleanup(): Promise<void>;
   cleanupSync(): void;
 }
@@ -518,7 +515,7 @@ async function reapVerifiedChildAsync(meta: AgyIncognitoOwnerMeta): Promise<bool
   if (process.platform === 'win32') {
     if (!leaderAlive) return true;
     try {
-      await execFileP('taskkill', ['/pid', String(meta.childPid), '/T', '/F'], {
+      await execFileOffMain('taskkill', ['/pid', String(meta.childPid), '/T', '/F'], {
         timeout: PS_TIMEOUT_MS,
         windowsHide: true,
       });
@@ -705,8 +702,8 @@ export function createAgyIncognitoEnvSync(
     }
   };
 
-  const registerChildProcess = (childPid: number, ownsProcessGroup: boolean): void => {
-    if (cleaningOrDisposed || !Number.isInteger(childPid) || childPid <= 1) return;
+  const registerChildProcess = (childPid: number, ownsProcessGroup: boolean): Promise<void> => {
+    if (cleaningOrDisposed || !Number.isInteger(childPid) || childPid <= 1) return Promise.resolve();
     const childTicks = readLinuxProcessStartTicks(childPid);
     currentMeta = {
       ...currentMeta,
@@ -735,7 +732,9 @@ export function createAgyIncognitoEnvSync(
           if (pendingMetaWrite === update) pendingMetaWrite = null;
         });
       pendingMetaWrite = update;
+      return update;
     }
+    return Promise.resolve();
   };
 
   try {

@@ -496,7 +496,7 @@ public class OrtSession implements AutoCloseable {
     public OptLevel optLevel;
     public int intraThreads;
     public void setOptimizationLevel(OptLevel lvl){ this.optLevel = lvl; }
-    public void setIntraOpNumThreads(int n){ if (n != 4) throw new AssertionError("expected 4 threads, got "+n); this.intraThreads = n; }
+    public void setIntraOpNumThreads(int n){ int expected = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2)); if (n != expected) throw new AssertionError("expected " + expected + " threads, got "+n); this.intraThreads = n; }
     @Override public void close(){}
   }
 

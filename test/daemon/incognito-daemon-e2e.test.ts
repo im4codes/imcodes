@@ -19,8 +19,39 @@ const codexHarness = vi.hoisted(() => ({
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
+  const { promisify } = await import('node:util');
+  const isFakeCodexVersion = (cmd: unknown, args?: readonly string[] | null): boolean => {
+    const argList = Array.isArray(args) ? args : [];
+    const cmdStr = String(cmd ?? '');
+    return argList.includes('--version')
+      && (cmdStr === 'codex' || cmdStr.endsWith('/codex') || cmdStr.endsWith('\\codex.exe') || argList.some((a) => String(a).includes('codex')));
+  };
+  const actualExecFileP = promisify(actual.execFile);
+  const execFileMock = Object.assign(
+    vi.fn((...callArgs: unknown[]) => {
+      const cmd = callArgs[0];
+      const args = Array.isArray(callArgs[1]) ? (callArgs[1] as string[]) : undefined;
+      const cb = callArgs.find((arg): arg is (...cbArgs: unknown[]) => void => typeof arg === 'function');
+      if (isFakeCodexVersion(cmd, args)) {
+        if (cb) {
+          queueMicrotask(() => cb(null, 'codex-cli 0.163.0\n', ''));
+        }
+        return {} as never;
+      }
+      return (actual.execFile as (...fnArgs: unknown[]) => unknown)(...callArgs);
+    }),
+    {
+      [promisify.custom]: (cmd: string, args?: readonly string[] | null, options?: unknown) => {
+        if (isFakeCodexVersion(cmd, args)) {
+          return Promise.resolve({ stdout: 'codex-cli 0.163.0\n', stderr: '' });
+        }
+        return (actualExecFileP as (...fnArgs: unknown[]) => Promise<{ stdout: string; stderr: string }>)(cmd, args, options);
+      },
+    },
+  );
   return {
     ...actual,
+    execFile: execFileMock,
     spawn: vi.fn((_cmd: unknown, args?: readonly string[]) => {
       if (Array.isArray(args) && args.includes('app-server')) {
         const stdout = new PassThrough();

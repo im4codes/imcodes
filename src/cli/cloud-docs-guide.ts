@@ -213,7 +213,7 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '   imcodes cloud-docs builder <docId> --no-save --type pdf --out ./preview.pdf --script-file ./export.js',
     '   (Note: --no-save and --out require an existing <docId>; --out requires --no-save.)',
     '',
-    '3. Raw binary replacement from disk (`PUT /api/cloud-docs/:id/file`):',
+    '3. Raw binary replacement from disk (Cloud Docs file upload):',
     '   imcodes cloud-docs edit <docId> --file ./revised.docx --version 2',
     '   imcodes cloud-docs upload ./revised.docx --doc-id <docId> --version 2',
     `   Max upload size: ${Math.floor(CLOUD_DOCS_MAX_UPLOAD_BYTES / (1024 * 1024))} MiB.`,
