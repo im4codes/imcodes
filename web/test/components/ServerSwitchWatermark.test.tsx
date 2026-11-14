@@ -59,6 +59,9 @@ describe('ServerSwitchWatermark', () => {
     const shortcutRow = screen.getByTestId('server-switch-watermark-shortcut');
     const kbds = Array.from(shortcutRow.querySelectorAll('kbd')).map((el) => el.textContent);
     expect(kbds).toEqual(['Ctrl', '↓']);
+    expect(hud.querySelector('.server-switch-watermark-icon')).toBeNull();
+    expect(hud.querySelector('.server-switch-watermark-divider')).toBeNull();
+    expect(hud.querySelector('.server-switch-watermark-session-dot')).toBeNull();
   });
 
   it('renders muted fallback when sessionName is null, and omits session/shortcut rows when empty', () => {
@@ -224,7 +227,7 @@ describe('ServerSwitchWatermark', () => {
     expect(onDismiss).not.toHaveBeenCalled();
   });
 
-  it('defines pointer-events: none, centered fixed overlay, frosted glass, light-mode, and reduced-motion CSS rules', () => {
+  it('defines transparent borderless large-type watermark CSS rules with translucent text in dark, light, mobile, and reduced-motion modes', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const css = readFileSync(resolve(here, '../../src/styles.css'), 'utf8');
     const blockStart = css.indexOf('.server-switch-watermark {');
@@ -232,10 +235,16 @@ describe('ServerSwitchWatermark', () => {
     const tail = css.slice(blockStart);
 
     expect(tail).toMatch(/\.server-switch-watermark\s*\{[\s\S]*position:\s*fixed;[\s\S]*inset:\s*0;[\s\S]*pointer-events:\s*none;[\s\S]*user-select:\s*none;/);
-    expect(tail).toMatch(/\.server-switch-watermark-card\s*\{[\s\S]*backdrop-filter:\s*blur\(16px\)\s*saturate\(150%\);/);
-    expect(tail).toContain('.server-switch-watermark-kbd');
+    expect(tail).toMatch(/\.server-switch-watermark-card\s*\{[\s\S]*background:\s*transparent;[\s\S]*border:\s*none;[\s\S]*box-shadow:\s*none;[\s\S]*backdrop-filter:\s*none;[\s\S]*-webkit-backdrop-filter:\s*none;/);
+    expect(tail).toMatch(/\.server-switch-watermark-server-name\s*\{[\s\S]*font-size:\s*clamp\(32px,\s*5vw,\s*58px\);[\s\S]*color:\s*rgba\([^)]+,\s*0\.\d+\);/);
+    expect(tail).toMatch(/\.server-switch-watermark-session-name\s*\{[\s\S]*font-size:\s*clamp\(16px,\s*2\.4vw,\s*26px\);/);
+    expect(tail).toMatch(/\.server-switch-watermark-kbd\s*\{[\s\S]*border:\s*none;[\s\S]*background:\s*transparent;[\s\S]*color:\s*rgba\([^)]+,\s*0\.\d+\);/);
     expect(tail).toContain('@media (prefers-color-scheme: light)');
     expect(tail).toContain('@media (prefers-reduced-motion: reduce)');
-    expect(tail).toContain('@media (max-width: 480px)');
+    expect(tail).toMatch(/@media \(max-width: 480px\)[\s\S]*\.server-switch-watermark-server-name\s*\{[\s\S]*font-size:\s*clamp\(24px,\s*7\.5vw,\s*40px\);/);
+    expect(css).not.toContain('.server-switch-watermark-icon');
+    expect(css).not.toContain('.server-switch-watermark-divider');
+    expect(css).not.toContain('.server-switch-watermark-session-dot');
+    expect(css).not.toContain(':is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card');
   });
 });

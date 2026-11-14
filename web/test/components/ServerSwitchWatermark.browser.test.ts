@@ -73,18 +73,44 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
       await page.waitForTimeout(170);
       const heldStyle = await page.evaluate(() => {
         const card = document.querySelector('.server-switch-watermark-card') as HTMLElement;
+        const serverName = document.querySelector('.server-switch-watermark-server-name') as HTMLElement;
+        const session = document.querySelector('.server-switch-watermark-session') as HTMLElement;
+        const kbd = document.querySelector('.server-switch-watermark-kbd') as HTMLElement;
         const cs = getComputedStyle(card);
+        const serverCs = getComputedStyle(serverName);
+        const sessionCs = getComputedStyle(session);
+        const kbdCs = getComputedStyle(kbd);
         return {
           state: card.parentElement?.getAttribute('data-state'),
           opacity: Number(cs.opacity),
           transform: cs.transform,
           pointerEvents: cs.pointerEvents,
+          backgroundColor: cs.backgroundColor,
+          borderStyle: cs.borderTopStyle,
+          boxShadow: cs.boxShadow,
+          backdropFilter: cs.backdropFilter,
+          serverFontSize: parseFloat(serverCs.fontSize),
+          serverColor: serverCs.color,
+          sessionColor: sessionCs.color,
+          kbdBackgroundColor: kbdCs.backgroundColor,
+          kbdBorderStyle: kbdCs.borderTopStyle,
+          kbdColor: kbdCs.color,
           activeId: document.activeElement?.id,
         };
       });
       expect(heldStyle.state).toBe('visible');
       expect(heldStyle.opacity).toBeGreaterThan(0.99);
       expect(heldStyle.pointerEvents).toBe('none');
+      expect(heldStyle.backgroundColor).toBe('rgba(0, 0, 0, 0)');
+      expect(heldStyle.borderStyle).toBe('none');
+      expect(heldStyle.boxShadow).toBe('none');
+      expect(heldStyle.backdropFilter).toBe('none');
+      expect(heldStyle.serverFontSize).toBeGreaterThanOrEqual(48);
+      expect(heldStyle.serverColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
+      expect(heldStyle.sessionColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
+      expect(heldStyle.kbdBackgroundColor).toBe('rgba(0, 0, 0, 0)');
+      expect(heldStyle.kbdBorderStyle).toBe('none');
+      expect(heldStyle.kbdColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
       expect(heldStyle.activeId).toBe('focus-guard');
 
       await page.waitForFunction(() => document.querySelector('.server-switch-watermark')?.getAttribute('data-state') === 'exiting');
@@ -159,12 +185,25 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
         });
       });
       const reducedHold = await reducedPage.evaluate(() => {
-        const cs = getComputedStyle(document.querySelector('.server-switch-watermark-card') as HTMLElement);
-        return { animationName: cs.animationName, transitionDuration: cs.transitionDuration, opacity: cs.opacity };
+        const card = document.querySelector('.server-switch-watermark-card') as HTMLElement;
+        const serverName = document.querySelector('.server-switch-watermark-server-name') as HTMLElement;
+        const cs = getComputedStyle(card);
+        const serverCs = getComputedStyle(serverName);
+        return {
+          animationName: cs.animationName,
+          transitionDuration: cs.transitionDuration,
+          opacity: cs.opacity,
+          backgroundColor: cs.backgroundColor,
+          boxShadow: cs.boxShadow,
+          serverColor: serverCs.color,
+        };
       });
       expect(reducedHold.animationName).toBe('none');
       expect(reducedHold.transitionDuration).toBe('0s');
       expect(reducedHold.opacity).toBe('1');
+      expect(reducedHold.backgroundColor).toBe('rgba(0, 0, 0, 0)');
+      expect(reducedHold.boxShadow).toBe('none');
+      expect(reducedHold.serverColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
 
       await reducedPage.waitForFunction(() => document.querySelector('.server-switch-watermark')?.getAttribute('data-state') === 'exiting');
       const reducedExit = await reducedPage.evaluate(() => {

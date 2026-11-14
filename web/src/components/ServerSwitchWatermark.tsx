@@ -71,28 +71,16 @@ export function ServerSwitchWatermark({
     >
       <div class="server-switch-watermark-card">
         <div class="server-switch-watermark-server">
-          <span class="server-switch-watermark-icon" aria-hidden="true">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="3" y="4" width="18" height="6" rx="1.5" />
-              <rect x="3" y="14" width="18" height="6" rx="1.5" />
-              <circle cx="7" cy="7" r="1" fill="currentColor" stroke="none" />
-              <circle cx="7" cy="17" r="1" fill="currentColor" stroke="none" />
-            </svg>
-          </span>
           <span class="server-switch-watermark-server-name" data-testid="server-switch-watermark-server">
             {serverName}
           </span>
         </div>
         {secondaryText && (
-          <>
-            <div class="server-switch-watermark-divider" />
-            <div class={`server-switch-watermark-session${isFallback ? ' is-muted' : ''}`}>
-              <span class="server-switch-watermark-session-dot" aria-hidden="true" />
-              <span class="server-switch-watermark-session-name" data-testid="server-switch-watermark-session">
-                {secondaryText}
-              </span>
-            </div>
-          </>
+          <div class={`server-switch-watermark-session${isFallback ? ' is-muted' : ''}`}>
+            <span class="server-switch-watermark-session-name" data-testid="server-switch-watermark-session">
+              {secondaryText}
+            </span>
+          </div>
         )}
         {shortcutKeycaps.length > 0 && (
           <div class="server-switch-watermark-shortcut" data-testid="server-switch-watermark-shortcut">

@@ -19390,20 +19390,18 @@ button.quick-agent-delegation-preset.active {
 .server-switch-watermark-card {
   display: flex;
   flex-direction: column;
-  align-items: stretch;
+  align-items: center;
+  text-align: center;
   gap: 8px;
-  min-width: 240px;
-  max-width: min(460px, calc(100vw - 48px));
-  padding: 14px 20px;
-  border-radius: 14px;
-  background: rgba(13, 20, 34, 0.80);
-  border: 1px solid var(--chrome-line);
-  box-shadow:
-    0 20px 50px rgba(2, 6, 23, 0.45),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(16px) saturate(150%);
-  -webkit-backdrop-filter: blur(16px) saturate(150%);
-  color: #f8fafc;
+  min-width: 0;
+  max-width: min(88vw, 960px);
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   opacity: 1;
   transform: scale(1) translateY(0);
   animation: server-switch-hud-in 140ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
@@ -19419,65 +19417,47 @@ button.quick-agent-delegation-preset.active {
 .server-switch-watermark-server {
   display: flex;
   align-items: center;
-  gap: 9px;
+  justify-content: center;
+  max-width: 100%;
   min-width: 0;
 }
 
-.server-switch-watermark-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--chrome-accent);
-  flex-shrink: 0;
-  opacity: 0.92;
-}
-
 .server-switch-watermark-server-name {
-  font-size: 16px;
-  font-weight: 650;
-  line-height: 1.25;
-  letter-spacing: -0.01em;
+  font-size: clamp(32px, 5vw, 58px);
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  color: rgba(248, 250, 252, 0.38);
+  text-shadow: 0 2px 12px rgba(2, 6, 23, 0.22);
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.server-switch-watermark-divider {
-  height: 1px;
-  background: var(--chrome-line-soft);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  word-break: break-word;
 }
 
 .server-switch-watermark-session {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  max-width: 100%;
   min-width: 0;
-  color: #cbd5e1;
+  color: rgba(226, 232, 240, 0.30);
 }
 
 .server-switch-watermark-session.is-muted {
-  color: #94a3b8;
-  opacity: 0.85;
-}
-
-.server-switch-watermark-session-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--chrome-accent-2);
-  box-shadow: 0 0 8px rgba(52, 211, 153, 0.55);
-  flex-shrink: 0;
-}
-
-.server-switch-watermark-session.is-muted .server-switch-watermark-session-dot {
-  background: #64748b;
-  box-shadow: none;
+  color: rgba(148, 163, 184, 0.28);
 }
 
 .server-switch-watermark-session-name {
-  font-size: 13px;
+  font-size: clamp(16px, 2.4vw, 26px);
   font-weight: 500;
-  line-height: 1.3;
+  line-height: 1.25;
+  color: inherit;
+  text-shadow: 0 1px 8px rgba(2, 6, 23, 0.18);
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -19486,64 +19466,47 @@ button.quick-agent-delegation-preset.active {
 .server-switch-watermark-shortcut {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 2px;
+  gap: 6px;
+  margin-top: 4px;
 }
 
 .server-switch-watermark-kbd {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 22px;
-  height: 20px;
-  padding: 0 6px;
-  border-radius: 5px;
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  border-bottom-width: 2px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #cbd5e1;
+  min-width: 0;
+  height: auto;
+  padding: 0 2px;
+  border-radius: 0;
+  border: none;
+  background: transparent;
+  color: rgba(203, 213, 225, 0.26);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 11px;
+  font-size: clamp(12px, 1.4vw, 15px);
   font-weight: 600;
-  line-height: 1;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
 }
 
 @media (prefers-color-scheme: light) {
-  .server-switch-watermark-card {
-    background: rgba(248, 250, 252, 0.84);
-    border-color: rgba(15, 23, 42, 0.14);
-    box-shadow:
-      0 20px 50px rgba(15, 23, 42, 0.14),
-      inset 0 1px 0 rgba(255, 255, 255, 0.85);
-    color: #0f172a;
-  }
-
-  .server-switch-watermark-icon {
-    color: #0284c7;
-  }
-
-  .server-switch-watermark-divider {
-    background: rgba(15, 23, 42, 0.10);
+  .server-switch-watermark-server-name {
+    color: rgba(15, 23, 42, 0.30);
+    text-shadow: 0 1px 8px rgba(255, 255, 255, 0.35);
   }
 
   .server-switch-watermark-session {
-    color: #334155;
+    color: rgba(51, 65, 85, 0.24);
+    text-shadow: 0 1px 6px rgba(255, 255, 255, 0.30);
   }
 
   .server-switch-watermark-session.is-muted {
-    color: #64748b;
-  }
-
-  .server-switch-watermark-session-dot {
-    background: #059669;
-    box-shadow: 0 0 6px rgba(5, 150, 105, 0.35);
+    color: rgba(100, 116, 139, 0.22);
   }
 
   .server-switch-watermark-kbd {
-    border-color: rgba(15, 23, 42, 0.16);
-    background: rgba(15, 23, 42, 0.05);
-    color: #334155;
+    color: rgba(51, 65, 85, 0.22);
   }
 }
 
@@ -19564,19 +19527,18 @@ button.quick-agent-delegation-preset.active {
   }
 
   .server-switch-watermark-card {
-    min-width: 196px;
+    min-width: 0;
     max-width: calc(100vw - 32px);
-    padding: 12px 16px;
+    padding: 0;
     gap: 6px;
-    border-radius: 14px;
   }
 
-  .server-switch-watermark-server {
-    font-size: 15px;
+  .server-switch-watermark-server-name {
+    font-size: clamp(24px, 7.5vw, 40px);
   }
 
-  .server-switch-watermark-session {
-    font-size: 12px;
+  .server-switch-watermark-session-name {
+    font-size: clamp(14px, 4.2vw, 20px);
   }
 }
 
@@ -19730,8 +19692,7 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .download-transfer-center,
 :is(html.native-ios-mac, html.native-mac-desktop) .capability-global-operation .capability-operation-card,
 :is(html.native-ios-mac, html.native-mac-desktop) .task-pair-card-hover-preview,
-:is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop,
-:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
+:is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
@@ -19804,8 +19765,4 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 
 :is(html.native-ios-mac, html.native-mac-desktop) .remote-desktop-touch-hint {
   background: rgb(5 20 34 / 86%);
-}
-
-:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
-  background: rgba(13, 20, 34, 0.94);
 }
