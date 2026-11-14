@@ -555,3 +555,77 @@ describe('TerminalView — diff scroll backlog while frames are stalled', () => 
     }
   });
 });
+
+describe('TerminalView — Mac native host scaling modes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubNativeEnv(nativeHost?: Record<string, unknown>) {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true, getPlatform: () => 'ios' });
+    vi.stubGlobal('__IMCODES_NATIVE_HOST__', nativeHost);
+    vi.stubGlobal('navigator', {
+      platform: 'MacIntel',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
+      maxTouchPoints: 0,
+    });
+    vi.stubGlobal('innerWidth', 1200);
+    vi.stubGlobal('matchMedia', (q: string) => ({
+      matches: q === '(hover: hover) and (pointer: fine)',
+      media: q,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }));
+  }
+
+  it.each([
+    ['Catalyst .mac native-1x explicit', { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'native-1x' }],
+    ['Catalyst .mac implicit', { isMacDesktop: true, pageZoomApplied: false }],
+    ['Designed-for-iPad with WKWebView pageZoom', { isMacDesktop: true, pageZoomApplied: true, scaleMode: 'native-page-zoom' }],
+  ])('keeps desktop terminal font metrics (13px / 1.4 / keyboard enabled) for %s', async (_label, nativeHost) => {
+    stubNativeEnv(nativeHost);
+    const { FitAddon } = await import('@xterm/addon-fit');
+    (TerminalMock as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (FitAddon as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    const { unmount } = render(<TerminalView sessionName={`term-${_label}`} />);
+    expect(TerminalMock).toHaveBeenCalled();
+    const ctorOpts = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(ctorOpts.fontSize).toBe(13);
+    expect(ctorOpts.lineHeight).toBe(1.4);
+    expect(ctorOpts.disableStdin).toBe(false);
+    unmount();
+  });
+
+  it('retains 15px fallback on legacy iOS-on-Mac shells and downgrades cleanly when late native-host arrives without resize', async () => {
+    const { NATIVE_HOST_EVENT, IOS_MAC_TERMINAL_FONT_SIZE } = await import('../../src/native-platform.js');
+    const { FitAddon } = await import('@xterm/addon-fit');
+    stubNativeEnv(undefined);
+    (TerminalMock as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (FitAddon as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    const { unmount } = render(<TerminalView sessionName="term-legacy-then-late" />);
+    const ctorOpts = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(ctorOpts.fontSize).toBe(IOS_MAC_TERMINAL_FONT_SIZE);
+    expect(ctorOpts.lineHeight).toBe(1.45);
+    expect(ctorOpts.disableStdin).toBe(false);
+
+    const termInstance = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+    const fitInstance = (FitAddon as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+    fitInstance.fit.mockClear();
+
+    // Late bridge injection on Catalyst .mac without resize
+    vi.stubGlobal('__IMCODES_NATIVE_HOST__', { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'native-1x' });
+    window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+
+    expect(termInstance.options.fontSize).toBe(13);
+    expect(termInstance.options.lineHeight).toBe(1.4);
+    expect(termInstance.options.disableStdin).toBe(false);
+    expect(fitInstance.fit).toHaveBeenCalled();
+
+    fitInstance.fit.mockClear();
+    unmount();
+    window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+    expect(fitInstance.fit).not.toHaveBeenCalled();
+  });
+});

@@ -246,6 +246,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             webView.pageZoom = Self.macDesignedForIpadPageZoom
             pageZoomApplied = true
         }
+        let scaleMode: String
+        if !hostFlags.isMacDesktop {
+            scaleMode = "none"
+        } else if pageZoomApplied {
+            scaleMode = "native-page-zoom"
+        } else if !hostFlags.needsDesignedForIpadPageZoom {
+            scaleMode = "native-1x"
+        } else {
+            scaleMode = "legacy-css"
+        }
 
         var scripts: [String] = []
         if let builtinPublic = Bundle.main.resourceURL?.appendingPathComponent("public"),
@@ -257,10 +267,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
            let payloadJson = String(data: payloadData, encoding: .utf8) {
             scripts.append("window.__IMCODES_NATIVE_BUILD_INFO__ = \(payloadJson);")
         }
-        if let hostData = try? JSONSerialization.data(withJSONObject: [
+        let hostPayload: [String: Any] = [
             "isMacDesktop": hostFlags.isMacDesktop,
-            "pageZoomApplied": pageZoomApplied
-        ]),
+            "pageZoomApplied": pageZoomApplied,
+            "scaleMode": scaleMode
+        ]
+        if let hostData = try? JSONSerialization.data(withJSONObject: hostPayload),
            let hostJson = String(data: hostData, encoding: .utf8) {
             scripts.append("window.__IMCODES_NATIVE_HOST__ = \(hostJson);")
             scripts.append("window.dispatchEvent(new CustomEvent('imcodes:native-host'));")

@@ -5,7 +5,10 @@ import { TaskPairEventDecisions } from '../../src/components/TaskPairEventDecisi
 import { bindTaskPairDecisions, receiveTaskPairDecision } from '../../src/task-pair-decisions.js';
 import { TASK_PAIR_DECISION_MSG } from '@shared/task-pair-decision.js';
 const layout = vi.hoisted(() => ({ mobile: false }));
-vi.mock('../../src/mobile-device.js', () => ({ isMobileLayout: () => layout.mobile }));
+vi.mock('../../src/mobile-device.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/mobile-device.js')>();
+  return { ...actual, isMobileLayout: () => layout.mobile };
+});
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }) }));
 let unbind: (() => void) | undefined;
 afterEach(() => { cleanup(); unbind?.(); unbind = undefined; layout.mobile = false; vi.restoreAllMocks(); });

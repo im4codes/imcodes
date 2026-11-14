@@ -16,9 +16,12 @@ type NavigatorLike = {
 
 type MatchMediaLike = (query: string) => { matches: boolean };
 
+export type NativeHostScaleMode = 'none' | 'native-1x' | 'native-page-zoom' | 'legacy-css';
+
 export type NativeHostInfo = {
   isMacDesktop?: boolean;
   pageZoomApplied?: boolean;
+  scaleMode?: NativeHostScaleMode;
 };
 
 export type NativePlatformEnvironment = {
@@ -90,9 +93,20 @@ export function isNativeMacDesktop(env: NativePlatformEnvironment = readNativePl
 
 export function shouldUseIosMacTextScale(env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {
   if (!isNativeMacDesktop(env)) return false;
+  const host = env.nativeHost;
+  if (host?.scaleMode === 'legacy-css') return true;
+  if (host?.scaleMode === 'native-1x' || host?.scaleMode === 'native-page-zoom' || host?.scaleMode === 'none') {
+    return false;
+  }
   // When native WKWebView.pageZoom already compensates macOS's 0.77x Designed-for-iPad scaling,
   // avoid stacking CSS font-size overrides on top of the zoomed viewport.
-  if (env.nativeHost?.pageZoomApplied === true) return false;
+  if (host?.pageZoomApplied === true) return false;
+  // An authoritative native host reporting { isMacDesktop: true, pageZoomApplied: false }
+  // (e.g. Mac Catalyst .mac idiom) already renders at 1:1 desktop scale without CSS bumping.
+  // Legacy native shells without __IMCODES_NATIVE_HOST__ keep the CSS/terminal fallback.
+  if (typeof host?.isMacDesktop === 'boolean' && typeof host?.pageZoomApplied === 'boolean') {
+    return false;
+  }
   return true;
 }
 

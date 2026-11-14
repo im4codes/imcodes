@@ -3,7 +3,10 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
 import { bindTaskPairDecisions, receiveTaskPairDecision } from '../../src/task-pair-decisions.js';
 const device = vi.hoisted(() => ({ mobile: false }));
-vi.mock('../../src/mobile-device.js', () => ({ isMobileLayout: () => device.mobile }));
+vi.mock('../../src/mobile-device.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/mobile-device.js')>();
+  return { ...actual, isMobileLayout: () => device.mobile };
+});
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 const payload = { taskId: 'split-task', title: 'Same display task', verb: 'WORKING', toStatus: 'working', executor: 'deck_sub_canonical_exec', auditor: 'deck_sub_canonical_audit', executorLabel: 'Same display', auditorLabel: 'Same display' };
 const originalMedia = Object.getOwnPropertyDescriptor(window, 'matchMedia');

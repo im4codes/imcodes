@@ -2,7 +2,7 @@ import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
-import { isMobileLayout } from '../mobile-device.js';
+import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { applyTaskPairPanelFit, bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
 import { useTaskPairPanelWidth } from '../task-pair-panel-width.js';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
@@ -178,13 +178,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     if (!visitScoped) writeServerWideChoice({ serverId, mobile: isMobile, collapsed: next });
   }, [serverId, isMobile, visitScoped]);
   useEffect(() => {
-    const media = window.matchMedia?.('(max-width: 720px)');
-    if (!media) return undefined;
     // Only the layout class is tracked here; the choice is re-read by the effect below when the layout (or the panel's scope) changes.
     const onChange = () => { setIsMobile(isMobileLayout()); setPhone(phoneNow()); };
-    media.addEventListener?.('change', onChange);
-    window.addEventListener('resize', onChange);
-    return () => { media.removeEventListener?.('change', onChange); window.removeEventListener('resize', onChange); };
+    onChange();
+    return subscribeDeviceLayoutChange(onChange);
   }, []);
   // The choice is re-resolved only when what it belongs to changes: another server or sub-session, or the layout class. A phone
   // sub-session starts closed again for a different session; a resize within the same view never reaches this.

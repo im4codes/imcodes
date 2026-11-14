@@ -278,7 +278,7 @@ import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, SharedOpenTimeoutError, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { recordPerfRender } from './perf-render-debug.js';
-import { isMobileDevice } from './mobile-device.js';
+import { isMobileDevice, subscribeDeviceLayoutChange } from './mobile-device.js';
 import {
   getAuthKey,
   clearAuthKey,
@@ -336,7 +336,7 @@ import {
   isMobileKeyboardInputTarget,
   isSubSessionBarInputTarget,
 } from './mobile-keyboard.js';
-import { applyNativePlatformClasses, isNativeMacDesktop, NATIVE_HOST_EVENT, shouldUseIosMacTextScale } from './native-platform.js';
+import { applyNativePlatformClasses, isNativeMacDesktop, shouldUseIosMacTextScale } from './native-platform.js';
 import { boundedVisualViewportHeight, createSettledViewportUpdater } from './visual-viewport.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
@@ -1438,15 +1438,8 @@ function InternalMainApp() {
           : next
       ));
     };
-    window.addEventListener(NATIVE_HOST_EVENT, syncNativePlatform);
-    const mq = typeof window.matchMedia === 'function'
-      ? window.matchMedia('(hover: hover) and (pointer: fine)')
-      : null;
-    mq?.addEventListener?.('change', syncNativePlatform);
-    return () => {
-      window.removeEventListener(NATIVE_HOST_EVENT, syncNativePlatform);
-      mq?.removeEventListener?.('change', syncNativePlatform);
-    };
+    syncNativePlatform();
+    return subscribeDeviceLayoutChange(syncNativePlatform, { includeResize: false });
   }, []);
 
   const isNativeMac = nativePlatformSnapshot.macDesktop;

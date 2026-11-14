@@ -1,4 +1,4 @@
-import { isNativeMacDesktop, type NativeHostInfo } from './native-platform.js';
+import { isNativeMacDesktop, NATIVE_HOST_EVENT, type NativeHostInfo } from './native-platform.js';
 
 /** Phone/tablet detection used by the app shell. */
 export function isMobileUserAgent(userAgent: string = typeof navigator === 'undefined' ? '' : navigator.userAgent): boolean {
@@ -67,4 +67,34 @@ export function isMobileDevice(options: MobileLayoutOptions = {}): boolean {
 export function isMobileLayout(options: MobileLayoutOptions = {}): boolean {
   const width = options.width ?? (typeof window !== 'undefined' && Number.isFinite(window.innerWidth) ? window.innerWidth : undefined);
   return isMobileDevice(options) || (width !== undefined && width <= 720);
+}
+
+/**
+ * Subscribe to runtime signals that can change device/layout classification
+ * (native host bridge injection, pointer capability changes, and optionally viewport width).
+ */
+export function subscribeDeviceLayoutChange(
+  listener: () => void,
+  options: { includeResize?: boolean } = {},
+): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const includeResize = options.includeResize ?? true;
+  const queries = [
+    '(hover: hover) and (pointer: fine)',
+    '(pointer: coarse)',
+    ...(includeResize ? ['(max-width: 720px)'] : []),
+  ];
+  const mediaLists = typeof window.matchMedia === 'function'
+    ? queries.map((q) => window.matchMedia(q)).filter((m): m is MediaQueryList => Boolean(m))
+    : [];
+
+  window.addEventListener(NATIVE_HOST_EVENT, listener);
+  if (includeResize) window.addEventListener('resize', listener);
+  for (const mq of mediaLists) mq.addEventListener?.('change', listener);
+
+  return () => {
+    window.removeEventListener(NATIVE_HOST_EVENT, listener);
+    if (includeResize) window.removeEventListener('resize', listener);
+    for (const mq of mediaLists) mq.removeEventListener?.('change', listener);
+  };
 }

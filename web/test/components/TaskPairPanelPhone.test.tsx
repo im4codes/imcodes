@@ -7,6 +7,8 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { TaskPairStatusPanel, TaskPairStatusPanelHost } from '../../src/components/TaskPairStatusPanel.js';
+import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
+import { NATIVE_HOST_EVENT } from '../../src/native-platform.js';
 import { TASK_PAIR_PANEL_MAX_HEIGHT_VAR } from '../../src/task-pair-panel-fit.js';
 import { LEGACY_SESSION_MAP_KEY_PREFIX, resetTaskPairPanelMemoryForTests } from '../../src/task-pair-panel-state.js';
 
@@ -395,4 +397,71 @@ describe('everything that is not a phone sub-session is unchanged', () => {
     host.remove();
   });
 
+  it('updates mounted TaskPairStatusPanel and TaskPairEventChip on late native-host without resize or matchMedia', async () => {
+    window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:srv:desktop', '0');
+    window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:srv:mobile', '1');
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true, getPlatform: () => 'ios' });
+    vi.stubGlobal('__IMCODES_NATIVE_HOST__', undefined);
+    // MatchMedia unavailable, iPad UA, 0 touch points -> native iOS starts mobile before nativeHost arrives
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: undefined });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 });
+    Object.defineProperty(window.screen, 'width', { configurable: true, value: 1600 });
+    Object.defineProperty(window.screen, 'height', { configurable: true, value: 1000 });
+    vi.stubGlobal('navigator', {
+      platform: 'iPad',
+      userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+      maxTouchPoints: 0,
+    });
+
+    const chipPayload = {
+      taskId: 't1',
+      title: 'Late host task',
+      verb: 'WORKING',
+      toStatus: 'working',
+      executor: 'deck_sub_a',
+      auditor: 'deck_sub_b',
+    };
+
+    try {
+      const panelView = render(<TaskPairStatusPanel events={live} serverId="srv" scopeSessionId="deck_sub_a" />);
+      const chipView = render(<TaskPairEventChip eventId="ev-late" payload={chipPayload} />);
+      expect(isCollapsed(panelView.container)).toBe(true);
+      expect(chipView.container.querySelector('.task-pair-split-btn')).toBeNull();
+
+      // Late imcodes:native-host without any resize event
+      vi.stubGlobal('__IMCODES_NATIVE_HOST__', { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'native-1x' });
+      await act(() => {
+        window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      });
+      expect(isCollapsed(panelView.container)).toBe(false);
+      expect(chipView.container.querySelector('.task-pair-split-btn')).not.toBeNull();
+
+      // Negative control: narrow desktop width <= 720 compacts panel and hides split button
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 640 });
+      await act(() => {
+        window.dispatchEvent(new Event('resize'));
+      });
+      expect(isCollapsed(panelView.container)).toBe(true);
+      expect(chipView.container.querySelector('.task-pair-split-btn')).toBeNull();
+
+      // Restore wide viewport, then verify real iPhone stays compact
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 });
+      vi.stubGlobal('__IMCODES_NATIVE_HOST__', { isMacDesktop: false, pageZoomApplied: false, scaleMode: 'none' });
+      vi.stubGlobal('navigator', {
+        platform: 'iPhone',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        maxTouchPoints: 5,
+      });
+      await act(() => {
+        window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      });
+      expect(isCollapsed(panelView.container)).toBe(true);
+      expect(chipView.container.querySelector('.task-pair-split-btn')).toBeNull();
+
+      panelView.unmount();
+      chipView.unmount();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

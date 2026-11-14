@@ -7,8 +7,8 @@ import 'xterm/css/xterm.css';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { TerminalDiffRegistration } from '../terminal-diff-registry.js';
-import { IOS_MAC_TERMINAL_FONT_SIZE, NATIVE_HOST_EVENT, shouldUseIosMacTextScale } from '../native-platform.js';
-import { isMobileDevice } from '../mobile-device.js';
+import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
+import { isMobileDevice, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { applyDiffToRows, fullFrameWriteFromDiff, isRenderableLineIndex, resolveDiffRows } from '../terminal-frame.js';
 
@@ -178,13 +178,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         fitRef.current?.fit();
       }
     };
-    window.addEventListener(NATIVE_HOST_EVENT, syncPlatform);
-    const mq = typeof window.matchMedia === 'function' ? window.matchMedia('(hover: hover) and (pointer: fine)') : null;
-    mq?.addEventListener?.('change', syncPlatform);
-    return () => {
-      window.removeEventListener(NATIVE_HOST_EVENT, syncPlatform);
-      mq?.removeEventListener?.('change', syncPlatform);
-    };
+    syncPlatform();
+    return subscribeDeviceLayoutChange(syncPlatform, { includeResize: false });
   }, [mobileInput]);
 
   const clearRawFlushTimer = useCallback(() => {

@@ -135,6 +135,9 @@ describe('native platform text scaling', () => {
     expect(appDelegate).toContain('webView.pageZoom = Self.macDesignedForIpadPageZoom');
     expect(appDelegate).toContain('window.__IMCODES_NATIVE_HOST__');
     expect(appDelegate).toContain("CustomEvent('imcodes:native-host')");
+    expect(appDelegate).toContain('"native-1x"');
+    expect(appDelegate).toContain('"native-page-zoom"');
+    expect(appDelegate).toContain('"none"');
 
     const otaStart = appDelegate.indexOf('private static let nativeBundledBuildIdKey');
     expect(otaStart).toBeGreaterThan(0);
@@ -142,5 +145,37 @@ describe('native platform text scaling', () => {
     expect(otaSlice).not.toContain('UIKit');
     expect(otaSlice).not.toContain('WKWebView');
     expect(otaSlice).not.toContain('UIDevice');
+  });
+
+  it('distinguishes native-1x Catalyst .mac, native-page-zoom iOS-on-Mac, and legacy shell fallback', () => {
+    const catalystMac = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'native-1x' },
+    });
+    expect(isNativeMacDesktop(catalystMac)).toBe(true);
+    expect(shouldUseIosMacTextScale(catalystMac)).toBe(false);
+
+    // Even when a host omits scaleMode and sends { isMacDesktop: true, pageZoomApplied: false },
+    // the authoritative Mac host does not want legacy CSS double-scaling.
+    const catalystMacImplicit = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: false },
+    });
+    expect(isNativeMacDesktop(catalystMacImplicit)).toBe(true);
+    expect(shouldUseIosMacTextScale(catalystMacImplicit)).toBe(false);
+    const root = document.createElement('html');
+    applyNativePlatformClasses(root, catalystMacImplicit);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+
+    const designedForIpadZoom = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: true, scaleMode: 'native-page-zoom' },
+    });
+    expect(isNativeMacDesktop(designedForIpadZoom)).toBe(true);
+    expect(shouldUseIosMacTextScale(designedForIpadZoom)).toBe(false);
+
+    const explicitLegacy = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'legacy-css' },
+    });
+    expect(shouldUseIosMacTextScale(explicitLegacy)).toBe(true);
+    applyNativePlatformClasses(root, explicitLegacy);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(true);
   });
 });

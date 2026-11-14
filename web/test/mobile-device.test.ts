@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { isMobileDevice, isMobileLayout } from '../src/mobile-device.js';
+import { describe, expect, it, vi } from 'vitest';
+import { isMobileDevice, isMobileLayout, subscribeDeviceLayoutChange } from '../src/mobile-device.js';
+import { NATIVE_HOST_EVENT } from '../src/native-platform.js';
 
 describe('shared mobile layout detection', () => {
   it.each([
@@ -97,5 +98,59 @@ describe('shared mobile layout detection', () => {
       maxTouchPoints: 5,
       width: 1080,
     })).toBe(true);
+  });
+
+  it('subscribes to native-host, pointer media queries, and optional resize with full cleanup', () => {
+    const mqListeners = new Map<string, Set<() => void>>();
+    const origMatchMedia = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: (query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: (_ev: string, fn: () => void) => {
+          const set = mqListeners.get(query) ?? new Set<() => void>();
+          set.add(fn);
+          mqListeners.set(query, set);
+        },
+        removeEventListener: (_ev: string, fn: () => void) => {
+          mqListeners.get(query)?.delete(fn);
+        },
+      }),
+    });
+
+    try {
+      const fullListener = vi.fn();
+      const unsubFull = subscribeDeviceLayoutChange(fullListener);
+      window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      window.dispatchEvent(new Event('resize'));
+      mqListeners.get('(hover: hover) and (pointer: fine)')?.forEach((fn) => fn());
+      mqListeners.get('(pointer: coarse)')?.forEach((fn) => fn());
+      mqListeners.get('(max-width: 720px)')?.forEach((fn) => fn());
+      expect(fullListener).toHaveBeenCalledTimes(5);
+
+      unsubFull();
+      window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      window.dispatchEvent(new Event('resize'));
+      expect(fullListener).toHaveBeenCalledTimes(5);
+
+      const noResizeListener = vi.fn();
+      const unsubNoResize = subscribeDeviceLayoutChange(noResizeListener, { includeResize: false });
+      window.dispatchEvent(new Event('resize'));
+      expect(noResizeListener).not.toHaveBeenCalled();
+      window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      expect(noResizeListener).toHaveBeenCalledTimes(1);
+      unsubNoResize();
+
+      // Missing matchMedia still subscribes to native-host without throwing
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: undefined });
+      const fallbackListener = vi.fn();
+      const unsubFallback = subscribeDeviceLayoutChange(fallbackListener);
+      window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      expect(fallbackListener).toHaveBeenCalledTimes(1);
+      unsubFallback();
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: origMatchMedia });
+    }
   });
 });

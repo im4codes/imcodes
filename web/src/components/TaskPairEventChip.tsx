@@ -4,7 +4,7 @@ import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@share
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { isMobileLayout } from '../mobile-device.js';
+import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
@@ -73,15 +73,9 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     return () => window.removeEventListener('deck:pair-split-state', handler);
   }, []);
   useEffect(() => {
-    const media = window.matchMedia?.('(max-width: 720px)');
-    if (!media) return undefined;
     const onChange = () => setIsMobile(isMobileLayout());
-    media.addEventListener?.('change', onChange);
-    window.addEventListener('resize', onChange);
-    return () => {
-      media.removeEventListener?.('change', onChange);
-      window.removeEventListener('resize', onChange);
-    };
+    onChange();
+    return subscribeDeviceLayoutChange(onChange);
   }, []);
   const [hoverPreviewAnchor, setHoverPreviewAnchor] = useState<DOMRect | null>(null);
   const cardRef = useRef<HTMLElement | null>(null);
