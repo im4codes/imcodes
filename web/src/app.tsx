@@ -929,6 +929,13 @@ function InternalMainApp() {
   });
   const authRef = useRef(auth);
   authRef.current = auth;
+  const appMountedRef = useRef(true);
+  useEffect(() => {
+    appMountedRef.current = true;
+    return () => {
+      appMountedRef.current = false;
+    };
+  }, []);
   const sharedDiscoveryAbortRef = useRef<AbortController | null>(null);
   const sharedDiscoveryGenerationRef = useRef(0);
   useEffect(() => {
@@ -1114,12 +1121,15 @@ function InternalMainApp() {
 
   // Native: server URL state and readiness flag
   const [nativeServerUrl, setNativeServerUrl] = useState<string | null>(null);
+  const nativeServerUrlRef = useRef<string | null>(null);
+  nativeServerUrlRef.current = nativeServerUrl;
   const [nativeReady, setNativeReady] = useState(!isNative()); // web is immediately ready
   const [splashDone, setSplashDone] = useState(false);
 
   const connectNativeServer = useCallback(async (url: string) => {
     const releaseCleanupGate = holdAuthCredentialCleanupGate();
     const attempt = beginAuthAttempt();
+    nativeServerUrlRef.current = url;
     setNativeServerUrl(url);
     configureApi(url);
     configureExpectedUserId(null);
@@ -1625,6 +1635,7 @@ function InternalMainApp() {
     (async () => {
       try {
         const url = await getServerUrl();
+        nativeServerUrlRef.current = url;
         setNativeServerUrl(url);
         if (url) configureApi(url);
 
@@ -6476,6 +6487,7 @@ function InternalMainApp() {
         credentialServerUrl: auth?.baseUrl ?? nativeServerUrl,
       });
       try { await clearServerUrl(); } catch { /* ignore */ }
+      nativeServerUrlRef.current = null;
       setNativeServerUrl(null);
     } finally {
       releaseCleanupGate();
@@ -7269,7 +7281,20 @@ function InternalMainApp() {
     });
   }, [activeSessionInfo?.name, activeSessionInfo?.project, auth?.userId, canViewTaskConsole, selectedServerId]);
 
-  const handleAppLoginSuccess = (userId: string, url: string, r2RelayEnabled?: boolean) => {
+  const handleAppLoginSuccess = (
+    userId: string,
+    url: string,
+    r2RelayEnabled?: boolean,
+    expectedGeneration?: number,
+  ) => {
+    if (!appMountedRef.current) return;
+    if (expectedGeneration !== undefined && authMutationGenerationRef.current !== expectedGeneration) {
+      return;
+    }
+    const activeServerUrl = authRef.current?.baseUrl ?? nativeServerUrlRef.current;
+    if (activeServerUrl && activeServerUrl !== url) {
+      return;
+    }
     const authState: AuthState = { userId, baseUrl: url };
     const nextGeneration = authMutationGenerationRef.current + 1;
     authMutationGenerationRef.current = nextGeneration;
@@ -7282,7 +7307,7 @@ function InternalMainApp() {
     ));
     if (r2RelayEnabled === undefined) {
       void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
-        if (authMutationGenerationRef.current !== nextGeneration || me.id !== userId) return;
+        if (!appMountedRef.current || authMutationGenerationRef.current !== nextGeneration || me.id !== userId) return;
         setServerR2RelayEnabled(me.r2RelayEnabled === true);
       }).catch(() => { /* fail-closed false already set */ });
     }
@@ -9900,8 +9925,18 @@ function InternalMainApp() {
           beginAuthAttempt={beginAuthAttempt}
           onLoginSuccess={handleAppLoginSuccess}
           onWebLogin={() => {
+            const expectedGeneration = authMutationGenerationRef.current;
+            const targetServerUrl = authRef.current?.baseUrl ?? nativeServerUrlRef.current ?? window.location.origin;
             void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
-              handleAppLoginSuccess(me.id, auth?.baseUrl ?? nativeServerUrl ?? window.location.origin, me.r2RelayEnabled === true);
+              const currentTargetUrl = authRef.current?.baseUrl ?? nativeServerUrlRef.current ?? window.location.origin;
+              if (
+                !appMountedRef.current
+                || authMutationGenerationRef.current !== expectedGeneration
+                || currentTargetUrl !== targetServerUrl
+              ) {
+                return;
+              }
+              handleAppLoginSuccess(me.id, targetServerUrl, me.r2RelayEnabled === true, expectedGeneration);
             }).catch(() => {});
           }}
           zIndex={20000}

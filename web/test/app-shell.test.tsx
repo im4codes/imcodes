@@ -385,13 +385,17 @@ vi.mock('../src/components/ErrorBoundary.js', () => ({
 vi.mock('../src/components/LanguageSwitcher.js', () => ({ LanguageSwitcher: textComponent('language-switcher') }));
 vi.mock('../src/pages/LoginPage.js', () => ({
   LoginPage: ({
+    onLogin,
     onLoginSuccess,
     beginAuthAttempt,
+    completionMode,
     onChangeServer,
     sessionNotStuck,
   }: {
+    onLogin?: () => void;
     onLoginSuccess: (userId: string, url: string) => void;
     beginAuthAttempt?: () => { isCurrent: () => boolean; finish: () => void };
+    completionMode?: 'reload' | 'callback';
     onChangeServer?: () => void | Promise<void>;
     sessionNotStuck?: boolean;
   }) => (
@@ -405,9 +409,12 @@ vi.mock('../src/pages/LoginPage.js', () => ({
             if (loginAttemptState.pending) await loginAttemptState.pending;
             if (attempt?.isCurrent() ?? true) {
               if (loginAttemptState.mode === 'web') {
-                // Model the real Web LoginPage path: it owns the cookie login
-                // and reloads directly; it does not call native onLoginSuccess.
-                loginAttemptState.webReloads += 1;
+                onLogin?.();
+                if (completionMode !== 'callback') {
+                  // Model the real Web LoginPage path: it owns the cookie login
+                  // and reloads directly; it does not call native onLoginSuccess.
+                  loginAttemptState.webReloads += 1;
+                }
               } else {
                 onLoginSuccess(loginState.userId, loginState.baseUrl);
               }
@@ -11029,6 +11036,144 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       openSpy.mockRestore();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
+  it('prevents a stale embedded guest onWebLogin /me response from restoring auth after Logout and still updates host auth when current', async () => {
+    loginAttemptState.mode = 'web';
+    let meCallCount = 0;
+    let resolveDelayedGuestMe!: (me: { id: string; r2RelayEnabled?: boolean }) => void;
+    let resolveSecondGuestMe!: (me: { id: string; r2RelayEnabled?: boolean }) => void;
+
+    const { ApiError } = await import('../src/api.js');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        meCallCount += 1;
+        if (meCallCount === 1) return { id: 'user-1', r2RelayEnabled: false };
+        if (meCallCount === 2) {
+          return new Promise<{ id: string; r2RelayEnabled?: boolean }>((resolve) => {
+            resolveDelayedGuestMe = resolve;
+          });
+        }
+        return new Promise<{ id: string; r2RelayEnabled?: boolean }>((resolve) => {
+          resolveSecondGuestMe = resolve;
+        });
+      }
+      if (path === '/api/remote-desktop/unattended-password/proof') {
+        throw new ApiError(401, 'auth_required');
+      }
+      if (path === '/api/auth/logout') return {};
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+
+      // 1) Positive control: embedded web login updates host auth in-memory and keeps overlay + prefilled ID
+      const view1 = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      const quickBtns1 = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickBtns1[quickBtns1.length - 1]!);
+      const overlay1 = view1.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      fireEvent.input(overlay1.querySelector('input[inputmode="numeric"]') as HTMLInputElement, { target: { value: '5987654321' } });
+      fireEvent.input(overlay1.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-123' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+
+      await waitFor(() => expect(meCallCount).toBe(2));
+      expect((await screen.findByLabelText(/public_id/) as HTMLInputElement).value).toBe('5987654321');
+      await act(async () => {
+        resolveDelayedGuestMe({ id: 'user-2', r2RelayEnabled: true });
+      });
+      await waitFor(() => {
+        expect(JSON.parse(localStorage.getItem('rcc_auth') || '{}').userId).toBe('user-2');
+      });
+      expect(view1.container.querySelector('.remote-desktop-guest-overlay')).toBeTruthy();
+      expect((screen.getByLabelText(/public_id/) as HTMLInputElement).value).toBe('5987654321');
+      expect(loginAttemptState.webReloads).toBe(0);
+      view1.unmount();
+
+      // 2) Negative control: delayed onWebLogin /me settles AFTER exit + explicit Log Out -> must NOT restore auth
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      meCallCount = 0;
+      const wsBeforeView2 = wsInstances.length;
+      const view2 = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(wsBeforeView2));
+      const quickBtns2 = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickBtns2[quickBtns2.length - 1]!);
+      const overlay2 = view2.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      fireEvent.input(overlay2.querySelector('input[inputmode="numeric"]') as HTMLInputElement, { target: { value: '5123456789' } });
+      fireEvent.input(overlay2.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-123' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+      await waitFor(() => expect(meCallCount).toBe(2));
+
+      fireEvent.click(view2.container.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+      expect(view2.container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+      await waitFor(() => expect(localStorage.getItem('rcc_auth')).toBeNull());
+      expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+
+      await act(async () => {
+        resolveDelayedGuestMe({ id: 'user-1', r2RelayEnabled: true });
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(localStorage.getItem('rcc_auth')).toBeNull();
+      expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy();
+      view2.unmount();
+
+      // 3) Negative control: stale /me #1 settles AFTER newer auth attempt /me #2 starts -> only #2 commits
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      meCallCount = 0;
+      const wsBeforeView3 = wsInstances.length;
+      const view3 = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(wsBeforeView3));
+      const quickBtns3 = await screen.findAllByTestId('controlled-node-quick-connect-by-id');
+      fireEvent.click(quickBtns3[quickBtns3.length - 1]!);
+      const overlay3 = view3.container.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+      fireEvent.input(overlay3.querySelector('input[inputmode="numeric"]') as HTMLInputElement, { target: { value: '5123456789' } });
+      fireEvent.input(overlay3.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-123' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+      await waitFor(() => expect(meCallCount).toBe(2));
+
+      // Trigger a second embedded login attempt while the first /me is still pending
+      fireEvent.input(overlay3.querySelector('input[type="password"]') as HTMLInputElement, { target: { value: 'secret-password-456' } });
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.connect' }));
+      await screen.findByText('remote_desktop.guest.state_auth_required');
+      fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.sign_in' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'login-page' }));
+      await waitFor(() => expect(meCallCount).toBe(3));
+
+      await act(async () => {
+        resolveDelayedGuestMe({ id: 'stale-user', r2RelayEnabled: false });
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(JSON.parse(localStorage.getItem('rcc_auth') || '{}').userId).toBe('user-1');
+
+      await act(async () => {
+        resolveSecondGuestMe({ id: 'fresh-user', r2RelayEnabled: true });
+      });
+      await waitFor(() => {
+        expect(JSON.parse(localStorage.getItem('rcc_auth') || '{}').userId).toBe('fresh-user');
+      });
+      view3.unmount();
+    } finally {
+      loginAttemptState.mode = 'native';
+      loginAttemptState.webReloads = 0;
     }
   }, 20_000);
 });
