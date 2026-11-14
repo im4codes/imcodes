@@ -211,4 +211,36 @@ describe('native platform text scaling', () => {
     expect(appDelegate).toContain('targetWebView.underPageBackgroundColor = bg');
     expect(appDelegate).toContain('applicationWillEnterForeground');
   });
+
+  it('scopes compact Android mobile sizing rules without CSS zoom and leaves iOS/Mac styles intact', () => {
+    const root = document.createElement('html');
+    applyNativePlatformClasses(root, {
+      capacitor: {
+        isNativePlatform: () => true,
+        getPlatform: () => 'android',
+      },
+      navigator: {
+        platform: 'Linux armv8l',
+        userAgent: 'Mozilla/5.0 (Linux; Android 14)',
+        maxTouchPoints: 5,
+      },
+    });
+    expect(root.dataset.nativePlatform).toBe('android');
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(false);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const styles = readFileSync(resolve(dir, '../src/styles.css'), 'utf8');
+    const androidBlockStart = styles.indexOf('html[data-native-platform="android"]');
+    expect(androidBlockStart).toBeGreaterThan(-1);
+    const androidSection = styles.slice(Math.max(0, androidBlockStart - 120));
+    expect(androidSection).toContain('@media (max-width: 420px)');
+    expect(androidSection).toContain('--subsession-compact-card-width: 46px;');
+    expect(androidSection).toContain('html[data-native-platform="android"] .mobile-server-bar');
+    expect(androidSection).toContain('html[data-native-platform="android"] .subcard-bar-mobile .subsession-bar');
+    expect(androidSection).toContain('html[data-native-platform="android"] .controls-input');
+    expect(androidSection).toContain('html[data-native-platform="android"] .chat-bubble-content');
+    expect(androidSection).not.toMatch(/\bzoom\s*:/);
+    expect(styles).toContain('html.native-ios-mac {\n  -webkit-text-size-adjust: 115%;\n  text-size-adjust: 115%;\n}');
+  });
 });

@@ -75,27 +75,36 @@ public class StreamingSpeechPlugin extends Plugin {
         // ORT cannot resolve external .weights from an in-memory Android asset.
         // Publish complete files into this model revision's private no-backup cache.
         File root = new File(getContext().getNoBackupFilesDir(), MODEL_CACHE_DIR);
-        for (String name : MODEL_FILES) {
-            File file = new File(root, name);
-            if (!file.getParentFile().isDirectory() && !file.getParentFile().mkdirs()) {
-                throw new IOException("Speech cache directory unavailable");
-            }
-            try (java.io.InputStream input = getContext().getAssets().open(name)) {
-                if (file.isFile() && file.length() == input.available() && file.length() > 0) continue;
-                File pending = new File(file.getPath() + ".part");
-                try {
-                    try (FileOutputStream output = new FileOutputStream(pending)) {
-                        byte[] buffer = new byte[65536];
-                        int count;
-                        while ((count = input.read(buffer)) != -1) {
-                            output.write(buffer, 0, count);
-                        }
-                    }
-                    if (!pending.renameTo(file)) throw new IOException("Speech cache publish failed");
-                } finally {
-                    pending.delete();
+        File readyMarker = new File(root, ".cache-complete");
+        boolean cacheValid = readyMarker.isFile();
+        if (cacheValid) {
+            for (String name : MODEL_FILES) {
+                File cached = new File(root, name);
+                if (!cached.isFile() || (!"hotwords.txt".equals(name) && cached.length() == 0)) {
+                    cacheValid = false;
+                    break;
                 }
             }
+        }
+        if (!cacheValid) {
+            readyMarker.delete();
+            for (String name : MODEL_FILES) {
+                extractAssetFile(root, name);
+            }
+            File pendingMarker = new File(root, ".cache-complete.part");
+            try {
+                try (FileOutputStream markerOut = new FileOutputStream(pendingMarker)) {
+                    markerOut.write(MODEL_CACHE_DIR.getBytes(StandardCharsets.UTF_8));
+                }
+                if (!pendingMarker.renameTo(readyMarker)) {
+                    throw new IOException("Speech cache marker publish failed");
+                }
+            } finally {
+                pendingMarker.delete();
+            }
+        } else {
+            // Keep tiny optional hotwords.txt synchronized even when large weights are cached.
+            extractAssetFile(root, "hotwords.txt");
         }
         String hotwords = "";
         try (BufferedReader reader = new BufferedReader(
@@ -114,6 +123,29 @@ public class StreamingSpeechPlugin extends Plugin {
             Qwen3OnnxDecoder.DEFAULT_MAX_NEW_TOKENS
         );
         return decoder;
+    }
+
+    private void extractAssetFile(File root, String name) throws IOException {
+        File file = new File(root, name);
+        File parent = file.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+            throw new IOException("Speech cache directory unavailable");
+        }
+        try (java.io.InputStream input = getContext().getAssets().open(name)) {
+            File pending = new File(file.getPath() + ".part");
+            try {
+                try (FileOutputStream output = new FileOutputStream(pending)) {
+                    byte[] buffer = new byte[65536];
+                    int count;
+                    while ((count = input.read(buffer)) != -1) {
+                        output.write(buffer, 0, count);
+                    }
+                }
+                if (!pending.renameTo(file)) throw new IOException("Speech cache publish failed");
+            } finally {
+                pending.delete();
+            }
+        }
     }
 
     private Qwen3SpeechWindow.DecodeResult decodeSamples(

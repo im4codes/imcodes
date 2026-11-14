@@ -129,6 +129,8 @@ describe('Qwen3-ASR mobile assets', () => {
     const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
     const androidBuildGradle = await readFile(new URL('android/build.gradle', base), 'utf8');
     const appBuildGradle = await readFile(new URL('../../web/android/app/build.gradle', import.meta.url), 'utf8');
+    const mainActivity = await readFile(new URL('../../web/android/app/src/main/java/com/im/codes/MainActivity.java', import.meta.url), 'utf8');
+    const capacitorPluginsUrl = new URL('../../web/android/app/src/main/assets/capacitor.plugins.json', import.meta.url);
     const consumerRules = await readFile(new URL('android/consumer-rules.pro', base), 'utf8');
     const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
     const androidDecoder = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3OnnxDecoder.java', base), 'utf8');
@@ -138,8 +140,18 @@ describe('Qwen3-ASR mobile assets', () => {
     const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
     const qwenAsr = await readFile(new URL('ios/Sources/Qwen3ASR/Qwen3ASR.swift', base), 'utf8');
     expect(androidBuildGradle).toContain("com.microsoft.onnxruntime:onnxruntime-android:1.28.0");
+    expect(androidBuildGradle).toContain("noCompress += ['onnx', 'weights']");
+    expect(appBuildGradle).toContain("noCompress += ['onnx', 'weights']");
     expect(androidBuildGradle).not.toContain('sherpa-onnx');
     expect(appBuildGradle).not.toContain('sherpa-onnx');
+    expect(mainActivity).toContain('import com.imcodes.speech.StreamingSpeechPlugin;');
+    expect(mainActivity).toContain('registerPlugin(StreamingSpeechPlugin.class);');
+    expect(mainActivity).toContain('isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")');
+    expect(mainActivity).toContain('settings.setTextZoom(100);');
+    if (existsSync(capacitorPluginsUrl)) {
+      const pluginsJson = await readFile(capacitorPluginsUrl, 'utf8');
+      expect(pluginsJson).toContain('com.imcodes.speech.StreamingSpeechPlugin');
+    }
     expect(consumerRules).toContain('ai.onnxruntime.**');
     expect(consumerRules).not.toContain('sherpa');
     expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
@@ -148,6 +160,8 @@ describe('Qwen3-ASR mobile assets', () => {
     for (const name of iosModelFiles) { expect(ios).toContain('"' + name + '"'); }
     for (const name of ['listeningState', 'audioLevel', 'partialResults', 'recognitionError']) { expect(android).toContain('"' + name + '"'); expect(ios).toContain('"' + name + '"'); }
     expect(android).toContain('getNoBackupFilesDir()');
+    expect(android).toContain('.cache-complete');
+    expect(android).not.toContain('input.available()');
     expect(android).toContain('READ_CHUNK_SAMPLES = 800');
     expect(android).toContain('new Qwen3OnnxDecoder(');
     expect(android).toContain('new Qwen3SpeechWindow()');
@@ -174,7 +188,7 @@ describe('Qwen3-ASR mobile assets', () => {
     // API 24 compatibility guard: no java.nio.file (API 26+) or InputStream.readAllBytes/Files.readString (API 33+/Java 11) in production sources without coreLibraryDesugaring
     expect(androidTokenizer).toContain('readUtf8File(');
     expect(androidTokenizer).toContain('FileInputStream');
-    for (const javaSrc of [android, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
+    for (const javaSrc of [mainActivity, android, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
       expect(javaSrc).not.toMatch(/\bjava\.nio\.file\b|\bFiles\b|\.toPath\s*\(|\breadAllBytes\s*\(|\bFiles\s*\.\s*(?:readString|writeString)\s*\(|\bByteArrayOutputStream[^;]*toString\s*\(\s*StandardCharsets/);
     }
 

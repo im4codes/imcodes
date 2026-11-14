@@ -7,6 +7,7 @@ import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.WebSettings;
 
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
@@ -15,6 +16,11 @@ import androidx.core.view.WindowInsetsCompat;
 import com.getcapacitor.BridgeActivity;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginHandle;
+import com.imcodes.speech.StreamingSpeechPlugin;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends BridgeActivity {
 
@@ -24,6 +30,9 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(AuthSessionPlugin.class);
         registerPlugin(ShareReceiverPlugin.class);
         registerPlugin(NativeClipboardPlugin.class);
+        if (!isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")) {
+            registerPlugin(StreamingSpeechPlugin.class);
+        }
         // JPushPlugin only exists in the `china` flavor source set. Load it via
         // reflection so the `global` flavor compiles and runs without any JPush
         // class dependency. (BuildConfig.HAS_JPUSH is set per-flavor in app/build.gradle.)
@@ -40,6 +49,13 @@ public class MainActivity extends BridgeActivity {
             }
         }
         super.onCreate(savedInstanceState);
+        // Lock OS-level accessibility font scaling so fixed-width mobile controls/cards stay proportional.
+        if (getBridge() != null && getBridge().getWebView() != null) {
+            WebSettings settings = getBridge().getWebView().getSettings();
+            if (settings != null) {
+                settings.setTextZoom(100);
+            }
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM
                 && getBridge() != null && getBridge().getWebView() != null) {
             View webViewParent = (View) getBridge().getWebView().getParent();
@@ -89,5 +105,21 @@ public class MainActivity extends BridgeActivity {
         if (instance instanceof AuthSessionPlugin) {
             ((AuthSessionPlugin) instance).handleCallback(uri);
         }
+    }
+
+    private boolean isPluginListedInCapacitorPlugins(String classpath) {
+        String quoted = "\"" + classpath + "\"";
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(getAssets().open("capacitor.plugins.json"), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.contains(quoted)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+            // Asset may be absent or stale in cap-copy-only builds; fall back to explicit registration.
+        }
+        return false;
     }
 }

@@ -21983,3 +21983,136 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
     background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
   }
 }
+
+/* Android WebView (with native setTextZoom(100)): compact mobile sizing on narrow phones (<= 420 CSS px)
+   to match iOS density (~7 sub-session cards across ~360px, unclipped top-bar controls) without CSS zoom. */
+@media (max-width: 420px) {
+  html[data-native-platform="android"] {
+    --subsession-compact-card-width: 46px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-bar {
+    gap: 4px;
+    padding: 5px 6px;
+  }
+
+  html[data-native-platform="android"] .mobile-sidebar-toggle {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    font-size: 16px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-btn {
+    min-height: 34px;
+    gap: 5px;
+    padding: 4px 6px 4px 7px;
+    border-radius: 10px;
+    font-size: 12px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-btn-icon,
+  html[data-native-platform="android"] .mobile-server-btn-chevron {
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-actions {
+    gap: 3px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-actions .view-toggle {
+    padding: 3px 5px;
+    font-size: 12px;
+  }
+
+  html[data-native-platform="android"] .tab-bar {
+    min-height: 36px;
+    gap: 2px;
+    padding: 3px 6px 0;
+  }
+
+  html[data-native-platform="android"] .tab {
+    min-height: 30px;
+    padding: 0 10px;
+    font-size: 11px;
+  }
+
+  html[data-native-platform="android"] .tab-tool {
+    max-width: 48px;
+    font-size: 8.5px;
+  }
+
+  html[data-native-platform="android"] .tab-add-btn {
+    width: 26px;
+    height: 26px;
+    font-size: 14px;
+  }
+
+  html[data-native-platform="android"] .subsession-bar,
+  html[data-native-platform="android"] .subcard-bar-mobile .subsession-bar {
+    gap: 4px;
+    padding: 2px 6px calc(3px + env(safe-area-inset-bottom, 0px));
+  }
+
+  html[data-native-platform="android"] .subsession-card:not(.subsession-card-rail) {
+    min-height: 38px;
+    gap: 1px;
+    padding: 2px 1px 6px;
+    border-radius: 7px;
+  }
+
+  html[data-native-platform="android"] .subsession-card-icon {
+    font-size: 12px;
+  }
+
+  html[data-native-platform="android"] .subsession-card-label {
+    font-size: 9px;
+  }
+
+  html[data-native-platform="android"] .subsession-card-model {
+    font-size: 8px;
+  }
+
+  html[data-native-platform="android"] .subsession-card-seq {
+    font-size: 8px;
+  }
+
+  html[data-native-platform="android"] .shortcuts {
+    gap: 3px;
+    padding: 3px 6px;
+  }
+
+  html[data-native-platform="android"] .shortcuts-model {
+    padding: 3px 6px 3px 0;
+  }
+
+  html[data-native-platform="android"] .controls {
+    padding: 4px 6px;
+    gap: 4px;
+  }
+
+  html[data-native-platform="android"] .controls-input {
+    min-height: 30px;
+    padding: 6px 9px;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+
+  html[data-native-platform="android"] .btn {
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+
+  html[data-native-platform="android"] .chat-view {
+    padding: 6px 10px;
+  }
+
+  html[data-native-platform="android"] .chat-user,
+  html[data-native-platform="android"] .chat-assistant,
+  html[data-native-platform="android"] .chat-bubble-content {
+    font-size: 13.5px;
+    line-height: 1.45;
+  }
+}

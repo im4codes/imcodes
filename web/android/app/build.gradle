@@ -103,7 +103,7 @@ android {
     }
 
     // Keep the offline model directly readable by AssetManager/ONNX Runtime.
-    androidResources { noCompress += ['onnx'] }
+    androidResources { noCompress += ['onnx', 'weights'] }
 
     buildFeatures {
         buildConfig = true
