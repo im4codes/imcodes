@@ -548,9 +548,6 @@ export function SessionPane({
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
           runExecutionClonesFeedback={executionCloneLaunchState}
-          onRefreshHistory={timelineForceRefresh}
-          historyRefreshing={timelineRefreshing}
-          historyStatus={timelineHistoryStatus}
         />
       )}
 

@@ -18,9 +18,7 @@ import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import { CodexResetCredits } from './CodexResetCredits.js';
 import { CodexCreditBalance } from './CodexCreditBalance.js';
-import { SessionUsagePanel } from './SessionUsagePanel.js';
 import type { WsClient } from '../ws-client.js';
-import type { TimelineHistoryStatus } from '../hooks/useTimeline.js';
 import type { ExecutionCloneLaunchState } from '../hooks/useExecutionCloneLaunch.js';
 import {
   ACK_FAILURE_ACK_TIMEOUT,
@@ -71,10 +69,6 @@ interface Props {
   runExecutionClonesTitle?: string;
   runExecutionClonesCount?: number;
   runExecutionClonesFeedback?: ExecutionCloneLaunchState;
-  /** Reuses the current session timeline's authoritative force-refresh path. */
-  onRefreshHistory?: () => void;
-  historyRefreshing?: boolean;
-  historyStatus?: TimelineHistoryStatus | null;
   /** WS client — enables the Codex reset-credits affordance (codex sessions). */
   wsClient?: WsClient | null;
   connected?: boolean;
@@ -91,10 +85,9 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, onRefreshHistory, historyRefreshing = false, historyStatus, wsClient, connected, isMobile }: Props) {
+function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, wsClient, connected, isMobile }: Props) {
   recordPerfRender('UsageFooter');
   const { t } = useTranslation();
-  const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
 
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
@@ -289,20 +282,8 @@ function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOve
     });
   }, [runExecutionClonesFeedback, t]);
   const executionCloneFeedbackPhase = runExecutionClonesFeedback?.phase ?? 'idle';
-  const historyRefreshError = historyStatus?.response?.state === 'error'
-    ? historyStatus.response.localizedMessage
-    : null;
-  const historyRefreshLabel = historyRefreshing
-    ? t('chat.refreshing_history')
-    : t('chat.sync_history');
-  const historyRefreshAccessibleLabel = historyRefreshError
-    ? `${historyRefreshLabel}: ${historyRefreshError}`
-    : historyRefreshLabel;
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
-      {sessionUsageOpen && (
-        <SessionUsagePanel targetSessionName={sessionName} onClose={() => setSessionUsageOpen(false)} />
-      )}
       {hasContextInfo && (
         <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
@@ -412,38 +393,6 @@ function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOve
               )}
             </span>
           )}
-          {onRefreshHistory && (
-            <span class="shortcut-btn-history-refresh-wrapper">
-              <button
-                type="button"
-                class={`shortcut-btn shortcut-btn-icon shortcut-btn-history-refresh${historyRefreshing ? ' is-refreshing' : ''}${historyRefreshError ? ' is-error' : ''}`}
-                title={historyRefreshAccessibleLabel}
-                aria-label={historyRefreshAccessibleLabel}
-                disabled={historyRefreshing}
-                onClick={() => {
-                  if (!historyRefreshing) onRefreshHistory();
-                }}
-              >
-                <span class="shortcut-btn-history-refresh-glyph" aria-hidden="true">↻</span>
-                {historyRefreshError && (
-                  <span
-                    class="shortcut-btn-history-refresh-error"
-                    role="alert"
-                    aria-label={historyRefreshError}
-                  >!</span>
-                )}
-              </button>
-            </span>
-          )}
-          <button
-            type="button"
-            class="shortcut-btn shortcut-btn-icon shortcut-btn-session-usage"
-            title={t('sessionUsage.open')}
-            aria-label={t('sessionUsage.open')}
-            onClick={() => setSessionUsageOpen(true)}
-          >
-            📊
-          </button>
           <span class="shortcut-btn-tools-wrapper">
             {/* Undecided-state bubble. Points the user at the wrench so the
              *  first-run choice surface is obvious even before they scroll
@@ -531,8 +480,6 @@ export const UsageFooter = memo(UsageFooterImpl, (prev, next) => (
   && prev.runExecutionClonesTitle === next.runExecutionClonesTitle
   && prev.runExecutionClonesCount === next.runExecutionClonesCount
   && prev.runExecutionClonesFeedback === next.runExecutionClonesFeedback
-  && prev.historyRefreshing === next.historyRefreshing
-  && prev.historyStatus === next.historyStatus
   && prev.wsClient === next.wsClient
   && prev.connected === next.connected
 ));

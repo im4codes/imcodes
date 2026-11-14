@@ -22,7 +22,7 @@ describe('heartbeat UI wiring and accessibility contract', () => {
     expect(css).toContain('@keyframes supervision-heartbeat-pulse');
     expect(css).toContain('@keyframes chat-heartbeat-beat');
     expect(css).toContain('@keyframes chat-waiting-sway');
-    const heartbeatReducedSelector = '.supervision-heartbeat-badge.is-sending,\n  .shortcut-btn-history-refresh.is-refreshing .shortcut-btn-history-refresh-glyph,\n  .chat-execution-status-chip.waiting';
+    const heartbeatReducedSelector = '.supervision-heartbeat-badge.is-sending,\n  .chat-execution-status-chip.waiting';
     const selectorAt = css.indexOf(heartbeatReducedSelector);
     const reducedAt = css.lastIndexOf('@media (prefers-reduced-motion: reduce)', selectorAt);
     const reduced = css.slice(reducedAt, css.indexOf('\n}', selectorAt) + 2);

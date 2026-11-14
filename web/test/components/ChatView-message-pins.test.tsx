@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import type { MessagePin } from '../../../shared/message-pins.js';
+import { createEmptyUsageSummaryResponse } from '../../../shared/usage-analytics.js';
 import {
   __resetMessagePinNavigationForTests,
   getPendingMessagePin,
@@ -66,11 +67,14 @@ vi.mock('../../src/hooks/usePref.js', () => ({
   },
 }));
 
+const stableT = (key: string) => key;
+const stableTranslation = { i18n: { language: 'en' }, t: stableT };
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    i18n: { language: 'en' },
-    t: (key: string) => key,
-  }),
+  useTranslation: () => stableTranslation,
+}));
+
+vi.mock('../../src/api/usage-summary.js', () => ({
+  fetchUsageSummary: vi.fn(async () => createEmptyUsageSummaryResponse()),
 }));
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
@@ -143,7 +147,7 @@ describe('ChatView message pin action', () => {
   });
   afterEach(cleanup);
 
-  it('places the compact pin counter after the font and branch controls', () => {
+  it('places the compact pin counter after the font and branch controls and session usage button directly right of it', () => {
     const { container } = render(
       <ChatView
         events={[]}
@@ -157,11 +161,15 @@ describe('ChatView message pin action', () => {
     );
     const titlebar = container.querySelector('.chat-titlebar');
     const trigger = screen.getByTestId('message-pins-trigger');
+    const usageButton = screen.getByLabelText('sessionUsage.open');
     expect(titlebar).not.toBeNull();
-    expect(titlebar!.children).toHaveLength(3);
+    expect(titlebar!.children).toHaveLength(4);
     expect(titlebar!.children[0]?.querySelector('[aria-label="Aa"]')).toBeTruthy();
     expect(titlebar!.children[1]?.querySelector('.session-repo-branch-summary')).toBeTruthy();
     expect(titlebar!.children[2]).toBe(trigger.closest('.message-pins-bar'));
+    expect(titlebar!.children[3]).toBe(usageButton);
+    expect(usageButton.classList.contains('chat-session-usage-btn')).toBe(true);
+    expect(usageButton.getAttribute('title')).toBe('sessionUsage.open');
     expect(trigger.textContent).toBe('📌0/0');
   });
 
@@ -570,5 +578,46 @@ describe('ChatView message pin action', () => {
     expect(document.querySelector('pre.zoom-text-content')?.textContent).toBe(sourceText);
     fireEvent.click(screen.getByText('common.quote'));
     expect(onQuote).toHaveBeenCalledWith(sourceText);
+  });
+
+  it('opens and closes SessionUsagePanel from the titlebar usage button, hides it in preview mode, and keeps top sync working', async () => {
+    const onForceSync = vi.fn();
+    const { container, rerender } = render(
+      <ChatView
+        events={[]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        onForceSync={onForceSync}
+        messagePinsEnabled
+      />,
+    );
+
+    const syncButton = screen.getByLabelText('chat.sync_history');
+    expect(syncButton.classList.contains('chat-sync-btn')).toBe(true);
+    fireEvent.click(syncButton);
+    expect(onForceSync).toHaveBeenCalledTimes(1);
+
+    const usageButton = screen.getByLabelText('sessionUsage.open');
+    fireEvent.click(usageButton);
+    await waitFor(() => expect(document.body.querySelector('.session-usage-backdrop')).toBeTruthy());
+    expect(container.querySelector('.session-usage-backdrop')).toBeNull();
+
+    fireEvent.click(screen.getByLabelText('sessionUsage.close'));
+    expect(document.body.querySelector('.session-usage-backdrop')).toBeNull();
+
+    rerender(
+      <ChatView
+        events={[]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        onForceSync={onForceSync}
+        messagePinsEnabled
+        preview
+      />,
+    );
+    expect(container.querySelector('.chat-titlebar')).toBeNull();
+    expect(screen.queryByLabelText('sessionUsage.open')).toBeNull();
   });
 });

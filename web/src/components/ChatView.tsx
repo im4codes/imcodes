@@ -151,6 +151,7 @@ import {
 } from '@shared/message-pins.js';
 import { useMessagePins } from '../hooks/useMessagePins.js';
 import { MessagePinsBar, type MessagePinPreviewMode } from './MessagePinsBar.js';
+import { SessionUsagePanel } from './SessionUsagePanel.js';
 import {
   clearPendingMessagePin,
   getPendingMessagePin,
@@ -2885,6 +2886,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // the portion they want to copy.
   const [zoomText, setZoomText] = useState<string | null>(null);
   const [renderItemLimit, setRenderItemLimit] = useState(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+  const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
+  useEffect(() => {
+    setSessionUsageOpen(false);
+  }, [sessionId, preview]);
   const pinsEnabled = messagePinsEnabled && !preview && !!serverId && !!sessionId;
   const messagePins = useMessagePins(serverId, sessionId, pinsEnabled);
 
@@ -4791,6 +4796,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                 }}
               />
             )}
+            {sessionId && (
+              <button
+                type="button"
+                class="chat-session-usage-btn"
+                title={t('sessionUsage.open')}
+                aria-label={t('sessionUsage.open')}
+                onClick={() => setSessionUsageOpen(true)}
+              >
+                📊
+              </button>
+            )}
           </div>
         )}
         {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} />}
@@ -5264,6 +5280,9 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           specific portion. */}
       {zoomText && (
         <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
+      )}
+      {!preview && sessionId && sessionUsageOpen && (
+        <SessionUsagePanel targetSessionName={sessionId} onClose={() => setSessionUsageOpen(false)} />
       )}
       <HtmlFullscreenPreview preview={htmlFullscreenPreview} onClose={closeHtmlFullscreenPreview} />
       {/* External link confirm dialog */}

@@ -78,90 +78,26 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('portals the Token usage dialog above floating-window stacking contexts', () => {
+  it('hides the execution-clone launcher and omits moved usage-stats and removed footer history-refresh buttons', () => {
+    const onRunExecutionClones = vi.fn();
     const { container } = render(
       <UsageFooter
         usage={{ inputTokens: 1000, cacheTokens: 2000, contextWindow: 1_000_000 }}
         sessionName="deck_test_brain"
-      />,
-    );
-
-    fireEvent.click(screen.getByLabelText('sessionUsage.open'));
-    expect(document.body.querySelector('.session-usage-backdrop')).toBeTruthy();
-    expect(container.querySelector('.session-usage-backdrop')).toBeNull();
-  });
-
-  it('hides the execution-clone launcher and puts history refresh before stats', () => {
-    const onRunExecutionClones = vi.fn();
-    const onRefreshHistory = vi.fn();
-    const { container } = render(
-      <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-        sessionName="deck_test_brain"
         onRunExecutionClones={onRunExecutionClones}
         runExecutionClonesTitle="Run clones"
         runExecutionClonesCount={3}
-        onRefreshHistory={onRefreshHistory}
       />,
     );
 
     expect(screen.queryByLabelText('Run clones')).toBeNull();
     expect(container.querySelector('.shortcut-btn-execution-clones')).toBeNull();
-    const refreshButton = screen.getByLabelText('chat.sync_history');
-    const statsButton = screen.getByLabelText('sessionUsage.open');
-    expect(refreshButton.compareDocumentPosition(statsButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-
-    fireEvent.click(refreshButton);
-    expect(onRefreshHistory).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.shortcut-btn-session-usage')).toBeNull();
+    expect(container.querySelector('.shortcut-btn-history-refresh')).toBeNull();
+    expect(screen.queryByLabelText('sessionUsage.open')).toBeNull();
+    expect(screen.queryByLabelText('chat.sync_history')).toBeNull();
+    expect(document.body.querySelector('.session-usage-backdrop')).toBeNull();
     expect(onRunExecutionClones).not.toHaveBeenCalled();
-  });
-
-  it('disables history refresh and shows a spinner while its timeline is refreshing', () => {
-    const onRefreshHistory = vi.fn();
-    const { container } = render(
-      <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-        sessionName="deck_test_brain"
-        onRefreshHistory={onRefreshHistory}
-        historyRefreshing
-      />,
-    );
-
-    const refreshButton = screen.getByLabelText('chat.refreshing_history') as HTMLButtonElement;
-    expect(refreshButton.disabled).toBe(true);
-    expect(refreshButton.classList.contains('is-refreshing')).toBe(true);
-    expect(container.querySelector('.shortcut-btn-history-refresh-glyph')).toBeTruthy();
-    fireEvent.click(refreshButton);
-    expect(onRefreshHistory).not.toHaveBeenCalled();
-  });
-
-  it('surfaces the timeline refresh error without replacing the refresh action', () => {
-    const onRefreshHistory = vi.fn();
-    const { container } = render(
-      <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-        sessionName="deck_test_brain"
-        onRefreshHistory={onRefreshHistory}
-        historyStatus={{
-          phase: 'idle',
-          steps: { cache: 'skipped', textTail: 'skipped', daemon: 'skipped', http: 'skipped', older: 'skipped' },
-          counts: {},
-          response: {
-            state: 'error',
-            i18nKey: 'chat.timelineStatus.error',
-            localizedMessage: 'History service unavailable',
-            recoverable: true,
-          },
-        }}
-      />,
-    );
-
-    const refreshButton = screen.getByLabelText('chat.sync_history: History service unavailable');
-    expect(refreshButton.getAttribute('title')).toBe('chat.sync_history: History service unavailable');
-    expect(refreshButton.classList.contains('is-error')).toBe(true);
-    expect(container.querySelector('[role="alert"]')?.getAttribute('aria-label')).toBe('History service unavailable');
-    fireEvent.click(refreshButton);
-    expect(onRefreshHistory).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the robot status row visible without hosting the repo branch summary', () => {
