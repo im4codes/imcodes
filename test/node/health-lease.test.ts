@@ -170,19 +170,25 @@ describe('controlled-node authenticated health lease', () => {
     await expect(readFile(controlledNodeHealthWatchdogStatePath(journalPath), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('immediately restarts a live macOS process whose authenticated lease is stale', async () => {
+  it('restarts a live macOS process whose authenticated lease is stale only after confirmation (not immediately on wake)', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-health-'));
     temporaryDirs.push(dir);
     const journalPath = join(dir, 'install-journal.json');
     await writeControlledNodeHealthLease(controlledNodeHealthLeasePath(journalPath), 819_999, 88);
+    let now = 1_000_000;
     const restartService = vi.fn();
-
-    await expect(runMacosControlledNodeHealthWatchdog({
+    const run = () => runMacosControlledNodeHealthWatchdog({
       journalPath,
-      now: () => 1_000_000,
+      now: () => now,
       processExists: () => true,
       restartService,
-    })).resolves.toEqual({ healthy: false, restarted: true, reason: 'lease_stale' });
+    });
+
+    await expect(run()).resolves.toEqual({ healthy: false, restarted: false, reason: 'lease_stale' });
+    expect(restartService).not.toHaveBeenCalled();
+
+    now += 60_000;
+    await expect(run()).resolves.toEqual({ healthy: false, restarted: true, reason: 'lease_stale' });
     expect(restartService).toHaveBeenCalledOnce();
   });
 
@@ -224,16 +230,29 @@ describe('controlled-node authenticated health lease', () => {
     expect(restartService).not.toHaveBeenCalled();
   });
 
-  it('still restarts a live macOS process when neither lease is fresh (the process is stuck, not offline)', async () => {
+  it('restarts a stuck live macOS process when neither lease is fresh across the confirm window, while granting sleep/wake grace', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-health-'));
     temporaryDirs.push(dir);
     const journalPath = join(dir, 'install-journal.json');
     await writeControlledNodeHealthLease(controlledNodeHealthLeasePath(journalPath), 1_000, 55);
     await writeControlledNodeHealthLease(controlledNodeLivenessLeasePath(journalPath), 700_000, 55);
+    let now = 1_000_000;
     const restartService = vi.fn();
-    await expect(runMacosControlledNodeHealthWatchdog({
-      journalPath, now: () => 1_000_000, processExists: () => true, restartService,
-    })).resolves.toEqual({ healthy: false, restarted: true, reason: 'lease_stale' });
+    const run = () => runMacosControlledNodeHealthWatchdog({
+      journalPath, now: () => now, processExists: () => true, restartService,
+    });
+
+    await expect(run()).resolves.toEqual({ healthy: false, restarted: false, reason: 'lease_stale' });
+    expect(restartService).not.toHaveBeenCalled();
+
+    // Sleep/clock jump > resumeGapMs resets wake grace instead of killing immediately on wake.
+    now += 600_000;
+    await expect(run()).resolves.toEqual({ healthy: false, restarted: false, reason: 'lease_stale' });
+    expect(restartService).not.toHaveBeenCalled();
+
+    // If the live process still fails to renew after one awake watchdog interval, it is restarted.
+    now += 60_000;
+    await expect(run()).resolves.toEqual({ healthy: false, restarted: true, reason: 'lease_stale' });
     expect(restartService).toHaveBeenCalledOnce();
   });
 

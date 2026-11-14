@@ -11,6 +11,7 @@ import {
   CONTROLLED_NODE_LIVENESS_WRITE_INTERVAL_MS,
   CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS,
   CONTROLLED_NODE_UNREACHABLE_WARN_REPEAT_MS,
+  CONTROLLED_NODE_UPGRADE_HEALTH,
 } from '../../shared/controlled-node-service.js';
 
 export const CONTROLLED_NODE_HEALTH_LEASE_FILE = 'health-lease.json';
@@ -127,6 +128,8 @@ function isControlledNodeHealthLease(value: unknown): value is ControlledNodeHea
 interface ControlledNodeHealthWatchdogState {
   version: 1;
   failureSince: number;
+  observedAt?: number;
+  pid?: number;
   reason: string;
 }
 
@@ -137,6 +140,8 @@ function isControlledNodeHealthWatchdogState(value: unknown): value is Controlle
     && typeof state.failureSince === 'number'
     && Number.isSafeInteger(state.failureSince)
     && state.failureSince >= 0
+    && (state.observedAt === undefined || (typeof state.observedAt === 'number' && Number.isSafeInteger(state.observedAt)))
+    && (state.pid === undefined || (typeof state.pid === 'number' && Number.isSafeInteger(state.pid) && state.pid >= 0))
     && typeof state.reason === 'string';
 }
 
@@ -184,19 +189,24 @@ async function readLeaseFile(path: string): Promise<LeaseReading> {
  * an unreachable server is not a reason to restart it. The authenticated health lease is accepted as well (a node
  * that predates the liveness lease only writes that one).
  *
- * Missing/invalid leases receive a full grace window so first boot and normal process replacement are not mistaken
- * for a wedge. A stale lease whose exact PID is still alive is decisive evidence of the observed fake-alive state and
- * can be restarted immediately.
+ * Missing/invalid/stale leases receive confirmation grace so first boot, normal process replacement,
+ * and OS sleep/wake clock jumps do not falsely kill a healthy waking node before it renews liveness.
+ * Once a live PID stays `lease_stale` across the confirmation window with no sleep/clock discontinuity,
+ * it is restarted cleanly.
  */
 export async function runMacosControlledNodeHealthWatchdog(options: {
   journalPath: string;
   now?: () => number;
   staleMs?: number;
+  confirmMs?: number;
+  resumeGapMs?: number;
   processExists?: (pid: number) => boolean;
   restartService: () => void | Promise<void>;
 }): Promise<ControlledNodeHealthWatchdogResult> {
   const now = options.now?.() ?? Date.now();
   const staleMs = options.staleMs ?? CONTROLLED_NODE_HEALTH_STALE_MS;
+  const confirmMs = options.confirmMs ?? CONTROLLED_NODE_UPGRADE_HEALTH.LIVENESS_FRESH_MS;
+  const resumeGapMs = options.resumeGapMs ?? CONTROLLED_NODE_UPGRADE_HEALTH.SLEEP_JUMP_GAP_MS;
   const statePath = controlledNodeHealthWatchdogStatePath(options.journalPath);
   const processExists = options.processExists ?? ((pid: number) => {
     try {
@@ -229,30 +239,52 @@ export async function runMacosControlledNodeHealthWatchdog(options: {
   // Not healthy: name the failure after the first lease that exists (the liveness lease, else the health lease).
   let reason: ControlledNodeHealthWatchdogResult['reason'] = 'lease_missing';
   let pidAlive = false;
+  let observedPid: number | undefined;
   const primary = judged.find((entry) => entry.reading.kind === 'lease') ?? judged.find((entry) => entry.reading.kind === 'invalid');
   if (primary?.reading.kind === 'invalid') reason = 'lease_invalid';
-  else if (primary) {
+  else if (primary && primary.reading.kind === 'lease') {
     pidAlive = primary.pidAlive;
+    observedPid = primary.reading.lease.pid;
     if (primary.ageMs < -60_000) reason = 'lease_future';
     else if (!primary.pidAlive) reason = 'lease_pid_missing';
     else reason = 'lease_stale';
   }
 
-  let failureSince = now;
+  let previousState: ControlledNodeHealthWatchdogState | null = null;
   try {
     const parsed = await readJson(statePath);
-    if (isControlledNodeHealthWatchdogState(parsed)) failureSince = Math.min(parsed.failureSince, now);
+    if (isControlledNodeHealthWatchdogState(parsed)) previousState = parsed;
   } catch {
     // Missing/corrupt state starts a fresh bounded grace window.
   }
 
-  // A live process with a lease already stale for the full threshold is conclusive. Other states may simply be a
-  // fresh replacement, so require persistence across the grace window before restarting.
-  const decisiveStaleProcess = reason === 'lease_stale' && pidAlive;
-  const shouldRestart = decisiveStaleProcess || now - failureSince >= staleMs;
+  let failureSince = previousState ? Math.min(previousState.failureSince, now) : now;
+  const staleLiveProcess = reason === 'lease_stale' && pidAlive && observedPid !== undefined;
+  let decisiveStaleProcess = false;
+  let clockDiscontinuity = false;
+  if (staleLiveProcess) {
+    const previousObservedAt = previousState?.observedAt;
+    const observationGapMs = typeof previousObservedAt === 'number' ? now - previousObservedAt : null;
+    clockDiscontinuity = observationGapMs !== null && (observationGapMs < -60_000 || observationGapMs > resumeGapMs);
+    if (clockDiscontinuity) {
+      // OS sleep/clock jump invalidated the prior failure observation: grant a fresh post-wake grace window.
+      failureSince = now;
+    } else if (
+      previousState !== null
+      && previousState.reason === 'lease_stale'
+      && previousState.pid === observedPid
+      && observationGapMs !== null
+      && observationGapMs >= confirmMs
+    ) {
+      decisiveStaleProcess = true;
+    }
+  }
+  const shouldRestart = decisiveStaleProcess || (!clockDiscontinuity && now - failureSince >= staleMs);
   await writeJsonAtomic(statePath, {
     version: 1,
     failureSince,
+    observedAt: now,
+    ...(observedPid !== undefined ? { pid: observedPid } : {}),
     reason,
   } satisfies ControlledNodeHealthWatchdogState);
   if (!shouldRestart) return { healthy: false, restarted: false, reason };

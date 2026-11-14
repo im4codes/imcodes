@@ -1734,6 +1734,33 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('/delete-driver ([string]$newVirtualDisplayDriver.Driver) /uninstall /force');
     expect(script.indexOf('/delete-driver ([string]$newVirtualDisplayDriver.Driver)'))
       .toBeLessThan(script.indexOf('/add-driver $rollbackVirtualDisplayInf /install'));
+
+    // Offline liveness + sleep clamping + .new ACL/ReadOnly recovery + rollback ACL re-application
+    expect(script).toContain('function Get-IMCodesLivenessLease');
+    expect(script).toContain(`$stepMs -gt ${CONTROLLED_NODE_UPGRADE_HEALTH.SLEEP_JUMP_GAP_MS}`);
+    expect(script).toContain("$livenessLease = Join-Path (Split-Path -Parent $dst) 'liveness-lease.json'");
+    expect(script).toContain('Remove-Item -Force $healthLease,$livenessLease -ErrorAction SilentlyContinue');
+    expect(script).toContain('$clearStagingDir = { param([string]$target)');
+    expect(script).toContain('& $clearStagingDir $pendingRemoteDesktop; & $clearStagingDir $backupRemoteDesktop');
+    expect(script.indexOf('& $clearStagingDir $pendingRemoteDesktop'))
+      .toBeLessThan(script.indexOf("'C:\\ProgramData\\imcodes-node\\remote-desktop-worker.new' '/reset'"));
+    const restoreMainIdx = script.indexOf("& $runRecovery 'restore_main'");
+    const restoreRdIdx = script.indexOf("& $runRecovery 'restore_remote_desktop'");
+    expect(restoreMainIdx).toBeGreaterThan(0);
+    expect(restoreRdIdx).toBeGreaterThan(0);
+    expect(script.indexOf("'*S-1-5-11:RX'", restoreMainIdx)).toBeGreaterThan(restoreMainIdx);
+    expect(script.indexOf("'C:\\ProgramData\\imcodes-node\\remote-desktop-worker\\win32-x64\\imcodes-remote-desktop-worker.exe' '/reset'", restoreRdIdx)).toBeGreaterThan(restoreRdIdx);
+
+    const helperScript = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\tmp\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\tmp\\imcodes-node.exe.manifest.json',
+      stagedComputerUseHelperDir: 'C:\\tmp\\computer-use-helper',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+    });
+    const restoreHelperIdx = helperScript.indexOf("& $runRecovery 'restore_helper'");
+    expect(restoreHelperIdx).toBeGreaterThan(0);
+    expect(helperScript.indexOf("'C:\\ProgramData\\imcodes-node\\computer-use-helper' '/reset'", restoreHelperIdx)).toBeGreaterThan(restoreHelperIdx);
   });
 
   it('escapes the one-shot upgrade script path in Task Scheduler XML', () => {

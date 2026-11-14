@@ -999,4 +999,71 @@ describe('pending_setup disposition when unbound without credential or trailer',
       'controlled node is enrolled but enrollment blob is unavailable; manual recovery required',
     );
   });
+
+  it('repairs drifted credential dir ACL on elevated reinstall/repair and retries credential load', async () => {
+    let repaired = false;
+    const order: string[] = [];
+    const deps = makeDeps({
+      isStableRuntime: vi.fn(async () => false),
+      assertElevated: vi.fn(async () => { order.push('elevate'); }),
+      prepareCredentialDir: vi.fn(async () => {
+        order.push('prepare');
+        repaired = true;
+      }),
+      loadCredential: vi.fn(async () => {
+        order.push('load');
+        if (!repaired) {
+          throw new Error('windows_credential_acl_insecure:unauthorized_allow:S-1-5-21-1254309406-3540811138-863848884-1001:0x1f01ff');
+        }
+        return CRED;
+      }),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        abiProfile: CONTROLLED_NODE_ABI_MODERN,
+        phase: 'service_healthy',
+        updatedAt: 100,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        serverId: CRED.serverId,
+        serviceName: SERVICE_RECEIPT.name,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result).toMatchObject({ credential: CRED, disposition: 'handoff_complete' });
+    expect(order.slice(0, 4)).toEqual(['load', 'elevate', 'prepare', 'load']);
+  });
+
+  it('still fails closed on credential ACL drift when running as the stable service runtime', async () => {
+    const deps = makeDeps({
+      isStableRuntime: vi.fn(async () => true),
+      prepareCredentialDir: vi.fn(async () => {}),
+      loadCredential: vi.fn(async () => {
+        throw new Error('windows_credential_acl_insecure:unauthorized_allow:S-1-5-21-1254309406-3540811138-863848884-1001:0x1f01ff');
+      }),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        abiProfile: CONTROLLED_NODE_ABI_MODERN,
+        phase: 'service_healthy',
+        updatedAt: 100,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: IDENTITY.sourceExePath,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        serverId: CRED.serverId,
+        serviceName: SERVICE_RECEIPT.name,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/windows_credential_acl_insecure/);
+    expect(deps.prepareCredentialDir).not.toHaveBeenCalled();
+  });
 });

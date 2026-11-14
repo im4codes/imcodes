@@ -13,6 +13,7 @@ import { createMacosRemoteDesktopProductionDependencies } from './macos-remote-d
 import { createControlledNodeRuntime } from './runtime.js';
 import { createLocalDaemonController } from './local-daemon-control.js';
 import { readPreviousUpgradeFailure } from './self-upgrade.js';
+import { recordBootstrapFailureDiagnostic } from './startup-diagnostics.js';
 import {
   createRemoteDesktopSignedShellLauncher,
   resolveRemoteDesktopAccountShellArtifact,
@@ -573,6 +574,7 @@ async function main(): Promise<void> {
 
 void main().catch(async (error) => {
   process.exitCode = 1;
+  await recordBootstrapFailureDiagnostic(error, { installerLaunch });
   // Always emit the machine-greppable line: logs, service managers and support
   // scripts key on it, and it stays useful when there is no console at all.
   process.stderr.write(`imcodes-node: ${error instanceof Error ? error.message : String(error)}\n`);

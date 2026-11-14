@@ -793,10 +793,34 @@ async function ensureServiceStartRequested(
  * second instance or kill the current connection); the source path may
  * repair on drift but must NOT lie about persistence.
  */
+function isCredentialAclDriftError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith('windows_credential_acl_insecure:') || message === 'credential_permissions_insecure';
+}
+
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
-  const existing = await deps.loadCredential();
-  let journal = await loadJournalOrThrow(deps);
   const abiProfile = deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  let existing: ControlledNodeCredential | null;
+  let preloadedJournal: InstallJournal | null = null;
+  try {
+    existing = await deps.loadCredential();
+  } catch (error) {
+    if (!isCredentialAclDriftError(error)) throw error;
+    preloadedJournal = await loadJournalOrThrow(deps);
+    if (await deps.isStableRuntime(preloadedJournal)) throw error;
+    if (deps.enrollmentBlob && normalizeControlledNodeAbiProfile(deps.enrollmentBlob.abiProfile) !== abiProfile) {
+      throw new Error('controlled node stdin enrollment ABI profile does not match the executable');
+    }
+    if (phaseIndex(preloadedJournal.phase) >= phaseIndex('credential_prepared')
+      && normalizeControlledNodeAbiProfile(preloadedJournal.abiProfile) !== abiProfile) {
+      throw new Error('controlled node persisted ABI profile does not match the executable');
+    }
+    preloadedJournal = await ensureElevated(deps, preloadedJournal);
+    await deps.prepareCredentialDir();
+    deps.warn('controlled node repaired credential directory ACL after drift during reinstall');
+    existing = await deps.loadCredential();
+  }
+  let journal = preloadedJournal ?? await loadJournalOrThrow(deps);
   if (deps.enrollmentBlob && normalizeControlledNodeAbiProfile(deps.enrollmentBlob.abiProfile) !== abiProfile) {
     throw new Error('controlled node stdin enrollment ABI profile does not match the executable');
   }

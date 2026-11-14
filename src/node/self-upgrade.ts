@@ -1629,7 +1629,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     ? `if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstHelperExe).Hash.ToLowerInvariant() -cne $currentHelperHash) { throw 'computer-use helper rollback hash mismatch' }; if ($currentHelperManifestHash -and (Get-FileHash -Algorithm SHA256 -LiteralPath $dstHelperManifest).Hash.ToLowerInvariant() -cne $currentHelperManifestHash) { throw 'computer-use helper manifest rollback hash mismatch' }`
     : '';
   const helperSwap = input.stagedComputerUseHelperDir
-    ? `Remove-Item -Recurse -Force $pendingHelper,$backupHelper -ErrorAction SilentlyContinue\r\n`
+    ? `& $clearStagingDir $pendingHelper; & $clearStagingDir $backupHelper\r\n`
       + `New-Item -ItemType Directory -Force $pendingHelper | Out-Null\r\n`
       + `Copy-Item -Recurse -Force -Path (Join-Path $srcHelper '*') -Destination $pendingHelper\r\n`
       + `& $verifyReleaseArtifact (Join-Path $pendingHelper 'open-computer-use.exe')\r\n`
@@ -1639,12 +1639,13 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `& $verifyReleaseArtifact (Join-Path $dstHelper 'open-computer-use.exe')\r\n`
     : '';
   const helperRollback = input.stagedComputerUseHelperDir
-    ? `if ($helperPublished -and (Test-Path $dstHelper)) { Remove-Item -Recurse -Force $dstHelper }\r\n`
+    ? `if ($helperPublished -and (Test-Path $dstHelper)) { & $clearStagingDir $dstHelper }\r\n`
       + `if ($helperBackedUp -and (Test-Path $backupHelper)) { $dstHelperExe = Join-Path $backupHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper}; Move-Item -Force $backupHelper $dstHelper; $dstHelperExe = Join-Path $dstHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper} }\r\n`
-      + `Remove-Item -Recurse -Force $pendingHelper -ErrorAction SilentlyContinue\r\n`
+      + `if (Test-Path $dstHelper) { ${helperAcl.replaceAll('\r\n', '; ')} }\r\n`
+      + `try { & $clearStagingDir $pendingHelper } catch { }\r\n`
     : '';
   const helperCleanup = input.stagedComputerUseHelperDir
-    ? `Remove-Item -Recurse -Force $backupHelper,$pendingHelper -ErrorAction SilentlyContinue\r\n`
+    ? `try { & $clearStagingDir $backupHelper } catch { }; try { & $clearStagingDir $pendingHelper } catch { }\r\n`
     : '';
   const remoteDesktopVariables = input.stagedRemoteDesktopWorkerDir
     ? `$dstRemoteDesktop = ${psQuote(remoteDesktopWorkerDir)}\r\n`
@@ -1655,7 +1656,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `$rollbackRemoteDesktopArchiveHash = ''\r\n`
     : '';
   const remoteDesktopSwap = input.stagedRemoteDesktopWorkerDir
-    ? `Remove-Item -Recurse -Force $pendingRemoteDesktop,$backupRemoteDesktop -ErrorAction SilentlyContinue\r\n`
+    ? `& $clearStagingDir $pendingRemoteDesktop; & $clearStagingDir $backupRemoteDesktop\r\n`
       + `New-Item -ItemType Directory -Force $pendingRemoteDesktop | Out-Null\r\n`
       + pendingRemoteDesktopAcl + `\r\n`
       + `Copy-Item -Recurse -Force -Path (Join-Path $srcRemoteDesktop '*') -Destination $pendingRemoteDesktop\r\n`
@@ -1665,12 +1666,13 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `$remoteDesktopPublished = $true\r\n`
     : '';
   const remoteDesktopRollback = input.stagedRemoteDesktopWorkerDir
-    ? `if ($remoteDesktopPublished -and (Test-Path $dstRemoteDesktop)) { Remove-Item -Recurse -Force $dstRemoteDesktop }\r\n`
+    ? `if ($remoteDesktopPublished -and (Test-Path $dstRemoteDesktop)) { & $clearStagingDir $dstRemoteDesktop }\r\n`
       + `if ($remoteDesktopBackedUp -and (Test-Path $backupRemoteDesktop)) { & $verifyRemoteDesktopArtifactSet $backupRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; Move-Item -Force $backupRemoteDesktop $dstRemoteDesktop; & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner }\r\n`
-      + `Remove-Item -Recurse -Force $pendingRemoteDesktop -ErrorAction SilentlyContinue\r\n`
+      + `if (Test-Path $dstRemoteDesktop) { ${remoteDesktopWorkerAcl.replaceAll('\r\n', '; ')} }\r\n`
+      + `try { & $clearStagingDir $pendingRemoteDesktop } catch { }\r\n`
     : '';
   const remoteDesktopCleanup = input.stagedRemoteDesktopWorkerDir
-    ? `Remove-Item -Recurse -Force $backupRemoteDesktop,$pendingRemoteDesktop -ErrorAction SilentlyContinue\r\n`
+    ? `try { & $clearStagingDir $backupRemoteDesktop } catch { }; try { & $clearStagingDir $pendingRemoteDesktop } catch { }\r\n`
     : '';
   const virtualDisplayDriverInventory = input.stagedRemoteDesktopWorkerDir
     ? `$driverInventoryAvailable = $false\r\n`
@@ -1770,6 +1772,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + windowsUpgradeHealthWaitScript()
     + `$upgradePhase = 'preflight'\r\n`
     + `$healthLease = Join-Path (Split-Path -Parent $dst) 'health-lease.json'\r\n`
+    + `$livenessLease = Join-Path (Split-Path -Parent $dst) 'liveness-lease.json'\r\n`
     + `$upgradeMarker = Join-Path (Split-Path -Parent $dst) ${psQuote(WINDOWS_UPGRADE_MARKER_NAME)}\r\n`
     + `$backupDst = "$dst.upgrade-old"\r\n`
     + `$backupManifest = "$dstManifest.upgrade-old"\r\n`
@@ -1812,6 +1815,19 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `  } while ($passes -lt 2 -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline)\r\n`
     + `  throw 'controlled node executable remained locked after stop'\r\n`
     + `}\r\n`
+    + `$clearStagingDir = { param([string]$target)\r\n`
+    + `  if (-not (Test-Path -LiteralPath $target)) { return }\r\n`
+    + `  try {\r\n`
+    + `    Get-ChildItem -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {\r\n`
+    + `      try { $_.Attributes = $_.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } catch { }\r\n`
+    + `    }\r\n`
+    + `  } catch { }\r\n`
+    + `  $icaclsExe = Join-Path $env:WINDIR 'System32\\icacls.exe'\r\n`
+    + `  & $icaclsExe $target /grant:r '*S-1-5-18:(OI)(CI)F' /T /C /Q | Out-Null\r\n`
+    + `  & $icaclsExe $target /grant:r '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null\r\n`
+    + `  & $icaclsExe $target /setowner '*S-1-5-18' /T /C /Q | Out-Null\r\n`
+    + `  Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop\r\n`
+    + `}\r\n`
     + releasePreflightGuard
     + `$upgradePhase = 'install'\r\n`
     + `try {\r\n`
@@ -1824,7 +1840,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `try { $durableTransaction = Get-Content -LiteralPath $upgradeMarker -Raw | ConvertFrom-Json; if ([int]$durableTransaction.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$durableTransaction.previousReceipt.sha256 -cmatch '^[a-f0-9]{64}$') { $rollbackMainHash = [string]$durableTransaction.previousReceipt.sha256 } } catch { }\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
     + `& $waitForNodeExecutableRelease\r\n`
-    + `$publishAtomic = { param([string]$source,[string]$destination,[string]$backup) $pending = "$destination.pending-$PID"; Remove-Item -Force -LiteralPath $pending -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $source -Destination $pending; if (Test-Path -LiteralPath $destination) { [IO.File]::Replace($pending, $destination, $backup, $true) } else { Move-Item -LiteralPath $pending -Destination $destination }; }\r\n`
+    + `$publishAtomic = { param([string]$source,[string]$destination,[string]$backup) $pending = "$destination.pending-$PID"; Remove-Item -Force -LiteralPath $pending -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $source -Destination $pending; if (Test-Path -LiteralPath $destination) { try { $di = Get-Item -LiteralPath $destination -Force; if ($di.Attributes -band [IO.FileAttributes]::ReadOnly) { $di.Attributes = $di.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } } catch { }; [IO.File]::Replace($pending, $destination, $backup, $true) } else { Move-Item -LiteralPath $pending -Destination $destination }; }\r\n`
     + `$currentPublishedHash = if (Test-Path -LiteralPath $dst) { (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() } else { '' }\r\n`
     + `if ($currentPublishedHash -cne $srcHash) {\r\n`
     + `  if ($currentPublishedHash -cne $rollbackMainHash -and (Test-Path -LiteralPath $backupDst) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -eq $rollbackMainHash) { & $publishAtomic $backupDst $dst "$dst.recovery-discard"; Remove-Item -Force "$dst.recovery-discard" -ErrorAction SilentlyContinue }\r\n`
@@ -1854,7 +1870,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
         + `if ($driverInventoryAvailable) { try { $currentVirtualDisplayDrivers = @(Get-WindowsDriver -Online -All | Where-Object { [IO.Path]::GetFileName([string]$_.OriginalFileName) -ceq 'imcodes-virtual-display.inf' -and [string]$_.ProviderName -ceq 'IM.codes' -and [string]$_.ClassName -ceq 'Display' }); $newVirtualDisplayDrivers = @($currentVirtualDisplayDrivers | Where-Object { $previousVirtualDisplayDrivers.Driver -cnotcontains $_.Driver }); if ($newVirtualDisplayDrivers.Count -gt 1) { $newVirtualDisplayDrivers = @(); $driverInventoryAvailable = $false } } catch { $newVirtualDisplayDrivers = @(); $driverInventoryAvailable = $false } }\r\n`
         + `$virtualDisplayDriverInstalled = $newVirtualDisplayDrivers.Count -eq 1\r\n`
       : '')
-    + `Remove-Item -Force $healthLease -ErrorAction SilentlyContinue\r\n`
+    + `Remove-Item -Force $healthLease,$livenessLease -ErrorAction SilentlyContinue\r\n`
     + `$upgradeStartedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\r\n`
     + `$upgradePhase = 'restart_health'\r\n`
     + `Start-ScheduledTask -TaskName $task\r\n`
@@ -1875,7 +1891,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = 'rollback_started'; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recordedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback_started' }\r\n`
     + `$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })\r\n`
     + `if ($rollbackExecutableReleased) {\r\n`
-    + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node rollback source hash mismatch' }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node restored hash mismatch' } } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
+    + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node rollback source hash mismatch' }; if (Test-Path -LiteralPath $dst) { try { $di = Get-Item -LiteralPath $dst -Force; if ($di.Attributes -band [IO.FileAttributes]::ReadOnly) { $di.Attributes = $di.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } } catch { } }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node restored hash mismatch' }; ${exeAcl.replaceAll('\r\n', '; ')} } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
     + windowsManifestRestoreScript()
     + (helperRollback ? `& $runRecovery 'restore_helper' { ${helperRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
     + (remoteDesktopRollback ? `& $runRecovery 'restore_remote_desktop' { ${remoteDesktopRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
