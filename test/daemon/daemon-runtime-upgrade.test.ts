@@ -56,6 +56,7 @@ import {
   linuxProcStatLiveness,
   ownerMatchesLiveProcess,
   probeProcessLivenessWithExec,
+  probeProcessStartToken,
   psLiveness,
 } from '../../src/daemon/daemon-lock-identity.mjs';
 import { acquireInstanceLock, releaseInstanceLock } from '../../src/daemon/instance-lock.js';
@@ -70,6 +71,20 @@ import { resolvePosixDaemonServicePaths } from '../../src/util/posix-daemon-serv
 import { buildPosixRestartCommand, buildPosixUpgradeScript } from '../../src/util/posix-upgrade-script.js';
 import { launchWindowsUpgrade } from '../../src/util/windows-upgrade-script.js';
 import { imcodesStateDirForHome } from '../../src/util/imcodes-state-dir.js';
+
+type LiveTestPlatform = 'linux' | 'darwin' | 'win32';
+const hostPlatform: LiveTestPlatform = process.platform === 'win32'
+  ? 'win32'
+  : process.platform === 'darwin'
+    ? 'darwin'
+    : 'linux';
+const LOCK_IDENTITY_MODULE_URL = new URL('../../src/daemon/daemon-lock-identity.mjs', import.meta.url).href;
+
+function mismatchedStartTokenForHost(): string {
+  if (hostPlatform === 'linux') return 'linux:0';
+  if (hostPlatform === 'win32') return 'windows:0';
+  return 'ps:Thu Jan  1 00:00:00 1970';
+}
 
 const tempDirs: string[] = [];
 const chmodRestore: Array<{ path: string; mode: number }> = [];
@@ -93,15 +108,18 @@ function writeFakeDaemonScript(scriptPath: string, stateDir: string, version: st
     "const fs=require('fs');",
     'const p=Number(process.argv[1]);',
     'const s=Date.now();',
-    `fs.writeFileSync(${statusPath}, JSON.stringify({pid:p,startedAt:s,updatedAt:s,restartCount:1,version:${JSON.stringify(version)}}));`,
     ...(includeLockMetadata
       ? [
-          "const stat=fs.readFileSync('/proc/'+p+'/stat','utf8');",
-          "const after=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\\s+/);",
-          "const startTicks=after[19];",
-          `fs.writeFileSync(${lockPath}, JSON.stringify({version:1,pid:p,startToken:'linux:'+startTicks,acquiredAt:s,socketPath:${socketPath},sessionIds:[],residualResources:[]}));`,
+          `(async()=>{const {probeProcessStartToken}=await import(${JSON.stringify(LOCK_IDENTITY_MODULE_URL)});`,
+          'const startToken=probeProcessStartToken(p);',
+          "if(!startToken)throw new Error('probeProcessStartToken_failed');",
+          `fs.writeFileSync(${statusPath}, JSON.stringify({pid:p,startedAt:s,updatedAt:s,restartCount:1,version:${JSON.stringify(version)}}));`,
+          `fs.writeFileSync(${lockPath}, JSON.stringify({version:1,pid:p,startToken,acquiredAt:s,socketPath:${socketPath},sessionIds:[],residualResources:[]}));`,
+          '})().catch((err)=>{console.error(err);process.exit(1);});',
         ]
-      : []),
+      : [
+          `fs.writeFileSync(${statusPath}, JSON.stringify({pid:p,startedAt:s,updatedAt:s,restartCount:1,version:${JSON.stringify(version)}}));`,
+        ]),
   ].join('');
   writeFileSync(
     scriptPath,
@@ -195,6 +213,7 @@ async function buildRuntimeFeedArtifact(
   destDir: string,
   version: string,
   options: {
+    os?: LiveTestPlatform;
     omitEntry?: string;
     includeFilesDoc?: boolean;
     useShellShimForNode?: boolean;
@@ -213,8 +232,9 @@ async function buildRuntimeFeedArtifact(
   const { nodePath, entryPath } = writeRunnableTree(destDir, version, options);
   options.preArchiveHook?.(destDir);
 
+  const os = options.os ?? 'linux';
   const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-  const target = `linux-${arch}` as const;
+  const target = `${os}-${arch}` as const;
   const artifactDir = options.archiveOut.targetSubdir ? join(options.archiveOut.dir, 'daemon-runtime') : options.archiveOut.dir;
   mkdirSync(artifactDir, { recursive: true });
   const archiveName = `daemon-runtime-${target}.tar.gz`;
@@ -230,7 +250,7 @@ async function buildRuntimeFeedArtifact(
       artifact: {
         fileName: archiveName,
         format: 'tar.gz',
-        os: 'linux',
+        os,
         arch,
         size: archiveBytes.length,
         sha256: sha256(archiveBytes),
@@ -260,11 +280,11 @@ async function buildRuntimeFeedArtifact(
     const built = await createDaemonRuntimeManifest({
       bundleRoot: destDir,
       archivePath,
-      os: 'linux',
+      os,
       arch,
       nodeVersion: 'v22.11.0',
       nodeProvider: 'official-node',
-      nodeArchive: `node-v22.11.0-linux-${arch}.tar.gz`,
+      nodeArchive: `node-v22.11.0-${os}-${arch}.tar.gz`,
       nodeArchiveSha256: 'a'.repeat(64),
       buildCommit: 'abcdef123456',
       buildVersion: version,
@@ -288,24 +308,24 @@ async function buildRuntimeFeedArtifact(
       targets: {
         [target]: {
           target,
-          os: 'linux',
+          os,
           arch,
           components: {
             'imcodes-node': {
               component: 'imcodes-node',
               version,
-              fileName: `imcodes-node-linux${target.endsWith('arm64') ? '-arm64' : ''}`,
+              fileName: `imcodes-node-${os}${target.endsWith('arm64') ? '-arm64' : ''}`,
               sha256: '1'.repeat(64),
               sizeBytes: 123,
-              compat: { os: 'linux', arch },
+              compat: { os, arch },
             },
             'remote-desktop': {
               component: 'remote-desktop',
               version,
-              fileName: 'imcodes-linux-remote-desktop-worker',
+              fileName: `imcodes-${os}-remote-desktop-worker`,
               sha256: '2'.repeat(64),
               sizeBytes: 456,
-              compat: { os: 'linux', arch, protocolVersion: 2 },
+              compat: { os, arch, protocolVersion: 2 },
             },
             'open-computer-use': {
               component: 'open-computer-use',
@@ -313,7 +333,7 @@ async function buildRuntimeFeedArtifact(
               fileName: 'open-computer-use',
               sha256: '3'.repeat(64),
               sizeBytes: 789,
-              compat: { os: 'linux', arch },
+              compat: { os, arch },
             },
             'daemon-runtime': {
               component: 'daemon-runtime',
@@ -321,7 +341,7 @@ async function buildRuntimeFeedArtifact(
               fileName: archiveName,
               sha256: archiveSha,
               sizeBytes: archiveBytes.length,
-              compat: { os: 'linux', arch, nodeVersion: process.version },
+              compat: { os, arch, nodeVersion: process.version },
             },
           },
         },
@@ -716,7 +736,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     writeRunnableTree(rel110, '1.1.0');
     writeRunnableTree(rel120, '1.2.0');
     mkdirSync(join(runtimeRoot, 'releases', '.staging-leftover'), { recursive: true });
-    switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, 'linux');
+    switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, hostPlatform);
 
     // Counterexample 1: sleep 15 without daemon-runtime.json MUST FAIL post-restart health & roll back!
     mkdirSync(stateDir, { recursive: true });
@@ -730,7 +750,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     const scriptDirSleep = mkdtempSync(join(root, 'script-sleep-'));
     const launchedSleep = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirSleep,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot,
       stagedReleaseDir: rel120,
       previousTarget: rel110,
@@ -762,7 +782,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     const scriptDirOldVer = mkdtempSync(join(root, 'script-oldver-'));
     const launchedOldVer = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirOldVer,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot,
       stagedReleaseDir: rel120,
       previousTarget: rel110,
@@ -795,7 +815,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     const scriptDirOk = mkdtempSync(join(root, 'script-ok-'));
     const launchedOk = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirOk,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot,
       stagedReleaseDir: rel120,
       previousTarget: rel110,
@@ -821,7 +841,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     expect(existsSync(join(stateDir, UPGRADE_COOLDOWN_SENTINEL_FILE))).toBe(true);
 
     // Failed restart path: restart exits 1 -> switch-runner automatically rolls current back to 1.1.0!
-    switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, 'linux');
+    switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, hostPlatform);
     const failRestartScript = join(root, 'fail-restart.sh');
     const markerFile = join(root, 'rollback-restarted.txt');
     writeFileSync(
@@ -832,7 +852,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     const scriptDirFail = mkdtempSync(join(root, 'script-fail-'));
     const launchedFail = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirFail,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot,
       stagedReleaseDir: rel120,
       previousTarget: rel110,
@@ -1293,25 +1313,26 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     // 1. Positive matched-owner identity using acquireInstanceLock + real kill via stopVerifiedDaemon
     const liveChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });
     try {
-      const liveStat = readFileSync(`/proc/${liveChild.pid}/stat`, 'utf8');
-      const liveTicks = liveStat.slice(liveStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      const liveStartToken = probeProcessStartToken(liveChild.pid!, hostPlatform);
+      expect(liveStartToken).toBeTruthy();
+      const staleToken = mismatchedStartTokenForHost();
       writeFileSync(join(stateDir, 'daemon.pid'), `${liveChild.pid}\n`);
       writeFileSync(
         join(stateDir, 'daemon.lock.json'),
         JSON.stringify({
           version: 1,
           pid: liveChild.pid,
-          startToken: `linux:${liveTicks}`,
+          startToken: liveStartToken,
           acquiredAt: Date.now(),
           socketPath: join(stateDir, 'daemon.sock'),
           sessionIds: [],
           residualResources: [],
         }),
       );
-      const verified = readVerifiedDaemonIdentity(stateDir, 'linux');
+      const verified = readVerifiedDaemonIdentity(stateDir, hostPlatform);
       expect(verified).toMatchObject({
         pid: liveChild.pid,
-        startToken: `linux:${liveTicks}`,
+        startToken: liveStartToken,
         source: 'daemon_lock',
       });
 
@@ -1338,15 +1359,15 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
         JSON.stringify({
           version: 1,
           pid: liveChild.pid,
-          startToken: 'linux:0',
+          startToken: staleToken,
           acquiredAt: Date.now(),
           socketPath: join(stateDir, 'daemon.sock'),
           sessionIds: [],
           residualResources: [],
         }),
       );
-      expect(readVerifiedDaemonIdentity(stateDir, 'linux')).toBeNull();
-      expect(stopVerifiedDaemon({ pid: liveChild.pid!, startToken: 'linux:0' }, { platform: 'linux', graceMs: 100 })).toBe(false);
+      expect(readVerifiedDaemonIdentity(stateDir, hostPlatform)).toBeNull();
+      expect(stopVerifiedDaemon({ pid: liveChild.pid!, startToken: staleToken }, { platform: hostPlatform, graceMs: 100 })).toBe(false);
       expect(() => process.kill(liveChild.pid!, 0)).not.toThrow();
 
       // 2b. Legacy runtime:* scheme and cross-scheme rejected fail-closed
@@ -1362,12 +1383,12 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
           residualResources: [],
         }),
       );
-      expect(readVerifiedDaemonIdentity(stateDir, 'linux')).toBeNull();
+      expect(readVerifiedDaemonIdentity(stateDir, hostPlatform)).toBeNull();
       expect(ownerMatchesLiveProcess({ pid: liveChild.pid!, startToken: 'ps:Mon Jan  1 00:00:00 2026' }, 'linux')).toBe(false);
 
       // 2c. Bare daemon.pid with missing daemon.lock.json rejected fail-closed
       rmSync(join(stateDir, 'daemon.lock.json'), { force: true });
-      expect(readVerifiedDaemonIdentity(stateDir, 'linux')).toBeNull();
+      expect(readVerifiedDaemonIdentity(stateDir, hostPlatform)).toBeNull();
 
       // 2d. Stop actually terminates when verified identity matches
       writeFileSync(
@@ -1375,14 +1396,14 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
         JSON.stringify({
           version: 1,
           pid: liveChild.pid,
-          startToken: `linux:${liveTicks}`,
+          startToken: liveStartToken,
           acquiredAt: Date.now(),
           socketPath: join(stateDir, 'daemon.sock'),
           sessionIds: [],
           residualResources: [],
         }),
       );
-      expect(stopVerifiedDaemon({ pid: liveChild.pid!, startToken: `linux:${liveTicks}` }, { platform: 'linux', graceMs: 1000 })).toBe(true);
+      expect(stopVerifiedDaemon({ pid: liveChild.pid!, startToken: liveStartToken! }, { platform: hostPlatform, graceMs: 1000 })).toBe(true);
     } finally {
       try { liveChild.kill('SIGKILL'); } catch { /* ignore */ }
     }
@@ -1425,15 +1446,18 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
         'fs.mkdirSync(home, { recursive: true });',
         'const pid = process.pid;',
         'const now = Date.now();',
-        "const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');",
-        "const ticks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\\s+/)[19];",
-        "fs.writeFileSync(path.join(home, 'daemon.pid'), pid + '\\n');",
-        "fs.writeFileSync(path.join(home, 'daemon-runtime.json'), JSON.stringify({ pid, startedAt: now, updatedAt: now, restartCount: 1, version: '1.1.0' }));",
-        "fs.writeFileSync(path.join(home, 'daemon.lock.json'), JSON.stringify({ version: 1, pid, startToken: 'linux:' + ticks, acquiredAt: now, socketPath: path.join(home, 'daemon.sock'), sessionIds: [], residualResources: [] }));",
+        `(async () => {`,
+        `  const { probeProcessStartToken } = await import(${JSON.stringify(LOCK_IDENTITY_MODULE_URL)});`,
+        '  const startToken = probeProcessStartToken(pid);',
+        "  if (!startToken) throw new Error('probeProcessStartToken_failed');",
+        "  fs.writeFileSync(path.join(home, 'daemon.pid'), pid + '\\n');",
+        "  fs.writeFileSync(path.join(home, 'daemon-runtime.json'), JSON.stringify({ pid, startedAt: now, updatedAt: now, restartCount: 1, version: '1.1.0' }));",
+        "  fs.writeFileSync(path.join(home, 'daemon.lock.json'), JSON.stringify({ version: 1, pid, startToken, acquiredAt: now, socketPath: path.join(home, 'daemon.sock'), sessionIds: [], residualResources: [] }));",
+        '})().catch((err) => { console.error(err); process.exit(1); });',
         'setInterval(() => {}, 1000);',
       ].join('\n'),
     );
-    switchDaemonRuntimeCurrentPointer(sysRoot, rel110, 'linux');
+    switchDaemonRuntimeCurrentPointer(sysRoot, rel110, hostPlatform);
     chmodSync(sysRoot, 0o555);
     chmodRestore.push({ path: sysRoot, mode: 0o755 });
 
@@ -1453,12 +1477,12 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
 
     const build120 = makeTempDir('imcodes-rt-f3r2-120-');
     const feed120 = makeTempDir('imcodes-rt-f3r2-feed-');
-    await buildRuntimeFeedArtifact(build120, '1.2.0', { archiveOut: { dir: feed120 } });
+    await buildRuntimeFeedArtifact(build120, '1.2.0', { os: hostPlatform, archiveOut: { dir: feed120 } });
 
     let userFbRollback: Awaited<ReturnType<typeof upgradeBundledDaemonRuntime>>;
     try {
       userFbRollback = await upgradeBundledDaemonRuntime({
-        platform: 'linux',
+        platform: hostPlatform,
         arch: process.arch,
         currentVersion: '1.1.0',
         execPath: sysLayout.nodePath,
@@ -1489,7 +1513,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     const det120 = join(detRuntime, 'releases', '1.2.0');
     const lay110 = writeRunnableTree(det110, '1.1.0');
     writeRunnableTree(det120, '1.2.0');
-    switchDaemonRuntimeCurrentPointer(detRuntime, det110, 'linux');
+    switchDaemonRuntimeCurrentPointer(detRuntime, det110, hostPlatform);
 
     const detStateRestoreScript = join(detRoot, 'det-old-110.sh');
     writeFakeDaemonScript(detStateRestoreScript, detState, '1.1.0', true);
@@ -1508,7 +1532,7 @@ esac
     const detScriptDir = mkdtempSync(join(detRoot, 'script-'));
     const launchedUnserviced = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: detScriptDir,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot: detRuntime,
       stagedReleaseDir: det120,
       previousTarget: det110,
@@ -1547,7 +1571,7 @@ esac
     const detFailScriptDir = mkdtempSync(join(detRoot, 'script-rb-fail-'));
     const launchedRbFail = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: detFailScriptDir,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot: detRuntime,
       stagedReleaseDir: det120,
       previousTarget: det110,
@@ -1596,7 +1620,7 @@ esac
     const scriptDirHappy = mkdtempSync(join(root, 'script-happy-'));
     const launchedHappy = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirHappy,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot,
       stagedReleaseDir: rel120,
       targetVersion: '1.2.0',
@@ -1618,7 +1642,7 @@ esac
     expect(existsSync(join(runtimeRoot, 'releases', '1.0.0'))).toBe(false);
     expect(readFileSync(join(runtimeRoot, 'releases', '1.1.0', 'package', 'sentinel.txt'), 'utf8')).toBe('preserve-me-1.1.0');
 
-    const explicitRb = rollbackDaemonRuntimeCurrentPointer(runtimeRoot, undefined, 'linux');
+    const explicitRb = rollbackDaemonRuntimeCurrentPointer(runtimeRoot, undefined, hostPlatform);
     expect(realpathSync(explicitRb.restoredTarget!)).toBe(realpathSync(join(runtimeRoot, 'releases', '1.1.0')));
     expect(readFileSync(join(runtimeRoot, 'current', 'package', 'sentinel.txt'), 'utf8')).toBe('preserve-me-1.1.0');
 
@@ -1636,7 +1660,7 @@ esac
         startedAt: Date.now(),
       }),
     );
-    const recovered = recoverInterruptedDaemonRuntimeSwitch(runtimeRoot, 'linux');
+    const recovered = recoverInterruptedDaemonRuntimeSwitch(runtimeRoot, hostPlatform);
     expect(recovered.recovered).toBe(true);
     expect(realpathSync(join(runtimeRoot, 'current'))).toBe(realpathSync(rel110));
 
@@ -1655,7 +1679,7 @@ esac
     const scriptDirBad = mkdtempSync(join(rootBad, 'script-bad-'));
     const launchedBad = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirBad,
-      platform: 'linux',
+      platform: hostPlatform,
       runtimeRoot: rtBad,
       stagedReleaseDir: bad120,
       targetVersion: '1.2.0',
@@ -2092,7 +2116,7 @@ esac
       const rel120 = join(runtimeRoot, 'releases', '1.2.0');
       const lay110 = writeRunnableTree(rel110, '1.1.0');
       writeRunnableTree(rel120, '1.2.0');
-      switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, 'linux');
+      switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, hostPlatform);
 
       const lockHandle = acquireRuntimeUpgradeLock(stateDir, { mode: 'detached_handoff_pending' });
       transferRuntimeUpgradeLock(stateDir, lockHandle.ownerToken, { mode: 'detached_handoff_pending', targetVersion: '1.2.0' });
@@ -2117,17 +2141,19 @@ esac
           const isTarget120 = target === realpathSync(${JSON.stringify(rel120)});
           const startVer = isTarget120 && ${opts.badTarget ? 'true' : 'false'} ? '1.1.0' : (isTarget120 ? '1.2.0' : '1.1.0');
           const childScript = [
-            "const { writeFileSync, mkdirSync, readFileSync } = require('node:fs');",
+            "const { writeFileSync, mkdirSync } = require('node:fs');",
             "const { join } = require('node:path');",
             "const dir = process.argv[1];",
             "const ver = process.argv[2];",
             "mkdirSync(dir, { recursive: true });",
-            "const stat = readFileSync('/proc/self/stat', 'utf8');",
-            "const startTime = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ')[19];",
             "const now = Date.now();",
-            "writeFileSync(join(dir, 'daemon.pid'), String(process.pid) + String.fromCharCode(10));",
-            "writeFileSync(join(dir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken: 'linux:' + startTime, acquiredAt: now, socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [] }));",
-            "writeFileSync(join(dir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: ver, startedAt: now, socketPath: join(dir, 'daemon.sock') }));",
+            "import(" + ${JSON.stringify(JSON.stringify(LOCK_IDENTITY_MODULE_URL))} + ").then(({ probeProcessStartToken }) => {",
+            "  const startToken = probeProcessStartToken(process.pid);",
+            "  if (!startToken) throw new Error('probeProcessStartToken_failed');",
+            "  writeFileSync(join(dir, 'daemon.pid'), String(process.pid) + String.fromCharCode(10));",
+            "  writeFileSync(join(dir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: ver, startedAt: now, socketPath: join(dir, 'daemon.sock') }));",
+            "  writeFileSync(join(dir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken, acquiredAt: now, socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [] }));",
+            "}).catch((err) => { console.error(err); process.exit(1); });",
             "setInterval(() => {}, 1000);",
           ].join('; ');
           const child = spawn(process.execPath, ['-e', childScript, stateDir, startVer], { detached: true, stdio: 'ignore' });
@@ -2141,22 +2167,23 @@ esac
       const daemonModuleUrl = new URL('../../src/daemon/daemon-runtime-upgrade.ts', import.meta.url).href;
 
       const oldDaemonScript = `
-        import { readFileSync, writeFileSync } from 'node:fs';
+        import { writeFileSync } from 'node:fs';
         import { join } from 'node:path';
         import { spawn } from 'node:child_process';
+        import { probeProcessStartToken } from ${JSON.stringify(LOCK_IDENTITY_MODULE_URL)};
         const stateDir = ${JSON.stringify(stateDir)};
-        const stat = readFileSync('/proc/self/stat', 'utf8');
-        const startTime = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ')[19];
+        const startToken = probeProcessStartToken(process.pid);
+        if (!startToken) throw new Error('probeProcessStartToken_failed');
         const now = Date.now();
         writeFileSync(${JSON.stringify(oldPidFile)}, String(process.pid));
         writeFileSync(join(stateDir, 'daemon.pid'), process.pid + '\\n');
-        writeFileSync(join(stateDir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken: 'linux:' + startTime, acquiredAt: now, socketPath: join(stateDir, 'daemon.sock'), sessionIds: [], residualResources: [] }));
         writeFileSync(join(stateDir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: '1.1.0', startedAt: now, socketPath: join(stateDir, 'daemon.sock') }));
+        writeFileSync(join(stateDir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken, acquiredAt: now, socketPath: join(stateDir, 'daemon.sock'), sessionIds: [], residualResources: [] }));
 
         const mod = await import(${JSON.stringify(daemonModuleUrl)});
         const useSystemd = ${systemdUserAvailable ? 'true' : 'false'};
         const launched = await mod.launchDetachedDaemonRuntimeSwitchRunner({
-          platform: 'linux',
+          platform: ${JSON.stringify(hostPlatform)},
           runtimeRoot: ${JSON.stringify(runtimeRoot)},
           stagedReleaseDir: ${JSON.stringify(rel120)},
           previousTarget: ${JSON.stringify(rel110)},
@@ -2218,7 +2245,7 @@ esac
         // Runtime upgrade lock MUST be released by surviving switch-runner
         expect(existsSync(join(stateDir, DAEMON_RUNTIME_LOCK_DIR_NAME))).toBe(false);
 
-        const finalIdentity = readVerifiedDaemonIdentity(stateDir, 'linux');
+        const finalIdentity = readVerifiedDaemonIdentity(stateDir, hostPlatform);
         expect(finalIdentity).toBeTruthy();
 
         if (opts.badTarget) {
@@ -2248,7 +2275,8 @@ esac
   }, 60_000);
 
   it('[F3-R4] handoff fault matrix: definite refusal fences zombie runner; uncertain/claimed dispatch preserves stage, lock, OS job, blocks concurrent retries, and follows delayed completion/rollback', async () => {
-    const buildCustomDaemonFeed = async (opts: { version: string; runtimeReportedVersion: string }) => {
+    const buildCustomDaemonFeed = async (opts: { version: string; runtimeReportedVersion: string; os?: LiveTestPlatform }) => {
+      const os = opts.os ?? 'linux';
       const root = makeTempDir(`imcodes-rt-f3r4-feed-${opts.version}-`);
       const layout110 = join(root, 'rt', 'releases', '1.1.0');
       const feedSrc = join(root, 'feed-src');
@@ -2259,17 +2287,20 @@ esac
       // Real CommonJS daemon entrypoint that prints runtimeReportedVersion on --version OR writes real daemon.lock.json + daemon-runtime.json when started
       const daemonJs = [
         `if (process.argv.includes('--version')) { console.log(${JSON.stringify(opts.version)}); process.exit(0); }`,
-        `const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');`,
+        `const { mkdirSync, writeFileSync } = require('node:fs');`,
         `const { join } = require('node:path');`,
         `const dir = process.env.IMCODES_HOME;`,
         `if (!dir) process.exit(2);`,
         `mkdirSync(dir, { recursive: true });`,
-        `const stat = readFileSync('/proc/self/stat', 'utf8');`,
-        `const startTime = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ')[19];`,
         `const now = Date.now();`,
-        `writeFileSync(join(dir, 'daemon.pid'), String(process.pid) + '\\n');`,
-        `writeFileSync(join(dir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken: 'linux:' + startTime, acquiredAt: now, socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [] }));`,
-        `writeFileSync(join(dir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: ${JSON.stringify(opts.runtimeReportedVersion)}, startedAt: now, socketPath: join(dir, 'daemon.sock') }));`,
+        `(async () => {`,
+        `  const { probeProcessStartToken } = await import(${JSON.stringify(LOCK_IDENTITY_MODULE_URL)});`,
+        `  const startToken = probeProcessStartToken(process.pid);`,
+        `  if (!startToken) throw new Error('probeProcessStartToken_failed');`,
+        `  writeFileSync(join(dir, 'daemon.pid'), String(process.pid) + '\\n');`,
+        `  writeFileSync(join(dir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: ${JSON.stringify(opts.runtimeReportedVersion)}, startedAt: now, socketPath: join(dir, 'daemon.sock') }));`,
+        `  writeFileSync(join(dir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken, acquiredAt: now, socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [] }));`,
+        `})().catch((err) => { console.error(err); process.exit(1); });`,
         `setInterval(() => {}, 1000);`,
       ].join('\n');
       writeFileSync(join(feedSrc, 'package', 'dist', 'src', 'index.js'), daemonJs);
@@ -2282,18 +2313,18 @@ esac
       );
 
       const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-      const target = `linux-${arch}` as const;
+      const target = `${os}-${arch}` as const;
       const archiveName = `daemon-runtime-${target}.tar.gz`;
       const archivePath = join(artDir, archiveName);
       execFileSync('tar', ['-czf', archivePath, '-C', feedSrc, '.'], { stdio: 'pipe' });
       const built = await createDaemonRuntimeManifest({
         bundleRoot: feedSrc,
         archivePath,
-        os: 'linux',
+        os,
         arch,
         nodeVersion: 'v22.11.0',
         nodeProvider: 'official-node',
-        nodeArchive: `node-v22.11.0-linux-${arch}.tar.gz`,
+        nodeArchive: `node-v22.11.0-${os}-${arch}.tar.gz`,
         nodeArchiveSha256: 'a'.repeat(64),
         buildCommit: 'abcdef123456',
         buildVersion: opts.version,
@@ -2309,13 +2340,13 @@ esac
         targets: {
           [target]: {
             target,
-            os: 'linux',
+            os,
             arch,
             components: {
-              'imcodes-node': { component: 'imcodes-node', version: opts.version, fileName: `imcodes-node-linux`, sha256: '1'.repeat(64), sizeBytes: 1, compat: { os: 'linux', arch } },
-              'remote-desktop': { component: 'remote-desktop', version: opts.version, fileName: 'rd', sha256: '2'.repeat(64), sizeBytes: 1, compat: { os: 'linux', arch, protocolVersion: 2 } },
-              'open-computer-use': { component: 'open-computer-use', version: opts.version, fileName: 'ocu', sha256: '3'.repeat(64), sizeBytes: 1, compat: { os: 'linux', arch } },
-              'daemon-runtime': { component: 'daemon-runtime', version: opts.version, fileName: archiveName, sha256: sha256(archiveBytes), sizeBytes: archiveBytes.length, compat: { os: 'linux', arch, nodeVersion: process.version } },
+              'imcodes-node': { component: 'imcodes-node', version: opts.version, fileName: `imcodes-node-${os}`, sha256: '1'.repeat(64), sizeBytes: 1, compat: { os, arch } },
+              'remote-desktop': { component: 'remote-desktop', version: opts.version, fileName: 'rd', sha256: '2'.repeat(64), sizeBytes: 1, compat: { os, arch, protocolVersion: 2 } },
+              'open-computer-use': { component: 'open-computer-use', version: opts.version, fileName: 'ocu', sha256: '3'.repeat(64), sizeBytes: 1, compat: { os, arch } },
+              'daemon-runtime': { component: 'daemon-runtime', version: opts.version, fileName: archiveName, sha256: sha256(archiveBytes), sizeBytes: archiveBytes.length, compat: { os, arch, nodeVersion: process.version } },
             },
           },
         },
@@ -2486,12 +2517,13 @@ esac
       const fix = await buildCustomDaemonFeed({
         version: '1.2.0',
         runtimeReportedVersion: opts.badTarget ? '1.1.0' : '1.2.0',
+        os: hostPlatform,
       });
       const home = join(fix.root, 'home');
       const state = join(fix.root, 'state');
       mkdirSync(home, { recursive: true });
       mkdirSync(state, { recursive: true });
-      switchDaemonRuntimeCurrentPointer(fix.rtRoot, fix.layout110, 'linux');
+      switchDaemonRuntimeCurrentPointer(fix.rtRoot, fix.layout110, hostPlatform);
 
       // Start an old verified foreground daemon (so rollback & good upgrade test real daemon liveness)
       const oldProc = spawn(fix.lay110.nodePath, [fix.lay110.entryPath], {
@@ -2501,15 +2533,15 @@ esac
       });
       oldProc.unref();
       const deadline = Date.now() + 10_000;
-      while (!readVerifiedDaemonIdentity(state, 'linux') && Date.now() < deadline) {
+      while (!readVerifiedDaemonIdentity(state, hostPlatform) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 40));
       }
-      expect(readVerifiedDaemonIdentity(state, 'linux')?.version).toBe('1.1.0');
+      expect(readVerifiedDaemonIdentity(state, hostPlatform)?.version).toBe('1.1.0');
 
       const delayedTimers: Array<ReturnType<typeof setTimeout>> = [];
       try {
         const res = await upgradeBundledDaemonRuntime({
-          platform: 'linux',
+          platform: hostPlatform,
           currentVersion: '1.1.0',
           targetVersion: '1.2.0',
           execPath: fix.lay110.nodePath,
@@ -2522,9 +2554,19 @@ esac
           wasRunning: true,
           healthCheckTimeoutMs: 2_000,
           settleMs: 120,
-          switchRunnerHostExecutor: async (_file, args) => {
-            const cfgPath = args[args.length - 1]!;
-            const scriptPath = args[args.length - 2]!;
+          switchRunnerHostExecutor: async (file, args) => {
+            let scriptPath: string;
+            let cfgPath: string;
+            if (file === 'launchctl') {
+              const plistXml = readFileSync(args[args.length - 1]!, 'utf8');
+              const progMatch = plistXml.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/);
+              const items = progMatch ? [...progMatch[1]!.matchAll(/<string>([^<]+)<\/string>/g)].map((m) => m[1]!) : [];
+              scriptPath = items[1]!;
+              cfgPath = items[2]!;
+            } else {
+              cfgPath = args[args.length - 1]!;
+              scriptPath = args[args.length - 2]!;
+            }
             // OS accepted the job and starts it 200ms later, after caller times out / helper crashes
             const t = setTimeout(() => {
               const c = spawn(process.execPath, [scriptPath, cfgPath], { detached: true, stdio: 'ignore' });
@@ -2544,7 +2586,7 @@ esac
 
         // Retry while outcome is uncertain MUST fail closed on single-flight lock and NOT touch releaseDir/current
         await expect(upgradeBundledDaemonRuntime({
-          platform: 'linux',
+          platform: hostPlatform,
           currentVersion: '1.1.0',
           targetVersion: '1.2.0',
           execPath: fix.lay110.nodePath,
@@ -2569,7 +2611,7 @@ esac
         );
 
         expect(existsSync(join(state, DAEMON_RUNTIME_LOCK_DIR_NAME))).toBe(false);
-        const postIdentity = readVerifiedDaemonIdentity(state, 'linux');
+        const postIdentity = readVerifiedDaemonIdentity(state, hostPlatform);
         expect(postIdentity).toBeTruthy();
         if (opts.badTarget) {
           expect(exitCode).toBe(1);
