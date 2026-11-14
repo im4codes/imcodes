@@ -5392,5 +5392,16 @@
     "open_new_window": "在新視窗中開啟",
     "window_blocked": "瀏覽器封鎖了雲端文件視窗。請允許本網站的彈出視窗後重試。",
     "window_blocked_dismiss": "忽略"
+  },
+  "mobile_gesture": {
+    "hud": {
+      "title": "雙指導航",
+      "up": "上一個伺服器",
+      "down": "下一個伺服器",
+      "left": "上一個工作階段",
+      "right": "下一個工作階段",
+      "drag_to_threshold": "拖曳超過閾值即可切換",
+      "release_to_switch": "放開立即切換"
+    }
   }
 }

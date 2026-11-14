@@ -5392,5 +5392,16 @@
     "open_new_window": "Abrir en una nueva ventana",
     "window_blocked": "El navegador bloqueó la ventana de Documentos en la nube. Permite las ventanas emergentes para este sitio e inténtalo de nuevo.",
     "window_blocked_dismiss": "Descartar"
+  },
+  "mobile_gesture": {
+    "hud": {
+      "title": "Navegación con 2 dedos",
+      "up": "Servidor anterior",
+      "down": "Siguiente servidor",
+      "left": "Sesión anterior",
+      "right": "Siguiente sesión",
+      "drag_to_threshold": "Arrastra hasta el umbral para cambiar",
+      "release_to_switch": "Suelta para cambiar"
+    }
   }
 }

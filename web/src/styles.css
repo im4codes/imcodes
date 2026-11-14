@@ -19701,6 +19701,329 @@ button.quick-agent-delegation-preset.active {
   }
 }
 
+.mobile-swipe-hud {
+  position: fixed;
+  inset: 0;
+  z-index: 10082;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  pointer-events: none;
+  user-select: none;
+}
+
+.mobile-swipe-hud-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+  width: min(90vw, 360px);
+  padding: 16px 18px;
+  border-radius: 18px;
+  background: rgba(15, 23, 42, 0.84);
+  border: 1.5px solid rgba(148, 163, 184, 0.36);
+  box-shadow:
+    0 24px 60px rgba(2, 6, 23, 0.58),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  color: rgba(248, 250, 252, 0.94);
+  animation: server-switch-hud-in 120ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.mobile-swipe-hud-card.is-server.is-armed {
+  border-color: rgba(56, 189, 248, 0.92);
+  box-shadow:
+    0 24px 60px rgba(2, 6, 23, 0.62),
+    0 0 26px rgba(56, 189, 248, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.mobile-swipe-hud-card.is-session.is-armed {
+  border-color: rgba(251, 191, 36, 0.92);
+  box-shadow:
+    0 24px 60px rgba(2, 6, 23, 0.62),
+    0 0 26px rgba(251, 191, 36, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.mobile-swipe-hud-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: rgba(203, 213, 225, 0.9);
+}
+
+.mobile-swipe-hud-pct {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: rgba(248, 250, 252, 0.95);
+}
+
+.mobile-swipe-hud-compass {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto;
+  align-items: center;
+  justify-items: center;
+  gap: 8px;
+}
+
+.mobile-swipe-hud-center {
+  grid-row: 2;
+  grid-column: 2;
+  position: relative;
+  width: 52px;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mobile-swipe-hud-ring {
+  width: 48px;
+  height: 48px;
+  transform: rotate(-90deg);
+}
+
+.mobile-swipe-hud-ring-track {
+  fill: none;
+  stroke: rgba(148, 163, 184, 0.24);
+  stroke-width: 4;
+}
+
+.mobile-swipe-hud-ring-fill {
+  fill: none;
+  stroke: rgba(148, 163, 184, 0.85);
+  stroke-width: 4;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 60ms linear, stroke 140ms ease;
+}
+
+.mobile-swipe-hud-card.is-server .mobile-swipe-hud-ring-fill {
+  stroke: rgba(56, 189, 248, 0.96);
+}
+
+.mobile-swipe-hud-card.is-session .mobile-swipe-hud-ring-fill {
+  stroke: rgba(251, 191, 36, 0.96);
+}
+
+.mobile-swipe-hud-center-badge {
+  position: absolute;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: rgba(248, 250, 252, 0.92);
+}
+
+.mobile-swipe-hud-dir {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(203, 213, 225, 0.82);
+  text-align: center;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.mobile-swipe-hud-dir.is-up {
+  grid-row: 1;
+  grid-column: 2;
+  min-width: 116px;
+}
+
+.mobile-swipe-hud-dir.is-left {
+  grid-row: 2;
+  grid-column: 1;
+}
+
+.mobile-swipe-hud-dir.is-right {
+  grid-row: 2;
+  grid-column: 3;
+}
+
+.mobile-swipe-hud-dir.is-down {
+  grid-row: 3;
+  grid-column: 2;
+  min-width: 116px;
+}
+
+.mobile-swipe-hud-dir-arrow {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.mobile-swipe-hud-dir-label {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-swipe-hud-dir.is-server.is-active {
+  border-color: rgba(56, 189, 248, 0.58);
+  background: rgba(56, 189, 248, 0.14);
+  color: rgba(224, 242, 254, 0.96);
+}
+
+.mobile-swipe-hud-dir.is-server.is-armed {
+  border-color: rgba(56, 189, 248, 0.95);
+  background: rgba(56, 189, 248, 0.28);
+  color: #ffffff;
+  transform: scale(1.03);
+}
+
+.mobile-swipe-hud-dir.is-session.is-active {
+  border-color: rgba(251, 191, 36, 0.58);
+  background: rgba(251, 191, 36, 0.14);
+  color: rgba(254, 243, 199, 0.96);
+}
+
+.mobile-swipe-hud-dir.is-session.is-armed {
+  border-color: rgba(251, 191, 36, 0.95);
+  background: rgba(251, 191, 36, 0.28);
+  color: #ffffff;
+  transform: scale(1.03);
+}
+
+.mobile-swipe-hud-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mobile-swipe-hud-bar-track {
+  height: 4px;
+  width: 100%;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.22);
+  overflow: hidden;
+}
+
+.mobile-swipe-hud-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.85);
+  transition: width 60ms linear, background-color 140ms ease;
+}
+
+.mobile-swipe-hud-card.is-server .mobile-swipe-hud-bar-fill {
+  background: rgba(56, 189, 248, 0.96);
+}
+
+.mobile-swipe-hud-card.is-session .mobile-swipe-hud-bar-fill {
+  background: rgba(251, 191, 36, 0.96);
+}
+
+.mobile-swipe-hud-hint {
+  font-size: 12px;
+  font-weight: 500;
+  text-align: center;
+  color: rgba(203, 213, 225, 0.88);
+}
+
+.mobile-swipe-hud.is-armed .mobile-swipe-hud-hint {
+  font-weight: 600;
+  color: rgba(248, 250, 252, 0.98);
+}
+
+@media (prefers-color-scheme: light) {
+  .mobile-swipe-hud-card {
+    background: rgba(255, 255, 255, 0.9);
+    border-color: rgba(15, 23, 42, 0.16);
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.18),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+    color: rgba(15, 23, 42, 0.92);
+  }
+
+  .mobile-swipe-hud-card.is-server.is-armed {
+    border-color: rgba(2, 132, 199, 0.9);
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.18),
+      0 0 24px rgba(2, 132, 199, 0.2);
+  }
+
+  .mobile-swipe-hud-card.is-session.is-armed {
+    border-color: rgba(217, 119, 6, 0.9);
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.18),
+      0 0 24px rgba(217, 119, 6, 0.2);
+  }
+
+  .mobile-swipe-hud-header,
+  .mobile-swipe-hud-hint {
+    color: rgba(51, 65, 85, 0.86);
+  }
+
+  .mobile-swipe-hud-pct,
+  .mobile-swipe-hud-center-badge,
+  .mobile-swipe-hud.is-armed .mobile-swipe-hud-hint {
+    color: rgba(15, 23, 42, 0.95);
+  }
+
+  .mobile-swipe-hud-dir {
+    border-color: rgba(15, 23, 42, 0.14);
+    background: rgba(15, 23, 42, 0.04);
+    color: rgba(51, 65, 85, 0.88);
+  }
+
+  .mobile-swipe-hud-dir.is-server.is-active {
+    border-color: rgba(2, 132, 199, 0.55);
+    background: rgba(2, 132, 199, 0.12);
+    color: rgba(12, 74, 110, 0.96);
+  }
+
+  .mobile-swipe-hud-dir.is-server.is-armed {
+    border-color: rgba(2, 132, 199, 0.92);
+    background: rgba(2, 132, 199, 0.22);
+    color: rgba(12, 74, 110, 1);
+  }
+
+  .mobile-swipe-hud-dir.is-session.is-active {
+    border-color: rgba(217, 119, 6, 0.55);
+    background: rgba(217, 119, 6, 0.12);
+    color: rgba(120, 53, 15, 0.96);
+  }
+
+  .mobile-swipe-hud-dir.is-session.is-armed {
+    border-color: rgba(217, 119, 6, 0.92);
+    background: rgba(217, 119, 6, 0.22);
+    color: rgba(120, 53, 15, 1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mobile-swipe-hud-card,
+  .mobile-swipe-hud-ring-fill,
+  .mobile-swipe-hud-dir,
+  .mobile-swipe-hud-bar-fill {
+    animation: none;
+    transition: none;
+  }
+
+  .mobile-swipe-hud-dir.is-armed {
+    transform: none;
+  }
+}
+
 /* Desktop Cloud Docs button: animated iridescent conic marquee border */
 .btn.desktop-cloud-docs-marquee-btn,
 html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
@@ -19852,7 +20175,8 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .capability-global-operation .capability-operation-card,
 :is(html.native-ios-mac, html.native-mac-desktop) .task-pair-card-hover-preview,
 :is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop,
-:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
+:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card,
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
@@ -19931,8 +20255,16 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
   background: rgba(13, 20, 34, 0.94);
 }
 
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card {
+  background: rgba(13, 20, 34, 0.94);
+}
+
 @media (prefers-color-scheme: light) {
   :is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
+    background: rgba(255, 255, 255, 0.94);
+  }
+
+  :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card {
     background: rgba(255, 255, 255, 0.94);
   }
 }

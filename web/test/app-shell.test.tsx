@@ -10375,4 +10375,136 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
+
+  it('shows 4-direction MobileSwipeHud gated on threshold-on-release and ignores bottom drag/scroll surfaces', async () => {
+    const mkTouchEvent = (
+      type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+    ) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
+      };
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+
+      // 1) Bottom control/scroll surfaces never open HUD or switch sessions
+      for (const selector of ['.controls-wrapper', '.shortcuts-row', '.subsession-bar', '.tab-bar']) {
+        const el = view.container.querySelector(selector);
+        if (!el) continue;
+        await act(async () => {
+          el.dispatchEvent(mkTouchEvent('touchstart', [
+            { identifier: 1, clientX: 80, clientY: 500 },
+            { identifier: 2, clientX: 84, clientY: 520 },
+          ]));
+          el.dispatchEvent(mkTouchEvent('touchmove', [
+            { identifier: 1, clientX: 160, clientY: 500 },
+            { identifier: 2, clientX: 164, clientY: 520 },
+          ]));
+        });
+        expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+        await act(async () => {
+          el.dispatchEvent(mkTouchEvent('touchend', []));
+        });
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      }
+
+      // 2) Dragging 2 fingers on session pane shows 4-direction HUD before threshold without switching yet
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [
+          { identifier: 1, clientX: 80, clientY: 200 },
+          { identifier: 2, clientX: 84, clientY: 250 },
+        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
+          { identifier: 1, clientX: 112, clientY: 200 },
+          { identifier: 2, clientX: 116, clientY: 250 },
+        ]));
+      });
+
+      const hud = screen.getByTestId('mobile-swipe-hud');
+      expect(hud.getAttribute('data-direction')).toBe('right');
+      expect(hud.getAttribute('data-armed')).toBe('false');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-up')).toBeTruthy();
+      expect(screen.getByTestId('mobile-swipe-hud-dir-down')).toBeTruthy();
+      expect(screen.getByTestId('mobile-swipe-hud-dir-left')).toBeTruthy();
+      expect(screen.getByTestId('mobile-swipe-hud-dir-right').getAttribute('data-active')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // 3) Drag past threshold -> armed, STILL does not switch mid-drag
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
+          { identifier: 1, clientX: 160, clientY: 200 },
+          { identifier: 2, clientX: 164, clientY: 250 },
+        ]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // 4) Pull back below threshold before lifting -> disarms and does NOT switch on release
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
+          { identifier: 1, clientX: 100, clientY: 200 },
+          { identifier: 2, clientX: 104, clientY: 250 },
+        ]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('false');
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', []));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // 5) Drag past threshold and touchcancel -> clears HUD without switching
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [
+          { identifier: 1, clientX: 80, clientY: 200 },
+          { identifier: 2, clientX: 84, clientY: 250 },
+        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
+          { identifier: 1, clientX: 160, clientY: 200 },
+          { identifier: 2, clientX: 164, clientY: 250 },
+        ]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchcancel', []));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // 6) Drag past threshold and release -> clears HUD and switches to deck_beta_brain
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [
+          { identifier: 1, clientX: 80, clientY: 200 },
+          { identifier: 2, clientX: 84, clientY: 250 },
+        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
+          { identifier: 1, clientX: 160, clientY: 200 },
+          { identifier: 2, clientX: 164, clientY: 250 },
+        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', []));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
 });

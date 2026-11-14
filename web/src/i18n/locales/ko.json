@@ -5391,5 +5391,16 @@
     "open_new_window": "새 창에서 열기",
     "window_blocked": "브라우저가 클라우드 문서 창을 차단했습니다. 이 사이트의 팝업을 허용한 뒤 다시 시도하세요.",
     "window_blocked_dismiss": "숨기기"
+  },
+  "mobile_gesture": {
+    "hud": {
+      "title": "두 손가락 탐색",
+      "up": "이전 서버",
+      "down": "다음 서버",
+      "left": "이전 세션",
+      "right": "다음 세션",
+      "drag_to_threshold": "임계값까지 드래그하여 전환",
+      "release_to_switch": "놓아서 전환"
+    }
   }
 }

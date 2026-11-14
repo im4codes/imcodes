@@ -109,6 +109,7 @@ import {
 import {
   attachMobileNavigationGestures,
   MOBILE_NAVIGATION_GESTURE_KEYCAPS,
+  type MobileNavigationGestureProgress,
 } from './mobile-navigation-gestures.js';
 import {
   projectUnifiedServerList,
@@ -191,6 +192,7 @@ import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
 import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
 import { ServerSwitchWatermark } from './components/ServerSwitchWatermark.js';
+import { MobileSwipeHud } from './components/MobileSwipeHud.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { PushStatusBadge } from './components/PushStatusBadge.js';
@@ -7459,6 +7461,7 @@ function InternalMainApp() {
     || (remoteDesktopWallOpen && !remoteDesktopWallMinimized);
 
   // Global keyboard shortcuts & mobile 2-finger navigation gestures: switch servers & session tabs.
+  const [mobileGestureProgress, setMobileGestureProgress] = useState<MobileNavigationGestureProgress | null>(null);
   const [serverSwitchWatermark, setServerSwitchWatermark] = useState<{
     serverId: string;
     serverName: string;
@@ -7653,9 +7656,11 @@ function InternalMainApp() {
   }, [isMobile, navigateServerByStep, navigateTabByStep]);
 
   useEffect(() => {
+    setMobileGestureProgress(null);
     return attachMobileNavigationGestures({
       isMobile,
       isBlocked: () => hasBlockingMobileGestureOverlayRef.current,
+      onProgress: setMobileGestureProgress,
       onAction: (action) => {
         const keycaps = MOBILE_NAVIGATION_GESTURE_KEYCAPS[action];
         if (action === 'serverPrev' || action === 'serverNext') {
@@ -7666,6 +7671,12 @@ function InternalMainApp() {
       },
     });
   }, [isMobile, navigateServerByStep, navigateTabByStep]);
+
+  useEffect(() => {
+    if (!isMobile || hasBlockingComposerOverlay || mobileSidebarOpen || mobileRemoteSurfaceActive) {
+      setMobileGestureProgress(null);
+    }
+  }, [isMobile, hasBlockingComposerOverlay, mobileSidebarOpen, mobileRemoteSurfaceActive]);
 
   useEffect(() => {
     if (!serverSwitchWatermark) return;
@@ -10424,16 +10435,19 @@ function InternalMainApp() {
             ? trans('common.loading', { defaultValue: 'Loading…' })
             : null;
         return (
-          <ServerSwitchWatermark
-            visible={serverSwitchWatermark !== null}
-            triggerKey={serverSwitchWatermark?.nonce ?? 0}
-            serverName={serverSwitchWatermark?.serverName ?? ''}
-            sessionName={watermarkSessionName}
-            switchKind={serverSwitchWatermark?.switchKind}
-            fallbackLabel={watermarkFallbackLabel}
-            shortcutKeycaps={serverSwitchWatermark?.shortcutKeycaps}
-            onDismiss={dismissServerSwitchWatermark}
-          />
+          <>
+            {isMobile && <MobileSwipeHud progress={mobileGestureProgress} />}
+            <ServerSwitchWatermark
+              visible={serverSwitchWatermark !== null}
+              triggerKey={serverSwitchWatermark?.nonce ?? 0}
+              serverName={serverSwitchWatermark?.serverName ?? ''}
+              sessionName={watermarkSessionName}
+              switchKind={serverSwitchWatermark?.switchKind}
+              fallbackLabel={watermarkFallbackLabel}
+              shortcutKeycaps={serverSwitchWatermark?.shortcutKeycaps}
+              onDismiss={dismissServerSwitchWatermark}
+            />
+          </>
         );
       })()}
 

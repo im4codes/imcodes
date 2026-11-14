@@ -4,9 +4,11 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import {
   MOBILE_NAVIGATION_GESTURE_KEYCAPS,
+  MOBILE_SWIPE_PRIMARY_THRESHOLD_PX,
   TwoFingerSwipeTracker,
   attachMobileNavigationGestures,
   canHandleMobileNavigationGesture,
+  type MobileNavigationGestureProgress,
   type TouchPointSnapshot,
 } from '../src/mobile-navigation-gestures.js';
 
@@ -34,6 +36,7 @@ describe('mobile-navigation-gestures', () => {
   it.each([
     {
       label: 'swipe up -> serverPrev',
+      direction: 'up',
       start: [
         { identifier: 1, clientX: 120, clientY: 300 },
         { identifier: 2, clientX: 180, clientY: 305 },
@@ -47,6 +50,7 @@ describe('mobile-navigation-gestures', () => {
     },
     {
       label: 'swipe down -> serverNext',
+      direction: 'down',
       start: [
         { identifier: 1, clientX: 120, clientY: 200 },
         { identifier: 2, clientX: 180, clientY: 205 },
@@ -60,6 +64,7 @@ describe('mobile-navigation-gestures', () => {
     },
     {
       label: 'swipe left -> tabPrev',
+      direction: 'left',
       start: [
         { identifier: 1, clientX: 250, clientY: 300 },
         { identifier: 2, clientX: 255, clientY: 350 },
@@ -73,6 +78,7 @@ describe('mobile-navigation-gestures', () => {
     },
     {
       label: 'swipe right -> tabNext',
+      direction: 'right',
       start: [
         { identifier: 1, clientX: 100, clientY: 300 },
         { identifier: 2, clientX: 105, clientY: 350 },
@@ -84,38 +90,65 @@ describe('mobile-navigation-gestures', () => {
       expected: 'tabNext',
       keycaps: ['2F', '→'],
     },
-  ])('recognizes $label and enforces single-trigger latch until fingers lift', ({ start, move, expected, keycaps }) => {
-    const tracker = new TwoFingerSwipeTracker();
+  ])('recognizes $label only on release past threshold and enforces single-trigger latch until all fingers lift', ({ direction, start, move, expected, keycaps }) => {
+    const progressEvents: Array<MobileNavigationGestureProgress | null> = [];
+    const tracker = new TwoFingerSwipeTracker({
+      onProgress: (p) => progressEvents.push(p),
+    });
+
     tracker.onTouchStart({ touches: start });
-    expect(tracker.onTouchMove({ touches: move })).toBe(expected);
+    expect(progressEvents.at(-1)).toEqual({
+      dx: 0,
+      dy: 0,
+      direction: null,
+      action: null,
+      distance: 0,
+      threshold: MOBILE_SWIPE_PRIMARY_THRESHOLD_PX,
+      progress: 0,
+      armed: false,
+    });
+
+    // Does NOT trigger mid-drag on touchmove; instead arms progress state
+    expect(tracker.onTouchMove({ touches: move })).toBeNull();
+    expect(progressEvents.at(-1)).toMatchObject({
+      direction,
+      action: expected,
+      threshold: MOBILE_SWIPE_PRIMARY_THRESHOLD_PX,
+      progress: 1,
+      armed: true,
+    });
     expect(MOBILE_NAVIGATION_GESTURE_KEYCAPS[expected]).toEqual(keycaps);
 
-    // Further movement in the same gesture must NOT re-trigger
-    expect(tracker.onTouchMove({
-      touches: move.map((pt) => ({ ...pt, clientX: pt.clientX + 50, clientY: pt.clientY + 50 })),
-    })).toBeNull();
+    // Sequential lift: lifting 1 finger while armed triggers once and clears HUD
+    expect(tracker.onTouchEnd({ touches: [move[0]!], changedTouches: [move[1]!] })).toBe(expected);
+    expect(progressEvents.at(-1)).toBeNull();
 
-    // Lifting only 1 finger does not unlock a new trigger
-    tracker.onTouchEnd({ touches: [move[0]!] });
+    // Remaining movement and lifting 2nd finger must NOT re-trigger
     expect(tracker.onTouchMove({
-      touches: move.map((pt) => ({ ...pt, clientY: pt.clientY - 120 })),
+      touches: [{ ...move[0]!, clientX: move[0]!.clientX + 50, clientY: move[0]!.clientY - 120 }],
     })).toBeNull();
+    expect(tracker.onTouchEnd({ touches: [], changedTouches: [move[0]!] })).toBeNull();
 
     // Lifting all fingers resets so a fresh gesture works
-    tracker.onTouchEnd({ touches: [] });
     tracker.onTouchStart({ touches: start });
-    expect(tracker.onTouchMove({ touches: move })).toBe(expected);
+    expect(tracker.onTouchMove({ touches: move })).toBeNull();
+    expect(tracker.onTouchEnd({ touches: [], changedTouches: move })).toBe(expected);
+    expect(progressEvents.at(-1)).toBeNull();
   });
 
   it('ignores 1-finger scrolling, short jitter, single-finger stall, and diagonal ambiguity', () => {
-    const tracker = new TwoFingerSwipeTracker();
+    const progressEvents: Array<MobileNavigationGestureProgress | null> = [];
+    const tracker = new TwoFingerSwipeTracker({
+      onProgress: (p) => progressEvents.push(p),
+    });
 
-    // 1-finger scroll
+    // 1-finger scroll never shows HUD or triggers
     tracker.onTouchStart({ touches: [{ identifier: 1, clientX: 100, clientY: 100 }] });
     expect(tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 100, clientY: 300 }] })).toBeNull();
-    tracker.onTouchEnd({ touches: [] });
+    expect(tracker.onTouchEnd({ touches: [] })).toBeNull();
+    expect(progressEvents).toEqual([]);
 
-    // Short jitter (< 48px average)
+    // Short jitter (< 56px threshold) stays unarmed and does not trigger on release
     tracker.onTouchStart({
       touches: [
         { identifier: 1, clientX: 100, clientY: 200 },
@@ -124,13 +157,21 @@ describe('mobile-navigation-gestures', () => {
     });
     expect(tracker.onTouchMove({
       touches: [
-        { identifier: 1, clientX: 100, clientY: 235 },
-        { identifier: 2, clientX: 150, clientY: 235 },
+        { identifier: 1, clientX: 100, clientY: 240 },
+        { identifier: 2, clientX: 150, clientY: 240 },
       ],
     })).toBeNull();
-    tracker.onTouchEnd({ touches: [] });
+    expect(progressEvents.at(-1)).toMatchObject({
+      direction: 'down',
+      action: 'serverNext',
+      armed: false,
+    });
+    expect(progressEvents.at(-1)!.progress).toBeGreaterThan(0.5);
+    expect(progressEvents.at(-1)!.progress).toBeLessThan(1);
+    expect(tracker.onTouchEnd({ touches: [] })).toBeNull();
+    expect(progressEvents.at(-1)).toBeNull();
 
-    // One finger moves 90px, second finger stays < 28px (stalled) -> rejected
+    // One finger moves 110px, second finger stays < 28px (stalled) -> stays unarmed and rejected
     tracker.onTouchStart({
       touches: [
         { identifier: 1, clientX: 100, clientY: 200 },
@@ -139,13 +180,14 @@ describe('mobile-navigation-gestures', () => {
     });
     expect(tracker.onTouchMove({
       touches: [
-        { identifier: 1, clientX: 100, clientY: 290 },
+        { identifier: 1, clientX: 100, clientY: 310 },
         { identifier: 2, clientX: 150, clientY: 215 },
       ],
     })).toBeNull();
-    tracker.onTouchEnd({ touches: [] });
+    expect(progressEvents.at(-1)?.armed).toBe(false);
+    expect(tracker.onTouchEnd({ touches: [] })).toBeNull();
 
-    // Diagonal ambiguity (60px horizontal vs 55px vertical -> 60 < 55 * 1.35)
+    // Diagonal ambiguity (70px horizontal vs 65px vertical -> 70 < 65 * 1.35) -> no direction, unarmed
     tracker.onTouchStart({
       touches: [
         { identifier: 1, clientX: 100, clientY: 200 },
@@ -154,16 +196,26 @@ describe('mobile-navigation-gestures', () => {
     });
     expect(tracker.onTouchMove({
       touches: [
-        { identifier: 1, clientX: 160, clientY: 255 },
-        { identifier: 2, clientX: 210, clientY: 255 },
+        { identifier: 1, clientX: 170, clientY: 265 },
+        { identifier: 2, clientX: 220, clientY: 265 },
       ],
     })).toBeNull();
+    expect(progressEvents.at(-1)).toMatchObject({
+      direction: null,
+      action: null,
+      armed: false,
+      progress: 0,
+    });
+    expect(tracker.onTouchEnd({ touches: [] })).toBeNull();
   });
 
-  it('rejects pinch/spread, 3+ finger touches, and resets cleanly on touchcancel', () => {
-    const tracker = new TwoFingerSwipeTracker();
+  it('rejects pinch/spread, 3+ finger touches, pull-back below threshold, and resets cleanly on touchcancel', () => {
+    const progressEvents: Array<MobileNavigationGestureProgress | null> = [];
+    const tracker = new TwoFingerSwipeTracker({
+      onProgress: (p) => progressEvents.push(p),
+    });
 
-    // Pinch spread on Y (one moves up, one moves down) -> locked out even if both then move down
+    // Pinch spread on Y (one moves up, one moves down) -> locked out & HUD hidden even if both then move down
     tracker.onTouchStart({
       touches: [
         { identifier: 1, clientX: 120, clientY: 200 },
@@ -176,13 +228,38 @@ describe('mobile-navigation-gestures', () => {
         { identifier: 2, clientX: 160, clientY: 230 },
       ],
     })).toBeNull();
+    expect(progressEvents.at(-1)).toBeNull();
     expect(tracker.onTouchMove({
       touches: [
         { identifier: 1, clientX: 120, clientY: 320 },
         { identifier: 2, clientX: 160, clientY: 320 },
       ],
     })).toBeNull();
-    tracker.onTouchEnd({ touches: [] });
+    expect(tracker.onTouchEnd({ touches: [] })).toBeNull();
+
+    // Slide past threshold (armed: true), then pull back below threshold (armed: false) before lifting -> NO trigger
+    tracker.onTouchStart({
+      touches: [
+        { identifier: 1, clientX: 100, clientY: 200 },
+        { identifier: 2, clientX: 150, clientY: 200 },
+      ],
+    });
+    tracker.onTouchMove({
+      touches: [
+        { identifier: 1, clientX: 100, clientY: 280 },
+        { identifier: 2, clientX: 150, clientY: 280 },
+      ],
+    });
+    expect(progressEvents.at(-1)?.armed).toBe(true);
+    tracker.onTouchMove({
+      touches: [
+        { identifier: 1, clientX: 100, clientY: 220 },
+        { identifier: 2, clientX: 150, clientY: 220 },
+      ],
+    });
+    expect(progressEvents.at(-1)?.armed).toBe(false);
+    expect(tracker.onTouchEnd({ touches: [] })).toBeNull();
+    expect(progressEvents.at(-1)).toBeNull();
 
     // 3rd finger touch locks out until all lift
     tracker.onTouchStart({
@@ -198,22 +275,32 @@ describe('mobile-navigation-gestures', () => {
         { identifier: 3, clientX: 200, clientY: 200 },
       ],
     });
+    expect(progressEvents.at(-1)).toBeNull();
     expect(tracker.onTouchMove({
       touches: [
         { identifier: 1, clientX: 100, clientY: 300 },
         { identifier: 2, clientX: 150, clientY: 300 },
       ],
     })).toBeNull();
-    tracker.onTouchEnd({ touches: [] });
+    expect(tracker.onTouchEnd({ touches: [] })).toBeNull();
 
-    // touchcancel resets state so next gesture works immediately
+    // touchcancel while armed clears HUD and resets state so next gesture works immediately
     tracker.onTouchStart({
       touches: [
         { identifier: 1, clientX: 100, clientY: 200 },
         { identifier: 2, clientX: 150, clientY: 200 },
       ],
     });
+    tracker.onTouchMove({
+      touches: [
+        { identifier: 1, clientX: 100, clientY: 280 },
+        { identifier: 2, clientX: 150, clientY: 280 },
+      ],
+    });
+    expect(progressEvents.at(-1)?.armed).toBe(true);
     tracker.onTouchCancel();
+    expect(progressEvents.at(-1)).toBeNull();
+
     tracker.onTouchStart({
       touches: [
         { identifier: 1, clientX: 100, clientY: 200 },
@@ -225,7 +312,8 @@ describe('mobile-navigation-gestures', () => {
         { identifier: 1, clientX: 100, clientY: 280 },
         { identifier: 2, clientX: 150, clientY: 280 },
       ],
-    })).toBe('serverNext');
+    })).toBeNull();
+    expect(tracker.onTouchEnd({ touches: [] })).toBe('serverNext');
   });
 
   it('blocks gestures when !isMobile or blocking overlays/surfaces are active', () => {
@@ -406,12 +494,22 @@ describe('mobile-navigation-gestures', () => {
     dispatchTouch(host, 'touchend', [], [{ identifier: 2, clientX: 150, clientY: 340 }]);
     expect(actions).toEqual([]);
 
-    // No duplicate emission on touchend when touchmove already emitted
+    // Only triggers on touchend (not during touchmove), and still does not duplicate on subsequent touchend
+    detach();
     actions.length = 0;
+    const progressStates: Array<MobileNavigationGestureProgress | null> = [];
+    const detachWithProgress = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (action) => actions.push(action),
+      onProgress: (p) => progressStates.push(p),
+    });
     dispatchTouch(host, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 150, clientY: 200 }]);
     dispatchTouch(host, 'touchmove', [{ identifier: 1, clientX: 100, clientY: 280 }, { identifier: 2, clientX: 150, clientY: 280 }]);
+    expect(actions).toEqual([]);
+    expect(progressStates.at(-1)?.armed).toBe(true);
     dispatchTouch(host, 'touchend', [], [{ identifier: 1, clientX: 100, clientY: 300 }, { identifier: 2, clientX: 150, clientY: 300 }]);
     expect(actions).toEqual(['serverNext']);
+    expect(progressStates.at(-1)).toBeNull();
 
     // Coalesced pinch/spread in touchend changedTouches stays rejected
     actions.length = 0;
@@ -419,7 +517,7 @@ describe('mobile-navigation-gestures', () => {
     dispatchTouch(host, 'touchend', [], [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 160, clientY: 260 }]);
     expect(actions).toEqual([]);
 
-    detach();
+    detachWithProgress();
   });
 
   it('F2: blocks VoiceOverlay and sibling role-less fullscreen overlays/backdrops while allowing non-blocking chat-history-overlay', () => {
@@ -470,5 +568,117 @@ describe('mobile-navigation-gestures', () => {
     statusPill.className = 'chat-history-overlay';
     document.body.appendChild(statusPill);
     expect(canHandleMobileNavigationGesture(target, { isMobile: true, document })).toBe(true);
+  });
+
+  it('decouples bottom drag/scroll control surfaces and mixed-origin touches from 2-finger navigation', () => {
+    const mainPane = document.createElement('div');
+    mainPane.className = 'session-pane';
+    document.body.appendChild(mainPane);
+
+    // Every bottom control / scrollable strip / resize handle must return false from canHandleMobileNavigationGesture
+    for (const selectorSpec of [
+      { cls: 'controls-wrapper' },
+      { cls: 'mobile-controls' },
+      { cls: 'subcard-bar' },
+      { cls: 'subsession-bar' },
+      { cls: 'subsession-strip' },
+      { cls: 'subcard-scroll' },
+      { cls: 'subsession-row-with-close' },
+      { cls: 'subsession-close-all-strip' },
+      { cls: 'team-discussion-bottom' },
+      { cls: 'shortcuts-row' },
+      { cls: 'shortcuts' },
+      { cls: 'shortcuts-meta-scroll' },
+      { cls: 'shortcut-dpad' },
+      { cls: 'tab-bar' },
+      { attr: ['data-mobile-gesture-ignore', 'true'] as const },
+      { cls: 'resize-hover-surface' },
+      { attr: ['data-resize-handle', 'true'] as const },
+    ]) {
+      const container = document.createElement('div');
+      if ('cls' in selectorSpec && selectorSpec.cls) container.className = selectorSpec.cls;
+      if ('attr' in selectorSpec && selectorSpec.attr) {
+        container.setAttribute(selectorSpec.attr[0], selectorSpec.attr[1]);
+      }
+      const btn = document.createElement('button');
+      const textNode = document.createTextNode('item');
+      btn.appendChild(textNode);
+      container.appendChild(btn);
+      document.body.appendChild(container);
+
+      expect(canHandleMobileNavigationGesture(container, { isMobile: true, document })).toBe(false);
+      expect(canHandleMobileNavigationGesture(btn, { isMobile: true, document })).toBe(false);
+      // Mobile WebKit can report a Text node inside a button as touch target
+      expect(canHandleMobileNavigationGesture(textNode, { isMobile: true, document })).toBe(false);
+
+      // Legitimate swipe on mainPane still works
+      expect(canHandleMobileNavigationGesture(mainPane, { isMobile: true, document })).toBe(true);
+      container.remove();
+    }
+
+    // End-to-end mixed-origin touch tests through attachMobileNavigationGestures
+    const controls = document.createElement('div');
+    controls.className = 'controls-wrapper';
+    const subScroll = document.createElement('div');
+    subScroll.className = 'subcard-scroll';
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    document.body.appendChild(controls);
+    document.body.appendChild(subScroll);
+    document.body.appendChild(tabBar);
+
+    const actions: string[] = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (a) => actions.push(a),
+      onProgress: (p) => progressLog.push(p),
+    });
+
+    // 1) Both fingers inside .controls-wrapper -> ignored, no HUD
+    dispatchTouch(controls, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 500 }, { identifier: 2, clientX: 150, clientY: 500 }]);
+    dispatchTouch(controls, 'touchmove', [{ identifier: 1, clientX: 200, clientY: 500 }, { identifier: 2, clientX: 250, clientY: 500 }]);
+    dispatchTouch(controls, 'touchend', [], [{ identifier: 1, clientX: 200, clientY: 500 }, { identifier: 2, clientX: 250, clientY: 500 }]);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+
+    // 2) Finger 1 starts inside .subcard-scroll, Finger 2 lands on .session-pane -> NOT hijacked
+    dispatchTouch(subScroll, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 450 }]);
+    dispatchTouch(mainPane, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 450 }, { identifier: 2, clientX: 150, clientY: 300 }]);
+    dispatchTouch(mainPane, 'touchmove', [{ identifier: 1, clientX: 100, clientY: 350 }, { identifier: 2, clientX: 150, clientY: 200 }]);
+    dispatchTouch(mainPane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+
+    // 3) Finger 1 starts on .session-pane, Finger 2 lands on .controls-wrapper -> NOT hijacked
+    dispatchTouch(mainPane, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 300 }]);
+    dispatchTouch(controls, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 300 }, { identifier: 2, clientX: 150, clientY: 500 }]);
+    dispatchTouch(mainPane, 'touchmove', [{ identifier: 1, clientX: 200, clientY: 300 }, { identifier: 2, clientX: 250, clientY: 500 }]);
+    dispatchTouch(mainPane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+
+    // 4) Simultaneous 2-finger touchstart where event.target is mainPane, but touches[1].target is .tab-bar -> NOT hijacked
+    dispatchTouch(mainPane, 'touchstart', [
+      { identifier: 1, clientX: 100, clientY: 200, target: mainPane },
+      { identifier: 2, clientX: 150, clientY: 40, target: tabBar },
+    ]);
+    dispatchTouch(mainPane, 'touchmove', [
+      { identifier: 1, clientX: 200, clientY: 200, target: mainPane },
+      { identifier: 2, clientX: 250, clientY: 40, target: tabBar },
+    ]);
+    dispatchTouch(mainPane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+
+    // 5) Subsequent clean 2-finger gesture on .session-pane recovers and triggers normally
+    dispatchTouch(mainPane, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 150, clientY: 200 }]);
+    dispatchTouch(mainPane, 'touchmove', [{ identifier: 1, clientX: 100, clientY: 120 }, { identifier: 2, clientX: 150, clientY: 120 }]);
+    expect(progressLog.at(-1)?.armed).toBe(true);
+    dispatchTouch(mainPane, 'touchend', []);
+    expect(actions).toEqual(['serverPrev']);
+    expect(progressLog.at(-1)).toBeNull();
+
+    detach();
   });
 });
