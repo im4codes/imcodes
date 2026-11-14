@@ -1874,11 +1874,11 @@ export function NewSessionDialog({
 
         </div>
 
-        <div class="incognito-create-option">
-          <label>
+        <div class={`incognito-create-option${incognito ? ' is-active' : ''}`}>
+          <label class={`incognito-toggle-btn${incognito ? ' is-active' : ''}`}>
             <input type="checkbox" checked={incognito} disabled={!canIncognito}
               onChange={event => setIncognito(event.currentTarget.checked)} />
-            {t('session.incognito')}
+            <span>🕶️ {t('session.incognito')}</span>
           </label>
           <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
           {(!canIncognito || (incognito && !supportsSessionIncognito(agentType))) && <p role="status">{t('session.incognito_unsupported')}</p>}
@@ -1903,7 +1903,7 @@ export function NewSessionDialog({
             {t("common.cancel")}
           </button>
           <button
-            class="btn btn-primary"
+            class={`btn btn-primary${incognito ? ' incognito-launch-btn' : ''}`}
             onClick={handleStart}
             disabled={!isSessionAgentTypeSelectable(agentType) || starting || (incognito && (!canIncognito || !supportsSessionIncognito(agentType)))}
           >

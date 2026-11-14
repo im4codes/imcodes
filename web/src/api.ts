@@ -1406,6 +1406,7 @@ export interface SubSessionData {
   /** The owning parent execution run id for an execution clone. Clones sharing a
    *  `parentRunId` are grouped together in the execution-detail view. */
   parentRunId?: string | null;
+  incognito?: boolean;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
@@ -1455,6 +1456,7 @@ export async function createSubSession(
     activeModel?: string | null;
     effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
     transportConfig?: Record<string, unknown> | null;
+    incognito?: boolean;
   },
 ): Promise<{ id: string; sessionName: string; subSession: SubSessionData }> {
   const res = await apiFetch<{ id: string; sessionName: string; subSession: {
@@ -1465,6 +1467,7 @@ export async function createSubSession(
     gemini_session_id: string | null; parent_session: string | null; description: string | null; cc_preset_id: string | null;
     requested_model: string | null; active_model: string | null; effort: import('../../shared/effort-levels.js').TransportEffortLevel | null;
     transport_config: Record<string, unknown> | string | null;
+    incognito?: boolean;
   } }>(`/api/server/${serverId}/sub-sessions`, {
     method: 'POST',
     body: JSON.stringify({
@@ -1499,6 +1502,7 @@ export async function createSubSession(
       transportConfig: (typeof s.transport_config === 'string'
         ? JSON.parse(s.transport_config)
         : (s.transport_config ?? null)) as Record<string, unknown> | null,
+      ...(s.incognito === true ? { incognito: true } : {}),
     },
   };
 }

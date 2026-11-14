@@ -15,6 +15,8 @@ import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -93,6 +95,9 @@ export async function buildSubSessionSyncPayload(
   const sessionName = `deck_sub_${id}`;
   const record = getSession(sessionName);
   const r = { ...record, ...overrides };
+  if (isIncognitoSessionName(sessionName) || isIncognitoSession(r)) {
+    return null;
+  }
   if (!r?.agentType) {
     logger.warn({ id, sessionName }, 'Skipping subsession.sync without agentType');
     return null;

@@ -2713,4 +2713,41 @@ describe('SubSessionBar', () => {
       }
     }
   });
+
+  it('adds .incognito class on SubSessionBar buttons and applies dashed border + distinct incognito control styles in CSS', () => {
+    const cssPath = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/styles.css');
+    const css = readFileSync(cssPath, 'utf8');
+    expect(css).toContain('.tab.incognito');
+    expect(css).toContain('border-style: dashed');
+    expect(css).toContain('.subsession-card.incognito');
+    expect(css).toContain('.subsession-window.incognito');
+    expect(css).toContain('.incognito-toggle-btn');
+    expect(css).toContain('.incognito-launch-btn');
+
+    const subs = [
+      makeSubSession({ id: 'priv-bar', sessionName: 'deck_sub_priv-bar', label: 'priv-bar', incognito: true }),
+      makeSubSession({ id: 'norm-bar', sessionName: 'deck_sub_norm-bar', label: 'norm-bar', incognito: false }),
+    ];
+    const view = render(
+      <SubSessionBar
+        subSessions={subs}
+        openIds={new Set(['priv-bar'])}
+        focusedSubId="priv-bar"
+        collapsed={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const privBtn = view.container.querySelector('.subsession-card[data-sub-id="priv-bar"]');
+    const normBtn = view.container.querySelector('.subsession-card[data-sub-id="norm-bar"]');
+    expect(privBtn?.classList.contains('incognito')).toBe(true);
+    expect(privBtn?.classList.contains('open')).toBe(true);
+    expect(privBtn?.classList.contains('focused')).toBe(true);
+    expect(normBtn?.classList.contains('incognito')).toBe(false);
+  });
 });

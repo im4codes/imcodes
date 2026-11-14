@@ -215,4 +215,61 @@ describe('server WsBridge incognito privacy isolation (F3)', () => {
     logger.info({ tag: 'normal-control' }, 'ordinary log check');
     expect(logSpy.mock.calls.flat().join('\n')).toContain('normal-control');
   });
+
+  it('tracks incognito sub-sessions in memory across start, timeline events, and close without DB writes', async () => {
+    const { bridge, daemonWs, browserWs, executedSql } = await setupBridge();
+
+    browserWs.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'subghost1',
+      sessionType: 'claude-code-sdk',
+      cwd: '/tmp/secret-sub',
+      label: 'Ghost Sub',
+      parentSession: 'deck_priv_brain',
+      incognito: true,
+    }));
+    await flushAsync();
+
+    browserWs.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: 'deck_sub_subghost1',
+      mode: 'full',
+    }));
+    await flushAsync();
+
+    daemonWs.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'ev-sub-priv-1',
+        sessionId: 'deck_sub_subghost1',
+        ts: Date.now(),
+        seq: 1,
+        epoch: 1,
+        type: 'assistant.text',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: 'SECRET-SUB-STREAM-REPLY', streaming: false },
+      },
+    }));
+    await flushAsync();
+
+    const cacheWrites = executedSql.filter((q) => q.sql.includes('session_text_tail_cache'));
+    const subSessionWrites = executedSql.filter((q) => q.sql.includes('sub_sessions'));
+    expect(cacheWrites).toEqual([]);
+    expect(subSessionWrites).toEqual([]);
+    expect(bridge.getRecentText('deck_sub_subghost1')).toEqual([]);
+    expect(browserWs.sent.map((item) => String(item)).join('\n')).toContain('SECRET-SUB-STREAM-REPLY');
+
+    // Close incognito sub-session -> zero sub_sessions DB writes and broadcasts subsession.removed
+    browserWs.sent.length = 0;
+    daemonWs.emit('message', JSON.stringify({
+      type: 'subsession.closed',
+      id: 'subghost1',
+      sessionName: 'deck_sub_subghost1',
+    }));
+    await flushAsync();
+
+    expect(executedSql.filter((q) => q.sql.includes('sub_sessions'))).toEqual([]);
+    expect(browserWs.sent.map((item) => String(item)).join('\n')).toContain('subsession.removed');
+  });
 });

@@ -1115,4 +1115,24 @@ describe('SessionTabs', () => {
     expect(saveUserPrefMock).not.toHaveBeenCalled();
     expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual(['ag_cd', 'ag_aip', 'ag_worker']);
   });
+
+  it('adds .incognito class on incognito tabs in both active and inactive states', () => {
+    const sessions = makeSessions([
+      { name: 'deck_priv_brain', label: 'priv', role: 'brain', agentType: 'claude-code-sdk', incognito: true },
+      { name: 'deck_norm_brain', label: 'norm', role: 'brain', agentType: 'claude-code-sdk', incognito: false },
+    ]);
+    const view = render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="deck_priv_brain"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    const tabs = [...view.container.querySelectorAll('.tab')];
+    expect(tabs[0]?.classList.contains('incognito')).toBe(true);
+    expect(tabs[0]?.classList.contains('active')).toBe(true);
+    expect(tabs[1]?.classList.contains('incognito')).toBe(false);
+  });
 });

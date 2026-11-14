@@ -18,7 +18,8 @@ import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { listActiveSharesForUser } from '../db/tab-sharing.js';
 import { rawSubSessionIdFromDisplayName } from '../../../shared/tab-sharing.js';
-import { isSessionAgentType } from '../../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType } from '../../../shared/agent-types.js';
+import { SESSION_INCOGNITO_UNSUPPORTED, supportsSessionIncognito } from '../../../shared/session-incognito-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import {
@@ -79,6 +80,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     active_model?: string | null;
     effort?: string | null;
     transport_config?: Record<string, unknown> | null;
+    incognito?: boolean;
   };
   try {
     body = await c.req.json() as typeof body;
@@ -88,6 +90,9 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
 
   if (!body.type) return c.json({ error: 'missing_fields' }, 400);
   if (!isSessionAgentType(body.type)) return c.json({ error: 'invalid_type' }, 400);
+  if (body.incognito === true && !supportsSessionIncognito(body.type)) {
+    return c.json({ error: SESSION_INCOGNITO_UNSUPPORTED }, 400);
+  }
   if (isKnownTestSessionLike({
     cwd: body.cwd ?? null,
     parentSession: body.parent_session ?? null,
@@ -181,6 +186,38 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     .join('')
     .slice(0, 8);
 
+  const sessionName = `deck_sub_${id}`;
+  if (body.incognito === true) {
+    const now = Date.now();
+    const sub = {
+      id,
+      server_id: serverId,
+      type: body.type,
+      shell_bin: body.shellBin ?? null,
+      cwd: body.cwd ?? null,
+      label: body.label ?? null,
+      closed_at: null,
+      cc_session_id: null,
+      gemini_session_id: null,
+      parent_session: effectiveParentSession || null,
+      sort_order: null,
+      runtime_type: getSessionRuntimeType(body.type),
+      provider_id: body.type,
+      provider_session_id: null,
+      description: body.description ?? null,
+      created_at: now,
+      updated_at: now,
+      cc_preset_id: body.cc_preset_id ?? null,
+      requested_model: body.requested_model ?? null,
+      active_model: body.active_model ?? null,
+      effort: body.effort ?? null,
+      transport_config: body.transport_config ?? {},
+      execution_clone_metadata: null,
+      incognito: true,
+    };
+    return c.json({ id: sub.id, sessionName, subSession: sub }, 201);
+  }
+
   const sub = await createSubSession(
     c.env.DB,
     id,
@@ -201,7 +238,6 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     body.transport_config ?? null,
   );
 
-  const sessionName = `deck_sub_${id}`;
   return c.json({ id: sub.id, sessionName, subSession: sub }, 201);
 });
 

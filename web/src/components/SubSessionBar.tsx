@@ -430,7 +430,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, sequenceNumber, isOpe
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''}${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}${extraClass ? ` ${extraClass}` : ''}`}
+      class={`subsession-card${sub.incognito ? ' incognito' : ''}${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''}${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}${extraClass ? ` ${extraClass}` : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -484,7 +484,8 @@ function sameCollapsedSub(a: SubSession, b: SubSession): boolean {
     && a.runtimeType === b.runtimeType
     && a.activeModel === b.activeModel
     && a.requestedModel === b.requestedModel
-    && a.modelDisplay === b.modelDisplay;
+    && a.modelDisplay === b.modelDisplay
+    && !!a.incognito === !!b.incognito;
 }
 
 const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, next) => (
@@ -522,7 +523,7 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, sequenceNumber, cardS
   const abbr = getAgentBadgeLabel(sub.type);
   return (
     <div
-      class={`subcard subcard-preview-placeholder${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subcard subcard-preview-placeholder${sub.incognito ? ' incognito' : ''}${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
       style={{
         width: cardSize.w,
         height: cardSize.h,

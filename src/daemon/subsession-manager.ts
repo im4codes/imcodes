@@ -37,6 +37,9 @@ import {
   shouldAutoRespawnDeadProcessSubSession,
 } from './restart-continuation.js';
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { isIncognitoSessionName, notifySessionTeardown } from '../../shared/session-incognito-context.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
+import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
@@ -85,6 +88,7 @@ export interface SubSessionRecord {
   pairCreatedMetadata?: TaskPairCreatedSessionMetadata | null;
   effort?: TransportEffortLevel;
   fresh?: boolean;
+  incognito?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
 }
@@ -553,6 +557,11 @@ export async function stopSubSession(
       clearSessionRestartContinuation(sessionName);
       removeSession(sessionName);
       timelineEmitter.forgetSession(sessionName);
+      notifySessionTeardown(sessionName);
+      if (isIncognitoSession(record) || isIncognitoSessionName(sessionName)) {
+        getTransportQueueStore().discardSessionQueueState(sessionName);
+        getDefaultTimelineDetailStore().forgetSession(sessionName);
+      }
     },
     emitFailure: async (_record, failure) => {
       const message = buildSubSessionCloseFailureMessage(failure);
@@ -652,6 +661,9 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       ? normalizedSuppliedPreset
       : existing?.ccPreset;
     const existingRuntime = getTransportRuntime(sessionName);
+    if (!existingRuntime && (isIncognitoSession(sub) || isIncognitoSession(existing) || isIncognitoSessionName(sessionName))) {
+      continue;
+    }
     const runtimeOwner = existingRuntime?.recipientIdentity;
     // A reconnect DTO is a projection, not a runtime-replacement command.
     // AG's local route and learned native handle belong to this exact live
@@ -690,6 +702,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         transportConfig: sub.transportConfig ?? existing?.transportConfig,
         description: sub.description ?? existing?.description,
         ccPreset: rebuildCcPreset,
+        ...(isIncognitoSession(existing) || isIncognitoSession(sub) ? { incognito: true } : {}),
         ...(ownsLiveAgy ? {
           agentType: existing.agentType,
           providerId: existing.providerId,

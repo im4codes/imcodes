@@ -75,6 +75,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const sessionName = panel.props?.sessionName as string;
   const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
   const { t } = useTranslation();
+  const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
   const { events, refreshing, historyStatus, forceRefresh } = useTimeline(sessionName, ctx.ws, ctx.serverId, {
     isActiveSession: ctx.activeSession === sessionName,
     // Pinned panel is always visible to the user while mounted; participate
@@ -82,8 +83,8 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
     isVisible: true,
     subscriptionMode: 'full',
     bootstrapWhenVisible: true,
+    incognito: liveSub?.incognito,
   });
-  const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
   // A pinned shell/script panel exists precisely to observe live output, but it
   // issues no terminal subscription of its own. Hold the raw PTY stream for the

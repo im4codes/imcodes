@@ -33,6 +33,7 @@ import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/tr
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
 import { isActiveTurnFinishedError } from '../session-live-status.js';
 import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
+import { forgetIncognitoTimelineSessions, registerIncognitoTimelineSession } from './useTimeline.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -160,6 +161,13 @@ export function useSubSessions(
     }
     if (!connected) {
       rebuiltRef.current = false;
+      setSubSessions((prev) => {
+        if (!prev.some((s) => s.incognito)) return prev;
+        for (const s of prev) {
+          if (s.incognito) forgetIncognitoTimelineSessions(serverId, s.sessionName);
+        }
+        return prev.filter((s) => !s.incognito);
+      });
       return;
     }
     rebuiltRef.current = false;
@@ -433,6 +441,7 @@ export function useSubSessions(
       if (msg.type === 'subsession.removed') {
         const removedId = (msg as any).id as string;
         if (removedId) {
+          forgetIncognitoTimelineSessions(serverId, toSessionName(removedId));
           setSubSessions((prev) => prev.filter((s) => s.id !== removedId));
         }
         return;
@@ -723,6 +732,7 @@ export function useSubSessions(
       const ccPresetId = extra?.ccPreset as string | undefined;
       const requestedModel = (extra?.requestedModel as string | undefined) ?? (extra?.model as string | undefined);
       const transportConfig = extra?.transportConfig as Record<string, unknown> | undefined;
+      const incognito = extra?.incognito === true;
       const res = await apiCreate(serverId, {
         type,
         shellBin,
@@ -736,7 +746,12 @@ export function useSubSessions(
         activeModel: requestedModel ?? null,
         effort: (extra?.thinking as SubSession['effort'] | undefined) ?? null,
         transportConfig: transportConfig ?? null,
+        ...(incognito ? { incognito: true } : {}),
       });
+      const isPrivate = incognito || res.subSession.incognito === true;
+      if (isPrivate) {
+        registerIncognitoTimelineSession(serverId, res.sessionName);
+      }
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,
@@ -747,6 +762,7 @@ export function useSubSessions(
         activeModel: res.subSession.activeModel ?? requestedModel ?? null,
         effort: (extra?.thinking as SubSession['effort'] | undefined) ?? res.subSession.effort ?? null,
         transportConfig: res.subSession.transportConfig ?? transportConfig ?? null,
+        ...(isPrivate ? { incognito: true } : {}),
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it — transport providers may need extra fields
@@ -806,7 +822,7 @@ export function useSubSessions(
   const restart = useCallback(async (id: string) => {
     if (!serverId || !ws) return;
     const sub = subSessions.find((s) => s.id === id);
-    if (!sub) return;
+    if (!sub || sub.incognito) return;
     // In-place restart: daemon kills and recreates with same ID/name.
     // PG record stays — no close + create cycle.
     ws.subSessionRestart(sub.sessionName);
@@ -817,11 +833,16 @@ export function useSubSessions(
 
   const rename = useCallback(async (id: string, label: string) => {
     if (!serverId) return;
-    await patchSubSession(serverId, id, { label }).catch(() => {});
+    const sub = subSessions.find((s) => s.id === id);
+    if (sub?.incognito) {
+      ws?.send({ type: 'subsession.rename', sessionName: sub.sessionName, label });
+    } else {
+      await patchSubSession(serverId, id, { label }).catch(() => {});
+    }
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, label } : s,
     ));
-  }, [serverId]);
+  }, [serverId, subSessions, ws]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
   const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession,

@@ -139,8 +139,16 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     );
 
     const checkbox = view.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
+    expect(view.container.querySelector('.incognito-create-option .incognito-toggle-btn')).toBeTruthy();
+    expect(view.container.querySelector('.incognito-create-option.is-active')).toBeNull();
+    expect(view.container.querySelector('.incognito-toggle-btn.is-active')).toBeNull();
+    expect(view.container.querySelector('.dialog-footer .btn-primary.incognito-launch-btn')).toBeNull();
+
     fireEvent.click(checkbox);
     expect(checkbox.checked).toBe(true);
+    expect(view.container.querySelector('.incognito-create-option.is-active')).toBeTruthy();
+    expect(view.container.querySelector('.incognito-toggle-btn.is-active')).toBeTruthy();
+    expect(view.container.querySelector('.dialog-footer .btn-primary.incognito-launch-btn')).toBeTruthy();
 
     const piButton = view.container.querySelector('[data-agent-type="pi"]') as HTMLButtonElement | null;
     expect(piButton).toBeTruthy();
@@ -353,8 +361,16 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     );
 
     const checkbox = view.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
+    expect(view.container.querySelector('.incognito-create-option .incognito-toggle-btn')).toBeTruthy();
+    expect(view.container.querySelector('.incognito-create-option.is-active')).toBeNull();
+    expect(view.container.querySelector('.incognito-toggle-btn.is-active')).toBeNull();
+    expect(view.container.querySelector('.dialog-footer .btn-primary.incognito-launch-btn')).toBeNull();
+
     fireEvent.click(checkbox);
     expect(checkbox.checked).toBe(true);
+    expect(view.container.querySelector('.incognito-create-option.is-active')).toBeTruthy();
+    expect(view.container.querySelector('.incognito-toggle-btn.is-active')).toBeTruthy();
+    expect(view.container.querySelector('.dialog-footer .btn-primary.incognito-launch-btn')).toBeTruthy();
 
     const codexSdkBtn = view.container.querySelector('[data-agent-type="codex-sdk"]') as HTMLButtonElement | null;
     expect(codexSdkBtn).toBeTruthy();

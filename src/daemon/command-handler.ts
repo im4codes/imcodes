@@ -2254,8 +2254,10 @@ export function setRouterContext(ctx: RouterContext): void {
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
   const cmd = msg && typeof msg === 'object' ? msg as Record<string, unknown> : {};
-  const name = resolveSessionCommandName(cmd) ?? (typeof cmd.project === 'string' ? `deck_${sanitizeProjectName(cmd.project)}_brain` : undefined);
-  if (cmd.type === 'session.start' && name && cmd.incognito === true) setSessionIncognito(name, true);
+  const name = resolveSessionCommandName(cmd)
+    ?? (cmd.type === 'subsession.start' && typeof cmd.id === 'string' && cmd.id ? subSessionName(cmd.id) : undefined)
+    ?? (typeof cmd.project === 'string' ? `deck_${sanitizeProjectName(cmd.project)}_brain` : undefined);
+  if ((cmd.type === 'session.start' || cmd.type === 'subsession.start') && name && cmd.incognito === true) setSessionIncognito(name, true);
   withSessionPrivacy(name, cmd.incognito === true || isIncognitoSession(name ? getSession(name) : undefined), () => handleWebCommandInternal(msg, serverLink));
 }
 
@@ -8167,11 +8169,13 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
 // ── Sub-session handlers ──────────────────────────────────────────────────
 
 async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  if (cmd.incognito === true) {
-    serverLink.send({ type: 'session.error', message: SESSION_INCOGNITO_UNSUPPORTED }); return;
-  }
+  const incognito = cmd.incognito === true;
   const id = cmd.id as string | undefined;
   const type = cmd.sessionType as string | undefined;
+  if (incognito && (!type || !supportsSessionIncognito(type) || !serverLink.supportsIncognitoSessions())) {
+    serverLink.send({ type: 'session.error', message: SESSION_INCOGNITO_UNSUPPORTED });
+    return;
+  }
   if (!id || !type) {
     logger.warn('subsession.start: missing id or type');
     return;
@@ -8224,72 +8228,84 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
 
   // Transport-backed providers: launch without tmux.
   if (isTransportAgent(type)) {
+    const label = typeof cmd.label === 'string' && cmd.label.trim() ? cmd.label.trim() : undefined;
     const ocMode = cmd.ocMode as string | undefined;
-    const bindExistingKey = type === 'openclaw'
-      ? (ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined)
-      : ((cmd.providerSessionId as string | undefined) || undefined);
+    const bindExistingKey = incognito
+      ? undefined
+      : type === 'openclaw'
+        ? (ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined)
+        : ((cmd.providerSessionId as string | undefined) || undefined);
     const description = ((cmd.ocDescription as string) || (cmd.description as string) || '').trim() || undefined;
     if (bindExistingKey && isProviderSessionBound(bindExistingKey)) {
       logger.warn({ id, bindExistingKey }, 'subsession.start: providerSessionId already bound — skipped');
       return;
     }
-    try {
-      await launchTransportSession({
-        name: sessionName,
-        projectName,
-        role: 'w1',
-        agentType: type as any,
-        projectDir: (cwd as string) || process.cwd(),
-        description,
-        requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
-        transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
-        bindExistingKey,
-        ...(ccPreset ? { ccPreset } : {}),
-        ...(isClaudeCodeSdkAgentType(type) ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
-        ...(effort ? { effort } : {}),
-        userCreated: true,
-        parentSession: parentSession || undefined,
-      });
-      // Sync to server DB
+    setSessionIncognito(sessionName, incognito);
+    await withSessionPrivacy(sessionName, incognito, async () => {
       try {
-        await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
-      } catch { /* not connected */ }
-    } catch (e: unknown) {
-      logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
-      const now = Date.now();
-      const errMsg = e instanceof Error ? e.message : String(e);
-      const existing = getSession(sessionName);
-      const errorRecord: SessionRecord = {
-        name: sessionName,
-        projectName: existing?.projectName ?? sessionName,
-        role: existing?.role ?? 'w1',
-        agentType: type,
-        projectDir: existing?.projectDir ?? ((cwd as string) || process.cwd()),
-        state: 'error',
-        restarts: existing?.restarts ?? 0,
-        restartTimestamps: existing?.restartTimestamps ?? [],
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-        runtimeType: 'transport',
-        providerId: type,
-        ...(description ? { description } : {}),
-        ...(ccPreset ? { ccPreset } : {}),
-        ...(effort ? { effort } : {}),
-        ...(parentSession ? { parentSession } : {}),
-        ...(cmd.requestedModel || cmd.model
-          ? { requestedModel: ((cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined)) }
-          : {}),
-        userCreated: true,
-      };
-      upsertSession(errorRecord);
-      timelineEmitter.emit(
-        sessionName,
-        'session.state',
-        { state: 'error', error: errMsg },
-        { source: 'daemon', confidence: 'high' },
-      );
-    }
+        await launchTransportSession({
+          ...(incognito ? { incognito: true, fresh: true } : {}),
+          name: sessionName,
+          projectName,
+          role: 'w1',
+          agentType: type as any,
+          projectDir: (cwd as string) || process.cwd(),
+          ...(label ? { label } : {}),
+          description,
+          requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
+          transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
+          bindExistingKey,
+          ...(ccPreset ? { ccPreset } : {}),
+          ...(isClaudeCodeSdkAgentType(type) ? { ccSessionId: randomUUID(), fresh: true } : {}),
+          ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
+          ...(effort ? { effort } : {}),
+          userCreated: true,
+          parentSession: parentSession || undefined,
+        });
+        // Sync to server DB (skipped for incognito sub-sessions)
+        if (!incognito) {
+          try {
+            await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
+          } catch { /* not connected */ }
+        }
+      } catch (e: unknown) {
+        logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
+        const now = Date.now();
+        const errMsg = e instanceof Error ? e.message : String(e);
+        const existing = getSession(sessionName);
+        const errorRecord: SessionRecord = {
+          name: sessionName,
+          projectName: existing?.projectName ?? sessionName,
+          role: existing?.role ?? 'w1',
+          agentType: type,
+          projectDir: existing?.projectDir ?? ((cwd as string) || process.cwd()),
+          state: 'error',
+          restarts: existing?.restarts ?? 0,
+          restartTimestamps: existing?.restartTimestamps ?? [],
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+          runtimeType: 'transport',
+          providerId: type,
+          ...(incognito ? { incognito: true } : {}),
+          ...(label ? { label } : {}),
+          ...(description ? { description } : {}),
+          ...(ccPreset ? { ccPreset } : {}),
+          ...(effort ? { effort } : {}),
+          ...(parentSession ? { parentSession } : {}),
+          ...(cmd.requestedModel || cmd.model
+            ? { requestedModel: ((cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined)) }
+            : {}),
+          userCreated: true,
+        };
+        upsertSession(errorRecord);
+        timelineEmitter.emit(
+          sessionName,
+          'session.state',
+          { state: 'error', error: errMsg },
+          { source: 'daemon', confidence: 'high' },
+        );
+      }
+    });
     return;
   }
   const subCcInitPrompt = cmd.ccInitPrompt as string | null | undefined;
@@ -8347,6 +8363,16 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   const record = getSession(sName);
   if (!record) {
     logger.warn({ sessionName: sName }, 'subsession.restart: session not found in store');
+    return;
+  }
+  if ((isIncognitoSession(record) || isIncognitoSessionName(sName))
+    && (record.state === 'error' || record.state === 'stopped' || !getTransportRuntime(sName))) {
+    logger.warn({ sessionName: sName }, 'subsession.restart: refusing to restart dead incognito sub-session');
+    serverLink.send({
+      type: 'session.error',
+      project: record.projectName,
+      message: 'Incognito session cannot be restored; start a new session.',
+    });
     return;
   }
   const id = sName.replace(/^deck_sub_/, '');
@@ -8453,6 +8479,15 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
   const existing = getSession(sessionName);
   if (!existing) {
     logger.warn({ sessionName }, 'subsession.set_model: session not found');
+    return;
+  }
+  if (isIncognitoSession(existing) || isIncognitoSessionName(sessionName)) {
+    logger.warn({ sessionName }, 'subsession.set_model: refusing process restart for incognito sub-session');
+    serverLink.send({
+      type: 'session.error',
+      project: existing.projectName,
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+    });
     return;
   }
 

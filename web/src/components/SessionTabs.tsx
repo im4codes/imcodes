@@ -467,7 +467,7 @@ function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, 
         // names (active → inactive) and replaying red when the user changes tabs.
         const hasAlert = s.state === 'idle' && (idleAlerts?.has(s.name) ?? false);
         const stateClass = isWorkingSessionState(s.state) ? 'busy' : s.state === 'idle' ? 'idle' : '';
-        const classes = ['tab', isBrain ? 'brain' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
+        const classes = ['tab', isBrain ? 'brain' : '', s.incognito ? 'incognito' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
         const isDragOver = dragOverIdx === idx;
 
         // WS latency shown inline on the active tab
@@ -675,7 +675,8 @@ function sameTabSessions(a: SessionInfo[], b: SessionInfo[]): boolean {
       || left.state !== right.state
       || left.label !== right.label
       || left.agentType !== right.agentType
-      || left.runtimeType !== right.runtimeType) return false;
+      || left.runtimeType !== right.runtimeType
+      || !!left.incognito !== !!right.incognito) return false;
   }
   return true;
 }

@@ -1332,6 +1332,8 @@ export function syncIncognitoTimelineSessions(
   for (const [key, state] of incognitoCacheState.entries()) {
     if (state.mode !== 'incognito') continue;
     if (serverId ? !key.startsWith(prefix) : key.includes(':')) continue;
+    // session_list only contains main sessions; do not evict live incognito sub-sessions.
+    if (key.slice(prefix.length).startsWith('deck_sub_')) continue;
     if (!seenIncognitoKeys.has(key)) forgetIncognitoTimelineKey(key);
   }
 }

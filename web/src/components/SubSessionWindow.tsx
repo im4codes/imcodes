@@ -342,6 +342,7 @@ export function SubSessionWindow({
     // On-screen windows must paint their local cache and obtain one bounded
     // tail/delta even before focus; hidden windows defer bootstrap entirely.
     bootstrapWhenVisible: visible,
+    incognito: sub.incognito,
   });
 
   // Re-surface a still-pending question in the dedicated dialog from history
@@ -590,6 +591,7 @@ export function SubSessionWindow({
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
     sharedState,
+    incognito: sub.incognito,
   };
   // Keep the controls' working sweep on the same reconciled live state as the
   // footer. Transport sub-session metadata can lag the authoritative timeline
@@ -1023,6 +1025,7 @@ export function SubSessionWindow({
     : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
   const rootClass = [
     'subsession-window',
+    sub.incognito ? 'incognito' : '',
     isDesktopMaximized ? 'subsession-window-maximized' : '',
     desktopLayoutCapable && !isMobile && active ? 'subsession-window-active' : '',
     resizingDir ? 'is-resizing' : '',

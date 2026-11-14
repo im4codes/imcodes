@@ -969,4 +969,20 @@ describe('SubSessionCard', () => {
     );
     expect(view.getByTestId('subsession-seq-sub-card-1').textContent).toBe('5');
   });
+
+  it('renders .incognito class on subcard when sub.incognito is true', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession({ incognito: true })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const card = view.container.querySelector('.subcard');
+    expect(card?.classList.contains('incognito')).toBe(true);
+  });
 });

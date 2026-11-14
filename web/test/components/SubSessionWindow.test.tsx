@@ -2229,4 +2229,51 @@ describe('SDK window startup budget', () => {
       expect(onInputRef).toHaveBeenCalledWith(null);
     });
   });
+
+  it('adds .incognito class and badge on SubSessionWindow when sub.incognito is true', () => {
+    const sub: any = {
+      id: 'sub-win-priv',
+      sessionName: 'deck_sub_sub-win-priv',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport',
+      label: 'Priv Win',
+      state: 'idle',
+      cwd: '/tmp',
+      parentSession: 'deck_main_brain',
+      incognito: true,
+    };
+    const ws: any = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+      subscribeTerminal: vi.fn(),
+      unsubscribeTerminal: vi.fn(),
+      sendSnapshotRequest: vi.fn(),
+      sendResize: vi.fn(),
+      getDaemonCapabilitySnapshot: vi.fn(() => null),
+      onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
+    };
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+    const win = document.querySelector('.subsession-window[data-subsession-id="sub-win-priv"]');
+    expect(win?.classList.contains('incognito')).toBe(true);
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]?.activeSession?.incognito).toBe(true);
+  });
 });

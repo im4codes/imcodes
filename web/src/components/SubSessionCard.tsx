@@ -148,6 +148,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
+    incognito: sub.incognito,
   };
 }
 
@@ -197,6 +198,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
       isVisible: timelineHydrated || isOpen || !!isFocused,
       // Cards are collapsed previews; a promoted/open window owns the full stream.
       subscriptionMode: 'summary',
+      incognito: sub.incognito,
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
@@ -448,7 +450,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}${overlayOpen ? ' subcard-overlay-open' : ''}`}
+      class={`subcard${sub.incognito ? ' incognito' : ''}${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}${overlayOpen ? ' subcard-overlay-open' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative', '--subsession-accent-color': accentColor, '--subcard-h': `${cardH}px` } as JSX.CSSProperties}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >

@@ -1,5 +1,5 @@
 import { R2_RELAY_MSG } from '../../../shared/r2-relay.js';
-import { isIncognitoSession, SESSION_INCOGNITO_SERVER_READY } from '../../../shared/session-incognito-types.js';
+import { isIncognitoSession, SESSION_INCOGNITO_SERVER_READY, supportsSessionIncognito } from '../../../shared/session-incognito-types.js';
 import { withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import {
@@ -7863,6 +7863,21 @@ export class WsBridge {
       if (msg.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE || msg.type === SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE) {
         this.trackBrowserConsoleSubscription(ws, msg);
       }
+      if (browserMessageType === 'subsession.start' && msg.incognito === true && typeof msg.id === 'string' && msg.id) {
+        const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
+        if (supportsSessionIncognito(agentType)) {
+          const subSessionName = `deck_sub_${msg.id}`;
+          this.incognitoSessions.add(subSessionName);
+          this.activeSubSessions.set(subSessionName, {
+            name: subSessionName,
+            state: 'starting',
+            label: typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined,
+            parentSession: typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined,
+            agentType,
+            runtimeType: agentType ? getSessionRuntimeType(agentType) : undefined,
+          });
+        }
+      }
       if (browserMessageType === 'subsession.rebuild_all') {
         if (msg.supportsCreatedBatch === true) this.batchCreatedBrowsers.add(ws);
         this.sendToDaemon(JSON.stringify({ ...msg, supportsSyncBatch: true }));
@@ -9658,12 +9673,14 @@ export class WsBridge {
       return;
     }
     if (type === 'subsession.update_gemini_id' && this.db) {
+      if (typeof msg.id === 'string' && this.incognitoSessions.has(`deck_sub_${msg.id}`)) return;
       void updateSubSession(this.db, msg.id as string, this.serverId, {
         gemini_session_id: msg.geminiSessionId as string,
       }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to update gemini_session_id'));
       return;
     }
     if (type === 'subsession.close' && this.db) {
+      if (typeof msg.id === 'string' && this.incognitoSessions.has(`deck_sub_${msg.id}`)) return;
       void updateSubSession(this.db, msg.id as string, this.serverId, { closed_at: Date.now() })
         .catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to close sub-session in DB'));
       return;
@@ -9719,9 +9736,18 @@ export class WsBridge {
     }
 
     // ── Sub-session closed by daemon → mark in DB + notify browsers ─────────
-    if (type === 'subsession.closed' && this.db) {
-      const id = msg.id as string;
-      if (id) {
+    if (type === 'subsession.closed') {
+      const id = typeof msg.id === 'string' ? msg.id : '';
+      const incognitoSubName = id ? `deck_sub_${id}` : '';
+      if (id && this.incognitoSessions.has(incognitoSubName)) {
+        this.incognitoSessions.delete(incognitoSubName);
+        this.recentTextBySession.delete(incognitoSubName);
+        this.activeSubSessions.delete(incognitoSubName);
+        this.invalidateSessionOwnershipCache(incognitoSubName);
+        this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName ?? incognitoSubName }));
+        return;
+      }
+      if (id && this.db) {
         void this.db.execute('UPDATE sub_sessions SET closed_at = $1 WHERE id = $2 AND server_id = $3',
           [Date.now(), id, this.serverId])
           .then(() => {
@@ -10929,6 +10955,7 @@ export class WsBridge {
     if (this.disposed) return false;
     if (!this.db) return true; // no db = dev/test mode, allow all
     if (this.activeSubSessions.has(sessionName)) return true;
+    if (this.authenticated && this.incognitoSessions.has(sessionName)) return true;
     if (this.authenticated
       && this.daemonNodeRole !== NODE_ROLE.CONTROLLED
       && this.activeMainSessions.has(sessionName)) {
