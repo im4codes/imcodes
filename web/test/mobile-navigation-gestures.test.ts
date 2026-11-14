@@ -14,11 +14,14 @@ function dispatchTouch(
   target: EventTarget,
   type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
   touches: TouchPointSnapshot[],
+  changedTouches: TouchPointSnapshot[] = [],
 ): void {
   const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
     touches: TouchPointSnapshot[];
+    changedTouches: TouchPointSnapshot[];
   };
   Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+  Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
   target.dispatchEvent(evt);
 }
 
@@ -320,5 +323,152 @@ describe('mobile-navigation-gestures', () => {
     expect(mobileAction).toHaveBeenNthCalledWith(1, 'serverPrev');
     expect(mobileAction).toHaveBeenNthCalledWith(2, 'tabNext');
     detachMobile();
+  });
+
+  it.each([
+    {
+      label: 'fast coalesced up -> serverPrev',
+      start: [{ identifier: 1, clientX: 120, clientY: 280 }, { identifier: 2, clientX: 170, clientY: 282 }],
+      subThresholdMove: [{ identifier: 1, clientX: 120, clientY: 245 }, { identifier: 2, clientX: 170, clientY: 247 }],
+      endChanged: [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+      expected: 'serverPrev',
+    },
+    {
+      label: 'fast coalesced down -> serverNext',
+      start: [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+      subThresholdMove: [{ identifier: 1, clientX: 120, clientY: 240 }, { identifier: 2, clientX: 170, clientY: 242 }],
+      endChanged: [{ identifier: 1, clientX: 120, clientY: 280 }, { identifier: 2, clientX: 170, clientY: 282 }],
+      expected: 'serverNext',
+    },
+    {
+      label: 'fast coalesced left -> tabPrev',
+      start: [{ identifier: 1, clientX: 240, clientY: 200 }, { identifier: 2, clientX: 242, clientY: 250 }],
+      subThresholdMove: [{ identifier: 1, clientX: 205, clientY: 200 }, { identifier: 2, clientX: 207, clientY: 250 }],
+      endChanged: [{ identifier: 1, clientX: 160, clientY: 200 }, { identifier: 2, clientX: 162, clientY: 250 }],
+      expected: 'tabPrev',
+    },
+    {
+      label: 'fast coalesced right -> tabNext',
+      start: [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 102, clientY: 250 }],
+      subThresholdMove: [{ identifier: 1, clientX: 140, clientY: 200 }, { identifier: 2, clientX: 142, clientY: 250 }],
+      endChanged: [{ identifier: 1, clientX: 180, clientY: 200 }, { identifier: 2, clientX: 182, clientY: 250 }],
+      expected: 'tabNext',
+    },
+  ])('F1: evaluates $label when threshold is crossed only in touchend changedTouches', ({ start, subThresholdMove, endChanged, expected }) => {
+    const actions: string[] = [];
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (action) => actions.push(action),
+    });
+
+    dispatchTouch(host, 'touchstart', start);
+    dispatchTouch(host, 'touchmove', subThresholdMove);
+    expect(actions).toEqual([]);
+    dispatchTouch(host, 'touchend', [], endChanged);
+    expect(actions).toEqual([expected]);
+    detach();
+  });
+
+  it('F1: handles sequential lift, blocks partner-below-threshold promotion, rejects coalesced pinch, and never duplicates touchmove trigger', () => {
+    const actions: string[] = [];
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (action) => actions.push(action),
+    });
+
+    // Sequential lift where both fingers already crossed threshold on first lift -> triggers once on first touchend, second lift is no-op
+    dispatchTouch(host, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 150, clientY: 200 }]);
+    dispatchTouch(
+      host,
+      'touchend',
+      [{ identifier: 2, clientX: 150, clientY: 280 }],
+      [{ identifier: 1, clientX: 100, clientY: 280 }],
+    );
+    expect(actions).toEqual(['serverNext']);
+    dispatchTouch(host, 'touchmove', [{ identifier: 2, clientX: 150, clientY: 340 }]);
+    dispatchTouch(host, 'touchend', [], [{ identifier: 2, clientX: 150, clientY: 360 }]);
+    expect(actions).toEqual(['serverNext']);
+
+    // Partner lifts below threshold (20px) -> remaining finger dragging further past 90px must NOT promote/trigger
+    actions.length = 0;
+    dispatchTouch(host, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 150, clientY: 200 }]);
+    dispatchTouch(
+      host,
+      'touchend',
+      [{ identifier: 2, clientX: 150, clientY: 220 }],
+      [{ identifier: 1, clientX: 100, clientY: 220 }],
+    );
+    dispatchTouch(host, 'touchmove', [{ identifier: 2, clientX: 150, clientY: 310 }]);
+    dispatchTouch(host, 'touchend', [], [{ identifier: 2, clientX: 150, clientY: 340 }]);
+    expect(actions).toEqual([]);
+
+    // No duplicate emission on touchend when touchmove already emitted
+    actions.length = 0;
+    dispatchTouch(host, 'touchstart', [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 150, clientY: 200 }]);
+    dispatchTouch(host, 'touchmove', [{ identifier: 1, clientX: 100, clientY: 280 }, { identifier: 2, clientX: 150, clientY: 280 }]);
+    dispatchTouch(host, 'touchend', [], [{ identifier: 1, clientX: 100, clientY: 300 }, { identifier: 2, clientX: 150, clientY: 300 }]);
+    expect(actions).toEqual(['serverNext']);
+
+    // Coalesced pinch/spread in touchend changedTouches stays rejected
+    actions.length = 0;
+    dispatchTouch(host, 'touchstart', [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 160, clientY: 200 }]);
+    dispatchTouch(host, 'touchend', [], [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 160, clientY: 260 }]);
+    expect(actions).toEqual([]);
+
+    detach();
+  });
+
+  it('F2: blocks VoiceOverlay and sibling role-less fullscreen overlays/backdrops while allowing non-blocking chat-history-overlay', () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    // Exact VoiceOverlay DOM shape (even without role="dialog") + textarea child must block
+    const backdrop = document.createElement('div');
+    backdrop.className = 'voice-overlay-backdrop';
+    const overlay = document.createElement('div');
+    overlay.className = 'voice-overlay';
+    const ta = document.createElement('textarea');
+    overlay.appendChild(ta);
+    document.body.appendChild(backdrop);
+    document.body.appendChild(overlay);
+    expect(canHandleMobileNavigationGesture(ta, { isMobile: true, document })).toBe(false);
+    overlay.remove();
+    backdrop.remove();
+    expect(canHandleMobileNavigationGesture(target, { isMobile: true, document })).toBe(true);
+
+    // Sibling role-less fullscreen overlays & backdrops across components
+    for (const cls of [
+      'mobile-server-menu',
+      'ask-dialog-overlay',
+      'fb-overlay',
+      'mobile-fb-overlay',
+      'fb-conflict-overlay',
+      'html-fullscreen-preview',
+      'onboarding-overlay',
+      'openspec-auto-details-backdrop',
+      'cloud-docs-modal-backdrop',
+      'qp-backdrop',
+      'controls-composer-backdrop',
+      'peer-audit-overlay',
+      'session-usage-backdrop',
+      'modal-backdrop',
+      'daemon-details-backdrop',
+    ]) {
+      const node = document.createElement('div');
+      node.className = cls;
+      document.body.appendChild(node);
+      expect(canHandleMobileNavigationGesture(target, { isMobile: true, document })).toBe(false);
+      node.remove();
+    }
+
+    // Non-blocking chat history status pill does NOT suppress gestures
+    const statusPill = document.createElement('div');
+    statusPill.className = 'chat-history-overlay';
+    document.body.appendChild(statusPill);
+    expect(canHandleMobileNavigationGesture(target, { isMobile: true, document })).toBe(true);
   });
 });

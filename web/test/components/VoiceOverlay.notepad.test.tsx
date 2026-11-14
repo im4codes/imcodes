@@ -913,4 +913,25 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     expect(document.querySelector('.voice-overlay-stream-mirror')).toBeNull();
     expect(ta.classList.contains('voice-overlay-text-streaming')).toBe(false);
   });
+
+  it('blocks mobile 2-finger navigation gestures while VoiceOverlay is open and restores when closed', async () => {
+    const { canHandleMobileNavigationGesture } = await import('../../src/mobile-navigation-gestures.js');
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    expect(canHandleMobileNavigationGesture(host, { isMobile: true, document })).toBe(true);
+
+    const { rerender } = render(
+      <VoiceOverlay open onSend={vi.fn()} onClose={vi.fn()} />,
+    );
+    const voiceOverlay = document.querySelector('.voice-overlay')!;
+    const ta = voiceOverlay.querySelector('textarea')!;
+    expect(voiceOverlay.getAttribute('role')).toBe('dialog');
+    expect(voiceOverlay.getAttribute('aria-modal')).toBe('true');
+    expect(canHandleMobileNavigationGesture(ta, { isMobile: true, document })).toBe(false);
+
+    rerender(<VoiceOverlay open={false} onSend={vi.fn()} onClose={vi.fn()} />);
+    expect(document.querySelector('.voice-overlay')).toBeNull();
+    expect(canHandleMobileNavigationGesture(host, { isMobile: true, document })).toBe(true);
+    host.remove();
+  });
 });

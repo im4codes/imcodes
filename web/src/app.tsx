@@ -7457,9 +7457,13 @@ function InternalMainApp() {
   const viewModeNavRef = useRef(viewMode);
   viewModeNavRef.current = viewMode;
 
-  const navigateServerByStep = useCallback((direction: 1 | -1, shortcutKeycaps: readonly string[]): boolean => {
+  const navigateServerByStep = useCallback((
+    direction: 1 | -1,
+    shortcutKeycaps: readonly string[],
+    minCount = 1,
+  ): boolean => {
     const serversList = orderedServersNavRef.current;
-    if (serversList.length === 0) return false;
+    if (serversList.length < minCount) return false;
     const nextId = cycleOrderedId(
       serversList.map((srv) => srv.id),
       selectedServerIdRef.current,
@@ -7478,11 +7482,15 @@ function InternalMainApp() {
     return true;
   }, []);
 
-  const navigateTabByStep = useCallback((direction: 1 | -1, watermarkKeycaps?: readonly string[]): boolean => {
+  const navigateTabByStep = useCallback((
+    direction: 1 | -1,
+    watermarkKeycaps?: readonly string[],
+    minCount = 1,
+  ): boolean => {
     const serverId = selectedServerIdRef.current;
     if (!serverId || manualDashboardRef.current) return false;
     const tabsList = orderedTabsNavRef.current;
-    if (tabsList.length === 0) return false;
+    if (tabsList.length < minCount) return false;
     const nextName = cycleOrderedId(
       tabsList.map((session) => session.name),
       activeSessionRef.current,
@@ -7563,10 +7571,10 @@ function InternalMainApp() {
       onAction: (action) => {
         const keycaps = MOBILE_NAVIGATION_GESTURE_KEYCAPS[action];
         if (action === 'serverPrev' || action === 'serverNext') {
-          navigateServerByStep(action === 'serverNext' ? 1 : -1, keycaps);
+          navigateServerByStep(action === 'serverNext' ? 1 : -1, keycaps, 2);
           return;
         }
-        navigateTabByStep(action === 'tabNext' ? 1 : -1, keycaps);
+        navigateTabByStep(action === 'tabNext' ? 1 : -1, keycaps, 2);
       },
     });
   }, [isMobile, navigateServerByStep, navigateTabByStep]);

@@ -947,7 +947,7 @@ export function VoiceOverlay({
   return createPortal((
     <>
     <div class="voice-overlay-backdrop" aria-hidden="true" />
-    <div class="voice-overlay" style={{ height: maxH }}>
+    <div class="voice-overlay" role="dialog" aria-modal="true" style={{ height: maxH }}>
       <div class="voice-overlay-grid" />
 
       <div class="voice-overlay-header">

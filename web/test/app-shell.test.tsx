@@ -9084,4 +9084,233 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
+
+  it('F1/F2: completes fast coalesced touchend swipes and blocks open VoiceOverlay / mobile-server-menu', async () => {
+    const dispatchCoalescedSwipe = (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      subThresholdMove: Array<{ identifier: number; clientX: number; clientY: number }>,
+      endChanged: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start;
+          changedTouches: typeof start;
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      target.dispatchEvent(mkEvent('touchstart', start));
+      target.dispatchEvent(mkEvent('touchmove', subThresholdMove));
+      target.dispatchEvent(mkEvent('touchend', [], endChanged));
+    };
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // F2: open VoiceOverlay DOM -> 2-finger swipe inside its textarea does NOT navigate or show watermark
+      const voiceBackdrop = document.createElement('div');
+      voiceBackdrop.className = 'voice-overlay-backdrop';
+      const voiceOverlay = document.createElement('div');
+      voiceOverlay.className = 'voice-overlay';
+      const voiceTa = document.createElement('textarea');
+      voiceOverlay.appendChild(voiceTa);
+      document.body.appendChild(voiceBackdrop);
+      document.body.appendChild(voiceOverlay);
+
+      dispatchCoalescedSwipe(
+        voiceTa,
+        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+        [{ identifier: 1, clientX: 118, clientY: 200 }, { identifier: 2, clientX: 122, clientY: 250 }],
+        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+      );
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      voiceOverlay.remove();
+      voiceBackdrop.remove();
+
+      // F2: open .mobile-server-menu -> 2-finger swipe Down is blocked
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      dispatchCoalescedSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+        [{ identifier: 1, clientX: 120, clientY: 238 }, { identifier: 2, clientX: 170, clientY: 240 }],
+        [{ identifier: 1, clientX: 120, clientY: 280 }, { identifier: 2, clientX: 170, clientY: 282 }],
+      );
+      expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+
+      // F1: fast coalesced touchend swipe Right (move=38px, end=85px) -> switches to deck_beta_brain
+      dispatchCoalescedSwipe(
+        alphaPane,
+        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+        [{ identifier: 1, clientX: 118, clientY: 200 }, { identifier: 2, clientX: 122, clientY: 250 }],
+        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+
+      // F1: fast coalesced touchend swipe Down (move=40px, end=80px) -> switches to Server Two
+      dispatchCoalescedSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+        [{ identifier: 1, clientX: 120, clientY: 240 }, { identifier: 2, clientX: 170, clientY: 242 }],
+        [{ identifier: 1, clientX: 120, clientY: 280 }, { identifier: 2, clientX: 170, clientY: 282 }],
+      );
+      await screen.findByTestId('session-pane-deck_delta_brain');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('F3: mobile 2-finger navigation safely no-ops for <=1 server or <=1 tab regardless of dashboard, null, or stale selection', async () => {
+    const dispatchSwipe = (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start;
+          changedTouches: typeof start;
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      target.dispatchEvent(mkEvent('touchstart', start));
+      target.dispatchEvent(mkEvent('touchmove', move));
+      target.dispatchEvent(mkEvent('touchend', [], move));
+    };
+
+    let mockSessions: Array<Record<string, unknown>> = [
+      { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+    ];
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') return { sessions: mockSessions };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      // Case 1: Single server + single tab with stale saved session -> Up/Down/Left/Right all no-op without watermark
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'stale_deleted_session');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      dispatchSwipe(
+        alphaPane,
+        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+        [{ identifier: 1, clientX: 120, clientY: 290 }, { identifier: 2, clientX: 170, clientY: 292 }],
+      );
+      dispatchSwipe(
+        alphaPane,
+        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+      );
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Case 2: Enter dashboard via real mobile Home button (clears rcc_server -> null selection) with 1 server -> Down/Up must stay on dashboard
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const homeBtn = view.container.querySelector('.mobile-server-menu-home')!;
+      fireEvent.click(homeBtn);
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+      expect(localStorage.getItem('rcc_server')).toBeNull();
+
+      dispatchSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+        [{ identifier: 1, clientX: 120, clientY: 290 }, { identifier: 2, clientX: 170, clientY: 292 }],
+      );
+      dispatchSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 290 }, { identifier: 2, clientX: 170, clientY: 292 }],
+        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+      );
+      expect(screen.getByText('dashboard-page')).toBeTruthy();
+      expect(localStorage.getItem('rcc_server')).toBeNull();
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('F3: mobile 2-finger navigation safely no-ops for zero tabs with stale selection', async () => {
+    const dispatchSwipe = (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start;
+          changedTouches: typeof start;
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      target.dispatchEvent(mkEvent('touchstart', start));
+      target.dispatchEvent(mkEvent('touchmove', move));
+      target.dispatchEvent(mkEvent('touchend', [], move));
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'stale_tab');
+      const { App } = await importApp();
+      const emptyView = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+      await act(async () => {
+        wsInstances[0].connectedHandler?.();
+        wsInstances[0].emit({ type: 'session_list', daemon: 'srv-1', sessions: [] });
+      });
+      await waitFor(() => expect(emptyView.container.querySelector('.mobile-server-btn-name')?.textContent).toBe('Alpha Server'));
+      dispatchSwipe(
+        emptyView.container,
+        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+      );
+      dispatchSwipe(
+        emptyView.container,
+        [{ identifier: 1, clientX: 200, clientY: 200 }, { identifier: 2, clientX: 204, clientY: 250 }],
+        [{ identifier: 1, clientX: 115, clientY: 200 }, { identifier: 2, clientX: 119, clientY: 250 }],
+      );
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
 });

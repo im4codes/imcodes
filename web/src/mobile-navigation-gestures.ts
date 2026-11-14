@@ -10,6 +10,7 @@ export interface TouchPointSnapshot {
 
 export interface TouchEventLike {
   readonly touches: ArrayLike<TouchPointSnapshot>;
+  readonly changedTouches?: ArrayLike<TouchPointSnapshot>;
   readonly target?: EventTarget | null;
 }
 
@@ -25,14 +26,31 @@ export const MOBILE_NAVIGATION_GESTURE_KEYCAPS: Record<MobileNavigationAction, r
   tabNext: ['2F', '→'],
 };
 
+// Fullscreen overlays, backdrops, and drawers across the UI that may omit role="dialog".
 const MOBILE_GESTURE_BLOCKING_DOM_SELECTOR = [
   '.mobile-sidebar-overlay.open',
+  '.mobile-server-menu',
+  '.voice-overlay-backdrop',
+  '.voice-overlay',
+  '.ask-dialog-overlay',
+  '.fb-overlay',
+  '.mobile-fb-overlay',
   '.fb-lightbox',
+  '.fb-conflict-overlay',
+  '.html-fullscreen-preview',
+  '.onboarding-overlay',
+  '.openspec-auto-details-backdrop',
+  '.cloud-docs-modal-backdrop',
+  '.qp-backdrop',
+  '.controls-composer-backdrop',
+  '.peer-audit-overlay',
+  '.session-usage-backdrop',
+  '.modal-backdrop',
+  '.daemon-details-backdrop',
 ].join(', ');
 
 const MOBILE_GESTURE_BLOCKING_TARGET_SELECTOR = [
-  '.mobile-sidebar-overlay.open',
-  '.fb-lightbox',
+  MOBILE_GESTURE_BLOCKING_DOM_SELECTOR,
   '.remote-desktop-panel',
   '.remote-desktop-workspace',
   '.remote-desktop-wall',
@@ -127,54 +145,100 @@ export interface TwoFingerSwipeTrackerOptions {
 
 /**
  * Pure two-finger 4-direction swipe recognizer.
- * Tracks only two-finger parallel translations, rejects pinch/spread zoom,
- * 1-finger scrolling, 3+ finger touches, jitter, and diagonal ambiguity,
- * and emits at most one navigation action until all touches lift.
+ * Evaluates displacement across `touchmove` and `touchend` (`changedTouches`),
+ * rejects pinch/spread zoom, 1-finger scrolling, 3+ finger touches, jitter, and
+ * diagonal ambiguity, and emits at most one navigation action until all touches lift.
  */
 export class TwoFingerSwipeTracker {
   private phase: TrackerPhase = 'idle';
   private startPoints = new Map<number, { x: number; y: number }>();
+  private lastPoints = new Map<number, { x: number; y: number }>();
   private readonly canTrack: (target: EventTarget | null | undefined) => boolean;
 
   constructor(options: TwoFingerSwipeTrackerOptions = {}) {
     this.canTrack = options.canTrack ?? (() => true);
   }
 
+  private clearTrackedPoints(): void {
+    this.startPoints.clear();
+    this.lastPoints.clear();
+  }
+
+  private updateTrackedPositions(touches?: ArrayLike<TouchPointSnapshot>): void {
+    if (!touches) return;
+    for (let i = 0; i < touches.length; i++) {
+      const point = touches[i];
+      if (!point || !this.startPoints.has(point.identifier)) continue;
+      this.lastPoints.set(point.identifier, { x: point.clientX, y: point.clientY });
+    }
+  }
+
+  private evaluateTrackedPoints(): MobileNavigationAction | null {
+    const ids = Array.from(this.startPoints.keys());
+    if (ids.length !== 2) return null;
+    const id1 = ids[0]!;
+    const id2 = ids[1]!;
+    const start1 = this.startPoints.get(id1);
+    const start2 = this.startPoints.get(id2);
+    const end1 = this.lastPoints.get(id1);
+    const end2 = this.lastPoints.get(id2);
+    if (!start1 || !start2 || !end1 || !end2) return null;
+
+    const dx1 = end1.x - start1.x;
+    const dy1 = end1.y - start1.y;
+    const dx2 = end2.x - start2.x;
+    const dy2 = end2.y - start2.y;
+
+    if (isOpposingFingerMovement(dx1, dy1, dx2, dy2)) {
+      this.phase = 'locked_out';
+      this.clearTrackedPoints();
+      return null;
+    }
+
+    const absAvgDx = Math.abs((dx1 + dx2) / 2);
+    const absAvgDy = Math.abs((dy1 + dy2) / 2);
+    return absAvgDy >= absAvgDx
+      ? classifySingleAxisSwipe(dy1, dy2, absAvgDx, 'serverPrev', 'serverNext')
+      : classifySingleAxisSwipe(dx1, dx2, absAvgDy, 'tabPrev', 'tabNext');
+  }
+
   reset(): void {
     this.phase = 'idle';
-    this.startPoints.clear();
+    this.clearTrackedPoints();
   }
 
   onTouchStart(event: TouchEventLike): void {
     const count = event.touches.length;
     if (count > 2) {
       this.phase = 'locked_out';
-      this.startPoints.clear();
+      this.clearTrackedPoints();
       return;
     }
     if (count === 2) {
       if (this.phase !== 'idle') {
         if (this.phase === 'tracking') {
           this.phase = 'locked_out';
-          this.startPoints.clear();
+          this.clearTrackedPoints();
         }
         return;
       }
       if (!this.canTrack(event.target)) {
         this.phase = 'locked_out';
-        this.startPoints.clear();
+        this.clearTrackedPoints();
         return;
       }
       const first = event.touches[0];
       const second = event.touches[1];
       if (!first || !second || first.identifier === second.identifier) {
         this.phase = 'locked_out';
-        this.startPoints.clear();
+        this.clearTrackedPoints();
         return;
       }
-      this.startPoints.clear();
+      this.clearTrackedPoints();
       this.startPoints.set(first.identifier, { x: first.clientX, y: first.clientY });
       this.startPoints.set(second.identifier, { x: second.clientX, y: second.clientY });
+      this.lastPoints.set(first.identifier, { x: first.clientX, y: first.clientY });
+      this.lastPoints.set(second.identifier, { x: second.clientX, y: second.clientY });
       this.phase = 'tracking';
     }
   }
@@ -193,58 +257,68 @@ export class TwoFingerSwipeTracker {
     }
     if (count !== 2 || !this.canTrack(event.target)) {
       this.phase = 'locked_out';
-      this.startPoints.clear();
+      this.clearTrackedPoints();
       return null;
     }
     const first = event.touches[0];
     const second = event.touches[1];
-    if (!first || !second) {
+    if (!first || !second || !this.startPoints.has(first.identifier) || !this.startPoints.has(second.identifier)) {
       this.phase = 'locked_out';
-      this.startPoints.clear();
-      return null;
-    }
-    const start1 = this.startPoints.get(first.identifier);
-    const start2 = this.startPoints.get(second.identifier);
-    if (!start1 || !start2) {
-      this.phase = 'locked_out';
-      this.startPoints.clear();
+      this.clearTrackedPoints();
       return null;
     }
 
-    const dx1 = first.clientX - start1.x;
-    const dy1 = first.clientY - start1.y;
-    const dx2 = second.clientX - start2.x;
-    const dy2 = second.clientY - start2.y;
-
-    if (isOpposingFingerMovement(dx1, dy1, dx2, dy2)) {
-      this.phase = 'locked_out';
-      this.startPoints.clear();
-      return null;
-    }
-
-    const absAvgDx = Math.abs((dx1 + dx2) / 2);
-    const absAvgDy = Math.abs((dy1 + dy2) / 2);
-    const action = absAvgDy >= absAvgDx
-      ? classifySingleAxisSwipe(dy1, dy2, absAvgDx, 'serverPrev', 'serverNext')
-      : classifySingleAxisSwipe(dx1, dx2, absAvgDy, 'tabPrev', 'tabNext');
-
+    this.updateTrackedPositions(event.touches);
+    const action = this.evaluateTrackedPoints();
     if (!action) return null;
 
     this.phase = 'triggered';
-    this.startPoints.clear();
+    this.clearTrackedPoints();
     return action;
   }
 
-  onTouchEnd(event: TouchEventLike): void {
-    const count = event.touches.length;
-    if (count === 0) {
+  onTouchEnd(event: TouchEventLike): MobileNavigationAction | null {
+    const remainingCount = event.touches.length;
+    if (this.phase !== 'tracking') {
+      if (remainingCount === 0) {
+        this.reset();
+      } else if (this.phase === 'idle' && remainingCount > 2) {
+        this.phase = 'locked_out';
+      }
+      return null;
+    }
+
+    if (remainingCount > 2 || !this.canTrack(event.target)) {
+      if (remainingCount === 0) {
+        this.reset();
+      } else {
+        this.phase = 'locked_out';
+        this.clearTrackedPoints();
+      }
+      return null;
+    }
+
+    this.updateTrackedPositions(event.touches);
+    this.updateTrackedPositions(event.changedTouches);
+    const action = this.evaluateTrackedPoints();
+
+    if (action) {
+      if (remainingCount === 0) {
+        this.reset();
+      } else {
+        this.phase = 'triggered';
+        this.clearTrackedPoints();
+      }
+      return action;
+    }
+
+    if (remainingCount === 0) {
       this.reset();
-      return;
-    }
-    if (this.phase === 'tracking' && count < 2) {
+    } else {
       this.phase = 'locked_out';
-      this.startPoints.clear();
+      this.clearTrackedPoints();
     }
+    return null;
   }
 
   onTouchCancel(): void {
@@ -278,7 +352,10 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
     const action = tracker.onTouchMove(e);
     if (action) options.onAction(action);
   };
-  const handleTouchEnd = (e: TouchEvent) => tracker.onTouchEnd(e);
+  const handleTouchEnd = (e: TouchEvent) => {
+    const action = tracker.onTouchEnd(e);
+    if (action) options.onAction(action);
+  };
   const handleTouchCancel = () => tracker.onTouchCancel();
 
   const listenerOpts: AddEventListenerOptions = { passive: true, capture: true };
