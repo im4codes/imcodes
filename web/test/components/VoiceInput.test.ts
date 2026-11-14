@@ -1459,6 +1459,23 @@ describe('Web Mobile final drain', () => {
         (err) => errResults.push(err),
       )).resolves.toBe(false);
       expect(errResults).toEqual(['permission_denied']);
+      // 4. Primed capture ending cleanly with empty text before startListening adopts must NOT restart outside user gesture
+      expect(VoiceInput.primeWebGesture({ deferAudioPause: true })).toBe(true);
+      expect(instances).toHaveLength(4);
+      const emptyPrimedRec = instances[3];
+      emptyPrimedRec.onstart?.();
+      emptyPrimedRec.onend?.();
+      const emptyListening: boolean[] = [];
+      const emptyErrors: string[] = [];
+      await expect(VoiceInput.startListening(
+        vi.fn(),
+        (v) => emptyListening.push(v),
+        (err) => emptyErrors.push(err),
+      )).resolves.toBe(true);
+      expect(instances).toHaveLength(4);
+      expect(emptyListening).toEqual([true, false]);
+      expect(emptyErrors).toEqual([]);
+      expect(VoiceInput.isListening()).toBe(false);
     } finally {
       VoiceInput.onRecognitionError(null);
       await VoiceInput.stopListening({ abort: true });

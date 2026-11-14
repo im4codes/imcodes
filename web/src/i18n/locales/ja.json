@@ -1538,7 +1538,7 @@
     "delete_error": "アカウントの削除に失敗しました。もう一度お試しください。"
   },
   "voice": {
-    "listening": "音声認識中...",
+    "listening": "聞き取り中...",
     "paused": "一時停止",
     "starting": "マイクを起動中…",
     "ready": "マイクをタップして話す",
@@ -1574,7 +1574,9 @@
     "slide_left_cancel": "左スワイプ · キャンセル",
     "slide_right_edit": "編集 · 右スワイプ",
     "release_to_cancel": "離して録音をキャンセル",
-    "release_to_edit": "離してテキストを編集"
+    "release_to_edit": "離してテキストを編集",
+    "ended": "録音を終了しました",
+    "no_speech": "音声が検出されませんでした"
   },
   "p2p": {
     "final_original_request_reminder": "議論の要約だけで終わらせず、議論を統合した後は必ず元のユーザー依頼に直接対応してください。\n元のユーザー依頼: \"{{request}}\"",

@@ -1538,7 +1538,7 @@
     "delete_error": "刪除帳號失敗，請重試。"
   },
   "voice": {
-    "listening": "辨識中...",
+    "listening": "正在聆聽...",
     "paused": "已暫停",
     "starting": "正在啟動麥克風…",
     "ready": "點擊麥克風開始說話",
@@ -1574,7 +1574,9 @@
     "slide_left_cancel": "左滑 取消",
     "slide_right_edit": "右滑 編輯",
     "release_to_cancel": "放開取消錄音",
-    "release_to_edit": "放開進入編輯"
+    "release_to_edit": "放開進入編輯",
+    "ended": "錄音已結束",
+    "no_speech": "未偵測到語音"
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",

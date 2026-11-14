@@ -1590,7 +1590,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldZone, setVoiceHoldZone] = useState<'send' | 'cancel' | 'edit'>('send');
   const [voiceHoldDragX, setVoiceHoldDragX] = useState(0);
   const [voiceHoldText, setVoiceHoldText] = useState('');
+  const [voiceHoldPhase, setVoiceHoldPhase] = useState<'starting' | 'recording' | 'ended'>('starting');
   const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
+  const [voiceHoldLiveAudio, setVoiceHoldLiveAudio] = useState(false);
   const [voiceHoldError, setVoiceHoldError] = useState<string | null>(null);
   const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1622,7 +1624,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     baseText: string;
     transcript: string;
     zone: 'send' | 'cancel' | 'edit';
-    phase: 'starting' | 'recording' | 'draining' | 'failed' | 'settled';
+    phase: 'starting' | 'recording' | 'ended' | 'draining' | 'failed' | 'settled';
     error: string | null;
     pointerType: string;
     didStartRecording: boolean;
@@ -1631,6 +1633,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     startPromise: Promise<boolean> | null;
     drainPromise: Promise<void> | null;
   } | null>(null);
+  const voiceHoldLiveAudioRef = useRef(false);
   const voiceHoldBarsRef = useRef<number[]>(Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTranscriptRef = useRef<HTMLDivElement | null>(null);
   const inputDisabledRef = useRef(false);
@@ -5567,7 +5570,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [clearComposerVoiceWindowListeners]);
 
   const pulseVoiceHoldRecognizing = useCallback((durationMs = 1500) => {
-    if (!voiceHoldActiveRef.current) return;
+    const activePhase = voiceHoldTxRef.current?.phase;
+    if (!voiceHoldActiveRef.current || (activePhase !== 'starting' && activePhase !== 'recording')) return;
     setVoiceHoldRecognizing(true);
     if (voiceHoldRecognizingTimerRef.current !== null) {
       clearTimeout(voiceHoldRecognizingTimerRef.current);
@@ -5582,6 +5586,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldPointerRef.current = null;
     voiceHoldPendingRef.current = false;
     voiceHoldActiveRef.current = false;
+    voiceHoldLiveAudioRef.current = false;
     clearVoiceHoldTimers();
     clearComposerVoiceWindowListeners();
     clearComposerVoiceTouchLock(
@@ -5591,6 +5596,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     VoiceInput.onAudioLevel(null);
     if (mountedRef.current) {
       setVoiceHoldPending(false);
+      setVoiceHoldPhase('starting');
+      setVoiceHoldLiveAudio(false);
       setVoiceHoldRecognizing(false);
       setVoiceHoldActive(false);
       setVoiceHoldZone('send');
@@ -5839,7 +5846,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       orphanTx
       && !orphanTx.settled
       && orphanTx.drainPromise === null
-      && (orphanTx.phase === 'starting' || orphanTx.phase === 'recording')
+      && (orphanTx.phase === 'starting' || orphanTx.phase === 'recording' || orphanTx.phase === 'ended')
     ) {
       void finalizeVoiceHold(orphanTx, 'cancel');
       return;
@@ -5908,7 +5915,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       baseText: base,
       transcript: '',
       zone: 'send' as 'send' | 'cancel' | 'edit',
-      phase: 'starting' as 'starting' | 'recording' | 'draining' | 'failed' | 'settled',
+      phase: 'starting' as 'starting' | 'recording' | 'ended' | 'draining' | 'failed' | 'settled',
       error: null as string | null,
       pointerType: ptr.pointerType,
       didStartRecording: false,
@@ -5920,14 +5927,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldTxRef.current = tx;
     voiceHoldActiveRef.current = true;
     voiceHoldZoneRef.current = 'send';
+    voiceHoldLiveAudioRef.current = false;
     const emptyBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
     voiceHoldBarsRef.current = emptyBars;
     setVoiceHoldBars(emptyBars);
     setVoiceHoldText('');
     setVoiceHoldZone('send');
     setVoiceHoldDragX(0);
+    setVoiceHoldPhase('starting');
+    setVoiceHoldLiveAudio(false);
+    setVoiceHoldRecognizing(false);
     setVoiceHoldActive(true);
-    setVoiceHoldRecognizing(true);
     if (initialDx !== 0) {
       updateVoiceHoldZoneFromDx(tx, initialDx, false);
     }
@@ -5943,7 +5953,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
 
     VoiceInput.onAudioLevel((rawLevel) => {
-      if (!mountedRef.current || voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null || tx.phase === 'draining') return;
+      if (
+        !mountedRef.current
+        || voiceHoldTxRef.current !== tx
+        || tx.settled
+        || tx.error !== null
+        || (tx.phase !== 'starting' && tx.phase !== 'recording')
+      ) return;
+      if (!voiceHoldLiveAudioRef.current) {
+        voiceHoldLiveAudioRef.current = true;
+        setVoiceHoldLiveAudio(true);
+      }
       const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
       if (level > 0.015) pulseVoiceHoldRecognizing(1800);
       const prev = voiceHoldBarsRef.current;
@@ -5962,11 +5982,35 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         }
       },
       (listening) => {
-        if (!listening) return;
         if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
-        if (tx.phase !== 'starting' && tx.phase !== 'recording') return;
-        tx.didStartRecording = true;
-        tx.phase = 'recording';
+        if (listening) {
+          if (tx.phase !== 'starting' && tx.phase !== 'recording') return;
+          tx.didStartRecording = true;
+          tx.phase = 'recording';
+          if (mountedRef.current) {
+            setVoiceHoldPhase('recording');
+          }
+          return;
+        }
+        if (tx.phase === 'starting' && !tx.didStartRecording) {
+          failTransaction('permission_denied');
+          return;
+        }
+        if (tx.phase !== 'recording') return;
+        tx.phase = 'ended';
+        if (voiceHoldRecognizingTimerRef.current !== null) {
+          clearTimeout(voiceHoldRecognizingTimerRef.current);
+          voiceHoldRecognizingTimerRef.current = null;
+        }
+        voiceHoldLiveAudioRef.current = false;
+        const zeroBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
+        voiceHoldBarsRef.current = zeroBars;
+        if (mountedRef.current) {
+          setVoiceHoldPhase('ended');
+          setVoiceHoldRecognizing(false);
+          setVoiceHoldLiveAudio(false);
+          setVoiceHoldBars(zeroBars);
+        }
       },
       (err) => {
         failTransaction(err || 'permission_denied');
@@ -6157,7 +6201,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
       return;
     }
-    if (tx.phase !== 'starting' && tx.phase !== 'recording') {
+    if (tx.phase !== 'starting' && tx.phase !== 'recording' && tx.phase !== 'ended') {
       if (tx.phase === 'failed') {
         void finalizeVoiceHold(tx, 'failed');
       }
@@ -9103,10 +9147,29 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        {voiceHoldActive && typeof document !== 'undefined' && createPortal(
+        {voiceHoldActive && typeof document !== 'undefined' && (() => {
+          const voiceHoldRecording = voiceHoldPhase === 'recording';
+          const voiceHoldEnded = voiceHoldPhase === 'ended';
+          const voiceHoldActuallyRecognizing = voiceHoldRecording && voiceHoldRecognizing;
+          const voiceHoldTranscriptDisplay = voiceHoldText.trim()
+            ? voiceHoldText
+            : voiceHoldEnded
+              ? t('voice.no_speech')
+              : voiceHoldRecording
+                ? (voiceHoldActuallyRecognizing ? t('voice.buffering_hint') : t('voice.speak_now'))
+                : t('voice.starting');
+          const voiceHoldStatusLabel = voiceHoldEnded
+            ? (voiceHoldText.trim() ? t('voice.ended') : t('voice.no_speech'))
+            : voiceHoldPhase === 'starting'
+              ? t('voice.starting')
+              : voiceHoldActuallyRecognizing
+                ? t('voice.recognizing')
+                : t('voice.listening');
+          return createPortal(
           <div
             class={`voice-hold-hud voice-hold-hud-zone-${voiceHoldZone}`}
             data-zone={voiceHoldZone}
+            data-phase={voiceHoldPhase}
             style={{ '--voice-slide-x': `${voiceHoldDragX}px` } as JSX.CSSProperties}
             role="status"
             aria-live="polite"
@@ -9117,21 +9180,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             </div>
             <div class="voice-hold-hud-transcript-stage">
               <div ref={voiceHoldTranscriptRef} class="voice-hold-hud-transcript">
-                {voiceHoldText.trim() ? voiceHoldText : t('voice.buffering_hint')}
-                <VoiceStreamingRobot active={voiceHoldRecognizing} />
+                {voiceHoldTranscriptDisplay}
+                <VoiceStreamingRobot active={voiceHoldActuallyRecognizing} />
               </div>
             </div>
             <div class="voice-hold-hud-card">
               <div class="voice-hold-hud-header">
-                <span class={`voice-hold-hud-recognizing${voiceHoldRecognizing ? ' is-recognizing' : ''}`}>
+                <span class={`voice-hold-hud-recognizing${voiceHoldActuallyRecognizing ? ' is-recognizing' : ''}${voiceHoldEnded ? ' is-ended' : ''}`}>
                   <span
-                    class={`voice-status-dot voice-status-dot-active${voiceHoldRecognizing ? ' voice-status-dot-recognizing' : ''}`}
+                    class={`voice-status-dot${voiceHoldRecording ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
                     aria-hidden="true"
                   />
-                  <span class="voice-recognizing-dots" aria-hidden="true">
-                    <i /><i /><i />
-                  </span>
-                  <span>{voiceHoldRecognizing ? t('voice.recognizing') : t('voice.listening')}</span>
+                  {voiceHoldRecording && (
+                    <span class="voice-recognizing-dots" aria-hidden="true">
+                      <i /><i /><i />
+                    </span>
+                  )}
+                  <span>{voiceHoldStatusLabel}</span>
                 </span>
               </div>
               <div class={`voice-hold-hud-active-hint is-${voiceHoldZone}`}>
@@ -9141,7 +9206,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     ? t('voice.release_to_edit')
                     : t('voice.release_to_send')}
               </div>
-              <div class="voice-hold-hud-waveform" aria-hidden="true">
+              <div class={`voice-hold-hud-waveform${voiceHoldRecording && !voiceHoldLiveAudio ? ' is-ambient-wave' : ''}${voiceHoldEnded ? ' is-ended' : ''}`} aria-hidden="true">
                 {voiceHoldBars.map((level, idx) => {
                   const centerNorm = 1 - Math.abs((idx / Math.max(1, voiceHoldBars.length - 1)) * 2 - 1);
                   const envelope = 0.38 + 0.62 * Math.sin((centerNorm * Math.PI) / 2);
@@ -9230,7 +9295,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             </div>
           </div>,
           document.body,
-        )}
+        );
+        })()}
         <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}`}>
           {!isMobileLayout && !compact && (
             <>

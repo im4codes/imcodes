@@ -3221,6 +3221,10 @@ html.native-ios-mac .chat-dl-btn {
   background: #38bdf8;
   box-shadow: 0 0 16px #38bdf8, 0 0 32px rgba(56,189,248,0.55);
 }
+.voice-status-dot-ended {
+  background: #f59e0b;
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.4);
+}
 @keyframes voice-dot-pulse { 0%,100% { box-shadow: 0 0 12px #22d3ee, 0 0 24px rgba(34,211,238,0.3); } 50% { box-shadow: 0 0 20px #22d3ee, 0 0 40px rgba(34,211,238,0.5); } }
 .voice-recognizing-dots {
   display: inline-flex; align-items: center; gap: 3px;
@@ -3573,6 +3577,9 @@ html.native-ios-mac .chat-dl-btn {
 .voice-hold-hud-recognizing.is-recognizing {
   color: rgba(224, 242, 254, 0.96);
 }
+.voice-hold-hud-recognizing.is-ended {
+  color: rgba(253, 230, 138, 0.92);
+}
 .voice-hold-hud-waveform {
   position: relative;
   z-index: 1;
@@ -3592,6 +3599,22 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(255, 255, 255, 0.94);
   box-shadow: 0 0 10px rgba(103, 232, 249, 0.45);
   transition: height 0.08s ease, opacity 0.08s ease;
+}
+.voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar {
+  transform-origin: center center;
+  animation: voice-hold-ambient-wave 1.15s ease-in-out infinite;
+}
+.voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar:nth-child(4n + 1) { animation-delay: 0s; }
+.voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar:nth-child(4n + 2) { animation-delay: 0.16s; }
+.voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar:nth-child(4n + 3) { animation-delay: 0.32s; }
+.voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar:nth-child(4n + 4) { animation-delay: 0.48s; }
+@keyframes voice-hold-ambient-wave {
+  0%, 100% { transform: scaleY(1); opacity: 0.48; }
+  50% { transform: scaleY(2.2); opacity: 0.9; }
+}
+.voice-hold-hud-waveform.is-ended .voice-hold-hud-bar {
+  opacity: 0.32;
+  box-shadow: none;
 }
 .voice-hold-hud-zone-cancel .voice-hold-hud-bar {
   box-shadow: 0 0 10px rgba(251, 113, 133, 0.5);
@@ -3892,6 +3915,7 @@ html.native-ios-mac .chat-dl-btn {
   .voice-editor-marquee::after,
   .voice-hold-hud-aurora,
   .voice-hold-hud-aurora-core,
+  .voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar,
   .controls-composer-voice-ready::after,
   .controls-composer-voice-pending::after,
   .controls-composer-voice-holding::after,

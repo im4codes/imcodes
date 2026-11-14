@@ -1017,11 +1017,13 @@ export async function startListening(
         (onError ?? _onError)?.(outcome.error);
         return false;
       }
-      if (outcome.endedWithCapture && outcome.text) {
+      if (outcome.endedWithCapture) {
         const owner = createCaptureOwner(onResult, onListeningChange, onError);
         claimActiveOwner(owner);
         setOwnerListening(owner, true);
-        emitOwnerResult(owner, outcome.text, true);
+        if (outcome.text) {
+          emitOwnerResult(owner, outcome.text, true);
+        }
         setOwnerListening(owner, false);
         retireOwner(owner);
         return true;

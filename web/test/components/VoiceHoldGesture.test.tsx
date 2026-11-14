@@ -348,12 +348,13 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(hud.textContent).toContain('voice.slide_left_cancel');
     expect(hud.textContent).toContain('voice.release_to_send');
     expect(hud.textContent).toContain('voice.slide_right_edit');
-    expect(hud.textContent).toContain('voice.recognizing');
-    expect(hud.textContent).toContain('voice.buffering_hint');
+    expect(hud.textContent).toContain('voice.listening');
+    expect(hud.textContent).toContain('voice.speak_now');
 
     voiceMock.levelHandler?.(0.4);
     voiceMock.partialHandler?.('你好 IM.codes');
     await vi.advanceTimersByTimeAsync(0);
+    expect(hud.textContent).toContain('voice.recognizing');
     const transcriptEl = document.querySelector('.voice-hold-hud-transcript') as HTMLElement;
     expect(transcriptEl.textContent).toBe('你好 IM.codes');
     expect(transcriptEl.querySelector('.voice-streaming-robot-cursor')).not.toBeNull();
@@ -3052,5 +3053,98 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       if (origInnerHeight) Object.defineProperty(window, 'innerHeight', origInnerHeight);
       else Reflect.deleteProperty(window, 'innerHeight');
     }
+  });
+
+  it('tracks honest starting -> listening -> recognizing -> ended transitions and never freezes HUD on zero-level recognition when backend stops', async () => {
+    voiceMock.startListening.mockImplementation(async (
+      onResult: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+      onError?: (error: string) => void,
+    ) => {
+      voiceMock.partialHandler = onResult;
+      voiceMock.listeningHandler = onListeningChange ?? null;
+      voiceMock.errorHandler = onError ?? null;
+      return true;
+    });
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    const resetToUnfocused = async () => {
+      input.blur();
+      fireEvent.blur(input);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('false');
+    };
+
+    // 1. Before listening(true) arrives: starting phase shows voice.starting, NEVER fake recognizing / 0-dot active robot
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(hud).not.toBeNull();
+    expect(hud.getAttribute('data-phase')).toBe('starting');
+    expect(hud.textContent).toContain('voice.starting');
+    expect(hud.textContent).not.toContain('voice.recognizing');
+    expect(hud.textContent).not.toContain('voice.buffering_hint');
+    expect(hud.querySelector('.voice-streaming-robot-cursor.is-active')).toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).toBeNull();
+
+    // 2. listening(true) without audio level (e.g. mobile Web skipping getUserMedia): recording + ambient wave, voice.listening + speak_now
+    voiceMock.listeningHandler?.(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-phase')).toBe('recording');
+    expect(hud.textContent).toContain('voice.listening');
+    expect(hud.textContent).toContain('voice.speak_now');
+    expect(hud.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).not.toBeNull();
+
+    // Real audioLevel disables CSS ambient wave and activates recognizing + live bars
+    voiceMock.levelHandler?.(0.5);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).toBeNull();
+    expect(hud.textContent).toContain('voice.recognizing');
+    expect(hud.querySelector('.voice-streaming-robot-cursor.is-active')).not.toBeNull();
+
+    // 3. Backend emits listening(false) cleanly while finger still held -> HUD stops lying, switches to ended / no_speech, flattens bars
+    voiceMock.listeningHandler?.(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-phase')).toBe('ended');
+    expect(hud.textContent).toContain('voice.no_speech');
+    expect(hud.textContent).not.toContain('voice.recognizing');
+    expect(hud.textContent).not.toContain('voice.buffering_hint');
+    expect(hud.querySelector('.voice-streaming-robot-cursor.is-active')).toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-waveform.is-ended')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).toBeNull();
+    Array.from(hud.querySelectorAll('.voice-hold-hud-bar')).forEach((bar) => {
+      expect((bar as HTMLElement).style.height).toBe('5px');
+    });
+
+    // Slide to cancel after ended still updates zone and closes cleanly without sending
+    dispatchPointer(input, 'pointermove', 90, 500, 1);
+    expect(hud.getAttribute('data-zone')).toBe('cancel');
+    dispatchPointer(input, 'pointerup', 90, 500, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // 4. Premature listening(false) while still in starting (!didStartRecording) fails cleanly with banner & restores typing focus
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(document.querySelector('.voice-hold-error-banner')).not.toBeNull();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    await resetToUnfocused();
   });
 });

@@ -1538,7 +1538,7 @@
     "delete_error": "계정 삭제에 실패했습니다. 다시 시도해 주세요."
   },
   "voice": {
-    "listening": "인식 중...",
+    "listening": "듣는 중...",
     "paused": "일시정지",
     "starting": "마이크 시작 중…",
     "ready": "마이크를 눌러 말하세요",
@@ -1574,7 +1574,9 @@
     "slide_left_cancel": "왼쪽 · 취소",
     "slide_right_edit": "편집 · 오른쪽",
     "release_to_cancel": "놓아서 녹음 취소",
-    "release_to_edit": "놓아서 텍스트 편집"
+    "release_to_edit": "놓아서 텍스트 편집",
+    "ended": "녹음이 종료됨",
+    "no_speech": "음성이 감지되지 않음"
   },
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",

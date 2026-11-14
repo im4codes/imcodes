@@ -1574,7 +1574,9 @@
     "slide_left_cancel": "Slide left · Cancel",
     "slide_right_edit": "Edit · Slide right",
     "release_to_cancel": "Release to cancel recording",
-    "release_to_edit": "Release to edit text"
+    "release_to_edit": "Release to edit text",
+    "ended": "Recording stopped",
+    "no_speech": "No speech detected"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",

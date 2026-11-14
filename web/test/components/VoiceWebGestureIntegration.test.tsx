@@ -384,4 +384,76 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
     expect(textarea.readOnly).toBe(false);
     expect(document.querySelector('.voice-overlay-mic-active')).toBeNull();
   });
+
+  it('transitions hold HUD cleanly to voice.no_speech (never stuck on recognizing) on empty primed end and mid-hold onend', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+
+    // 1. Primed recognition starts & ends cleanly with no speech BEFORE 175ms timer: must not restart outside gesture or freeze in recognizing
+    inUserGesture = true;
+    fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      clientX: 160, clientY: 500, pointerId: 30, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+    }));
+    inUserGesture = false;
+    expect(instances).toHaveLength(1);
+    instances[0].onstart?.();
+    instances[0].onend?.();
+
+    await vi.advanceTimersByTimeAsync(175);
+    expect(instances).toHaveLength(1);
+    const hud1 = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(hud1).not.toBeNull();
+    expect(hud1.getAttribute('data-phase')).toBe('ended');
+    expect(hud1.textContent).toContain('voice.no_speech');
+    expect(hud1.textContent).not.toContain('voice.recognizing');
+    expect(hud1.textContent).not.toContain('voice.buffering_hint');
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+      clientX: 160, clientY: 500, pointerId: 30, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // 2. Active hold gets onstart -> shows ambient wave + voice.listening -> iOS WebKit silent onend -> switches to ended cleanly
+    inUserGesture = true;
+    fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      clientX: 160, clientY: 500, pointerId: 31, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+    }));
+    inUserGesture = false;
+    await vi.advanceTimersByTimeAsync(175);
+    expect(instances).toHaveLength(2);
+    const rec2 = instances[1];
+    const hud2 = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(hud2.getAttribute('data-phase')).toBe('starting');
+    rec2.onstart?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud2.getAttribute('data-phase')).toBe('recording');
+    expect(hud2.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).not.toBeNull();
+
+    rec2.onerror?.({ error: 'no-speech' });
+    rec2.onend?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud2.getAttribute('data-phase')).toBe('ended');
+    expect(hud2.textContent).toContain('voice.no_speech');
+    expect(hud2.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).toBeNull();
+    expect(hud2.querySelector('.voice-hold-hud-waveform.is-ended')).not.toBeNull();
+
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+      clientX: 160, clientY: 500, pointerId: 31, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
 });
