@@ -42,7 +42,7 @@ export interface OfficePreviewProps {
   initialMode?: 'view' | 'edit';
   /** Optional callback to open the document share dialog. */
   onOpenShare?: () => void;
-  /** Fired once when ONLYOFFICE DocsAPI.DocEditor actually initializes cleanly. */
+  /** Fired once when an active ONLYOFFICE document finishes loading (`events.onDocumentReady`). */
   onOnlyOfficeOpened?: (info: { mode: 'view' | 'edit'; fileType?: string }) => void;
 }
 
@@ -388,6 +388,7 @@ function OnlyOfficeEmbeddedEditor({
   const { t } = useTranslation();
   const holderIdRef = useRef(`onlyoffice-editor-${Math.random().toString(36).slice(2, 10)}`);
   const editorInstanceRef = useRef<{ destroyEditor?: () => void } | null>(null);
+  const editorGenerationRef = useRef(0);
   const onOnlyOfficeOpenedRef = useRef(onOnlyOfficeOpened);
   onOnlyOfficeOpenedRef.current = onOnlyOfficeOpened;
   const modeRef = useRef(mode);
@@ -396,32 +397,83 @@ function OnlyOfficeEmbeddedEditor({
   const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
+    const generation = ++editorGenerationRef.current;
     let cancelled = false;
+    let disposed = false;
+    let readyFired = false;
+    let failedBeforeReady = false;
     setScriptError(null);
     if (!ooConfig.config || !ooConfig.scriptUrl) return;
 
     (async () => {
       try {
         await loadOnlyOfficeScript(ooConfig.scriptUrl!);
-        if (cancelled) return;
+        if (cancelled || disposed || editorGenerationRef.current !== generation) return;
         if (!window.DocsAPI?.DocEditor) {
           throw new Error('DocsAPI.DocEditor is unavailable');
         }
         if (editorInstanceRef.current?.destroyEditor) {
           try { editorInstanceRef.current.destroyEditor(); } catch { /* ignore */ }
+          editorInstanceRef.current = null;
         }
-        editorInstanceRef.current = new window.DocsAPI.DocEditor(
-          holderIdRef.current,
-          ooConfig.config as unknown as Record<string, unknown>,
+        const rawConfig = ooConfig.config as unknown as Record<string, unknown>;
+        const existingEvents = (
+          rawConfig.events && typeof rawConfig.events === 'object'
+            ? rawConfig.events
+            : {}
+        ) as Record<string, unknown>;
+        const prevOnDocumentReady = typeof existingEvents.onDocumentReady === 'function'
+          ? (existingEvents.onDocumentReady as (...args: unknown[]) => unknown)
+          : undefined;
+        const prevOnError = typeof existingEvents.onError === 'function'
+          ? (existingEvents.onError as (...args: unknown[]) => unknown)
+          : undefined;
+
+        let createdInstance: { destroyEditor?: () => void } | null = null;
+        const isStaleInstance = () => (
+          cancelled
+          || disposed
+          || editorGenerationRef.current !== generation
+          || (createdInstance !== null && editorInstanceRef.current !== createdInstance)
         );
-        if (!cancelled) {
-          onOnlyOfficeOpenedRef.current?.({
-            mode: modeRef.current,
-            fileType: ooConfig.config?.document?.fileType,
-          });
+        const editorConfig: Record<string, unknown> = {
+          ...rawConfig,
+          events: {
+            ...existingEvents,
+            onDocumentReady: (...args: unknown[]) => {
+              const existingResult = prevOnDocumentReady?.(...args);
+              if (isStaleInstance() || readyFired || failedBeforeReady) {
+                return existingResult;
+              }
+              readyFired = true;
+              onOnlyOfficeOpenedRef.current?.({
+                mode: modeRef.current,
+                fileType: ooConfig.config?.document?.fileType,
+              });
+              return existingResult;
+            },
+            onError: (...args: unknown[]) => {
+              if (!readyFired) {
+                failedBeforeReady = true;
+              }
+              return prevOnError?.(...args);
+            },
+          },
+        };
+        const instance = new window.DocsAPI.DocEditor(
+          holderIdRef.current,
+          editorConfig,
+        );
+        createdInstance = instance;
+        if (cancelled || disposed || editorGenerationRef.current !== generation) {
+          if (instance?.destroyEditor) {
+            try { instance.destroyEditor(); } catch { /* ignore */ }
+          }
+          return;
         }
+        editorInstanceRef.current = instance;
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelled && !disposed && editorGenerationRef.current === generation) {
           const msg = err instanceof Error ? err.message : String(err);
           if (onAutoFallbackLocal) {
             onAutoFallbackLocal(msg);
@@ -434,6 +486,7 @@ function OnlyOfficeEmbeddedEditor({
 
     return () => {
       cancelled = true;
+      disposed = true;
       if (editorInstanceRef.current?.destroyEditor) {
         try { editorInstanceRef.current.destroyEditor(); } catch { /* ignore */ }
         editorInstanceRef.current = null;

@@ -1763,6 +1763,8 @@ describe('CloudDocsPanel', () => {
     };
     expect(typeof lastMdProps?.onOnlyOfficeOpened).toBe('function');
     lastMdProps.onOnlyOfficeOpened!({ mode: 'edit' });
+    // Duplicate ready callback for the same .md preview must not emit extra API calls
+    lastMdProps.onOnlyOfficeOpened!({ mode: 'edit' });
 
     expect(recordRecentDocumentApiMock).toHaveBeenCalledTimes(1);
     expect(recordRecentDocumentApiMock).toHaveBeenCalledWith({
@@ -1773,5 +1775,12 @@ describe('CloudDocsPanel', () => {
       openMode: 'edit',
       openedWithOnlyOffice: true,
     });
+
+    // Closing preview & reopening an unready .md never records until its onOnlyOfficeOpened fires
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    await waitFor(() => expect(screen.queryByTestId('mock-office-preview')).toBeNull());
+    fireEvent.click(screen.getByText('Notes.md'));
+    await waitFor(() => expect(screen.getByTestId('mock-office-preview')).toBeTruthy());
+    expect(recordRecentDocumentApiMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -1110,13 +1110,20 @@ describe('OfficePreview fallback document transitions', () => {
     }
   });
 
-  it('fires onOnlyOfficeOpened only when DocsAPI.DocEditor initializes cleanly, never on disabled or fallback failures', async () => {
+  it('fires onOnlyOfficeOpened only on active instance events.onDocumentReady, never on constructor return, fallback, or stale/errored callbacks', async () => {
     const apiMod = await import('../../src/api.js');
     const cfgSpy = vi.spyOn(apiMod, 'fetchOnlyOfficeConfig');
     const origDocsApi = window.DocsAPI;
     const { resetOnlyOfficePrewarm } = await import('../../src/onlyoffice-preload.js');
     resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
     let activeScriptSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+    type EditorCfg = {
+      events?: {
+        onDocumentReady?: (...args: unknown[]) => void;
+        onError?: (...args: unknown[]) => void;
+      };
+    };
 
     try {
       // 1. ONLYOFFICE disabled on server -> onOnlyOfficeOpened must NOT fire
@@ -1184,9 +1191,11 @@ describe('OfficePreview fallback document transitions', () => {
       activeScriptSpy.mockRestore();
       activeScriptSpy = null;
 
-      // 3. ONLYOFFICE enabled and DocsAPI.DocEditor succeeds -> onOnlyOfficeOpened fires once
+      // 3. Constructor returns WITHOUT emitting onDocumentReady -> onError before ready -> Use Local Preview fallback -> late onDocumentReady stays 0; then Retry -> real onDocumentReady fires once
       resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
-      cfgSpy.mockResolvedValueOnce({
+      const existingErrorSpy = vi.fn();
+      const existingReadySpy = vi.fn();
+      const makeOkCfg = (key: string) => ({
         enabled: true,
         role: 'editor',
         allowDownload: true,
@@ -1197,25 +1206,94 @@ describe('OfficePreview fallback document transitions', () => {
         fileUrl: 'https://files.test/README.md',
         config: {
           documentType: 'word',
-          document: { title: 'README.md', url: 'https://files.test/README.md', fileType: 'txt', key: 'k-ok' },
+          document: { title: 'README.md', url: 'https://files.test/README.md', fileType: 'txt', key },
           editorConfig: { mode: 'edit' },
+          events: {
+            onError: existingErrorSpy,
+            onDocumentReady: existingReadySpy,
+          },
         },
       } as unknown as Awaited<ReturnType<typeof apiMod.fetchOnlyOfficeConfig>>);
-      const okEditor = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
-      activeScriptSpy = installOnlyOfficeScriptLoadMock(okEditor);
 
-      const onOpenedOk = vi.fn();
+      cfgSpy.mockResolvedValueOnce(makeOkCfg('k-fail-async'));
+      cfgSpy.mockResolvedValueOnce(makeOkCfg('k-retry-ok'));
+
+      const capturedConfigs: EditorCfg[] = [];
+      const destroySpy = vi.fn();
+      const controlledEditor = vi.fn().mockImplementation((_id: string, cfg: EditorCfg) => {
+        capturedConfigs.push(cfg);
+        return { destroyEditor: destroySpy };
+      });
+      activeScriptSpy = installOnlyOfficeScriptLoadMock(controlledEditor);
+
+      const onOpenedControlled = vi.fn();
       const v3 = render(
         <OfficePreview
           serverId="srv-1"
           path="/repo/README.md"
           mimeType="text/markdown"
-          onOnlyOfficeOpened={onOpenedOk}
+          onOnlyOfficeOpened={onOpenedControlled}
         />,
       );
-      await waitFor(() => expect(onOpenedOk).toHaveBeenCalledTimes(1));
-      expect(onOpenedOk).toHaveBeenCalledWith({ mode: 'edit', fileType: 'txt' });
+      await waitFor(() => expect(controlledEditor).toHaveBeenCalledTimes(1));
+      // Constructor returned cleanly, yet onDocumentReady has NOT fired -> MUST NOT call onOnlyOfficeOpened
+      expect(onOpenedControlled).not.toHaveBeenCalled();
+
+      // Async download/convert error before ready + preserve existing events.onError
+      const firstEvents = capturedConfigs[0]?.events;
+      firstEvents?.onError?.({ data: { errorCode: -2 } });
+      expect(existingErrorSpy).toHaveBeenCalledTimes(1);
+      // Even if a stale onDocumentReady arrives on the errored instance, it must be ignored
+      firstEvents?.onDocumentReady?.();
+      expect(onOpenedControlled).not.toHaveBeenCalled();
+
+      // Switch to Local Preview via toolbar -> unmounts embedded editor
+      fireEvent.click(v3.getByTestId('onlyoffice-fallback-btn'));
+      await waitFor(() => expect(v3.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(destroySpy).toHaveBeenCalled();
+      // Late onDocumentReady after fallback must stay 0
+      firstEvents?.onDocumentReady?.();
+      expect(onOpenedControlled).not.toHaveBeenCalled();
+
+      // Retry ONLYOFFICE -> fresh instance mounts -> emits onDocumentReady twice -> fires onOnlyOfficeOpened ONCE
+      fireEvent.click(v3.getByTestId('office-preview-retry-onlyoffice'));
+      await waitFor(() => expect(controlledEditor).toHaveBeenCalledTimes(2));
+      expect(onOpenedControlled).not.toHaveBeenCalled();
+      const retryEvents = capturedConfigs[1]?.events;
+      retryEvents?.onDocumentReady?.();
+      retryEvents?.onDocumentReady?.();
+      expect(existingReadySpy).toHaveBeenCalled();
+      expect(onOpenedControlled).toHaveBeenCalledTimes(1);
+      expect(onOpenedControlled).toHaveBeenCalledWith({ mode: 'edit', fileType: 'txt' });
+
+      // 4. Document switch (rerender to OTHER.md) before late old ready, and unmount guard
+      cfgSpy.mockResolvedValueOnce({
+        ...makeOkCfg('k-other'),
+        fileUrl: 'https://files.test/OTHER.md',
+        config: {
+          documentType: 'word',
+          document: { title: 'OTHER.md', url: 'https://files.test/OTHER.md', fileType: 'txt', key: 'k-other' },
+          editorConfig: { mode: 'edit' },
+        },
+      } as unknown as Awaited<ReturnType<typeof apiMod.fetchOnlyOfficeConfig>>);
+      v3.rerender(
+        <OfficePreview
+          serverId="srv-1"
+          path="/repo/OTHER.md"
+          mimeType="text/markdown"
+          onOnlyOfficeOpened={onOpenedControlled}
+        />,
+      );
+      await waitFor(() => expect(controlledEditor).toHaveBeenCalledTimes(3));
+      // Late ready from instance #2 (README.md) must NOT fire for OTHER.md
+      retryEvents?.onDocumentReady?.();
+      expect(onOpenedControlled).toHaveBeenCalledTimes(1);
+
+      const thirdEvents = capturedConfigs[2]?.events;
       v3.unmount();
+      // Late ready after unmount must NOT fire
+      thirdEvents?.onDocumentReady?.();
+      expect(onOpenedControlled).toHaveBeenCalledTimes(1);
     } finally {
       activeScriptSpy?.mockRestore();
       resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });

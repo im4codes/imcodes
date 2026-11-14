@@ -13,6 +13,7 @@ import {
   createCloudDocFolder,
   deleteCloudDocFolderTree,
   insertCloudDoc,
+  listRecentDocumentsRaw,
   listSharedCloudItemsForUser,
   resolveCloudDocAccess,
   revokeCloudDocShare,
@@ -218,5 +219,28 @@ describe('cloud-docs & migration 105 PostgreSQL integration', () => {
       ['cd-owner'],
     );
     expect(remaining.map((r) => r.id)).toEqual(['rdoc_oo_md', 'rdoc_valid_docx']);
+
+    // Post-migration stale writer boundary (F2): old server pod inserts unverified .md omitting opened_with_onlyoffice
+    // (DEFAULT FALSE) after migration 108 already ran -> listRecentDocumentsRaw excludes them BEFORE LIMIT
+    // while keeping verified .md (TRUE), Office/PDF docs (FALSE), and per-user / same-source_key isolation.
+    const newerTs = now + 50_000;
+    await db.execute(
+      `INSERT INTO recent_documents (
+         id, user_id, source_kind, source_key, server_id, server_name, session_name,
+         file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
+       ) VALUES
+       ('rdoc_old_pod_1', 'cd-owner', 'server_file', 'srv:srv-1:/repo/after-1.md', 'srv-1', 'Node', NULL, '/repo/after-1.md', NULL, 'after-1.md', 'text/markdown', 'view', 1, $1, $1),
+       ('rdoc_old_pod_2', 'cd-owner', 'server_file', 'srv:srv-1:/repo/AFTER-2.MD', 'srv-1', 'Node', NULL, '/repo/AFTER-2.MD', NULL, 'AFTER-2.MD', 'text/markdown; charset=utf-8', 'view', 1, $2, $2),
+       ('rdoc_old_pod_3', 'cd-owner', 'cloud_doc', 'cdoc:legacy-md-note', NULL, NULL, NULL, NULL, NULL, 'note.md', 'text/plain', 'view', 1, $3, $3),
+       ('rdoc_member_unverified', 'cd-member', 'server_file', 'srv:srv-1:/repo/OO.md', 'srv-1', 'Node', NULL, '/repo/OO.md', NULL, 'OO.md', 'text/markdown', 'view', 1, $3, $3),
+       ('rdoc_member_pdf', 'cd-member', 'server_file', 'srv:srv-1:/repo/Guide.pdf', 'srv-1', 'Node', NULL, '/repo/Guide.pdf', NULL, 'Guide.pdf', 'application/pdf', 'view', 1, $1, $1)`,
+      [newerTs, newerTs + 1, newerTs + 2],
+    );
+
+    const ownerVisible = await listRecentDocumentsRaw(db, 'cd-owner', 2);
+    expect(ownerVisible.map((r) => r.id).sort()).toEqual(['rdoc_oo_md', 'rdoc_valid_docx']);
+
+    const memberVisible = await listRecentDocumentsRaw(db, 'cd-member', 10);
+    expect(memberVisible.map((r) => r.id)).toEqual(['rdoc_member_pdf']);
   });
 });

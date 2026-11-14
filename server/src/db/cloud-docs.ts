@@ -659,11 +659,24 @@ export async function listRecentDocumentsRaw(
   limit = CLOUD_DOCS_RECENT_DEFAULT_LIMIT,
 ): Promise<RecentDocumentRow[]> {
   const clamped = Math.max(1, Math.min(CLOUD_DOCS_RECENT_MAX_LIMIT, Math.floor(limit || CLOUD_DOCS_RECENT_DEFAULT_LIMIT)));
+  // Read-side eligibility guard (before ORDER BY / LIMIT): if an older server pod
+  // writes an unverified Markdown entry (opened_with_onlyoffice = FALSE) after
+  // migration 108 ran, exclude it here so it never resurfaces or consumes slots.
   return db.query<RecentDocumentRow>(
     `SELECT id, user_id, source_kind, source_key, server_id, server_name, session_name,
             file_path, cloud_doc_id, title, mime_type, open_mode, open_count, opened_with_onlyoffice, last_opened_at, created_at
      FROM recent_documents
      WHERE user_id = $1
+       AND (
+         opened_with_onlyoffice = TRUE
+         OR NOT (
+           LOWER(TRIM(COALESCE(file_path, ''))) LIKE '%.md'
+           OR LOWER(TRIM(COALESCE(title, ''))) LIKE '%.md'
+           OR LOWER(TRIM(COALESCE(mime_type, ''))) = 'text/markdown'
+           OR LOWER(TRIM(COALESCE(mime_type, ''))) LIKE 'text/markdown;%'
+           OR LOWER(TRIM(COALESCE(mime_type, ''))) LIKE 'text/markdown %'
+         )
+       )
      ORDER BY last_opened_at DESC, created_at DESC
      LIMIT $2`,
     [userId, clamped],

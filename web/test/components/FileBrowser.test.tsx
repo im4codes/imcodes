@@ -3792,10 +3792,14 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       expect(recentCalls()).toHaveLength(0);
       vThrow.unmount();
 
-      // Case 3: ONLYOFFICE enabled and DocsAPI.DocEditor initializes cleanly -> records ONCE with openedWithOnlyOffice: true
+      // Case 3: ONLYOFFICE DocEditor constructs without ready -> onError + Use Local Preview -> ZERO recent calls; then Retry + real onDocumentReady -> records ONCE with openedWithOnlyOffice: true
       resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
       configScenario = 'ok';
-      nextDocEditor = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+      const capturedCfgs: Array<{ events?: { onDocumentReady?: () => void; onError?: (err?: unknown) => void } }> = [];
+      nextDocEditor = vi.fn().mockImplementation((_id: string, cfg: { events?: { onDocumentReady?: () => void; onError?: (err?: unknown) => void } }) => {
+        capturedCfgs.push(cfg);
+        return { destroyEditor: vi.fn() };
+      });
       const vOk = render(
         <FileBrowser
           ws={ws}
@@ -3818,6 +3822,23 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
         } as unknown as ServerMessage);
       });
       fireEvent.click(vOk.getByTestId('fb-open-csv-office-btn'));
+      await waitFor(() => expect(capturedCfgs).toHaveLength(1));
+      // Constructor alone MUST NOT record
+      expect(recentCalls()).toHaveLength(0);
+      // Async error before ready + fallback to local preview MUST NOT record
+      capturedCfgs[0]?.events?.onError?.({ data: { errorCode: -4 } });
+      capturedCfgs[0]?.events?.onDocumentReady?.();
+      expect(recentCalls()).toHaveLength(0);
+      fireEvent.click(vOk.getByTestId('onlyoffice-fallback-btn'));
+      await waitFor(() => expect(vOk.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(recentCalls()).toHaveLength(0);
+
+      // Retry ONLYOFFICE and emit genuine onDocumentReady (twice -> deduplicated to 1 record call)
+      fireEvent.click(vOk.getByTestId('office-preview-retry-onlyoffice'));
+      await waitFor(() => expect(capturedCfgs).toHaveLength(2));
+      expect(recentCalls()).toHaveLength(0);
+      capturedCfgs[1]?.events?.onDocumentReady?.();
+      capturedCfgs[1]?.events?.onDocumentReady?.();
       await waitFor(() => expect(recentCalls()).toHaveLength(1));
       const mdPayload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
       expect(mdPayload).toMatchObject({

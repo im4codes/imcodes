@@ -18,11 +18,12 @@ import {
   LocalCloudDocStorage,
   type CloudDocStorage,
 } from '../src/storage/cloud-doc-storage.js';
-import type {
-  CloudDocFolderRow,
-  CloudDocRow,
-  CloudDocShareRow,
-  RecentDocumentRow,
+import {
+  listRecentDocumentsRaw,
+  type CloudDocFolderRow,
+  type CloudDocRow,
+  type CloudDocShareRow,
+  type RecentDocumentRow,
 } from '../src/db/cloud-docs.js';
 import { CLOUD_DOCS_MAX_UPLOAD_BYTES } from '../../shared/cloud-docs.js';
 
@@ -120,8 +121,25 @@ function createInMemoryCloudDocsDb() {
 
       if (s.includes('FROM recent_documents WHERE user_id = $1')) {
         const [userId, limit] = params as [string, number];
+        const enforcesOnlyOfficeMdGuard =
+          s.includes('opened_with_onlyoffice = TRUE')
+          && s.includes("LIKE '%.md'")
+          && s.includes("'text/markdown'");
         return [...recents.values()]
-          .filter((r) => r.user_id === userId)
+          .filter((r) => {
+            if (r.user_id !== userId) return false;
+            if (!enforcesOnlyOfficeMdGuard) return true;
+            if (r.opened_with_onlyoffice === true) return true;
+            const fp = String(r.file_path ?? '').trim().toLowerCase();
+            const title = String(r.title ?? '').trim().toLowerCase();
+            const mime = String(r.mime_type ?? '').trim().toLowerCase();
+            const isMd = fp.endsWith('.md')
+              || title.endsWith('.md')
+              || mime === 'text/markdown'
+              || mime.startsWith('text/markdown;')
+              || mime.startsWith('text/markdown ');
+            return !isMd;
+          })
           .sort((a, b) => Number(b.last_opened_at) - Number(a.last_opened_at))
           .slice(0, limit ?? 50) as unknown as T[];
       }
@@ -1159,6 +1177,93 @@ describe('cloud docs & recent documents', () => {
     const items = ((await populatedRecent.json()) as { items: Array<{ sourceKind: string; title: string }> }).items;
     expect(items).toHaveLength(2);
     expect(items.map((i) => i.title).sort()).toEqual(['Notes.md', 'README.md']);
+
+    // 5. Post-migration legacy writer boundary (F2): stale pod inserts unverified .md omitting opened_with_onlyoffice
+    //    -> read-side listRecentDocumentsRaw / GET /api/recent-documents excludes unverified .md BEFORE LIMIT
+    //    so valid verified .md & Office/PDF rows are neither polluted nor crowded out, and users remain isolated.
+    const t = Date.now() + 10_000;
+    for (let i = 0; i < 5; i += 1) {
+      await memDb.db.execute(
+        `INSERT INTO recent_documents (
+           id, user_id, source_kind, source_key, server_id, server_name, session_name,
+           file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, $13, $14)`,
+        [
+          `rdoc_legacy_after_${i}`,
+          'owner-1',
+          'server_file',
+          `srv:srv-1:/repo/legacy-${i}.md`,
+          'srv-1',
+          null,
+          null,
+          `/repo/legacy-${i}.md`,
+          null,
+          `legacy-${i}.md`,
+          i === 0 ? 'text/markdown; charset=utf-8' : 'text/markdown',
+          'view',
+          t + 1000 + i,
+          t + 1000 + i,
+        ],
+      );
+    }
+    // Same source_key for user-bob (unverified .md)
+    await memDb.db.execute(
+      `INSERT INTO recent_documents (
+         id, user_id, source_kind, source_key, server_id, server_name, session_name,
+         file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, $13, $14)`,
+      [
+        'rdoc_bob_legacy_md',
+        'user-bob',
+        'server_file',
+        'srv:srv-1:/repo/README.md',
+        'srv-1',
+        null,
+        null,
+        '/repo/README.md',
+        null,
+        'README.md',
+        'text/markdown',
+        'view',
+        t + 5000,
+        t + 5000,
+      ],
+    );
+    // Valid Office doc older than the 5 polluted legacy .md rows
+    await memDb.db.execute(
+      `INSERT INTO recent_documents (
+         id, user_id, source_kind, source_key, server_id, server_name, session_name,
+         file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, $13, $14)`,
+      [
+        'rdoc_owner_docx',
+        'owner-1',
+        'server_file',
+        'srv:srv-1:/repo/Spec.docx',
+        'srv-1',
+        null,
+        null,
+        '/repo/Spec.docx',
+        null,
+        'Spec.docx',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'edit',
+        t - 5000,
+        t - 5000,
+      ],
+    );
+
+    const limitedRows = await listRecentDocumentsRaw(memDb.db, 'owner-1', 3);
+    expect(limitedRows).toHaveLength(3);
+    expect(limitedRows.map((r) => r.title).sort()).toEqual(['Notes.md', 'README.md', 'Spec.docx']);
+
+    const limitedRoute = await app.request('/api/recent-documents?limit=3', { headers: bearerHeader('owner-1') });
+    expect(limitedRoute.status).toBe(200);
+    const limitedJson = (await limitedRoute.json()) as { items: Array<{ title: string }> };
+    expect(limitedJson.items.map((i) => i.title).sort()).toEqual(['Notes.md', 'README.md', 'Spec.docx']);
+
+    const bobLimitedRows = await listRecentDocumentsRaw(memDb.db, 'user-bob', 10);
+    expect(bobLimitedRows).toHaveLength(0);
   });
 
   it('rejects internal upload/pasted-text temp paths from Recent recording (POSIX & Windows) while recording created & shared Cloud Docs', async () => {
