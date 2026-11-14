@@ -15,11 +15,26 @@ vi.mock('react-i18next', () => ({
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
 import { TaskPairStatusPanel, TaskPairStatusPanelHost, collapsedStorageKey } from '../../src/components/TaskPairStatusPanel.js';
-import { taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
+import { SubSessionTaskTitle } from '../../src/components/SubSessionTaskTitle.js';
+import { SupervisionTaskPairSnapshotBridge, taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
-import { SUPERVISION_CONSOLE_UNAVAILABLE_REASONS } from '../../../shared/supervision-task-console.js';
+import {
+  clearAllSupervisionTaskConsoleCaches,
+  writeSupervisionTaskConsoleCache,
+} from '../../src/supervision-task-console-cache.js';
+import {
+  SUPERVISION_TASK_CONSOLE_PHASE,
+  SUPERVISION_TASK_CONSOLE_SYNC_STATE,
+  createSupervisionTaskConsoleState,
+} from '../../src/supervision-task-console-reducer.js';
+import { SUPERVISION_TASK_STATUS_CONTRACT_VERSION } from '../../../shared/supervision-config.js';
+import {
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
+  SUPERVISION_TASK_CONSOLE_MSG,
+  SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+} from '../../../shared/supervision-task-console.js';
 import {
   TASK_PAIR_STATUSES,
   TASK_PAIR_VERBS,
@@ -1773,4 +1788,421 @@ describe('intentional title-only Pair preview', () => {
     }
   });
 
+});
+
+describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
+  function fakeWs() {
+    const handlers = new Set<(message: unknown) => void>();
+    const sent: any[] = [];
+    return {
+      sent,
+      ws: {
+        send: (message: object) => { sent.push(message); },
+        onMessage: (handler: (message: unknown) => void) => {
+          handlers.add(handler);
+          return () => { handlers.delete(handler); };
+        },
+      } as any,
+      emit: (message: unknown) => {
+        for (const handler of [...handlers]) handler(message);
+      },
+      latestSubscribe: () => [...sent].reverse().find((frame) => frame.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE),
+    };
+  }
+
+  function snapshotPayload(input: {
+    subscriptionId: string;
+    projectName: string;
+    coordinatorSessionName: string;
+    tasks: Array<{ taskId: string; title: string; status?: string; executor?: string; updatedAt?: number }>;
+    projectionVersion?: number;
+    pairRevision?: number;
+  }) {
+    return {
+      type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+      subscriptionId: input.subscriptionId,
+      scope: { projectName: input.projectName, coordinatorSessionName: input.coordinatorSessionName },
+      schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+      statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+      projectionVersion: input.projectionVersion ?? 1,
+      lastDurableEventId: 10,
+      projectionEpoch: 'epoch-1',
+      pairRevision: input.pairRevision ?? 0,
+      generatedAt: 1_000,
+      tasks: input.tasks.map((task) => ({
+        taskId: task.taskId,
+        title: task.title,
+        status: 'implementing',
+        phase: 'active',
+        validationState: 'pending',
+        updatedAt: task.updatedAt ?? 1_000,
+        lastEventId: 10,
+        pair: {
+          status: task.status ?? 'working',
+          flags: [],
+          round: 0,
+          blocking: ['P0'],
+          executor: task.executor ?? 'deck_sub_exec',
+          auditor: 'deck_sub_aud',
+          createdAt: 500,
+          startedAt: 600,
+          updatedAt: task.updatedAt ?? 1_000,
+        },
+      })),
+      assignments: [],
+      pools: [],
+    };
+  }
+
+  beforeEach(() => {
+    clearAllSupervisionTaskConsoleCaches();
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearAllSupervisionTaskConsoleCaches();
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+  });
+
+  it('recovers warm cached server/tab tasks and sub-session titles immediately on switch without scopeReset flash, then reconciles on SYNCED', async () => {
+    const mock = fakeWs();
+    const eventsLog: any[] = [];
+    const onSnapshot = (event: Event) => { eventsLog.push((event as CustomEvent).detail); };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    try {
+      const view = render(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-a"
+            projectName="proj-a"
+            coordinatorSessionName="deck_a_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-a" />
+          <SubSessionTaskTitle sessionName="deck_sub_a" serverId="srv-a" fallback="Fallback A" />
+        </div>,
+      );
+
+      // Unvisited scope emits scopeReset before first live snapshot.
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(true);
+      const subA = mock.latestSubscribe();
+      expect(subA).toBeTruthy();
+
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subA.subscriptionId,
+          projectName: 'proj-a',
+          coordinatorSessionName: 'deck_a_brain',
+          tasks: [{ taskId: 'tsk-a1', title: 'Server A Task', executor: 'deck_sub_a', updatedAt: 1_000 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Task');
+
+      // Switch to uncached Server B: emits scopeReset, hides Server A tasks immediately.
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-b"
+            projectName="proj-b"
+            coordinatorSessionName="deck_b_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-b" />
+          <SubSessionTaskTitle sessionName="deck_sub_b" serverId="srv-b" fallback="Fallback B" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(true);
+      expect(screen.queryByText('Server A Task')).toBeNull();
+      expect(screen.getByText('Fallback B')).toBeTruthy();
+
+      const subB = mock.latestSubscribe();
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subB.subscriptionId,
+          projectName: 'proj-b',
+          coordinatorSessionName: 'deck_b_brain',
+          tasks: [{ taskId: 'tsk-b1', title: 'Server B Task', executor: 'deck_sub_b', updatedAt: 1_100 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server B Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server B Task');
+
+      // Switch BACK to Server A while live WS hasn't answered yet: instant warm recovery with NO scopeReset!
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-a"
+            projectName="proj-a"
+            coordinatorSessionName="deck_a_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-a" />
+          <SubSessionTaskTitle sessionName="deck_sub_a" serverId="srv-a" fallback="Fallback A" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(false);
+      expect(eventsLog.some((entry) => entry?.cached === true && entry?.serverId === 'srv-a')).toBe(true);
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Task');
+      expect(screen.queryByText('Server B Task')).toBeNull();
+
+      // Background live SYNCED update arrives: updates finished/new rows smoothly.
+      const subA2 = mock.latestSubscribe();
+      expect(subA2.scope.projectName).toBe('proj-a');
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subA2.subscriptionId,
+          projectName: 'proj-a',
+          coordinatorSessionName: 'deck_a_brain',
+          projectionVersion: 2,
+          pairRevision: 1,
+          tasks: [{ taskId: 'tsk-a2', title: 'Server A Live Followup', status: 'in_audit', executor: 'deck_sub_a', updatedAt: 2_000 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Live Followup');
+      expect(screen.queryByText('Server A Task')).toBeNull();
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Live Followup');
+    } finally {
+      window.removeEventListener('supervision:task-pairs', onSnapshot);
+    }
+  });
+
+  it('never leaks rows across servers that share identical projectName and coordinatorSessionName', () => {
+    const mock = fakeWs();
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-1', projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          t1: {
+            taskId: 't1',
+            title: 'Only On Server One',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 9_000,
+            lastEventId: 1,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 9_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-2', projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          t1: {
+            taskId: 't1',
+            title: 'Only On Server Two',
+            status: 'in_audit',
+            phase: 'audit',
+            validationState: 'pending',
+            updatedAt: 5_000,
+            lastEventId: 1,
+            pair: { status: 'in_audit', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 5_000 },
+          },
+        },
+      },
+    );
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected={false}
+          userId="user-1"
+          serverId="srv-1"
+          projectName="shared"
+          coordinatorSessionName="deck_shared_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-1" />
+      </div>,
+    );
+    expect(screen.getByText('Only On Server One')).toBeTruthy();
+
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected={false}
+          userId="user-1"
+          serverId="srv-2"
+          projectName="shared"
+          coordinatorSessionName="deck_shared_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-2" />
+      </div>,
+    );
+    expect(screen.getByText('Only On Server Two')).toBeTruthy();
+    expect(screen.queryByText('Only On Server One')).toBeNull();
+  });
+
+  it('hydrates persisted cache immediately on cold mount before WS exists and hides cleanly if daemon later reports UNAVAILABLE', () => {
+    const auth = { userId: 'user-1', serverId: 'srv-cold', projectName: 'proj-cold', coordinatorSessionName: 'deck_cold_brain' };
+    writeSupervisionTaskConsoleCache(auth, {
+      ...createSupervisionTaskConsoleState({ projectName: auth.projectName, coordinatorSessionName: auth.coordinatorSessionName }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+      projectionVersion: 2,
+      tasks: {
+        cold: {
+          taskId: 'cold',
+          title: 'Persisted Task Across Reload',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 1_500,
+          lastEventId: 2,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_cold', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 1_500 },
+        },
+      },
+    });
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-cold"
+          projectName="proj-cold"
+          coordinatorSessionName="deck_cold_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-cold" />
+        <SubSessionTaskTitle sessionName="deck_sub_cold" serverId="srv-cold" fallback="Cold Fallback" />
+      </div>,
+    );
+
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Persisted Task Across Reload');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Persisted Task Across Reload');
+
+    // Now WS connects and daemon responds UNAVAILABLE -> hides panel & title and clears cache.
+    const mock = fakeWs();
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-1"
+          serverId="srv-cold"
+          projectName="proj-cold"
+          coordinatorSessionName="deck_cold_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-cold" />
+        <SubSessionTaskTitle sessionName="deck_sub_cold" serverId="srv-cold" fallback="Cold Fallback" />
+      </div>,
+    );
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-cold', coordinatorSessionName: 'deck_cold_brain' },
+        reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
+        retryable: true,
+      });
+    });
+
+    expect(screen.queryByText('Persisted Task Across Reload')).toBeNull();
+    expect(screen.getByText('Cold Fallback')).toBeTruthy();
+  });
+
+  it('clears previous tab tasks immediately when switching to a cached empty scope without emitting scopeReset', () => {
+    const mock = fakeWs();
+    const eventsLog: any[] = [];
+    const onSnapshot = (event: Event) => { eventsLog.push((event as CustomEvent).detail); };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    try {
+      writeSupervisionTaskConsoleCache(
+        { userId: 'user-1', serverId: 'srv-tab', projectName: 'proj-nonempty', coordinatorSessionName: 'deck_tab_1' },
+        {
+          ...createSupervisionTaskConsoleState({ projectName: 'proj-nonempty', coordinatorSessionName: 'deck_tab_1' }),
+          phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+          hasAuthoritativeSnapshot: true,
+          syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+          projectionVersion: 1,
+          tasks: {
+            t1: {
+              taskId: 't1',
+              title: 'Tab One Task',
+              status: 'implementing',
+              phase: 'active',
+              validationState: 'pending',
+              updatedAt: 1_000,
+              lastEventId: 1,
+              pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 1_000 },
+            },
+          },
+        },
+      );
+      writeSupervisionTaskConsoleCache(
+        { userId: 'user-1', serverId: 'srv-tab', projectName: 'proj-empty', coordinatorSessionName: 'deck_tab_2' },
+        {
+          ...createSupervisionTaskConsoleState({ projectName: 'proj-empty', coordinatorSessionName: 'deck_tab_2' }),
+          phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+          hasAuthoritativeSnapshot: true,
+          syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+          projectionVersion: 0,
+          tasks: {},
+        },
+      );
+
+      const view = render(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected={false}
+            userId="user-1"
+            serverId="srv-tab"
+            projectName="proj-nonempty"
+            coordinatorSessionName="deck_tab_1"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-tab" />
+        </div>,
+      );
+      expect(screen.getByText('Tab One Task')).toBeTruthy();
+
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected={false}
+            userId="user-1"
+            serverId="srv-tab"
+            projectName="proj-empty"
+            coordinatorSessionName="deck_tab_2"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-tab" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(false);
+      expect(eventsLog.some((entry) => entry?.authorityUnavailable === true)).toBe(false);
+      expect(screen.queryByText('Tab One Task')).toBeNull();
+    } finally {
+      window.removeEventListener('supervision:task-pairs', onSnapshot);
+    }
+  });
 });

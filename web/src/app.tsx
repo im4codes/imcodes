@@ -9019,7 +9019,7 @@ function InternalMainApp() {
               </div>
               )}
               </div>
-              {auth?.userId && selectedServerId && activeSessionInfo && wsRef.current && (
+              {auth?.userId && selectedServerId && activeSessionInfo && (
                 <SupervisionTaskPairSnapshotBridge
                   ws={wsRef.current}
                   connected={connected && daemonOnline}

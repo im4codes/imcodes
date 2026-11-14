@@ -32,7 +32,11 @@ function status(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
 }
 
-type TaskPairConsoleSnapshotDetail = { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] };
+type TaskPairConsoleSnapshotDetail = { serverId?: string; tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] };
+
+function matchesSnapshotServer(snapshot: { serverId?: unknown } | null | undefined, serverId?: string | null): boolean {
+  return !(typeof snapshot?.serverId === 'string' && snapshot.serverId && serverId && snapshot.serverId !== serverId);
+}
 
 function finiteTimestamp(value: unknown, fallback?: number): number | undefined {
   const numeric = typeof value === 'number' ? value : Number(value);
@@ -128,9 +132,10 @@ function resolveSessionModel(
   return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
 }
 
-function hasPairActivity(events: readonly TimelineEvent[]): boolean {
+function hasPairActivity(events: readonly TimelineEvent[], serverId?: string | null): boolean {
   if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
-  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly unknown[]; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: unknown; tasks?: readonly unknown[]; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+  if (!matchesSnapshotServer(snapshot, serverId)) return false;
   return Boolean(snapshot?.authorityUnavailable) || (Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0);
 }
 
@@ -193,13 +198,17 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     lastScopeKey.current = scopeKey;
     setChoice(visitScoped ? undefined : readServerWideChoice({ serverId, mobile: isMobile }));
   }, [scopeKey, serverId, isMobile, visitScoped]);
+  const lastSnapshotServerIdRef = useRef<string | undefined>((() => {
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: string } }).__imcodesTaskPairSnapshot;
+    return matchesSnapshotServer(detail, serverId) ? detail?.serverId : undefined;
+  })());
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
-    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
-    return detail ? normalizeSnapshot(detail) : null;
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: string; tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
+    return detail && matchesSnapshotServer(detail, serverId) ? normalizeSnapshot(detail) : null;
   });
   const [snapshotTitles, setSnapshotTitles] = useState<Map<string, string>>(() => {
-    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { scopeReset?: unknown; authorityUnavailable?: unknown; taskTitles?: Record<string, string>; tasks?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
-    return collectTaskPairTitlesFromSnapshot(detail);
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: string; scopeReset?: unknown; authorityUnavailable?: unknown; taskTitles?: Record<string, string>; tasks?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
+    return matchesSnapshotServer(detail, serverId) ? collectTaskPairTitlesFromSnapshot(detail) : new Map();
   });
   const [activeSplitTaskId, setActiveSplitTaskId] = useState<string | null>(() => {
     return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
@@ -214,10 +223,11 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   }, []);
   useEffect(() => {
     const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; taskTitles?: Record<string, string>; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean; authorityUnavailable?: boolean } | undefined;
-      if (!detail) return;
+      const detail = (event as CustomEvent).detail as { serverId?: string; tasks?: readonly Record<string, unknown>[]; taskTitles?: Record<string, string>; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean; authorityUnavailable?: boolean } | undefined;
+      if (!detail || !matchesSnapshotServer(detail, serverId)) return;
       if (detail.scopeReset) {
         (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
+        lastSnapshotServerIdRef.current = undefined;
         setSnapshotRows(null);
         setSnapshotTitles(new Map());
         return;
@@ -229,12 +239,18 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       }
       if (Array.isArray(detail.tasks)) {
         const normalized = normalizeSnapshot(detail);
-        if (normalized) setSnapshotRows((current) => mergeSnapshotRows(current, normalized));
+        if (normalized) {
+          const crossServer = Boolean(
+            detail.serverId && lastSnapshotServerIdRef.current && detail.serverId !== lastSnapshotServerIdRef.current,
+          );
+          if (detail.serverId) lastSnapshotServerIdRef.current = detail.serverId;
+          setSnapshotRows((current) => mergeSnapshotRows(crossServer ? null : current, normalized));
+        }
       }
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
-  }, []);
+  }, [serverId]);
   const latest = new Map<string, { payload: Record<string, unknown>; startedAt: number; updatedAt: number }>();
   const reworkCounts = new Map<string, number>();
   const taskTitles = new Map<string, string>();
@@ -436,22 +452,24 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
 export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
-  const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
-  const [active, setActive] = useState(() => hasPairActivity(props.events));
-  const [authorityUnavailable, setAuthorityUnavailable] = useState(() => Boolean(initialSnapshot?.authorityUnavailable));
+  const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: unknown; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+  const [active, setActive] = useState(() => hasPairActivity(props.events, props.serverId));
+  const [authorityUnavailable, setAuthorityUnavailable] = useState(() => (
+    matchesSnapshotServer(initialSnapshot, props.serverId) && Boolean(initialSnapshot?.authorityUnavailable)
+  ));
   const [resolvedMobileAnchor, setResolvedMobileAnchor] = useState<Element | null>(() => props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null);
   useLayoutEffect(() => {
     const anchor = props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null;
     if (anchor !== resolvedMobileAnchor) setResolvedMobileAnchor(anchor);
   });
   useEffect(() => {
-    if (!active && hasPairActivity(props.events)) {
+    if (!active && hasPairActivity(props.events, props.serverId)) {
       setActive(true);
     }
-  }, [active, props.events]);
+  }, [active, props.events, props.serverId]);
   useEffect(() => {
-    const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined;
+    const applySnapshot = (detail: { serverId?: unknown; tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined) => {
+      if (!matchesSnapshotServer(detail, props.serverId)) return;
       if (detail?.scopeReset) {
         setActive(true);
         setAuthorityUnavailable(true);
@@ -468,9 +486,14 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
         setAuthorityUnavailable(false);
       }
     };
+    const current = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: unknown; tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+    if (current && !current.scopeReset) applySnapshot(current);
+    const onSnapshot = (event: Event) => {
+      applySnapshot((event as CustomEvent).detail as Parameters<typeof applySnapshot>[0]);
+    };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
-  }, []);
+  }, [props.serverId]);
   if (!active) return null;
   // Owner rule: load silently, never cover the chat. While the authoritative
   // snapshot for a new scope is pending (or unavailable), render nothing: stale

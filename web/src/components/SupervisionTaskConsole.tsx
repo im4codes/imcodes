@@ -34,6 +34,10 @@ import {
   type SupervisionTaskConsoleReducerState,
 } from '../supervision-task-console-reducer.js';
 import {
+  readSupervisionTaskConsoleCache,
+  type SupervisionTaskConsoleAuthority,
+} from '../supervision-task-console-cache.js';
+import {
   canViewSupervisionTaskConsole,
   type SupervisionTaskConsoleVisibilityInput,
 } from '../supervision-task-console-visibility.js';
@@ -129,6 +133,13 @@ export function SupervisionTaskPairSnapshotBridge(props: {
   coordinatorSessionName: string;
 }) {
   const scopeKey = `${props.serverId}\u0000${props.projectName}\u0000${props.coordinatorSessionName}`;
+  const authorityScopeKey = `${props.userId}\u0000${scopeKey}`;
+  const authority = useMemo<SupervisionTaskConsoleAuthority>(() => ({
+    userId: props.userId,
+    serverId: props.serverId,
+    projectName: props.projectName,
+    coordinatorSessionName: props.coordinatorSessionName,
+  }), [authorityScopeKey]);
   const { state } = useSupervisionTaskConsole({
     ws: props.ws,
     connected: props.connected,
@@ -138,29 +149,39 @@ export function SupervisionTaskPairSnapshotBridge(props: {
   });
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    // Invalidate rows from the previous server/project/session immediately;
-    // the new subscription will publish its authoritative snapshot separately.
+    const scopeMatches = state.scope.projectName === props.projectName
+      && state.scope.coordinatorSessionName === props.coordinatorSessionName;
+    const hasCachedForTarget = (scopeMatches && state.hasAuthoritativeSnapshot)
+      || Boolean(readSupervisionTaskConsoleCache(authority));
+    if (hasCachedForTarget) return;
+    // Invalidate rows from the previous server/project/session only when
+    // the new scope has no warm cached projection to show immediately.
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true, scopeKey } }));
-  }, [scopeKey]);
+  }, [authorityScopeKey]);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (state.scope.projectName !== props.projectName
       || state.scope.coordinatorSessionName !== props.coordinatorSessionName) return;
-    // Cached projections are marked STALE and must not silently replace the
-    // daemon's authoritative list.  Publish only a live, fully synced snapshot.
-    if (state.hasAuthoritativeSnapshot && state.syncState === SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED) {
-      const detail = { ...taskConsoleStateToPairSnapshot(state), serverId: props.serverId };
+    if (state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR && !state.hasAuthoritativeSnapshot) {
+      const detail = { authorityUnavailable: true, error: state.error ?? 'unsupported' };
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
       return;
     }
-    if (state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR) {
-      const detail = { authorityUnavailable: true, error: state.error ?? 'unsupported' };
+    const publishableState = state.hasAuthoritativeSnapshot
+      ? state
+      : readSupervisionTaskConsoleCache(authority);
+    if (publishableState) {
+      const detail = {
+        ...taskConsoleStateToPairSnapshot(publishableState),
+        serverId: props.serverId,
+        cached: publishableState.syncState !== SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+      };
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
     }
-  }, [state, props.projectName, props.coordinatorSessionName]);
+  }, [state, props.userId, props.serverId, props.projectName, props.coordinatorSessionName]);
   return null;
 }
 
