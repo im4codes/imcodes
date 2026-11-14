@@ -41,4 +41,61 @@ describe('shared mobile layout detection', () => {
   it('recognizes desktop-site phones through touch without using width', () => {
     expect(isMobileDevice({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', width: 1024, pointerCoarse: true, maxTouchPoints: 5 })).toBe(true);
   });
+
+  it('keeps Capacitor iOS running on macOS in the desktop shell while keeping real iOS/Android mobile', () => {
+    // Mac Designed-for-iPad with Swift nativeHost signal (even if WebKit reports iPad UA and narrow width)
+    const macAppNarrow = {
+      userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+      native: true,
+      nativePlatform: 'ios',
+      platform: 'iPad',
+      maxTouchPoints: 0,
+      width: 600,
+      nativeHost: { isMacDesktop: true, pageZoomApplied: true },
+    };
+    expect(isMobileDevice(macAppNarrow)).toBe(false);
+    expect(isMobileLayout(macAppNarrow)).toBe(true);
+    expect(isMobileLayout({ ...macAppNarrow, width: 1280 })).toBe(false);
+
+    // Mac Designed-for-iPad fallback without nativeHost global (older native binary / MacIntel)
+    expect(isMobileDevice({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
+      native: true,
+      nativePlatform: 'ios',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      width: 1280,
+    })).toBe(false);
+
+    // Real iPhone & real iPad (including desktop UA & trackpad) stay mobile
+    expect(isMobileDevice({
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+      native: true,
+      nativePlatform: 'ios',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      width: 390,
+      nativeHost: { isMacDesktop: false, pageZoomApplied: false },
+    })).toBe(true);
+
+    expect(isMobileDevice({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15',
+      native: true,
+      nativePlatform: 'ios',
+      platform: 'MacIntel',
+      maxTouchPoints: 5,
+      hoverFinePointer: true,
+      width: 1180,
+    })).toBe(true);
+
+    // Android native stays mobile
+    expect(isMobileDevice({
+      userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8)',
+      native: true,
+      nativePlatform: 'android',
+      platform: 'Linux armv8l',
+      maxTouchPoints: 5,
+      width: 1080,
+    })).toBe(true);
+  });
 });

@@ -9313,4 +9313,62 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
+
+  it('uses desktop shell with persistent sidebar on native Capacitor iOS-on-Mac and updates reactively on imcodes:native-host', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('http://localhost');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const prevCapacitor = (globalThis as { Capacitor?: unknown }).Capacitor;
+    const prevHost = (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__;
+    const prevUA = navigator.userAgent;
+    const prevMaxTouch = navigator.maxTouchPoints;
+
+    try {
+      (globalThis as { Capacitor?: unknown }).Capacitor = {
+        isNativePlatform: () => true,
+        getPlatform: () => 'ios',
+      };
+      // Start with an iPad-like UA + 0 touch points before native host signal arrives
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+      });
+      Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: 0 });
+      delete (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__;
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      // Before native host arrives with iPad UA and coarse pointer, shell starts mobile
+      expect(view.container.querySelector('.layout')?.classList.contains('layout-mobile')).toBe(true);
+      expect(view.container.querySelector('.mobile-sidebar-overlay')).toBeTruthy();
+
+      // Native Swift host signals isiOSAppOnMac + native WKWebView pageZoom applied
+      (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__ = {
+        isMacDesktop: true,
+        pageZoomApplied: true,
+      };
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent('imcodes:native-host'));
+      });
+
+      await waitFor(() => {
+        expect(view.container.querySelector('.layout')?.classList.contains('layout-mobile')).toBe(false);
+      });
+      expect(view.container.querySelector('.mobile-sidebar-overlay')).toBeNull();
+      expect(screen.getByTestId('desktop-cloud-docs-btn')).toBeTruthy();
+      expect(document.documentElement.classList.contains('native-ios-mac')).toBe(false);
+    } finally {
+      if (prevCapacitor === undefined) delete (globalThis as { Capacitor?: unknown }).Capacitor;
+      else (globalThis as { Capacitor?: unknown }).Capacitor = prevCapacitor;
+      if (prevHost === undefined) delete (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__;
+      else (globalThis as { __IMCODES_NATIVE_HOST__?: unknown }).__IMCODES_NATIVE_HOST__ = prevHost;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: prevUA });
+      Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: prevMaxTouch });
+    }
+  }, 15000);
 });

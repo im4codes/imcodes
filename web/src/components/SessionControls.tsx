@@ -6645,6 +6645,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
+  const mobileLayoutRef = useRef(isMobileLayout);
+  mobileLayoutRef.current = isMobileLayout;
+  const [, setResponsiveLayoutTick] = useState(0);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onResize = () => {
+      const next = window.innerWidth <= 640;
+      if (next !== mobileLayoutRef.current) {
+        mobileLayoutRef.current = next;
+        setResponsiveLayoutTick((tick) => tick + 1);
+      }
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
   const showMobileStackedAttachmentButton = isMobileLayout
     && isTransport

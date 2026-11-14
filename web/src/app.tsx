@@ -336,7 +336,7 @@ import {
   isMobileKeyboardInputTarget,
   isSubSessionBarInputTarget,
 } from './mobile-keyboard.js';
-import { shouldUseIosMacTextScale } from './native-platform.js';
+import { applyNativePlatformClasses, isNativeMacDesktop, NATIVE_HOST_EVENT, shouldUseIosMacTextScale } from './native-platform.js';
 import { boundedVisualViewportHeight, createSettledViewportUpdater } from './visual-viewport.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
@@ -1265,7 +1265,7 @@ function InternalMainApp() {
     const updateAutomaticLayout = () => {
       setAutomaticTeamDiscussionLayout(defaultTeamDiscussionLayout(
         window.innerHeight,
-        !/iPhone|iPad|iPod|Android/i.test(navigator.userAgent),
+        !isMobileDevice(),
       ));
     };
     window.addEventListener('resize', updateAutomaticLayout);
@@ -1416,9 +1416,44 @@ function InternalMainApp() {
     });
   }, []);
 
+  const [nativePlatformSnapshot, setNativePlatformSnapshot] = useState(() => ({
+    mobile: isMobileDevice(),
+    macDesktop: isNativeMacDesktop(),
+    macTextScale: shouldUseIosMacTextScale(),
+  }));
+
+  useEffect(() => {
+    const syncNativePlatform = () => {
+      applyNativePlatformClasses();
+      const next = {
+        mobile: isMobileDevice(),
+        macDesktop: isNativeMacDesktop(),
+        macTextScale: shouldUseIosMacTextScale(),
+      };
+      setNativePlatformSnapshot((prev) => (
+        prev.mobile === next.mobile
+          && prev.macDesktop === next.macDesktop
+          && prev.macTextScale === next.macTextScale
+          ? prev
+          : next
+      ));
+    };
+    window.addEventListener(NATIVE_HOST_EVENT, syncNativePlatform);
+    const mq = typeof window.matchMedia === 'function'
+      ? window.matchMedia('(hover: hover) and (pointer: fine)')
+      : null;
+    mq?.addEventListener?.('change', syncNativePlatform);
+    return () => {
+      window.removeEventListener(NATIVE_HOST_EVENT, syncNativePlatform);
+      mq?.removeEventListener?.('change', syncNativePlatform);
+    };
+  }, []);
+
+  const isNativeMac = nativePlatformSnapshot.macDesktop;
+
   // Keep layout height within visual viewport on mobile (keyboard-aware)
   useEffect(() => {
-    if (shouldUseIosMacTextScale()) {
+    if (isNativeMac || shouldUseIosMacTextScale()) {
       document.documentElement.style.removeProperty('--vvh');
       document.documentElement.style.removeProperty('--kbh');
       document.documentElement.classList.remove('kb-open', 'input-focused', 'subcard-input-focused');
@@ -1553,7 +1588,7 @@ function InternalMainApp() {
       document.removeEventListener('focusout', onFocusOut);
       document.removeEventListener('visibilitychange', onResume);
     };
-  }, []);
+  }, [isNativeMac]);
 
   // Native: initialize server URL and API key from Preferences storage
   useEffect(() => {
@@ -4823,7 +4858,7 @@ function InternalMainApp() {
           chatScrollFnsRef.current.get(activeSession)?.();
           // Steal focus from xterm textarea so it stops capturing keystrokes in chat mode.
           // Only on desktop — on mobile we don't want to pop up the keyboard automatically.
-          if (!/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+          if (!isMobileRef.current) {
             focusComposerElement(inputRefsMap.current.get(activeSession));
           }
         });

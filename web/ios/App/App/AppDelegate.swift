@@ -8,6 +8,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
     var window: UIWindow?
     private var didRegisterLocalPlugins = false
+    private var didConfigureWebViewChrome = false
+    private static let macDesignedForIpadPageZoom: CGFloat = 1.0 / 0.77
 
     override init() {
         super.init()
@@ -168,17 +170,62 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     }
 
     private func registerLocalPluginsIfNeeded() {
-        guard !didRegisterLocalPlugins else { return }
         guard let vc = window?.rootViewController as? CAPBridgeViewController,
               let bridge = vc.bridge else {
             return
         }
 
-        bridge.registerPluginInstance(AuthSessionPlugin())
-        bridge.registerPluginInstance(WatchBridgePlugin())
-        bridge.registerPluginInstance(ShareReceiverPlugin.shared)
-        configureInputChrome(bridge.webView)
-        didRegisterLocalPlugins = true
+        if !didRegisterLocalPlugins {
+            bridge.registerPluginInstance(AuthSessionPlugin())
+            bridge.registerPluginInstance(WatchBridgePlugin())
+            bridge.registerPluginInstance(ShareReceiverPlugin.shared)
+            didRegisterLocalPlugins = true
+        }
+
+        if !didConfigureWebViewChrome, let webView = bridge.webView {
+            configureInputChrome(webView)
+            didConfigureWebViewChrome = true
+        }
+    }
+
+    static func isMacDesktopHost(isiOSAppOnMac: Bool, isMacCatalyst: Bool) -> Bool {
+        isiOSAppOnMac || isMacCatalyst
+    }
+
+    static func shouldApplyDesignedForIpadPageZoom(
+        isiOSAppOnMac: Bool,
+        isMacCatalyst: Bool,
+        isMacIdiom: Bool
+    ) -> Bool {
+        isiOSAppOnMac || (isMacCatalyst && !isMacIdiom)
+    }
+
+    private static func currentMacHostFlags() -> (isMacDesktop: Bool, needsDesignedForIpadPageZoom: Bool) {
+        let isiOSAppOnMac: Bool
+        if #available(iOS 14.0, *) {
+            isiOSAppOnMac = ProcessInfo.processInfo.isiOSAppOnMac
+        } else {
+            isiOSAppOnMac = false
+        }
+        #if targetEnvironment(macCatalyst)
+        let isMacCatalyst = true
+        #else
+        let isMacCatalyst = false
+        #endif
+        let isMacIdiom: Bool
+        if #available(iOS 14.0, *) {
+            isMacIdiom = UIDevice.current.userInterfaceIdiom == .mac
+        } else {
+            isMacIdiom = false
+        }
+        return (
+            isMacDesktop: isMacDesktopHost(isiOSAppOnMac: isiOSAppOnMac, isMacCatalyst: isMacCatalyst),
+            needsDesignedForIpadPageZoom: shouldApplyDesignedForIpadPageZoom(
+                isiOSAppOnMac: isiOSAppOnMac,
+                isMacCatalyst: isMacCatalyst,
+                isMacIdiom: isMacIdiom
+            )
+        )
     }
 
     /// Removes the leading/trailing shortcuts-bar button groups -- the
@@ -191,6 +238,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     /// exact same bar shows up identically on a real iPhone/iPad, so it now
     /// always runs.
     private func configureInputChrome(_ webView: WKWebView?) {
+        let hostFlags = Self.currentMacHostFlags()
+        var pageZoomApplied = false
+        if #available(iOS 14.0, *), hostFlags.needsDesignedForIpadPageZoom, let webView = webView {
+            // macOS "Designed for iPad" scales UIKit points by 0.77x; compensating at the
+            // WKWebView level keeps desktop typography, icons, and layout parity 1:1.
+            webView.pageZoom = Self.macDesignedForIpadPageZoom
+            pageZoomApplied = true
+        }
+
+        var scripts: [String] = []
         if let builtinPublic = Bundle.main.resourceURL?.appendingPathComponent("public"),
            let manifest = Self.readBuildManifest(in: builtinPublic),
            let payloadData = try? JSONSerialization.data(withJSONObject: [
@@ -198,10 +255,21 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
                "buildTime": manifest.buildTime
            ]),
            let payloadJson = String(data: payloadData, encoding: .utf8) {
-            let script = "window.__IMCODES_NATIVE_BUILD_INFO__ = \(payloadJson);"
-            let userScript = WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+            scripts.append("window.__IMCODES_NATIVE_BUILD_INFO__ = \(payloadJson);")
+        }
+        if let hostData = try? JSONSerialization.data(withJSONObject: [
+            "isMacDesktop": hostFlags.isMacDesktop,
+            "pageZoomApplied": pageZoomApplied
+        ]),
+           let hostJson = String(data: hostData, encoding: .utf8) {
+            scripts.append("window.__IMCODES_NATIVE_HOST__ = \(hostJson);")
+            scripts.append("window.dispatchEvent(new CustomEvent('imcodes:native-host'));")
+        }
+        if !scripts.isEmpty {
+            let combinedScript = scripts.joined(separator: "\n")
+            let userScript = WKUserScript(source: combinedScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)
             webView?.configuration.userContentController.addUserScript(userScript)
-            webView?.evaluateJavaScript(script, completionHandler: nil)
+            webView?.evaluateJavaScript(combinedScript, completionHandler: nil)
         }
         guard #available(iOS 14.0, *) else { return }
         webView?.inputAssistantItem.leadingBarButtonGroups = []

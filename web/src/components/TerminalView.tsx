@@ -7,7 +7,8 @@ import 'xterm/css/xterm.css';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { TerminalDiffRegistration } from '../terminal-diff-registry.js';
-import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
+import { IOS_MAC_TERMINAL_FONT_SIZE, NATIVE_HOST_EVENT, shouldUseIosMacTextScale } from '../native-platform.js';
+import { isMobileDevice } from '../mobile-device.js';
 import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { applyDiffToRows, fullFrameWriteFromDiff, isRenderableLineIndex, resolveDiffRows } from '../terminal-frame.js';
 
@@ -139,7 +140,9 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   // swallowing real user scrolls, and that belongs in its own change with its
   // own acceptance criteria.
 
-  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const [isMobile, setIsMobile] = useState(() => isMobileDevice());
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
 
   // Coalesced scroll-to-bottom for the diff data path. Repeat requests replace
   // the pending frame instead of appending a new one, and the frame is
@@ -159,7 +162,30 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   const scrollHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showScrollbar, setShowScrollbar] = useState(false);
   const [recoveryError, setRecoveryError] = useState(false);
-  const useIosMacTextScale = shouldUseIosMacTextScale();
+  const [useIosMacTextScale, setUseIosMacTextScale] = useState(() => shouldUseIosMacTextScale());
+
+  useEffect(() => {
+    const syncPlatform = () => {
+      const nextMobile = isMobileDevice();
+      const nextScale = shouldUseIosMacTextScale();
+      setIsMobile((prev) => (prev === nextMobile ? prev : nextMobile));
+      setUseIosMacTextScale((prev) => (prev === nextScale ? prev : nextScale));
+      const term = termRef.current;
+      if (term) {
+        term.options.fontSize = nextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13;
+        term.options.lineHeight = nextScale ? 1.45 : 1.4;
+        term.options.disableStdin = nextMobile && !mobileInput;
+        fitRef.current?.fit();
+      }
+    };
+    window.addEventListener(NATIVE_HOST_EVENT, syncPlatform);
+    const mq = typeof window.matchMedia === 'function' ? window.matchMedia('(hover: hover) and (pointer: fine)') : null;
+    mq?.addEventListener?.('change', syncPlatform);
+    return () => {
+      window.removeEventListener(NATIVE_HOST_EVENT, syncPlatform);
+      mq?.removeEventListener?.('change', syncPlatform);
+    };
+  }, [mobileInput]);
 
   const clearRawFlushTimer = useCallback(() => {
     if (rawFlushTimerRef.current) {
@@ -307,7 +333,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       cursorBlink: !preview,
       // On mobile: disable xterm stdin unless mobileInput is set (shell sessions
       // need keyboard for interactive SSH-like input).
-      disableStdin: isMobile && !mobileInput,
+      disableStdin: isMobileRef.current && !mobileInput,
     });
 
     // The isolated real-browser shell harness uses the xterm API to select and
@@ -373,7 +399,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         }
       }, 400);
       // Auto-focus terminal on mount for desktop keyboard input
-      if (!isMobile) {
+      if (!isMobileRef.current) {
         requestFrame(() => term.focus());
       }
     }
@@ -550,7 +576,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [sessionName, useIosMacTextScale]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessionName]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // When WS reconnects (connected → true), re-send terminal dimensions so tmux
   // always matches xterm — prevents garbled/corrupted display (花屏).
