@@ -748,8 +748,9 @@ export const TASK_PAIR_SPLIT_UNRELATED_TOKEN =
  * per-pair cron_create_self nudges), whereas multi-phase long tasks require
  * Brain to automatically schedule a bounded cron_create_self supervisor
  * (completionPolicy="until_complete") at an interval of at least 20 minutes
- * (never more frequent than every 20 minutes) and auto-cancel it once all
- * phases complete.
+ * (never more frequent than every 20 minutes) and scale/extend that interval
+ * appropriately based on task complexity (e.g. 30m/45m/60m+ for heavy
+ * multi-phase tasks), and auto-cancel it once all phases complete.
  */
 export const TASK_PAIR_MULTI_PHASE_CRON_RULE: string =
   'Multi-phase long-task supervisor cron (Brain): single pairs use the '
@@ -757,13 +758,16 @@ export const TASK_PAIR_MULTI_PHASE_CRON_RULE: string =
   + 'nudges). For a multi-phase long task spanning multiple phases or dependent '
   + 'pairs, Brain MUST automatically create a supervisor cron via '
   + 'cron_create_self with completionPolicy="until_complete" and an interval of '
-  + 'at least 20 minutes (>= 20 minutes, e.g. */20 * * * *, never more frequent '
-  + 'than every 20 minutes) to track phase advancement and recover stalls, and '
-  + 'automatically cancel it via cron_cancel_self once all phases are complete.';
+  + 'at least 20 minutes (>= 20 minutes, e.g. */20 * * * * minimum, never more '
+  + 'frequent than every 20 minutes), AND scale/extend the interval '
+  + 'appropriately based on task complexity (e.g. 30m/45m/60m+ for heavy '
+  + 'multi-phase or long-running tasks) to track phase advancement and recover '
+  + 'stalls, and automatically cancel it via cron_cancel_self once all phases '
+  + 'are complete.';
 
 /** Compact snake_case token used by the Brain duty tables in supervision-prompts.ts. */
 export const TASK_PAIR_MULTI_PHASE_CRON_TOKEN =
-  'single_pair_no_cron_multi_phase_long_task_must_cron_create_self_min_20m_completionPolicy_until_complete_auto_cancel_when_all_phases_done' as const;
+  'single_pair_no_cron_multi_phase_long_task_must_cron_create_self_min_20m_scaled_by_complexity_completionPolicy_until_complete_auto_cancel_when_all_phases_done' as const;
 
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
