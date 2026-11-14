@@ -730,6 +730,18 @@ let transportListModelsCacheGeneration = 0;
 const sessionResetGenerations = new Map<string, number>();
 let nextSessionResetGeneration = 0;
 
+const MAX_PROCESS_AUTOMATION_QUEUE_DEPTH = 50;
+
+interface QueuedProcessAutomationMessage {
+  text: string;
+  options?: Parameters<typeof sendProcessSessionMessage>[3];
+}
+
+const processAutomationQueues = new Map<string, QueuedProcessAutomationMessage[]>();
+const processAutomationDrainInFlight = new Set<string>();
+const scheduledProcessAutomationDrains = new Set<string>();
+let processAutomationHooksRegistered = false;
+
 function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
   return `${sessionName}\u0000${clientMessageId}`;
 }
@@ -6266,18 +6278,6 @@ async function sendProcessSessionMessage(
     scheduleCatchup(sessionName);
   }
 }
-
-const MAX_PROCESS_AUTOMATION_QUEUE_DEPTH = 50;
-
-interface QueuedProcessAutomationMessage {
-  text: string;
-  options?: Parameters<typeof sendProcessSessionMessage>[3];
-}
-
-const processAutomationQueues = new Map<string, QueuedProcessAutomationMessage[]>();
-const processAutomationDrainInFlight = new Set<string>();
-const scheduledProcessAutomationDrains = new Set<string>();
-let processAutomationHooksRegistered = false;
 
 function scheduleProcessAutomationDrain(sessionName: string): void {
   if (!processAutomationQueues.has(sessionName)) return;
