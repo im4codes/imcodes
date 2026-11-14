@@ -12,14 +12,15 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep, win32 as win32Path } from 'node:path';
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { normalizeNodeExeBuildVersion, sha256File } from './node-exe-artifacts.mjs';
 
 export const DAEMON_RUNTIME_MANIFEST_SCHEMA_VERSION = 1;
 export const DAEMON_RUNTIME_FILES_FILENAME = 'daemon-runtime.files.json';
 export const DEFAULT_DAEMON_RUNTIME_NODE_VERSION = 'v24.16.0';
+export const WINDOWS_ZIP_SCRIPT_PATH = join(dirname(fileURLToPath(import.meta.url)), 'windows-zip-archive.ps1');
 export const DAEMON_RUNTIME_SUPPORTED_TARGETS = Object.freeze([
   'linux-x64',
   'linux-arm64',
@@ -584,20 +585,104 @@ export async function verifyExtractedDaemonRuntime(bundleRoot, expectedFiles, op
   return { fileCount: actualFiles.length };
 }
 
-function extractArchiveToDir(archivePath, format, destDir) {
+/**
+ * Resolve the Windows PowerShell 5.1 executable path from `SystemRoot`.
+ */
+export function resolveWindowsPowerShellPath(env = process.env) {
+  const systemRoot = env.SystemRoot?.trim() || 'C:\\Windows';
+  return win32Path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+function resolveArchivePathForPlatform(targetPath, platform) {
+  if (platform === 'win32' && (process.platform === 'win32' || /^[A-Za-z]:[\\/]/.test(targetPath) || targetPath.startsWith('\\\\'))) {
+    return win32Path.resolve(targetPath);
+  }
+  return resolve(targetPath);
+}
+
+/**
+ * Build `-File` arguments for `scripts/windows-zip-archive.ps1`.
+ * Passes named script parameters directly so paths with spaces, quotes, or `$`
+ * reach PowerShell verbatim without inline command string reparsing.
+ */
+export function buildWindowsZipPowerShellArgs(mode, sourcePath, destinationPath, options = {}) {
+  if (mode !== 'Expand' && mode !== 'Compress') {
+    throw new Error(`unsupported Windows zip mode: ${mode}`);
+  }
+  const platform = options.platform ?? process.platform;
+  const scriptPath = options.scriptPath ?? WINDOWS_ZIP_SCRIPT_PATH;
+  return [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    scriptPath,
+    '-Mode',
+    mode,
+    '-SourcePath',
+    resolveArchivePathForPlatform(sourcePath, platform),
+    '-DestinationPath',
+    resolveArchivePathForPlatform(destinationPath, platform),
+  ];
+}
+
+/**
+ * Extract a `.tar.gz` or `.zip` archive into `destDir`.
+ */
+export function extractArchiveToDir(archivePath, format, destDir, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const run = options.execFileSyncImpl ?? execFileSync;
+  const env = options.env ?? process.env;
+  const stdio = options.stdio ?? 'pipe';
   if (format === 'tar.gz') {
-    execFileSync('tar', ['-xzf', archivePath, '-C', destDir], { stdio: 'pipe' });
+    run('tar', ['-xzf', archivePath, '-C', destDir], { stdio });
     return;
   }
   if (format === 'zip') {
-    if (process.platform === 'win32') {
-      execFileSync('powershell.exe', [
-        '-NoLogo', '-NoProfile', '-NonInteractive',
-        '-Command', 'Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force',
-        archivePath, destDir,
-      ], { stdio: 'pipe' });
+    if (platform === 'win32') {
+      const psExe = resolveWindowsPowerShellPath(env);
+      const args = buildWindowsZipPowerShellArgs('Expand', archivePath, destDir, {
+        platform,
+        scriptPath: options.scriptPath,
+      });
+      run(psExe, args, { stdio });
     } else {
-      execFileSync('unzip', ['-q', archivePath, '-d', destDir], { stdio: 'pipe' });
+      run('unzip', ['-q', archivePath, '-d', destDir], { stdio });
+    }
+    return;
+  }
+  throw new Error(`unsupported archive format: ${format}`);
+}
+
+/**
+ * Create a `.tar.gz` or `.zip` archive from `stageDir`.
+ */
+export function createArchiveFromDir(stageDir, archivePath, format, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const run = options.execFileSyncImpl ?? execFileSync;
+  const env = options.env ?? process.env;
+  const stdio = options.stdio ?? 'pipe';
+  if (format === 'tar.gz') {
+    const entries = options.topEntries ?? readdirSync(stageDir).sort();
+    run('tar', ['-czf', archivePath, '-C', stageDir, ...entries], {
+      stdio,
+      env: { ...env, COPYFILE_DISABLE: '1' },
+    });
+    return;
+  }
+  if (format === 'zip') {
+    if (platform === 'win32') {
+      const psExe = resolveWindowsPowerShellPath(env);
+      const args = buildWindowsZipPowerShellArgs('Compress', stageDir, archivePath, {
+        platform,
+        scriptPath: options.scriptPath,
+      });
+      run(psExe, args, { stdio });
+    } else {
+      const entries = options.topEntries ?? readdirSync(stageDir).sort();
+      run('zip', ['-q', '-r', archivePath, ...entries], { cwd: stageDir, stdio });
     }
     return;
   }

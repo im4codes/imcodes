@@ -33,8 +33,10 @@ import { fileURLToPath } from 'node:url';
 import {
   DAEMON_RUNTIME_FILES_FILENAME,
   DEFAULT_DAEMON_RUNTIME_NODE_VERSION,
+  createArchiveFromDir,
   createDaemonRuntimeFilesDocument,
   createDaemonRuntimeManifest,
+  extractArchiveToDir,
   parseDaemonRuntimeTarget,
   pruneStagedNodeModulesForTarget,
   shouldKeepPackageLockEntry,
@@ -165,15 +167,9 @@ async function resolveNodeBinary({ targetInfo, nodeVersion, nodeBinOverride, wor
   );
 
   await rm(join(cacheRoot, dirName), { recursive: true, force: true });
-  if (targetInfo.isWindows && process.platform === 'win32') {
-    sh('powershell.exe', [
-      '-NoLogo', '-NoProfile', '-NonInteractive',
-      '-Command', 'Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force',
-      archivePath, cacheRoot,
-    ]);
-  } else {
-    sh('tar', ['-xf', archivePath, '-C', cacheRoot]);
-  }
+  extractArchiveToDir(archivePath, targetInfo.isWindows ? 'zip' : 'tar.gz', cacheRoot, {
+    stdio: 'inherit',
+  });
   if (!existsSync(nodeBin)) {
     throw new Error(`verified Node archive did not contain ${nodeBin}`);
   }
@@ -394,26 +390,10 @@ function signWindowsBundle(stageDir) {
 function createBundleArchive(stageDir, archivePath, targetInfo) {
   rmSync(archivePath, { force: true });
   const topEntries = readdirSync(stageDir).sort();
-  if (targetInfo.archiveFormat === 'tar.gz') {
-    sh('tar', ['-czf', archivePath, '-C', stageDir, ...topEntries], {
-      env: { ...process.env, COPYFILE_DISABLE: '1' },
-    });
-    return;
-  }
-  if (targetInfo.archiveFormat === 'zip') {
-    if (process.platform === 'win32') {
-      const systemRoot = process.env.SystemRoot?.trim() || 'C:\\Windows';
-      sh(join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), [
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-        'Compress-Archive -Path (Join-Path $args[0] "*") -DestinationPath $args[1] -CompressionLevel Optimal -Force',
-        stageDir, archivePath,
-      ]);
-    } else {
-      sh('zip', ['-q', '-r', archivePath, ...topEntries], { cwd: stageDir });
-    }
-    return;
-  }
-  throw new Error(`unsupported archive format: ${targetInfo.archiveFormat}`);
+  createArchiveFromDir(stageDir, archivePath, targetInfo.archiveFormat, {
+    stdio: 'inherit',
+    topEntries,
+  });
 }
 
 async function main() {

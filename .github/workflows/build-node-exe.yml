@@ -384,9 +384,11 @@ jobs:
           node scripts/daemon-runtime-artifacts.mjs verify \
             "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.manifest.json" \
             --expected-version "$IMCODES_BUILD_VERSION"
-          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-smoke.XXXXXX")"
-          HOME_ROOT="$(mkdtemp -d "${RUNNER_TEMP}/daemon-runtime-home.XXXXXX")"
+          SMOKE_ROOT=""
+          HOME_ROOT=""
           trap 'chmod -R u+w "$SMOKE_ROOT" 2>/dev/null || true; rm -rf "$SMOKE_ROOT" "$HOME_ROOT"' EXIT
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-smoke.XXXXXX")"
+          HOME_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-home.XXXXXX")"
           tar -xzf "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.tar.gz" -C "$SMOKE_ROOT"
           chmod -R a-w "$SMOKE_ROOT"
           env -i HOME="$HOME_ROOT" IMCODES_HOME="$HOME_ROOT/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \

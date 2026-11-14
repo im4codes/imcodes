@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -13,12 +14,17 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { parse as parseYaml } from 'yaml';
 // @ts-expect-error Plain ESM helper under scripts/
 import {
   DAEMON_RUNTIME_FILES_FILENAME,
+  WINDOWS_ZIP_SCRIPT_PATH,
+  buildWindowsZipPowerShellArgs,
   collectBundleFileEntries,
+  createArchiveFromDir,
   createDaemonRuntimeFilesDocument,
   createDaemonRuntimeManifest,
+  extractArchiveToDir,
   parseDaemonRuntimeTarget,
   pruneStagedNodeModulesForTarget,
   sanitizeBundleRelativePath,
@@ -324,5 +330,155 @@ describe('daemon-runtime CI wiring and macOS entitlements', () => {
     expect(entitlements).toContain('com.apple.security.cs.allow-unsigned-executable-memory');
     expect(entitlements).toContain('com.apple.security.cs.disable-library-validation');
     expect(entitlements).not.toContain('<!--');
+  });
+
+  it('executes the extracted POSIX smoke prelude in isolated bash without mkdtemp typos and cleans up via EXIT trap', () => {
+    const workflow = parseYaml(readFileSync('.github/workflows/build-node-exe.yml', 'utf8')) as {
+      jobs: { build: { steps: Array<{ name?: string; run?: string }> } };
+    };
+    const posixStep = workflow.jobs.build.steps.find(
+      (step) => step.name === 'Build, verify and smoke-test POSIX daemon-runtime bundle',
+    );
+    expect(posixStep?.run).toBeTruthy();
+    const lines = String(posixStep!.run).split('\n').map((line) => line.trimEnd());
+    const startIdx = lines.findIndex((line) => line.includes('SMOKE_ROOT=""'));
+    const trapIdx = lines.findIndex((line) => line.includes('trap '));
+    const homeMktempIdx = lines.findIndex((line) => line.includes('HOME_ROOT="$(mktemp -d'));
+    expect(startIdx).toBeGreaterThan(-1);
+    expect(trapIdx).toBeGreaterThan(startIdx);
+    expect(homeMktempIdx).toBeGreaterThan(trapIdx);
+    const prelude = lines.slice(startIdx, homeMktempIdx + 1).join('\n');
+    expect(prelude).not.toContain('mkdtemp');
+
+    const runnerTemp = tempDir('imcodes-posix-prelude-');
+    const stdout = execFileSync(
+      'bash',
+      [
+        '--noprofile',
+        '--norc',
+        '-c',
+        `set -euo pipefail\n${prelude}\ntest -d "$SMOKE_ROOT"\ntest -d "$HOME_ROOT"\nprintf '%s|%s\\n' "$SMOKE_ROOT" "$HOME_ROOT"`,
+      ],
+      {
+        env: { ...process.env, RUNNER_TEMP: runnerTemp },
+        encoding: 'utf8',
+      },
+    ).trim();
+
+    const [createdSmoke, createdHome] = stdout.split('|');
+    expect(createdSmoke.startsWith(runnerTemp)).toBe(true);
+    expect(createdHome.startsWith(runnerTemp)).toBe(true);
+    expect(createdSmoke).not.toBe(createdHome);
+    expect(readdirSync(runnerTemp)).toEqual([]);
+
+    // Partial-allocation failure: fail after SMOKE_ROOT is created, verify EXIT trap cleans up.
+    const partialLines = lines.slice(startIdx, homeMktempIdx).join('\n');
+    let failed = false;
+    try {
+      execFileSync(
+        'bash',
+        ['--noprofile', '--norc', '-c', `set -euo pipefail\n${partialLines}\nfalse`],
+        { env: { ...process.env, RUNNER_TEMP: runnerTemp }, stdio: 'pipe' },
+      );
+    } catch {
+      failed = true;
+    }
+    expect(failed).toBe(true);
+    expect(readdirSync(runnerTemp)).toEqual([]);
+  });
+});
+
+describe('Windows zip PowerShell -File invocation without -Command/$args', () => {
+  it('eliminates powershell -Command and $args across runtime build/verify scripts', () => {
+    const buildSrc = readFileSync('scripts/build-daemon-runtime.mjs', 'utf8');
+    const artifactsSrc = readFileSync('scripts/daemon-runtime-artifacts.mjs', 'utf8');
+    const ps1Src = readFileSync('scripts/windows-zip-archive.ps1', 'utf8');
+
+    expect(buildSrc).not.toMatch(/['"]-Command['"]/);
+    expect(buildSrc).not.toMatch(/\$args\[\d+\]/);
+    expect(artifactsSrc).not.toMatch(/['"]-Command['"]/);
+    expect(artifactsSrc).not.toMatch(/\$args\[\d+\]/);
+    expect(ps1Src).toContain("ValidateSet('Expand', 'Compress')");
+    expect(ps1Src).toContain('Expand-Archive -LiteralPath $SourcePath -DestinationPath $DestinationPath -Force');
+    expect(ps1Src).toContain('Compress-Archive -LiteralPath ($Items | ForEach-Object { $_.FullName }) -DestinationPath $DestinationPath -CompressionLevel Optimal -Force');
+  });
+
+  it('passes literal -File script arguments with spaces and single quotes under win32', () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const mockExec = (cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+    };
+    const stagePath = "C:\\Work Space\\stage 'one'\\$node";
+    const archivePath = "C:\\Out 'Dir'\\daemon runtime 'win32'.zip";
+    const extractPath = "C:\\Verify 'Dir'\\out put";
+    const env = { SystemRoot: "C:\\Win 'Root'" };
+
+    const builtArgs = buildWindowsZipPowerShellArgs('Compress', stagePath, archivePath, { platform: 'win32' });
+    expect(builtArgs).not.toContain('-Command');
+    expect(builtArgs).toEqual([
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      WINDOWS_ZIP_SCRIPT_PATH,
+      '-Mode',
+      'Compress',
+      '-SourcePath',
+      stagePath,
+      '-DestinationPath',
+      archivePath,
+    ]);
+
+    createArchiveFromDir(stagePath, archivePath, 'zip', {
+      platform: 'win32',
+      env,
+      execFileSyncImpl: mockExec,
+    });
+    extractArchiveToDir(archivePath, 'zip', extractPath, {
+      platform: 'win32',
+      env,
+      execFileSyncImpl: mockExec,
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].cmd).toBe("C:\\Win 'Root'\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(calls[0].args[calls[0].args.indexOf('-Mode') + 1]).toBe('Compress');
+    expect(calls[0].args[calls[0].args.indexOf('-SourcePath') + 1]).toBe(stagePath);
+    expect(calls[0].args[calls[0].args.indexOf('-DestinationPath') + 1]).toBe(archivePath);
+    expect(calls[1].cmd).toBe("C:\\Win 'Root'\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(calls[1].args[calls[1].args.indexOf('-Mode') + 1]).toBe('Expand');
+    expect(calls[1].args[calls[1].args.indexOf('-SourcePath') + 1]).toBe(archivePath);
+    expect(calls[1].args[calls[1].args.indexOf('-DestinationPath') + 1]).toBe(extractPath);
+  });
+
+  it('round-trips a real zip bundle whose stage and archive paths contain spaces and single quotes', async () => {
+    const root = tempDir('imcodes-dr-zip-');
+    const bundleRoot = join(root, "stage with spaces and 'quotes'");
+    const outDir = join(root, "out with spaces and 'quotes'");
+    mkdirSync(outDir, { recursive: true });
+    createFakeBundle(bundleRoot, 'win32');
+    const localOpts = {
+      bundleRoot,
+      os: 'win32',
+      arch: 'x64',
+      nodeVersion: 'v24.16.0',
+      nodeProvider: 'local-node-bin',
+      nodeBinarySha256: sha256('local-node'),
+      buildCommit: 'd'.repeat(40),
+      buildVersion: '0.1.3',
+    };
+    const filesDoc = await createDaemonRuntimeFilesDocument(localOpts);
+    await writeDaemonRuntimeJson(join(bundleRoot, DAEMON_RUNTIME_FILES_FILENAME), filesDoc);
+    const archivePath = join(outDir, "daemon-runtime-win32 'test'.zip");
+    createArchiveFromDir(bundleRoot, archivePath, 'zip');
+    const { manifest } = await createDaemonRuntimeManifest({ ...localOpts, archivePath });
+    const manifestPath = join(outDir, "daemon-runtime-win32 'test'.manifest.json");
+    await writeDaemonRuntimeJson(manifestPath, manifest);
+
+    const verified = await verifyDaemonRuntimeArchive(manifestPath, { requireOfficialNode: false });
+    expect(verified.artifact.format).toBe('zip');
+    expect(verified.fileCount).toBe(manifest.fileCount);
   });
 });
