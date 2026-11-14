@@ -2068,6 +2068,9 @@ const REPO_REQUEST_TYPES = new Set<string>([
 
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
+// Periodic share-expiry & controlled-read sweep handle (module-level, shared across all active bridges)
+let shareExpirySweepHandle: ReturnType<typeof setInterval> | null = null;
+const SHARE_EXPIRY_SWEEP_INTERVAL_MS = 30_000;
 let shareClockNow = (): number => Date.now();
 
 export function __setShareBridgeClockForTests(clock: (() => number) | null): void {
@@ -2100,6 +2103,15 @@ const SHARE_HOT_PATH_COVERAGE_TTL_MS = 5_000;
 const SHARE_INPUT_AUTHORITY_REUSE_MS = 30_000;
 /** Share-command audit rows that may be waiting to be written; beyond it new ones are dropped and counted. */
 const SHARE_AUDIT_MAX_PENDING = 500;
+/** Throttle periodic heartbeat DB writes well below MACHINE_PRESENCE_STALENESS_MS (90s) and cron timeout (10m). */
+const HEARTBEAT_DB_WRITE_INTERVAL_MS = 45_000;
+/** Long fallback interval for cross-pod capability sync checks on heartbeat when no operations are active. */
+const CAPABILITY_HEARTBEAT_FALLBACK_INTERVAL_MS = 60_000;
+/** Cache controlled-node hostId resolution within a connection generation before periodic fallback recheck. */
+const REMOTE_DESKTOP_NODE_CONTEXT_RECHECK_MS = 60_000;
+/** Bounded positive ownership cache for DB-verified main sessions; invalidated on session removal/disconnect. */
+const SESSION_OWNERSHIP_CACHE_TTL_MS = 5 * 60_000;
+const SESSION_OWNERSHIP_CACHE_MAX_ENTRIES = 2048;
 
 function capabilityOpaqueId(value: unknown): string | null {
   return typeof value === 'string' && value.trim() && value.length <= 128 ? value : null;
@@ -2267,6 +2279,97 @@ export class WsBridge {
   private daemonOwnerUserId: string | null = null;
   private lastCapabilityRevisionSent = 0;
   private capabilitySyncInitialized = false;
+  private lastCapabilityHeartbeatRefreshAt = 0;
+  private activeCapabilityOperations = new Set<string>();
+  private remoteDesktopNodeContextCache: {
+    generation: number;
+    hostId: string;
+    checkedAt: number;
+  } | null = null;
+  private remoteDesktopNodeContextLastUnavailableGeneration: number | null = null;
+  private remoteDesktopNodeContextInFlight: {
+    generation: number;
+    promise: Promise<void>;
+  } | null = null;
+  private lastHeartbeatDbWriteAt = 0;
+  private lastHeartbeatDbVersion: string | null = null;
+  private lastHeartbeatDbGeneration: number | null = null;
+  private lastHeartbeatDbStatus: 'online' | 'offline' | null = null;
+
+  private resetHeartbeatDbPersistenceState(status: 'online' | 'offline' | null = null): void {
+    this.lastHeartbeatDbWriteAt = 0;
+    this.lastHeartbeatDbVersion = null;
+    this.lastHeartbeatDbGeneration = null;
+    this.lastHeartbeatDbStatus = status;
+  }
+
+  private persistHeartbeatIfDue(
+    db: Database,
+    connectionGeneration: number,
+    daemonVersion: string | null | undefined,
+    options?: {
+      force?: boolean;
+      controlledCapabilities?: ControlledNodeCapability[];
+      runtimeArch?: string | null;
+      logLabel?: string;
+    },
+  ): void {
+    const normalizedVersion = typeof daemonVersion === 'string' ? daemonVersion : null;
+    const now = Date.now();
+    const force = options?.force === true;
+    const isDue = force
+      || this.lastHeartbeatDbStatus !== 'online'
+      || this.lastHeartbeatDbGeneration !== connectionGeneration
+      || this.lastHeartbeatDbVersion !== normalizedVersion
+      || this.lastHeartbeatDbWriteAt <= 0
+      || (now - this.lastHeartbeatDbWriteAt) >= HEARTBEAT_DB_WRITE_INTERVAL_MS;
+    if (!isDue) return;
+
+    const prevWriteAt = this.lastHeartbeatDbWriteAt;
+    const prevVersion = this.lastHeartbeatDbVersion;
+    const prevGeneration = this.lastHeartbeatDbGeneration;
+    const prevStatus = this.lastHeartbeatDbStatus;
+
+    this.lastHeartbeatDbWriteAt = now;
+    this.lastHeartbeatDbVersion = normalizedVersion;
+    this.lastHeartbeatDbGeneration = connectionGeneration;
+    this.lastHeartbeatDbStatus = 'online';
+
+    const writePromise = options?.controlledCapabilities !== undefined || options?.runtimeArch !== undefined
+      ? updateServerHeartbeat(
+          db,
+          this.serverId,
+          normalizedVersion,
+          options?.controlledCapabilities,
+          options?.runtimeArch,
+        )
+      : updateServerHeartbeat(db, this.serverId, normalizedVersion);
+
+    writePromise.catch((err) => {
+      if (this.daemonGeneration === connectionGeneration && this.lastHeartbeatDbWriteAt === now) {
+        this.lastHeartbeatDbWriteAt = prevWriteAt;
+        this.lastHeartbeatDbVersion = prevVersion;
+        this.lastHeartbeatDbGeneration = prevGeneration;
+        this.lastHeartbeatDbStatus = prevStatus;
+      }
+      logger.error({ err }, options?.logLabel ?? 'Failed to update heartbeat');
+    });
+  }
+
+  invalidateRemoteDesktopNodeContext(): void {
+    this.remoteDesktopNodeContextCache = null;
+    this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+  }
+
+  static invalidateRemoteDesktopNodeContext(serverId?: string): void {
+    if (serverId) {
+      WsBridge.instances.get(serverId)?.invalidateRemoteDesktopNodeContext();
+      return;
+    }
+    for (const bridge of WsBridge.instances.values()) {
+      bridge.invalidateRemoteDesktopNodeContext();
+    }
+  }
 
   /**
    * Publish the two authority coordinates a controlled node cannot derive:
@@ -2283,6 +2386,16 @@ export class WsBridge {
       || this.daemonWs !== ws
       || this.daemonGeneration !== connectionGeneration
       || !this.authenticated) return;
+    if (this.remoteDesktopNodeContextInFlight?.generation === connectionGeneration) {
+      await this.remoteDesktopNodeContextInFlight.promise;
+      return;
+    }
+    const cached = this.remoteDesktopNodeContextCache;
+    if (cached
+      && cached.generation === connectionGeneration
+      && (Date.now() - cached.checkedAt) < REMOTE_DESKTOP_NODE_CONTEXT_RECHECK_MS) {
+      return;
+    }
     const sendUnavailable = () => {
       if (this.daemonWs !== ws
         || this.daemonGeneration !== connectionGeneration
@@ -2292,30 +2405,65 @@ export class WsBridge {
         daemonGeneration: connectionGeneration,
       }));
     };
-    try {
-      const row = await db.queryOne<{ host_id: string }>(
-        'SELECT host_id FROM remote_desktop_host_endpoints WHERE server_id = $1',
-        [this.serverId],
-      );
-      const context = row ? validateRemoteDesktopNodeAuthorityContext({
-        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
-        hostId: row.host_id,
-        daemonGeneration: connectionGeneration,
-      }) : null;
-      if (!context?.ok) {
-        sendUnavailable();
-        return;
+    const run = (async () => {
+      try {
+        const row = await db.queryOne<{ host_id: string }>(
+          'SELECT host_id FROM remote_desktop_host_endpoints WHERE server_id = $1',
+          [this.serverId],
+        );
+        if (this.daemonWs !== ws
+          || this.daemonGeneration !== connectionGeneration
+          || !this.authenticated) return;
+        const context = row ? validateRemoteDesktopNodeAuthorityContext({
+          type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+          hostId: row.host_id,
+          daemonGeneration: connectionGeneration,
+        }) : null;
+        if (!context?.ok || context.value.type !== REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT) {
+          const hadCachedCurrent = this.remoteDesktopNodeContextCache?.generation === connectionGeneration;
+          this.remoteDesktopNodeContextCache = null;
+          if (hadCachedCurrent || this.remoteDesktopNodeContextLastUnavailableGeneration !== connectionGeneration) {
+            this.remoteDesktopNodeContextLastUnavailableGeneration = connectionGeneration;
+            sendUnavailable();
+          }
+          return;
+        }
+        const previousHostId = this.remoteDesktopNodeContextCache?.generation === connectionGeneration
+          ? this.remoteDesktopNodeContextCache.hostId
+          : null;
+        this.remoteDesktopNodeContextCache = {
+          generation: connectionGeneration,
+          hostId: context.value.hostId,
+          checkedAt: Date.now(),
+        };
+        this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+        if (previousHostId !== context.value.hostId) {
+          ws.send(JSON.stringify(context.value));
+        }
+      } catch (error) {
+        // Host backfill/migration failure removes consent authority; it must not
+        // take unrelated controlled-node exec/file-transfer liveness down.
+        logger.warn({ error, serverId: this.serverId },
+          'could not publish remote desktop canonical-host context');
+        if (this.daemonWs !== ws
+          || this.daemonGeneration !== connectionGeneration
+          || !this.authenticated) return;
+        const hadCachedCurrent = this.remoteDesktopNodeContextCache?.generation === connectionGeneration;
+        this.remoteDesktopNodeContextCache = null;
+        if (hadCachedCurrent || this.remoteDesktopNodeContextLastUnavailableGeneration !== connectionGeneration) {
+          this.remoteDesktopNodeContextLastUnavailableGeneration = connectionGeneration;
+          sendUnavailable();
+        }
       }
-      if (this.daemonWs !== ws
-        || this.daemonGeneration !== connectionGeneration
-        || !this.authenticated) return;
-      ws.send(JSON.stringify(context.value));
-    } catch (error) {
-      // Host backfill/migration failure removes consent authority; it must not
-      // take unrelated controlled-node exec/file-transfer liveness down.
-      logger.warn({ error, serverId: this.serverId },
-        'could not publish remote desktop canonical-host context');
-      sendUnavailable();
+    })();
+    const inFlight = { generation: connectionGeneration, promise: run };
+    this.remoteDesktopNodeContextInFlight = inFlight;
+    try {
+      await run;
+    } finally {
+      if (this.remoteDesktopNodeContextInFlight === inFlight) {
+        this.remoteDesktopNodeContextInFlight = null;
+      }
     }
   }
   /**
@@ -2330,9 +2478,7 @@ export class WsBridge {
   ): void {
     const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
     if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
-    updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
-      logger.error({ err }, 'Failed to update heartbeat'),
-    );
+    this.persistHeartbeatIfDue(db, connectionGeneration, hbVersion);
     try { ws.send(JSON.stringify(heartbeatAckWithClock(
       msg,
       this.daemonControlledNodeId,
@@ -2568,7 +2714,6 @@ export class WsBridge {
   /** browser socket → live share-scoped authorization state */
   private browserShareStates = new Map<WebSocket, ShareScopedSocketState>();
   private shareCoverageResolver: ShareCoverageResolver = resolveShareCoverageFromDb;
-  private shareExpirySweepTimer: ReturnType<typeof setInterval> | null = null;
   private sessionRuntimeTypes = new Map<string, 'process' | 'transport' | 'unknown'>();
   private activeDispatchIds = new Map<string, string>();
 
@@ -2817,6 +2962,8 @@ export class WsBridge {
   /** Latest daemon-owned active sub-session snapshot for push title resolution. */
   private activeSubSessions = new Map<string, WatchActiveSubSessionRow>();
   private hasActiveMainSessionSnapshot = false;
+  /** Bounded LRU+TTL positive cache of DB-verified main session names scoped strictly to this serverId. */
+  private verifiedMainSessionOwnership = new Map<string, number>();
   /**
    * Project-identity scope key per session, exactly as the daemon derives it
    * (sessionIdentityProjectKey). Browser session lists for share recipients
@@ -2942,10 +3089,49 @@ export class WsBridge {
     setPreviewEvictedHook((serverId, previewId) =>
       WsBridge.instances.get(serverId)?.terminatePreviewRelaysForPreview(previewId),
     );
-    this.shareExpirySweepTimer = setInterval(() => {
-      void this.sweepShareSockets();
-    }, 30_000);
-    this.shareExpirySweepTimer.unref?.();
+  }
+
+  private hasActiveShareSweepState(): boolean {
+    return this.browserShareStates.size > 0 || this.controlledTargetBrowserSockets.size > 0;
+  }
+
+  private static ensureShareExpirySweepTimer(): void {
+    if (shareExpirySweepHandle) return;
+    shareExpirySweepHandle = setInterval(() => {
+      if (WsBridge.instances.size === 0) {
+        WsBridge.stopShareExpirySweepTimer();
+        return;
+      }
+      let anyActive = false;
+      for (const bridge of WsBridge.instances.values()) {
+        if (!bridge.hasActiveShareSweepState()) continue;
+        anyActive = true;
+        void bridge.sweepShareSockets().catch((err) =>
+          logger.warn({ err, serverId: bridge.serverId }, 'Share expiry sweep failed'),
+        );
+      }
+      if (!anyActive) {
+        WsBridge.stopShareExpirySweepTimer();
+      }
+    }, SHARE_EXPIRY_SWEEP_INTERVAL_MS);
+    shareExpirySweepHandle.unref?.();
+  }
+
+  private static stopShareExpirySweepTimer(): void {
+    if (shareExpirySweepHandle) {
+      clearInterval(shareExpirySweepHandle);
+      shareExpirySweepHandle = null;
+    }
+  }
+
+  private static syncShareExpirySweepTimer(): void {
+    for (const bridge of WsBridge.instances.values()) {
+      if (bridge.hasActiveShareSweepState()) {
+        WsBridge.ensureShareExpirySweepTimer();
+        return;
+      }
+    }
+    WsBridge.stopShareExpirySweepTimer();
   }
 
   static get(serverId: string): WsBridge {
@@ -3153,6 +3339,7 @@ export class WsBridge {
         });
         bridge.daemonWs.send(JSON.stringify(toCapabilitySyncAuthorityFrame(authority, keys)));
         bridge.lastCapabilityRevisionSent = record.revision;
+        bridge.lastCapabilityHeartbeatRefreshAt = Date.now();
         delivered += 1;
       } catch (error) {
         logger.warn({ error, serverId: bridge.serverId }, 'Capability sync fan-out failed');
@@ -3177,6 +3364,7 @@ export class WsBridge {
         pending,
         [bridge.capabilityAuthorizationSigner.key],
       )));
+      bridge.activeCapabilityOperations.add(pending.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: pending.targetServerId, operationId }, 'Capability authorization dispatch failed');
@@ -3201,6 +3389,7 @@ export class WsBridge {
     if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
     try {
       this.daemonWs.send(JSON.stringify(frame));
+      this.activeCapabilityOperations.add(frame.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: this.serverId }, 'Capability install dispatch failed');
@@ -3213,6 +3402,8 @@ export class WsBridge {
     if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
     try {
       this.daemonWs.send(JSON.stringify(frame));
+      if (frame.decision === 'install') this.activeCapabilityOperations.add(frame.operationId);
+      else this.activeCapabilityOperations.delete(frame.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: this.serverId }, 'Capability confirmation dispatch failed');
@@ -3225,6 +3416,7 @@ export class WsBridge {
     if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
     try {
       this.daemonWs.send(JSON.stringify(frame));
+      this.activeCapabilityOperations.delete(frame.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: this.serverId }, 'Capability cancellation dispatch failed');
@@ -3323,6 +3515,7 @@ export class WsBridge {
     )));
     this.lastCapabilityRevisionSent = record.revision;
     this.capabilitySyncInitialized = true;
+    this.lastCapabilityHeartbeatRefreshAt = Date.now();
     await this.replayPendingCapabilityBlobUploads(db, socket, expectedGeneration, ownerUserId);
     await this.replayPendingCapabilityAuthorizations(db, socket, expectedGeneration, ownerUserId);
     await this.replayLocalCapabilityManageRequests(db, socket, expectedGeneration, ownerUserId);
@@ -3337,59 +3530,75 @@ export class WsBridge {
     if (!ownerUserId
       || !this.capabilitySyncInitialized
       || !this.canAcceptCapabilityOperation(ownerUserId)) return;
-    await this.expirePreActivationCapabilityOperations(
-      db,
-      socket,
-      expectedGeneration,
-      ownerUserId,
-    );
-    const expired = await expireCapabilityPendingActivations(db, {
-      ownerUserId,
-      targetServerId: this.serverId,
-    });
-    for (const entry of expired) {
-      this.broadcastToBrowsers(JSON.stringify({
-        type: CAPABILITY_OPERATION_MSG.PROGRESS,
-        operationId: entry.operation.id,
-        revision: entry.operation.revision,
-        state: entry.operation.state,
-        errorCode: entry.operation.errorCode,
-      }));
-      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
-        socket.send(JSON.stringify({
-          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
-          operationId: entry.operation.id,
-          capabilityId: entry.capabilityId,
-          versionId: entry.versionId,
-          bindingId: entry.bindingId,
-          authorityRevision: entry.authorityRevision,
-          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
-        } satisfies CapabilityOperationCommitAbortFrame));
-      }
+    const hasPendingWork = this.activeCapabilityOperations.size > 0 || this.pendingCapabilityManage.size > 0;
+    const now = Date.now();
+    if (!hasPendingWork
+      && (now - this.lastCapabilityHeartbeatRefreshAt) < CAPABILITY_HEARTBEAT_FALLBACK_INTERVAL_MS) {
+      return;
     }
-    const record = await getCapabilitySyncSnapshot(db, {
-      ownerUserId,
-      maxItems: CAPABILITY_LIMITS.LIST_MAX,
-      afterRevision: this.lastCapabilityRevisionSent,
-    });
-    if (record.revision <= this.lastCapabilityRevisionSent
-      || this.daemonWs !== socket
-      || this.daemonGeneration !== expectedGeneration) return;
-    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
-      record,
-      CAPABILITY_SYNC_MSG.DELTA,
-      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
-    )));
-    const authority = await getCapabilityAuthorityRecordSet(db, {
-      ownerUserId,
-      serverId: this.serverId,
-    });
-    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
-    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
-      authority,
-      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
-    )));
-    this.lastCapabilityRevisionSent = record.revision;
+    const prevRefreshAt = this.lastCapabilityHeartbeatRefreshAt;
+    this.lastCapabilityHeartbeatRefreshAt = now;
+    try {
+      await this.expirePreActivationCapabilityOperations(
+        db,
+        socket,
+        expectedGeneration,
+        ownerUserId,
+      );
+      const expired = await expireCapabilityPendingActivations(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+      });
+      for (const entry of expired) {
+        this.activeCapabilityOperations.delete(entry.operation.id);
+        this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId: entry.operation.id,
+          revision: entry.operation.revision,
+          state: entry.operation.state,
+          errorCode: entry.operation.errorCode,
+        }));
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId: entry.operation.id,
+            capabilityId: entry.capabilityId,
+            versionId: entry.versionId,
+            bindingId: entry.bindingId,
+            authorityRevision: entry.authorityRevision,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+      }
+      const record = await getCapabilitySyncSnapshot(db, {
+        ownerUserId,
+        maxItems: CAPABILITY_LIMITS.LIST_MAX,
+        afterRevision: this.lastCapabilityRevisionSent,
+      });
+      if (record.revision <= this.lastCapabilityRevisionSent
+        || this.daemonWs !== socket
+        || this.daemonGeneration !== expectedGeneration) return;
+      socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+        record,
+        CAPABILITY_SYNC_MSG.DELTA,
+        this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+      )));
+      const authority = await getCapabilityAuthorityRecordSet(db, {
+        ownerUserId,
+        serverId: this.serverId,
+      });
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+        authority,
+        this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+      )));
+      this.lastCapabilityRevisionSent = record.revision;
+    } catch (error) {
+      if (this.lastCapabilityHeartbeatRefreshAt === now) {
+        this.lastCapabilityHeartbeatRefreshAt = prevRefreshAt;
+      }
+      throw error;
+    }
   }
 
   private async expirePreActivationCapabilityOperations(
@@ -3407,6 +3616,7 @@ export class WsBridge {
       serverId: this.serverId,
     });
     for (const operation of expired) {
+      this.activeCapabilityOperations.delete(operation.id);
       this.broadcastToBrowsers(JSON.stringify({
         type: CAPABILITY_OPERATION_MSG.PROGRESS,
         operationId: operation.id,
@@ -3437,6 +3647,7 @@ export class WsBridge {
     });
     for (const entry of expired) {
       const { operation } = entry;
+      this.activeCapabilityOperations.delete(operation.id);
       this.broadcastToBrowsers(JSON.stringify({
         type: CAPABILITY_OPERATION_MSG.PROGRESS,
         operationId: operation.id,
@@ -3463,6 +3674,7 @@ export class WsBridge {
     });
     for (const entry of pending) {
       if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      this.activeCapabilityOperations.add(entry.operationId);
       socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
         entry,
         [this.capabilityAuthorizationSigner.key],
@@ -3483,6 +3695,7 @@ export class WsBridge {
     });
     for (const entry of pending) {
       if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      this.activeCapabilityOperations.add(entry.operationId);
       const access = await issueCapabilityBlobAccess(db, {
         ownerUserId,
         serverId: this.serverId,
@@ -3851,6 +4064,14 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, operationId, expectedRevision }, 'Dropped stale capability progress');
         return true;
       }
+      if (updated.state === CAPABILITY_INSTALL_STATE.INSTALLED
+        || updated.state === CAPABILITY_INSTALL_STATE.REWORK
+        || updated.state === CAPABILITY_INSTALL_STATE.FAILED
+        || updated.state === CAPABILITY_INSTALL_STATE.CANCELLED) {
+        this.activeCapabilityOperations.delete(operationId);
+      } else {
+        this.activeCapabilityOperations.add(operationId);
+      }
       this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: updated.revision }));
       return true;
     }
@@ -4000,6 +4221,7 @@ export class WsBridge {
             } satisfies CapabilityOperationCancelFrame));
           }
         }
+        this.activeCapabilityOperations.delete(operationId);
         return true;
       }
       if (activated.pendingBlob && this.capabilityBlobSigningKey) {
@@ -4039,6 +4261,7 @@ export class WsBridge {
             state: failed.state,
             errorCode: failed.errorCode,
           }));
+          this.activeCapabilityOperations.delete(operationId);
           return true;
         }
       } else if (this.capabilityAuthorizationSigner) {
@@ -4049,6 +4272,14 @@ export class WsBridge {
             [this.capabilityAuthorizationSigner.key],
           )));
         }
+      }
+      if (activated.operation.state === CAPABILITY_INSTALL_STATE.INSTALLED
+        || activated.operation.state === CAPABILITY_INSTALL_STATE.REWORK
+        || activated.operation.state === CAPABILITY_INSTALL_STATE.FAILED
+        || activated.operation.state === CAPABILITY_INSTALL_STATE.CANCELLED) {
+        this.activeCapabilityOperations.delete(operationId);
+      } else {
+        this.activeCapabilityOperations.add(operationId);
       }
       this.broadcastToBrowsers(JSON.stringify({
         type: CAPABILITY_OPERATION_MSG.PROGRESS,
@@ -4100,13 +4331,16 @@ export class WsBridge {
             errorCode,
           } satisfies CapabilityOperationCommitAbortFrame));
         }
-        if (failed) this.broadcastToBrowsers(JSON.stringify({
-          type: CAPABILITY_OPERATION_MSG.PROGRESS,
-          operationId,
-          revision: failed.revision,
-          state: failed.state,
-          errorCode: failed.errorCode,
-        }));
+        if (failed) {
+          this.activeCapabilityOperations.delete(operationId);
+          this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+        }
         return true;
       }
       const completed = await completeCapabilityCommit(db, {
@@ -4144,6 +4378,7 @@ export class WsBridge {
           authorityRevision,
         } satisfies CapabilityOperationCommitAckFrame));
       }
+      this.activeCapabilityOperations.delete(operationId);
       await WsBridge.broadcastCapabilitySync(
         ownerUserId,
         db,
@@ -5842,6 +6077,12 @@ export class WsBridge {
     this.authenticated = false;
     this.lastCapabilityRevisionSent = 0;
     this.capabilitySyncInitialized = false;
+    this.lastCapabilityHeartbeatRefreshAt = 0;
+    this.activeCapabilityOperations.clear();
+    this.remoteDesktopNodeContextCache = null;
+    this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+    this.remoteDesktopNodeContextInFlight = null;
+    this.resetHeartbeatDbPersistenceState(null);
     this.controlledNodeCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
@@ -6116,6 +6357,7 @@ export class WsBridge {
         this.incognitoSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
+        this.verifiedMainSessionOwnership.clear();
         this.hasActiveMainSessionSnapshot = false;
         // This connection's own credentials are verified: a controlled node's heartbeat may be acknowledged now.
         const credentialMs = Date.now() - authStartedAt;
@@ -6154,67 +6396,61 @@ export class WsBridge {
         }
         onAuthenticated?.();
 
-        updateServerHeartbeat(
-          db,
-          this.serverId,
-          this.daemonVersion,
-          this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
+        this.persistHeartbeatIfDue(db, connectionGeneration, this.daemonVersion, {
+          force: true,
+          controlledCapabilities: this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
           // Validated before it is stored: this column is read by artifact
           // selection, and an unrecognised value is worse than the stale one
           // it would replace.
-          typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
+          runtimeArch: typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
             ? msg.runtimeArch
             : null,
-        ).catch((err) =>
-          logger.error({ err }, 'Failed to update heartbeat on auth'),
-        );
-        // Full-daemon-only traffic (memory feature config) is NOT pushed to a
+          logLabel: 'Failed to update heartbeat on auth',
+        });
+        const postAuthTasks: Array<Promise<void>> = [];
+        // Full-daemon-only traffic (memory feature config + user identity) is NOT pushed to a
         // controlled node — it is a restricted presence/exec-result surface (10.2).
         if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && typeof server.user_id === 'string' && server.user_id.trim()) {
-          try {
-            const memoryFeatureFlags = await this.readUserMemoryFeatureFlags(server.user_id);
-            if (!isCurrentAuthConnection()) {
-              finishLocalAuth();
-              return;
+          const authUserId = server.user_id;
+          postAuthTasks.push((async () => {
+            try {
+              const memoryFeatureFlags = await this.readUserMemoryFeatureFlags(authUserId);
+              if (!isCurrentAuthConnection()) return;
+              this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
+            } catch (err) {
+              logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
             }
-            this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
-          } catch (err) {
-            logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
-          }
-          if (!isCurrentAuthConnection()) {
-            finishLocalAuth();
-            return;
-          }
+          })());
           // USER-scope identity content lives on the server; push it now
           // instead of the daemon polling for it (owner rule,
           // tsk_cd_identity_daemon_storage). Unconditional: this event is
           // rare (one per connect) and the content is capped at 100k chars,
           // so no need for hash comparison here -- a reconnecting daemon
           // with a stale copy gets the current one either way.
-          try {
-            const userProfile = await getServerSessionIdentityProfile(db, server.user_id, 'user', '');
-            if (!isCurrentAuthConnection()) {
-              finishLocalAuth();
-              return;
+          postAuthTasks.push((async () => {
+            try {
+              const userProfile = await getServerSessionIdentityProfile(db, authUserId, 'user', '');
+              if (!isCurrentAuthConnection()) return;
+              if (userProfile && userProfile.content) this.sendSessionIdentityUserPush(userProfile);
+            } catch (err) {
+              logger.warn({ err, serverId: this.serverId }, 'failed to push user identity on daemon auth');
             }
-            if (userProfile && userProfile.content) this.sendSessionIdentityUserPush(userProfile);
-          } catch (err) {
-            logger.warn({ err, serverId: this.serverId }, 'failed to push user identity on daemon auth');
-          }
-          if (!isCurrentAuthConnection()) {
-            finishLocalAuth();
-            return;
-          }
+          })());
         }
         if (this.daemonNodeRole === NODE_ROLE.FULL) {
-          try {
-            await this.sendCapabilitySnapshot(db, ws, connectionGeneration);
-          } catch (error) {
-            // Capability sync is fail-closed and independent from core daemon
-            // liveness. Keep the connection, report the unavailable slice, and
-            // let the daemon retry with CAPABILITY_SYNC_MSG.REQUEST.
-            logger.warn({ error, serverId: this.serverId }, 'Initial capability snapshot failed');
-          }
+          postAuthTasks.push((async () => {
+            try {
+              await this.sendCapabilitySnapshot(db, ws, connectionGeneration);
+            } catch (error) {
+              // Capability sync is fail-closed and independent from core daemon
+              // liveness. Keep the connection, report the unavailable slice, and
+              // let the daemon retry with CAPABILITY_SYNC_MSG.REQUEST.
+              logger.warn({ error, serverId: this.serverId }, 'Initial capability snapshot failed');
+            }
+          })());
+        }
+        if (postAuthTasks.length > 0) {
+          await Promise.all(postAuthTasks);
           if (!isCurrentAuthConnection()) {
             finishLocalAuth();
             return;
@@ -6630,9 +6866,7 @@ export class WsBridge {
           ? msg.daemonVersion
           : this.daemonVersion;
         if (typeof heartbeatDaemonVersion === 'string') this.daemonVersion = heartbeatDaemonVersion;
-        updateServerHeartbeat(db, this.serverId, heartbeatDaemonVersion).catch((err) =>
-          logger.error({ err }, 'Failed to update heartbeat'),
-        );
+        this.persistHeartbeatIfDue(db, connectionGeneration, heartbeatDaemonVersion);
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead
         try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
         void this.refreshCapabilitySyncOnHeartbeat(db, ws, connectionGeneration).catch((error: unknown) => {
@@ -6730,6 +6964,7 @@ export class WsBridge {
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
+        this.verifiedMainSessionOwnership.clear();
         this.hasActiveMainSessionSnapshot = false;
         this.clearAutoUpgradeRetryTimer();
         this.rejectAllPendingFileTransfers('daemon_disconnected');
@@ -6749,6 +6984,12 @@ export class WsBridge {
         this.daemonControlledOs = null;
         this.daemonControlledNodeId = null;
         this.daemonOwnerUserId = null;
+        this.lastCapabilityHeartbeatRefreshAt = 0;
+        this.activeCapabilityOperations.clear();
+        this.remoteDesktopNodeContextCache = null;
+        this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+        this.remoteDesktopNodeContextInFlight = null;
+        this.resetHeartbeatDbPersistenceState('offline');
         if (disconnectedOwnerUserId) {
           this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
         }
@@ -6823,6 +7064,7 @@ export class WsBridge {
       coveredSessionNames,
       coveredProjectDirs,
     });
+    WsBridge.ensureShareExpirySweepTimer();
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
     void this.refreshShareActorDisplayName(ws);
     void this.refreshShareCoveredSessions(ws);
@@ -7002,6 +7244,16 @@ export class WsBridge {
   async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
     // Synchronous, before any await: from here no socket's cached coverage serves a command.
     this.shareCoverageEpoch += 1;
+    if (target.kind === 'main') {
+      this.verifiedMainSessionOwnership.delete(target.sessionName);
+      this.activeMainSessions.delete(target.sessionName);
+    } else if (target.kind === 'subsession') {
+      const subName = `deck_sub_${target.subSessionId}`;
+      this.verifiedMainSessionOwnership.delete(subName);
+      this.activeSubSessions.delete(subName);
+    } else if (target.kind === 'server') {
+      this.verifiedMainSessionOwnership.clear();
+    }
     const sockets = [...this.browserShareStates]
       .filter(([, state]) => (
         state.target.serverId === target.serverId
@@ -7027,6 +7279,7 @@ export class WsBridge {
     if (controlledTarget) {
       this.controlledTargetBrowserSockets.add(ws);
       this.controlledBrowserReads.register(ws, userId);
+      WsBridge.ensureShareExpirySweepTimer();
       void this.controlledBrowserReads.revalidate(userId);
     }
     const sendInitial = (json: string) => controlledTarget ? this.controlledBrowserReads.send(ws, json) : safeSend(ws, json);
@@ -9180,9 +9433,16 @@ export class WsBridge {
 
     // ── Lifecycle events: broadcast whitelist ─────────────────────────────────
     if (type === 'session_event') {
-      if (msg.event === 'stopped' && typeof msg.session === 'string' && msg.session) {
-        this.incognitoSessions.delete(msg.session);
-        this.recentTextBySession.delete(msg.session);
+      if (typeof msg.session === 'string' && msg.session
+        && (msg.event === 'stopped' || msg.event === 'deleted' || msg.event === 'removed' || msg.event === 'closed')) {
+        this.verifiedMainSessionOwnership.delete(msg.session);
+        if (msg.event === 'deleted' || msg.event === 'removed') {
+          this.activeMainSessions.delete(msg.session);
+        }
+        if (msg.event === 'stopped') {
+          this.incognitoSessions.delete(msg.session);
+          this.recentTextBySession.delete(msg.session);
+        }
       }
       this.broadcastToBrowsers(JSON.stringify({ ...msg, type: 'session.event' }));
       return;
@@ -9832,6 +10092,11 @@ export class WsBridge {
       this.activeMainSessions.set(name, { name, project, projectDir, state, agentType, runtimeType, label });
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
+    }
+    for (const cachedSession of this.verifiedMainSessionOwnership.keys()) {
+      if (!this.activeMainSessions.has(cachedSession)) {
+        this.verifiedMainSessionOwnership.delete(cachedSession);
+      }
     }
     this.syncCoveredProjectDirsAcrossShareSockets();
     this.scheduleAutoUpgradeFlushAtIdleBoundary();
@@ -10567,6 +10832,7 @@ export class WsBridge {
     this.controlledTargetBrowserSockets.delete(ws);
     this.controlledBrowserReads.remove(ws);
     this.browserShareStates.delete(ws);
+    WsBridge.syncShareExpirySweepTimer();
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
       for (const sessionName of [...sessions.keys()]) {
@@ -10616,6 +10882,17 @@ export class WsBridge {
     }
   }
 
+  private cacheVerifiedMainSessionOwnership(sessionName: string): void {
+    if (sessionName.startsWith('deck_sub_')) return;
+    this.verifiedMainSessionOwnership.delete(sessionName);
+    this.verifiedMainSessionOwnership.set(sessionName, Date.now());
+    while (this.verifiedMainSessionOwnership.size > SESSION_OWNERSHIP_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.verifiedMainSessionOwnership.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.verifiedMainSessionOwnership.delete(oldestKey);
+    }
+  }
+
   /**
    * Verify that a session name belongs to this server.
    * Checks both regular sessions and sub-sessions.
@@ -10623,13 +10900,30 @@ export class WsBridge {
   private async verifySessionOwnership(sessionName: string): Promise<boolean> {
     if (!this.db) return true; // no db = dev/test mode, allow all
     if (this.activeSubSessions.has(sessionName)) return true;
+    if (this.authenticated
+      && this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      && this.activeMainSessions.has(sessionName)) {
+      return true;
+    }
+    const cachedAt = this.verifiedMainSessionOwnership.get(sessionName);
+    if (cachedAt !== undefined) {
+      if ((Date.now() - cachedAt) < SESSION_OWNERSHIP_CACHE_TTL_MS) {
+        this.verifiedMainSessionOwnership.delete(sessionName);
+        this.verifiedMainSessionOwnership.set(sessionName, cachedAt);
+        return true;
+      }
+      this.verifiedMainSessionOwnership.delete(sessionName);
+    }
     try {
       // Check regular sessions
       const row = await this.db.queryOne<Record<string, unknown>>(
         'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
         [this.serverId, sessionName],
       );
-      if (row) return true;
+      if (row) {
+        this.cacheVerifiedMainSessionOwnership(sessionName);
+        return true;
+      }
 
       // Check sub-sessions: name is deck_sub_{id}
       const subMatch = sessionName.match(/^deck_sub_(.+)$/);
@@ -11164,7 +11458,10 @@ export class WsBridge {
 
   /** Called when RECONNECT_GRACE_MS elapses without the daemon coming back. */
   private onReconnectGraceExpired(): void {
-    if (this.authenticated) return;  // daemon actually came back — nothing to do
+    if (this.authenticated) {
+      this.maybeCleanup();
+      return;  // daemon actually came back — nothing to do
+    }
     if (!this.daemonOfflineAnnounced) {
       this.daemonOfflineAnnounced = true;
       this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_OFFLINE }));
@@ -11173,6 +11470,7 @@ export class WsBridge {
       this.emitInflightFailure(entry, ACK_FAILURE_DAEMON_OFFLINE);
       this.removeInflight(entry.commandId);
     }
+    this.maybeCleanup();
   }
 
   /** Per-command ack timeout fired. */
@@ -14541,17 +14839,56 @@ export class WsBridge {
   private maybeCleanup(): void {
     if (
       !this.daemonWs
+      && !this.graceTimer
       && this.browserSockets.size === 0
       && this.previewWsTunnels.size === 0
       && this.pendingPreviewWsUpgrades.size === 0
     ) {
-      this.browserRateLimiter.stop();
-      this.browserDataReadRateLimiter.stop();
-      if (this.shareExpirySweepTimer) {
-        clearInterval(this.shareExpirySweepTimer);
-        this.shareExpirySweepTimer = null;
-      }
-      WsBridge.instances.delete(this.serverId);
+      this.dispose();
+    }
+  }
+
+  dispose(): void {
+    this.browserRateLimiter.stop();
+    this.browserDataReadRateLimiter.stop();
+    if (this.ackHousekeepingTimer) {
+      clearInterval(this.ackHousekeepingTimer);
+      this.ackHousekeepingTimer = null;
+    }
+    if (this.graceTimer) {
+      clearTimeout(this.graceTimer);
+      this.graceTimer = null;
+    }
+    if (this.authTimer) {
+      clearTimeout(this.authTimer);
+      this.authTimer = null;
+    }
+    this.clearAutoUpgradeRetryTimer();
+    this.clearPendingIdlePushes();
+    this.resetHeartbeatDbPersistenceState(null);
+    this.lastCapabilityHeartbeatRefreshAt = 0;
+    this.activeCapabilityOperations.clear();
+    this.remoteDesktopNodeContextCache = null;
+    this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+    this.remoteDesktopNodeContextInFlight = null;
+    this.verifiedMainSessionOwnership.clear();
+    WsBridge.instances.delete(this.serverId);
+    WsBridge.syncShareExpirySweepTimer();
+    if (WsBridge.instances.size === 0 && cleanupSweepHandle) {
+      clearInterval(cleanupSweepHandle);
+      cleanupSweepHandle = null;
+    }
+  }
+
+  static disposeAll(): void {
+    for (const bridge of [...WsBridge.instances.values()]) {
+      bridge.dispose();
+    }
+    WsBridge.instances.clear();
+    WsBridge.stopShareExpirySweepTimer();
+    if (cleanupSweepHandle) {
+      clearInterval(cleanupSweepHandle);
+      cleanupSweepHandle = null;
     }
   }
 

@@ -828,49 +828,67 @@ describe('WsBridge', () => {
     });
 
     it('publishes the canonical host context and actively clears it when the mapping disappears', async () => {
-      let hostId: string | null = 'host-00000000000000000001';
-      const db = {
-        queryOne: async (sql: string) => {
-          if (sql.includes('remote_desktop_host_endpoints')) return hostId ? { host_id: hostId } : null;
-          return {
-            token_hash: 'valid-hash', owner_status: 'active',
-            node_role: 'controlled',
-            revoked_at: null,
-            os: CONTROLLED_NODE_OS_WIN,
-          };
-        },
-        query: async () => [],
-        execute: async () => ({ changes: 1 }),
-        exec: async () => {},
-        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => (
-          fn(db as unknown as import('../src/db/client.js').Database)
-        ),
-        close: () => {},
-      } as unknown as import('../src/db/client.js').Database;
-      const bridge = WsBridge.get(serverId);
-      const ws = new MockWs();
-      bridge.handleDaemonConnection(ws as never, db, {} as never);
-      ws.emit('message', JSON.stringify({
-        type: 'auth',
-        serverId,
-        token: 'my-token',
-        capabilities: [],
-      }));
-      await flushAsync();
-      const generation = bridge.daemonConnectionGeneration();
-      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
-        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
-        hostId: 'host-00000000000000000001',
-        daemonGeneration: generation,
-      });
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+      try {
+        let hostId: string | null = 'host-00000000000000000001';
+        let hostLookupCount = 0;
+        const db = {
+          queryOne: async (sql: string) => {
+            if (sql.includes('remote_desktop_host_endpoints')) {
+              hostLookupCount += 1;
+              return hostId ? { host_id: hostId } : null;
+            }
+            return {
+              token_hash: 'valid-hash', owner_status: 'active',
+              node_role: 'controlled',
+              revoked_at: null,
+              os: CONTROLLED_NODE_OS_WIN,
+            };
+          },
+          query: async () => [],
+          execute: async () => ({ changes: 1 }),
+          exec: async () => {},
+          transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => (
+            fn(db as unknown as import('../src/db/client.js').Database)
+          ),
+          close: () => {},
+        } as unknown as import('../src/db/client.js').Database;
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, db, {} as never);
+        ws.emit('message', JSON.stringify({
+          type: 'auth',
+          serverId,
+          token: 'my-token',
+          capabilities: [],
+        }));
+        await flushAsync();
+        const generation = bridge.daemonConnectionGeneration();
+        expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+          type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+          hostId: 'host-00000000000000000001',
+          daemonGeneration: generation,
+        });
+        expect(hostLookupCount).toBe(1);
 
-      hostId = null;
-      ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
-      await flushAsync();
-      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
-        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
-        daemonGeneration: generation,
-      });
+        hostId = null;
+        // Immediate heartbeat within connection cache window skips redundant DB query & push.
+        ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+        await flushAsync();
+        expect(hostLookupCount).toBe(1);
+
+        // Fallback recheck after 60s sees the removed mapping and clears node context.
+        await vi.advanceTimersByTimeAsync(60_000);
+        ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+        await flushAsync();
+        expect(hostLookupCount).toBe(2);
+        expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+          type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+          daemonGeneration: generation,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('closes on auth timeout', async () => {
