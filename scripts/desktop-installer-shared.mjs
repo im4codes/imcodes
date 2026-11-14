@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   extractArchiveToDir,
   parseDaemonRuntimeTarget,
@@ -27,7 +27,7 @@ export async function loadDesktopCompatibilityModule() {
   if (cachedCompatModule) return cachedCompatModule;
   const distPath = join(REPO_ROOT, 'dist', 'shared', 'desktop-installer-compatibility.js');
   if (existsSync(distPath)) {
-    cachedCompatModule = await import(distPath);
+    cachedCompatModule = await import(pathToFileURL(distPath).href);
     return cachedCompatModule;
   }
   // When running under tsx/vitest, importing .ts directly succeeds.
@@ -46,7 +46,7 @@ export async function loadImcodesStateDirName() {
   if (cachedStateDirName) return cachedStateDirName;
   const distPath = join(REPO_ROOT, 'dist', 'src', 'util', 'imcodes-state-dir.js');
   if (existsSync(distPath)) {
-    const mod = await import(distPath);
+    const mod = await import(pathToFileURL(distPath).href);
     cachedStateDirName = mod.IMCODES_STATE_DIR_NAME;
     return cachedStateDirName;
   }

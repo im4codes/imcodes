@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   assertDaemonRuntimeManifestShape,
   parseDaemonRuntimeTarget,
@@ -18,7 +18,7 @@ export async function loadDesktopReleaseManifestModule() {
   if (cachedReleaseManifestMod) return cachedReleaseManifestMod;
   const distPath = join(REPO_ROOT, 'dist', 'shared', 'desktop-release-manifest.js');
   if (existsSync(distPath)) {
-    cachedReleaseManifestMod = await import(distPath);
+    cachedReleaseManifestMod = await import(pathToFileURL(distPath).href);
     return cachedReleaseManifestMod;
   }
   try {
