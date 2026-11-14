@@ -677,6 +677,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
 }));
 vi.mock('../src/components/SubSessionBar.js', () => ({
   SUBSESSION_BAR_COLLAPSED_STORAGE_KEY: 'subsession_bar_collapsed',
+  SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY: 'rcc_subcard_collapsed_default_v2',
   SubSessionBar: ({
     onCollapsedChange,
     onNew,
@@ -701,6 +702,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     onOpenSpecAutoToggleCompact,
     onOpenSpecAutoHide,
     desktopLayoutCapable,
+    collapsed,
     desktopLayout,
     onDesktopLayoutChange,
     desktopDockSide,
@@ -713,6 +715,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     <div
       data-testid="app-shell-subsession-bar"
       data-running-discussions={String(totalRunningDiscussions)}
+      data-collapsed={String(collapsed)}
       data-desktop-layout={desktopLayout}
       data-desktop-dock-side={desktopDockSide}
       data-team-discussion-layout={teamDiscussionLayout}
@@ -2469,7 +2472,35 @@ describe('App shell', () => {
     expect(window.location.hash).toContain('/srv-1/deck_alpha_brain');
   }, 20_000);
 
-  it('defaults the vertical rail right, persists both dock sides, and keeps each as a root flex child', async () => {
+  it.each([true, false])('defaults fresh desktop to left vertical pills, respecting expanded override=%s', async (expanded) => {
+    if (expanded) {
+      localStorage.setItem('subsession_bar_collapsed', 'false');
+      localStorage.setItem('rcc_subcard_collapsed_default_v2', '1');
+    }
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const { App } = await importApp();
+    render(<App />);
+    const bar = await screen.findByTestId('app-shell-subsession-bar');
+    if (expanded) {
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+    } else {
+      const host = await screen.findByTestId('subsession-vertical-rail-host');
+      expect(host.classList.contains('subsession-vertical-rail-host-left')).toBe(true);
+    }
+    expect(bar.dataset.desktopLayout).toBe(expanded
+      ? SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL
+      : SUBSESSION_DESKTOP_LAYOUT.VERTICAL);
+    expect(bar.dataset.desktopDockSide).toBe(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT);
+    expect(bar.dataset.collapsed).toBe(String(!expanded));
+    expect(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBeNull();
+  }, 20_000);
+
+  it('preserves explicit horizontal/right overrides, persists both dock sides, and keeps each as a root flex child', async () => {
+    localStorage.setItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY, JSON.stringify({ version: 1, layout: SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL }));
+    localStorage.setItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY, JSON.stringify({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT }));
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -2491,7 +2522,7 @@ describe('App shell', () => {
       version: 1,
       layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
     });
-    expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBeNull();
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)!)).toEqual({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT });
 
     fireEvent.click(screen.getByTestId('app-shell-subsession-dock-left'));
     await waitFor(() => expect(screen.getByTestId('subsession-vertical-rail-host').dataset.dockSide)
@@ -2597,13 +2628,15 @@ describe('App shell', () => {
     }
   }, 20_000);
 
-  it('keeps the saved desktop rail preference untouched while mobile uses its original layout', async () => {
+  it.each([true, false])('keeps desktop preferences untouched while mobile uses its original layout (custom=%s)', async (custom) => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
     const saved = JSON.stringify({ version: 1, layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL });
-    const savedDockSide = JSON.stringify({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.LEFT });
-    localStorage.setItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY, saved);
-    localStorage.setItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY, savedDockSide);
+    const savedDockSide = JSON.stringify({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT });
+    if (custom) {
+      localStorage.setItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY, saved);
+      localStorage.setItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY, savedDockSide);
+    }
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -2616,8 +2649,8 @@ describe('App shell', () => {
       expect(screen.queryByTestId('app-shell-subsession-layout-toggle')).toBeNull();
       expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
       expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
-      expect(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)).toBe(saved);
-      expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBe(savedDockSide);
+      expect(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)).toBe(custom ? saved : null);
+      expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBe(custom ? savedDockSide : null);
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }

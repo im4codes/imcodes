@@ -1240,7 +1240,11 @@ function InternalMainApp() {
     } catch { /* ignore */ }
   }, [subSessionBarCollapsed]);
   const [subSessionDesktopLayout, setSubSessionDesktopLayout] = useState<SubSessionDesktopLayout>(
-    () => loadSubSessionDesktopLayout(),
+    // An explicit expanded-card preference predates the layout switch. Preserve
+    // it as horizontal only when no layout was chosen; never persist a default.
+    () => loadSubSessionDesktopLayout(undefined, subSessionBarCollapsed
+      ? SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+      : SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL),
   );
   const [subSessionDesktopDockSide, setSubSessionDesktopDockSide] = useState<SubSessionDesktopDockSide>(
     () => loadSubSessionDesktopDockSide(),

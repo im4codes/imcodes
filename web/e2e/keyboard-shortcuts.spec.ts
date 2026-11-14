@@ -369,6 +369,13 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
     ],
   });
 
+  // A fresh desktop uses compact buttons in the left vertical rail, without saving an override.
+  await expect(page.locator('.subsession-vertical-rail-host-left .subsession-card-rail')).toHaveCount(2);
+  expect(await page.evaluate(() => [
+    localStorage.getItem('imcodes.web.subsession.desktop-layout.v1'),
+    localStorage.getItem('imcodes.web.subsession.desktop-dock-side.v1'),
+  ])).toEqual([null, null]);
+
   // Sequence badges appear on sub-session strip items in display order (1, 2) floating at bottom-left without inflating card height
   await expect(page.getByTestId('subsession-seq-sub-e2e-1')).toHaveText('1');
   await expect(page.getByTestId('subsession-seq-sub-e2e-2')).toHaveText('2');

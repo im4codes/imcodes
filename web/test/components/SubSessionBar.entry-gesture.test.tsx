@@ -14,6 +14,7 @@ import {
   type SubSessionEntryState,
 } from '../../src/subsession-entry-gesture.js';
 import { SubSessionBar } from '../../src/components/SubSessionBar.js';
+import { SUBSESSION_DESKTOP_LAYOUT } from '../../src/subsession-desktop-layout-preference.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 
 vi.mock('react-i18next', () => ({
@@ -296,7 +297,7 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
 function renderBar(props: Partial<Parameters<typeof SubSessionBar>[0]> = {}) {
   const subSessions = props.subSessions ?? [makeSubSession()];
   return render(
-    <SubSessionBar
+    <SubSessionBar desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL}
       subSessions={subSessions}
       openIds={props.openIds ?? new Set()}
       maximizedIds={props.maximizedIds}

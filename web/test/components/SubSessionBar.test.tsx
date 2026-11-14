@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { h } from 'preact';
+import { h, type ComponentProps } from 'preact';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const { probeDirectConnectivityMock, directFileStatusListeners } = vi.hoisted(() => ({
@@ -119,7 +119,7 @@ vi.mock('../../src/direct-file-transfer.js', () => ({
   }),
 }));
 
-import { SubSessionBar } from '../../src/components/SubSessionBar.js';
+import { SubSessionBar as DefaultSubSessionBar } from '../../src/components/SubSessionBar.js';
 import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
@@ -131,6 +131,11 @@ import {
 import { TEAM_DISCUSSION_LAYOUT } from '../../src/team-discussion-layout-preference.js';
 
 const LOCALE_DIR = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/i18n/locales');
+
+// Existing interaction fixtures explicitly exercise horizontal/expanded mode.
+function SubSessionBar(props: ComponentProps<typeof DefaultSubSessionBar>) {
+  return <DefaultSubSessionBar desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL} {...props} />;
+}
 
 function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   return {
@@ -186,6 +191,7 @@ const daemonStatsMessage = {
 describe('SubSessionBar', () => {
   beforeEach(() => {
     localStorage.clear();
+    localStorage.setItem('rcc_subcard_collapsed', 'false');
     vi.clearAllMocks();
     directFileStatusListeners.clear();
     probeDirectConnectivityMock.mockResolvedValue({
@@ -194,6 +200,30 @@ describe('SubSessionBar', () => {
       localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
       remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
     });
+  });
+
+  it('defaults to left-docked vertical pills while preserving explicit expanded preference', () => {
+    localStorage.removeItem('rcc_subcard_collapsed');
+    const host = document.createElement('aside');
+    document.body.appendChild(host);
+    const props = {
+      subSessions: [makeSubSession()], openIds: new Set<string>(),
+      onOpen: vi.fn(), onClose: vi.fn(), onRestart: vi.fn(),
+      ws: null, connected: true, onDiff: vi.fn(), onHistory: vi.fn(),
+      verticalRailHost: host, onDesktopDockSideChange: vi.fn(),
+    };
+    try {
+      const view = render(<DefaultSubSessionBar {...props} />);
+      expect(host.querySelector('.subsession-card-rail')).toBeTruthy();
+      expect(host.querySelector('[data-testid="subsession-vertical-rail-dock-left"]')?.getAttribute('aria-pressed')).toBe('true');
+      expect(JSON.parse(localStorage.getItem('rcc_subcard_collapsed')!)).toBe(true);
+      view.unmount();
+      localStorage.setItem('rcc_subcard_collapsed', 'false');
+      const expanded = render(<DefaultSubSessionBar {...props} />);
+      expect(expanded.getByTestId('subsession-preview-sub-1')).toBeTruthy();
+      expect(JSON.parse(localStorage.getItem('rcc_subcard_collapsed')!)).toBe(false);
+      expanded.unmount();
+    } finally { host.remove(); }
   });
 
   it('caps compact model labels without shortening the identity or context', () => {

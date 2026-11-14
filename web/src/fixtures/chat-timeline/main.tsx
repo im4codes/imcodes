@@ -60,6 +60,7 @@ import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { SubSessionWindow } from '../../components/SubSessionWindow.js';
 import { SubSessionBar } from '../../components/SubSessionBar.js';
+import { SUBSESSION_DESKTOP_LAYOUT } from '../../subsession-desktop-layout-preference.js';
 import {
   getMobileKeyboardState,
   isMobileKeyboardInputTarget,
@@ -453,6 +454,7 @@ function FixtureSubBar() {
         />
       )}
       <SubSessionBar
+        desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL}
         subSessions={[subTransport, subShell]}
         openIds={new Set(openIds)}
         maximizedIds={new Set(maximizedIds)}

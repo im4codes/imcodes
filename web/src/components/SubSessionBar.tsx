@@ -826,16 +826,19 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout: requestedDesktopLayout, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.LEFT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   recordPerfRender('SubSessionBar');
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
-  const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
   const isTeamDiscussionRail = desktopLayoutCapable
     && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
-  const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
+  const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, true));
   const collapsed = controlledCollapsed ?? internalCollapsed;
+  const desktopLayout = requestedDesktopLayout ?? (collapsed
+    ? SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+    : SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL);
+  const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
   const [p2pHidden, setP2pHidden] = useState(() => load(P2P_MOBILE_COMPACT_STORAGE_KEY, false));
   const [p2pDesktopCompact, setP2pDesktopCompact] = useState(() => load(P2P_DESKTOP_COMPACT_STORAGE_KEY, false));
   const [showSizePanel, setShowSizePanel] = useState(false);

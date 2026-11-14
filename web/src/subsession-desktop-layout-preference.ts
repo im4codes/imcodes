@@ -35,16 +35,17 @@ function isSubSessionDesktopDockSide(value: unknown): value is SubSessionDesktop
 
 export function loadSubSessionDesktopLayout(
   storage: Pick<Storage, 'getItem'> = localStorage,
+  missingLayout: SubSessionDesktopLayout = SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
 ): SubSessionDesktopLayout {
   try {
     const raw = storage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY);
-    if (raw === null) return SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL;
+    if (raw === null) return missingLayout;
     const value = JSON.parse(raw) as Partial<StoredSubSessionDesktopLayout> | null;
     if (value?.version === 1 && isSubSessionDesktopLayout(value.layout)) return value.layout;
   } catch {
     // Local preferences are fail-soft; an unavailable or corrupt store must not block the UI.
   }
-  return SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL;
+  return SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
 }
 
 export function saveSubSessionDesktopLayout(
@@ -64,13 +65,13 @@ export function loadSubSessionDesktopDockSide(
 ): SubSessionDesktopDockSide {
   try {
     const raw = storage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY);
-    if (raw === null) return SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT;
+    if (raw === null) return SUBSESSION_DESKTOP_DOCK_SIDE.LEFT;
     const value = JSON.parse(raw) as Partial<StoredSubSessionDesktopDockSide> | null;
     if (value?.version === 1 && isSubSessionDesktopDockSide(value.side)) return value.side;
   } catch {
-    // Legacy, corrupt, and unavailable local stores all fail safely to the right.
+    // Legacy, corrupt, and unavailable local stores all fail safely to the left.
   }
-  return SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT;
+  return SUBSESSION_DESKTOP_DOCK_SIDE.LEFT;
 }
 
 export function saveSubSessionDesktopDockSide(
