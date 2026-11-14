@@ -175,4 +175,107 @@ describe('supervision-task-console-cache', () => {
     expect(setItemSpy).toHaveBeenCalled();
     expect(readSupervisionTaskConsoleCache(auth)?.tasks.t1?.title).toBe('Task t1');
   });
+
+  it('rejects structurally corrupted persisted tasks, pairs, assignments, pools, and events while accepting valid legacy optional omissions', () => {
+    const authBad = makeAuthority(10);
+    const authGood = makeAuthority(11);
+    const baseValid = makeSnapshotState(authBad, 'tsk_shared', 'Valid Title');
+    const validRow = baseValid.tasks.tsk_shared;
+    const validLegacyEntry = makeSnapshotState(authGood, 'tsk_legacy', 'Legacy Optional Fields Omitted');
+    const { eventsByTask: _omitEvents, resyncGeneration: _omitGen, ...legacyRest } = validLegacyEntry as unknown as Record<string, unknown>;
+    const validPairWithoutOptionals = {
+      status: 'working',
+      flags: [],
+      round: 0,
+      blocking: ['P0'],
+    };
+
+    const badPayloads = [
+      // F2 exact counterexample: pair.flags = 17
+      { ...baseValid, tasks: { tsk_shared: { ...validRow, pair: { ...validRow.pair!, flags: 17 } } } },
+      // Corrupted pair.status & pair.blocking & pair.scheduling
+      { ...baseValid, tasks: { tsk_shared: { ...validRow, pair: { ...validRow.pair!, status: 'bogus_status' } } } },
+      { ...baseValid, tasks: { tsk_shared: { ...validRow, pair: { ...validRow.pair!, blocking: 'P0' } } } },
+      { ...baseValid, tasks: { tsk_shared: { ...validRow, pair: { ...validRow.pair!, scheduling: { epoch: 1, manual: true, dependsOn: 17, since: 1, writer: 'brain' } } } } },
+      // Corrupted assignment row shape
+      { ...baseValid, assignments: { asg_bad: { assignmentId: 'asg_bad', taskId: 'tsk_shared', status: 'bogus' } } },
+      // Corrupted pool row shape
+      { ...baseValid, pools: [{ poolId: 'p1', label: 'Primary', activeCount: 'many', capacity: 4 }] },
+      // Corrupted eventsByTask shape
+      { ...baseValid, eventsByTask: { tsk_shared: [{ eventId: 'bad', projectionVersion: 1, op: 'task_upsert' }] } },
+    ];
+
+    for (const badState of badPayloads) {
+      clearAllSupervisionTaskConsoleCaches();
+      window.localStorage.setItem(
+        SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
+        JSON.stringify([
+          { authority: authBad, accessedAt: 100, state: badState },
+          {
+            authority: authGood,
+            accessedAt: 100,
+            state: {
+              ...legacyRest,
+              tasks: {
+                tsk_legacy: {
+                  ...validLegacyEntry.tasks.tsk_legacy,
+                  pair: validPairWithoutOptionals,
+                },
+              },
+            },
+          },
+        ]),
+      );
+      expect(readSupervisionTaskConsoleCache(authBad)).toBeNull();
+      expect(readSupervisionTaskConsoleCache(authGood)?.tasks.tsk_legacy?.title).toBe('Legacy Optional Fields Omitted');
+    }
+  });
+
+  it('never resurrects cleared user/authority entries from stale storage when setItem or removeItem fails', () => {
+    const authA1 = makeAuthority(21, { userId: 'user-a', projectName: 'proj-a1' });
+    const authA2 = makeAuthority(22, { userId: 'user-a', projectName: 'proj-a2' });
+    const authB = makeAuthority(23, { userId: 'user-b', projectName: 'proj-b' });
+
+    writeSupervisionTaskConsoleCache(authA1, makeSnapshotState(authA1, 'ta1', 'User A1 Task'));
+    writeSupervisionTaskConsoleCache(authA2, makeSnapshotState(authA2, 'ta2', 'User A2 Task'));
+    writeSupervisionTaskConsoleCache(authB, makeSnapshotState(authB, 'tb', 'User B Task'));
+
+    // Case 1: only Storage.setItem throws QuotaExceededError (getItem/removeItem work)
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+    });
+    clearSupervisionTaskConsoleCacheForUser('user-a');
+    expect(readSupervisionTaskConsoleCache(authA1)).toBeNull();
+    expect(readSupervisionTaskConsoleCache(authA2)).toBeNull();
+    expect(readSupervisionTaskConsoleCache(authB)?.tasks.tb?.title).toBe('User B Task');
+
+    // Re-enable setItem and verify single-authority clear when setItem fails again
+    setItemSpy.mockRestore();
+    writeSupervisionTaskConsoleCache(authA1, makeSnapshotState(authA1, 'ta1', 'User A1 Fresh'));
+    expect(readSupervisionTaskConsoleCache(authA1)?.tasks.ta1?.title).toBe('User A1 Fresh');
+
+    // Case 2: BOTH setItem AND removeItem throw during clear
+    const setItemFail = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+    });
+    const removeItemFail = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+      throw new DOMException('SecurityError', 'SecurityError');
+    });
+    clearSupervisionTaskConsoleCache(authA1);
+    expect(readSupervisionTaskConsoleCache(authA1)).toBeNull();
+    expect(readSupervisionTaskConsoleCache(authB)?.tasks.tb?.title).toBe('User B Task');
+
+    // Writing a new authoritative snapshot for authA1 keeps authA1 readable in memory
+    // while keeping untouched cleared entries inaccessible, and recovers storage once restored.
+    writeSupervisionTaskConsoleCache(authA1, makeSnapshotState(authA1, 'ta1', 'Recovered A1 Task'));
+    expect(readSupervisionTaskConsoleCache(authA1)?.tasks.ta1?.title).toBe('Recovered A1 Task');
+    expect(readSupervisionTaskConsoleCache(authA2)).toBeNull();
+
+    setItemFail.mockRestore();
+    removeItemFail.mockRestore();
+    writeSupervisionTaskConsoleCache(authA1, makeSnapshotState(authA1, 'ta1', 'Persisted A1 Task'));
+    clearAllSupervisionTaskConsoleCaches();
+    expect(readSupervisionTaskConsoleCache(authA1)).toBeNull();
+    expect(readSupervisionTaskConsoleCache(authB)).toBeNull();
+  });
 });

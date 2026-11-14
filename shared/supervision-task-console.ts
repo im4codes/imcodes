@@ -929,6 +929,20 @@ function isPoolRow(value: unknown): boolean {
     && isFiniteNumber(value.capacity);
 }
 
+export function isValidSupervisionTaskConsoleTaskRow(value: unknown): value is SupervisionTaskConsoleTaskRow {
+  return isTaskRow(value);
+}
+
+export function isValidSupervisionTaskConsoleAssignmentRow(
+  value: unknown,
+): value is SupervisionTaskConsoleAssignmentRow {
+  return isAssignmentRow(value);
+}
+
+export function isValidSupervisionTaskConsolePoolRow(value: unknown): value is SupervisionTaskConsolePoolRow {
+  return isPoolRow(value);
+}
+
 /** Fail-closed structural validator for projections arriving on the console wire. */
 export function isValidSupervisionTaskConsoleEvent(
   value: unknown,

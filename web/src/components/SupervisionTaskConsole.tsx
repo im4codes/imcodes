@@ -157,14 +157,22 @@ export function SupervisionTaskPairSnapshotBridge(props: {
     // Invalidate rows from the previous server/project/session only when
     // the new scope has no warm cached projection to show immediately.
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
-    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true, scopeKey } }));
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+      detail: { scopeReset: true, scopeKey, authorityScopeKey, serverId: props.serverId },
+    }));
   }, [authorityScopeKey]);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (state.scope.projectName !== props.projectName
       || state.scope.coordinatorSessionName !== props.coordinatorSessionName) return;
     if (state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR && !state.hasAuthoritativeSnapshot) {
-      const detail = { authorityUnavailable: true, error: state.error ?? 'unsupported' };
+      const detail = {
+        authorityUnavailable: true,
+        error: state.error ?? 'unsupported',
+        serverId: props.serverId,
+        scopeKey,
+        authorityScopeKey,
+      };
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
       return;
@@ -176,12 +184,14 @@ export function SupervisionTaskPairSnapshotBridge(props: {
       const detail = {
         ...taskConsoleStateToPairSnapshot(publishableState),
         serverId: props.serverId,
+        scopeKey,
+        authorityScopeKey,
         cached: publishableState.syncState !== SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
       };
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
     }
-  }, [state, props.userId, props.serverId, props.projectName, props.coordinatorSessionName]);
+  }, [state, authorityScopeKey]);
   return null;
 }
 

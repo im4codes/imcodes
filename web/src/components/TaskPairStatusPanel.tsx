@@ -32,10 +32,60 @@ function status(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
 }
 
-type TaskPairConsoleSnapshotDetail = { serverId?: string; tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] };
+type TaskPairConsoleSnapshotDetail = {
+  authoritative?: unknown;
+  serverId?: string;
+  scopeKey?: string;
+  authorityScopeKey?: string;
+  tasks?: readonly Record<string, unknown>[];
+  taskTitles?: Record<string, string>;
+  assignments?: readonly Record<string, unknown>[];
+  scopeReset?: boolean;
+  authorityUnavailable?: boolean;
+  op?: string;
+  task?: unknown;
+};
+
+type SnapshotScopeMeta = {
+  authorityScopeKey?: string;
+  scopeKey?: string;
+  serverId?: string;
+};
 
 function matchesSnapshotServer(snapshot: { serverId?: unknown } | null | undefined, serverId?: string | null): boolean {
   return !(typeof snapshot?.serverId === 'string' && snapshot.serverId && serverId && snapshot.serverId !== serverId);
+}
+
+function isAcceptedPanelSnapshot(
+  snapshot: { authoritative?: unknown; serverId?: unknown } | null | undefined,
+  serverId?: string | null,
+): boolean {
+  if (!snapshot || snapshot.authoritative === false) return false;
+  return matchesSnapshotServer(snapshot, serverId);
+}
+
+function readSnapshotScope(detail: unknown): SnapshotScopeMeta {
+  if (!detail || typeof detail !== 'object') return {};
+  const raw = detail as Record<string, unknown>;
+  return {
+    ...(typeof raw.authorityScopeKey === 'string' && raw.authorityScopeKey ? { authorityScopeKey: raw.authorityScopeKey } : {}),
+    ...(typeof raw.scopeKey === 'string' && raw.scopeKey ? { scopeKey: raw.scopeKey } : {}),
+    ...(typeof raw.serverId === 'string' && raw.serverId ? { serverId: raw.serverId } : {}),
+  };
+}
+
+function isCrossScopeSnapshot(prev: SnapshotScopeMeta | undefined, next: SnapshotScopeMeta): boolean {
+  if (!prev) return false;
+  if (prev.authorityScopeKey && next.authorityScopeKey) {
+    return prev.authorityScopeKey !== next.authorityScopeKey;
+  }
+  if (prev.scopeKey && next.scopeKey) {
+    return prev.scopeKey !== next.scopeKey;
+  }
+  if (!prev.authorityScopeKey && next.authorityScopeKey) {
+    return true;
+  }
+  return Boolean(prev.serverId && next.serverId && prev.serverId !== next.serverId);
 }
 
 function finiteTimestamp(value: unknown, fallback?: number): number | undefined {
@@ -134,8 +184,8 @@ function resolveSessionModel(
 
 function hasPairActivity(events: readonly TimelineEvent[], serverId?: string | null): boolean {
   if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
-  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: unknown; tasks?: readonly unknown[]; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
-  if (!matchesSnapshotServer(snapshot, serverId)) return false;
+  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+  if (!isAcceptedPanelSnapshot(snapshot, serverId)) return false;
   return Boolean(snapshot?.authorityUnavailable) || (Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0);
 }
 
@@ -198,17 +248,19 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     lastScopeKey.current = scopeKey;
     setChoice(visitScoped ? undefined : readServerWideChoice({ serverId, mobile: isMobile }));
   }, [scopeKey, serverId, isMobile, visitScoped]);
-  const lastSnapshotServerIdRef = useRef<string | undefined>((() => {
-    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: string } }).__imcodesTaskPairSnapshot;
-    return matchesSnapshotServer(detail, serverId) ? detail?.serverId : undefined;
+  const lastSnapshotScopeRef = useRef<SnapshotScopeMeta | undefined>((() => {
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    if (!isAcceptedPanelSnapshot(detail, serverId)) return undefined;
+    const scope = readSnapshotScope(detail);
+    return scope.authorityScopeKey || scope.scopeKey || scope.serverId ? scope : undefined;
   })());
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
-    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: string; tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
-    return detail && matchesSnapshotServer(detail, serverId) ? normalizeSnapshot(detail) : null;
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    return detail && isAcceptedPanelSnapshot(detail, serverId) ? normalizeSnapshot(detail) : null;
   });
   const [snapshotTitles, setSnapshotTitles] = useState<Map<string, string>>(() => {
-    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: string; scopeReset?: unknown; authorityUnavailable?: unknown; taskTitles?: Record<string, string>; tasks?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
-    return matchesSnapshotServer(detail, serverId) ? collectTaskPairTitlesFromSnapshot(detail) : new Map();
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    return isAcceptedPanelSnapshot(detail, serverId) ? collectTaskPairTitlesFromSnapshot(detail) : new Map();
   });
   const [activeSplitTaskId, setActiveSplitTaskId] = useState<string | null>(() => {
     return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
@@ -222,12 +274,11 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     return () => window.removeEventListener('deck:pair-split-state', handler);
   }, []);
   useEffect(() => {
-    const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { serverId?: string; tasks?: readonly Record<string, unknown>[]; taskTitles?: Record<string, string>; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean; authorityUnavailable?: boolean } | undefined;
-      if (!detail || !matchesSnapshotServer(detail, serverId)) return;
+    const applyPanelSnapshot = (detail: TaskPairConsoleSnapshotDetail | undefined) => {
+      if (!detail || !isAcceptedPanelSnapshot(detail, serverId)) return;
       if (detail.scopeReset) {
         (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
-        lastSnapshotServerIdRef.current = undefined;
+        lastSnapshotScopeRef.current = undefined;
         setSnapshotRows(null);
         setSnapshotTitles(new Map());
         return;
@@ -240,13 +291,25 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       if (Array.isArray(detail.tasks)) {
         const normalized = normalizeSnapshot(detail);
         if (normalized) {
-          const crossServer = Boolean(
-            detail.serverId && lastSnapshotServerIdRef.current && detail.serverId !== lastSnapshotServerIdRef.current,
-          );
-          if (detail.serverId) lastSnapshotServerIdRef.current = detail.serverId;
-          setSnapshotRows((current) => mergeSnapshotRows(crossServer ? null : current, normalized));
+          const nextScope = readSnapshotScope(detail);
+          const crossScope = isCrossScopeSnapshot(lastSnapshotScopeRef.current, nextScope);
+          if (nextScope.authorityScopeKey || nextScope.scopeKey || nextScope.serverId) {
+            lastSnapshotScopeRef.current = nextScope;
+          }
+          setSnapshotRows((current) => mergeSnapshotRows(crossScope ? null : current, normalized));
         }
       }
+    };
+    const current = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    if (current && !current.scopeReset) {
+      applyPanelSnapshot(current);
+    } else if (!current && lastSnapshotScopeRef.current?.serverId && serverId && lastSnapshotScopeRef.current.serverId !== serverId) {
+      lastSnapshotScopeRef.current = undefined;
+      setSnapshotRows(null);
+      setSnapshotTitles(new Map());
+    }
+    const onSnapshot = (event: Event) => {
+      applyPanelSnapshot((event as CustomEvent).detail as TaskPairConsoleSnapshotDetail | undefined);
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
@@ -452,10 +515,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
 export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
-  const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: unknown; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+  const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events, props.serverId));
   const [authorityUnavailable, setAuthorityUnavailable] = useState(() => (
-    matchesSnapshotServer(initialSnapshot, props.serverId) && Boolean(initialSnapshot?.authorityUnavailable)
+    isAcceptedPanelSnapshot(initialSnapshot, props.serverId) && Boolean(initialSnapshot?.authorityUnavailable)
   ));
   const [resolvedMobileAnchor, setResolvedMobileAnchor] = useState<Element | null>(() => props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null);
   useLayoutEffect(() => {
@@ -468,28 +531,30 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
     }
   }, [active, props.events, props.serverId]);
   useEffect(() => {
-    const applySnapshot = (detail: { serverId?: unknown; tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined) => {
-      if (!matchesSnapshotServer(detail, props.serverId)) return;
-      if (detail?.scopeReset) {
+    const applySnapshot = (detail: TaskPairConsoleSnapshotDetail | undefined) => {
+      if (!detail || !isAcceptedPanelSnapshot(detail, props.serverId)) return;
+      if (detail.scopeReset) {
         setActive(true);
         setAuthorityUnavailable(true);
         return;
       }
-      if ((Array.isArray(detail?.tasks) && detail.tasks.length > 0) || detail?.op === 'task_upsert' || detail?.task) {
-        if (Array.isArray(detail?.tasks)) (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
+      if ((Array.isArray(detail.tasks) && detail.tasks.length > 0) || detail.op === 'task_upsert' || detail.task) {
+        if (Array.isArray(detail.tasks)) (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
         setActive(true);
+      } else if (Array.isArray(detail.tasks)) {
+        (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       }
-      if (detail && 'authorityUnavailable' in detail) {
+      if ('authorityUnavailable' in detail) {
         setAuthorityUnavailable(Boolean(detail.authorityUnavailable));
         setActive(true);
-      } else if (detail && Array.isArray(detail.tasks)) {
+      } else if (Array.isArray(detail.tasks)) {
         setAuthorityUnavailable(false);
       }
     };
-    const current = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: unknown; tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+    const current = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
     if (current && !current.scopeReset) applySnapshot(current);
     const onSnapshot = (event: Event) => {
-      applySnapshot((event as CustomEvent).detail as Parameters<typeof applySnapshot>[0]);
+      applySnapshot((event as CustomEvent).detail as TaskPairConsoleSnapshotDetail | undefined);
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);

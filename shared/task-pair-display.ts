@@ -41,6 +41,7 @@ export function collectTaskPairTitles(
 /** Collect usable display titles from a window `__imcodesTaskPairSnapshot` payload. */
 export function collectTaskPairTitlesFromSnapshot(
   snapshot: {
+    authoritative?: unknown;
     scopeReset?: unknown;
     authorityUnavailable?: unknown;
     taskTitles?: Readonly<Record<string, string | undefined>>;
@@ -48,7 +49,7 @@ export function collectTaskPairTitlesFromSnapshot(
   } | null | undefined,
   target = new Map<string, string>(),
 ): Map<string, string> {
-  if (!snapshot || snapshot.scopeReset || snapshot.authorityUnavailable) return target;
+  if (!snapshot || snapshot.authoritative === false || snapshot.scopeReset || snapshot.authorityUnavailable) return target;
   if (snapshot.taskTitles && typeof snapshot.taskTitles === 'object') {
     for (const [taskId, rawTitle] of Object.entries(snapshot.taskTitles)) {
       const display = taskPairDisplayTitle(rawTitle, taskId);

@@ -21,6 +21,7 @@ import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
 import {
+  SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
   clearAllSupervisionTaskConsoleCaches,
   writeSupervisionTaskConsoleCache,
 } from '../../src/supervision-task-console-cache.js';
@@ -2204,5 +2205,333 @@ describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
     } finally {
       window.removeEventListener('supervision:task-pairs', onSnapshot);
     }
+  });
+
+  it('replaces panel rows across different project/coordinator/user scopes on the same server even when taskId matches and target updatedAt is older', async () => {
+    // F1 exact counterexample: same serverId, different project/coordinator, identical taskId `tsk_shared`,
+    // where Project A has newer updatedAt=9_000 and Project B has older updatedAt=1_000.
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-same', projectName: 'proj-a', coordinatorSessionName: 'deck_a_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-a', coordinatorSessionName: 'deck_a_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 5,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'Project A Private Task',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 9_000,
+            lastEventId: 5,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 100, startedAt: 100, updatedAt: 9_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-same', projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 2,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'Project B Target Task',
+            status: 'in_audit',
+            phase: 'audit',
+            validationState: 'pending',
+            updatedAt: 1_000,
+            lastEventId: 2,
+            pair: { status: 'in_audit', flags: [], round: 1, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'deck_sub_2', createdAt: 50, startedAt: 50, updatedAt: 1_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-2', serverId: 'srv-same', projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'User 2 Target Task',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 500,
+            lastEventId: 1,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 10, startedAt: 10, updatedAt: 500 },
+          },
+        },
+      },
+    );
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-same"
+          projectName="proj-a"
+          coordinatorSessionName="deck_a_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Project A Private Task');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Project A Private Task');
+
+    // Switch to Project B (older updatedAt=1_000, same serverId, same taskId): must replace Project A row immediately.
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Project B Target Task');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Project B Target Task');
+    expect(screen.queryByText('Project A Private Task')).toBeNull();
+
+    // Switch user on the exact same server/project/coordinator -> must replace with User 2's row (updatedAt=500).
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-2"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Target Task');
+    expect(screen.queryByText('Project B Target Task')).toBeNull();
+
+    // Live WS SYNCED on User 2 updates smoothly while keeping same-scope stale packet protection.
+    const mock = fakeWs();
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-2"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+        schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+        statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+        projectionVersion: 9,
+        lastDurableEventId: 9,
+        projectionEpoch: 'ep-u2',
+        generatedAt: 2_000,
+        tasks: [{
+          taskId: 'tsk_shared',
+          title: 'User 2 Live Synced',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 9,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 10, startedAt: 10, updatedAt: 2_000 },
+        }],
+        assignments: [],
+        pools: [],
+      });
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Live Synced');
+
+    // Same-scope older timestamp synthetic packet must still be ignored by anti-reorder guard.
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-same',
+          authorityScopeKey: 'user-2\u0000srv-same\u0000proj-b\u0000deck_b_brain',
+          authoritative: true,
+          tasks: [{ taskId: 'tsk_shared', title: 'Stale Out-Of-Order Packet', updatedAt: 100, pair: { status: 'working', updatedAt: 100 } }],
+          assignments: [],
+        },
+      }));
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Live Synced');
+    expect(screen.queryByText('Stale Out-Of-Order Packet')).toBeNull();
+  });
+
+  it('drops structurally corrupted persisted cache (e.g. non-array pair.flags) cleanly on cold mount without breaking rendering', () => {
+    const auth = { userId: 'user-1', serverId: 'srv-bad', projectName: 'proj-bad', coordinatorSessionName: 'deck_bad_brain' };
+    const corruptedState = {
+      ...createSupervisionTaskConsoleState({ projectName: auth.projectName, coordinatorSessionName: auth.coordinatorSessionName }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+      projectionVersion: 1,
+      lastDurableEventId: 1,
+      projectionEpoch: 'ep-1',
+      tasks: {
+        tsk_shared: {
+          taskId: 'tsk_shared',
+          title: 'Corrupted Pair Flags',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 1_000,
+          lastEventId: 1,
+          pair: { status: 'working', flags: 17, round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 1_000 },
+        },
+      },
+    };
+    window.localStorage.setItem(
+      SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
+      JSON.stringify([{ authority: auth, accessedAt: 100, state: corruptedState }]),
+    );
+
+    const mock = fakeWs();
+    render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-1"
+          serverId="srv-bad"
+          projectName="proj-bad"
+          coordinatorSessionName="deck_bad_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-bad" />
+      </div>,
+    );
+    expect(screen.queryByText('Corrupted Pair Flags')).toBeNull();
+
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-bad', coordinatorSessionName: 'deck_bad_brain' },
+        schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+        statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+        projectionVersion: 2,
+        lastDurableEventId: 2,
+        projectionEpoch: 'ep-1',
+        generatedAt: 2_000,
+        tasks: [{
+          taskId: 'tsk_live',
+          title: 'Recovered From Live Sync',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 2,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 2_000 },
+        }],
+        assignments: [],
+        pools: [],
+      });
+    });
+    expect(screen.getByText('Recovered From Live Sync')).toBeTruthy();
+  });
+
+  it('rejects explicit authoritative:false snapshots on initial mount and updates without clobbering last good state', async () => {
+    const validState = {
+      ...createSupervisionTaskConsoleState({ projectName: 'proj-auth', coordinatorSessionName: 'deck_auth_brain' }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+      projectionVersion: 1,
+      tasks: {
+        t_good: {
+          taskId: 't_good',
+          title: 'Authoritative Cached Task',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 1,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_auth', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 2_000 },
+        },
+      },
+    };
+    const baseSnapshot = { ...taskConsoleStateToPairSnapshot(validState), serverId: 'srv-auth', cached: true };
+    const rejectedInitial = {
+      ...baseSnapshot,
+      authoritative: false,
+      tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_bad', title: 'Non-authoritative task' }],
+      taskTitles: { t_bad: 'Non-authoritative task' },
+    };
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = rejectedInitial;
+
+    render(
+      <div>
+        <TaskPairStatusPanelHost events={[]} serverId="srv-auth" />
+        <SubSessionTaskTitle sessionName="deck_sub_auth" serverId="srv-auth" fallback="Fallback Title" />
+      </div>,
+    );
+    expect(screen.queryByText('Non-authoritative task')).toBeNull();
+    expect(screen.getByText('Fallback Title')).toBeTruthy();
+
+    // Positive control: cached:true + authoritative:true renders immediately.
+    act(() => {
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = baseSnapshot;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: baseSnapshot }));
+    });
+    await waitFor(() => expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Authoritative Cached Task'));
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Authoritative Cached Task');
+
+    // Subsequent authoritative:false event or wrong-server event must not overwrite or hide last good rows.
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-auth',
+          authoritative: false,
+          tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_spoof', title: 'Spoofed Non-Authoritative' }],
+          taskTitles: { t_spoof: 'Spoofed Non-Authoritative' },
+          assignments: [],
+        },
+      }));
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-other',
+          authoritative: true,
+          tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_other', title: 'Other Server Task' }],
+          assignments: [],
+        },
+      }));
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Authoritative Cached Task');
+    expect(screen.queryByText('Spoofed Non-Authoritative')).toBeNull();
+    expect(screen.queryByText('Other Server Task')).toBeNull();
   });
 });

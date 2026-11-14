@@ -1675,6 +1675,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     const onSnapshot = (event: Event) => {
       const detail = (event as CustomEvent).detail;
+      if (detail?.authoritative === false) return;
       if (detail?.scopeReset || detail?.authorityUnavailable) {
         setTaskPairReferences([]);
         setTaskPairPickerOpen(false);
