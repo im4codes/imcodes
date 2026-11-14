@@ -18893,9 +18893,15 @@ button.quick-agent-delegation-preset.active {
   color: #fecaca;
 }
 
-.cloud-docs-banner.is-warn {
+.cloud-docs-banner.is-warn,
+.cloud-docs-banner.is-warning {
   background: rgba(120, 53, 15, 0.35);
   color: #fde68a;
+}
+
+.cloud-docs-banner.is-info {
+  background: rgba(30, 58, 138, 0.38);
+  color: #bfdbfe;
 }
 
 .cloud-docs-link-btn {
@@ -20231,6 +20237,245 @@ button.quick-agent-delegation-preset.active {
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 11px;
+  }
+}
+
+.cloud-docs-main-chat-anchor {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+  max-width: calc(100% - 28px);
+  max-height: calc(100% - 28px);
+}
+
+.cloud-docs-fab {
+  pointer-events: auto;
+  position: relative;
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.42);
+  background: linear-gradient(145deg, #16223a 0%, #0f172a 100%);
+  box-shadow: 0 8px 22px rgba(2, 6, 23, 0.55);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.cloud-docs-fab:hover,
+.cloud-docs-fab.active {
+  transform: translateY(-1px);
+  border-color: rgba(96, 165, 250, 0.8);
+  box-shadow: 0 10px 26px rgba(37, 99, 235, 0.32);
+}
+
+.cloud-docs-fab.busy {
+  border-color: rgba(56, 189, 248, 0.85);
+}
+
+.cloud-docs-fab-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  object-fit: cover;
+  display: block;
+}
+
+.cloud-docs-fab-busy-dot {
+  position: absolute;
+  top: -1px;
+  right: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #38bdf8;
+  border: 2px solid #0f172a;
+  animation: cloudDocsPulse 1.3s ease-in-out infinite;
+}
+
+@keyframes cloudDocsPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+.cloud-docs-mini-chat {
+  pointer-events: auto;
+  width: min(380px, 100%);
+  height: min(420px, calc(100vh - 180px));
+  max-height: calc(100% - 52px);
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  border: 1px solid #334155;
+  background: #0b1120;
+  box-shadow: 0 18px 42px rgba(2, 6, 23, 0.72);
+  overflow: hidden;
+}
+
+.cloud-docs-mini-chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #1e293b;
+  background: #0f172a;
+  flex-shrink: 0;
+}
+
+.cloud-docs-mini-chat-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.cloud-docs-mini-chat-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.cloud-docs-mini-chat-title-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.cloud-docs-mini-chat-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #f1f5f9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-docs-mini-chat-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+
+.cloud-docs-mini-chat-status.busy {
+  color: #7dd3fc;
+}
+
+.cloud-docs-mini-chat-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #22c55e;
+}
+
+.cloud-docs-mini-chat-status.busy .cloud-docs-mini-chat-status-dot {
+  background: #38bdf8;
+  animation: cloudDocsPulse 1.3s ease-in-out infinite;
+}
+
+.cloud-docs-mini-chat-close {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 16px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.cloud-docs-mini-chat-close:hover {
+  background: rgba(148, 163, 184, 0.16);
+  color: #f8fafc;
+}
+
+.cloud-docs-mini-chat-messages {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.cloud-docs-mini-chat-messages .chat-view {
+  flex: 1;
+  min-height: 0;
+}
+
+.cloud-docs-mini-chat-doc-strip {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px 0;
+  background: #0f172a;
+  border-top: 1px solid #1e293b;
+  flex-shrink: 0;
+}
+
+.cloud-docs-mini-chat-reattach-btn {
+  border: 1px dashed rgba(96, 165, 250, 0.45);
+  background: rgba(30, 58, 138, 0.24);
+  color: #93c5fd;
+  font-size: 11px;
+  line-height: 1.3;
+  padding: 2px 8px;
+  border-radius: 999px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.cloud-docs-mini-chat-reattach-btn:hover {
+  background: rgba(30, 58, 138, 0.42);
+  color: #dbeafe;
+}
+
+.cloud-docs-mini-chat-controls {
+  flex-shrink: 0;
+  border-top: 1px solid #1e293b;
+  background: #0f172a;
+}
+
+.cloud-docs-mini-chat-controls .controls-wrapper {
+  padding: 4px 6px 6px;
+}
+
+@media (max-width: 600px) {
+  .cloud-docs-main-chat-anchor {
+    right: 10px;
+    bottom: 10px;
+    max-width: calc(100% - 20px);
+    max-height: calc(100% - 20px);
+  }
+
+  .cloud-docs-mini-chat {
+    width: calc(100vw - 24px);
+    height: min(380px, calc(100dvh - 130px));
   }
 }
 

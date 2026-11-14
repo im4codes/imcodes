@@ -5374,6 +5374,7 @@
       "remove_recent": "Quitar de recientes",
       "share": "Compartir",
       "more": "Más acciones",
+      "quote": "Citar",
       "clear_search": "Limpiar búsqueda"
     },
     "blank_type": {
@@ -5464,7 +5465,21 @@
     "drop_hint": "Suelta un archivo Office o PDF compatible para subirlo",
     "open_new_window": "Abrir en una nueva ventana",
     "window_blocked": "El navegador bloqueó la ventana de Documentos en la nube. Permite las ventanas emergentes para este sitio e inténtalo de nuevo.",
-    "window_blocked_dismiss": "Descartar"
+    "window_blocked_dismiss": "Descartar",
+    "quote": {
+      "inserted": "Se citó \"{{name}}\" en la sesión activa",
+      "sent_to_main": "Se envió la cita de \"{{name}}\" a la ventana principal",
+      "no_target_window": "No se encontró ninguna ventana de sesión de IM.codes activa"
+    },
+    "ai_chat": {
+      "title": "Chat de IA — {{session}}",
+      "open": "Abrir chat de IA ({{session}})",
+      "collapse": "Contraer chat de IA",
+      "synced": "Sincronizado",
+      "thinking": "Pensando...",
+      "reattach_doc": "Adjuntar {{name}}",
+      "reattach_doc_hint": "Volver a adjuntar \"{{name}}\" como contexto citado"
+    }
   },
   "mobile_gesture": {
     "hud": {

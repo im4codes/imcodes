@@ -42,6 +42,7 @@ interface Props {
   onToggleMaximized?: () => void;
   getMaximizeBounds?: () => WorkspaceBounds | null;
   desktopLayoutCapable?: boolean;
+  geometryRequest?: { version: number; geometry: WindowGeometry } | null;
   className?: string;
   /** Keep resize/window geometry chrome but let the child render its titlebar. */
   hideTitleBar?: boolean;
@@ -187,6 +188,7 @@ export function FloatingPanel({
   onToggleMaximized,
   getMaximizeBounds,
   desktopLayoutCapable = true,
+  geometryRequest = null,
   className,
   hideTitleBar = false,
   dragHandleSelector,
@@ -202,10 +204,18 @@ export function FloatingPanel({
   const [, forceWorkspaceRender] = useState(0);
   const geomRef = useRef(geom);
   geomRef.current = geom;
+  const lastAppliedGeometryVersionRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (shouldPersistGeometry(isDesktopMaximized)) saveGeom(id, geom, defaultVersion);
   }, [id, geom, isDesktopMaximized, defaultVersion]);
+
+  useEffect(() => {
+    if (!geometryRequest) return;
+    if (lastAppliedGeometryVersionRef.current === geometryRequest.version) return;
+    lastAppliedGeometryVersionRef.current = geometryRequest.version;
+    setGeom(clampGeomToViewport(geometryRequest.geometry, minW, minH, fitSmallViewport));
+  }, [fitSmallViewport, geometryRequest, minH, minW]);
   useEffect(() => {
     const onResize = () => {
       if (isDesktopMaximized) {

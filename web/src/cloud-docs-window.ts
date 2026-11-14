@@ -1,11 +1,13 @@
 import { isStandaloneDisplayMode } from './pwa-install.js';
 import { publishCloudDocsWindowBlocked } from './cloud-docs-window-notice.js';
 import { remoteDesktopWindowBounds, remoteDesktopWindowFeatures } from './remote-desktop-window.js';
+import type { CloudDocQuoteTarget } from './cloud-docs-reference.js';
 
 export const CLOUD_DOCS_WINDOW_QUERY = 'cloudDocs';
 export const CLOUD_DOCS_TAB_QUERY = 'cloudDocsTab';
 export const CLOUD_DOCS_FOLDER_QUERY = 'cloudDocsFolder';
 export const CLOUD_DOCS_DOC_QUERY = 'cloudDocsDoc';
+export const CLOUD_DOCS_QUOTE_CHANNEL = 'imcodes:cloud-docs-quote';
 
 export type CloudDocsWindowTab = 'recent' | 'my_docs' | 'shared';
 
@@ -13,6 +15,12 @@ export interface CloudDocsWindowParams {
   tab?: CloudDocsWindowTab;
   folderId?: string;
   docId?: string;
+}
+
+export interface CloudDocQuoteMessage {
+  type: 'cloud_doc_quote';
+  target: CloudDocQuoteTarget;
+  ts: number;
 }
 
 const VALID_CLOUD_DOCS_TABS = new Set<CloudDocsWindowTab>(['recent', 'my_docs', 'shared']);
@@ -69,4 +77,70 @@ export function openCloudDocsWindow(params?: CloudDocsWindowParams): Window | nu
     publishCloudDocsWindowBlocked();
   }
   return opened;
+}
+
+function isValidCloudDocQuoteTarget(value: unknown): value is CloudDocQuoteTarget {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<CloudDocQuoteTarget> & Record<string, unknown>;
+  if (candidate.kind === 'cloud_doc') {
+    return typeof candidate.docId === 'string' && candidate.docId.length > 0 && typeof candidate.name === 'string';
+  }
+  if (candidate.kind === 'server_file') {
+    return typeof candidate.path === 'string' && candidate.path.length > 0 && typeof candidate.name === 'string';
+  }
+  return false;
+}
+
+/**
+ * Broadcast a document quote from a detached/standalone Cloud Docs window
+ * to any same-origin main app window listening on `CLOUD_DOCS_QUOTE_CHANNEL`.
+ */
+export function publishCloudDocQuote(target: CloudDocQuoteTarget): boolean {
+  if (typeof BroadcastChannel === 'undefined') return false;
+  try {
+    const channel = new BroadcastChannel(CLOUD_DOCS_QUOTE_CHANNEL);
+    try {
+      const payload: CloudDocQuoteMessage = {
+        type: 'cloud_doc_quote',
+        target,
+        ts: Date.now(),
+      };
+      channel.postMessage(payload);
+      return true;
+    } finally {
+      channel.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Subscribe to document quotes posted by standalone Cloud Docs windows.
+ * Returns a cleanup callback. Safe no-op when BroadcastChannel is unavailable.
+ */
+export function subscribeCloudDocQuotes(
+  onQuote: (target: CloudDocQuoteTarget) => void,
+): () => void {
+  if (typeof BroadcastChannel === 'undefined') return () => {};
+  try {
+    const channel = new BroadcastChannel(CLOUD_DOCS_QUOTE_CHANNEL);
+    const handleMessage = (event: MessageEvent<unknown>) => {
+      const data = event.data as Partial<CloudDocQuoteMessage> | null | undefined;
+      if (!data || data.type !== 'cloud_doc_quote') return;
+      if (!isValidCloudDocQuoteTarget(data.target)) return;
+      onQuote(data.target);
+    };
+    channel.addEventListener('message', handleMessage);
+    return () => {
+      try {
+        channel.removeEventListener('message', handleMessage);
+        channel.close();
+      } catch {
+        // Ignore channel close errors on teardown.
+      }
+    };
+  } catch {
+    return () => {};
+  }
 }

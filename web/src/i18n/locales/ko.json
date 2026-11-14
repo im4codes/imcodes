@@ -5373,6 +5373,7 @@
       "remove_recent": "최근 목록에서 제거",
       "share": "공유",
       "more": "더보기",
+      "quote": "인용",
       "clear_search": "검색 지우기"
     },
     "blank_type": {
@@ -5463,7 +5464,21 @@
     "drop_hint": "지원되는 Office 또는 PDF 파일을 놓아 업로드하세요",
     "open_new_window": "새 창에서 열기",
     "window_blocked": "브라우저가 클라우드 문서 창을 차단했습니다. 이 사이트의 팝업을 허용한 뒤 다시 시도하세요.",
-    "window_blocked_dismiss": "숨기기"
+    "window_blocked_dismiss": "숨기기",
+    "quote": {
+      "inserted": "\"{{name}}\" 문서를 활성 세션에 인용했습니다",
+      "sent_to_main": "\"{{name}}\" 인용을 기본 창으로 보냈습니다",
+      "no_target_window": "활성 IM.codes 세션 창을 찾을 수 없습니다"
+    },
+    "ai_chat": {
+      "title": "AI 채팅 — {{session}}",
+      "open": "AI 채팅 열기 ({{session}})",
+      "collapse": "AI 채팅 접기",
+      "synced": "동기화됨",
+      "thinking": "생각 중...",
+      "reattach_doc": "{{name}} 연결",
+      "reattach_doc_hint": "\"{{name}}\" 문서를 인용 컨텍스트로 다시 연결"
+    }
   },
   "mobile_gesture": {
     "hud": {

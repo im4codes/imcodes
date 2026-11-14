@@ -5384,6 +5384,7 @@
       "remove_recent": "移出最近列表",
       "share": "共享",
       "more": "更多操作",
+      "quote": "引用",
       "clear_search": "清除搜索"
     },
     "blank_type": {
@@ -5474,7 +5475,21 @@
     "drop_hint": "松开即可上传支持的 Office 或 PDF 文件",
     "open_new_window": "在新窗口中打开",
     "window_blocked": "浏览器拦截了云文档窗口。请允许本站弹出窗口后重试。",
-    "window_blocked_dismiss": "忽略"
+    "window_blocked_dismiss": "忽略",
+    "quote": {
+      "inserted": "已引用「{{name}}」到当前会话",
+      "sent_to_main": "已发送「{{name}}」引用到主窗口",
+      "no_target_window": "未找到可接收引用的 IM.codes 会话窗口"
+    },
+    "ai_chat": {
+      "title": "AI 对话 — {{session}}",
+      "open": "展开 AI 对话 ({{session}})",
+      "collapse": "收起 AI 对话",
+      "synced": "已同步",
+      "thinking": "思考中...",
+      "reattach_doc": "关联 {{name}}",
+      "reattach_doc_hint": "重新关联「{{name}}」作为引用上下文"
+    }
   },
   "mobile_gesture": {
     "hud": {

@@ -5373,6 +5373,7 @@
       "remove_recent": "履歴から削除",
       "share": "共有",
       "more": "その他の操作",
+      "quote": "引用",
       "clear_search": "検索をクリア"
     },
     "blank_type": {
@@ -5463,7 +5464,21 @@
     "drop_hint": "対応している Office または PDF ファイルをドロップしてアップロード",
     "open_new_window": "新しいウィンドウで開く",
     "window_blocked": "ブラウザがクラウドドキュメントのウィンドウをブロックしました。このサイトのポップアップを許可してもう一度お試しください。",
-    "window_blocked_dismiss": "非表示"
+    "window_blocked_dismiss": "非表示",
+    "quote": {
+      "inserted": "「{{name}}」をアクティブなセッションに引用しました",
+      "sent_to_main": "「{{name}}」の引用をメインウィンドウに送信しました",
+      "no_target_window": "アクティブな IM.codes セッションウィンドウが見つかりません"
+    },
+    "ai_chat": {
+      "title": "AI チャット — {{session}}",
+      "open": "AI チャットを開く ({{session}})",
+      "collapse": "AI チャットを閉じる",
+      "synced": "同期済み",
+      "thinking": "思考中...",
+      "reattach_doc": "{{name}} を添付",
+      "reattach_doc_hint": "「{{name}}」を引用コンテキストとして再添付"
+    }
   },
   "mobile_gesture": {
     "hud": {

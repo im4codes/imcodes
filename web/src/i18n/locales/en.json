@@ -5383,6 +5383,7 @@
       "rename": "Rename",
       "remove_recent": "Remove from Recent",
       "share": "Share",
+      "quote": "Quote",
       "more": "More actions",
       "clear_search": "Clear search"
     },
@@ -5474,7 +5475,21 @@
     "drop_hint": "Drop supported Office or PDF file to upload",
     "open_new_window": "Open in new window",
     "window_blocked": "Your browser blocked the Cloud Docs window. Allow pop-ups for this site and try again.",
-    "window_blocked_dismiss": "Dismiss"
+    "window_blocked_dismiss": "Dismiss",
+    "quote": {
+      "inserted": "Quoted \"{{name}}\" into active session",
+      "sent_to_main": "Quoted \"{{name}}\" to main window",
+      "no_target_window": "No active IM.codes session window found"
+    },
+    "ai_chat": {
+      "title": "AI Chat — {{session}}",
+      "open": "Open AI chat ({{session}})",
+      "collapse": "Collapse AI chat",
+      "synced": "Synced",
+      "thinking": "Thinking...",
+      "reattach_doc": "Attach {{name}}",
+      "reattach_doc_hint": "Re-attach \"{{name}}\" as quote context"
+    }
   },
   "mobile_gesture": {
     "hud": {

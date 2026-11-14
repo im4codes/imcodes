@@ -42,9 +42,23 @@ vi.mock('../../src/components/OfficePreview.js', () => ({
       <div
         data-testid="mock-office-preview"
         data-cloud-doc-id={String(props.cloudDocId ?? '')}
+        data-path={String(props.path ?? '')}
         data-read-only={String(Boolean(props.readOnly))}
         data-has-src-url={String(Boolean(props.srcUrl))}
         data-initial-mode={String(props.initialMode ?? '')}
+      />
+    );
+  },
+}));
+
+const mainChatFloatSpy = vi.fn();
+vi.mock('../../src/components/CloudDocsMainChatFloat.js', () => ({
+  CloudDocsMainChatFloat: (props: { mainChat: unknown; activePreviewQuote?: unknown }) => {
+    mainChatFloatSpy(props);
+    return (
+      <div
+        data-testid="mock-cloud-docs-main-chat-float"
+        data-active-quote={props.activePreviewQuote ? JSON.stringify(props.activePreviewQuote) : ''}
       />
     );
   },
@@ -1731,13 +1745,11 @@ describe('CloudDocsPanel', () => {
     const mdDoc = makeDoc({
       id: 'doc-md-1',
       name: 'Notes.md',
-      ext: '.md',
       mimeType: 'text/markdown',
     });
     const docxDoc = makeDoc({
       id: 'doc-docx-1',
       name: 'Spec.docx',
-      ext: '.docx',
       mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     });
 
@@ -1782,5 +1794,209 @@ describe('CloudDocsPanel', () => {
     fireEvent.click(screen.getByText('Notes.md'));
     await waitFor(() => expect(screen.getByTestId('mock-office-preview')).toBeTruthy());
     expect(recordRecentDocumentApiMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('supports one-click quote buttons in My Docs, Shared, Recent (accessible only), grid mode, context menu, and preview header', async () => {
+    const ownedDoc = makeDoc({ id: 'doc-own-1', name: 'Architecture.docx' });
+    const sharedDoc: SharedCloudDocItem = {
+      id: 'doc-shr-1',
+      folderId: null,
+      name: 'Budget.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      sizeBytes: 4096,
+      docVersion: 2,
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_100_000,
+      role: 'viewer',
+      allowDownload: true,
+      ownerName: 'alice',
+      sharedTeamName: 'Core',
+    };
+    const accessibleRecentServerFile: RecentDocumentItem = {
+      id: 'rec-srv-1',
+      sourceKind: 'server_file',
+      sourceType: 'server_file',
+      sourceKey: 'server_file:srv-1:/repo/guide.pdf',
+      title: 'guide.pdf',
+      mimeType: 'application/pdf',
+      serverId: 'srv-1',
+      serverName: 'Dev Box',
+      serverOnline: true,
+      sessionName: 'deck_cd_brain',
+      filePath: '/repo/guide.pdf',
+      cloudDocId: null,
+      lastOpenedAt: 1_700_000_600_000,
+      openCount: 1,
+      accessible: true,
+      openMode: 'view',
+    };
+    const blockedRecentDoc: RecentDocumentItem = {
+      id: 'rec-blk-1',
+      sourceKind: 'cloud_doc',
+      sourceType: 'cloud_doc',
+      sourceKey: 'cloud:doc-missing',
+      title: 'Revoked.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      serverId: null,
+      serverName: null,
+      serverOnline: null,
+      sessionName: null,
+      filePath: null,
+      cloudDocId: 'doc-missing',
+      lastOpenedAt: 1_700_000_500_000,
+      openCount: 1,
+      accessible: false,
+      accessReason: 'cloud_doc_missing',
+      openMode: 'view',
+    };
+
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [ownedDoc],
+      sharedFolders: [],
+      sharedDocs: [sharedDoc],
+    });
+    listRecentDocumentsApiMock.mockResolvedValue({
+      items: [accessibleRecentServerFile, blockedRecentDoc],
+    });
+    listCloudDocTeamsApiMock.mockResolvedValue({ teams: [] });
+
+    const onQuoteDoc = vi.fn();
+    render(<CloudDocsPanel initialTab="recent" onQuoteDoc={onQuoteDoc} />);
+
+    // Recent: accessible item has quote button; blocked item does not
+    await waitFor(() => expect(screen.getByTestId('quote-recent-rec-srv-1')).toBeTruthy());
+    expect(screen.queryByTestId('quote-recent-rec-blk-1')).toBeNull();
+    fireEvent.click(screen.getByTestId('quote-recent-rec-srv-1'));
+    expect(onQuoteDoc).toHaveBeenLastCalledWith({
+      kind: 'server_file',
+      path: '/repo/guide.pdf',
+      name: 'guide.pdf',
+      serverId: 'srv-1',
+    });
+
+    // Recent preview keeps OfficePreview open while quoting from preview header
+    fireEvent.click(screen.getByText('guide.pdf'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-preview-quote')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-quote'));
+    expect(onQuoteDoc).toHaveBeenLastCalledWith({
+      kind: 'server_file',
+      path: '/repo/guide.pdf',
+      name: 'guide.pdf',
+      serverId: 'srv-1',
+    });
+    expect(screen.getByTestId('mock-office-preview')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    await waitFor(() => expect(screen.queryByTestId('mock-office-preview')).toBeNull());
+
+    // My Docs: list & grid views + context menu + cloud_doc preview quote
+    fireEvent.click(screen.getByTestId('cloud-docs-tab-my-docs'));
+    await waitFor(() => expect(screen.getByTestId('quote-cloud-doc-doc-own-1')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('quote-cloud-doc-doc-own-1'));
+    expect(onQuoteDoc).toHaveBeenLastCalledWith({
+      kind: 'cloud_doc',
+      docId: 'doc-own-1',
+      name: 'Architecture.docx',
+      mimeType: ownedDoc.mimeType,
+    });
+
+    // Switch to grid/card mode: quote button remains mounted
+    fireEvent.click(screen.getByTestId('cloud-docs-view-grid'));
+    await waitFor(() => expect(screen.getByTestId('quote-cloud-doc-doc-own-1')).toBeTruthy());
+
+    // Context menu quote item
+    fireEvent.contextMenu(screen.getByTestId('cloud-doc-row-doc-own-1'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-ctx-quote')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('cloud-docs-ctx-quote'));
+    expect(onQuoteDoc).toHaveBeenLastCalledWith({
+      kind: 'cloud_doc',
+      docId: 'doc-own-1',
+      name: 'Architecture.docx',
+      mimeType: ownedDoc.mimeType,
+    });
+
+    // Preview cloud_doc quote keeps OfficePreview open
+    fireEvent.click(screen.getByText('Architecture.docx'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-preview-quote')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-quote'));
+    expect(onQuoteDoc).toHaveBeenLastCalledWith({
+      kind: 'cloud_doc',
+      docId: 'doc-own-1',
+      name: 'Architecture.docx',
+      mimeType: ownedDoc.mimeType,
+    });
+    expect(screen.getByTestId('mock-office-preview')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+
+    // Shared Docs quote button + context menu
+    fireEvent.click(screen.getByTestId('cloud-docs-tab-shared'));
+    await waitFor(() => expect(screen.getByTestId('quote-shared-doc-doc-shr-1')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('quote-shared-doc-doc-shr-1'));
+    expect(onQuoteDoc).toHaveBeenLastCalledWith({
+      kind: 'cloud_doc',
+      docId: 'doc-shr-1',
+      name: 'Budget.xlsx',
+      mimeType: sharedDoc.mimeType,
+    });
+  });
+
+  it('quotes via BroadcastChannel with feedback in standalone mode and wires mainChat float only in-app', async () => {
+    const origBC = globalThis.BroadcastChannel;
+    const posted: unknown[] = [];
+    class MockBC {
+      postMessage(data: unknown) { posted.push(data); }
+      close() {}
+    }
+    vi.stubGlobal('BroadcastChannel', MockBC);
+
+    const doc = makeDoc({ id: 'doc-bc-1', name: 'Standalone.docx' });
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [doc],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+    listRecentDocumentsApiMock.mockResolvedValue({ items: [] });
+    listCloudDocTeamsApiMock.mockResolvedValue({ teams: [] });
+
+    const fakeMainChat = {
+      session: { name: 'deck_cd_brain', project: 'app', state: 'idle' },
+      sessions: [],
+      subSessions: [],
+      ws: null,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: { loaded: true, history: [], commands: [], phrases: [], reload: vi.fn(), recordHistory: vi.fn(), addCommand: vi.fn(), updateCommand: vi.fn(), removeCommand: vi.fn(), addPhrase: vi.fn(), removePhrase: vi.fn() },
+    } as unknown as NonNullable<Parameters<typeof CloudDocsPanel>[0]['mainChat']>;
+
+    try {
+      // In-app mounts main chat float in list view and attaches preview target when opened
+      mainChatFloatSpy.mockClear();
+      const { rerender } = render(<CloudDocsPanel initialTab="my_docs" mainChat={fakeMainChat} />);
+      await waitFor(() => expect(screen.getByTestId('mock-cloud-docs-main-chat-float')).toBeTruthy());
+      expect(screen.getByTestId('mock-cloud-docs-main-chat-float').getAttribute('data-active-quote')).toBe('');
+
+      fireEvent.click(screen.getByText('Standalone.docx'));
+      await waitFor(() => expect(screen.getByTestId('mock-office-preview')).toBeTruthy());
+      expect(JSON.parse(screen.getByTestId('mock-cloud-docs-main-chat-float').getAttribute('data-active-quote') || '{}')).toMatchObject({
+        kind: 'cloud_doc',
+        docId: 'doc-bc-1',
+        name: 'Standalone.docx',
+      });
+
+      // Standalone omits floating main-session chat and uses BroadcastChannel for Quote
+      rerender(<CloudDocsPanel initialTab="my_docs" standalone mainChat={fakeMainChat} />);
+      expect(screen.queryByTestId('mock-cloud-docs-main-chat-float')).toBeNull();
+      fireEvent.click(screen.getByTestId('cloud-docs-preview-quote'));
+      expect(posted).toHaveLength(1);
+      expect(posted[0]).toMatchObject({
+        type: 'cloud_doc_quote',
+        target: { kind: 'cloud_doc', docId: 'doc-bc-1', name: 'Standalone.docx' },
+      });
+      await waitFor(() => expect(screen.getByTestId('cloud-docs-quote-notice')).toBeTruthy());
+    } finally {
+      vi.stubGlobal('BroadcastChannel', origBC);
+    }
   });
 });

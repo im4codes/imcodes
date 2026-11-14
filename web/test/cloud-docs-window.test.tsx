@@ -9,9 +9,12 @@ import { h } from 'preact';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import {
   buildCloudDocsWindowUrl,
+  CLOUD_DOCS_QUOTE_CHANNEL,
   isCloudDocsStandaloneWindow,
   openCloudDocsWindow,
+  publishCloudDocQuote,
   readCloudDocsWindowParams,
+  subscribeCloudDocQuotes,
 } from '../src/cloud-docs-window.js';
 import { resetCloudDocsWindowNoticeForTests } from '../src/cloud-docs-window-notice.js';
 import { CloudDocsWindowBlockedNotice } from '../src/components/CloudDocsWindowBlockedNotice.js';
@@ -175,5 +178,66 @@ describe('cloud-docs-window helpers & blocked notice', () => {
     vi.doUnmock('../src/components/CloudDocsPanel.js');
     vi.doUnmock('../src/pwa-install.js');
     vi.resetModules();
+  });
+
+  it('publishes and subscribes Cloud Docs quotes across same-origin BroadcastChannel safely', () => {
+    const channels = new Map<string, Set<(event: MessageEvent<unknown>) => void>>();
+    const origBC = globalThis.BroadcastChannel;
+
+    class MockBroadcastChannel {
+      name: string;
+      private listeners = new Set<(event: MessageEvent<unknown>) => void>();
+      constructor(name: string) {
+        this.name = name;
+        if (!channels.has(name)) channels.set(name, new Set());
+      }
+      addEventListener(type: string, fn: (event: MessageEvent<unknown>) => void) {
+        if (type !== 'message') return;
+        this.listeners.add(fn);
+        channels.get(this.name)!.add(fn);
+      }
+      removeEventListener(type: string, fn: (event: MessageEvent<unknown>) => void) {
+        if (type !== 'message') return;
+        this.listeners.delete(fn);
+        channels.get(this.name)?.delete(fn);
+      }
+      postMessage(data: unknown) {
+        for (const fn of channels.get(this.name) ?? []) {
+          fn({ data } as MessageEvent<unknown>);
+        }
+      }
+      close() {
+        for (const fn of this.listeners) channels.get(this.name)?.delete(fn);
+        this.listeners.clear();
+      }
+    }
+
+    vi.stubGlobal('BroadcastChannel', MockBroadcastChannel);
+    try {
+      const received: unknown[] = [];
+      const unsubscribe = subscribeCloudDocQuotes((target) => {
+        received.push(target);
+      });
+
+      expect(publishCloudDocQuote({ kind: 'cloud_doc', docId: 'd1', name: 'Spec.docx' })).toBe(true);
+      expect(publishCloudDocQuote({ kind: 'server_file', path: '/repo/README.md', name: 'README.md', serverId: 's1' })).toBe(true);
+
+      // Invalid messages on channel must be ignored
+      const rawChannel = new MockBroadcastChannel(CLOUD_DOCS_QUOTE_CHANNEL);
+      rawChannel.postMessage({ type: 'cloud_doc_quote', target: { kind: 'cloud_doc', docId: '', name: 'bad' } });
+      rawChannel.postMessage({ type: 'other_event' });
+      rawChannel.close();
+
+      expect(received).toEqual([
+        { kind: 'cloud_doc', docId: 'd1', name: 'Spec.docx' },
+        { kind: 'server_file', path: '/repo/README.md', name: 'README.md', serverId: 's1' },
+      ]);
+
+      unsubscribe();
+      expect(publishCloudDocQuote({ kind: 'cloud_doc', docId: 'd2', name: 'After.docx' })).toBe(true);
+      expect(received).toHaveLength(2);
+    } finally {
+      vi.stubGlobal('BroadcastChannel', origBC);
+    }
   });
 });

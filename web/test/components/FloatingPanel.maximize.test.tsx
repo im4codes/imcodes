@@ -413,4 +413,48 @@ describe('FloatingPanel maximize integration', () => {
     fireEvent.click(closeBtn);
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  it('applies geometryRequest updates when undocking and snapping to target bounds', () => {
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (Macintosh; Intel Mac OS X)');
+    Object.defineProperty(window, 'innerWidth', { value: 1440, configurable: true });
+    Object.defineProperty(window, 'innerHeight', { value: 900, configurable: true });
+
+    const { rerender } = render(
+      <FloatingPanel
+        id="cloud-docs"
+        title="Cloud Docs"
+        onClose={() => {}}
+        enableMaximize
+        isMaximized
+        getMaximizeBounds={() => ({ x: 240, y: 40, w: 1200, h: 860 })}
+        onToggleMaximized={() => {}}
+      >
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    const panel = document.querySelector('.floating-panel') as HTMLElement;
+    expect(panel.style.left).toBe('240px');
+    expect(panel.style.width).toBe('1200px');
+
+    rerender(
+      <FloatingPanel
+        id="cloud-docs"
+        title="Cloud Docs"
+        onClose={() => {}}
+        enableMaximize
+        isMaximized={false}
+        getMaximizeBounds={() => ({ x: 240, y: 40, w: 1200, h: 860 })}
+        geometryRequest={{ version: 1, geometry: { x: 840, y: 48, w: 592, h: 680 } }}
+        onToggleMaximized={() => {}}
+      >
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    expect(panel.style.left).toBe('840px');
+    expect(panel.style.top).toBe('48px');
+    expect(panel.style.width).toBe('592px');
+    expect(panel.style.height).toBe('680px');
+  });
 });

@@ -5374,6 +5374,7 @@
       "remove_recent": "移出最近列表",
       "share": "共用",
       "more": "更多操作",
+      "quote": "引用",
       "clear_search": "清除搜尋"
     },
     "blank_type": {
@@ -5464,7 +5465,21 @@
     "drop_hint": "拖放至此以上傳支援的 Office 或 PDF 檔案",
     "open_new_window": "在新視窗中開啟",
     "window_blocked": "瀏覽器封鎖了雲端文件視窗。請允許本網站的彈出視窗後重試。",
-    "window_blocked_dismiss": "忽略"
+    "window_blocked_dismiss": "忽略",
+    "quote": {
+      "inserted": "已引用「{{name}}」至目前工作階段",
+      "sent_to_main": "已傳送「{{name}}」引用至主視窗",
+      "no_target_window": "找不到可接收引用的 IM.codes 工作階段視窗"
+    },
+    "ai_chat": {
+      "title": "AI 對話 — {{session}}",
+      "open": "展開 AI 對話 ({{session}})",
+      "collapse": "收合 AI 對話",
+      "synced": "已同步",
+      "thinking": "思考中...",
+      "reattach_doc": "關聯 {{name}}",
+      "reattach_doc_hint": "重新關聯「{{name}}」作為引用上下文"
+    }
   },
   "mobile_gesture": {
     "hud": {

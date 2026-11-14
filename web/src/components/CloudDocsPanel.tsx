@@ -44,6 +44,9 @@ import {
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
+import type { CloudDocQuoteTarget } from '../cloud-docs-reference.js';
+import { publishCloudDocQuote } from '../cloud-docs-window.js';
+import { CloudDocsMainChatFloat, type CloudDocsMainChatContext } from './CloudDocsMainChatFloat.js';
 
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 
@@ -58,6 +61,8 @@ export interface CloudDocsPanelProps {
   standalone?: boolean;
   initialFolderId?: string | null;
   initialDocId?: string | null;
+  onQuoteDoc?: (target: CloudDocQuoteTarget) => void;
+  mainChat?: CloudDocsMainChatContext | null;
 }
 
 type PreviewTarget =
@@ -361,6 +366,20 @@ function TrashIcon() {
   );
 }
 
+function QuoteIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M10 11H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h3a1 1 0 0 1 1 1v7a4 4 0 0 1-4 4m14-6h-4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h3a1 1 0 0 1 1 1v7a4 4 0 0 1-4 4"
+        stroke="currentColor"
+        stroke-width="1.8"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+  );
+}
+
 export function buildUniqueAutoDocName(
   type: CloudDocBlankType,
   existingDocs: readonly CloudDocItem[],
@@ -410,6 +429,8 @@ export function CloudDocsPanel({
   standalone = false,
   initialFolderId = null,
   initialDocId = null,
+  onQuoteDoc,
+  mainChat = null,
 }: CloudDocsPanelProps) {
   const { t } = useTranslation();
   const tRef = useRef(t);
@@ -448,11 +469,79 @@ export function CloudDocsPanel({
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [previewTitleDraft, setPreviewTitleDraft] = useState('');
   const [previewTitleStatus, setPreviewTitleStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [quoteNotice, setQuoteNotice] = useState<{ kind: 'ok' | 'warn'; text: string } | null>(null);
+  const quoteNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRecordedOnlyOfficeKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     lastRecordedOnlyOfficeKeyRef.current = null;
   }, [previewTarget]);
+
+  useEffect(() => () => {
+    if (quoteNoticeTimerRef.current) clearTimeout(quoteNoticeTimerRef.current);
+  }, []);
+
+  const showQuoteNotice = useCallback((kind: 'ok' | 'warn', text: string) => {
+    setQuoteNotice({ kind, text });
+    if (quoteNoticeTimerRef.current) clearTimeout(quoteNoticeTimerRef.current);
+    quoteNoticeTimerRef.current = setTimeout(() => {
+      setQuoteNotice(null);
+      quoteNoticeTimerRef.current = null;
+    }, 2800);
+  }, []);
+
+  const previewQuoteTarget = useMemo<CloudDocQuoteTarget | null>(() => {
+    if (!previewTarget) return null;
+    if (previewTarget.kind === 'cloud_doc') {
+      return {
+        kind: 'cloud_doc',
+        docId: previewTarget.id,
+        name: previewTarget.name,
+        mimeType: previewTarget.mimeType,
+      };
+    }
+    return {
+      kind: 'server_file',
+      path: previewTarget.path,
+      name: previewTarget.title,
+      serverId: previewTarget.serverId,
+    };
+  }, [previewTarget]);
+
+  const buildRecentQuoteTarget = useCallback((item: RecentDocumentItem): CloudDocQuoteTarget | null => {
+    if (!item.accessible) return null;
+    if (item.sourceKind === 'cloud_doc' && item.cloudDocId) {
+      return {
+        kind: 'cloud_doc',
+        docId: item.cloudDocId,
+        name: item.title,
+        mimeType: item.mimeType,
+      };
+    }
+    if (item.sourceKind === 'server_file' && item.filePath) {
+      return {
+        kind: 'server_file',
+        path: item.filePath,
+        name: item.title,
+        serverId: item.serverId ?? undefined,
+      };
+    }
+    return null;
+  }, []);
+
+  const handleQuoteTarget = useCallback((target: CloudDocQuoteTarget) => {
+    if (onQuoteDoc) {
+      onQuoteDoc(target);
+      showQuoteNotice('ok', t('cloud_docs.quote.inserted', { name: target.name }));
+      return;
+    }
+    const posted = publishCloudDocQuote(target);
+    if (posted) {
+      showQuoteNotice('ok', t('cloud_docs.quote.sent_to_main', { name: target.name }));
+    } else {
+      showQuoteNotice('warn', t('cloud_docs.quote.no_target_window', 'No active IM.codes session window found'));
+    }
+  }, [onQuoteDoc, showQuoteNotice, t]);
 
   const handleOnlyOfficeOpened = useCallback((info: { mode: 'view' | 'edit' }) => {
     if (!previewTarget || typeof recordRecentDocumentApi !== 'function') return;
@@ -1624,6 +1713,22 @@ export function CloudDocsPanel({
           type="button"
           role="menuitem"
           class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-quote"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => runAction(() => handleQuoteTarget({
+            kind: 'cloud_doc',
+            docId: doc.id,
+            name: doc.name,
+            mimeType: doc.mimeType,
+          }))}
+        >
+          <QuoteIcon />
+          <span>{t('cloud_docs.actions.quote', 'Quote')}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
           data-testid="cloud-docs-ctx-download"
           onClick={() => runAction(() => { void handleDownloadCloudDoc(doc.id, doc.name); })}
         >
@@ -1746,6 +1851,22 @@ export function CloudDocsPanel({
               : t('cloud_docs.actions.view', 'View')}
           </span>
         </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-quote"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => runAction(() => handleQuoteTarget({
+            kind: 'cloud_doc',
+            docId: doc.id,
+            name: doc.name,
+            mimeType: doc.mimeType,
+          }))}
+        >
+          <QuoteIcon />
+          <span>{t('cloud_docs.actions.quote', 'Quote')}</span>
+        </button>
         {doc.allowDownload && (
           <button
             type="button"
@@ -1788,6 +1909,7 @@ export function CloudDocsPanel({
         && item.accessible
         && item.allowDownload !== false,
       );
+      const quoteTarget = buildRecentQuoteTarget(item);
       return (
         <>
           <button
@@ -1806,6 +1928,19 @@ export function CloudDocsPanel({
                   : t('cloud_docs.actions.open', 'Open')}
             </span>
           </button>
+          {quoteTarget && (
+            <button
+              type="button"
+              role="menuitem"
+              class="cloud-docs-popover-item"
+              data-testid="cloud-docs-ctx-quote"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => runAction(() => handleQuoteTarget(quoteTarget))}
+            >
+              <QuoteIcon />
+              <span>{t('cloud_docs.actions.quote', 'Quote')}</span>
+            </button>
+          )}
           {canDownloadCloud && item.cloudDocId && (
             <button
               type="button"
@@ -2070,6 +2205,20 @@ export function CloudDocsPanel({
             </div>
           )}
           <div class="cloud-docs-preview-actions">
+            {previewQuoteTarget && (
+              <button
+                type="button"
+                class="cloud-docs-btn"
+                data-testid="cloud-docs-preview-quote"
+                aria-label={t('cloud_docs.actions.quote', 'Quote')}
+                title={t('cloud_docs.actions.quote', 'Quote')}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => handleQuoteTarget(previewQuoteTarget)}
+              >
+                <QuoteIcon />
+                <span class="cloud-docs-preview-btn-label">{t('cloud_docs.actions.quote', 'Quote')}</span>
+              </button>
+            )}
             {canShareInPreview && (
               <button
                 type="button"
@@ -2098,6 +2247,15 @@ export function CloudDocsPanel({
             )}
           </div>
         </div>
+        {quoteNotice && (
+          <div
+            class={`cloud-docs-banner${quoteNotice.kind === 'warn' ? ' is-warning' : ' is-info'}`}
+            data-testid="cloud-docs-quote-notice"
+          >
+            <span>{quoteNotice.text}</span>
+            <button type="button" class="cloud-docs-link-btn" onClick={() => setQuoteNotice(null)}><CloseIcon /></button>
+          </div>
+        )}
         {error && (
           <div class="cloud-docs-banner is-error" data-testid="cloud-docs-error">
             <span>{error}</span>
@@ -2128,6 +2286,12 @@ export function CloudDocsPanel({
             )}
           </Suspense>
         </div>
+        {mainChat && !standalone && (
+          <CloudDocsMainChatFloat
+            mainChat={mainChat}
+            activePreviewQuote={previewQuoteTarget}
+          />
+        )}
         {renderShareModal()}
       </div>
     );
@@ -2328,6 +2492,16 @@ export function CloudDocsPanel({
           )}
         </div>
       </div>
+
+      {quoteNotice && (
+        <div
+          class={`cloud-docs-banner${quoteNotice.kind === 'warn' ? ' is-warning' : ' is-info'}`}
+          data-testid="cloud-docs-quote-notice"
+        >
+          <span>{quoteNotice.text}</span>
+          <button type="button" class="cloud-docs-link-btn" onClick={() => setQuoteNotice(null)}><CloseIcon /></button>
+        </div>
+      )}
 
       {error && (
         <div class="cloud-docs-banner is-error" data-testid="cloud-docs-error">
@@ -2619,6 +2793,22 @@ export function CloudDocsPanel({
                     <span class="cloud-docs-time">{formatTime(item.lastOpenedAt)}</span>
                   </div>
                   <div class="cloud-docs-row-actions">
+                    {(() => {
+                      const quoteTarget = buildRecentQuoteTarget(item);
+                      return quoteTarget ? (
+                        <button
+                          type="button"
+                          class="cloud-docs-icon-btn"
+                          data-testid={`quote-recent-${item.id}`}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => handleQuoteTarget(quoteTarget)}
+                          title={t('cloud_docs.actions.quote', 'Quote')}
+                          aria-label={t('cloud_docs.actions.quote', 'Quote')}
+                        >
+                          <QuoteIcon size={13} />
+                        </button>
+                      ) : null;
+                    })()}
                     <button
                       type="button"
                       class="cloud-docs-icon-btn"
@@ -2748,6 +2938,22 @@ export function CloudDocsPanel({
                       <span>{formatBytes(doc.sizeBytes)}</span>
                     </div>
                     <div class="cloud-docs-row-actions">
+                      <button
+                        type="button"
+                        class="cloud-docs-icon-btn"
+                        data-testid={`quote-shared-doc-${doc.id}`}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => handleQuoteTarget({
+                          kind: 'cloud_doc',
+                          docId: doc.id,
+                          name: doc.name,
+                          mimeType: doc.mimeType,
+                        })}
+                        title={t('cloud_docs.actions.quote', 'Quote')}
+                        aria-label={t('cloud_docs.actions.quote', 'Quote')}
+                      >
+                        <QuoteIcon />
+                      </button>
                       {doc.allowDownload && (
                         <button
                           type="button"
@@ -2892,6 +3098,22 @@ export function CloudDocsPanel({
                     <button
                       type="button"
                       class="cloud-docs-icon-btn"
+                      data-testid={`quote-cloud-doc-${doc.id}`}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleQuoteTarget({
+                        kind: 'cloud_doc',
+                        docId: doc.id,
+                        name: doc.name,
+                        mimeType: doc.mimeType,
+                      })}
+                      title={t('cloud_docs.actions.quote', 'Quote')}
+                      aria-label={t('cloud_docs.actions.quote', 'Quote')}
+                    >
+                      <QuoteIcon />
+                    </button>
+                    <button
+                      type="button"
+                      class="cloud-docs-icon-btn"
                       data-testid={`download-cloud-doc-${doc.id}`}
                       onClick={() => void handleDownloadCloudDoc(doc.id, doc.name)}
                       title={t('cloud_docs.actions.download', 'Download')}
@@ -2970,6 +3192,12 @@ export function CloudDocsPanel({
         )}
       </div>
 
+      {mainChat && !standalone && (
+        <CloudDocsMainChatFloat
+          mainChat={mainChat}
+          activePreviewQuote={previewQuoteTarget}
+        />
+      )}
       {renderContextMenu()}
       {renderShareModal()}
     </div>

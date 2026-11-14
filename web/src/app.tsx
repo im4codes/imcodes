@@ -77,6 +77,13 @@ import {
   supervisionTaskConsolePreferenceBounds,
 } from './components/SupervisionTaskConsole.js';
 import { CloudDocsGlyphIcon, CloudDocsPanel } from './components/CloudDocsPanel.js';
+import type { CloudDocsMainChatContext } from './components/CloudDocsMainChatFloat.js';
+import {
+  computeRightHalfUnobstructedCloudDocsGeometry,
+  formatCloudDocQuoteText,
+  resolveCloudDocQuoteTarget,
+  type CloudDocQuoteTarget,
+} from './cloud-docs-reference.js';
 import {
   loadSupervisionTaskConsolePreferences,
   saveSupervisionTaskConsolePreferences,
@@ -385,7 +392,7 @@ import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import { RemoteDesktopWindowBlockedNotice } from './components/RemoteDesktopWindowBlockedNotice.js';
 import { CloudDocsWindowBlockedNotice } from './components/CloudDocsWindowBlockedNotice.js';
-import { openCloudDocsWindow } from './cloud-docs-window.js';
+import { openCloudDocsWindow, subscribeCloudDocQuotes } from './cloud-docs-window.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
   fetchCurrentAppBuildInfo,
@@ -1191,7 +1198,13 @@ function InternalMainApp() {
   }, [showMobileServerMenu]);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [showCloudDocs, setShowCloudDocs] = useState(false);
+  const showCloudDocsRef = useRef(showCloudDocs);
+  showCloudDocsRef.current = showCloudDocs;
   const [desktopCloudDocsMaximized, setDesktopCloudDocsMaximized] = useState(false);
+  const [cloudDocsGeometryRequest, setCloudDocsGeometryRequest] = useState<{
+    version: number;
+    geometry: WindowGeometry;
+  } | null>(null);
   // On phones the console is a large overlay: never re-open it by itself at
   // launch (owner: load silently, no big box on open). Desktop keeps the remembered side-panel state.
   const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
@@ -8075,6 +8088,100 @@ function InternalMainApp() {
       executionCloneKind: session.executionCloneKind,
       parentRunId: session.parentRunId,
     })), [detectedModels, subSessions, subUsages]);
+  const visibleOpenWindowIdsRef = useRef(visibleOpenWindowIds);
+  visibleOpenWindowIdsRef.current = visibleOpenWindowIds;
+
+  const handleQuoteCloudDoc = useCallback((target: CloudDocQuoteTarget) => {
+    const destination = resolveCloudDocQuoteTarget({
+      openSubIds: visibleOpenWindowIdsRef.current,
+      stack: stackRef.current,
+      focusedSubId: focusedSubIdRef.current,
+      subSessions: subSessionsRef.current,
+      activeSession: activeSessionRef.current,
+    });
+    if (!destination) return;
+
+    const quoteText = formatCloudDocQuoteText(target);
+    const inputEl = inputRefsMap.current.get(destination.sessionName) ?? null;
+
+    if (destination.kind === 'sub') {
+      if (!isMobileRef.current) {
+        bringSubToFront(destination.subId);
+      } else {
+        setShowCloudDocs(false);
+      }
+    } else if (isMobileRef.current) {
+      setShowCloudDocs(false);
+    } else if (showCloudDocsRef.current) {
+      const workspaceBounds = getDesktopMaximizeBounds();
+      if (workspaceBounds) {
+        const composerHost = inputEl?.closest<HTMLElement>('.controls-wrapper') ?? inputEl;
+        const composerRect = composerHost?.getBoundingClientRect();
+        const composerTopPx = composerRect && composerRect.height > 0 ? composerRect.top : null;
+        const dockedGeometry = computeRightHalfUnobstructedCloudDocsGeometry({
+          workspaceBounds,
+          composerTopPx,
+          minW: 420,
+          minH: 360,
+        });
+        setDesktopCloudDocsMaximized(false);
+        setCloudDocsGeometryRequest((prev) => ({
+          version: (prev?.version ?? 0) + 1,
+          geometry: dockedGeometry,
+        }));
+      } else {
+        setDesktopCloudDocsMaximized(false);
+      }
+    }
+
+    if (inputEl && inputEl.isConnected) {
+      const existingText = inputEl.textContent ?? '';
+      const needsGap = existingText.length > 0 && !/[\s\n]$/.test(existingText);
+      appendContentEditableTextPreservingNewlines(inputEl, `${needsGap ? ' ' : ''}${quoteText}`);
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => {
+          if (destination.kind === 'sub' && !isMobileRef.current) {
+            bringSubToFront(destination.subId);
+          }
+          const liveEl = inputRefsMap.current.get(destination.sessionName);
+          if (liveEl && liveEl.isConnected) {
+            focusComposerElement(liveEl, { moveCursorToEnd: true });
+          }
+        });
+      }
+    } else {
+      setPendingPrefills((prev) => {
+        const existing = prev[destination.sessionName] || '';
+        const needsGap = existing.length > 0 && !/[\s\n]$/.test(existing);
+        return {
+          ...prev,
+          [destination.sessionName]: `${existing}${needsGap ? ' ' : ''}${quoteText}`,
+        };
+      });
+      if (destination.kind === 'sub' && !isMobileRef.current && typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => {
+          bringSubToFront(destination.subId);
+        });
+      }
+    }
+  }, [bringSubToFront, getDesktopMaximizeBounds]);
+
+  useEffect(() => subscribeCloudDocQuotes(handleQuoteCloudDoc), [handleQuoteCloudDoc]);
+
+  const cloudDocsMainChatContext = useMemo<CloudDocsMainChatContext | null>(() => {
+    if (!activeSessionInfo || !selectedServerId) return null;
+    return {
+      session: activeSessionInfo,
+      sessions: quickDelegationSessions,
+      subSessions: subSessionsSlim,
+      ws: wsRef.current,
+      connected,
+      serverId: selectedServerId,
+      quickData,
+      detectedModel: detectedModels.get(activeSessionInfo.name),
+    };
+  }, [activeSessionInfo, connected, detectedModels, quickData, quickDelegationSessions, selectedServerId, subSessionsSlim]);
+
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
     const sub = subSessionId
@@ -9837,8 +9944,8 @@ function InternalMainApp() {
           onClose={() => setShowCloudDocs(false)}
           defaultW={1080}
           defaultH={760}
-          minW={640}
-          minH={440}
+          minW={420}
+          minH={360}
           getDefaultGeometry={getDesktopMaximizeBounds}
           defaultVersion={2}
           zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cloudDocs, 5102)}
@@ -9852,8 +9959,12 @@ function InternalMainApp() {
           onToggleMaximized={() => setDesktopCloudDocsMaximized((current) => !current)}
           getMaximizeBounds={getDesktopMaximizeBounds}
           desktopLayoutCapable={desktopLayoutCapable}
+          geometryRequest={cloudDocsGeometryRequest}
         >
-          <CloudDocsPanel />
+          <CloudDocsPanel
+            onQuoteDoc={handleQuoteCloudDoc}
+            mainChat={cloudDocsMainChatContext}
+          />
         </FloatingPanel>
       )}
 
