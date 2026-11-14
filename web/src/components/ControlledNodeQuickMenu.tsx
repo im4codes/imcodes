@@ -8,16 +8,23 @@ interface ControlledNodeQuickMenuProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
   onOpenRemoteDesktopWall?(): void;
   onConnectById?(): void;
+  /** Desktop sidebars allow popping a host into its own browser window; mobile bars hide it. */
+  allowStandaloneWindow?: boolean;
 }
 
 /**
- * Compact controlled-node launcher for the desktop sidebar.
+ * Compact controlled-node launcher for the desktop sidebar and mobile header bar.
  *
  * The management button remains responsible for enrollment/settings. This
  * split-button menu is deliberately read-only: it lists every accessible node
  * and jumps straight into remote control without opening the management panel.
  */
-export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDesktopWall, onConnectById }: ControlledNodeQuickMenuProps) {
+export function ControlledNodeQuickMenu({
+  onOpenRemoteDesktop,
+  onOpenRemoteDesktopWall,
+  onConnectById,
+  allowStandaloneWindow = true,
+}: ControlledNodeQuickMenuProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -46,7 +53,9 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
         open={open}
         onClose={close}
         onSelect={(machine) => onOpenRemoteDesktop?.(machine)}
-        onOpenInWindow={(machine) => { openRemoteDesktopWindow(machine.serverId); }}
+        onOpenInWindow={allowStandaloneWindow
+          ? (machine) => { openRemoteDesktopWindow(machine.serverId); }
+          : undefined}
         titleAction={(onOpenRemoteDesktopWall || onConnectById) && <>
           {onConnectById && <button type="button" class="controlled-node-quick-wall" role="menuitem" onClick={() => { close(); onConnectById(); }}>
             {t('remote_desktop.connect_by_id')}

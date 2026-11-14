@@ -8791,6 +8791,7 @@ function InternalMainApp() {
                     onOpenRemoteDesktop={openRemoteDesktop}
                     onOpenRemoteDesktopWall={openRemoteDesktopWall}
                     onConnectById={openRemoteDesktopById}
+                    allowStandaloneWindow={false}
                   />
                 </div>
                 {activeSession && (

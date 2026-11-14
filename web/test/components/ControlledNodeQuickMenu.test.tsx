@@ -155,6 +155,36 @@ describe('ControlledNodeQuickMenu', () => {
     opened.mockRestore();
   });
 
+  it('hides the open-in-new-window button when allowStandaloneWindow is false (mobile) while preserving row selection', async () => {
+    const online = node({});
+    machines = [
+      online,
+      node({ serverId: 'node-2', refName: 'offline-two', displayName: 'Offline Two', online: false }),
+    ];
+    const onOpenRemoteDesktop = vi.fn();
+    const onWall = vi.fn();
+    render(
+      <ControlledNodeQuickMenu
+        onOpenRemoteDesktop={onOpenRemoteDesktop}
+        onOpenRemoteDesktopWall={onWall}
+        allowStandaloneWindow={false}
+      />,
+    );
+
+    const trigger = screen.getByRole('button', { name: 'controlled_nodes.machines_title' });
+    fireEvent.click(trigger);
+    await screen.findByText('Desktop One');
+
+    expect(screen.queryByRole('menuitem', { name: 'remote_desktop.open_new_window' })).toBeNull();
+    expect(screen.getByRole('menuitem', { name: 'remote_desktop.wall_short_title' })).toBeTruthy();
+
+    const rows = screen.getAllByRole('menuitem').filter((item) => item.classList.contains('controlled-node-quick-row'));
+    expect(rows).toHaveLength(2);
+    fireEvent.click(rows[0]!);
+    expect(onOpenRemoteDesktop).toHaveBeenCalledWith(online);
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
   it('shows no new-window button when the caller does not offer one', async () => {
     machines = [node({})];
     render(
