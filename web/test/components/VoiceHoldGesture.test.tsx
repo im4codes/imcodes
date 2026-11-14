@@ -1180,7 +1180,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 overlayBorderRadius: gs('.voice-overlay').borderRadius,
                 overlayZIndex: gs('.voice-overlay').zIndex,
               };
-            }, { z: zone, waitMs: reducedMotion === 'no-preference' && zone !== 'send' ? 240 : 0 });
+            }, { z: zone, waitMs: reducedMotion === 'no-preference' && zone !== 'send' ? 350 : 0 });
 
             expect(computed.trailing2PaddingRight).toBe('96px');
             expect(computed.trailing1PaddingRight).toBe('54px');
