@@ -60,25 +60,41 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /hermes_agent/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /^pi$/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /cc_cli_sdk/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
   });
 
-  it('launches the CC CLI SDK choice as its independent agent type', () => {
+  it.each([{ allowedAgentTypes: undefined }, { allowedAgentTypes: [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'claude-code-sdk', 'claude-code'] }])('never restores CC CLI SDK via an allow-list (%j)', async ({ allowedAgentTypes }) => {
     const onStart = vi.fn();
-    render(
-      <StartSubSessionDialog
-        ws={makeWs() as any}
-        defaultCwd="/tmp"
-        isProviderConnected={() => false}
-        getRemoteSessions={() => []}
-        refreshSessions={vi.fn()}
-        onStart={onStart}
-        onClose={vi.fn()}
-      />,
+    const { container } = render(
+      <StartSubSessionDialog ws={makeWs() as any} defaultCwd="/tmp" allowedAgentTypes={allowedAgentTypes}
+        isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()}
+        onStart={onStart} onClose={vi.fn()} />,
     );
-    fireEvent.click(screen.getByRole('button', { name: /cc_cli_sdk/i }));
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    const unavailable = container.querySelector<HTMLButtonElement>(`[data-agent-type="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`);
+    if (unavailable) {
+      expect(unavailable.style.display).toBe('none');
+      expect(unavailable.disabled).toBe(true);
+      fireEvent.click(unavailable);
+    }
+    await waitFor(() => expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('claude-code-sdk'));
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
-    expect(onStart).toHaveBeenCalledWith(CLAUDE_CODE_CLI_SDK_AGENT_TYPE, undefined, '/tmp', undefined, expect.anything());
+    expect(onStart).toHaveBeenLastCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.anything());
+    fireEvent.click(screen.getByRole('button', { name: /claude_code_cli/i }));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenLastCalledWith('claude-code', undefined, '/tmp', undefined, undefined);
+  });
+
+  it('cannot launch when the only allowed type is unavailable CC CLI SDK', () => {
+    const onStart = vi.fn();
+    render(<StartSubSessionDialog ws={makeWs() as any} defaultCwd="/tmp"
+      allowedAgentTypes={[CLAUDE_CODE_CLI_SDK_AGENT_TYPE]} isProviderConnected={() => false}
+      getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={onStart} onClose={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    const launch = screen.getByRole('button', { name: /launch/i }) as HTMLButtonElement;
+    expect(launch.disabled).toBe(true);
+    fireEvent.click(launch);
+    expect(onStart).not.toHaveBeenCalled();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {

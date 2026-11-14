@@ -8,6 +8,7 @@ import { PREF_KEY_DEFAULT_SHELL } from "../constants/prefs.js";
 import { sanitizeProjectName } from "@shared/sanitize-project-name.js";
 import {
   getSessionAgentGroups,
+  isSessionAgentTypeSelectable,
   getSessionAgentLabel,
   SESSION_AGENT_GROUP_LABEL_KEYS,
 } from "./session-agent-options.js";
@@ -213,6 +214,7 @@ export function NewSessionDialog({
     return preset;
   };
   const selectAgentType = (nextAgentType: AgentType) => {
+    if (!isSessionAgentTypeSelectable(nextAgentType)) return;
     if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextAgentType)) return;
     setAgentType(nextAgentType);
     if (!customProviderSdk) setLastUnlockedAgentType(nextAgentType);
@@ -859,7 +861,7 @@ export function NewSessionDialog({
                       // underlying data/behavior (and any test that still
                       // queries it directly) stays fully intact.
                       style={choice.hidden ? { display: 'none' } : undefined}
-                      disabled={starting || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
+                      disabled={!isSessionAgentTypeSelectable(choice.id) || starting || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
                       aria-pressed={agentType === choice.id}
                       onClick={() => selectAgentType(choice.id as AgentType)}
                     >
@@ -1903,7 +1905,7 @@ export function NewSessionDialog({
           <button
             class="btn btn-primary"
             onClick={handleStart}
-            disabled={starting || (incognito && (!canIncognito || !supportsSessionIncognito(agentType)))}
+            disabled={!isSessionAgentTypeSelectable(agentType) || starting || (incognito && (!canIncognito || !supportsSessionIncognito(agentType)))}
           >
             {starting ? t("new_session.starting") : t("new_session.start")}
           </button>

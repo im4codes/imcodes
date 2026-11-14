@@ -53,6 +53,7 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: '⚡',
     fallbackLabel: 'CC CLI SDK',
     labelKey: 'session.agentType.cc_cli_sdk',
+    hidden: true,
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -251,6 +252,11 @@ export function getSessionAgentLabel(
   return choice.labelKey ? t(choice.labelKey) : choice.fallbackLabel;
 }
 
+/** Frontend selection policy only; historical types and backend parsing stay intact. */
+export function isSessionAgentTypeSelectable(agentType: string): boolean {
+  return agentType !== CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
+}
+
 /**
  * Agent types offered for a project's default coder/auditor role (AddProject,
  * ProjectSettings) — a narrower, differently-curated list than
@@ -265,4 +271,4 @@ export const PROJECT_ROLE_AGENT_TYPES: string[] = [
   'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk',
   'kimi-sdk', 'muse-code-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
-];
+].filter(isSessionAgentTypeSelectable);

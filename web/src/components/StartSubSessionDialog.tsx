@@ -8,7 +8,7 @@ import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
-import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
+import { getSessionAgentGroups, getSessionAgentLabel, isSessionAgentTypeSelectable, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
@@ -156,6 +156,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     return preset;
   };
   const selectType = (nextType: string) => {
+    if (!isSessionAgentTypeSelectable(nextType)) return;
     if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextType)) return;
     setType(nextType);
     if (!customProviderSdk) setLastUnlockedType(nextType);
@@ -213,13 +214,13 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
 
   const agentGroups = getSessionAgentGroups('sub-session');
   const allowedAgentTypeSet = useMemo(
-    () => allowedAgentTypes ? new Set(allowedAgentTypes) : null,
+    () => allowedAgentTypes ? new Set(allowedAgentTypes.filter(isSessionAgentTypeSelectable)) : null,
     [allowedAgentTypes],
   );
 
   useEffect(() => {
     if (!allowedAgentTypeSet || allowedAgentTypeSet.has(type)) return;
-    const fallback = allowedAgentTypes?.[0];
+    const fallback = allowedAgentTypeSet.values().next().value;
     if (fallback) setType(fallback);
   }, [allowedAgentTypeSet, allowedAgentTypes, type]);
 
@@ -294,7 +295,9 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     ? Math.min(MAX_SUB_SESSION_LAUNCH_COUNT, Math.max(1, parseInt(countInput, 10) || 1))
     : 1;
 
+  const canStartType = isSessionAgentTypeSelectable(type) && (!allowedAgentTypeSet || allowedAgentTypeSet.has(type));
   const handleStart = () => {
+    if (!canStartType) return;
     const desc = description.trim() || undefined;
     if (customProviderSdk && !ccPreset) {
       setPresetError(t('new_session.custom_provider_preset_required'));
@@ -511,9 +514,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                           // allow-listed via allowedAgentTypes (e.g. the
                           // supervision-pool worker-type picker, which still
                           // legitimately offers qwen as a backend) is a
-                          // deliberate exception and renders normally.
-                          style={(choice.hidden && !allowedAgentTypeSet?.has(choice.id)) ? { display: 'none' } : undefined}
-                          disabled={customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)}
+                          // deliberate exception and renders normally. Unavailable Claude CLI SDK
+                          // is never restored by an allow-list.
+                          style={(choice.hidden && (!isSessionAgentTypeSelectable(choice.id) || !allowedAgentTypeSet?.has(choice.id))) ? { display: 'none' } : undefined}
+                          disabled={!isSessionAgentTypeSelectable(choice.id) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
                           aria-pressed={type === choice.id}
                           onClick={() => selectType(choice.id)}
                         >
@@ -1028,7 +1032,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
 
         <div class="dialog-footer">
           <button class="btn btn-secondary" onClick={onClose}>Cancel</button>
-          <button class="btn btn-primary" onClick={handleStart}>Launch</button>
+          <button class="btn btn-primary" onClick={handleStart} disabled={!canStartType}>Launch</button>
         </div>
       </div>
     </div>

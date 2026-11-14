@@ -1,6 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testing-library/preact';
@@ -154,6 +155,35 @@ describe('SessionSettingsDialog supervision', () => {
 
   afterEach(() => {
     cleanup();
+  });
+
+  it.each(['codex-sdk', CLAUDE_CODE_CLI_SDK_AGENT_TYPE])('does not offer CC CLI SDK but preserves historical type display (%s)', type => {
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain"
+      description="" cwd="/proj" type={type} surface="session" onClose={vi.fn()} onSaved={vi.fn()} />);
+    const select = screen.getByTestId('session-agent-type') as HTMLSelectElement;
+    expect(select.value).toBe(type);
+    expect(screen.queryByRole('option', { name: 'cc_cli_sdk' })).toBeNull();
+    const legacy = select.querySelector<HTMLOptionElement>(`option[value="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`);
+    if (type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) {
+      expect(legacy?.disabled).toBe(true);
+      expect(legacy?.hidden).toBe(true);
+      expect(legacy?.textContent).toBe('cc_cli_sdk');
+    } else expect(legacy).toBeNull();
+    for (const allowed of ['claude-code-sdk', 'claude-code']) {
+      expect(select.querySelector<HTMLOptionElement>(`option[value="${allowed}"]`)?.disabled).toBe(false);
+    }
+  });
+
+  it('excludes CC CLI SDK from new execution-pool choices without removing usable Claude backends', () => {
+    const candidates = buildSupervisionExecutionPoolCandidates({
+      sessionName: 'deck_proj_brain',
+      sessions: [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'claude-code-sdk', 'claude-code'].map((type, index) => ({
+        sessionName: `deck_proj_worker_${index}`, parentSession: 'deck_proj_brain', type,
+        state: 'idle', activeModel: 'claude-sonnet-4-6', providerId: 'anthropic',
+      })),
+    });
+    expect(candidates.map(candidate => candidate.config.agentType)).toEqual(expect.arrayContaining(['claude-code-sdk', 'claude-code']));
+    expect(candidates.some(candidate => candidate.config.agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE)).toBe(false);
   });
 
   it('keeps session and supervision fields on independent production surfaces', () => {

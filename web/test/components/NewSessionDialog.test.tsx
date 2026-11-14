@@ -235,18 +235,22 @@ describe('NewSessionDialog', () => {
     });
   });
 
-  it('starts the independent CC CLI SDK agent type without changing the legacy SDK choice', () => {
+  it('hides and disables CC CLI SDK while preserving both usable Claude choices', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    selectAgent(CLAUDE_CODE_CLI_SDK_AGENT_TYPE);
-    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'cli-sdk-app' } });
-    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/cli-sdk-app' } });
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    const hidden = getAgentButton(CLAUDE_CODE_CLI_SDK_AGENT_TYPE);
+    expect(hidden.style.display).toBe('none');
+    expect(hidden.disabled).toBe(true);
+    fireEvent.click(hidden);
+    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: /claude_code_cli/i }));
+    expect(getAgentButton('claude-code').getAttribute('aria-pressed')).toBe('true');
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'claude-cli-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/claude-cli-app' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      project: 'cli-sdk-app',
-      agentType: CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
-    }));
-    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('false');
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({ agentType: 'claude-code' }));
   });
 
   it('includes optional git remote URL for main-session starts', () => {

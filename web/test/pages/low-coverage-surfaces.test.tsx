@@ -1,6 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { options } from 'preact';
@@ -180,6 +181,9 @@ describe('low-coverage page and component surfaces', () => {
     const onAdded = vi.fn();
     render(<AddProject apiKey="key-1" serverId="srv-1" onAdded={onAdded} onCancel={vi.fn()} />);
 
+    expect(document.querySelector(`option[value="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`)).toBeNull();
+    expect(screen.getAllByRole('option', { name: 'claude-code-sdk' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: 'claude-code' })).toHaveLength(2);
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'alpha' } });
     fireEvent.input(screen.getByPlaceholderText('/home/user/projects/my-project'), { target: { value: '/work/alpha' } });
     const issueTrackerSelect = screen.getByText('Issue Tracker').parentElement?.querySelector('select');
@@ -318,6 +322,9 @@ describe('low-coverage page and component surfaces', () => {
     render(<ProjectSettings apiKey="key-1" serverId="srv-1" projectName="alpha" onSaved={onSaved} onCancel={vi.fn()} />);
 
     const branch = await screen.findByDisplayValue('main');
+    expect(document.querySelector(`option[value="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`)).toBeNull();
+    expect(screen.getAllByRole('option', { name: 'claude-code-sdk' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: 'claude-code' })).toHaveLength(2);
     fireEvent.input(branch, { target: { value: 'release' } });
     fireEvent.click(screen.getByText('Auto-merge on approval'));
     fireEvent.click(screen.getByText('Save Settings'));

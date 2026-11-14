@@ -1,6 +1,7 @@
 /**
  * SessionSettingsDialog — edit metadata and view cwd for main or sub sessions.
  */
+import { isSessionAgentTypeSelectable } from './session-agent-options.js';
 import { AUDIT_SEVERITY_LEVELS, normalizeAuditBlockingSeverities, type AuditSeverity } from '@shared/audit-convergence.js';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
@@ -256,6 +257,7 @@ export function buildSupervisionExecutionPoolCandidates(input: {
       || session.parentSession !== owningMainSession
       || session.closedAt != null
       || (session.ownerCatalog !== true && !SUPERVISION_POOL_OPEN_SESSION_STATES.has(session.state ?? ''))
+      || !isSessionAgentTypeSelectable(session.type)
       || !isDelegationReplyCapableAgentType(session.type)
       || session.executionCloneKind != null
       || session.parentRunId != null
@@ -1122,8 +1124,8 @@ export function SessionSettingsDialog({
               style={{ width: '100%' }}
               disabled={saving}
             >
-              {SESSION_AGENT_TYPES.map((value) => (
-                <option key={value} value={value}>{renderTypeLabel(value)}</option>
+              {SESSION_AGENT_TYPES.filter((value) => isSessionAgentTypeSelectable(value) || value === agentType).map((value) => (
+                <option key={value} value={value} disabled={!isSessionAgentTypeSelectable(value)} hidden={!isSessionAgentTypeSelectable(value)}>{renderTypeLabel(value)}</option>
               ))}
             </select>
           </div>
