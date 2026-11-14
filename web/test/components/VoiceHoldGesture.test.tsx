@@ -583,7 +583,18 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       await vi.advanceTimersByTimeAsync(0);
     }
 
-    // Subsequent hold after aborted pending start still works cleanly
+    // Holding while focused after fallback stays native; blurring back enables subsequent hold cleanly
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(100);
+
+    // Subsequent hold after aborted pending start still works cleanly once unfocused
     dispatchPointer(input, 'pointerdown', 180);
     await vi.advanceTimersByTimeAsync(350);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
@@ -609,6 +620,11 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointermove', 90);
     dispatchPointer(input, 'pointerup', 90);
     await vi.advanceTimersByTimeAsync(0);
+
+    // Pre-recording failure focused composer; blur back to voice-ready before starting a new hold
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(100);
 
     dispatchPointer(input, 'pointerdown', 180);
     await vi.advanceTimersByTimeAsync(350);
@@ -675,7 +691,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(activeListening).toBe(false);
 
-    // After old error drain completes, a fresh hold can start and stop cleanly
+    // After old error drain completes and composer returns to unfocused voice-ready, a fresh hold can start and stop cleanly
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(100);
     dispatchPointer(input, 'pointerdown', 180);
     await vi.advanceTimersByTimeAsync(350);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
@@ -1348,7 +1367,6 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       const lockedCases = [
         { name: 'ready-unfocused', composerClass: 'controls-composer controls-composer-voice-ready', inputClass: 'controls-input', ce: 'false' },
         { name: 'pending-unfocused', composerClass: 'controls-composer controls-composer-voice-ready controls-composer-voice-pending', inputClass: 'controls-input', ce: 'false' },
-        { name: 'pending-while-focused', composerClass: 'controls-composer controls-composer-voice-ready controls-composer-voice-pending', inputClass: 'controls-input', ce: 'true' },
         { name: 'holding', composerClass: 'controls-composer controls-composer-voice-ready controls-composer-voice-holding', inputClass: 'controls-input', ce: 'false' },
         { name: 'disabled', composerClass: 'controls-composer', inputClass: 'controls-input controls-input-disabled', ce: 'false' },
       ];
@@ -1780,7 +1798,12 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
 
-    // 2. Immediately re-hold 240ms EVEN THOUGH previous start/stop never settled -> works immediately!
+    // Blur back to voice-ready unfocused state, then immediately re-hold even though previous start/stop never settled
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(100);
+
+    // 2. Immediately re-hold EVEN THOUGH previous start/stop never settled -> works immediately!
     dispatchPointer(input, 'pointerdown', 200);
     await vi.advanceTimersByTimeAsync(240);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
@@ -2051,7 +2074,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.activeElement).not.toBe(input);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // 3. Focused composer preserves 240ms hold threshold while 140ms tap stays safe
+    // 3. Focused composer NEVER triggers voice capture or applies touch/selection locks (100% native selection/IME/copy-paste)
     dispatchPointer(input, 'pointerdown', 180, 500, 2);
     await vi.advanceTimersByTimeAsync(60);
     dispatchPointer(input, 'pointerup', 180, 500, 2);
@@ -2059,17 +2082,23 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(input.getAttribute('contenteditable')).toBe('true');
 
     dispatchPointer(input, 'pointerdown', 180, 500, 3);
-    await vi.advanceTimersByTimeAsync(175);
-    expect(voiceMock.startListening).toHaveBeenCalledTimes(1); // NOT triggered at 175ms while already focused
-    await vi.advanceTimersByTimeAsync(64); // total 239ms
-    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1); // total 240ms
-    expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
-    dispatchPointer(input, 'pointermove', 100, 500, 3); // explicit slide-to-cancel
-    dispatchPointer(input, 'pointerup', 100, 500, 3);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1); // NEVER triggered while already focused
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(document.querySelector('.controls-composer-voice-pending')).toBeNull();
+    expect(document.querySelector('.controls-composer-voice-holding')).toBeNull();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.style.userSelect).toBe('');
+    expect(input.style.getPropertyValue('-webkit-touch-callout')).toBe('');
+    expect(document.activeElement).toBe(input);
+    const selectEv = new Event('selectstart', { bubbles: true, cancelable: true });
+    const ctxEv = new Event('contextmenu', { bubbles: true, cancelable: true });
+    expect(input.dispatchEvent(selectEv)).toBe(true);
+    expect(input.dispatchEvent(ctxEv)).toBe(true);
+    dispatchPointer(input, 'pointerup', 180, 500, 3);
     await vi.advanceTimersByTimeAsync(0);
-    expect(document.activeElement).not.toBe(input);
-    expect(input.getAttribute('contenteditable')).toBe('false');
+    expect(document.activeElement).toBe(input);
+    expect(input.getAttribute('contenteditable')).toBe('true');
   });
 
   it('guarantees click-to-type fallback across every failed or pre-recording aborted hold path without hijacking strong vertical scroll or explicit slide-to-cancel', async () => {
@@ -2408,5 +2437,88 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       if (origStop) voiceMock.stopListening.mockImplementation(origStop);
       if (origLevel) voiceMock.onAudioLevel.mockImplementation(origLevel);
     }
+  });
+
+  it('tapping unfocused composer with existing text moves caret to END and prevents compat mousedown reset, while focused taps keep caret undisturbed and active hold tolerates pre-start lostpointercapture', async () => {
+    voiceMock.startListening.mockImplementation(async (
+      onResult: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+      onError?: (error: string) => void,
+    ) => {
+      voiceMock.partialHandler = onResult;
+      voiceMock.listeningHandler = onListeningChange ?? null;
+      voiceMock.errorHandler = onError ?? null;
+      return true;
+    });
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const dispatchPrimary = (el: EventTarget, type: string, clientX = 180, clientY = 500, pointerId = 1, buttons = 1) => {
+      const ev = new Event(type, { bubbles: true, cancelable: true }) as PointerEvent;
+      Object.assign(ev, { clientX, clientY, pointerId, button: 0, pointerType: 'touch', isPrimary: true, buttons });
+      return fireEvent(el, ev);
+    };
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    input.textContent = 'hello world';
+
+    // 1. Short touch tap on unfocused composer puts caret at END (11) and shields compat mousedown targeting input itself
+    dispatchPrimary(input, 'pointerdown', 10, 500, 21, 1);
+    await vi.advanceTimersByTimeAsync(50);
+    dispatchPrimary(input, 'pointerup', 10, 500, 21, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).toBe(input);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    const selAfterTap = window.getSelection();
+    expect(selAfterTap?.isCollapsed).toBe(true);
+    expect(selAfterTap?.focusNode).toBe(input);
+    expect(selAfterTap?.focusOffset).toBe(input.childNodes.length);
+
+    const compatMouseDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    input.dispatchEvent(compatMouseDown);
+    expect(compatMouseDown.defaultPrevented).toBe(true);
+    expect(window.getSelection()?.focusNode).toBe(input);
+    expect(window.getSelection()?.focusOffset).toBe(input.childNodes.length);
+
+    // 2. While already focused, user moves caret into middle of text and taps -> caret stays at offset 3 (NOT reset to end)
+    const range = document.createRange();
+    const textNode = input.firstChild as Text;
+    range.setStart(textNode, 3);
+    range.collapse(true);
+    selAfterTap?.removeAllRanges();
+    selAfterTap?.addRange(range);
+    dispatchPrimary(input, 'pointerdown', 40, 500, 22, 1);
+    dispatchPrimary(input, 'pointerup', 40, 500, 22, 0);
+    fireEvent.click(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(window.getSelection()?.focusOffset).toBe(3);
+
+    // 3. After blurring back to unfocused voice-ready, active hold whose lostpointercapture fires with buttons=1 BEFORE didStartRecording keeps recording alive
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    dispatchPrimary(input, 'pointerdown', 180, 500, 23, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    dispatchPrimary(input, 'lostpointercapture', 180, 500, 23, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+    expect(voiceMock.stopListening).not.toHaveBeenCalled();
+
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('voice text ok');
+    dispatchPrimary(input, 'pointerup', 180, 500, 23, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
   });
 });

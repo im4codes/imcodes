@@ -1311,4 +1311,63 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('skips competing getUserMedia level meter on mobile touch browsers so Web Speech emits transcripts cleanly and marks drain start cleanly', async () => {
+    const instances = browser({ autoStart: false });
+    const meter = meterHarness();
+    const origUa = Object.getOwnPropertyDescriptor(navigator, 'userAgent');
+    const origTouch = Object.getOwnPropertyDescriptor(navigator, 'maxTouchPoints');
+    Object.defineProperty(navigator, 'userAgent', {
+      value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1',
+      configurable: true,
+    });
+    Object.defineProperty(navigator, 'maxTouchPoints', {
+      value: 5,
+      configurable: true,
+    });
+    const listening: boolean[] = [];
+    const errors: string[] = [];
+    const partials: Array<[string, boolean]> = [];
+    try {
+      await expect(VoiceInput.startListening(
+        (text, isFinal) => partials.push([text, isFinal]),
+        (v) => listening.push(v),
+        (err) => errors.push(err),
+      )).resolves.toBe(true);
+
+      instances[0].onstart?.();
+      instances[0].onaudiostart?.();
+      await Promise.resolve();
+      expect(listening).toEqual([true]);
+      // Critical on mobile iOS/Android web: getUserMedia MUST NOT open alongside SpeechRecognition
+      expect(meter.grants).toHaveLength(0);
+
+      final(instances[0], 'mobile transcript works');
+      expect(partials).toEqual([['mobile transcript works', true]]);
+      expect(errors).toEqual([]);
+
+      const stopPromise = VoiceInput.stopListening();
+      instances[0].onend?.();
+      await stopPromise;
+
+      // Stopping before onstart drains cleanly without spurious permission_denied
+      await expect(VoiceInput.startListening(
+        (text, isFinal) => partials.push([text, isFinal]),
+        undefined,
+        (err) => errors.push(err),
+      )).resolves.toBe(true);
+      const earlyStop = VoiceInput.stopListening();
+      instances[1].onstart?.();
+      instances[1].onend?.();
+      await earlyStop;
+      expect(errors).toEqual([]);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      if (origUa) Object.defineProperty(navigator, 'userAgent', origUa);
+      else delete (navigator as any).userAgent;
+      if (origTouch) Object.defineProperty(navigator, 'maxTouchPoints', origTouch);
+      else delete (navigator as any).maxTouchPoints;
+      vi.unstubAllGlobals();
+    }
+  });
+
 });

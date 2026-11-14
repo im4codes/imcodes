@@ -621,6 +621,13 @@ async function startWebLevelMeter(generation: number): Promise<void> {
   // microphone/RAF ownership ends immediately when capture stops.
   const isCapturing = (): boolean => generation === _generation && _listening;
   try {
+    // Mobile touch browsers/WebViews share a single exclusive audio capture route;
+    // opening getUserMedia alongside SpeechRecognition starves/silences recognition.
+    const isMobileTouchUa =
+      typeof navigator !== 'undefined'
+      && (navigator.maxTouchPoints ?? 0) > 0
+      && /iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent ?? '');
+    if (isMobileTouchUa) return;
     if (!isCapturing() || !navigator.mediaDevices?.getUserMedia) return;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     if (!isCapturing()) {
@@ -795,9 +802,13 @@ function stopWebListening(abort = false): Promise<void> {
     }
     return Promise.resolve();
   }
-  // Ignore any late onstart/onaudiostart once capture drain has been requested.
-  rec.onstart = null;
-  rec.onaudiostart = null;
+  // Do not restart listening or start the level meter if capture starts while draining,
+  // but still mark captureStarted so onend does not falsely report permission_denied.
+  const markDrainCaptureStarted = (): void => {
+    session.captureStarted = true;
+  };
+  rec.onstart = markDrainCaptureStarted;
+  rec.onaudiostart = markDrainCaptureStarted;
   return new Promise((resolve) => {
     let finished = false;
     const finish = (): void => {

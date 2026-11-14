@@ -183,7 +183,6 @@ export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
 const VOICE_HOLD_TAP_GUARD_MS = 145;
 const VOICE_HOLD_UNFOCUSED_DELAY_MS = 175;
-const VOICE_HOLD_FOCUSED_DELAY_MS = 240;
 const VOICE_HOLD_SLIDE_INTENT_MS = 90;
 const VOICE_HOLD_SLIDE_PROMOTE_PX = 14;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
@@ -5604,8 +5603,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
     const onCompatMouseDown = (ev: MouseEvent) => {
       const el = divRef.current;
-      const target = ev.target as Node | null;
-      if (el && document.activeElement === el && (!target || !el.contains(target))) {
+      if (el && document.activeElement === el) {
         ev.preventDefault();
       }
       cleanup();
@@ -5629,7 +5627,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (pointerType === 'touch') {
       armTouchTapCompatMouseShield();
     }
-    focusComposerForTyping();
+    focusComposerForTyping({ moveCursorToEnd: true });
   }, [armTouchTapCompatMouseShield, focusComposerForTyping]);
 
   const updateVoiceHoldZoneFromDx = useCallback((
@@ -5819,7 +5817,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       fallbackToComposerClick(ptr.pointerType);
       return;
     }
-    if (!tx.didStartRecording) {
+    if (!tx.didStartRecording && (event.buttons ?? 0) === 0) {
       void finalizeVoiceHold(tx, 'failed');
       return;
     }
@@ -5983,7 +5981,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     const el = divRef.current;
-    const wasFocused = !!el && document.activeElement === el && el.getAttribute('contenteditable') !== 'false';
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    const isFocusedEditable = !!el
+      && (active === el || (active !== null && el.contains(active)))
+      && el.getAttribute('contenteditable') !== 'false';
+    if (isFocusedEditable) {
+      // Once the composer is focused / IME is active, all taps, moves, and
+      // long-presses stay 100% native so selection, cursor placement, and
+      // copy/paste callouts are never hijacked by voice capture or touch locks.
+      return;
+    }
     // Never call event.preventDefault() on pointerdown: doing so suppresses
     // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
     // from opening when tapping the composer. While an earlier drain settles,
@@ -6000,7 +6007,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       id: pointerId,
       startX,
       startY,
-      wasFocused,
+      wasFocused: false,
       pointerType,
       slideIntentDx: null as number | null,
       downAt: now,
@@ -6013,11 +6020,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     applyComposerVoiceTouchLock(el, false);
     attachComposerVoiceWindowListeners();
 
-    const holdDelayMs = wasFocused ? VOICE_HOLD_FOCUSED_DELAY_MS : VOICE_HOLD_UNFOCUSED_DELAY_MS;
     if (voiceHoldTimerRef.current !== null) clearTimeout(voiceHoldTimerRef.current);
     voiceHoldTimerRef.current = setTimeout(() => {
       activateComposerVoiceHold(ptr, 0, el);
-    }, holdDelayMs);
+    }, VOICE_HOLD_UNFOCUSED_DELAY_MS);
   }, [
     inputDisabled,
     voiceOpen,
@@ -9093,7 +9099,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               }
               if (voiceHoldPendingRef.current || voiceHoldActiveRef.current) return;
               if (!composerFocusedRef.current || el.getAttribute('contenteditable') !== 'true') {
-                focusComposerForTyping();
+                focusComposerForTyping({ moveCursorToEnd: true });
               }
             }}
             onPointerDown={handleComposerVoicePointerDown}
