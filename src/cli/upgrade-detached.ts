@@ -25,6 +25,8 @@ export interface DetachedUpgradeInput {
   platform: 'linux' | 'darwin';
   stateDir: string;
   home: string;
+  /** Optional node binary override (used when bundled daemon-runtime falls back to a legacy npm install). */
+  nodeBin?: string;
 }
 
 export interface DetachedUpgradeDeps {
@@ -74,14 +76,15 @@ export async function runDetachedPosixUpgrade(input: DetachedUpgradeInput, deps:
   const pollMs = deps.pollMs ?? 400;
   const limit = Date.now() + (deps.followLimitMs ?? 30 * 60_000);
 
+  const nodeBin = input.nodeBin ?? process.execPath;
   const started = launch({
     registryArg: input.registry ? `--registry ${input.registry}` : '',
     pkgSpec: input.pkgSpec,
     targetVer: input.targetVer,
     currentVer: input.currentVer,
     oldDaemonPid: readDaemonPid(input.stateDir),
-    nodeBin: process.execPath,
-    nodeDir: dirname(process.execPath),
+    nodeBin,
+    nodeDir: dirname(nodeBin),
     stateDir: input.stateDir,
     restartCmd: buildPosixRestartCommand({ platform: input.platform, home: input.home, stateDir: input.stateDir }),
     cleanupAfterSec: 24 * 60 * 60,

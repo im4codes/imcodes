@@ -94,7 +94,7 @@ function writeDaemonRuntimeFixture(
       nodeArchiveSha256: 'b'.repeat(64),
     },
     build: { commit: '1234567abcdef', version },
-    totalUncompressedBytes: 100,
+    totalUncompressedBytes: (DAEMON_RUNTIME_CRITICAL_ENTRIES.length + 1) * 10,
     fileCount: DAEMON_RUNTIME_CRITICAL_ENTRIES.length + 1,
     files: [
       { path: nodeRel, size: 10, sha256: 'c'.repeat(64), executable: true },

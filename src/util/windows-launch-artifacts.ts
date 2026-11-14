@@ -255,8 +255,7 @@ export function resolveLaunchPaths(): LaunchPaths {
  *     — and only use the `%APPDATA%\npm\` form when it provably matches.
  *     Falls back to direct node+script for dev installs where there's no
  *     shim at all. */
-export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
-  await mkdir(dirname(paths.watchdogPath), { recursive: true });
+export function renderWatchdogCmd(paths: LaunchPaths): string {
   // The watchdog .cmd is a Windows-only artifact and the input path uses
   // backslashes. Use `path.win32.*` explicitly so the resolution behaves
   // identically when this code is unit-tested on POSIX dev machines —
@@ -347,7 +346,7 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   // user notices" and "auto-upgrade self-recovers within ~10 minutes
   // even if the upgrade.cmd was malformed".  The exit-the-wait-state log
   // line distinguishes the stale-lock recovery from a normal lock release.
-  const watchdog = [
+  return [
     '@echo off',
     'chcp 65001 >nul 2>&1',
     // Every path below goes through %IMCODES_HOME%. A scoped home bakes it in;
@@ -384,11 +383,14 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     'goto loop',
     '',
   ].join('\r\n');
+}
 
+export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
+  await mkdir(dirname(paths.watchdogPath), { recursive: true });
   // CRITICAL: write as plain UTF-8 with NO BOM. cmd.exe does not understand
   // BOMs in batch files — the BOM bytes get prepended to the first command
   // and cmd reports "[BOM]@echo is not a recognized command".
-  await writeFile(paths.watchdogPath, watchdog, 'utf8');
+  await writeFile(paths.watchdogPath, renderWatchdogCmd(paths), 'utf8');
 }
 
 /** @deprecated cmd.exe does not understand UTF-8 BOMs in batch files; the BOM

@@ -2,6 +2,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   closeSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -14,12 +15,12 @@ import {
   renameSync,
   rmSync,
   statSync,
-  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
@@ -28,22 +29,80 @@ import {
 } from '../../shared/controlled-node-artifacts.js';
 import {
   DESKTOP_RELEASE_MANIFEST_FILENAME,
+  daemonRuntimeManifestFilename,
   desktopReleaseTargetManifestFilename,
   releaseTargetFromRuntime,
+  validateDaemonRuntimeManifest,
   validateDesktopReleaseManifest,
   verifyDesktopReleaseComponentIdentity,
+  type DaemonRuntimeManifest,
+  type DaemonRuntimeManifestFileEntry,
   type DesktopReleaseManifest,
   type DesktopReleaseTarget,
 } from '../../shared/desktop-release-manifest.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import { isPathInsideGitCheckout } from '../node/desktop-installer-probe.js';
-import { imcodesStateDir, imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
-import { buildPosixRestartCommand } from '../util/posix-upgrade-script.js';
+import { imcodesStateDir, imcodesStateDirForHome, IMCODES_HOME_ENV } from '../util/imcodes-state-dir.js';
+import { renderSystemdExecStart } from '../util/launch-target.js';
+import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
 import { windowsTaskName } from '../util/windows-daemon-watchdog.mjs';
+import { renderWatchdogCmd } from '../util/windows-launch-artifacts.js';
+import {
+  DAEMON_RUNTIME_LOCK_DIR_NAME,
+  DAEMON_RUNTIME_LOCK_OWNER_FILE,
+  DAEMON_RUNTIME_PREVIOUS_STATE_FILE,
+  DAEMON_RUNTIME_STAGING_PREFIX,
+  DAEMON_RUNTIME_SWITCH_STATE_FILE,
+  UPGRADE_COOLDOWN_SENTINEL_FILE,
+  acquireRuntimeUpgradeLock,
+  claimHandoffRuntimeUpgradeLock,
+  prepareServiceLaunchTarget,
+  pruneOldDaemonRuntimeReleases,
+  readCurrentPointerTarget,
+  readPackageVersionSync,
+  readVerifiedDaemonIdentity,
+  releaseRuntimeUpgradeLock,
+  restartDaemonService,
+  restoreServiceLaunchTarget,
+  rollbackDaemonRuntimeCurrentPointer,
+  stopVerifiedDaemon,
+  switchDaemonRuntimeCurrentPointer,
+  transferRuntimeUpgradeLock,
+  waitForHealthyTargetDaemon,
+  writeUpgradeCooldownSentinel,
+  type DaemonRuntimePlatform,
+  type ServiceLaunchBackup,
+  type ServiceLaunchTargetSpec,
+} from './daemon-runtime-switch-helper.mjs';
 
-export const DAEMON_RUNTIME_STAGING_PREFIX = '.staging-';
+export {
+  DAEMON_RUNTIME_LOCK_DIR_NAME,
+  DAEMON_RUNTIME_LOCK_OWNER_FILE,
+  DAEMON_RUNTIME_PREVIOUS_STATE_FILE,
+  DAEMON_RUNTIME_STAGING_PREFIX,
+  DAEMON_RUNTIME_SWITCH_STATE_FILE,
+  UPGRADE_COOLDOWN_SENTINEL_FILE,
+  acquireRuntimeUpgradeLock,
+  claimHandoffRuntimeUpgradeLock,
+  prepareServiceLaunchTarget,
+  pruneOldDaemonRuntimeReleases,
+  readCurrentPointerTarget,
+  readVerifiedDaemonIdentity,
+  releaseRuntimeUpgradeLock,
+  restartDaemonService,
+  restoreServiceLaunchTarget,
+  rollbackDaemonRuntimeCurrentPointer,
+  stopVerifiedDaemon,
+  switchDaemonRuntimeCurrentPointer,
+  transferRuntimeUpgradeLock,
+  validateDaemonRuntimeManifest,
+  waitForHealthyTargetDaemon,
+  writeUpgradeCooldownSentinel,
+  type DaemonRuntimeManifest,
+  type DaemonRuntimePlatform,
+};
+
 export const DAEMON_RUNTIME_FILES_FILENAME = 'daemon-runtime.files.json';
-export const DAEMON_RUNTIME_PREVIOUS_STATE_FILE = '.previous-target.json';
 export const DAEMON_RUNTIME_CRITICAL_ENTRY_PATHS = [
   'package/package.json',
   'package/config/default.yaml',
@@ -55,9 +114,7 @@ export const DAEMON_RUNTIME_CRITICAL_ENTRY_PATHS = [
 ] as const;
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
-const SAFE_BASENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-export type DaemonRuntimePlatform = 'linux' | 'darwin' | 'win32';
 export type DaemonRuntimeExecutionMode = 'dev_exempt' | 'bundled' | 'legacy_cli';
 export type WritableRuntimeRootKind = 'in_place' | 'user_fallback';
 
@@ -87,30 +144,6 @@ export type DaemonRuntimeArtifactSource =
       kind: 'local';
       dir: string;
     };
-
-export interface DaemonRuntimeManifestData {
-  schemaVersion: 1;
-  target: {
-    os: 'linux' | 'darwin' | 'win32';
-    arch: 'x64' | 'arm64';
-    nodeRelativePath: string;
-    entryRelativePath: string;
-  };
-  archive: {
-    format: 'tar.gz' | 'zip';
-    fileName: string;
-    size: number;
-    sha256: string;
-  };
-  build: {
-    commit: string;
-    version: string;
-  };
-  toolchain: {
-    nodeProvider: string;
-    nodeVersion: string;
-  };
-}
 
 export interface DaemonRuntimeRestartContext {
   platform: DaemonRuntimePlatform;
@@ -145,6 +178,7 @@ export interface DaemonRuntimeUpgradeOptions {
   allowLegacyCliFallback?: boolean;
   requireFullEntries?: boolean;
   healthCheckTimeoutMs?: number;
+  settleMs?: number;
   detachedHandoff?: boolean;
   /** Optional custom extractor (primarily for deterministic unit testing). */
   extractArchive?: (input: {
@@ -205,6 +239,21 @@ export interface DaemonServerCredential {
   token: string;
 }
 
+export type LegacyNpmCliFallbackResolution =
+  | {
+      eligible: true;
+      pkgDir: string;
+      prefixDir: string;
+      nodeBin: string;
+      cliEntry: string;
+    }
+  | {
+      eligible: false;
+      reason: 'legacy_npm_cli_missing' | 'legacy_npm_cli_read_only' | 'legacy_npm_cli_is_git_checkout';
+      message: string;
+      prefixDir?: string;
+    };
+
 function sha256Buffer(buf: Buffer | Uint8Array): string {
   return createHash('sha256').update(buf).digest('hex');
 }
@@ -226,21 +275,6 @@ function isInsideNodeModules(resolvedPath: string): boolean {
 function isSubPath(candidatePath: string, rootPath: string): boolean {
   const rel = relative(rootPath, candidatePath);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
-}
-
-function readPackageVersionSync(layoutDir: string): string | undefined {
-  try {
-    const raw = JSON.parse(readFileSync(join(layoutDir, 'package', 'package.json'), 'utf8')) as {
-      name?: unknown;
-      version?: unknown;
-    };
-    if (typeof raw.version === 'string' && raw.version.trim().length > 0) {
-      return raw.version.trim();
-    }
-  } catch {
-    // ignore missing or malformed package.json
-  }
-  return undefined;
 }
 
 function safeRealpath(targetPath: string): string {
@@ -276,6 +310,14 @@ function layoutDirFromExecPath(execPath: string, platform: NodeJS.Platform): str
     return dirname(execDir);
   }
   return null;
+}
+
+export function resolveDaemonRuntimeSwitchHelperPath(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const sibling = resolve(here, 'daemon-runtime-switch-helper.mjs');
+  if (existsSync(sibling)) return sibling;
+  const srcFallback = resolve(here, '..', '..', 'src', 'daemon', 'daemon-runtime-switch-helper.mjs');
+  return existsSync(srcFallback) ? srcFallback : sibling;
 }
 
 /**
@@ -395,6 +437,32 @@ export function isDirectoryWritable(dirPath: string): boolean {
   }
 }
 
+function isExistingDirectoryWritable(dirPath: string): boolean {
+  try {
+    if (!existsSync(dirPath) || !statSync(dirPath).isDirectory()) return false;
+    const probeFile = join(dirPath, `.imcodes-write-probe-${process.pid}-${randomBytes(4).toString('hex')}`);
+    const fd = openSync(probeFile, 'wx', 0o600);
+    closeSync(fd);
+    unlinkSync(probeFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveRuntimeUpgradeStateDir(
+  env: NodeJS.ProcessEnv = process.env,
+  userHome?: string,
+): string {
+  if (env[IMCODES_HOME_ENV]?.trim()) {
+    return imcodesStateDir(env);
+  }
+  if (userHome?.trim()) {
+    return imcodesStateDirForHome(userHome.trim(), env);
+  }
+  return imcodesStateDir(env);
+}
+
 /**
  * Resolve the per-user writable `daemon-runtime` fallback directory inside IM.codes state dir
  * (`~/.imcodes/daemon-runtime` or `%USERPROFILE%\.imcodes\daemon-runtime`).
@@ -404,10 +472,7 @@ export function resolveUserDaemonRuntimeRoot(options: {
   userHome?: string;
 } = {}): string {
   const env = options.env ?? process.env;
-  const stateDir = options.userHome?.trim()
-    ? imcodesStateDirForHome(options.userHome.trim(), env)
-    : imcodesStateDir(env);
-  return join(stateDir, 'daemon-runtime');
+  return join(resolveRuntimeUpgradeStateDir(env, options.userHome), 'daemon-runtime');
 }
 
 /**
@@ -437,19 +502,38 @@ export function resolveWritableDaemonRuntimeRoot(options: {
   return null;
 }
 
+function normalizeServerHttpUrl(rawUrl: unknown): string {
+  if (typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+    else if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    return parsed.toString().replace(/\/+$/u, '');
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Load bound daemon server credentials from `<stateDir>/server.json` if present.
+ * Matches canonical `bind-flow.ts` schema (`workerUrl` + `serverId` + `token`), accepting
+ * `ws:`/`wss:` or `http:`/`https:` URLs and secondary `serverUrl` when `workerUrl` is omitted.
  */
 export function loadDaemonServerCredential(env: NodeJS.ProcessEnv = process.env): DaemonServerCredential | null {
   try {
     const credsPath = join(imcodesStateDir(env), 'server.json');
     if (!existsSync(credsPath)) return null;
+    if (lstatSync(credsPath).isSymbolicLink()) return null;
     const raw = JSON.parse(readFileSync(credsPath, 'utf8')) as {
+      workerUrl?: unknown;
       serverUrl?: unknown;
       serverId?: unknown;
       token?: unknown;
     };
-    const serverUrl = typeof raw.serverUrl === 'string' ? raw.serverUrl.trim().replace(/\/+$/u, '') : '';
+    const serverUrl = normalizeServerHttpUrl(raw.workerUrl) || normalizeServerHttpUrl(raw.serverUrl);
     const serverId = typeof raw.serverId === 'string' ? raw.serverId.trim() : '';
     const token = typeof raw.token === 'string' ? raw.token.trim() : '';
     if (!serverUrl || !serverId || !token) return null;
@@ -459,95 +543,18 @@ export function loadDaemonServerCredential(env: NodeJS.ProcessEnv = process.env)
   }
 }
 
-export function validateDaemonRuntimeManifestObject(
-  value: unknown,
-  expectedTarget: DesktopReleaseTarget,
-): DaemonRuntimeManifestData {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('daemon_runtime_manifest_invalid:not_object');
-  }
-  const obj = value as Record<string, unknown>;
-  if (obj.schemaVersion !== 1) {
-    throw new Error('daemon_runtime_manifest_invalid:schemaVersion');
-  }
-  const target = obj.target as Record<string, unknown> | undefined;
-  const archive = obj.archive as Record<string, unknown> | undefined;
-  const build = obj.build as Record<string, unknown> | undefined;
-  const toolchain = obj.toolchain as Record<string, unknown> | undefined;
-  if (!target || typeof target !== 'object' || !archive || typeof archive !== 'object' || !build || typeof build !== 'object') {
-    throw new Error('daemon_runtime_manifest_invalid:missing_sections');
-  }
-  const actualTarget = `${String(target.os ?? '')}-${String(target.arch ?? '')}`;
-  if (actualTarget !== expectedTarget) {
-    throw new Error(`daemon_runtime_manifest_target_mismatch:${actualTarget}_vs_${expectedTarget}`);
-  }
-  if (archive.format !== 'tar.gz' && archive.format !== 'zip') {
-    throw new Error('daemon_runtime_manifest_invalid:archive_format');
-  }
-  const fileName = archive.fileName;
-  if (typeof fileName !== 'string' || !SAFE_BASENAME_RE.test(fileName) || basename(fileName) !== fileName) {
-    throw new Error('daemon_runtime_manifest_invalid:archive_fileName');
-  }
-  const size = archive.size;
-  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size <= 0) {
-    throw new Error('daemon_runtime_manifest_invalid:archive_size');
-  }
-  const sha256 = archive.sha256;
-  if (typeof sha256 !== 'string' || !SHA256_RE.test(sha256)) {
-    throw new Error('daemon_runtime_manifest_invalid:archive_sha256');
-  }
-  const version = build.version;
-  if (typeof version !== 'string' || !version.trim()) {
-    throw new Error('daemon_runtime_manifest_invalid:build_version');
-  }
-  const commit = build.commit;
-  if (typeof commit !== 'string' || !/^[a-f0-9]{7,64}$/u.test(commit)) {
-    throw new Error('daemon_runtime_manifest_invalid:build_commit');
-  }
-  const nodeRelativePath =
-    typeof target.nodeRelativePath === 'string' && target.nodeRelativePath
-      ? target.nodeRelativePath
-      : target.os === 'win32'
-        ? 'node.exe'
-        : 'bin/node';
-  const entryRelativePath =
-    typeof target.entryRelativePath === 'string' && target.entryRelativePath
-      ? target.entryRelativePath
-      : 'package/dist/src/index.js';
-  return {
-    schemaVersion: 1,
-    target: {
-      os: target.os as 'linux' | 'darwin' | 'win32',
-      arch: target.arch as 'x64' | 'arm64',
-      nodeRelativePath,
-      entryRelativePath,
-    },
-    archive: {
-      format: archive.format,
-      fileName,
-      size,
-      sha256,
-    },
-    build: {
-      commit,
-      version: version.trim(),
-    },
-    toolchain: {
-      nodeProvider: typeof toolchain?.nodeProvider === 'string' ? toolchain.nodeProvider : 'unknown',
-      nodeVersion: typeof toolchain?.nodeVersion === 'string' ? toolchain.nodeVersion : 'unknown',
-    },
-  };
-}
-
 /**
  * Walk an extracted `daemon-runtime` staging root, rejecting any escaping/dangling symlinks
- * and confirming all critical runtime files (and optional `daemon-runtime.files.json` hashes).
+ * and confirming all critical runtime files, manifest `files` digests, and optional `daemon-runtime.files.json`.
  */
 export function verifyStagedDaemonRuntimeTree(
   stagingDir: string,
   platform: DaemonRuntimePlatform,
   expectedVersion: string,
-  options: { requireFullEntries?: boolean } = {},
+  options: {
+    requireFullEntries?: boolean;
+    manifestFiles?: readonly DaemonRuntimeManifestFileEntry[];
+  } = {},
 ): { nodePath: string; entryPath: string } {
   const realRoot = realpathSync(stagingDir);
 
@@ -610,35 +617,46 @@ export function verifyStagedDaemonRuntimeTree(
     throw new Error(`daemon_runtime_extracted_version_mismatch:expected_${expectedVersion}_got_${pkgVer ?? 'missing'}`);
   }
 
+  const verifyEntryList = (entries: readonly DaemonRuntimeManifestFileEntry[], sourceLabel: string): void => {
+    for (const entry of entries) {
+      if (
+        typeof entry.path !== 'string'
+        || entry.path.includes('..')
+        || isAbsolute(entry.path)
+        || typeof entry.size !== 'number'
+        || typeof entry.sha256 !== 'string'
+        || !SHA256_RE.test(entry.sha256)
+      ) {
+        throw new Error(`${sourceLabel}_invalid_entry`);
+      }
+      const abs = resolve(stagingDir, ...entry.path.split('/'));
+      if (!isSubPath(abs, stagingDir)) {
+        throw new Error(`${sourceLabel}_path_escape:${entry.path}`);
+      }
+      if (!existsSync(abs)) {
+        throw new Error(`${sourceLabel}_missing:${entry.path}`);
+      }
+      const st = statSync(abs);
+      if (st.size !== entry.size || sha256File(abs) !== entry.sha256) {
+        throw new Error(`${sourceLabel}_digest_mismatch:${entry.path}`);
+      }
+      if (platform !== 'win32' && entry.executable === true && (st.mode & 0o111) === 0) {
+        throw new Error(`${sourceLabel}_not_executable:${entry.path}`);
+      }
+    }
+  };
+
+  if (options.manifestFiles && options.manifestFiles.length > 0) {
+    verifyEntryList(options.manifestFiles, 'daemon_runtime_manifest_files');
+  }
+
   const filesDocPath = join(stagingDir, DAEMON_RUNTIME_FILES_FILENAME);
   if (existsSync(filesDocPath)) {
     const filesDoc = JSON.parse(readFileSync(filesDocPath, 'utf8')) as {
-      files?: Array<{ path?: unknown; size?: unknown; sha256?: unknown }>;
+      files?: Array<{ path?: unknown; size?: unknown; sha256?: unknown; executable?: unknown }>;
     };
     if (Array.isArray(filesDoc.files)) {
-      for (const entry of filesDoc.files) {
-        if (
-          typeof entry.path !== 'string'
-          || entry.path.includes('..')
-          || isAbsolute(entry.path)
-          || typeof entry.size !== 'number'
-          || typeof entry.sha256 !== 'string'
-          || !SHA256_RE.test(entry.sha256)
-        ) {
-          throw new Error('daemon_runtime_files_doc_invalid_entry');
-        }
-        const abs = resolve(stagingDir, ...entry.path.split('/'));
-        if (!isSubPath(abs, stagingDir)) {
-          throw new Error(`daemon_runtime_files_doc_path_escape:${entry.path}`);
-        }
-        if (!existsSync(abs)) {
-          throw new Error(`daemon_runtime_files_doc_missing:${entry.path}`);
-        }
-        const st = statSync(abs);
-        if (st.size !== entry.size || sha256File(abs) !== entry.sha256) {
-          throw new Error(`daemon_runtime_files_doc_digest_mismatch:${entry.path}`);
-        }
-      }
+      verifyEntryList(filesDoc.files as DaemonRuntimeManifestFileEntry[], 'daemon_runtime_files_doc');
     }
   }
 
@@ -671,7 +689,8 @@ export function extractDaemonRuntimeArchive(
 }
 
 /**
- * Default pre-switch health probe: verify bundled `node --version` and `package/dist/src/index.js --version`.
+ * Default pre-switch (and stopped-daemon fallback) binary probe: verify bundled `node --version`
+ * and `package/dist/src/index.js --version`.
  */
 export function runDefaultRuntimeBinaryProbe(
   nodePath: string,
@@ -702,178 +721,6 @@ export function runDefaultRuntimeBinaryProbe(
   }
 }
 
-function readPreviousStateFile(runtimeRoot: string): { previousTarget?: string; previousVersion?: string } {
-  try {
-    const p = join(runtimeRoot, DAEMON_RUNTIME_PREVIOUS_STATE_FILE);
-    if (!existsSync(p)) return {};
-    const parsed = JSON.parse(readFileSync(p, 'utf8')) as { previousTarget?: unknown; previousVersion?: unknown };
-    return {
-      previousTarget: typeof parsed.previousTarget === 'string' ? parsed.previousTarget : undefined,
-      previousVersion: typeof parsed.previousVersion === 'string' ? parsed.previousVersion : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-export function readCurrentPointerTarget(runtimeRoot: string): { targetPath?: string; version?: string } {
-  const currentPath = join(runtimeRoot, 'current');
-  if (!existsSync(currentPath)) return {};
-  try {
-    const st = lstatSync(currentPath);
-    const targetPath = st.isSymbolicLink() ? resolve(dirname(currentPath), readlinkSync(currentPath)) : resolve(currentPath);
-    const version = readPackageVersionSync(targetPath) ?? basename(targetPath);
-    return { targetPath, version };
-  } catch {
-    return {};
-  }
-}
-
-/**
- * Atomically point `<runtimeRoot>/current` at `releaseDir` and record previous target for rollback.
- */
-export function switchDaemonRuntimeCurrentPointer(
-  runtimeRoot: string,
-  releaseDir: string,
-  platform: DaemonRuntimePlatform,
-  nowMs = Date.now(),
-): { currentLink: string; previousTarget?: string; previousVersion?: string } {
-  const resolvedRoot = resolve(runtimeRoot);
-  const resolvedRelease = resolve(releaseDir);
-  const currentLink = join(resolvedRoot, 'current');
-  mkdirSync(resolvedRoot, { recursive: true });
-
-  const prev = readCurrentPointerTarget(resolvedRoot);
-  if (prev.targetPath) {
-    writeFileSync(
-      join(resolvedRoot, DAEMON_RUNTIME_PREVIOUS_STATE_FILE),
-      JSON.stringify({
-        previousTarget: prev.targetPath,
-        previousVersion: prev.version ?? null,
-        switchedAt: nowMs,
-      }, null, 2),
-    );
-  }
-
-  const nonce = `${process.pid}-${randomBytes(4).toString('hex')}`;
-  if (platform === 'win32') {
-    const nextLink = join(resolvedRoot, `.current-next-${nonce}`);
-    const backupLink = join(resolvedRoot, `.current-prev-${nonce}`);
-    symlinkSync(resolvedRelease, nextLink, 'junction');
-    let movedExisting = false;
-    try {
-      if (existsSync(currentLink)) {
-        renameSync(currentLink, backupLink);
-        movedExisting = true;
-      }
-      renameSync(nextLink, currentLink);
-      if (movedExisting) {
-        rmSync(backupLink, { recursive: true, force: true });
-      }
-    } catch (err) {
-      rmSync(nextLink, { recursive: true, force: true });
-      if (movedExisting && !existsSync(currentLink) && existsSync(backupLink)) {
-        try { renameSync(backupLink, currentLink); } catch { /* best effort */ }
-      }
-      throw err;
-    }
-  } else {
-    const tempLink = join(resolvedRoot, `.current-next-${nonce}`);
-    symlinkSync(resolvedRelease, tempLink, 'dir');
-    try {
-      let existingIsDir = false;
-      try {
-        const st = lstatSync(currentLink);
-        existingIsDir = st.isDirectory() && !st.isSymbolicLink();
-      } catch {
-        existingIsDir = false;
-      }
-      if (existingIsDir) {
-        const legacyBackup = join(resolvedRoot, `.current-legacy-${nonce}`);
-        renameSync(currentLink, legacyBackup);
-        try {
-          renameSync(tempLink, currentLink);
-          rmSync(legacyBackup, { recursive: true, force: true });
-        } catch (err) {
-          if (!existsSync(currentLink) && existsSync(legacyBackup)) {
-            try { renameSync(legacyBackup, currentLink); } catch { /* best effort */ }
-          }
-          throw err;
-        }
-      } else {
-        renameSync(tempLink, currentLink);
-      }
-    } catch (err) {
-      rmSync(tempLink, { recursive: true, force: true });
-      throw err;
-    }
-  }
-
-  return {
-    currentLink,
-    ...(prev.targetPath ? { previousTarget: prev.targetPath } : {}),
-    ...(prev.version ? { previousVersion: prev.version } : {}),
-  };
-}
-
-/**
- * Roll `<runtimeRoot>/current` back to `previousTarget` (or unlink `current` if switching back
- * from a first-time user fallback to the read-only system `daemon-runtime`).
- */
-export function rollbackDaemonRuntimeCurrentPointer(
-  runtimeRoot: string,
-  previousTarget: string | undefined,
-  platform: DaemonRuntimePlatform,
-  nowMs = Date.now(),
-): { restoredTarget?: string } {
-  const resolvedRoot = resolve(runtimeRoot);
-  const resolvedPrev = previousTarget ?? readPreviousStateFile(resolvedRoot).previousTarget;
-  if (resolvedPrev && existsSync(resolvedPrev)) {
-    switchDaemonRuntimeCurrentPointer(resolvedRoot, resolvedPrev, platform, nowMs);
-    return { restoredTarget: resolve(resolvedPrev) };
-  }
-  const currentLink = join(resolvedRoot, 'current');
-  try {
-    if (lstatSync(currentLink)) {
-      rmSync(currentLink, { recursive: true, force: true });
-    }
-  } catch {
-    // already absent
-  }
-  return {};
-}
-
-/**
- * Prune stale staging directories and releases older than `current` + `previousTarget`.
- */
-export function pruneOldDaemonRuntimeReleases(
-  runtimeRoot: string,
-  keepTargets: readonly (string | undefined)[],
-): string[] {
-  const releasesDir = join(resolve(runtimeRoot), 'releases');
-  if (!existsSync(releasesDir)) return [];
-  const keepSet = new Set<string>();
-  for (const target of keepTargets) {
-    if (!target) continue;
-    keepSet.add(resolve(target));
-    try {
-      keepSet.add(realpathSync(target));
-    } catch {
-      // ignore dangling path
-    }
-  }
-  const removed: string[] = [];
-  for (const name of readdirSync(releasesDir)) {
-    const entryPath = join(releasesDir, name);
-    const resolvedEntry = resolve(entryPath);
-    if (name.startsWith(DAEMON_RUNTIME_STAGING_PREFIX) || !keepSet.has(resolvedEntry)) {
-      rmSync(entryPath, { recursive: true, force: true });
-      removed.push(entryPath);
-    }
-  }
-  return removed;
-}
-
 function buildNodeArtifactUrl(
   serverUrl: string,
   params: { serverId: string; os: string; arch: string; asset: string },
@@ -894,7 +741,7 @@ async function fetchAndVerifyFromServer(input: {
   expectedTarget: DesktopReleaseTarget;
   tempDir: string;
 }): Promise<
-  | { status: 'ready'; manifest: DaemonRuntimeManifestData; archivePath: string; archiveSha256: string }
+  | { status: 'ready'; manifest: DaemonRuntimeManifest; archivePath: string; archiveSha256: string }
   | { status: 'not_published'; httpStatus: number }
 > {
   const fetchImpl = input.source.fetchImpl ?? fetch;
@@ -921,7 +768,7 @@ async function fetchAndVerifyFromServer(input: {
   if (expectedManifestSha && sha256Buffer(manifestBytes) !== expectedManifestSha) {
     throw new Error('daemon_runtime_manifest_header_sha256_mismatch');
   }
-  const manifest = validateDaemonRuntimeManifestObject(
+  const manifest = validateDaemonRuntimeManifest(
     JSON.parse(manifestBytes.toString('utf8')),
     input.expectedTarget,
   );
@@ -949,7 +796,7 @@ async function fetchAndVerifyFromServer(input: {
   if (headerVersion && headerVersion !== manifest.build.version) {
     throw new Error('daemon_runtime_header_version_mismatch');
   }
-  if (archiveBytes.length !== manifest.archive.size || archiveSha256 !== manifest.archive.sha256) {
+  if (archiveBytes.length !== manifest.artifact.size || archiveSha256 !== manifest.artifact.sha256) {
     throw new Error('daemon_runtime_archive_digest_mismatch');
   }
 
@@ -975,7 +822,7 @@ async function fetchAndVerifyFromServer(input: {
     );
   }
 
-  const archivePath = join(input.tempDir, manifest.archive.fileName);
+  const archivePath = join(input.tempDir, manifest.artifact.fileName);
   writeFileSync(archivePath, archiveBytes);
   return { status: 'ready', manifest, archivePath, archiveSha256 };
 }
@@ -983,16 +830,19 @@ async function fetchAndVerifyFromServer(input: {
 function verifyUnifiedReleaseAlignment(
   rawReleaseManifest: unknown,
   expectedTarget: DesktopReleaseTarget,
-  manifest: DaemonRuntimeManifestData,
+  manifest: DaemonRuntimeManifest,
   archiveSize: number,
   archiveSha256: string,
 ): DesktopReleaseManifest {
   const rm = validateDesktopReleaseManifest(rawReleaseManifest);
   const check = verifyDesktopReleaseComponentIdentity(rm, expectedTarget, 'daemon-runtime', {
     version: manifest.build.version,
-    fileName: manifest.archive.fileName,
+    fileName: manifest.artifact.fileName,
     sha256: archiveSha256,
     sizeBytes: archiveSize,
+    ...(manifest.artifact.authenticodeSignerSha256
+      ? { authenticodeSignerSha256: manifest.artifact.authenticodeSignerSha256 }
+      : {}),
   });
   if (!check.ok) {
     throw new Error(`desktop_release_manifest_mismatch:${check.reason}`);
@@ -1005,13 +855,12 @@ function loadAndVerifyFromLocalDir(input: {
   expectedTarget: DesktopReleaseTarget;
   platform: DaemonRuntimePlatform;
 }):
-  | { status: 'ready'; manifest: DaemonRuntimeManifestData; archivePath: string; archiveSha256: string }
+  | { status: 'ready'; manifest: DaemonRuntimeManifest; archivePath: string; archiveSha256: string }
   | { status: 'not_published' } {
   const dir = resolve(input.dir);
-  const ext = input.platform === 'win32' ? 'zip' : 'tar.gz';
   const candidateManifestNames = [
-    `daemon-runtime-${input.expectedTarget}.${ext}.manifest.json`,
-    `daemon-runtime.${ext}.manifest.json`,
+    daemonRuntimeManifestFilename(input.expectedTarget),
+    'daemon-runtime.manifest.json',
   ];
   const candidateDirs = [dir, join(dir, 'daemon-runtime')];
   let manifestPath: string | undefined;
@@ -1031,17 +880,17 @@ function loadAndVerifyFromLocalDir(input: {
     return { status: 'not_published' };
   }
 
-  const manifest = validateDaemonRuntimeManifestObject(
+  const manifest = validateDaemonRuntimeManifest(
     JSON.parse(readFileSync(manifestPath, 'utf8')),
     input.expectedTarget,
   );
-  const archivePath = join(baseDir, manifest.archive.fileName);
+  const archivePath = join(baseDir, manifest.artifact.fileName);
   if (!existsSync(archivePath) || lstatSync(archivePath).isSymbolicLink()) {
     throw new Error('daemon_runtime_local_archive_missing_or_symlink');
   }
   const st = statSync(archivePath);
   const archiveSha256 = sha256File(archivePath);
-  if (st.size !== manifest.archive.size || archiveSha256 !== manifest.archive.sha256) {
+  if (st.size !== manifest.artifact.size || archiveSha256 !== manifest.artifact.sha256) {
     throw new Error('daemon_runtime_archive_digest_mismatch');
   }
 
@@ -1064,8 +913,106 @@ function loadAndVerifyFromLocalDir(input: {
   return { status: 'ready', manifest, archivePath, archiveSha256 };
 }
 
+function buildServiceLaunchConfig(input: {
+  platform: DaemonRuntimePlatform;
+  runtimeRoot: string;
+  targetCurrent: string;
+  homeDir: string;
+  stateDir: string;
+  env: NodeJS.ProcessEnv;
+}): {
+  targetNodePath: string;
+  targetEntryPath: string;
+  systemdUnitPath?: string;
+  systemdUnitName?: string;
+  launchAgentPath?: string;
+  windowsTask?: string;
+  vbsPath?: string;
+  launchTargetSpec: ServiceLaunchTargetSpec;
+} {
+  const targetNodePath =
+    input.platform === 'win32'
+      ? join(input.targetCurrent, 'node.exe')
+      : join(input.targetCurrent, 'bin', 'node');
+  const targetEntryPath = join(input.targetCurrent, 'package', 'dist', 'src', 'index.js');
+
+  if (input.platform === 'linux') {
+    const svcPaths = resolvePosixDaemonServicePaths({
+      ...input.env,
+      HOME: input.homeDir,
+      IMCODES_HOME: input.stateDir,
+    });
+    const systemdUnitPath = join(input.homeDir, '.config', 'systemd', 'user', svcPaths.systemdUnitName);
+    const execStart = renderSystemdExecStart({
+      program: targetNodePath,
+      args: [targetEntryPath, 'start', '--foreground'],
+    });
+    return {
+      targetNodePath,
+      targetEntryPath,
+      systemdUnitPath,
+      systemdUnitName: svcPaths.systemdUnitName,
+      launchTargetSpec: {
+        kind: 'systemd',
+        filePath: systemdUnitPath,
+        execStart,
+      },
+    };
+  }
+
+  if (input.platform === 'darwin') {
+    const svcPaths = resolvePosixDaemonServicePaths({
+      ...input.env,
+      HOME: input.homeDir,
+      IMCODES_HOME: input.stateDir,
+    });
+    const launchAgentsDir = join(input.homeDir, 'Library', 'LaunchAgents');
+    const primaryPlist = join(launchAgentsDir, `${svcPaths.launchAgentLabel}.plist`);
+    const legacyPlist = join(launchAgentsDir, 'cc.imcodes.daemon.plist');
+    const launchAgentPath =
+      !svcPaths.scoped && !existsSync(primaryPlist) && existsSync(legacyPlist)
+        ? legacyPlist
+        : primaryPlist;
+    return {
+      targetNodePath,
+      targetEntryPath,
+      launchAgentPath,
+      launchTargetSpec: {
+        kind: 'launchd',
+        filePath: launchAgentPath,
+        programArguments: [targetNodePath, targetEntryPath, 'start', '--foreground'],
+      },
+    };
+  }
+
+  const defaultStateDir = imcodesStateDirForHome(input.homeDir, input.env);
+  const windowsTask = windowsTaskName('daemon', input.stateDir, defaultStateDir);
+  const watchdogPath = join(input.stateDir, 'daemon-watchdog.cmd');
+  const vbsPath = join(input.stateDir, 'daemon-launcher.vbs');
+  const logPath = join(input.stateDir, 'watchdog.log');
+  const watchdogContent = renderWatchdogCmd({
+    nodeExe: targetNodePath,
+    imcodesScript: targetEntryPath,
+    watchdogPath,
+    vbsPath,
+    logPath,
+  });
+
+  return {
+    targetNodePath,
+    targetEntryPath,
+    windowsTask,
+    vbsPath,
+    launchTargetSpec: {
+      kind: 'windows_watchdog',
+      filePath: watchdogPath,
+      watchdogContent,
+    },
+  };
+}
+
 /**
- * Write and launch a self-contained detached switch+restart+healthcheck+rollback runner
+ * Write and launch a self-contained detached switch+launch-chain-align+restart+healthcheck+rollback runner
  * (used when the running daemon upgrades itself cleanly without in-place overwrites).
  */
 export function launchDetachedDaemonRuntimeSwitchRunner(input: {
@@ -1077,28 +1024,40 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
   targetVersion: string;
   stateDir: string;
   homeDir: string;
+  env?: NodeJS.ProcessEnv;
   keepTargets: string[];
+  lockOwnerToken?: string;
   restartCommand?: string;
+  rollbackRestartCommand?: string;
+  healthCheckTimeoutMs?: number;
+  settleMs?: number;
   spawnRunner?: (scriptPath: string, args: string[], scriptDir: string) => void;
 }): { scriptDir: string; scriptPath: string; logFile: string } {
   const scriptDir = input.scriptDir ?? mkdtempSync(join(tmpdir(), 'imcodes-rt-upgrade-'));
   const logFile = join(scriptDir, 'runtime-upgrade.log');
   const configPath = join(scriptDir, 'runtime-upgrade.json');
   const scriptPath = join(scriptDir, 'switch-runner.mjs');
-  const restartCommand =
-    input.restartCommand ??
-    (input.platform === 'win32'
-      ? ''
-      : buildPosixRestartCommand({
-          platform: input.platform,
-          home: input.homeDir,
-          stateDir: input.stateDir,
-        }));
+  const helperDestPath = join(scriptDir, 'daemon-runtime-switch-helper.mjs');
 
-  const defaultStateDir = imcodesStateDirForHome(input.homeDir);
-  const windowsTask = input.platform === 'win32'
-    ? windowsTaskName('daemon', input.stateDir, defaultStateDir)
-    : '';
+  copyFileSync(resolveDaemonRuntimeSwitchHelperPath(), helperDestPath);
+
+  const env = input.env ?? process.env;
+  const targetCurrent = join(resolve(input.runtimeRoot), 'current');
+  const launchCfg = buildServiceLaunchConfig({
+    platform: input.platform,
+    runtimeRoot: input.runtimeRoot,
+    targetCurrent,
+    homeDir: input.homeDir,
+    stateDir: input.stateDir,
+    env,
+  });
+
+  const previousNodePath = input.previousTarget
+    ? join(resolve(input.previousTarget), input.platform === 'win32' ? 'node.exe' : join('bin', 'node'))
+    : undefined;
+  const previousEntryPath = input.previousTarget
+    ? join(resolve(input.previousTarget), 'package', 'dist', 'src', 'index.js')
+    : undefined;
 
   writeFileSync(
     configPath,
@@ -1110,142 +1069,33 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
       targetVersion: input.targetVersion,
       stateDir: resolve(input.stateDir),
       keepTargets: input.keepTargets.map((t) => resolve(t)),
-      restartCommand,
-      windowsTask,
+      lockOwnerToken: input.lockOwnerToken ?? null,
+      targetNodePath: launchCfg.targetNodePath,
+      targetEntryPath: launchCfg.targetEntryPath,
+      ...(previousNodePath ? { previousNodePath } : {}),
+      ...(previousEntryPath ? { previousEntryPath } : {}),
+      ...(launchCfg.systemdUnitPath ? { systemdUnitPath: launchCfg.systemdUnitPath } : {}),
+      ...(launchCfg.systemdUnitName ? { systemdUnitName: launchCfg.systemdUnitName } : {}),
+      ...(launchCfg.launchAgentPath ? { launchAgentPath: launchCfg.launchAgentPath } : {}),
+      ...(launchCfg.windowsTask ? { windowsTask: launchCfg.windowsTask } : {}),
+      ...(launchCfg.vbsPath ? { vbsPath: launchCfg.vbsPath } : {}),
+      ...(input.restartCommand ? { restartCommand: input.restartCommand } : {}),
+      ...(input.rollbackRestartCommand ? { rollbackRestartCommand: input.rollbackRestartCommand } : {}),
+      launchTargetSpec: launchCfg.launchTargetSpec,
+      ...(typeof input.healthCheckTimeoutMs === 'number' ? { healthCheckTimeoutMs: input.healthCheckTimeoutMs } : {}),
+      ...(typeof input.settleMs === 'number' ? { settleMs: input.settleMs } : {}),
       logFile,
     }, null, 2),
   );
 
-  const runnerSource = `import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { randomBytes } from 'node:crypto';
-
-const cfg = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-const log = (msg) => {
-  try { appendFileSync(cfg.logFile, '[' + new Date().toISOString() + '] ' + msg + '\\n'); } catch {}
-};
-
-const switchPtr = (targetDir) => {
-  const root = cfg.runtimeRoot;
-  const currentLink = join(root, 'current');
-  const nonce = process.pid + '-' + randomBytes(4).toString('hex');
-  if (cfg.platform === 'win32') {
-    const next = join(root, '.current-next-' + nonce);
-    const prev = join(root, '.current-prev-' + nonce);
-    symlinkSync(targetDir, next, 'junction');
-    let moved = false;
-    try {
-      if (existsSync(currentLink)) { renameSync(currentLink, prev); moved = true; }
-      renameSync(next, currentLink);
-      if (moved) rmSync(prev, { recursive: true, force: true });
-    } catch (err) {
-      rmSync(next, { recursive: true, force: true });
-      if (moved && !existsSync(currentLink) && existsSync(prev)) {
-        try { renameSync(prev, currentLink); } catch {}
-      }
-      throw err;
-    }
-  } else {
-    const tmpLink = join(root, '.current-next-' + nonce);
-    symlinkSync(targetDir, tmpLink, 'dir');
-    try {
-      let existingDir = false;
-      try { const st = lstatSync(currentLink); existingDir = st.isDirectory() && !st.isSymbolicLink(); } catch {}
-      if (existingDir) {
-        const legacy = join(root, '.current-legacy-' + nonce);
-        renameSync(currentLink, legacy);
-        renameSync(tmpLink, currentLink);
-        rmSync(legacy, { recursive: true, force: true });
-      } else {
-        renameSync(tmpLink, currentLink);
-      }
-    } catch (err) {
-      rmSync(tmpLink, { recursive: true, force: true });
-      throw err;
-    }
-  }
-};
-
-const rollbackPtr = () => {
-  if (cfg.previousTarget && existsSync(cfg.previousTarget)) {
-    switchPtr(cfg.previousTarget);
-  } else {
-    rmSync(join(cfg.runtimeRoot, 'current'), { recursive: true, force: true });
-  }
-};
-
-const isAlive = (pid) => {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
-};
-
-const readPid = () => {
-  try {
-    const n = Number(readFileSync(join(cfg.stateDir, 'daemon.pid'), 'utf8').trim());
-    return Number.isInteger(n) && n > 1 ? n : null;
-  } catch { return null; }
-};
-
-const runRestart = () => {
-  if (cfg.platform === 'win32') {
-    const oldPid = readPid();
-    if (oldPid) {
-      try { execFileSync('taskkill', ['/F', '/T', '/PID', String(oldPid)], { stdio: 'ignore' }); } catch {}
-    }
-    try { execFileSync('schtasks', ['/Run', '/TN', cfg.windowsTask], { stdio: 'ignore' }); return true; } catch { return false; }
-  }
-  const r = spawnSync('/bin/bash', ['-lc', cfg.restartCommand], { stdio: 'pipe', encoding: 'utf8' });
-  if (r.status !== 0) log('restart stderr: ' + (r.stderr || '').trim());
-  return r.status === 0;
-};
-
-const lockFile = join(cfg.stateDir, 'upgrade.lock');
-try {
-  mkdirSync(cfg.stateDir, { recursive: true });
-  writeFileSync(lockFile, String(process.pid));
-  const oldPid = readPid();
-  log('switching current -> ' + cfg.stagedReleaseDir);
-  switchPtr(cfg.stagedReleaseDir);
-  try { unlinkSync(lockFile); } catch {}
-  const restarted = runRestart();
-  let healthy = false;
-  if (restarted) {
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
-      const pid = readPid();
-      if (pid && pid !== oldPid && isAlive(pid)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
-        if (isAlive(readPid())) { healthy = true; break; }
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
-    }
-  }
-  if (!healthy) {
-    log('post-restart health failed; rolling back to ' + (cfg.previousTarget || 'system fallback'));
-    rollbackPtr();
-    runRestart();
-    process.exitCode = 1;
-  } else {
-    log('post-restart health passed');
-    const keep = new Set(cfg.keepTargets);
-    try { keep.add(realpathSync(join(cfg.runtimeRoot, 'current'))); } catch {}
-    const relDir = join(cfg.runtimeRoot, 'releases');
-    if (existsSync(relDir)) {
-      for (const name of readdirSync(relDir)) {
-        const p = resolve(relDir, name);
-        if (name.startsWith('.staging-') || !keep.has(p)) rmSync(p, { recursive: true, force: true });
-      }
-    }
-  }
-} catch (err) {
-  log('error: ' + (err && err.stack ? err.stack : String(err)));
-  try { rollbackPtr(); runRestart(); } catch {}
-  process.exitCode = 1;
-} finally {
-  try { unlinkSync(lockFile); } catch {}
-}
-`;
+  const runnerSource = [
+    "import { readFileSync } from 'node:fs';",
+    "import { runDetachedSwitchTransaction } from './daemon-runtime-switch-helper.mjs';",
+    '',
+    "const cfg = JSON.parse(readFileSync(process.argv[2], 'utf8'));",
+    'process.exitCode = runDetachedSwitchTransaction(cfg) ? 0 : 1;',
+    '',
+  ].join('\n');
   writeFileSync(scriptPath, runnerSource, { mode: 0o700 });
 
   if (input.spawnRunner) {
@@ -1263,12 +1113,154 @@ try {
 }
 
 /**
+ * Resolve whether an eligible, writable legacy npm global CLI installation exists when
+ * `upgradeBundledDaemonRuntime` returns `fallback_legacy_cli`.
+ * Never selects read-only system directories, bundled `daemon-runtime` layouts, or git checkouts.
+ */
+export function resolveLegacyNpmCliFallback(options: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  execPath?: string;
+  userHome?: string;
+  stateDir?: string;
+} = {}): LegacyNpmCliFallbackResolution {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const pathSep = platform === 'win32' ? ';' : ':';
+  const candidatePrefixes: Array<{ prefixDir: string; explicitHint: boolean }> = [];
+  const seenPrefixes = new Set<string>();
+
+  const addPrefix = (rawPrefix: string | undefined, explicitHint: boolean): void => {
+    if (!rawPrefix?.trim()) return;
+    const resolved = resolve(rawPrefix.trim());
+    if (seenPrefixes.has(resolved)) return;
+    seenPrefixes.add(resolved);
+    candidatePrefixes.push({ prefixDir: resolved, explicitHint });
+  };
+
+  addPrefix(env.NPM_CONFIG_PREFIX || env.npm_config_prefix, true);
+
+  const pathEntries = (env.PATH ?? '')
+    .split(pathSep)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const dirEntry of pathEntries) {
+    const binNames = platform === 'win32' ? ['imcodes.cmd', 'imcodes.exe', 'imcodes'] : ['imcodes'];
+    for (const binName of binNames) {
+      const candidateBin = join(dirEntry, binName);
+      if (!existsSync(candidateBin)) continue;
+      const realBin = safeRealpath(candidateBin);
+      const norm = realBin.replace(/\\/gu, '/');
+      if (norm.includes('/daemon-runtime/')) continue;
+      if (isPathInsideGitCheckout(realBin)) {
+        return {
+          eligible: false,
+          reason: 'legacy_npm_cli_is_git_checkout',
+          message: `Legacy CLI binary resolves into git checkout (${realBin}); refusing automated fallback`,
+        };
+      }
+      const nmIdx = norm.lastIndexOf('/node_modules/imcodes/');
+      if (nmIdx !== -1) {
+        const prefixGuess =
+          platform === 'win32'
+            ? realBin.slice(0, nmIdx)
+            : norm.slice(0, nmIdx).endsWith('/lib')
+              ? dirname(realBin.slice(0, nmIdx))
+              : realBin.slice(0, nmIdx);
+        addPrefix(prefixGuess, true);
+      } else {
+        addPrefix(dirname(dirEntry), false);
+      }
+    }
+  }
+
+  let sawReadOnlyPrefix: string | undefined;
+  let sawGitCheckout = false;
+
+  for (const { prefixDir } of candidatePrefixes) {
+    const nodeModulesDir = platform === 'win32' ? join(prefixDir, 'node_modules') : join(prefixDir, 'lib', 'node_modules');
+    const binDir = platform === 'win32' ? prefixDir : join(prefixDir, 'bin');
+    const pkgDir = join(nodeModulesDir, 'imcodes');
+    const pkgJsonPath = join(pkgDir, 'package.json');
+    if (!existsSync(pkgJsonPath)) continue;
+
+    const realPkgDir = safeRealpath(pkgDir);
+    if (realPkgDir.replace(/\\/gu, '/').includes('/daemon-runtime/')) continue;
+    if (isPathInsideGitCheckout(realPkgDir)) {
+      sawGitCheckout = true;
+      continue;
+    }
+
+    let pkgName = '';
+    try {
+      pkgName = String((JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as { name?: unknown }).name ?? '');
+    } catch {
+      continue;
+    }
+    if (pkgName !== 'imcodes') continue;
+
+    const cliEntry = join(pkgDir, 'dist', 'src', 'cli.js');
+    if (!existsSync(cliEntry)) continue;
+
+    if (!isExistingDirectoryWritable(nodeModulesDir) || !isExistingDirectoryWritable(binDir)) {
+      sawReadOnlyPrefix ??= prefixDir;
+      continue;
+    }
+
+    const candidateNode = platform === 'win32' ? join(prefixDir, 'node.exe') : join(binDir, 'node');
+    let nodeBin = existsSync(candidateNode) ? candidateNode : '';
+    if (!nodeBin) {
+      for (const dirEntry of pathEntries) {
+        const p = join(dirEntry, platform === 'win32' ? 'node.exe' : 'node');
+        if (existsSync(p) && !p.replace(/\\/gu, '/').includes('/daemon-runtime/')) {
+          nodeBin = p;
+          break;
+        }
+      }
+    }
+    if (!nodeBin) nodeBin = options.execPath ?? process.execPath;
+
+    return {
+      eligible: true,
+      pkgDir,
+      prefixDir,
+      nodeBin,
+      cliEntry,
+    };
+  }
+
+  if (sawReadOnlyPrefix) {
+    return {
+      eligible: false,
+      reason: 'legacy_npm_cli_read_only',
+      prefixDir: sawReadOnlyPrefix,
+      message: `Legacy npm CLI prefix ${sawReadOnlyPrefix} is read-only`,
+    };
+  }
+  if (sawGitCheckout) {
+    return {
+      eligible: false,
+      reason: 'legacy_npm_cli_is_git_checkout',
+      message: 'Legacy CLI resolves inside a git checkout',
+    };
+  }
+  return {
+    eligible: false,
+    reason: 'legacy_npm_cli_missing',
+    message: 'No installed legacy npm global imcodes package found',
+  };
+}
+
+/**
  * Execute User Daemon runtime self-upgrade for `daemon-runtime/releases/<ver>` + `current`:
  * 1) Dev checkout/symlink exemption -> refuse cleanly
  * 2) Legacy CLI or unavailable bundled artifact -> return `fallback_legacy_cli` when allowed
- * 3) Bundled mode (writable in-place OR `~/.imcodes/daemon-runtime` user fallback) -> verify digests,
- *    extract cleanly without symlink escapes, pre-check binary, atomically switch `current`, prune
- *    older releases keeping current + rollback target, and auto-rollback on health failure.
+ * 3) Bundled mode (writable in-place OR `~/.imcodes/daemon-runtime` user fallback) -> single-flight lock,
+ *    verify manifest & archive & extracted tree digests, pre-check binary, atomically switch `current`
+ *    (preserving real-dir `current` bytes), align scoped service launcher, restart & verify live target
+ *    daemon (`pid` + `startToken` + `daemon-runtime.json`), record cooldown sentinel, prune old releases,
+ *    and auto-rollback pointer + service launcher + restart on any failure.
  */
 export async function upgradeBundledDaemonRuntime(
   options: DaemonRuntimeUpgradeOptions,
@@ -1335,16 +1327,23 @@ export async function upgradeBundledDaemonRuntime(
     return { status: 'fallback_legacy_cli', reason: 'daemon_runtime_source_not_configured' };
   }
 
+  const stateDir = resolveRuntimeUpgradeStateDir(env, options.userHome);
+  const homeDir = options.userHome?.trim() || env.HOME?.trim() || homedir();
+
+  const lockHandle = acquireRuntimeUpgradeLock(stateDir, {
+    mode: options.detachedHandoff ? 'detached_handoff_parent' : 'in_process',
+  });
+  let lockHandedOff = false;
+
   const workTmpDir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-rt-dl-'));
   let stagingDir: string | undefined;
   let downloaded:
-    | { status: 'ready'; manifest: DaemonRuntimeManifestData; archivePath: string; archiveSha256: string }
+    | { status: 'ready'; manifest: DaemonRuntimeManifest; archivePath: string; archiveSha256: string }
     | { status: 'not_published'; httpStatus?: number };
 
   try {
     if (source.kind === 'local') {
-      const localRes = loadAndVerifyFromLocalDir({ dir: source.dir, expectedTarget: target, platform });
-      downloaded = localRes;
+      downloaded = loadAndVerifyFromLocalDir({ dir: source.dir, expectedTarget: target, platform });
     } else {
       const arch = targetMeta.endsWith('-arm64') ? 'arm64' : 'x64';
       downloaded = await fetchAndVerifyFromServer({
@@ -1399,16 +1398,17 @@ export async function upgradeBundledDaemonRuntime(
     );
 
     if (options.extractArchive) {
+      mkdirSync(stagingDir, { recursive: true });
       await options.extractArchive({
         archivePath: downloaded.archivePath,
-        format: downloaded.manifest.archive.format,
+        format: downloaded.manifest.artifact.format,
         destDir: stagingDir,
         platform,
       });
     } else {
       extractDaemonRuntimeArchive(
         downloaded.archivePath,
-        downloaded.manifest.archive.format,
+        downloaded.manifest.artifact.format,
         stagingDir,
         platform,
       );
@@ -1416,6 +1416,7 @@ export async function upgradeBundledDaemonRuntime(
 
     const verified = verifyStagedDaemonRuntimeTree(stagingDir, platform, targetVer, {
       requireFullEntries: options.requireFullEntries,
+      manifestFiles: downloaded.manifest.files,
     });
 
     if (options.healthCheck) {
@@ -1441,7 +1442,6 @@ export async function upgradeBundledDaemonRuntime(
     const liveCurrent = readCurrentPointerTarget(writableResolution.targetRoot);
     if (existsSync(releaseDir)) {
       if (liveCurrent.targetPath && resolve(liveCurrent.targetPath) === resolve(releaseDir)) {
-        // Rare same-version repair into distinct versioned directory would need a different name
         throw new Error(`daemon_runtime_release_in_use:${releaseDir}`);
       }
       rmSync(releaseDir, { recursive: true, force: true });
@@ -1450,41 +1450,72 @@ export async function upgradeBundledDaemonRuntime(
     stagingDir = undefined;
 
     const prev = readCurrentPointerTarget(writableResolution.targetRoot);
-    const keepTargets = [releaseDir, prev.targetPath].filter((v): v is string => Boolean(v));
+    const prevTargetForHandoff = prev.targetPath && prev.targetPath !== join(resolve(writableResolution.targetRoot), 'current')
+      ? prev.targetPath
+      : undefined;
+    const keepTargets = [releaseDir, prevTargetForHandoff].filter((v): v is string => Boolean(v));
 
     if (options.detachedHandoff) {
-      const stateDir = imcodesStateDir(env);
-      const launched = launchDetachedDaemonRuntimeSwitchRunner({
-        platform,
-        runtimeRoot: writableResolution.targetRoot,
-        stagedReleaseDir: releaseDir,
-        previousTarget: prev.targetPath,
+      transferRuntimeUpgradeLock(stateDir, lockHandle.ownerToken, {
+        mode: 'detached_handoff_pending',
         targetVersion: targetVer,
-        stateDir,
-        homeDir: options.userHome ?? homedir(),
-        keepTargets,
-        spawnRunner: options.spawnDetachedRunner,
       });
-      return {
-        status: 'upgraded',
-        targetVersion: targetVer,
-        ...(prev.version ?? options.currentVersion ? { previousVersion: prev.version ?? options.currentVersion } : {}),
-        ...(prev.targetPath ? { previousTarget: prev.targetPath } : {}),
-        runtimeRoot: writableResolution.targetRoot,
-        releaseDir,
-        currentLink: join(writableResolution.targetRoot, 'current'),
-        writableRootKind: writableResolution.writableRootKind,
-        rolledBack: false,
-        detachedScriptDir: launched.scriptDir,
-      };
+      try {
+        const launched = launchDetachedDaemonRuntimeSwitchRunner({
+          platform,
+          runtimeRoot: writableResolution.targetRoot,
+          stagedReleaseDir: releaseDir,
+          previousTarget: prevTargetForHandoff,
+          targetVersion: targetVer,
+          stateDir,
+          homeDir,
+          env,
+          keepTargets,
+          lockOwnerToken: lockHandle.ownerToken,
+          healthCheckTimeoutMs: options.healthCheckTimeoutMs,
+          settleMs: options.settleMs,
+          spawnRunner: options.spawnDetachedRunner,
+        });
+        lockHandedOff = true;
+        return {
+          status: 'upgraded',
+          targetVersion: targetVer,
+          ...(prev.version ?? options.currentVersion ? { previousVersion: prev.version ?? options.currentVersion } : {}),
+          ...(prevTargetForHandoff ? { previousTarget: prevTargetForHandoff } : {}),
+          runtimeRoot: writableResolution.targetRoot,
+          releaseDir,
+          currentLink: join(writableResolution.targetRoot, 'current'),
+          writableRootKind: writableResolution.writableRootKind,
+          rolledBack: false,
+          detachedScriptDir: launched.scriptDir,
+        };
+      } catch (handoffErr) {
+        lockHandedOff = false;
+        throw handoffErr;
+      }
     }
 
+    const oldIdentity = readVerifiedDaemonIdentity(stateDir, platform);
     const nowMs = options.now?.() ?? Date.now();
     const switched = switchDaemonRuntimeCurrentPointer(writableResolution.targetRoot, releaseDir, platform, nowMs);
     const switchedNodePath = join(switched.currentLink, platform === 'win32' ? 'node.exe' : join('bin', 'node'));
     const switchedEntryPath = join(switched.currentLink, 'package', 'dist', 'src', 'index.js');
+    const launchCfg = buildServiceLaunchConfig({
+      platform,
+      runtimeRoot: writableResolution.targetRoot,
+      targetCurrent: switched.currentLink,
+      homeDir,
+      stateDir,
+      env,
+    });
+
+    let launchBackup: ServiceLaunchBackup | null = null;
+    let executedOsServiceRestart = false;
 
     try {
+      launchBackup = prepareServiceLaunchTarget(launchCfg.launchTargetSpec);
+      const restartBeganAtMs = Date.now();
+
       if (options.restartService) {
         await options.restartService({
           platform,
@@ -1494,7 +1525,26 @@ export async function upgradeBundledDaemonRuntime(
           previousVersion: switched.previousVersion ?? options.currentVersion,
           previousTarget: switched.previousTarget,
         });
+      } else {
+        const restartRes = restartDaemonService({
+          platform,
+          stateDir,
+          nodePath: launchCfg.targetNodePath,
+          entryPath: launchCfg.targetEntryPath,
+          systemdUnitPath: launchCfg.systemdUnitPath,
+          systemdUnitName: launchCfg.systemdUnitName,
+          launchAgentPath: launchCfg.launchAgentPath,
+          windowsTask: launchCfg.windowsTask,
+          vbsPath: launchCfg.vbsPath,
+          oldIdentity,
+          wasRunning: Boolean(oldIdentity),
+        });
+        if (!restartRes.ok) {
+          throw new Error(`daemon_restart_failed:${restartRes.mode}`);
+        }
+        executedOsServiceRestart = restartRes.mode !== 'noop_stopped';
       }
+
       if (options.healthCheck) {
         await options.healthCheck({
           phase: 'post_restart',
@@ -1504,6 +1554,16 @@ export async function upgradeBundledDaemonRuntime(
           nodePath: switchedNodePath,
           entryPath: switchedEntryPath,
           expectedVersion: targetVer,
+        });
+      } else if (oldIdentity || executedOsServiceRestart) {
+        waitForHealthyTargetDaemon({
+          stateDir,
+          expectedVersion: targetVer,
+          oldIdentity,
+          restartBeganAtMs,
+          platform,
+          timeoutMs: options.healthCheckTimeoutMs,
+          settleMs: options.settleMs,
         });
       } else {
         runDefaultRuntimeBinaryProbe(
@@ -1520,6 +1580,10 @@ export async function upgradeBundledDaemonRuntime(
         platform,
         options.now?.() ?? Date.now(),
       );
+      if (launchBackup) {
+        restoreServiceLaunchTarget(launchBackup);
+        launchBackup = null;
+      }
       if (options.restartService) {
         try {
           await options.restartService({
@@ -1532,6 +1596,26 @@ export async function upgradeBundledDaemonRuntime(
           });
         } catch {
           // rollback pointer already restored; best-effort restart attempt recorded
+        }
+      } else if (oldIdentity || executedOsServiceRestart) {
+        const prevRoot = restored.restoredTarget ?? writableResolution.activeRoot;
+        const postRbIdentity = readVerifiedDaemonIdentity(stateDir, platform);
+        try {
+          restartDaemonService({
+            platform,
+            stateDir,
+            nodePath: join(prevRoot, platform === 'win32' ? 'node.exe' : join('bin', 'node')),
+            entryPath: join(prevRoot, 'package', 'dist', 'src', 'index.js'),
+            systemdUnitPath: launchCfg.systemdUnitPath,
+            systemdUnitName: launchCfg.systemdUnitName,
+            launchAgentPath: launchCfg.launchAgentPath,
+            windowsTask: launchCfg.windowsTask,
+            vbsPath: launchCfg.vbsPath,
+            oldIdentity: postRbIdentity ?? oldIdentity,
+            wasRunning: Boolean(oldIdentity || executedOsServiceRestart),
+          });
+        } catch {
+          // rollback pointer + launcher already restored
         }
       }
       return {
@@ -1547,6 +1631,7 @@ export async function upgradeBundledDaemonRuntime(
       };
     }
 
+    writeUpgradeCooldownSentinel(stateDir, options.now?.() ?? Date.now());
     pruneOldDaemonRuntimeReleases(writableResolution.targetRoot, [
       releaseDir,
       switched.previousTarget,
@@ -1570,5 +1655,8 @@ export async function upgradeBundledDaemonRuntime(
       rmSync(stagingDir, { recursive: true, force: true });
     }
     rmSync(workTmpDir, { recursive: true, force: true });
+    if (!lockHandedOff) {
+      releaseRuntimeUpgradeLock(stateDir, lockHandle.ownerToken);
+    }
   }
 }

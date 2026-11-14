@@ -609,3 +609,230 @@ export function mergeDesktopReleaseManifests(
     targets,
   });
 }
+
+export const DAEMON_RUNTIME_MANIFEST_SCHEMA_VERSION = 1 as const;
+
+export const DAEMON_RUNTIME_CRITICAL_ENTRY_PATHS = [
+  'package/package.json',
+  'package/config/default.yaml',
+  'package/dist/src/index.js',
+  'package/dist/src/cli.js',
+] as const;
+
+export interface DaemonRuntimeManifestFileEntry {
+  path: string;
+  size: number;
+  sha256: string;
+  executable?: boolean;
+}
+
+export interface DaemonRuntimeManifest {
+  schemaVersion: typeof DAEMON_RUNTIME_MANIFEST_SCHEMA_VERSION;
+  artifact: {
+    fileName: string;
+    format: 'tar.gz' | 'zip';
+    os: DesktopReleaseOs;
+    arch: DesktopReleaseArch;
+    size: number;
+    sha256: string;
+    authenticodeSignerSha256?: string;
+    macosSigningIdentitySha1?: string;
+  };
+  entrypoint: {
+    node: 'bin/node' | 'node.exe';
+    script: 'package/dist/src/index.js';
+  };
+  toolchain: {
+    nodeProvider: string;
+    nodeVersion: string;
+    nodeArchive?: string;
+    nodeArchiveSha256?: string;
+    nodeBinarySha256?: string;
+  };
+  build: {
+    commit: string;
+    version: string;
+  };
+  totalUncompressedBytes: number;
+  fileCount: number;
+  files: DaemonRuntimeManifestFileEntry[];
+}
+
+export function daemonRuntimeManifestFilename(target: DesktopReleaseTarget): string {
+  return `daemon-runtime-${target}.manifest.json`;
+}
+
+const MACOS_SIGNING_SHA1_RE = /^[a-f0-9]{40}$/u;
+
+/**
+ * Authoritative validator for `daemon-runtime-<target>.manifest.json` produced by
+ * `scripts/daemon-runtime-artifacts.mjs` (`createDaemonRuntimeManifest`) and served
+ * by `server/src/services/controlled-node-artifact-catalog.ts`.
+ */
+export function validateDaemonRuntimeManifest(
+  value: unknown,
+  expectedTarget: DesktopReleaseTarget,
+): DaemonRuntimeManifest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('daemon_runtime_manifest_invalid:not_object');
+  }
+  const obj = value as Record<string, unknown>;
+  if (obj.schemaVersion !== DAEMON_RUNTIME_MANIFEST_SCHEMA_VERSION) {
+    throw new Error('daemon_runtime_manifest_invalid:schemaVersion');
+  }
+  const { os: expectedOs, arch: expectedArch } = parseDesktopReleaseTarget(expectedTarget);
+  const expectedFormat = expectedOs === 'win32' ? 'zip' : 'tar.gz';
+  const expectedFileName = `daemon-runtime-${expectedTarget}.${expectedFormat}`;
+  const expectedNode = expectedOs === 'win32' ? 'node.exe' : 'bin/node';
+
+  const artifact = obj.artifact;
+  if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) {
+    throw new Error('daemon_runtime_manifest_invalid:missing_artifact');
+  }
+  const a = artifact as Record<string, unknown>;
+  const actualOs = typeof a.os === 'string' ? a.os : '';
+  const actualArch = typeof a.arch === 'string' ? a.arch : '';
+  if (actualOs !== expectedOs || actualArch !== expectedArch) {
+    throw new Error(`daemon_runtime_manifest_target_mismatch:${actualOs}-${actualArch}_vs_${expectedTarget}`);
+  }
+  if (a.format !== expectedFormat) {
+    throw new Error('daemon_runtime_manifest_invalid:archive_format');
+  }
+  if (
+    typeof a.fileName !== 'string'
+    || a.fileName !== expectedFileName
+    || a.fileName.includes('/')
+    || a.fileName.includes('\\')
+  ) {
+    throw new Error('daemon_runtime_manifest_invalid:archive_fileName');
+  }
+  if (typeof a.size !== 'number' || !Number.isSafeInteger(a.size) || a.size <= 0) {
+    throw new Error('daemon_runtime_manifest_invalid:archive_size');
+  }
+  if (typeof a.sha256 !== 'string' || !DESKTOP_RELEASE_SHA256_RE.test(a.sha256)) {
+    throw new Error('daemon_runtime_manifest_invalid:archive_sha256');
+  }
+  let authenticodeSignerSha256: string | undefined;
+  if (a.authenticodeSignerSha256 !== undefined) {
+    if (typeof a.authenticodeSignerSha256 !== 'string' || !DESKTOP_RELEASE_SHA256_RE.test(a.authenticodeSignerSha256)) {
+      throw new Error('daemon_runtime_manifest_invalid:authenticodeSignerSha256');
+    }
+    authenticodeSignerSha256 = a.authenticodeSignerSha256;
+  }
+  let macosSigningIdentitySha1: string | undefined;
+  if (a.macosSigningIdentitySha1 !== undefined) {
+    if (typeof a.macosSigningIdentitySha1 !== 'string' || !MACOS_SIGNING_SHA1_RE.test(a.macosSigningIdentitySha1)) {
+      throw new Error('daemon_runtime_manifest_invalid:macosSigningIdentitySha1');
+    }
+    macosSigningIdentitySha1 = a.macosSigningIdentitySha1;
+  }
+
+  const entrypoint = obj.entrypoint;
+  if (!entrypoint || typeof entrypoint !== 'object' || Array.isArray(entrypoint)) {
+    throw new Error('daemon_runtime_manifest_invalid:missing_entrypoint');
+  }
+  const ep = entrypoint as Record<string, unknown>;
+  if (ep.node !== expectedNode || ep.script !== 'package/dist/src/index.js') {
+    throw new Error('daemon_runtime_manifest_invalid:entrypoint');
+  }
+
+  const toolchain = obj.toolchain;
+  if (!toolchain || typeof toolchain !== 'object' || Array.isArray(toolchain)) {
+    throw new Error('daemon_runtime_manifest_invalid:missing_toolchain');
+  }
+  const tc = toolchain as Record<string, unknown>;
+  if (typeof tc.nodeProvider !== 'string' || !tc.nodeProvider.trim() || typeof tc.nodeVersion !== 'string' || !NODE_VERSION_RE.test(tc.nodeVersion)) {
+    throw new Error('daemon_runtime_manifest_invalid:toolchain');
+  }
+
+  const build = obj.build;
+  if (!build || typeof build !== 'object' || Array.isArray(build)) {
+    throw new Error('daemon_runtime_manifest_invalid:missing_build');
+  }
+  const b = build as Record<string, unknown>;
+  if (typeof b.version !== 'string' || !DESKTOP_RELEASE_BUILD_VERSION_RE.test(b.version.trim())) {
+    throw new Error('daemon_runtime_manifest_invalid:build_version');
+  }
+  if (typeof b.commit !== 'string' || !DESKTOP_RELEASE_GIT_SHA_RE.test(b.commit)) {
+    throw new Error('daemon_runtime_manifest_invalid:build_commit');
+  }
+
+  if (!Array.isArray(obj.files) || obj.files.length === 0) {
+    throw new Error('daemon_runtime_manifest_invalid:files');
+  }
+  if (typeof obj.fileCount === 'number' && obj.fileCount !== obj.files.length) {
+    throw new Error('daemon_runtime_manifest_invalid:fileCount');
+  }
+  let sumBytes = 0;
+  const seen = new Set<string>();
+  const validatedFiles: DaemonRuntimeManifestFileEntry[] = [];
+  for (const rawEntry of obj.files) {
+    if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+      throw new Error('daemon_runtime_manifest_invalid:file_entry');
+    }
+    const f = rawEntry as Record<string, unknown>;
+    if (!isSafeManifestRelativePath(f.path)) {
+      throw new Error('daemon_runtime_manifest_invalid:file_path');
+    }
+    if (seen.has(f.path)) {
+      throw new Error('daemon_runtime_manifest_invalid:duplicate_file');
+    }
+    if (typeof f.sha256 !== 'string' || !DESKTOP_RELEASE_SHA256_RE.test(f.sha256)) {
+      throw new Error('daemon_runtime_manifest_invalid:file_sha256');
+    }
+    if (typeof f.size !== 'number' || !Number.isSafeInteger(f.size) || f.size < 0) {
+      throw new Error('daemon_runtime_manifest_invalid:file_size');
+    }
+    seen.add(f.path);
+    sumBytes += f.size;
+    validatedFiles.push({
+      path: f.path,
+      size: f.size,
+      sha256: f.sha256,
+      ...(typeof f.executable === 'boolean' ? { executable: f.executable } : {}),
+    });
+  }
+  if (typeof obj.totalUncompressedBytes === 'number' && obj.totalUncompressedBytes !== sumBytes) {
+    throw new Error('daemon_runtime_manifest_invalid:totalUncompressedBytes');
+  }
+  if (!seen.has(expectedNode)) {
+    throw new Error('daemon_runtime_manifest_invalid:missing_node_entry');
+  }
+  for (const reqPath of DAEMON_RUNTIME_CRITICAL_ENTRY_PATHS) {
+    if (!seen.has(reqPath)) {
+      throw new Error(`daemon_runtime_manifest_invalid:missing_critical_entry:${reqPath}`);
+    }
+  }
+
+  return {
+    schemaVersion: DAEMON_RUNTIME_MANIFEST_SCHEMA_VERSION,
+    artifact: {
+      fileName: a.fileName,
+      format: expectedFormat,
+      os: expectedOs,
+      arch: expectedArch,
+      size: a.size,
+      sha256: a.sha256,
+      ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
+      ...(macosSigningIdentitySha1 ? { macosSigningIdentitySha1 } : {}),
+    },
+    entrypoint: {
+      node: expectedNode,
+      script: 'package/dist/src/index.js',
+    },
+    toolchain: {
+      nodeProvider: tc.nodeProvider,
+      nodeVersion: tc.nodeVersion,
+      ...(typeof tc.nodeArchive === 'string' ? { nodeArchive: tc.nodeArchive } : {}),
+      ...(typeof tc.nodeArchiveSha256 === 'string' ? { nodeArchiveSha256: tc.nodeArchiveSha256 } : {}),
+      ...(typeof tc.nodeBinarySha256 === 'string' ? { nodeBinarySha256: tc.nodeBinarySha256 } : {}),
+    },
+    build: {
+      commit: b.commit,
+      version: b.version.trim(),
+    },
+    totalUncompressedBytes: typeof obj.totalUncompressedBytes === 'number' ? obj.totalUncompressedBytes : sumBytes,
+    fileCount: validatedFiles.length,
+    files: validatedFiles,
+  };
+}

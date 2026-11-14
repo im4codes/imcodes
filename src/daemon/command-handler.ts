@@ -9613,7 +9613,11 @@ async function handleDaemonUpgrade(
     return;
   }
 
-  const { inspectDaemonRuntimeMode, upgradeBundledDaemonRuntime } = await import('./daemon-runtime-upgrade.js');
+  const {
+    inspectDaemonRuntimeMode,
+    resolveLegacyNpmCliFallback,
+    upgradeBundledDaemonRuntime,
+  } = await import('./daemon-runtime-upgrade.js');
   const runtimeMode = inspectDaemonRuntimeMode({ entryScriptPath: process.argv[1] });
   if (runtimeMode.mode === 'dev_exempt') {
     logger.warn({ devCheckoutPath: runtimeMode.devCheckoutPath },
@@ -9628,21 +9632,13 @@ async function handleDaemonUpgrade(
     return;
   }
 
-  // For untargeted / `latest` upgrades, pre-flight against the npm registry —
-  // if our running version is already at or newer than what the registry
-  // resolves `imcodes@latest` to, skip the whole upgrade. This stops servers
-  // that blindly broadcast `latest` from clobbering a newer dev build's
-  // global install (npm install -g would replace the symlink/dir with the
-  // older registry release even if we then refused to restart, so we have to
-  // catch this BEFORE spawning the install).
-  // Resolve the registry ONCE here and reuse it for both the pre-flight probe
-  // and the install command baked into the upgrade script, so they never
-  // diverge (this is the fix for the prior hard-coded-official-registry probe).
   const normalizedRegistryOverride = normalizeRegistryBase(registryOverride);
   const upgradeRegistry = normalizedRegistryOverride
     ? { base: normalizedRegistryOverride, explicit: normalizedRegistryOverride !== INSTALLER_OFFICIAL_NPM_REGISTRY }
     : await resolveUpgradeRegistry();
-  if (runtimeMode.mode !== 'bundled' && (!targetVersion || targetVersion === 'latest')) {
+
+  const shouldAbortForRegistryLatest = async (): Promise<boolean> => {
+    if (targetVersion && targetVersion !== 'latest') return false;
     try {
       const res = await fetch(`${upgradeRegistry.base}imcodes/latest`, {
         headers: { accept: 'application/json' },
@@ -9656,7 +9652,7 @@ async function handleDaemonUpgrade(
         if (registryLatest && compareDaemonVersions(DAEMON_VERSION, registryLatest) >= 0) {
           logger.info({ daemonVersion: DAEMON_VERSION, registryLatest },
             'daemon.upgrade: registry "latest" is not newer than current, refusing to downgrade');
-          return;
+          return true;
         }
       } else {
         logger.warn({ status: res.status }, 'daemon.upgrade: registry probe returned non-2xx, proceeding without pre-flight');
@@ -9664,6 +9660,11 @@ async function handleDaemonUpgrade(
     } catch (e) {
       logger.warn({ err: e }, 'daemon.upgrade: registry probe failed, proceeding without pre-flight');
     }
+    return false;
+  };
+
+  if (runtimeMode.mode !== 'bundled' && await shouldAbortForRegistryLatest()) {
+    return;
   }
 
   // ── Toolchain pre-flight (non-Windows; Windows has its own runner) ─────────
@@ -9793,6 +9794,7 @@ async function handleDaemonUpgrade(
       return;
     }
 
+  let legacyFallbackNodeBin: string | undefined;
   if (runtimeMode.mode === 'bundled') {
     const bundledResult = await upgradeBundledDaemonRuntime({
       currentVersion: DAEMON_VERSION,
@@ -9830,7 +9832,31 @@ async function handleDaemonUpgrade(
       }
       return;
     }
-    logger.warn({ reason: bundledResult.reason }, 'daemon.upgrade: falling back to legacy CLI upgrade path');
+    const fallback = resolveLegacyNpmCliFallback({
+      platform: process.platform,
+      env: process.env,
+      execPath: process.execPath,
+      userHome: homedir(),
+      stateDir: imcodesStateDir(),
+    });
+    if (!fallback.eligible) {
+      logger.warn({ bundledReason: bundledResult.reason, fallback },
+        'daemon.upgrade: bundled feed unavailable and no writable legacy npm CLI fallback; blocking cleanly');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: fallback.reason,
+          detail: `${bundledResult.reason}: ${fallback.message}`,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    if (await shouldAbortForRegistryLatest()) {
+      return;
+    }
+    legacyFallbackNodeBin = fallback.nodeBin;
+    logger.warn({ reason: bundledResult.reason, fallbackPrefix: fallback.prefixDir },
+      'daemon.upgrade: falling back to legacy CLI upgrade path');
   }
   logger.info('daemon.upgrade: preparing upgrade script');
 
@@ -9897,7 +9923,7 @@ async function handleDaemonUpgrade(
   //   - snap:   /snap/node/current/{bin/node, lib/node_modules/...}
   // If none of the candidates exist (extremely unusual), fall back to bare
   // `npm` and rely on PATH — same behavior as before.
-  const nodeBin = process.execPath;
+  const nodeBin = legacyFallbackNodeBin ?? process.execPath;
   const nodeDir = dirname(nodeBin);
   // Discovery happens INSIDE the bash script at runtime (see the
   // `discover npm-cli.js` block in the script body). The bash script

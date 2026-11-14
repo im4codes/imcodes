@@ -1029,10 +1029,16 @@ program
     } catch { /* no install.json — use npm's ambient/default registry */ }
 
     // Detect package manager / runtime mode: bundled daemon-runtime, npm global, or git clone
-    const { inspectDaemonRuntimeMode, upgradeBundledDaemonRuntime } = await import('./daemon/daemon-runtime-upgrade.js');
+    const {
+      inspectDaemonRuntimeMode,
+      resolveLegacyNpmCliFallback,
+      upgradeBundledDaemonRuntime,
+    } = await import('./daemon/daemon-runtime-upgrade.js');
+    const { isPathInsideGitCheckout } = await import('./node/desktop-installer-probe.js');
     const runtimeMode = inspectDaemonRuntimeMode({ entryScriptPath: process.argv[1] });
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
+    let fallbackNodeBin: string | undefined;
 
     if (runtimeMode.mode === 'bundled') {
       console.log(`Checking bundled daemon-runtime upgrade (target: ${/^\d/.test(pkgTag) ? pkgTag : 'latest'})...`);
@@ -1042,31 +1048,6 @@ program
         entryScriptPath: process.argv[1],
         allowLegacyCliFallback: true,
         detachedHandoff: false,
-        restartService: async () => {
-          ensureServiceForeground();
-          await ensureMacosLaunchTarget();
-          if (platform === 'darwin') {
-            const plist = resolvePosixDaemonServicePaths().launchAgentPath;
-            if (existsSync(plist)) {
-              try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
-              killStaleImcodesProcesses();
-              execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
-            }
-          } else if (platform === 'linux') {
-            const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
-            if (existsSync(userService)) {
-              execSync(`systemctl --user daemon-reload && systemctl --user restart ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
-            }
-          } else if (platform === 'win32') {
-            const pidFile = resolve(resolveImcodesHome(), 'daemon.pid');
-            try {
-              const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-              if (pid && pid !== process.pid) {
-                try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
-              }
-            } catch { /* no PID file */ }
-          }
-        },
       });
       if (res.status === 'upgraded') {
         console.log(`Upgraded daemon-runtime to v${res.targetVersion} (${res.writableRootKind}: ${res.runtimeRoot})`);
@@ -1084,7 +1065,19 @@ program
         console.error(`daemon-runtime upgrade failed health check (${res.reason}); rolled back to previous version.`);
         process.exit(1);
       }
-      console.log(`Bundled daemon-runtime feed unavailable (${res.reason}); falling back to legacy CLI upgrade...`);
+      const fallback = resolveLegacyNpmCliFallback({
+        platform,
+        env: process.env,
+        execPath: process.execPath,
+        userHome: homedir(),
+        stateDir: imcodesStateDir(),
+      });
+      if (!fallback.eligible) {
+        console.error(`Bundled daemon-runtime upgrade unavailable (${res.reason}) and legacy CLI fallback blocked (${fallback.reason}): ${fallback.message}`);
+        process.exit(1);
+      }
+      fallbackNodeBin = fallback.nodeBin;
+      console.log(`Bundled daemon-runtime feed unavailable (${res.reason}); falling back to legacy CLI upgrade (${fallback.prefixDir})...`);
     }
 
     console.log(`Upgrading to ${pkg}  (${channelLabel})${registry ? `  via ${registry}` : ''}...`);
@@ -1092,7 +1085,7 @@ program
     // Step 1: Install new version (do NOT kill daemon — upgrade may be running from
     // a daemon-managed session, so killing it would kill ourselves).
     let installedEntryScript: string | null = null;
-    if (isGlobal && (platform === 'linux' || platform === 'darwin')) {
+    if ((isGlobal || Boolean(fallbackNodeBin)) && (platform === 'linux' || platform === 'darwin')) {
       // Linux/macOS: the install, the verification, the switch and the restart all
       // run in the detached upgrade script (the one the daemon's own upgrade uses),
       // so nothing below depends on this process or its terminal surviving.
@@ -1106,10 +1099,11 @@ program
         platform,
         stateDir: imcodesStateDir(),
         home: homedir(),
+        ...(fallbackNodeBin ? { nodeBin: fallbackNodeBin } : {}),
       });
       process.exit(code);
     }
-    if (isGlobal && platform === 'win32') {
+    if ((isGlobal || Boolean(fallbackNodeBin)) && platform === 'win32') {
       // Windows: the existing upgrade runner does the install and the restart, detached;
       // this process only follows its log, so a dropped session cannot interrupt it.
       const { runDetachedWindowsUpgrade } = await import('./cli/upgrade-detached.js');
@@ -1119,12 +1113,12 @@ program
         registry,
       }));
     }
-    if (isGlobal) {
+    if (isGlobal || Boolean(fallbackNodeBin)) {
       // linux, darwin and win32 returned above. There is no in-place `npm install -g`
       // here any more: that is the path that left 215 half-installed.
       console.error(`Upgrading a global install is not supported on ${platform}.`);
       process.exit(1);
-    } else {
+    } else if (runtimeMode.mode === 'dev_exempt' || isPathInsideGitCheckout(selfPath)) {
       const projectRoot = PROJECT_ROOT;
       try {
         if (platform === 'win32') {
@@ -1137,6 +1131,9 @@ program
         console.error('Git pull / build failed.');
         process.exit(1);
       }
+    } else {
+      console.error(`Refusing unsupported CLI upgrade outside bundled runtime, npm global install, or git checkout (${selfPath}).`);
+      process.exit(1);
     }
 
     // Show new version

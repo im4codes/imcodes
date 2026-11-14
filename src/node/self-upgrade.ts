@@ -1072,9 +1072,45 @@ export async function downloadControlledNodeComputerUseHelper(input: {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/^download_failed_(404|503)$/.test(message) || message === 'artifact_filename_mismatch') return undefined;
+    if (/^download_failed_(404|503)$/.test(message)) return undefined;
     throw error;
   }
+}
+
+async function verifyInstalledComputerUseHelperMatchesManifest(input: {
+  destinationPath: string;
+  target: ControlledNodeArtifactTarget;
+  releaseManifest: ReturnType<typeof validateDesktopReleaseManifest>;
+  releaseTarget: ReturnType<typeof releaseTargetFromRuntime>;
+}): Promise<boolean> {
+  if (!input.releaseTarget) return false;
+  const helperFileName = controlledNodeComputerUseHelperFilename(input.target.os);
+  const candidates = [
+    join(dirname(input.destinationPath), 'computer-use-helper', controlledNodePlatformArchKey(input.target), helperFileName),
+    join(dirname(input.destinationPath), 'computer-use-helper', helperFileName),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const st = await lstat(candidate);
+      if (st.isSymbolicLink() || !st.isFile()) continue;
+      const bytes = await readFile(candidate);
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+      const check = verifyDesktopReleaseComponentIdentity(
+        input.releaseManifest,
+        input.releaseTarget,
+        'open-computer-use',
+        {
+          fileName: helperFileName,
+          sha256,
+          sizeBytes: bytes.length,
+        },
+      );
+      if (check.ok) return true;
+    } catch {
+      // candidate absent or unreadable; check next
+    }
+  }
+  return false;
 }
 
 /**
@@ -2153,6 +2189,9 @@ export async function startControlledNodeSelfUpgrade(
       fetchImpl,
       expectedVersion: downloaded.version,
     }), { sleep: deps.sleep }));
+    const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
+    const destinationManifestPath = `${destinationPath}.manifest.json`;
+    const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');
     if (abiProfile !== CONTROLLED_NODE_ABI_GLIBC217 && downloaded.releaseManifestSha256) {
       const releaseTarget = releaseTargetFromRuntime(platform, arch);
       if (releaseTarget) {
@@ -2193,6 +2232,16 @@ export async function startControlledNodeSelfUpgrade(
             sizeBytes: helper.sizeBytes,
           });
           if (!helperCheck.ok) throw new Error(`release_manifest_${helperCheck.reason}`);
+        } else {
+          const installedMatches = await verifyInstalledComputerUseHelperMatchesManifest({
+            destinationPath,
+            target,
+            releaseManifest,
+            releaseTarget,
+          });
+          if (!installedMatches) {
+            throw new Error('release_manifest_missing_required_component:open-computer-use');
+          }
         }
 
         if (remoteDesktopWorker) {
@@ -2202,22 +2251,23 @@ export async function startControlledNodeSelfUpgrade(
             authenticodeSignerSha256?: string;
             build?: { version?: string };
           };
+          const rdStat = await stat(remoteDesktopWorker.artifactPath);
           const rdVersion = rdManifest.workerVersion ?? rdManifest.build?.version;
           const rdCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'remote-desktop', {
             ...(rdVersion ? { version: rdVersion } : {}),
             sha256: remoteDesktopWorker.sha256,
+            sizeBytes: rdStat.size,
             ...(typeof rdManifest.protocolVersion === 'number' ? { protocolVersion: rdManifest.protocolVersion } : {}),
             ...(rdManifest.authenticodeSignerSha256
               ? { authenticodeSignerSha256: rdManifest.authenticodeSignerSha256 }
               : {}),
           });
           if (!rdCheck.ok) throw new Error(`release_manifest_${rdCheck.reason}`);
+        } else if (target.os !== CONTROLLED_NODE_OS_MAC) {
+          throw new Error('release_manifest_missing_required_component:remote-desktop');
         }
       }
     }
-    const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
-    const destinationManifestPath = `${destinationPath}.manifest.json`;
-    const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');
     const stagedJournalPath = await prepareUpgradeJournal({
       currentJournalPath: destinationJournalPath,
       outputJournalPath: join(updateDir, 'install-journal.json'),
