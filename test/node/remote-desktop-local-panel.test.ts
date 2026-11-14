@@ -1133,5 +1133,134 @@ describe('local panel Coding Daemon endpoints and UI', () => {
       dom.window.close();
     }
   });
+
+  it('F3-R3: applies continuous finite slow poll responses without starvation and rejects stale out-of-order responses/errors', async () => {
+    const html = renderLocalPanelPage({
+      publicNodeId: '1234567890',
+      csrf: 'csrf-poll',
+      manageUrl: 'https://example.test/m',
+      shareUrl: 'https://example.test/s',
+    });
+
+    const pending: Array<{ resolve: (r: Response) => void; reject: (err: unknown) => void }> = [];
+    let pollCb: (() => void) | undefined;
+
+    const flush = async () => {
+      await new Promise<void>((r) => setImmediate(r));
+      await new Promise<void>((r) => setImmediate(r));
+    };
+
+    const dom = new JSDOM(html, {
+      url: 'http://127.0.0.1:43751/',
+      runScripts: 'dangerously',
+      beforeParse(win) {
+        (win as unknown as { setInterval: (cb: () => void, ms: number) => number }).setInterval = (cb, ms) => {
+          if (ms === 2000) pollCb = cb;
+          return ms;
+        };
+        (win as unknown as { fetch: typeof fetch }).fetch = (() =>
+          new Promise<Response>((resolve, reject) => {
+            pending.push({ resolve, reject });
+          })) as unknown as typeof fetch;
+      },
+    });
+
+    try {
+      const doc = dom.window.document;
+      expect(pending).toHaveLength(1);
+      expect(typeof pollCb).toBe('function');
+
+      // 1) Continuous finite slow responses (next 2s poll always starts before prior 2.5s response completes)
+      for (let i = 0; i < 5; i += 1) {
+        pollCb!();
+        pending[i]!.resolve(new Response(JSON.stringify({
+          publicNodeId: '1234567890',
+          paused: false,
+          connections: [],
+          deviceName: `SLOW-HEALTHY-${i}`,
+          daemon: {
+            available: true,
+            installed: true,
+            bound: true,
+            running: true,
+            connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+            autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+            runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+            canControl: true,
+            canBind: true,
+            canViewLogs: true,
+          },
+        }), { status: 200 }));
+        await flush();
+      }
+      expect((doc.getElementById('daemonCard') as HTMLElement).hidden).toBe(false);
+      expect((doc.getElementById('allowSwitch') as HTMLButtonElement).disabled).toBe(false);
+      expect(doc.getElementById('deviceName')?.textContent).toBe('SLOW-HEALTHY-4');
+
+      // Resolve leftover pending[5] cleanly as req #6
+      pending[5]!.resolve(new Response(JSON.stringify({
+        publicNodeId: '1234567890',
+        paused: false,
+        connections: [],
+        deviceName: 'CURRENT-6',
+        daemon: {
+          available: true,
+          installed: true,
+          bound: true,
+          running: true,
+          connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+          autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+          runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+          canControl: true,
+          canBind: true,
+          canViewLogs: true,
+        },
+      }), { status: 200 }));
+      await flush();
+
+      // 2) Out-of-order completion: req #8 and #9 start; req #9 resolves newer state FIRST;
+      //    older req #8 resolving later with stale payload must be dropped.
+      pollCb!(); // pending[6] (seq 7)
+      pollCb!(); // pending[7] (seq 8)
+      pollCb!(); // pending[8] (seq 9)
+      pending[8]!.resolve(new Response(JSON.stringify({
+        publicNodeId: '1234567890',
+        paused: true,
+        connections: [],
+        deviceName: 'NEWER-9',
+        daemon: {
+          available: true,
+          installed: true,
+          bound: true,
+          running: true,
+          connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+          autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+          runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+          canControl: true,
+          canBind: true,
+          canViewLogs: true,
+        },
+      }), { status: 200 }));
+      await flush();
+      expect(doc.getElementById('deviceName')?.textContent).toBe('NEWER-9');
+      expect((doc.getElementById('offlineBanner') as HTMLElement).hidden).toBe(true);
+
+      // Stale older success (pending[6]) and stale older error (pending[7]) must NOT roll back state or flash offline
+      pending[6]!.resolve(new Response(JSON.stringify({
+        publicNodeId: '1234567890',
+        paused: false,
+        connections: [],
+        deviceName: 'STALE-7',
+      }), { status: 200 }));
+      pending[7]!.reject(new Error('stale network failure'));
+      await flush();
+
+      expect(doc.getElementById('deviceName')?.textContent).toBe('NEWER-9');
+      expect((doc.getElementById('offlineBanner') as HTMLElement).hidden).toBe(true);
+      expect((doc.getElementById('pausedBanner') as HTMLElement).hidden).toBe(false);
+    } finally {
+      dom.window.close();
+    }
+  });
 });
 

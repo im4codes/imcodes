@@ -22,6 +22,7 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
   var remoteBusyCount = 0;
   var daemonBusyCount = 0;
   var loadSeq = 0;
+  var appliedLoadSeq = 0;
   function isRemoteBusy() { return remoteBusyCount > 0; }
   function isDaemonBusy() { return daemonBusyCount > 0; }
 
@@ -386,12 +387,14 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       if (!response.ok) throw new Error('state');
       return response.json();
     }).then(function (next) {
-      if (!hasActiveDom() || seq < loadSeq) return;
+      if (!hasActiveDom() || seq < appliedLoadSeq) return;
+      appliedLoadSeq = seq;
       state = next;
       offline = false;
       renderAll();
     }).catch(function () {
-      if (!hasActiveDom() || seq < loadSeq) return;
+      if (!hasActiveDom() || seq < appliedLoadSeq) return;
+      appliedLoadSeq = seq;
       offline = true;
       renderStatus();
     });
