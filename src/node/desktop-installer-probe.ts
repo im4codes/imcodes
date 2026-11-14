@@ -97,7 +97,10 @@ function safeRealpath(targetPath: string): string {
  * Resolve the canonical path even if intermediate or leaf segments do not yet exist,
  * resolving symlinks on the nearest existing ancestor so symlink escapes cannot bypass guards.
  */
-export function resolveCanonicalTargetPath(targetPath: string): string {
+export function resolveCanonicalTargetPath(targetPath: string, depth = 0): string {
+  if (depth > 32) {
+    throw new Error(`canonical_path_symlink_loop: ${targetPath}`);
+  }
   let cur = resolve(targetPath);
   const missingTail: string[] = [];
   while (!safeLstat(cur)) {
@@ -106,7 +109,19 @@ export function resolveCanonicalTargetPath(targetPath: string): string {
     missingTail.unshift(basename(cur));
     cur = parent;
   }
-  const canonicalAncestor = safeRealpath(cur);
+  let canonicalAncestor: string;
+  try {
+    canonicalAncestor = realpathSync(cur);
+  } catch {
+    const lst = safeLstat(cur);
+    if (lst?.isSymbolicLink()) {
+      const linkTarget = readlinkSync(cur);
+      const nextPath = resolve(dirname(cur), linkTarget);
+      canonicalAncestor = resolveCanonicalTargetPath(nextPath, depth + 1);
+    } else {
+      canonicalAncestor = resolve(cur);
+    }
+  }
   return missingTail.length > 0 ? join(canonicalAncestor, ...missingTail) : canonicalAncestor;
 }
 

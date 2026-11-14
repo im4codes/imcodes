@@ -611,4 +611,25 @@ describe('AC 2: discoverCodingDaemonRuntime current/ alignment & imcodes CLI thi
     expect(lstatSync(currentDir).isDirectory()).toBe(true);
     expect(readFileSync(join(currentDir, 'nested', 'state.txt'), 'utf8')).toBe('old-current-dir-content');
   });
+
+  it('rejects broken/dangling symlink targets outside isolated root and symlink loops via resolveCanonicalTargetPath (F6)', () => {
+    const root = makeTempDir();
+    const isoRoot = join(root, 'iso');
+    const outsideTarget = join(root, 'outside-missing', 'secret');
+    mkdirSync(isoRoot, { recursive: true });
+
+    const brokenOutside = join(isoRoot, 'dangling-outside');
+    symlinkSync(outsideTarget, brokenOutside);
+    expect(() =>
+      assertSafeNodeIsolatedTargetPath(join(brokenOutside, 'subdir'), 'linux', root, isoRoot, 'container'),
+    ).toThrow(/outside isolated root|unsafe/i);
+
+    const loopA = join(isoRoot, 'loop-a');
+    const loopB = join(isoRoot, 'loop-b');
+    symlinkSync(loopB, loopA);
+    symlinkSync(loopA, loopB);
+    expect(() =>
+      assertSafeNodeIsolatedTargetPath(join(loopA, 'child'), 'linux', root, isoRoot, 'container'),
+    ).toThrow(/canonical_path_symlink_loop/i);
+  });
 });

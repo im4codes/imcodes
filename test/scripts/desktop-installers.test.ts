@@ -45,6 +45,39 @@ function sha256File(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
+function readStartTokenForPid(pid: number): string {
+  if (process.platform === 'linux') {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const lastParen = stat.lastIndexOf(')');
+    const fields = stat.slice(lastParen + 1).trim().split(/\s+/);
+    const ticks = fields[19];
+    if (!ticks || !/^\d+$/.test(ticks)) {
+      throw new Error(`Failed to extract /proc/${pid}/stat starttime`);
+    }
+    return `linux:${ticks}`;
+  }
+  const lstart = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' })
+    .trim()
+    .replace(/\s+/g, ' ');
+  return `ps:${lstart}`;
+}
+
+async function spawnWorkerNode(script = 'setInterval(() => {}, 1000);') {
+  const child = spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+  if (!child.pid) throw new Error('failed to spawn worker node');
+  await new Promise((r) => setTimeout(r, 80));
+  return child;
+}
+
+function isPidAliveNode(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function createFakeRuntimeDir(
   root: string,
   os: 'linux' | 'darwin' | 'win32',
@@ -462,11 +495,14 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     writeFileSync(mockSystemctl, `#!/bin/sh\necho "SYSTEMCTL:$*" >> "${systemctlLog}"\nexit 0\n`);
     chmodSync(mockSystemctl, 0o755);
 
-    // F3: Live daemon lock that refuses to stop MUST abort BEFORE modifying CLI symlink or current/!
+    // F3: Live daemon lock with verified startToken whose stop hook fails MUST abort BEFORE modifying CLI symlink or current/!
     const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
     mkdirSync(join(isoHome, '.imcodes'), { recursive: true });
     const lockPath = join(isoHome, '.imcodes', 'daemon.lock.json');
-    writeFileSync(lockPath, JSON.stringify({ pid: sleeper.pid, startedAt: Date.now() }));
+    writeFileSync(
+      lockPath,
+      JSON.stringify({ version: 1, pid: sleeper.pid, startToken: readStartTokenForPid(sleeper.pid!) }),
+    );
     const failStopHook = join(root, 'fail-stop.sh');
     writeFileSync(failStopHook, '#!/bin/sh\nexit 1\n');
     chmodSync(failStopHook, 0o755);
@@ -639,5 +675,439 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     expect(cmdText).toContain('IMCODES_EXIT=%ERRORLEVEL%');
     // F5: No parenthesized compound if (...) else (...) block prematurely expanding %RESOLVED_NODE%
     expect(cmdText).not.toMatch(/^\s*\(\s*$/m);
+
+    // F3-R2 / F4-R2 / F6-R2 structural checks in Windows PowerShell runner
+    expect(ps1Text).toContain('function Get-WindowsLockOwnership');
+    expect(ps1Text).toContain('StartTime.ToUniversalTime().Ticks');
+    expect(ps1Text).not.toContain('Win32_Process');
+    expect(ps1Text).toContain('function Get-WindowsServicesSnapshot');
+    expect(ps1Text).toContain('function Invoke-Schtasks');
+    expect(ps1Text).toContain('[string]$SchtasksExe = \'\'');
+    expect(ps1Text).toContain('userDaemonWasRunning');
+    expect(ps1Text).toContain('canonical_path_symlink_loop');
+  });
+
+  it('verifies lock startToken ownership on POSIX: ignores stale PID reuse, stops matching owner, and fails closed on unknown/unprobeable tokens (F3-R2)', async () => {
+    const root = makeTempDir();
+    const runtimeDir = createFakeRuntimeDir(root, 'linux', '0.9.5');
+    const outDir = join(root, 'out-lock');
+    const res = await buildLinuxInstallers({
+      arch: 'x64',
+      version: '0.9.5',
+      runtimeDir,
+      outDir,
+      skipDeb: true,
+    });
+
+    // 1) Counterexample regression: unrelated node worker + mismatched startToken=linux:0 must NOT be signaled or passed to stop hook
+    const unrelated = await spawnWorkerNode('setInterval(() => {}, 1000); // unrelated-worker');
+    const hookLog = join(root, 'hook-calls.log');
+    const spyStopHook = join(root, 'spy-stop-hook.sh');
+    writeFileSync(spyStopHook, `#!/bin/sh\necho "HOOK:$1" >> "${hookLog}"\nexit 0\n`);
+    chmodSync(spyStopHook, 0o755);
+
+    const setupTakeoverRoot = (name: string, lockPayload: unknown) => {
+      const iso = join(root, `iso-${name}`);
+      const home = join(root, `home-${name}`);
+      const stateDir = join(home, '.imcodes');
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(
+        join(stateDir, 'last-upgrade-error.json'),
+        JSON.stringify({ exitCode: -2147020576 }),
+      );
+      writeFileSync(join(stateDir, 'daemon.lock.json'), JSON.stringify(lockPayload));
+      return { iso, home, stateDir };
+    };
+
+    try {
+      const stalePre = setupTakeoverRoot('stale-pre', { version: 1, pid: unrelated.pid, startToken: 'linux:0' });
+      const preOut = execFileSync(
+        res.shPath,
+        ['--phase', 'preinstall', '--isolated-root', stalePre.iso, '--home', stalePre.home, '--no-service-control'],
+        { env: { ...process.env, IMCODES_STOP_DAEMON_HOOK: spyStopHook }, encoding: 'utf8' },
+      );
+      expect(preOut).toBe('');
+      expect(isPidAliveNode(unrelated.pid!)).toBe(true);
+      expect(existsSync(hookLog)).toBe(false);
+
+      const staleFull = setupTakeoverRoot('stale-full', { version: 1, pid: unrelated.pid, startToken: 'linux:0' });
+      const fullOut = execFileSync(
+        res.shPath,
+        ['--isolated-root', staleFull.iso, '--home', staleFull.home, '--no-service-control'],
+        { encoding: 'utf8' },
+      );
+      expect(fullOut).toContain('INSTALL_OK scenario=legacy_broken_takeover');
+      expect(isPidAliveNode(unrelated.pid!)).toBe(true);
+
+      // 2) Fail-closed on missing startToken / unknown scheme / cross-scheme / unreadable /proc (even if cmdline contains node/index.js)
+      const failWorker = await spawnWorkerNode('setInterval(() => {}, 1000); // /fake/imcodes/index.js');
+      try {
+        for (const [label, lockObj, extraEnv] of [
+          ['missing-token', { version: 1, pid: failWorker.pid }, {}],
+          ['unknown-scheme', { version: 1, pid: failWorker.pid, startToken: 'runtime:1234' }, {}],
+          ['cross-scheme', { version: 1, pid: failWorker.pid, startToken: 'windows:1234' }, {}],
+          [
+            'probe-failed',
+            { version: 1, pid: failWorker.pid, startToken: readStartTokenForPid(failWorker.pid!) },
+            { IMCODES_PROC_DIR: join(root, 'missing-proc') },
+          ],
+        ] as Array<[string, unknown, Record<string, string>]>) {
+          const fc = setupTakeoverRoot(label, lockObj);
+          let aborted = false;
+          try {
+            execFileSync(
+              res.shPath,
+              ['--phase', 'preinstall', '--isolated-root', fc.iso, '--home', fc.home, '--no-service-control'],
+              { env: { ...process.env, ...extraEnv }, encoding: 'utf8' },
+            );
+          } catch {
+            aborted = true;
+          }
+          expect(aborted).toBe(true);
+          expect(isPidAliveNode(failWorker.pid!)).toBe(true);
+          expect(existsSync(join(fc.iso, 'daemon-runtime', 'rollback', 'latest', 'snapshot.env'))).toBe(false);
+        }
+      } finally {
+        try {
+          failWorker.kill('SIGKILL');
+        } catch {}
+      }
+
+      // 3) Positive owner match: real matching startToken stops owner cleanly without any hook
+      const owner = await spawnWorkerNode('setInterval(() => {}, 1000);');
+      try {
+        const ownCtx = setupTakeoverRoot('owner-match', {
+          version: 1,
+          pid: owner.pid,
+          startToken: readStartTokenForPid(owner.pid!),
+        });
+        const ownOut = execFileSync(
+          res.shPath,
+          ['--isolated-root', ownCtx.iso, '--home', ownCtx.home, '--no-service-control'],
+          { encoding: 'utf8' },
+        );
+        expect(ownOut).toContain('INSTALL_OK scenario=legacy_broken_takeover');
+        await new Promise((r) => setTimeout(r, 80));
+        expect(isPidAliveNode(owner.pid!)).toBe(false);
+      } finally {
+        try {
+          owner.kill('SIGKILL');
+        } catch {}
+      }
+
+      // 4) Dead PID and Zombie (Z) proc state proceed without error
+      const deadCtx = setupTakeoverRoot('dead-pid', { version: 1, pid: 9999999, startToken: 'linux:123' });
+      expect(
+        execFileSync(
+          res.shPath,
+          ['--isolated-root', deadCtx.iso, '--home', deadCtx.home, '--no-service-control'],
+          { encoding: 'utf8' },
+        ),
+      ).toContain('INSTALL_OK');
+
+      const fakeProcDir = join(root, 'fake-proc-z');
+      mkdirSync(join(fakeProcDir, String(unrelated.pid!)), { recursive: true });
+      writeFileSync(
+        join(fakeProcDir, String(unrelated.pid!), 'stat'),
+        `${unrelated.pid!} (node) Z 1 1 1 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 999999 0 0`,
+      );
+      const zombieCtx = setupTakeoverRoot('zombie-pid', {
+        version: 1,
+        pid: unrelated.pid,
+        startToken: 'linux:123',
+      });
+      expect(
+        execFileSync(
+          res.shPath,
+          ['--isolated-root', zombieCtx.iso, '--home', zombieCtx.home, '--no-service-control'],
+          { env: { ...process.env, IMCODES_PROC_DIR: fakeProcDir }, encoding: 'utf8' },
+        ),
+      ).toContain('INSTALL_OK');
+      expect(isPidAliveNode(unrelated.pid!)).toBe(true);
+
+      // 5) macOS ps: startToken scheme coverage via fake ps binary (mismatch untouched, missing fails closed, matching stops)
+      const macRtLock = createFakeRuntimeDir(root, 'darwin', '0.9.5');
+      const macStageLock = await buildMacosInstaller({
+        arch: 'arm64',
+        version: '0.9.5',
+        runtimeDir: macRtLock,
+        stageDir: join(root, 'mac-lock-stage'),
+        emitStageOnly: true,
+      });
+      const macLockRunner = join(macStageLock.scriptsDir, 'phase-a-runner.sh');
+      const fakePs = join(root, 'fake-ps');
+      writeFileSync(
+        fakePs,
+        `#!/bin/sh
+for a in "$@"; do last="$a"; done
+if [ "$last" = "9999999" ] || [ ! -r "/proc/$last/stat" ]; then exit 1; fi
+st="$(awk '{ idx=0; for(i=length($0);i>=1;i--) if(substr($0,i,1)==")"){idx=i;break}; rest=substr($0,idx+1); sub(/^[[:space:]]+/,"",rest); split(rest,f,/[[:space:]]+/); print f[1] }' "/proc/$last/stat" 2>/dev/null || true)"
+if [ "$st" = "Z" ] || [ "$st" = "X" ]; then
+  echo "Z    Sat Nov 14  1:02:03 2026"
+else
+  echo "Ss   Sat Nov 14  1:02:03 2026"
+fi
+`,
+        { mode: 0o755 },
+      );
+      const macMismatch = setupTakeoverRoot('mac-mismatch', {
+        version: 1,
+        pid: unrelated.pid,
+        startToken: 'ps:Sat Nov 14 00:00:00 2026',
+      });
+      expect(
+        execFileSync(
+          macLockRunner,
+          ['--isolated-root', macMismatch.iso, '--home', macMismatch.home, '--confirm-fda-switch', '--no-service-control'],
+          { env: { ...process.env, IMCODES_PS_BIN: fakePs }, encoding: 'utf8' },
+        ),
+      ).toContain('INSTALL_OK');
+      expect(isPidAliveNode(unrelated.pid!)).toBe(true);
+
+      const macUnknown = setupTakeoverRoot('mac-unknown', {
+        version: 1,
+        pid: unrelated.pid,
+        startToken: 'linux:123',
+      });
+      expect(() =>
+        execFileSync(
+          macLockRunner,
+          ['--isolated-root', macUnknown.iso, '--home', macUnknown.home, '--confirm-fda-switch', '--no-service-control'],
+          { env: { ...process.env, IMCODES_PS_BIN: fakePs }, encoding: 'utf8' },
+        ),
+      ).toThrow();
+      expect(isPidAliveNode(unrelated.pid!)).toBe(true);
+
+      const macOwner = await spawnWorkerNode('setInterval(() => {}, 1000);');
+      try {
+        const macOwnCtx = setupTakeoverRoot('mac-owner', {
+          version: 1,
+          pid: macOwner.pid,
+          startToken: 'ps:Sat Nov 14 1:02:03 2026',
+        });
+        expect(
+          execFileSync(
+            macLockRunner,
+            ['--isolated-root', macOwnCtx.iso, '--home', macOwnCtx.home, '--confirm-fda-switch', '--no-service-control'],
+            { env: { ...process.env, IMCODES_PS_BIN: fakePs }, encoding: 'utf8' },
+          ),
+        ).toContain('INSTALL_OK');
+        await new Promise((r) => setTimeout(r, 80));
+        expect(isPidAliveNode(macOwner.pid!)).toBe(false);
+      } finally {
+        try {
+          macOwner.kill('SIGKILL');
+        } catch {}
+      }
+    } finally {
+      try {
+        unrelated.kill('SIGKILL');
+      } catch {}
+    }
+  });
+
+  it('snapshots and reconciles Linux systemctl & macOS launchctl services across clean, active, and stopped states on rollback (F4-R2)', async () => {
+    const root = makeTempDir();
+    // Create a fake stateful systemctl binary backed by JSON state in SYSTEMCTL_STATE_FILE
+    const createStatefulSystemctl = (statePath: string, logPath: string, initial: Record<string, { enabled: boolean; active: boolean }>) => {
+      writeFileSync(statePath, JSON.stringify(initial, null, 2));
+      const bin = join(root, `fake-systemctl-${Math.random().toString(36).slice(2, 8)}.mjs`);
+      writeFileSync(
+        bin,
+        `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+const stateFile = ${JSON.stringify(statePath)};
+const logFile = ${JSON.stringify(logPath)};
+appendFileSync(logFile, args.join(' ') + '\\n');
+const isUser = args[0] === '--user';
+const filtered = isUser ? args.slice(1) : args;
+const cmd = filtered[0] || '';
+const unit = filtered[1] || '';
+const key = (isUser ? 'user:' : 'sys:') + unit;
+const st = JSON.parse(readFileSync(stateFile, 'utf8'));
+if (cmd === 'is-enabled') process.exit(st[key]?.enabled ? 0 : 1);
+if (cmd === 'is-active') process.exit(st[key]?.active ? 0 : 3);
+if (cmd === 'daemon-reload' || cmd === 'reset-failed') process.exit(0);
+st[key] = st[key] || { enabled: false, active: false };
+if (cmd === 'enable') st[key].enabled = true;
+else if (cmd === 'disable') st[key].enabled = false;
+else if (cmd === 'start' || cmd === 'restart') st[key].active = true;
+else if (cmd === 'stop') st[key].active = false;
+writeFileSync(stateFile, JSON.stringify(st, null, 2));
+process.exit(0);
+`,
+        { mode: 0o755 },
+      );
+      return bin;
+    };
+
+    const runtimeDir = createFakeRuntimeDir(root, 'linux', '0.9.5');
+    const nodeBin = join(root, 'imcodes-node');
+    writeFileSync(nodeBin, '#!/bin/sh\necho node\n', { mode: 0o755 });
+    const res = await buildLinuxInstallers({
+      arch: 'x64',
+      version: '0.9.5',
+      runtimeDir,
+      nodeExe: nodeBin,
+      outDir: join(root, 'out-svc'),
+      skipDeb: true,
+    });
+
+    // Case 1: Clean system -> install -> rollback must leave zero enabled/active units and zero unit files
+    const st1 = join(root, 'st-clean.json');
+    const log1 = join(root, 'log-clean.txt');
+    const sc1 = createStatefulSystemctl(st1, log1, {});
+    const iso1 = join(root, 'iso-clean');
+    const home1 = join(root, 'home-clean');
+    execFileSync(
+      res.shPath,
+      ['--isolated-root', iso1, '--home', home1, '--apply-services'],
+      { env: { ...process.env, IMCODES_SYSTEMCTL_BIN: sc1 }, encoding: 'utf8' },
+    );
+    expect(JSON.parse(readFileSync(st1, 'utf8'))['user:imcodes.service']).toEqual({ enabled: true, active: true });
+    execFileSync(
+      res.shPath,
+      ['--isolated-root', iso1, '--home', home1, '--rollback'],
+      { env: { ...process.env, IMCODES_SYSTEMCTL_BIN: sc1 }, encoding: 'utf8' },
+    );
+    const afterClean = JSON.parse(readFileSync(st1, 'utf8'));
+    expect(afterClean['user:imcodes.service']).toEqual({ enabled: false, active: false });
+    expect(existsSync(join(home1, '.config', 'systemd', 'user', 'imcodes.service'))).toBe(false);
+    expect(existsSync(join(home1, '.config', 'systemd', 'user', 'default.target.wants', 'imcodes.service'))).toBe(false);
+    expect(existsSync(join(iso1, 'controlled-node', 'imcodes-node'))).toBe(false);
+    expect(readFileSync(log1, 'utf8')).toContain('reset-failed imcodes.service');
+
+    // Case 2: Pre-existing DISABLED & STOPPED unit -> install -> rollback MUST restore old file and stay disabled & stopped (never started!)
+    const st2 = join(root, 'st-stopped.json');
+    const log2 = join(root, 'log-stopped.txt');
+    const sc2 = createStatefulSystemctl(st2, log2, {
+      'user:imcodes.service': { enabled: false, active: false },
+    });
+    const iso2 = join(root, 'iso-stopped');
+    const home2 = join(root, 'home-stopped');
+    mkdirSync(join(home2, '.config', 'systemd', 'user'), { recursive: true });
+    const oldUnit = '[Unit]\nDescription=OldStopped\n[Service]\nExecStart=/old/node /old/missing.js\n';
+    writeFileSync(join(home2, '.config', 'systemd', 'user', 'imcodes.service'), oldUnit);
+    execFileSync(
+      res.shPath,
+      ['--isolated-root', iso2, '--home', home2, '--force-takeover', '--apply-services'],
+      { env: { ...process.env, IMCODES_SYSTEMCTL_BIN: sc2 }, encoding: 'utf8' },
+    );
+    expect(JSON.parse(readFileSync(st2, 'utf8'))['user:imcodes.service']).toEqual({ enabled: true, active: true });
+    execFileSync(
+      res.shPath,
+      ['--isolated-root', iso2, '--home', home2, '--rollback'],
+      { env: { ...process.env, IMCODES_SYSTEMCTL_BIN: sc2 }, encoding: 'utf8' },
+    );
+    const afterStopped = JSON.parse(readFileSync(st2, 'utf8'));
+    expect(afterStopped['user:imcodes.service']).toEqual({ enabled: false, active: false });
+    expect(readFileSync(join(home2, '.config', 'systemd', 'user', 'imcodes.service'), 'utf8')).toBe(oldUnit);
+
+    // Case 3: Pre-existing ENABLED & ACTIVE unit -> install -> rollback MUST restore old file, enable, and restart/start
+    const st3 = join(root, 'st-active.json');
+    const log3 = join(root, 'log-active.txt');
+    const sc3 = createStatefulSystemctl(st3, log3, {
+      'user:imcodes.service': { enabled: true, active: true },
+    });
+    const iso3 = join(root, 'iso-active');
+    const home3 = join(root, 'home-active');
+    mkdirSync(join(home3, '.config', 'systemd', 'user'), { recursive: true });
+    const oldActiveUnit = '[Unit]\nDescription=OldActive\n[Service]\nExecStart=/old/active/node\n';
+    writeFileSync(join(home3, '.config', 'systemd', 'user', 'imcodes.service'), oldActiveUnit);
+    execFileSync(
+      res.shPath,
+      ['--isolated-root', iso3, '--home', home3, '--force-takeover', '--apply-services'],
+      { env: { ...process.env, IMCODES_SYSTEMCTL_BIN: sc3 }, encoding: 'utf8' },
+    );
+    execFileSync(
+      res.shPath,
+      ['--isolated-root', iso3, '--home', home3, '--rollback'],
+      { env: { ...process.env, IMCODES_SYSTEMCTL_BIN: sc3 }, encoding: 'utf8' },
+    );
+    const afterActive = JSON.parse(readFileSync(st3, 'utf8'));
+    expect(afterActive['user:imcodes.service']).toEqual({ enabled: true, active: true });
+    expect(readFileSync(join(home3, '.config', 'systemd', 'user', 'imcodes.service'), 'utf8')).toBe(oldActiveUnit);
+
+    // Case 4: macOS runner launchctl stateful rollback (using IMCODES_LAUNCHCTL_BIN)
+    const macRt = createFakeRuntimeDir(root, 'darwin', '0.9.5');
+    const macStage = await buildMacosInstaller({
+      arch: 'arm64',
+      version: '0.9.5',
+      runtimeDir: macRt,
+      nodeExe: nodeBin,
+      stageDir: join(root, 'mac-svc-stage'),
+      emitStageOnly: true,
+    });
+    const macRunner = join(macStage.scriptsDir, 'phase-a-runner.sh');
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
+    const daemonLabel = `gui/${uid}/imcodes.daemon`;
+    const launchStateFile = join(root, 'launchctl-state.json');
+    const launchLogFile = join(root, 'launchctl-log.txt');
+    writeFileSync(
+      launchStateFile,
+      JSON.stringify({ [daemonLabel]: { loaded: true, active: true, plist: '' } }),
+    );
+    const fakeLaunchctl = join(root, 'fake-launchctl.mjs');
+    writeFileSync(
+      fakeLaunchctl,
+      `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+const stFile = ${JSON.stringify(launchStateFile)};
+appendFileSync(${JSON.stringify(launchLogFile)}, args.join(' ') + '\\n');
+const st = JSON.parse(readFileSync(stFile, 'utf8'));
+const cmd = args[0];
+if (cmd === 'print') {
+  const lbl = args[1];
+  const entry = st[lbl];
+  if (!entry?.loaded) process.exit(113);
+  console.log('state = ' + (entry.active ? 'running' : 'not running'));
+  process.exit(0);
+}
+if (cmd === 'bootout') {
+  const lbl = args[1];
+  delete st[lbl];
+} else if (cmd === 'bootstrap') {
+  const domain = args[1];
+  const plist = args[2];
+  const text = readFileSync(plist, 'utf8');
+  const m = text.match(/<key>Label<\\/key>\\s*<string>([^<]+)<\\/string>/);
+  const lbl = domain + '/' + (m ? m[1] : 'unknown');
+  st[lbl] = { loaded: true, active: false, plist };
+} else if (cmd === 'kickstart') {
+  const lbl = args[args.length - 1];
+  if (st[lbl]) st[lbl].active = true;
+}
+writeFileSync(stFile, JSON.stringify(st, null, 2));
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+
+    const isoMac = join(root, 'iso-mac-svc');
+    const homeMac = join(root, 'home-mac-svc');
+    const macPlistDir = join(homeMac, 'Library', 'LaunchAgents');
+    mkdirSync(macPlistDir, { recursive: true });
+    const oldMacPlist =
+      '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>imcodes.daemon</string><key>ProgramArguments</key><array><string>/old/bin/imcodes</string></array></dict></plist>\n';
+    writeFileSync(join(macPlistDir, 'imcodes.daemon.plist'), oldMacPlist);
+    execFileSync(
+      macRunner,
+      ['--isolated-root', isoMac, '--home', homeMac, '--confirm-fda-switch', '--force-takeover', '--apply-services'],
+      { env: { ...process.env, IMCODES_LAUNCHCTL_BIN: fakeLaunchctl }, encoding: 'utf8' },
+    );
+    execFileSync(
+      macRunner,
+      ['--isolated-root', isoMac, '--home', homeMac, '--rollback'],
+      { env: { ...process.env, IMCODES_LAUNCHCTL_BIN: fakeLaunchctl }, encoding: 'utf8' },
+    );
+    const macStateAfter = JSON.parse(readFileSync(launchStateFile, 'utf8'));
+    expect(macStateAfter[daemonLabel]?.loaded).toBe(true);
+    expect(macStateAfter[daemonLabel]?.active).toBe(true);
+    expect(macStateAfter['system/cc.imcodes.node']).toBeUndefined();
+    expect(macStateAfter['system/cc.imcodes.node.watchdog']).toBeUndefined();
+    expect(readFileSync(join(macPlistDir, 'imcodes.daemon.plist'), 'utf8')).toBe(oldMacPlist);
+    expect(readFileSync(launchLogFile, 'utf8')).toContain(`bootout ${daemonLabel}`);
   });
 });

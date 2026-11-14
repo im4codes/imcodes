@@ -346,20 +346,23 @@ normalize_lexical_posix() {
 canonicalize_posix_path() {
   p="$(normalize_lexical_posix "$1")"
   hops=0
-  while [ "$hops" -lt 16 ]; do
-    hops=$((hops + 1))
+  while [ "$hops" -lt 32 ]; do
     if [ -L "$p" ]; then
+      hops=$((hops + 1))
       link_t="$(readlink "$p" 2>/dev/null || true)"
-      if [ -n "$link_t" ]; then
-        case "$link_t" in
-          /*) p="$(normalize_lexical_posix "$link_t")" ;;
-          *) p="$(normalize_lexical_posix "$(dirname -- "$p")/$link_t")" ;;
-        esac
-        continue
-      fi
+      [ -n "$link_t" ] || { echo "Refusing unresolvable symlink target: $p" >&2; exit 2; }
+      case "$link_t" in
+        /*) p="$(normalize_lexical_posix "$link_t")" ;;
+        *) p="$(normalize_lexical_posix "$(dirname -- "$p")/$link_t")" ;;
+      esac
+      continue
     fi
     break
   done
+  if [ -L "$p" ] && [ "$hops" -ge 32 ]; then
+    echo "Refusing symlink loop resolving path: $1" >&2
+    exit 2
+  fi
   cur="$p"
   tail_segs=""
   while [ "$cur" != "/" ] && [ ! -e "$cur" ] && [ ! -L "$cur" ]; do
@@ -373,20 +376,17 @@ canonicalize_posix_path() {
   done
   if [ -L "$cur" ]; then
     lt="$(readlink "$cur" 2>/dev/null || true)"
-    if [ -n "$lt" ]; then
-      case "$lt" in
-        /*) resolved_cur="$(canonicalize_posix_path "$lt")" ;;
-        *) resolved_cur="$(canonicalize_posix_path "$(dirname -- "$cur")/$lt")" ;;
-      esac
-    else
-      resolved_cur="$cur"
-    fi
+    [ -n "$lt" ] || { echo "Refusing unresolvable symlink target: $cur" >&2; exit 2; }
+    case "$lt" in
+      /*) resolved_cur="$(canonicalize_posix_path "$lt")" ;;
+      *) resolved_cur="$(canonicalize_posix_path "$(dirname -- "$cur")/$lt")" ;;
+    esac
   elif [ -d "$cur" ]; then
-    resolved_cur="$(cd "$cur" 2>/dev/null && pwd -P || printf '%s' "$cur")"
+    resolved_cur="$(cd "$cur" 2>/dev/null && pwd -P)" || { echo "Refusing unreadable directory during canonicalization: $cur" >&2; exit 2; }
   elif [ -e "$cur" ]; then
     c_dir="$(dirname -- "$cur")"
     c_base="$(basename -- "$cur")"
-    c_real_dir="$(cd "$c_dir" 2>/dev/null && pwd -P || printf '%s' "$c_dir")"
+    c_real_dir="$(cd "$c_dir" 2>/dev/null && pwd -P)" || { echo "Refusing unreadable parent directory during canonicalization: $c_dir" >&2; exit 2; }
     resolved_cur="$c_real_dir/$c_base"
   else
     resolved_cur="$cur"
@@ -591,10 +591,21 @@ if [ -n "$ISOLATED_ROOT" ]; then
   [ -n "$ROLLBACK_DIR" ] && assert_safe_isolated_target "$ROLLBACK_DIR" container && assert_within_base "$ROLLBACK_DIR" "$ISOLATED_ROOT" container
 fi
 
+can_control_posix_services() {
+  if [ "$PLATFORM" = "linux" ]; then
+    [ -z "$ISOLATED_ROOT" ] || [ -n "\${IMCODES_SYSTEMCTL_BIN:-}" ]
+    return $?
+  elif [ "$PLATFORM" = "darwin" ]; then
+    [ -z "$ISOLATED_ROOT" ] || [ -n "\${IMCODES_LAUNCHCTL_BIN:-}" ]
+    return $?
+  fi
+  return 1
+}
+
 run_systemctl_sys() {
   sys_bin="\${IMCODES_SYSTEMCTL_BIN:-}"
   if [ -n "$ISOLATED_ROOT" ] && [ -z "$sys_bin" ]; then
-    return 0
+    return 1
   fi
   [ -n "$sys_bin" ] || sys_bin="systemctl"
   command -v "$sys_bin" >/dev/null 2>&1 || return 1
@@ -626,7 +637,7 @@ resolve_target_unix_user() {
 run_systemctl_user() {
   sys_bin="\${IMCODES_SYSTEMCTL_BIN:-}"
   if [ -n "$ISOLATED_ROOT" ] && [ -z "$sys_bin" ]; then
-    return 0
+    return 1
   fi
   [ -n "$sys_bin" ] || sys_bin="systemctl"
   command -v "$sys_bin" >/dev/null 2>&1 || return 1
@@ -649,7 +660,7 @@ run_systemctl_user() {
 run_launchctl() {
   lctl_bin="\${IMCODES_LAUNCHCTL_BIN:-}"
   if [ -n "$ISOLATED_ROOT" ] && [ -z "$lctl_bin" ]; then
-    return 0
+    return 1
   fi
   [ -n "$lctl_bin" ] || lctl_bin="launchctl"
   command -v "$lctl_bin" >/dev/null 2>&1 || return 1
@@ -722,7 +733,102 @@ find_pkg_version_near() {
   return 1
 }
 
+read_snap_env_val() {
+  env_file="$1"
+  env_key="$2"
+  [ -f "$env_file" ] || return 0
+  grep "^$env_key=" "$env_file" 2>/dev/null | head -n 1 | cut -d= -f2- || true
+}
+
+probe_launchd_service_state() {
+  lbl="$1"
+  L_LOADED=0
+  L_ACTIVE=0
+  [ -n "$lbl" ] || return 0
+  if can_control_posix_services; then
+    p_rc=0
+    p_out="$(run_launchctl print "$lbl" 2>/dev/null)" || p_rc=$?
+    if [ "$p_rc" -eq 0 ]; then
+      L_LOADED=1
+      if printf '%s\\n' "$p_out" | grep -Eq 'state[[:space:]]*=[[:space:]]*running|pid[[:space:]]*=[[:space:]]*[1-9]'; then
+        L_ACTIVE=1
+      fi
+    fi
+  fi
+}
+
+capture_services_posix_vars() {
+  SNAP_SERVICES_CAPTURED=1
+  SNAP_SERVICES_APPLIED="\${SNAP_SERVICES_APPLIED:-0}"
+  SNAP_NODE_FILE_EXISTS=0; SNAP_NODE_ENABLED=0; SNAP_NODE_ACTIVE=0
+  SNAP_USER_FILE_EXISTS=0; SNAP_USER_ENABLED=0; SNAP_USER_ACTIVE=0
+  SNAP_MAC_UID=""
+  SNAP_MAC_NODE_FILE_EXISTS=0; SNAP_MAC_NODE_LOADED=0; SNAP_MAC_NODE_ACTIVE=0
+  SNAP_MAC_WD_FILE_EXISTS=0; SNAP_MAC_WD_LOADED=0; SNAP_MAC_WD_ACTIVE=0
+  SNAP_MAC_DAEMON_FILE_EXISTS=0; SNAP_MAC_DAEMON_LOADED=0; SNAP_MAC_DAEMON_ACTIVE=0
+  if [ "$PLATFORM" = "linux" ]; then
+    [ -e "$NODE_SERVICE_PATH" ] && SNAP_NODE_FILE_EXISTS=1
+    [ -e "$AUTOSTART_PATH" ] && SNAP_USER_FILE_EXISTS=1
+    if can_control_posix_services; then
+      run_systemctl_sys is-enabled imcodes-node.service >/dev/null 2>&1 && SNAP_NODE_ENABLED=1 || true
+      run_systemctl_sys is-active imcodes-node.service >/dev/null 2>&1 && SNAP_NODE_ACTIVE=1 || true
+      run_systemctl_user is-enabled imcodes.service >/dev/null 2>&1 && SNAP_USER_ENABLED=1 || true
+      run_systemctl_user is-active imcodes.service >/dev/null 2>&1 && SNAP_USER_ACTIVE=1 || true
+    fi
+  elif [ "$PLATFORM" = "darwin" ]; then
+    t_user="$(resolve_target_unix_user)"
+    SNAP_MAC_UID="$(id -u "$t_user" 2>/dev/null || id -u)"
+    [ -e "$NODE_SERVICE_PATH" ] && SNAP_MAC_NODE_FILE_EXISTS=1
+    [ -n "$NODE_WATCHDOG_SERVICE_PATH" ] && [ -e "$NODE_WATCHDOG_SERVICE_PATH" ] && SNAP_MAC_WD_FILE_EXISTS=1
+    [ -e "$AUTOSTART_PATH" ] && SNAP_MAC_DAEMON_FILE_EXISTS=1
+    probe_launchd_service_state "system/cc.imcodes.node"
+    SNAP_MAC_NODE_LOADED="$L_LOADED"; SNAP_MAC_NODE_ACTIVE="$L_ACTIVE"
+    probe_launchd_service_state "system/cc.imcodes.node.watchdog"
+    SNAP_MAC_WD_LOADED="$L_LOADED"; SNAP_MAC_WD_ACTIVE="$L_ACTIVE"
+    if [ -n "$SNAP_MAC_UID" ] && [ "$SNAP_MAC_UID" != "0" ]; then
+      probe_launchd_service_state "gui/$SNAP_MAC_UID/imcodes.daemon"
+      SNAP_MAC_DAEMON_LOADED="$L_LOADED"; SNAP_MAC_DAEMON_ACTIVE="$L_ACTIVE"
+    fi
+  fi
+}
+
+snapshot_services_posix() {
+  svc_manifest="$SNAPSHOT_DIR/services.env"
+  [ -f "$svc_manifest" ] && return 0
+  if [ "\${SNAP_SERVICES_CAPTURED:-0}" -ne 1 ]; then
+    capture_services_posix_vars
+  fi
+  if [ -n "$ISOLATED_ROOT" ]; then
+    assert_safe_isolated_target "$SNAPSHOT_DIR"
+  fi
+  mkdir -p "$SNAPSHOT_DIR"
+  svc_tmp="$svc_manifest.tmp.$$"
+  : > "$svc_tmp"
+  printf 'SERVICES_APPLIED=%s\\n' "\${SNAP_SERVICES_APPLIED:-0}" >> "$svc_tmp"
+  if [ "$PLATFORM" = "linux" ]; then
+    printf 'NODE_SVC_FILE_EXISTS=%s\\nNODE_SVC_ENABLED=%s\\nNODE_SVC_ACTIVE=%s\\n' "$SNAP_NODE_FILE_EXISTS" "$SNAP_NODE_ENABLED" "$SNAP_NODE_ACTIVE" >> "$svc_tmp"
+    printf 'USER_SVC_FILE_EXISTS=%s\\nUSER_SVC_ENABLED=%s\\nUSER_SVC_ACTIVE=%s\\n' "$SNAP_USER_FILE_EXISTS" "$SNAP_USER_ENABLED" "$SNAP_USER_ACTIVE" >> "$svc_tmp"
+  elif [ "$PLATFORM" = "darwin" ]; then
+    printf 'MAC_UID=%s\\n' "$SNAP_MAC_UID" >> "$svc_tmp"
+    printf 'MAC_NODE_FILE_EXISTS=%s\\nMAC_NODE_LOADED=%s\\nMAC_NODE_ACTIVE=%s\\n' "$SNAP_MAC_NODE_FILE_EXISTS" "$SNAP_MAC_NODE_LOADED" "$SNAP_MAC_NODE_ACTIVE" >> "$svc_tmp"
+    printf 'MAC_WD_FILE_EXISTS=%s\\nMAC_WD_LOADED=%s\\nMAC_WD_ACTIVE=%s\\n' "$SNAP_MAC_WD_FILE_EXISTS" "$SNAP_MAC_WD_LOADED" "$SNAP_MAC_WD_ACTIVE" >> "$svc_tmp"
+    printf 'MAC_DAEMON_FILE_EXISTS=%s\\nMAC_DAEMON_LOADED=%s\\nMAC_DAEMON_ACTIVE=%s\\n' "$SNAP_MAC_DAEMON_FILE_EXISTS" "$SNAP_MAC_DAEMON_LOADED" "$SNAP_MAC_DAEMON_ACTIVE" >> "$svc_tmp"
+  fi
+  mv -f "$svc_tmp" "$svc_manifest"
+}
+
+mark_services_applied_posix() {
+  SNAP_SERVICES_APPLIED=1
+  svc_manifest="$SNAPSHOT_DIR/services.env"
+  [ -f "$svc_manifest" ] || snapshot_services_posix
+  svc_tmp="$svc_manifest.tmp.$$"
+  grep -v '^SERVICES_APPLIED=' "$svc_manifest" > "$svc_tmp" 2>/dev/null || true
+  printf 'SERVICES_APPLIED=1\\n' >> "$svc_tmp"
+  mv -f "$svc_tmp" "$svc_manifest"
+}
+
 snapshot_paths() {
+  snapshot_services_posix
   mkdir -p "$SNAPSHOT_DIR/files"
   MANIFEST="$SNAPSHOT_DIR/snapshot.env"
   PRESERVED_MANIFEST="$SNAPSHOT_DIR/preserved.sha256"
@@ -779,6 +885,39 @@ restore_snapshot_posix() {
   fi
   MANIFEST="$snap/snapshot.env"
   [ -f "$MANIFEST" ] || { echo "Snapshot manifest missing in $snap" >&2; exit 1; }
+  SVC_MANIFEST="$snap/services.env"
+  svc_applied="$(read_snap_env_val "$SVC_MANIFEST" "SERVICES_APPLIED")"
+  should_rollback_services=0
+  if can_control_posix_services && { [ "$APPLY_SERVICES" -eq 1 ] || [ "$svc_applied" = "1" ]; }; then
+    should_rollback_services=1
+  fi
+
+  # Step 1: Stop/unload services touched by this installer BEFORE deleting/restoring unit files or plists
+  if [ "$should_rollback_services" -eq 1 ]; then
+    if [ "$PLATFORM" = "linux" ]; then
+      if [ "$(id -u)" -eq 0 ] || [ -n "\${IMCODES_SYSTEMCTL_BIN:-}" ]; then
+        run_systemctl_sys stop imcodes-node.service >/dev/null 2>&1 || true
+        run_systemctl_sys disable imcodes-node.service >/dev/null 2>&1 || true
+      fi
+      run_systemctl_user stop imcodes.service >/dev/null 2>&1 || true
+      run_systemctl_user disable imcodes.service >/dev/null 2>&1 || true
+    elif [ "$PLATFORM" = "darwin" ]; then
+      if [ "$(id -u)" -eq 0 ] || [ -n "\${IMCODES_LAUNCHCTL_BIN:-}" ]; then
+        run_launchctl bootout system/cc.imcodes.node >/dev/null 2>&1 || true
+        run_launchctl bootout system/cc.imcodes.node.watchdog >/dev/null 2>&1 || true
+        t_uid="$(read_snap_env_val "$SVC_MANIFEST" "MAC_UID")"
+        if [ -z "$t_uid" ]; then
+          t_user="$(resolve_target_unix_user)"
+          t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
+        fi
+        if [ -n "$t_uid" ] && [ "$t_uid" != "0" ]; then
+          run_launchctl bootout "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+  fi
+
+  # Step 2: Restore file/symlink/directory/absent snapshot entries
   for key in CLI AUTOSTART CURRENT RELEASE NODE_BIN NODE_SVC NODE_WD_SVC DESKTOP USER_WANTS; do
     kind="$(grep "^$key""_KIND=" "$MANIFEST" | cut -d= -f2- || true)"
     p="$(grep "^$key""_PATH=" "$MANIFEST" | cut -d= -f2- || true)"
@@ -827,22 +966,73 @@ restore_snapshot_posix() {
       fi
     done < "$snap/preserved.sha256"
   fi
-  if [ "$APPLY_SERVICES" -eq 1 ]; then
+
+  # Step 3: Reconcile daemon/node registration, enablement, and running state to captured pre-install snapshot
+  if [ "$should_rollback_services" -eq 1 ]; then
     if [ "$PLATFORM" = "linux" ]; then
-      if [ -f "$NODE_SERVICE_PATH" ]; then
+      n_exists="$(read_snap_env_val "$SVC_MANIFEST" "NODE_SVC_FILE_EXISTS")"
+      n_en="$(read_snap_env_val "$SVC_MANIFEST" "NODE_SVC_ENABLED")"
+      n_act="$(read_snap_env_val "$SVC_MANIFEST" "NODE_SVC_ACTIVE")"
+      u_exists="$(read_snap_env_val "$SVC_MANIFEST" "USER_SVC_FILE_EXISTS")"
+      u_en="$(read_snap_env_val "$SVC_MANIFEST" "USER_SVC_ENABLED")"
+      u_act="$(read_snap_env_val "$SVC_MANIFEST" "USER_SVC_ACTIVE")"
+      if [ "$(id -u)" -eq 0 ] || [ -n "\${IMCODES_SYSTEMCTL_BIN:-}" ]; then
         run_systemctl_sys daemon-reload >/dev/null 2>&1 || true
-        run_systemctl_sys restart imcodes-node.service >/dev/null 2>&1 || true
+        if [ "$n_exists" = "1" ] && [ -f "$NODE_SERVICE_PATH" ]; then
+          if [ "$n_en" = "1" ]; then
+            run_systemctl_sys enable imcodes-node.service >/dev/null 2>&1 || true
+          else
+            run_systemctl_sys disable imcodes-node.service >/dev/null 2>&1 || true
+          fi
+          if [ "$n_act" = "1" ]; then
+            run_systemctl_sys restart imcodes-node.service >/dev/null 2>&1 || run_systemctl_sys start imcodes-node.service >/dev/null 2>&1 || true
+          else
+            run_systemctl_sys stop imcodes-node.service >/dev/null 2>&1 || true
+          fi
+        else
+          run_systemctl_sys reset-failed imcodes-node.service >/dev/null 2>&1 || true
+        fi
       fi
-      if [ -f "$AUTOSTART_PATH" ]; then
-        run_systemctl_user daemon-reload >/dev/null 2>&1 || true
-        run_systemctl_user restart imcodes.service >/dev/null 2>&1 || true
+      run_systemctl_user daemon-reload >/dev/null 2>&1 || true
+      if [ "$u_exists" = "1" ] && [ -f "$AUTOSTART_PATH" ]; then
+        if [ "$u_en" = "1" ]; then
+          run_systemctl_user enable imcodes.service >/dev/null 2>&1 || true
+        else
+          run_systemctl_user disable imcodes.service >/dev/null 2>&1 || true
+        fi
+        if [ "$u_act" = "1" ]; then
+          run_systemctl_user restart imcodes.service >/dev/null 2>&1 || run_systemctl_user start imcodes.service >/dev/null 2>&1 || true
+        else
+          run_systemctl_user stop imcodes.service >/dev/null 2>&1 || true
+        fi
+      else
+        run_systemctl_user reset-failed imcodes.service >/dev/null 2>&1 || true
       fi
     elif [ "$PLATFORM" = "darwin" ]; then
-      [ -f "$NODE_SERVICE_PATH" ] && run_launchctl kickstart -k system/cc.imcodes.node >/dev/null 2>&1 || true
-      if [ -f "$AUTOSTART_PATH" ]; then
-        t_user="$(resolve_target_unix_user)"
-        t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
-        run_launchctl kickstart -k "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+      if [ "$(id -u)" -eq 0 ] || [ -n "\${IMCODES_LAUNCHCTL_BIN:-}" ]; then
+        mn_load="$(read_snap_env_val "$SVC_MANIFEST" "MAC_NODE_LOADED")"
+        mn_act="$(read_snap_env_val "$SVC_MANIFEST" "MAC_NODE_ACTIVE")"
+        mw_load="$(read_snap_env_val "$SVC_MANIFEST" "MAC_WD_LOADED")"
+        mw_act="$(read_snap_env_val "$SVC_MANIFEST" "MAC_WD_ACTIVE")"
+        md_load="$(read_snap_env_val "$SVC_MANIFEST" "MAC_DAEMON_LOADED")"
+        md_act="$(read_snap_env_val "$SVC_MANIFEST" "MAC_DAEMON_ACTIVE")"
+        t_uid="$(read_snap_env_val "$SVC_MANIFEST" "MAC_UID")"
+        if [ -z "$t_uid" ]; then
+          t_user="$(resolve_target_unix_user)"
+          t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
+        fi
+        if [ "$mn_load" = "1" ] && [ -f "$NODE_SERVICE_PATH" ]; then
+          run_launchctl bootstrap system "$NODE_SERVICE_PATH" >/dev/null 2>&1 || true
+          [ "$mn_act" = "1" ] && run_launchctl kickstart -k system/cc.imcodes.node >/dev/null 2>&1 || true
+        fi
+        if [ "$mw_load" = "1" ] && [ -n "$NODE_WATCHDOG_SERVICE_PATH" ] && [ -f "$NODE_WATCHDOG_SERVICE_PATH" ]; then
+          run_launchctl bootstrap system "$NODE_WATCHDOG_SERVICE_PATH" >/dev/null 2>&1 || true
+          [ "$mw_act" = "1" ] && run_launchctl kickstart -k system/cc.imcodes.node.watchdog >/dev/null 2>&1 || true
+        fi
+        if [ "$md_load" = "1" ] && [ -n "$t_uid" ] && [ "$t_uid" != "0" ] && [ -f "$AUTOSTART_PATH" ]; then
+          run_launchctl bootstrap "gui/$t_uid" "$AUTOSTART_PATH" >/dev/null 2>&1 || true
+          [ "$md_act" = "1" ] && run_launchctl kickstart -k "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+        fi
       fi
     fi
   fi
@@ -964,86 +1154,308 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-read_lock_pid() {
-  lock_file="$USER_STATE_DIR/daemon.lock.json"
+read_lock_field() {
+  lock_file="$1"
+  field_name="$2"
   [ -f "$lock_file" ] || return 1
-  pid_val="$(tr -d '\\n\\r ' < "$lock_file" | sed -n 's/.*"pid":\\([0-9][0-9]*\\).*/\\1/p')"
-  [ -n "$pid_val" ] && printf '%s\\n' "$pid_val"
+  awk -v k="$field_name" '
+    BEGIN { q = sprintf("%c", 34); txt = "" }
+    { gsub(/\\015/, ""); txt = txt " " $0 }
+    END {
+      if (k == "pid") {
+        if (match(txt, q "pid" q "[[:space:]]*:[[:space:]]*[0-9]+")) {
+          seg = substr(txt, RSTART, RLENGTH)
+          sub(/^.*:[[:space:]]*/, "", seg)
+          print seg
+        }
+      } else {
+        pat = q k q "[[:space:]]*:[[:space:]]*" q "[^" q "]*" q
+        if (match(txt, pat)) {
+          seg = substr(txt, RSTART, RLENGTH)
+          sub("^" q k q "[[:space:]]*:[[:space:]]*" q, "", seg)
+          sub(q "$", "", seg)
+          print seg
+        }
+      }
+    }
+  ' "$lock_file"
 }
 
-is_controllable_daemon_pid() {
-  pid="$1"
-  [ -n "\${IMCODES_STOP_DAEMON_HOOK:-}" ] && return 0
-  cmd_args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-  case "$cmd_args" in
-    *imcodes*|*daemon-stub*|*index.js*|*node*) return 0 ;;
-    *) return 1 ;;
-  esac
+read_lock_pid() {
+  read_lock_field "$USER_STATE_DIR/daemon.lock.json" "pid"
 }
 
-is_pid_alive() {
+read_lock_start_token() {
+  read_lock_field "$USER_STATE_DIR/daemon.lock.json" "startToken"
+}
+
+expected_platform_token_scheme() {
+  if [ "$PLATFORM" = "linux" ]; then
+    printf 'linux'
+  elif [ "$PLATFORM" = "darwin" ]; then
+    printf 'ps'
+  else
+    printf 'unknown'
+  fi
+}
+
+probe_lock_process_liveness() {
   pid="$1"
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  p_stat="$(ps -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
-  case "$p_stat" in
-    Z*) return 1 ;;
+  PROBE_STATUS="probe_failed"
+  PROBE_TOKEN=""
+  case "$pid" in
+    ''|*[!0-9]*)
+      PROBE_STATUS="dead"
+      return 0
+      ;;
   esac
+  if [ "$pid" -le 0 ] 2>/dev/null; then
+    PROBE_STATUS="dead"
+    return 0
+  fi
+
+  if [ "$PLATFORM" = "linux" ]; then
+    proc_dir="\${IMCODES_PROC_DIR:-/proc}"
+    if [ ! -d "$proc_dir" ]; then
+      PROBE_STATUS="probe_failed"
+      return 0
+    fi
+    stat_file="$proc_dir/$pid/stat"
+    if [ -f "$stat_file" ]; then
+      stat_line="$(cat "$stat_file" 2>/dev/null || true)"
+      if [ -z "$stat_line" ]; then
+        PROBE_STATUS="probe_failed"
+        return 0
+      fi
+      parsed="$(printf '%s\\n' "$stat_line" | awk '{
+        idx = 0
+        n = length($0)
+        for (i = n; i >= 1; i--) {
+          if (substr($0, i, 1) == ")") { idx = i; break }
+        }
+        if (idx == 0) exit 1
+        rest = substr($0, idx + 1)
+        sub(/^[[:space:]]+/, "", rest)
+        cnt = split(rest, f, /[[:space:]]+/)
+        if (cnt < 20) exit 1
+        print f[1] "|" f[20]
+      }' 2>/dev/null || true)"
+      if [ -z "$parsed" ]; then
+        PROBE_STATUS="probe_failed"
+        return 0
+      fi
+      p_state="\${parsed%%|*}"
+      p_ticks="\${parsed#*|}"
+      case "$p_state" in
+        Z*|X*|x*)
+          PROBE_STATUS="dead"
+          return 0
+          ;;
+      esac
+      case "$p_ticks" in
+        ''|*[!0-9]*)
+          PROBE_STATUS="probe_failed"
+          return 0
+          ;;
+      esac
+      PROBE_STATUS="alive"
+      PROBE_TOKEN="linux:$p_ticks"
+      return 0
+    fi
+    if [ -d "$proc_dir/$pid" ] || kill -0 "$pid" 2>/dev/null; then
+      PROBE_STATUS="probe_failed"
+      return 0
+    fi
+    PROBE_STATUS="dead"
+    return 0
+  elif [ "$PLATFORM" = "darwin" ]; then
+    ps_bin="\${IMCODES_PS_BIN:-ps}"
+    if ! command -v "$ps_bin" >/dev/null 2>&1; then
+      PROBE_STATUS="probe_failed"
+      return 0
+    fi
+    ps_rc=0
+    ps_out="$("$ps_bin" -o state= -o lstart= -p "$pid" 2>/dev/null)" || ps_rc=$?
+    if [ "$ps_rc" -ne 0 ]; then
+      if kill -0 "$pid" 2>/dev/null || ! "$ps_bin" -p "$$" -o pid= >/dev/null 2>&1; then
+        PROBE_STATUS="probe_failed"
+      else
+        PROBE_STATUS="dead"
+      fi
+      return 0
+    fi
+    parsed="$(printf '%s\\n' "$ps_out" | awk '{
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "") exit 1
+      if (!match(line, /^[^[:space:]]+/)) exit 1
+      st = substr(line, RSTART, RLENGTH)
+      ls = substr(line, RSTART + RLENGTH)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", ls)
+      gsub(/[[:space:]]+/, " ", ls)
+      if (ls == "") exit 1
+      print st "|" ls
+    }' 2>/dev/null || true)"
+    if [ -z "$parsed" ]; then
+      PROBE_STATUS="probe_failed"
+      return 0
+    fi
+    p_state="\${parsed%%|*}"
+    p_lstart="\${parsed#*|}"
+    case "$p_state" in
+      Z*|X*|x*)
+        PROBE_STATUS="dead"
+        return 0
+        ;;
+    esac
+    PROBE_STATUS="alive"
+    PROBE_TOKEN="ps:$p_lstart"
+    return 0
+  fi
+  PROBE_STATUS="probe_failed"
+  return 0
+}
+
+# Returns LOCK_OWNERSHIP = dead | stale | owned | unknown
+evaluate_lock_ownership() {
+  pid="$1"
+  lock_token="$2"
+  probe_lock_process_liveness "$pid"
+  if [ "$PROBE_STATUS" = "dead" ]; then
+    LOCK_OWNERSHIP="dead"
+    return 0
+  fi
+  if [ "$PROBE_STATUS" != "alive" ]; then
+    LOCK_OWNERSHIP="unknown"
+    return 0
+  fi
+  case "$lock_token" in
+    *:*)
+      tok_scheme="\${lock_token%%:*}"
+      tok_val="\${lock_token#*:}"
+      ;;
+    *)
+      LOCK_OWNERSHIP="unknown"
+      return 0
+      ;;
+  esac
+  if [ -z "$tok_val" ]; then
+    LOCK_OWNERSHIP="unknown"
+    return 0
+  fi
+  case "$tok_scheme" in
+    linux|ps|windows) ;;
+    *)
+      LOCK_OWNERSHIP="unknown"
+      return 0
+      ;;
+  esac
+  exp_scheme="$(expected_platform_token_scheme)"
+  if [ "$tok_scheme" != "$exp_scheme" ]; then
+    LOCK_OWNERSHIP="unknown"
+    return 0
+  fi
+  if [ "$lock_token" = "$PROBE_TOKEN" ]; then
+    LOCK_OWNERSHIP="owned"
+    return 0
+  fi
+  LOCK_OWNERSHIP="stale"
   return 0
 }
 
 STOPPED_ACTIVE_DAEMON=0
 verify_and_stop_active_lock() {
   [ "$CHECK_LOCK" -eq 1 ] || [ "$STOP_DAEMON" -eq 1 ] || return 0
+  lock_file="$USER_STATE_DIR/daemon.lock.json"
+  [ -f "$lock_file" ] || return 0
   lock_pid="$(read_lock_pid || true)"
   [ -n "$lock_pid" ] || return 0
-  if ! is_pid_alive "$lock_pid"; then
+  lock_token="$(read_lock_start_token || true)"
+  evaluate_lock_ownership "$lock_pid" "$lock_token"
+  if [ "$LOCK_OWNERSHIP" = "dead" ]; then
     return 0
   fi
-  # Live daemon PID detected. When takeover / autostart replacement / bundled switch runs,
-  # we must cleanly stop a controllable daemon OR fail closed before mutating runtime state.
-  if [ "$STOP_DAEMON" -eq 1 ] || [ "$PRESERVE_AUTOSTART" -eq 0 ] || [ "$SWITCH_BUNDLED" -eq 1 ]; then
-    if ! is_controllable_daemon_pid "$lock_pid"; then
-      echo "ERROR: live daemon lock pid=$lock_pid is not a controllable imcodes process; aborting without mutation" >&2
+  if [ "$LOCK_OWNERSHIP" = "stale" ]; then
+    echo "INFO: ignoring stale daemon lock pid=$lock_pid (startToken mismatch with live process $PROBE_TOKEN)" >&2
+    return 0
+  fi
+  if [ "$LOCK_OWNERSHIP" = "unknown" ]; then
+    if [ "$STOP_DAEMON" -eq 1 ] || [ "$PRESERVE_AUTOSTART" -eq 0 ] || [ "$SWITCH_BUNDLED" -eq 1 ]; then
+      echo "ERROR: cannot verify ownership of live daemon lock pid=$lock_pid (status=$PROBE_STATUS); aborting without mutation" >&2
       exit 3
     fi
+    return 0
+  fi
+  # LOCK_OWNERSHIP = owned: live verified imcodes daemon process.
+  if [ "$STOP_DAEMON" -eq 1 ] || [ "$PRESERVE_AUTOSTART" -eq 0 ] || [ "$SWITCH_BUNDLED" -eq 1 ]; then
     if [ -n "\${IMCODES_STOP_DAEMON_HOOK:-}" ]; then
+      evaluate_lock_ownership "$lock_pid" "$lock_token"
+      if [ "$LOCK_OWNERSHIP" = "dead" ] || [ "$LOCK_OWNERSHIP" = "stale" ]; then
+        return 0
+      fi
+      if [ "$LOCK_OWNERSHIP" != "owned" ]; then
+        echo "ERROR: lock ownership verification failed before stop hook for pid=$lock_pid; aborting without mutation" >&2
+        exit 3
+      fi
       "$IMCODES_STOP_DAEMON_HOOK" "$lock_pid" "$AUTOSTART_PATH" || true
     else
       if [ "$APPLY_SERVICES" -eq 1 ]; then
         if [ "$PLATFORM" = "linux" ]; then
+          SNAP_SERVICES_APPLIED=1
           run_systemctl_user stop imcodes.service >/dev/null 2>&1 || true
         elif [ "$PLATFORM" = "darwin" ]; then
           t_user="$(resolve_target_unix_user)"
           t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
-          run_launchctl bootout "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+          if [ -n "$t_uid" ] && [ "$t_uid" != "0" ]; then
+            SNAP_SERVICES_APPLIED=1
+            run_launchctl bootout "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+          fi
         fi
+      fi
+      evaluate_lock_ownership "$lock_pid" "$lock_token"
+      if [ "$LOCK_OWNERSHIP" = "dead" ] || [ "$LOCK_OWNERSHIP" = "stale" ]; then
+        STOPPED_ACTIVE_DAEMON=1
+        return 0
+      fi
+      if [ "$LOCK_OWNERSHIP" != "owned" ]; then
+        echo "ERROR: lock ownership verification failed before signal for pid=$lock_pid; aborting without mutation" >&2
+        exit 3
       fi
       kill -TERM "$lock_pid" 2>/dev/null || true
     fi
     wait_i=0
     while [ "$wait_i" -lt 25 ]; do
-      if ! is_pid_alive "$lock_pid"; then
+      evaluate_lock_ownership "$lock_pid" "$lock_token"
+      if [ "$LOCK_OWNERSHIP" = "dead" ] || [ "$LOCK_OWNERSHIP" = "stale" ]; then
         STOPPED_ACTIVE_DAEMON=1
         return 0
+      fi
+      if [ "$LOCK_OWNERSHIP" = "unknown" ]; then
+        echo "ERROR: lock ownership became unverifiable while waiting for pid=$lock_pid; aborting without mutation" >&2
+        exit 3
       fi
       sleep 0.2 2>/dev/null || sleep 1
       wait_i=$((wait_i + 1))
     done
-    if is_pid_alive "$lock_pid"; then
-      echo "ERROR: active imcodes daemon lock pid=$lock_pid did not exit after stop; aborting without mutation" >&2
-      exit 3
+    evaluate_lock_ownership "$lock_pid" "$lock_token"
+    if [ "$LOCK_OWNERSHIP" = "dead" ] || [ "$LOCK_OWNERSHIP" = "stale" ]; then
+      STOPPED_ACTIVE_DAEMON=1
+      return 0
     fi
+    echo "ERROR: active imcodes daemon lock pid=$lock_pid did not exit after stop; aborting without mutation" >&2
+    exit 3
   fi
 }
 
 if [ "$PHASE" = "preinst" ] || [ "$PHASE" = "preinstall" ]; then
+  capture_services_posix_vars
   verify_and_stop_active_lock
   snapshot_paths
   exit 0
 fi
 
-# Postinstall / full isolated install: verify/stop live daemon lock BEFORE snapshot or payload writes
+# Postinstall / full isolated install: capture pre-stop service state & verify/stop live daemon lock BEFORE snapshot or payload writes
+capture_services_posix_vars
 verify_and_stop_active_lock
 if [ ! -f "$SNAPSHOT_DIR/snapshot.env" ]; then
   snapshot_paths
@@ -1216,6 +1628,7 @@ EOF
 fi
 
 if [ "$APPLY_SERVICES" -eq 1 ]; then
+  mark_services_applied_posix
   if [ "$PLATFORM" = "linux" ]; then
     if [ "$(id -u)" -eq 0 ] || [ -n "\${IMCODES_SYSTEMCTL_BIN:-}" ]; then
       if [ -f "$NODE_SERVICE_PATH" ]; then

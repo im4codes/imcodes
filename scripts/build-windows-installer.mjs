@@ -47,6 +47,8 @@ export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent, mi
   [string]$StagedCliWrapper = '',
   [string]$MinimumRuntimeVersion = ${JSON.stringify(minVersion)},
   [string]$ServiceHookScript = '',
+  [string]$SchtasksExe = '',
+  [string]$ProcessProbeScript = '',
   [int]$TempMaxAgeHours = 24,
   [switch]$ForceTakeover,
   [switch]$AllowSystemRoot,
@@ -60,47 +62,103 @@ function Get-NormalizedPath([string]$PathValue) {
   return [System.IO.Path]::GetFullPath($PathValue).TrimEnd('\\').ToLowerInvariant()
 }
 
+function Normalize-WindowsReparseTarget([string]$RawTarget, [string]$LinkPath) {
+  if ([string]::IsNullOrWhiteSpace($RawTarget)) { return '' }
+  $t = $RawTarget.Trim()
+  if ($t.StartsWith('\\??\\UNC\\', [System.StringComparison]::OrdinalIgnoreCase) -or $t.StartsWith('\\\\?\\UNC\\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    $t = '\\\\' + $t.Substring(8)
+  } elseif ($t.StartsWith('\\??\\', [System.StringComparison]::OrdinalIgnoreCase) -or $t.StartsWith('\\\\?\\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    $t = $t.Substring(4)
+  }
+  if (-not [System.IO.Path]::IsPathRooted($t)) {
+    $parent = Split-Path -Parent $LinkPath
+    if ([string]::IsNullOrWhiteSpace($parent)) { return '' }
+    $t = Join-Path $parent $t
+  }
+  return [System.IO.Path]::GetFullPath($t)
+}
+
 function Resolve-CanonicalWindowsPath([string]$PathValue) {
   if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
-  $full = [System.IO.Path]::GetFullPath($PathValue)
-  $cur = $full
-  $tail = New-Object System.Collections.Generic.List[string]
-  while ($cur -and -not (Test-Path -LiteralPath $cur)) {
-    $parent = Split-Path -Parent $cur
-    if (-not $parent -or $parent -eq $cur) { break }
-    $tail.Insert(0, (Split-Path -Leaf $cur))
-    $cur = $parent
-  }
-  $resolvedBase = $cur
-  for ($hop = 0; $hop -lt 12; $hop++) {
-    if (-not (Test-Path -LiteralPath $resolvedBase)) { break }
-    try {
-      $item = Get-Item -LiteralPath $resolvedBase -Force -ErrorAction SilentlyContinue
-      if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-        $nextTarget = $null
+  $cur = [System.IO.Path]::GetFullPath($PathValue)
+  $maxHops = 32
+  $hops = 0
+  while ($true) {
+    $root = [System.IO.Path]::GetPathRoot($cur)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+      return [System.IO.Path]::GetFullPath($cur).TrimEnd('\\').ToLowerInvariant()
+    }
+    $rel = $cur.Substring($root.Length)
+    $segs = @($rel -split '[\\\\/]+' | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    $built = $root
+    $restarted = $false
+    for ($i = 0; $i -lt $segs.Length; $i++) {
+      $seg = $segs[$i]
+      $built = if ($built.EndsWith('\\')) { $built + $seg } else { $built + '\\' + $seg }
+      $item = $null
+      $isReparse = $false
+      $existsEntry = $false
+      try {
+        $item = Get-Item -LiteralPath $built -Force -ErrorAction Stop
+        $existsEntry = $true
+        $isReparse = [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+      } catch [System.Management.Automation.ItemNotFoundException] {
         try {
-          if ($item.PSObject.Methods['ResolveLinkTarget']) {
-            $rt = $item.ResolveLinkTarget($true)
-            if ($rt) { $nextTarget = $rt.FullName }
+          $attrs = [System.IO.File]::GetAttributes($built)
+          if ([int]$attrs -ne -1 -and ($attrs -band [System.IO.FileAttributes]::ReparsePoint)) {
+            $existsEntry = $true
+            $isReparse = $true
           }
         } catch {}
-        if (-not $nextTarget -and $item.Target) {
-          $nextTarget = [string]$item.Target[0]
-        }
-        if ($nextTarget) {
-          if (-not [System.IO.Path]::IsPathRooted($nextTarget)) {
-            $nextTarget = Join-Path (Split-Path -Parent $resolvedBase) $nextTarget
-          }
-          $resolvedBase = [System.IO.Path]::GetFullPath($nextTarget)
-          continue
-        }
+      } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+        $existsEntry = $false
+      } catch {
+        throw "canonical_path_unreadable: $built ($($_.Exception.Message))"
       }
-    } catch {}
-    break
+      if (-not $existsEntry) {
+        if ($i -lt ($segs.Length - 1)) {
+          for ($j = $i + 1; $j -lt $segs.Length; $j++) {
+            $built = if ($built.EndsWith('\\')) { $built + $segs[$j] } else { $built + '\\' + $segs[$j] }
+          }
+        }
+        return [System.IO.Path]::GetFullPath($built).TrimEnd('\\').ToLowerInvariant()
+      }
+      if ($isReparse) {
+        $hops++
+        if ($hops -gt $maxHops) {
+          throw "canonical_path_symlink_loop: $PathValue"
+        }
+        $rawTarget = ''
+        if ($item) {
+          try {
+            if ($item.PSObject.Methods['ResolveLinkTarget']) {
+              $rt = $item.ResolveLinkTarget($false)
+              if ($rt) { $rawTarget = [string]$rt.FullName }
+            }
+          } catch {}
+          if ([string]::IsNullOrWhiteSpace($rawTarget) -and $item.Target) {
+            $rawTarget = if ($item.Target -is [System.Array]) { [string]$item.Target[0] } else { [string]$item.Target }
+          }
+        }
+        $nextBase = Normalize-WindowsReparseTarget $rawTarget $built
+        if ([string]::IsNullOrWhiteSpace($nextBase)) {
+          throw "canonical_path_unresolvable_reparse: $built"
+        }
+        $nextFull = $nextBase
+        if ($i -lt ($segs.Length - 1)) {
+          for ($j = $i + 1; $j -lt $segs.Length; $j++) {
+            $nextFull = Join-Path $nextFull $segs[$j]
+          }
+        }
+        $cur = [System.IO.Path]::GetFullPath($nextFull)
+        $restarted = $true
+        break
+      }
+    }
+    if (-not $restarted) {
+      return [System.IO.Path]::GetFullPath($built).TrimEnd('\\').ToLowerInvariant()
+    }
   }
-  $combined = $resolvedBase
-  foreach ($seg in $tail) { $combined = Join-Path $combined $seg }
-  return [System.IO.Path]::GetFullPath($combined).TrimEnd('\\').ToLowerInvariant()
 }
 
 function Test-SameOrChildWindowsPath([string]$Candidate, [string]$Parent) {
@@ -521,69 +579,290 @@ function New-WindowsReparsePoint([string]$Kind, [string]$LinkPath, [string]$Targ
 
 function Invoke-ServiceAction([string]$Action, [hashtable]$Payload) {
   if (-not [string]::IsNullOrWhiteSpace($ServiceHookScript)) {
-    $jsonArg = ($Payload | ConvertTo-Json -Compress -Depth 5)
+    $jsonArg = ($Payload | ConvertTo-Json -Compress -Depth 6)
     & $ServiceHookScript -Action $Action -PayloadJson $jsonArg | Out-Null
     return $true
   }
   return $false
 }
 
-function Assert-SingleInstanceLockAndStop($Plan) {
-  if (-not $Plan.checkSingleInstanceLock -and -not $Plan.stopUserDaemonTask) { return $false }
+function Get-SchtasksExecutable {
+  if (-not [string]::IsNullOrWhiteSpace($SchtasksExe)) { return $SchtasksExe }
+  if (-not [string]::IsNullOrWhiteSpace($env:IMCODES_WIN_SCHTASKS_BIN)) { return $env:IMCODES_WIN_SCHTASKS_BIN }
+  return 'schtasks.exe'
+}
+
+function Test-UsingCustomSchtasksExe {
+  return (-not [string]::IsNullOrWhiteSpace($SchtasksExe)) -or (-not [string]::IsNullOrWhiteSpace($env:IMCODES_WIN_SCHTASKS_BIN))
+}
+
+function Test-CanControlNativeWindowsTasks {
+  if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+    return (Test-UsingCustomSchtasksExe)
+  }
+  return $true
+}
+
+function Invoke-Schtasks([string[]]$Arguments) {
+  $exe = Get-SchtasksExecutable
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = & $exe @Arguments 2>&1
+    $rc = $LASTEXITCODE
+    $text = (($out | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)
+    return [ordered]@{ exitCode = $rc; output = $text }
+  } finally {
+    $ErrorActionPreference = $prevEap
+  }
+}
+
+function Get-WindowsProcessLiveness([int]$ProcessId) {
+  if ($ProcessId -le 0) {
+    return [ordered]@{ status = 'dead'; token = '' }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ProcessProbeScript)) {
+    try {
+      $probeRaw = & $ProcessProbeScript -ProcessId $ProcessId
+      if ($LASTEXITCODE -ne 0) {
+        return [ordered]@{ status = 'probe_failed'; token = '' }
+      }
+      $probeObj = ($probeRaw | Out-String) | ConvertFrom-Json
+      if (-not $probeObj.alive) {
+        return [ordered]@{ status = 'dead'; token = '' }
+      }
+      if ($probeObj.startToken -is [string] -and -not [string]::IsNullOrWhiteSpace($probeObj.startToken)) {
+        return [ordered]@{ status = 'alive'; token = [string]$probeObj.startToken }
+      }
+      return [ordered]@{ status = 'probe_failed'; token = '' }
+    } catch {
+      return [ordered]@{ status = 'probe_failed'; token = '' }
+    }
+  }
+
+  $proc = $null
+  try {
+    $proc = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+  } catch [System.ArgumentException] {
+    return [ordered]@{ status = 'dead'; token = '' }
+  } catch {
+    return [ordered]@{ status = 'probe_failed'; token = '' }
+  }
+
+  try {
+    if ($proc.HasExited) {
+      return [ordered]@{ status = 'dead'; token = '' }
+    }
+    $ticks = $proc.StartTime.ToUniversalTime().Ticks
+    return [ordered]@{ status = 'alive'; token = "windows:$ticks" }
+  } catch {
+    try {
+      if ($proc.HasExited) {
+        return [ordered]@{ status = 'dead'; token = '' }
+      }
+    } catch {}
+    return [ordered]@{ status = 'probe_failed'; token = '' }
+  }
+}
+
+function Get-WindowsLockOwnership([int]$ProcessId, [string]$LockStartToken) {
+  $probe = Get-WindowsProcessLiveness $ProcessId
+  if ($probe.status -eq 'dead') {
+    return [ordered]@{ ownership = 'dead'; status = 'dead'; liveToken = '' }
+  }
+  if ($probe.status -ne 'alive') {
+    return [ordered]@{ ownership = 'unknown'; status = 'probe_failed'; liveToken = '' }
+  }
+  if ([string]::IsNullOrWhiteSpace($LockStartToken) -or ($LockStartToken -notmatch '^(?<scheme>[a-z]+):(?<val>.+)$')) {
+    return [ordered]@{ ownership = 'unknown'; status = 'invalid_token'; liveToken = $probe.token }
+  }
+  $scheme = $Matches['scheme']
+  if ($scheme -notin @('linux', 'ps', 'windows') -or $scheme -ne 'windows') {
+    return [ordered]@{ ownership = 'unknown'; status = 'cross_or_unknown_scheme'; liveToken = $probe.token }
+  }
+  if ($LockStartToken -eq $probe.token) {
+    return [ordered]@{ ownership = 'owned'; status = 'alive'; liveToken = $probe.token }
+  }
+  return [ordered]@{ ownership = 'stale'; status = 'token_mismatch'; liveToken = $probe.token }
+}
+
+function Read-DaemonLockInfo {
   $lockPath = Join-Path $UserStateDir 'daemon.lock.json'
-  if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { return $false }
+  if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { return $null }
   $lockPid = $null
+  $lockToken = ''
   try {
     $lockObj = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
     if ($lockObj.pid -is [int] -or $lockObj.pid -is [long] -or ($lockObj.pid -match '^\\d+$')) {
-      $lockPid = [int]$lockObj.pid
+      $parsedPid = [int]$lockObj.pid
+      if ($parsedPid -gt 0) { $lockPid = $parsedPid }
     }
-  } catch {}
-  if (-not $lockPid) { return $false }
-  $proc = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
-  if (-not $proc) { return $false }
+    if ($lockObj.PSObject.Properties['startToken'] -and ($lockObj.startToken -is [string])) {
+      $lockToken = [string]$lockObj.startToken
+    }
+  } catch {
+    return [ordered]@{ pid = $null; startToken = ''; invalid = $true }
+  }
+  if (-not $lockPid) { return $null }
+  return [ordered]@{ pid = $lockPid; startToken = $lockToken; invalid = $false }
+}
 
-  if ($Plan.stopUserDaemonTask -or (-not $Plan.preserveUserDaemonAutostart) -or $Plan.switchToBundledRuntime) {
-    $cmdLine = ''
-    try {
-      $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$lockPid" -ErrorAction SilentlyContinue
-      if ($cim -and $cim.CommandLine) { $cmdLine = [string]$cim.CommandLine }
-    } catch {}
-    $isControllable = (-not [string]::IsNullOrWhiteSpace($ServiceHookScript)) -or
-      ($cmdLine -match 'imcodes|index\\.js|daemon-stub') -or
-      ($proc.ProcessName -match 'node|imcodes')
-    if (-not $isControllable) {
-      throw "active_daemon_lock_uncontrollable_pid: $lockPid"
+function Get-WindowsServicesSnapshot {
+  $userDaemonRunning = $false
+  $lockInfo = Read-DaemonLockInfo
+  if ($lockInfo -and $lockInfo.pid) {
+    $own = Get-WindowsLockOwnership $lockInfo.pid $lockInfo.startToken
+    if ($own.ownership -eq 'owned') {
+      $userDaemonRunning = $true
+    }
+  }
+  $taskSnapshots = @()
+  $canQuery = Test-CanControlNativeWindowsTasks
+  foreach ($tn in @('imcodes-node', 'imcodes-node-watchdog', 'imcodes-daemon')) {
+    $entry = [ordered]@{
+      name = $tn
+      exists = $false
+      enabled = $false
+      running = $false
+      xmlContent = ''
+    }
+    if ($canQuery) {
+      $qXml = Invoke-Schtasks @('/Query', '/TN', $tn, '/XML')
+      if ($qXml.exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($qXml.output)) {
+        $entry.exists = $true
+        $entry.xmlContent = [string]$qXml.output
+        $enabledKnown = $false
+        $runningKnown = $false
+        if (-not (Test-UsingCustomSchtasksExe)) {
+          try {
+            $stObj = Get-ScheduledTask -TaskName $tn -ErrorAction Stop
+            $stStr = [string]$stObj.State
+            $entry.enabled = ($stStr -ne 'Disabled')
+            $entry.running = ($stStr -eq 'Running')
+            $enabledKnown = $true
+            $runningKnown = $true
+          } catch {}
+        }
+        if (-not $enabledKnown -or -not $runningKnown) {
+          $qStat = Invoke-Schtasks @('/Query', '/TN', $tn, '/FO', 'LIST', '/V')
+          if ($qStat.exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($qStat.output)) {
+            $outText = [string]$qStat.output
+            if (-not $runningKnown) {
+              $entry.running = ($outText -match '(?im)^\\s*(?:Status|状态)\\s*:\\s*(?:Running|正在运行)\\b')
+              $runningKnown = $true
+            }
+            if (-not $enabledKnown) {
+              if ($outText -match '(?im)^\\s*(?:Scheduled Task State|计划任务状态)\\s*:\\s*(?:Disabled|已禁用)\\b') {
+                $entry.enabled = $false
+                $enabledKnown = $true
+              } elseif ($outText -match '(?im)^\\s*(?:Scheduled Task State|计划任务状态)\\s*:\\s*(?:Enabled|已启用|启用)\\b') {
+                $entry.enabled = $true
+                $enabledKnown = $true
+              } elseif ($outText -match '(?im)^\\s*(?:Status|状态)\\s*:\\s*(?:Disabled|已禁用)\\b') {
+                $entry.enabled = $false
+                $enabledKnown = $true
+              }
+            }
+          }
+          if (-not $enabledKnown) {
+            if ($entry.xmlContent -match '<Enabled>\\s*false\\s*</Enabled>') {
+              $entry.enabled = $false
+            } else {
+              $entry.enabled = $true
+            }
+          }
+        }
+      }
+    }
+    $taskSnapshots += $entry
+  }
+  return [ordered]@{
+    userDaemonWasRunning = $userDaemonRunning
+    tasks = $taskSnapshots
+  }
+}
+
+function Stop-VerifiedDaemonProcess([hashtable]$LockInfo, [switch]$FailOnUnverifiable) {
+  if (-not $LockInfo -or -not $LockInfo.pid) { return $false }
+  $lockPid = [int]$LockInfo.pid
+  $lockToken = [string]$LockInfo.startToken
+  $own = Get-WindowsLockOwnership $lockPid $lockToken
+  if ($own.ownership -eq 'dead' -or $own.ownership -eq 'stale') {
+    return $false
+  }
+  if ($own.ownership -ne 'owned') {
+    if ($FailOnUnverifiable) {
+      throw "active_daemon_lock_unverifiable_pid: $lockPid ($($own.status))"
+    }
+    return $false
+  }
+
+  $handled = $false
+  if (-not [string]::IsNullOrWhiteSpace($ServiceHookScript)) {
+    $recheckHook = Get-WindowsLockOwnership $lockPid $lockToken
+    if ($recheckHook.ownership -eq 'dead' -or $recheckHook.ownership -eq 'stale') { return $false }
+    if ($recheckHook.ownership -ne 'owned') {
+      if ($FailOnUnverifiable) { throw "active_daemon_lock_unverifiable_pid: $lockPid" }
+      return $false
     }
     $handled = Invoke-ServiceAction 'StopDaemon' @{ pid = $lockPid; autostartPath = $AutostartPath }
-    if (-not $handled) {
-      if ($ApplyServices) {
-        try { Stop-ScheduledTask -TaskName 'imcodes-daemon' -ErrorAction SilentlyContinue } catch {}
-      }
-      Stop-Process -Id $lockPid -ErrorAction SilentlyContinue
+  }
+  if (-not $handled) {
+    if ($ApplyServices -and (Test-CanControlNativeWindowsTasks)) {
+      [void](Invoke-Schtasks @('/End', '/TN', 'imcodes-daemon'))
     }
-    for ($w = 0; $w -lt 25; $w++) {
-      if (-not (Get-Process -Id $lockPid -ErrorAction SilentlyContinue)) {
-        return $true
-      }
-      Start-Sleep -Milliseconds 200
+    $recheckSig = Get-WindowsLockOwnership $lockPid $lockToken
+    if ($recheckSig.ownership -eq 'dead' -or $recheckSig.ownership -eq 'stale') { return $true }
+    if ($recheckSig.ownership -ne 'owned') {
+      if ($FailOnUnverifiable) { throw "active_daemon_lock_unverifiable_pid: $lockPid" }
+      return $false
     }
-    if (Get-Process -Id $lockPid -ErrorAction SilentlyContinue) {
-      throw "active_daemon_lock_refused_to_stop: $lockPid"
+    Stop-Process -Id $lockPid -ErrorAction SilentlyContinue
+  }
+  for ($w = 0; $w -lt 25; $w++) {
+    $waitOwn = Get-WindowsLockOwnership $lockPid $lockToken
+    if ($waitOwn.ownership -eq 'dead' -or $waitOwn.ownership -eq 'stale') {
+      return $true
     }
+    if ($waitOwn.ownership -ne 'owned') {
+      if ($FailOnUnverifiable) { throw "active_daemon_lock_unverifiable_pid: $lockPid ($($waitOwn.status))" }
+      return $false
+    }
+    Start-Sleep -Milliseconds 200
+  }
+  $finalOwn = Get-WindowsLockOwnership $lockPid $lockToken
+  if ($finalOwn.ownership -eq 'dead' -or $finalOwn.ownership -eq 'stale') {
     return $true
+  }
+  if ($FailOnUnverifiable) {
+    throw "active_daemon_lock_refused_to_stop: $lockPid"
   }
   return $false
 }
 
-function Save-RollbackSnapshot($Plan) {
+function Assert-SingleInstanceLockAndStop($Plan) {
+  if (-not $Plan.checkSingleInstanceLock -and -not $Plan.stopUserDaemonTask) { return $false }
+  $lockInfo = Read-DaemonLockInfo
+  if (-not $lockInfo) { return $false }
+  if ($lockInfo.invalid) {
+    throw 'active_daemon_lock_corrupt_json'
+  }
+  $shouldTakeover = $Plan.stopUserDaemonTask -or (-not $Plan.preserveUserDaemonAutostart) -or $Plan.switchToBundledRuntime
+  if (-not $shouldTakeover) { return $false }
+  return (Stop-VerifiedDaemonProcess $lockInfo -FailOnUnverifiable)
+}
+
+function Save-RollbackSnapshot($Plan, $ServiceSnapshot) {
   $manifestPath = Join-Path $SnapshotDir 'snapshot.json'
   $filesDir = Join-Path $SnapshotDir 'files'
+  $svcDir = Join-Path $SnapshotDir 'services'
   New-Item -ItemType Directory -Force -Path $filesDir | Out-Null
+  New-Item -ItemType Directory -Force -Path $svcDir | Out-Null
   $entries = @()
   $idx = 0
   $nodeExeTarget = Join-Path $NodeRoot 'imcodes-node.exe'
-  foreach ($tp in @($CliWrapperPath, $AutostartPath, $CurrentDir, $ReleaseDir, $nodeExeTarget, $StartMenuShortcutPath, $DesktopShortcutPath)) {
+  $wdScriptTarget = Join-Path $NodeRoot 'health-watchdog.ps1'
+  foreach ($tp in @($CliWrapperPath, $AutostartPath, $CurrentDir, $ReleaseDir, $nodeExeTarget, $wdScriptTarget, $StartMenuShortcutPath, $DesktopShortcutPath)) {
     if ([string]::IsNullOrWhiteSpace($tp)) { continue }
     if ($tp -eq $ReleaseDir) {
       Assert-SafeTargetPath $tp $RealProfile
@@ -596,7 +875,7 @@ function Save-RollbackSnapshot($Plan) {
     }
     $item = Get-Item -LiteralPath $tp -Force
     if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-      $target = if ($item.Target) { [string]$item.Target[0] } else { '' }
+      $target = if ($item.Target) { if ($item.Target -is [System.Array]) { [string]$item.Target[0] } else { [string]$item.Target } } else { '' }
       $reparseKind = if ($item.PSIsContainer) { 'junction' } else { 'symlink' }
       $entries += [ordered]@{ kind = $reparseKind; originalPath = $tp; target = $target }
     } elseif ($item.PSIsContainer) {
@@ -619,6 +898,23 @@ function Save-RollbackSnapshot($Plan) {
       $preserved += [ordered]@{ path = $pp; sha256 = (Get-FileSha256Hex $pp) }
     }
   }
+  $savedTasks = @()
+  if ($ServiceSnapshot -and $ServiceSnapshot.tasks) {
+    foreach ($t in $ServiceSnapshot.tasks) {
+      $xmlRelPath = ''
+      if ($t.exists -and -not [string]::IsNullOrWhiteSpace($t.xmlContent)) {
+        $xmlRelPath = Join-Path 'services' ($t.name + '.task.xml')
+        Write-TextAtomic (Join-Path $SnapshotDir $xmlRelPath) $t.xmlContent ([System.Text.Encoding]::Unicode)
+      }
+      $savedTasks += [ordered]@{
+        name = $t.name
+        exists = [bool]$t.exists
+        enabled = [bool]$t.enabled
+        running = [bool]$t.running
+        xmlRelPath = $xmlRelPath
+      }
+    }
+  }
   $snapshotDoc = [ordered]@{
     schemaVersion = 1
     createdAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -627,6 +923,11 @@ function Save-RollbackSnapshot($Plan) {
     snapshotDir = $SnapshotDir
     entries = $entries
     preservedChecksums = $preserved
+    services = [ordered]@{
+      applyRecorded = [bool]$ApplyServices
+      userDaemonWasRunning = [bool]($ServiceSnapshot -and $ServiceSnapshot.userDaemonWasRunning)
+      tasks = $savedTasks
+    }
   }
   $json = ($snapshotDoc | ConvertTo-Json -Depth 6)
   Write-TextAtomic $manifestPath $json ([System.Text.Encoding]::UTF8)
@@ -732,14 +1033,16 @@ function Register-WindowsServices($Plan, [bool]$RestartDaemon) {
       nodeTaskXml = $nodeTaskXml
       watchdogTaskXml = $wdTaskXml
     }
-    if (-not $handledNode) {
+    if (-not $handledNode -and (Test-CanControlNativeWindowsTasks)) {
       $nodeXmlPath = Join-Path $SnapshotDir 'imcodes-node.task.xml'
       $wdXmlPath = Join-Path $SnapshotDir 'imcodes-node-watchdog.task.xml'
       Write-TextAtomic $nodeXmlPath $nodeTaskXml ([System.Text.Encoding]::Unicode)
       Write-TextAtomic $wdXmlPath $wdTaskXml ([System.Text.Encoding]::Unicode)
-      & schtasks.exe /Create /TN 'imcodes-node' /XML $nodeXmlPath /F | Out-Null
-      & schtasks.exe /Create /TN 'imcodes-node-watchdog' /XML $wdXmlPath /F | Out-Null
-      & schtasks.exe /Run /TN 'imcodes-node' | Out-Null
+      $r1 = Invoke-Schtasks @('/Create', '/TN', 'imcodes-node', '/XML', $nodeXmlPath, '/F')
+      if ($r1.exitCode -ne 0) { throw "schtasks_create_node_failed: $($r1.output)" }
+      $r2 = Invoke-Schtasks @('/Create', '/TN', 'imcodes-node-watchdog', '/XML', $wdXmlPath, '/F')
+      if ($r2.exitCode -ne 0) { throw "schtasks_create_watchdog_failed: $($r2.output)" }
+      [void](Invoke-Schtasks @('/Run', '/TN', 'imcodes-node'))
     }
   }
   if ((-not $Plan.preserveUserDaemonAutostart) -or $RestartDaemon) {
@@ -756,6 +1059,22 @@ if ($Mode -eq 'Rollback') {
     throw "Rollback snapshot not found: $manifestPath"
   }
   $snap = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+  $shouldRollbackServices = $ApplyServices -or ($snap.services -and $snap.services.applyRecorded)
+
+  # Step 1: Stop installed/running tasks and verified daemon process BEFORE deleting/restoring files
+  if ($shouldRollbackServices) {
+    $lockInfo = Read-DaemonLockInfo
+    if ($lockInfo) {
+      [void](Stop-VerifiedDaemonProcess $lockInfo)
+    }
+    if ([string]::IsNullOrWhiteSpace($ServiceHookScript) -and (Test-CanControlNativeWindowsTasks)) {
+      foreach ($tn in @('imcodes-node', 'imcodes-node-watchdog', 'imcodes-daemon')) {
+        [void](Invoke-Schtasks @('/End', '/TN', $tn))
+      }
+    }
+  }
+
+  # Step 2: Restore file/dir/reparse/absent entries and verify preserved checksums
   $restored = 0
   $removed = 0
   foreach ($entry in $snap.entries) {
@@ -805,8 +1124,51 @@ if ($Mode -eq 'Rollback') {
     }
     $verified++
   }
-  if ($ApplyServices) {
-    [void](Invoke-ServiceAction 'RollbackServices' @{ snapshotDir = $SnapshotDir })
+
+  # Step 3: Reconcile task registration/enablement/running state and old user daemon
+  if ($shouldRollbackServices) {
+    $handledSvc = Invoke-ServiceAction 'RollbackServices' @{ snapshotDir = $SnapshotDir; services = $snap.services }
+    if (-not $handledSvc -and (Test-CanControlNativeWindowsTasks)) {
+      $daemonTaskStarted = $false
+      $taskList = if ($snap.services -and $snap.services.tasks) { @($snap.services.tasks) } else { @() }
+      if ($taskList.Count -eq 0) {
+        foreach ($tn in @('imcodes-node', 'imcodes-node-watchdog')) {
+          [void](Invoke-Schtasks @('/End', '/TN', $tn))
+          [void](Invoke-Schtasks @('/Delete', '/TN', $tn, '/F'))
+        }
+      } else {
+        foreach ($t in $taskList) {
+          if (-not $t.exists) {
+            [void](Invoke-Schtasks @('/End', '/TN', $t.name))
+            [void](Invoke-Schtasks @('/Delete', '/TN', $t.name, '/F'))
+          } else {
+            if (-not [string]::IsNullOrWhiteSpace($t.xmlRelPath)) {
+              $xmlAbs = Join-Path $snap.snapshotDir $t.xmlRelPath
+              if (Test-Path -LiteralPath $xmlAbs -PathType Leaf) {
+                $cr = Invoke-Schtasks @('/Create', '/TN', $t.name, '/XML', $xmlAbs, '/F')
+                if ($cr.exitCode -ne 0) {
+                  throw "rollback_task_restore_failed: $($t.name): $($cr.output)"
+                }
+              }
+            }
+            if ($t.enabled) {
+              [void](Invoke-Schtasks @('/Change', '/TN', $t.name, '/ENABLE'))
+            } else {
+              [void](Invoke-Schtasks @('/Change', '/TN', $t.name, '/DISABLE'))
+            }
+            if ($t.running) {
+              [void](Invoke-Schtasks @('/Run', '/TN', $t.name))
+              if ($t.name -eq 'imcodes-daemon') { $daemonTaskStarted = $true }
+            } else {
+              [void](Invoke-Schtasks @('/End', '/TN', $t.name))
+            }
+          }
+        }
+      }
+      if ($snap.services -and $snap.services.userDaemonWasRunning -and (-not $daemonTaskStarted) -and (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
+        Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $AutostartPath) -WindowStyle Hidden | Out-Null
+      }
+    }
   }
   [ordered]@{ restoredCount = $restored; removedCount = $removed; verifiedPreservedCount = $verified } | ConvertTo-Json -Depth 4
   exit 0
@@ -814,17 +1176,28 @@ if ($Mode -eq 'Rollback') {
 
 $plan = Invoke-PhaseAProbe
 if ($Mode -eq 'PreInstall') {
+  $preServiceSnap = Get-WindowsServicesSnapshot
   [void](Assert-SingleInstanceLockAndStop $plan)
-  Save-RollbackSnapshot $plan
+  Save-RollbackSnapshot $plan $preServiceSnap
   $plan | Add-Member -NotePropertyName snapshotDir -NotePropertyValue $SnapshotDir -Force
   $plan | ConvertTo-Json -Depth 6
   exit 0
 }
 
-# PostInstall mode
+# PostInstall mode: capture pre-stop service state & verify lock BEFORE snapshot or payload writes
+$preServiceSnap = Get-WindowsServicesSnapshot
 $stoppedDaemon = Assert-SingleInstanceLockAndStop $plan
-if (-not (Test-Path -LiteralPath (Join-Path $SnapshotDir 'snapshot.json') -PathType Leaf)) {
-  Save-RollbackSnapshot $plan
+$snapManifestPath = Join-Path $SnapshotDir 'snapshot.json'
+if (-not (Test-Path -LiteralPath $snapManifestPath -PathType Leaf)) {
+  Save-RollbackSnapshot $plan $preServiceSnap
+} elseif ($ApplyServices) {
+  try {
+    $existingSnap = Get-Content -LiteralPath $snapManifestPath -Raw | ConvertFrom-Json
+    if ($existingSnap.services) {
+      $existingSnap.services.applyRecorded = $true
+      Write-TextAtomic $snapManifestPath ($existingSnap | ConvertTo-Json -Depth 6) ([System.Text.Encoding]::UTF8)
+    }
+  } catch {}
 }
 
 # 2. Clean expired .tmp artifacts only (never lockfiles or SQLite)
