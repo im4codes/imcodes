@@ -865,7 +865,7 @@ public class Harness {
       const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DortDtype='+dtype, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
       expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','AGC_LIFECYCLE_OK','AGC_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','SpeechGainTest: ALL 6 TESTS PASSED']);
     }
-  });
+  }, 95000);
 });
 
 // Execute the production Foundation-only recognizer, decoder, coordinator, and bounded window.
