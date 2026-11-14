@@ -1077,12 +1077,28 @@ export function runDetachedSwitchTransaction(cfg) {
 
   const stateDir = resolve(cfg.stateDir);
   const resolvedRoot = resolve(cfg.runtimeRoot);
+  if (cfg && cfg.envOverrides && typeof cfg.envOverrides === 'object') {
+    for (const [k, v] of Object.entries(cfg.envOverrides)) {
+      if (typeof v === 'string' && v.length > 0) {
+        process.env[k] = v;
+      }
+    }
+  }
+  const writeSwitchResult = (payload) => {
+    if (!cfg?.resultFile) return;
+    try {
+      writeFileAtomicSync(cfg.resultFile, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    } catch {
+      // best effort
+    }
+  };
   let ownedToken = cfg.lockOwnerToken || null;
   let launchBackup = null;
   let switched = false;
   let oldIdentity = null;
   let effectivePreviousTarget = cfg.previousTarget || null;
   let effectivePreviousVersion = cfg.previousVersion || null;
+  let txResultPayload = { status: 'failed', error: 'unknown_termination', finishedAt: Date.now() };
 
   const restoreAll = (oldIdentityForRollback) => {
     const rollbackBeganAtMs = Date.now();
@@ -1226,17 +1242,21 @@ export function runDetachedSwitchTransaction(cfg) {
       throw new Error(`daemon_restart_failed:${restartRes.mode}`);
     }
 
-    const health = waitForHealthyTargetDaemon({
-      stateDir,
-      expectedVersion: cfg.targetVersion,
-      oldIdentity,
-      restartBeganAtMs,
-      platform: cfg.platform,
-      timeoutMs: cfg.healthCheckTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS,
-      settleMs: cfg.settleMs ?? DEFAULT_SETTLE_MS,
-    });
-
-    log(`post-restart health passed: pid=${health.pid} version=${health.version}`);
+    let health = null;
+    if (cfg.wasRunning !== false || restartRes.mode !== 'noop_stopped') {
+      health = waitForHealthyTargetDaemon({
+        stateDir,
+        expectedVersion: cfg.targetVersion,
+        oldIdentity,
+        restartBeganAtMs,
+        platform: cfg.platform,
+        timeoutMs: cfg.healthCheckTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS,
+        settleMs: cfg.settleMs ?? DEFAULT_SETTLE_MS,
+      });
+      log(`post-restart health passed: pid=${health.pid} version=${health.version}`);
+    } else {
+      log(`post-restart health check skipped (daemon stopped and mode=${restartRes.mode})`);
+    }
     writeUpgradeCooldownSentinel(stateDir);
     writeSwitchStateRecord(resolvedRoot, {
       phase: 'completed',
@@ -1244,7 +1264,7 @@ export function runDetachedSwitchTransaction(cfg) {
       targetVersion: cfg.targetVersion,
       previousTarget: effectivePreviousTarget,
       previousVersion: effectivePreviousVersion,
-      pid: health.pid,
+      pid: health?.pid ?? null,
       completedAt: Date.now(),
     });
 
@@ -1256,16 +1276,59 @@ export function runDetachedSwitchTransaction(cfg) {
     if (persistedPrev) keepTargets.push(persistedPrev);
     pruneOldDaemonRuntimeReleases(cfg.runtimeRoot, keepTargets);
 
+    txResultPayload = {
+      status: 'ok',
+      targetVersion: cfg.targetVersion,
+      pid: health?.pid ?? null,
+      completedAt: Date.now(),
+    };
     return true;
   } catch (err) {
-    log(`switch transaction failed: ${err && err.stack ? err.stack : String(err)}`);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log(`switch transaction failed: ${err && err.stack ? err.stack : errMsg}`);
+    let rolledBackOk = false;
     if (switched) {
-      restoreAll(oldIdentity);
+      rolledBackOk = restoreAll(oldIdentity);
     } else if (launchBackup) {
       restoreServiceLaunchTarget(launchBackup);
     }
+    txResultPayload = {
+      status: rolledBackOk ? 'rolled_back' : 'failed',
+      error: errMsg,
+      finishedAt: Date.now(),
+    };
     return false;
   } finally {
     releaseRuntimeUpgradeLock(stateDir, ownedToken);
+    writeSwitchResult(txResultPayload);
+    if (cfg?.transientTaskXmlPath) {
+      try { unlinkSync(cfg.transientTaskXmlPath); } catch {}
+    }
+    if (cfg?.transientWindowsTask) {
+      try {
+        spawnSync(cfg.schtasksExe || 'schtasks', ['/Delete', '/TN', cfg.transientWindowsTask, '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+          timeout: 10_000,
+        });
+      } catch {
+        // best effort cleanup of one-shot Windows switch task
+      }
+    }
+    if (cfg?.transientLaunchAgentPlist) {
+      try { unlinkSync(cfg.transientLaunchAgentPlist); } catch {}
+    }
+    if (cfg?.transientLaunchAgentDomain && cfg?.transientLaunchAgentLabel) {
+      try {
+        const cleanupChild = spawn(
+          '/bin/sh',
+          ['-c', 'sleep 1; launchctl bootout "$1" >/dev/null 2>&1 || true', 'imcodes-switch-cleanup', `${cfg.transientLaunchAgentDomain}/${cfg.transientLaunchAgentLabel}`],
+          { detached: true, stdio: 'ignore' },
+        );
+        cleanupChild.unref();
+      } catch {
+        // best effort cleanup of transient launchd job
+      }
+    }
   }
 }

@@ -41,13 +41,20 @@ import {
   type DesktopReleaseTarget,
 } from '../../shared/desktop-release-manifest.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
+import { xmlEscapeText } from '../../shared/macos-daemon-launch.js';
 import { isPathInsideGitCheckout } from '../node/desktop-installer-probe.js';
+import { windowsSchtasksExecutablePath } from '../node/installer.js';
 import { execFileOffMain } from '../util/exec-helper.js';
 import { imcodesStateDir, imcodesStateDirForHome, IMCODES_HOME_ENV } from '../util/imcodes-state-dir.js';
 import { renderSystemdExecStart } from '../util/launch-target.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
+import { imcodesHomeHash } from '../util/windows-daemon-lock.js';
 import { windowsTaskName } from '../util/windows-daemon-watchdog.mjs';
-import { renderWatchdogCmd } from '../util/windows-launch-artifacts.js';
+import {
+  encodeWindowsDaemonScheduledTaskXml,
+  renderWatchdogCmd,
+  resolveWindowsDaemonTaskUserId,
+} from '../util/windows-launch-artifacts.js';
 import {
   DAEMON_RUNTIME_LOCK_DIR_NAME,
   DAEMON_RUNTIME_LOCK_OWNER_FILE,
@@ -121,6 +128,18 @@ const SHA256_RE = /^[a-f0-9]{64}$/;
 
 export type DaemonRuntimeExecutionMode = 'dev_exempt' | 'bundled' | 'legacy_cli';
 export type WritableRuntimeRootKind = 'in_place' | 'user_fallback';
+export type SwitchRunnerIsolationMode =
+  | 'linux_systemd_run'
+  | 'win32_schtasks'
+  | 'darwin_launchd'
+  | 'detached_process'
+  | 'custom';
+
+export type SwitchRunnerHostExecutor = (
+  file: string,
+  args: string[],
+  options?: { timeoutMs?: number; env?: NodeJS.ProcessEnv },
+) => Promise<{ stdout: string; stderr: string }>;
 
 export interface DaemonRuntimeModeInspection {
   mode: DaemonRuntimeExecutionMode;
@@ -184,6 +203,9 @@ export interface DaemonRuntimeUpgradeOptions {
   healthCheckTimeoutMs?: number;
   settleMs?: number;
   detachedHandoff?: boolean;
+  wasRunning?: boolean;
+  requireIsolatedHost?: boolean;
+  switchRunnerHostExecutor?: SwitchRunnerHostExecutor;
   /** Optional custom extractor (primarily for deterministic unit testing). */
   extractArchive?: (input: {
     archivePath: string;
@@ -212,6 +234,7 @@ export type DaemonRuntimeUpgradeResult =
       writableRootKind: WritableRuntimeRootKind;
       rolledBack: false;
       detachedScriptDir?: string;
+      detachedIsolationMode?: SwitchRunnerIsolationMode;
     }
   | {
       status: 'rolled_back';
@@ -231,7 +254,12 @@ export type DaemonRuntimeUpgradeResult =
     }
   | {
       status: 'blocked';
-      reason: 'dev_symlink_exempt' | 'downgrade_refused' | 'no_writable_runtime_root' | 'version_mismatch';
+      reason:
+        | 'dev_symlink_exempt'
+        | 'downgrade_refused'
+        | 'isolated_handoff_unavailable'
+        | 'no_writable_runtime_root'
+        | 'version_mismatch';
       message: string;
     }
   | {
@@ -1025,11 +1053,221 @@ function buildServiceLaunchConfig(input: {
   };
 }
 
+const SWITCH_RUNNER_ENV_KEYS = [
+  'HOME',
+  'USERPROFILE',
+  'IMCODES_HOME',
+  'IMCODES_DEFAULT_HOME',
+  'IMCODES_STATE_DIR_NAME',
+  'PATH',
+  'XDG_RUNTIME_DIR',
+  'DBUS_SESSION_BUS_ADDRESS',
+  'NODE_EXTRA_CA_CERTS',
+  'SystemRoot',
+  'WINDIR',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'USERDOMAIN',
+  'USERNAME',
+  'COMPUTERNAME',
+] as const;
+
+export function collectSwitchRunnerEnvOverrides(input: {
+  env: NodeJS.ProcessEnv;
+  homeDir: string;
+  stateDir: string;
+}): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of SWITCH_RUNNER_ENV_KEYS) {
+    const val = input.env[key];
+    if (typeof val === 'string' && val.length > 0 && !/[\r\n\0]/.test(val)) {
+      out[key] = val;
+    }
+  }
+  const resolvedState = resolve(input.stateDir);
+  if (!out.IMCODES_HOME && resolvedState !== resolve(imcodesStateDirForHome(input.homeDir, input.env))) {
+    out.IMCODES_HOME = resolvedState;
+  }
+  if (!out.HOME && input.homeDir && !/[\r\n\0]/.test(input.homeDir)) {
+    out.HOME = input.homeDir;
+  }
+  return out;
+}
+
+export function isProcessInsideSystemdServiceUnit(unitName: string): boolean {
+  if (process.platform !== 'linux' || !unitName) return false;
+  try {
+    const cgroup = readFileSync('/proc/self/cgroup', 'utf8');
+    return cgroup
+      .split(/\r?\n/)
+      .some((line) => line.trimEnd().endsWith(`/${unitName}`));
+  } catch {
+    return false;
+  }
+}
+
+export function determineSwitchRunnerIsolationKind(input: {
+  platform: DaemonRuntimePlatform;
+  restartCommand?: string;
+  systemdUnitPath?: string;
+  systemdUnitName?: string;
+  launchAgentPath?: string;
+  requireIsolatedHost?: boolean;
+}): Exclude<SwitchRunnerIsolationMode, 'custom'> {
+  if (input.restartCommand && !input.requireIsolatedHost) {
+    return 'detached_process';
+  }
+  if (input.platform === 'linux') {
+    const unitExists = Boolean(input.systemdUnitPath && existsSync(input.systemdUnitPath));
+    const inUnitCgroup = Boolean(input.systemdUnitName && isProcessInsideSystemdServiceUnit(input.systemdUnitName));
+    return input.requireIsolatedHost || unitExists || inUnitCgroup
+      ? 'linux_systemd_run'
+      : 'detached_process';
+  }
+  if (input.platform === 'win32') {
+    return 'win32_schtasks';
+  }
+  if (input.platform === 'darwin') {
+    const plistExists = Boolean(input.launchAgentPath && existsSync(input.launchAgentPath));
+    return input.requireIsolatedHost || plistExists ? 'darwin_launchd' : 'detached_process';
+  }
+  return 'detached_process';
+}
+
+export function buildLinuxSystemdRunSwitchArgs(input: {
+  unitName: string;
+  nodeExe: string;
+  scriptPath: string;
+  configPath: string;
+  envOverrides: Record<string, string>;
+}): string[] {
+  const args = [
+    '--user',
+    `--unit=${input.unitName}`,
+    '--collect',
+    '--quiet',
+    '--property=Type=exec',
+    '--property=KillMode=process',
+  ];
+  for (const [k, v] of Object.entries(input.envOverrides)) {
+    if (v && !/[\r\n\0]/.test(v) && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+      args.push(`--setenv=${k}=${v}`);
+    }
+  }
+  args.push(input.nodeExe, input.scriptPath, input.configPath);
+  return args;
+}
+
+export function buildWindowsSwitchRunnerTaskXml(input: {
+  nodeExe: string;
+  scriptPath: string;
+  configPath: string;
+  userId?: string;
+}): string {
+  const principalsBlock = input.userId?.trim()
+    ? `  <Principals>
+    <Principal id="Author">
+      <UserId>${xmlEscapeText(input.userId.trim())}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+`
+    : '';
+  const actionsContext = input.userId?.trim() ? 'Author' : 'Interactive';
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>IM.codes isolated daemon-runtime switch runner</Description>
+  </RegistrationInfo>
+  <Triggers />
+${principalsBlock}  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="${actionsContext}">
+    <Exec>
+      <Command>${xmlEscapeText(input.nodeExe)}</Command>
+      <Arguments>${xmlEscapeText(`"${input.scriptPath}" "${input.configPath}"`)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`;
+}
+
+export function buildMacosTransientLaunchAgentPlist(input: {
+  label: string;
+  nodeExe: string;
+  scriptPath: string;
+  configPath: string;
+  logFile: string;
+  envOverrides: Record<string, string>;
+}): string {
+  const envEntries = Object.entries(input.envOverrides)
+    .filter(([, v]) => typeof v === 'string' && v.length > 0 && !/[\r\n\0]/.test(v))
+    .map(([k, v]) => `    <key>${xmlEscapeText(k)}</key>\n    <string>${xmlEscapeText(v)}</string>`)
+    .join('\n');
+  const envBlock = envEntries
+    ? `  <key>EnvironmentVariables</key>\n  <dict>\n${envEntries}\n  </dict>\n`
+    : '';
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${xmlEscapeText(input.label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xmlEscapeText(input.nodeExe)}</string>
+    <string>${xmlEscapeText(input.scriptPath)}</string>
+    <string>${xmlEscapeText(input.configPath)}</string>
+  </array>
+${envBlock}  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${xmlEscapeText(input.logFile)}</string>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscapeText(input.logFile)}</string>
+</dict>
+</plist>
+`;
+}
+
+const defaultSwitchRunnerHostExecutor: SwitchRunnerHostExecutor = async (file, args, options) => {
+  const execAsync = execFileOffMain as unknown as (
+    f: string,
+    a: string[],
+    o: { timeout?: number; env?: NodeJS.ProcessEnv; windowsHide?: boolean; encoding: 'utf8' },
+  ) => Promise<{ stdout: string; stderr: string }>;
+  return execAsync(file, args, {
+    timeout: options?.timeoutMs ?? 15_000,
+    env: options?.env,
+    windowsHide: true,
+    encoding: 'utf8',
+  });
+};
+
 /**
  * Write and launch a self-contained detached switch+launch-chain-align+restart+healthcheck+rollback runner
- * (used when the running daemon upgrades itself cleanly without in-place overwrites).
+ * (used when the running daemon or CLI upgrades cleanly without in-place overwrites).
+ *
+ * When managed by systemd / Windows Task Scheduler tree-kill / macOS LaunchAgent, hands the runner
+ * off to an independent OS lifecycle host BEFORE returning, and fails closed if handoff fails.
  */
-export function launchDetachedDaemonRuntimeSwitchRunner(input: {
+export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
   scriptDir?: string;
   platform: DaemonRuntimePlatform;
   runtimeRoot: string;
@@ -1049,10 +1287,21 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
   rollbackRestartCommand?: string;
   healthCheckTimeoutMs?: number;
   settleMs?: number;
+  nodeExe?: string;
+  requireIsolatedHost?: boolean;
+  windowsTaskUserId?: string;
+  hostExecutor?: SwitchRunnerHostExecutor;
   spawnRunner?: (scriptPath: string, args: string[], scriptDir: string) => void;
-}): { scriptDir: string; scriptPath: string; logFile: string } {
+}): Promise<{
+  scriptDir: string;
+  scriptPath: string;
+  logFile: string;
+  resultFile: string;
+  isolationMode: SwitchRunnerIsolationMode;
+}> {
   const scriptDir = input.scriptDir ?? mkdtempSync(join(tmpdir(), 'imcodes-rt-upgrade-'));
   const logFile = join(scriptDir, 'runtime-upgrade.log');
+  const resultFile = join(scriptDir, 'switch-result.json');
   const configPath = join(scriptDir, 'runtime-upgrade.json');
   const scriptPath = join(scriptDir, 'switch-runner.mjs');
   const helperDestPath = join(scriptDir, 'daemon-runtime-switch-helper.mjs');
@@ -1062,6 +1311,7 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
   copyFileSync(resolveDaemonLockIdentityPath(), lockIdentityDestPath);
 
   const env = input.env ?? process.env;
+  const nodeExe = input.nodeExe?.trim() || process.execPath;
   const targetCurrent = join(resolve(input.runtimeRoot), 'current');
   const launchCfg = buildServiceLaunchConfig({
     platform: input.platform,
@@ -1082,6 +1332,79 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
     ?? (input.previousTarget
       ? join(resolve(input.previousTarget), 'package', 'dist', 'src', 'index.js')
       : undefined);
+
+  const envOverrides = collectSwitchRunnerEnvOverrides({
+    env,
+    homeDir: input.homeDir,
+    stateDir: input.stateDir,
+  });
+
+  const isolationMode: SwitchRunnerIsolationMode = input.spawnRunner
+    ? 'custom'
+    : determineSwitchRunnerIsolationKind({
+        platform: input.platform,
+        restartCommand: input.restartCommand,
+        systemdUnitPath: launchCfg.systemdUnitPath,
+        systemdUnitName: launchCfg.systemdUnitName,
+        launchAgentPath: launchCfg.launchAgentPath,
+        requireIsolatedHost: input.requireIsolatedHost,
+      });
+
+  const runHost = input.hostExecutor ?? defaultSwitchRunnerHostExecutor;
+  const nonce = `${imcodesHomeHash(input.stateDir)}-${process.pid}-${randomBytes(3).toString('hex')}`;
+
+  let transientWindowsTask: string | undefined;
+  let transientTaskXmlPath: string | undefined;
+  let schtasksExe: string | undefined;
+  let transientLaunchAgentLabel: string | undefined;
+  let transientLaunchAgentDomain: string | undefined;
+  let transientLaunchAgentPlist: string | undefined;
+
+  if (isolationMode === 'win32_schtasks') {
+    transientWindowsTask = `IMCodes-RuntimeSwitch-${nonce}`;
+    transientTaskXmlPath = join(scriptDir, 'switch-runner-task.xml');
+    const resolvedSchtasks = windowsSchtasksExecutablePath(env);
+    schtasksExe = process.platform === 'win32' && existsSync(resolvedSchtasks) ? resolvedSchtasks : 'schtasks';
+
+    let resolvedUserId = input.windowsTaskUserId?.trim();
+    if (!resolvedUserId) {
+      let whoamiOut = '';
+      if (process.platform === 'win32') {
+        try {
+          const res = await runHost('whoami', [], { timeoutMs: 5_000, env });
+          whoamiOut = res.stdout.trim();
+        } catch {
+          whoamiOut = '';
+        }
+      }
+      try {
+        resolvedUserId = resolveWindowsDaemonTaskUserId(env, () => whoamiOut);
+      } catch {
+        resolvedUserId = undefined;
+      }
+    }
+    const taskXml = buildWindowsSwitchRunnerTaskXml({
+      nodeExe,
+      scriptPath,
+      configPath,
+      userId: resolvedUserId,
+    });
+    writeFileSync(transientTaskXmlPath, encodeWindowsDaemonScheduledTaskXml(taskXml), { mode: 0o600 });
+  } else if (isolationMode === 'darwin_launchd') {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
+    transientLaunchAgentLabel = `imcodes.runtime-switch.${nonce}`;
+    transientLaunchAgentDomain = `gui/${uid}`;
+    transientLaunchAgentPlist = join(scriptDir, `${transientLaunchAgentLabel}.plist`);
+    const plistXml = buildMacosTransientLaunchAgentPlist({
+      label: transientLaunchAgentLabel,
+      nodeExe,
+      scriptPath,
+      configPath,
+      logFile,
+      envOverrides,
+    });
+    writeFileSync(transientLaunchAgentPlist, plistXml, { mode: 0o600 });
+  }
 
   writeFileSync(
     configPath,
@@ -1111,6 +1434,12 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
       ...(typeof input.healthCheckTimeoutMs === 'number' ? { healthCheckTimeoutMs: input.healthCheckTimeoutMs } : {}),
       ...(typeof input.settleMs === 'number' ? { settleMs: input.settleMs } : {}),
       logFile,
+      resultFile,
+      envOverrides,
+      ...(transientWindowsTask ? { transientWindowsTask, transientTaskXmlPath, schtasksExe } : {}),
+      ...(transientLaunchAgentLabel
+        ? { transientLaunchAgentLabel, transientLaunchAgentDomain, transientLaunchAgentPlist }
+        : {}),
     }, null, 2),
   );
 
@@ -1126,16 +1455,90 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
 
   if (input.spawnRunner) {
     input.spawnRunner(scriptPath, [configPath], scriptDir);
-  } else {
-    const child = spawn(process.execPath, [scriptPath, configPath], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
-    child.unref();
+    return { scriptDir, scriptPath, logFile, resultFile, isolationMode: 'custom' };
   }
 
-  return { scriptDir, scriptPath, logFile };
+  if (isolationMode === 'linux_systemd_run') {
+    const unitName = `imcodes-rt-switch-${nonce}`;
+    const args = buildLinuxSystemdRunSwitchArgs({
+      unitName,
+      nodeExe,
+      scriptPath,
+      configPath,
+      envOverrides,
+    });
+    try {
+      await runHost('systemd-run', args, { timeoutMs: 15_000, env });
+      return { scriptDir, scriptPath, logFile, resultFile, isolationMode };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`daemon_runtime_isolated_handoff_unavailable:linux_systemd_run:${msg}`);
+    }
+  }
+
+  if (isolationMode === 'win32_schtasks' && transientWindowsTask && transientTaskXmlPath && schtasksExe) {
+    try {
+      await runHost(schtasksExe, ['/Create', '/TN', transientWindowsTask, '/XML', transientTaskXmlPath, '/F'], {
+        timeoutMs: 15_000,
+        env,
+      });
+    } catch (err) {
+      try { unlinkSync(transientTaskXmlPath); } catch {}
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`daemon_runtime_isolated_handoff_unavailable:win32_schtasks_create:${msg}`);
+    }
+    try {
+      await runHost(schtasksExe, ['/Run', '/TN', transientWindowsTask], {
+        timeoutMs: 15_000,
+        env,
+      });
+      return { scriptDir, scriptPath, logFile, resultFile, isolationMode };
+    } catch (err) {
+      try {
+        await runHost(schtasksExe, ['/Delete', '/TN', transientWindowsTask, '/F'], {
+          timeoutMs: 10_000,
+          env,
+        });
+      } catch {
+        // preserve /Run error
+      }
+      try { unlinkSync(transientTaskXmlPath); } catch {}
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`daemon_runtime_isolated_handoff_unavailable:win32_schtasks_run:${msg}`);
+    }
+  }
+
+  if (isolationMode === 'darwin_launchd' && transientLaunchAgentDomain && transientLaunchAgentLabel && transientLaunchAgentPlist) {
+    try {
+      await runHost('launchctl', ['bootstrap', transientLaunchAgentDomain, transientLaunchAgentPlist], {
+        timeoutMs: 15_000,
+        env,
+      });
+      return { scriptDir, scriptPath, logFile, resultFile, isolationMode };
+    } catch (err) {
+      try {
+        await runHost('launchctl', ['bootout', `${transientLaunchAgentDomain}/${transientLaunchAgentLabel}`], {
+          timeoutMs: 10_000,
+          env,
+        });
+      } catch {
+        // preserve bootstrap error
+      }
+      try { unlinkSync(transientLaunchAgentPlist); } catch {}
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`daemon_runtime_isolated_handoff_unavailable:darwin_launchd:${msg}`);
+    }
+  }
+
+  const child = spawn(nodeExe, [scriptPath, configPath], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env,
+  });
+  child.unref();
+
+  return { scriptDir, scriptPath, logFile, resultFile, isolationMode: 'detached_process' };
 }
 
 /**
@@ -1540,7 +1943,7 @@ export async function upgradeBundledDaemonRuntime(
         targetVersion: targetVer,
       });
       try {
-        const launched = launchDetachedDaemonRuntimeSwitchRunner({
+        const launched = await launchDetachedDaemonRuntimeSwitchRunner({
           platform,
           runtimeRoot: writableResolution.targetRoot,
           stagedReleaseDir: releaseDir,
@@ -1548,7 +1951,7 @@ export async function upgradeBundledDaemonRuntime(
           previousVersion,
           previousNodePath: fallbackPreviousNodePath,
           previousEntryPath: fallbackPreviousEntryPath,
-          wasRunning: true,
+          wasRunning: options.wasRunning ?? Boolean(readVerifiedDaemonIdentity(stateDir, platform)),
           targetVersion: targetVer,
           stateDir,
           homeDir,
@@ -1557,6 +1960,8 @@ export async function upgradeBundledDaemonRuntime(
           lockOwnerToken: lockHandle.ownerToken,
           healthCheckTimeoutMs: options.healthCheckTimeoutMs,
           settleMs: options.settleMs,
+          requireIsolatedHost: options.requireIsolatedHost,
+          hostExecutor: options.switchRunnerHostExecutor,
           spawnRunner: options.spawnDetachedRunner,
         });
         lockHandedOff = true;
@@ -1571,9 +1976,21 @@ export async function upgradeBundledDaemonRuntime(
           writableRootKind: writableResolution.writableRootKind,
           rolledBack: false,
           detachedScriptDir: launched.scriptDir,
+          detachedIsolationMode: launched.isolationMode,
         };
       } catch (handoffErr) {
         lockHandedOff = false;
+        const msg = handoffErr instanceof Error ? handoffErr.message : String(handoffErr);
+        if (msg.startsWith('daemon_runtime_isolated_handoff_unavailable:')) {
+          if (!prevTargetForHandoff || resolve(releaseDir) !== resolve(prevTargetForHandoff)) {
+            rmSync(releaseDir, { recursive: true, force: true });
+          }
+          return {
+            status: 'blocked',
+            reason: 'isolated_handoff_unavailable',
+            message: `Refusing bundled daemon-runtime switch before pointer/service mutation because isolated OS lifecycle host failed: ${msg}`,
+          };
+        }
         throw handoffErr;
       }
     }

@@ -9803,6 +9803,7 @@ async function handleDaemonUpgrade(
       entryScriptPath: process.argv[1],
       allowLegacyCliFallback: true,
       detachedHandoff: true,
+      wasRunning: true,
     });
     if (bundledResult.status === 'upgraded') {
       logger.info({

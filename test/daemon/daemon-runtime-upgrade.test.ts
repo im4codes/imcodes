@@ -33,6 +33,9 @@ import {
   DAEMON_RUNTIME_SWITCH_STATE_FILE,
   UPGRADE_COOLDOWN_SENTINEL_FILE,
   acquireRuntimeUpgradeLock,
+  buildLinuxSystemdRunSwitchArgs,
+  buildMacosTransientLaunchAgentPlist,
+  buildWindowsSwitchRunnerTaskXml,
   inspectDaemonRuntimeMode,
   launchDetachedDaemonRuntimeSwitchRunner,
   readCurrentPointerTarget,
@@ -43,6 +46,7 @@ import {
   rollbackDaemonRuntimeCurrentPointer,
   stopVerifiedDaemon,
   switchDaemonRuntimeCurrentPointer,
+  transferRuntimeUpgradeLock,
   upgradeBundledDaemonRuntime,
 } from '../../src/daemon/daemon-runtime-upgrade.js';
 import {
@@ -52,9 +56,14 @@ import {
   psLiveness,
 } from '../../src/daemon/daemon-lock-identity.mjs';
 import { acquireInstanceLock, releaseInstanceLock } from '../../src/daemon/instance-lock.js';
-import { runDetachedPosixUpgrade, runDetachedWindowsUpgrade } from '../../src/cli/upgrade-detached.js';
+import {
+  followDetachedDaemonRuntimeSwitch,
+  runDetachedPosixUpgrade,
+  runDetachedWindowsUpgrade,
+} from '../../src/cli/upgrade-detached.js';
 import { inspectImcodesCliResolution, installImcodesCliWrapper } from '../../src/node/imcodes-cli-wrapper.js';
 import { discoverCodingDaemonRuntime } from '../../src/node/local-daemon-control.js';
+import { resolvePosixDaemonServicePaths } from '../../src/util/posix-daemon-service.js';
 import { buildPosixRestartCommand, buildPosixUpgradeScript } from '../../src/util/posix-upgrade-script.js';
 import { launchWindowsUpgrade } from '../../src/util/windows-upgrade-script.js';
 import { imcodesStateDirForHome } from '../../src/util/imcodes-state-dir.js';
@@ -716,7 +725,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
       { mode: 0o755 },
     );
     const scriptDirSleep = mkdtempSync(join(root, 'script-sleep-'));
-    const launchedSleep = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedSleep = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirSleep,
       platform: 'linux',
       runtimeRoot,
@@ -748,7 +757,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     const oldVerScript = join(root, 'old-ver-restart.sh');
     writeFakeDaemonScript(oldVerScript, stateDir, '1.1.0', true);
     const scriptDirOldVer = mkdtempSync(join(root, 'script-oldver-'));
-    const launchedOldVer = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedOldVer = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirOldVer,
       platform: 'linux',
       runtimeRoot,
@@ -781,7 +790,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     writeFakeDaemonScript(happyRestartScript, stateDir, '1.2.0', true);
 
     const scriptDirOk = mkdtempSync(join(root, 'script-ok-'));
-    const launchedOk = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedOk = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirOk,
       platform: 'linux',
       runtimeRoot,
@@ -818,7 +827,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
       { mode: 0o755 },
     );
     const scriptDirFail = mkdtempSync(join(root, 'script-fail-'));
-    const launchedFail = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedFail = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirFail,
       platform: 'linux',
       runtimeRoot,
@@ -1494,7 +1503,7 @@ esac
       { mode: 0o755 },
     );
     const detScriptDir = mkdtempSync(join(detRoot, 'script-'));
-    const launchedUnserviced = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedUnserviced = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: detScriptDir,
       platform: 'linux',
       runtimeRoot: detRuntime,
@@ -1533,7 +1542,7 @@ esac
     const alwaysFailScript = join(detRoot, 'always-fail.sh');
     writeFileSync(alwaysFailScript, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
     const detFailScriptDir = mkdtempSync(join(detRoot, 'script-rb-fail-'));
-    const launchedRbFail = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedRbFail = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: detFailScriptDir,
       platform: 'linux',
       runtimeRoot: detRuntime,
@@ -1564,7 +1573,7 @@ esac
     expect(swStateFail.phase).toBe('rollback_failed');
   });
 
-  it('[F4-R2] preserves migrated real-dir current target in detached switch/prune/rollback and recovers crash between renames', () => {
+  it('[F4-R2] preserves migrated real-dir current target in detached switch/prune/rollback and recovers crash between renames', async () => {
     const root = makeTempDir('imcodes-rt-f4r2-');
     const stateDir = join(root, 'state');
     mkdirSync(stateDir, { recursive: true });
@@ -1582,7 +1591,7 @@ esac
     const happyScript = join(root, 'happy-120.sh');
     writeFakeDaemonScript(happyScript, stateDir, '1.2.0', true);
     const scriptDirHappy = mkdtempSync(join(root, 'script-happy-'));
-    const launchedHappy = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedHappy = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirHappy,
       platform: 'linux',
       runtimeRoot,
@@ -1641,7 +1650,7 @@ esac
     const badVerScript = join(rootBad, 'bad-ver.sh');
     writeFakeDaemonScript(badVerScript, stateBad, '1.1.0', true);
     const scriptDirBad = mkdtempSync(join(rootBad, 'script-bad-'));
-    const launchedBad = launchDetachedDaemonRuntimeSwitchRunner({
+    const launchedBad = await launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirBad,
       platform: 'linux',
       runtimeRoot: rtBad,
@@ -1808,4 +1817,430 @@ esac
       nodeBin: join(customPrefix, 'node.exe'),
     });
   });
+
+  it('[F3-R3] dispatches isolated OS host (systemd-run / schtasks XML / launchctl bootstrap) and fails closed before pointer/service mutation', async () => {
+    // 1. Linux systemd unit: failing systemd-run fails closed BEFORE changing current pointer or unit file, and releases lock
+    const rootLinux = makeTempDir('imcodes-rt-f3r3-linux-');
+    const homeL = join(rootLinux, 'home');
+    const stateL = join(rootLinux, 'state');
+    const runtimeL = join(rootLinux, 'daemon-runtime');
+    const rel110 = join(runtimeL, 'releases', '1.1.0');
+    const curLayout = writeRunnableTree(rel110, '1.1.0');
+    switchDaemonRuntimeCurrentPointer(runtimeL, rel110, 'linux');
+    const svcPaths = resolvePosixDaemonServicePaths({ HOME: homeL, IMCODES_HOME: stateL });
+    mkdirSync(join(homeL, '.config', 'systemd', 'user'), { recursive: true });
+    const unitPath = join(homeL, '.config', 'systemd', 'user', svcPaths.systemdUnitName);
+    const origUnit = `[Service]\nExecStart=/opt/old/node /opt/old/index.js start --foreground\nKillMode=control-group\n`;
+    writeFileSync(unitPath, origUnit);
+
+    const build120 = makeTempDir('imcodes-rt-f3r3-build-');
+    const feed120 = makeTempDir('imcodes-rt-f3r3-feed-');
+    await buildRuntimeFeedArtifact(build120, '1.2.0', { archiveOut: { dir: feed120 } });
+
+    const failBlocked = await upgradeBundledDaemonRuntime({
+      platform: 'linux',
+      arch: process.arch,
+      currentVersion: '1.1.0',
+      execPath: curLayout.nodePath,
+      entryScriptPath: curLayout.entryPath,
+      userHome: homeL,
+      env: { HOME: homeL, IMCODES_HOME: stateL, PATH: process.env.PATH ?? '' },
+      runtimeRootOverride: runtimeL,
+      source: { kind: 'local', dir: feed120 },
+      detachedHandoff: true,
+      wasRunning: true,
+      switchRunnerHostExecutor: async () => {
+        throw new Error('systemd_dbus_unavailable');
+      },
+    });
+    expect(failBlocked).toMatchObject({ status: 'blocked', reason: 'isolated_handoff_unavailable' });
+    expect(realpathSync(join(runtimeL, 'current'))).toBe(realpathSync(rel110));
+    expect(readFileSync(unitPath, 'utf8')).toBe(origUnit);
+    expect(existsSync(join(runtimeL, 'releases', '1.2.0'))).toBe(false);
+    expect(existsSync(join(stateL, DAEMON_RUNTIME_LOCK_DIR_NAME))).toBe(false);
+
+    const capturedSystemdCalls: Array<{ file: string; args: string[] }> = [];
+    const okDispatch = await upgradeBundledDaemonRuntime({
+      platform: 'linux',
+      arch: process.arch,
+      currentVersion: '1.1.0',
+      execPath: curLayout.nodePath,
+      entryScriptPath: curLayout.entryPath,
+      userHome: homeL,
+      env: { HOME: homeL, IMCODES_HOME: stateL, PATH: process.env.PATH ?? '' },
+      runtimeRootOverride: runtimeL,
+      source: { kind: 'local', dir: feed120 },
+      detachedHandoff: true,
+      wasRunning: true,
+      switchRunnerHostExecutor: async (file, args) => {
+        capturedSystemdCalls.push({ file, args });
+        return { stdout: '', stderr: '' };
+      },
+    });
+    expect(okDispatch).toMatchObject({
+      status: 'upgraded',
+      detachedIsolationMode: 'linux_systemd_run',
+    });
+    expect(capturedSystemdCalls).toHaveLength(1);
+    expect(capturedSystemdCalls[0]!.file).toBe('systemd-run');
+    expect(capturedSystemdCalls[0]!.args).toEqual(
+      expect.arrayContaining(['--user', '--collect', '--quiet', '--property=Type=exec', `--setenv=IMCODES_HOME=${resolve(stateL)}`]),
+    );
+    releaseRuntimeUpgradeLock(stateL, undefined as unknown as string);
+    rmSync(join(stateL, DAEMON_RUNTIME_LOCK_DIR_NAME), { recursive: true, force: true });
+
+    // 2. Windows Task Scheduler XML (>261-char paths, no BootTrigger, InteractiveToken, /Create + /Run, cleanup on /Run fail)
+    const winRoot = makeTempDir('imcodes-rt-f3r3-win-');
+    const longNested = join(winRoot, 'very-long-segment-alpha-0123456789', 'very-long-segment-beta-0123456789', 'very-long-segment-gamma-0123456789', 'very-long-segment-delta-0123456789', 'very-long-segment-epsilon-0123456789');
+    mkdirSync(longNested, { recursive: true });
+    const winRt = join(winRoot, 'rt');
+    const win110 = join(winRt, 'releases', '1.1.0');
+    const win120 = join(winRt, 'releases', '1.2.0');
+    writeRunnableTree(win110, '1.1.0');
+    writeRunnableTree(win120, '1.2.0');
+    switchDaemonRuntimeCurrentPointer(winRt, win110, 'linux');
+    const winState = join(winRoot, 'state');
+    mkdirSync(winState, { recursive: true });
+
+    const winCalls: Array<{ file: string; args: string[]; xmlText?: string }> = [];
+    const winOk = await launchDetachedDaemonRuntimeSwitchRunner({
+      scriptDir: longNested,
+      platform: 'win32',
+      runtimeRoot: winRt,
+      stagedReleaseDir: win120,
+      previousTarget: win110,
+      targetVersion: '1.2.0',
+      stateDir: winState,
+      homeDir: winRoot,
+      env: { USERNAME: 'ciuser', USERDOMAIN: 'WINBOX' },
+      keepTargets: [win120, win110],
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      hostExecutor: async (file, args) => {
+        let xmlText: string | undefined;
+        const xmlIdx = args.indexOf('/XML');
+        if (xmlIdx >= 0 && args[xmlIdx + 1] && existsSync(args[xmlIdx + 1]!)) {
+          const buf = readFileSync(args[xmlIdx + 1]!);
+          expect(buf.subarray(0, 2).equals(Buffer.from([0xff, 0xfe]))).toBe(true);
+          xmlText = buf.subarray(2).toString('utf16le');
+        }
+        winCalls.push({ file, args, xmlText });
+        return { stdout: '', stderr: '' };
+      },
+    });
+    expect(winOk.isolationMode).toBe('win32_schtasks');
+    expect(winOk.scriptPath.length).toBeGreaterThan(220);
+    expect(winCalls).toHaveLength(2);
+    expect(winCalls[0]!.args.slice(0, 2)).toEqual(['/Create', '/TN']);
+    expect(winCalls[0]!.xmlText).toContain('<Triggers />');
+    expect(winCalls[0]!.xmlText).not.toContain('<BootTrigger>');
+    expect(winCalls[0]!.xmlText).toContain('<UserId>WINBOX\\ciuser</UserId>');
+    expect(winCalls[0]!.xmlText).toContain('<AllowStartOnDemand>true</AllowStartOnDemand>');
+    expect(winCalls[0]!.xmlText).toContain('switch-runner.mjs');
+    expect(winCalls[1]!.args.slice(0, 2)).toEqual(['/Run', '/TN']);
+
+    const winCleanupCalls: string[][] = [];
+    await expect(launchDetachedDaemonRuntimeSwitchRunner({
+      scriptDir: makeTempDir('imcodes-rt-f3r3-win-fail-'),
+      platform: 'win32',
+      runtimeRoot: winRt,
+      stagedReleaseDir: win120,
+      previousTarget: win110,
+      targetVersion: '1.2.0',
+      stateDir: winState,
+      homeDir: winRoot,
+      env: { USERNAME: 'ciuser', USERDOMAIN: 'WINBOX' },
+      keepTargets: [win120, win110],
+      hostExecutor: async (_file, args) => {
+        winCleanupCalls.push(args);
+        if (args[0] === '/Run') throw new Error('task_run_denied');
+        return { stdout: '', stderr: '' };
+      },
+    })).rejects.toThrow('daemon_runtime_isolated_handoff_unavailable:win32_schtasks_run');
+    expect(winCleanupCalls.map((a) => a[0])).toEqual(['/Create', '/Run', '/Delete']);
+
+    // 3. macOS LaunchAgent isolation: bootstrap fails closed before touching current/plist
+    const macRoot = makeTempDir('imcodes-rt-f3r3-mac-');
+    const macHome = join(macRoot, 'home');
+    const macState = join(macRoot, 'state');
+    const macSvc = resolvePosixDaemonServicePaths({ HOME: macHome, IMCODES_HOME: macState });
+    mkdirSync(join(macHome, 'Library', 'LaunchAgents'), { recursive: true });
+    const macPlist = join(macHome, 'Library', 'LaunchAgents', `${macSvc.launchAgentLabel}.plist`);
+    writeFileSync(macPlist, '<plist><dict><key>Label</key><string>x</string></dict></plist>');
+    const macRt = join(macRoot, 'rt');
+    const mac110 = join(macRt, 'releases', '1.1.0');
+    const mac120 = join(macRt, 'releases', '1.2.0');
+    writeRunnableTree(mac110, '1.1.0');
+    writeRunnableTree(mac120, '1.2.0');
+    switchDaemonRuntimeCurrentPointer(macRt, mac110, 'darwin');
+
+    const macCalls: string[][] = [];
+    await expect(launchDetachedDaemonRuntimeSwitchRunner({
+      platform: 'darwin',
+      runtimeRoot: macRt,
+      stagedReleaseDir: mac120,
+      previousTarget: mac110,
+      targetVersion: '1.2.0',
+      stateDir: macState,
+      homeDir: macHome,
+      env: { HOME: macHome, IMCODES_HOME: macState },
+      keepTargets: [mac120, mac110],
+      hostExecutor: async (_file, args) => {
+        macCalls.push(args);
+        if (args[0] === 'bootstrap') throw new Error('bootstrap_failed_5');
+        return { stdout: '', stderr: '' };
+      },
+    })).rejects.toThrow('daemon_runtime_isolated_handoff_unavailable:darwin_launchd');
+    expect(macCalls.map((a) => a[0])).toEqual(['bootstrap', 'bootout']);
+
+    // Pure helpers sanity check
+    expect(buildLinuxSystemdRunSwitchArgs({
+      unitName: 'imcodes-rt-switch-test',
+      nodeExe: '/usr/bin/node',
+      scriptPath: '/tmp/switch-runner.mjs',
+      configPath: '/tmp/runtime-upgrade.json',
+      envOverrides: { IMCODES_HOME: '/tmp/state dir' },
+    })).toEqual([
+      '--user',
+      '--unit=imcodes-rt-switch-test',
+      '--collect',
+      '--quiet',
+      '--property=Type=exec',
+      '--property=KillMode=process',
+      '--setenv=IMCODES_HOME=/tmp/state dir',
+      '/usr/bin/node',
+      '/tmp/switch-runner.mjs',
+      '/tmp/runtime-upgrade.json',
+    ]);
+    const samplePlist = buildMacosTransientLaunchAgentPlist({
+      label: 'imcodes.runtime-switch.1',
+      nodeExe: '/usr/local/bin/node',
+      scriptPath: '/tmp/switch-runner.mjs',
+      configPath: '/tmp/runtime-upgrade.json',
+      logFile: '/tmp/runtime-upgrade.log',
+      envOverrides: { IMCODES_HOME: '/tmp/mac-state' },
+    });
+    expect(samplePlist).toContain('<key>RunAtLoad</key>');
+    expect(samplePlist).toContain('<key>AbandonProcessGroup</key>');
+    expect(samplePlist).toContain('<key>IMCODES_HOME</key>');
+    expect(buildWindowsSwitchRunnerTaskXml({
+      nodeExe: 'C:\\node.exe',
+      scriptPath: 'C:\\s\\switch-runner.mjs',
+      configPath: 'C:\\s\\runtime-upgrade.json',
+    })).toContain('<Actions Context="Interactive">');
+  });
+
+  it('[F3-R3] causal spawn-chain isolation: runner spawned from old daemon survives kill-domain teardown for both good upgrade and bad-target rollback', async () => {
+    const waitUntil = async (pred: () => boolean, timeoutMs = 15_000): Promise<void> => {
+      const deadline = Date.now() + timeoutMs;
+      while (!pred()) {
+        if (Date.now() > deadline) throw new Error('waitUntil_timeout');
+        await new Promise((r) => setTimeout(r, 40));
+      }
+    };
+
+    let systemdUserAvailable = false;
+    if (process.platform === 'linux') {
+      try {
+        execFileSync('systemctl', ['--user', 'status'], { stdio: 'ignore', timeout: 3_000 });
+        systemdUserAvailable = true;
+      } catch {
+        systemdUserAvailable = false;
+      }
+    }
+
+    // 1. Counterexample: naive child spawned in old daemon's own process group/kill-domain is KILLED by kill -9 -<oldPid> before writing result!
+    const rootCe = makeTempDir('imcodes-rt-f3r3-ce-');
+    const ceDoneMarker = join(rootCe, 'ce-completed.txt');
+    const ceRunnerKilled = join(rootCe, 'ce-runner-started.txt');
+    const ceOldDaemon = spawn(
+      process.execPath,
+      [
+        '-e',
+        `
+          const { spawn } = require('node:child_process');
+          // Naive in-group child (simulating direct child / cgroup-bound runner without OS host isolation):
+          spawn(process.execPath, ['-e', 'require("node:fs").writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => { require("node:fs").writeFileSync(process.argv[2], "done"); }, 4000);', process.argv[1], process.argv[2]], { stdio: 'ignore' });
+          setInterval(() => {}, 1000);
+        `,
+        ceRunnerKilled,
+        ceDoneMarker,
+      ],
+      { detached: true, stdio: 'ignore' },
+    );
+    ceOldDaemon.unref();
+    await waitUntil(() => existsSync(ceRunnerKilled));
+    const ceRunnerPid = Number(readFileSync(ceRunnerKilled, 'utf8').trim());
+    // Sweep old daemon's entire kill domain (pgroup)
+    try { process.kill(-ceOldDaemon.pid!, 'SIGKILL'); } catch {}
+    await new Promise((r) => setTimeout(r, 250));
+    expect(() => process.kill(ceRunnerPid, 0)).toThrow();
+    expect(existsSync(ceDoneMarker)).toBe(false);
+
+    // 2. Causal isolated switch (good target 1.2.0 and bad target rollback):
+    // oldDaemon calls REAL launchDetachedDaemonRuntimeSwitchRunner inside its own kill-domain,
+    // restartCommand sends SIGKILL to -<oldDaemonPid> (sweeping oldDaemon's entire kill-domain!),
+    // yet isolated switch-runner SURVIVES and completes!
+    const runCausalScenario = async (opts: { badTarget: boolean }) => {
+      const root = makeTempDir(opts.badTarget ? 'imcodes-rt-f3r3-causal-bad-' : 'imcodes-rt-f3r3-causal-good-');
+      const stateDir = join(root, 'state');
+      mkdirSync(stateDir, { recursive: true });
+      const runtimeRoot = join(root, 'daemon-runtime');
+      const rel110 = join(runtimeRoot, 'releases', '1.1.0');
+      const rel120 = join(runtimeRoot, 'releases', '1.2.0');
+      const lay110 = writeRunnableTree(rel110, '1.1.0');
+      writeRunnableTree(rel120, '1.2.0');
+      switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, 'linux');
+
+      const lockHandle = acquireRuntimeUpgradeLock(stateDir, { mode: 'detached_handoff_pending' });
+      transferRuntimeUpgradeLock(stateDir, lockHandle.ownerToken, { mode: 'detached_handoff_pending', targetVersion: '1.2.0' });
+
+      const killDomainSweptMarker = join(root, 'kill-domain-swept.txt');
+      const restartWrapper = join(root, 'causal-restart.mjs');
+      const oldPidFile = join(root, 'old-daemon.pid');
+      writeFileSync(
+        restartWrapper,
+        `
+          import { appendFileSync, readFileSync, realpathSync } from 'node:fs';
+          import { spawn } from 'node:child_process';
+          import { join } from 'node:path';
+          const runtimeRoot = ${JSON.stringify(runtimeRoot)};
+          const stateDir = ${JSON.stringify(stateDir)};
+          const oldPid = Number(readFileSync(${JSON.stringify(oldPidFile)}, 'utf8').trim());
+          // Sweep old daemon's entire process group (kill domain)!
+          try { process.kill(-oldPid, 'SIGKILL'); } catch {}
+          appendFileSync(${JSON.stringify(killDomainSweptMarker)}, 'swept\\n');
+
+          const target = realpathSync(join(runtimeRoot, 'current'));
+          const isTarget120 = target === realpathSync(${JSON.stringify(rel120)});
+          const startVer = isTarget120 && ${opts.badTarget ? 'true' : 'false'} ? '1.1.0' : (isTarget120 ? '1.2.0' : '1.1.0');
+          const childScript = [
+            "const { writeFileSync, mkdirSync, readFileSync } = require('node:fs');",
+            "const { join } = require('node:path');",
+            "const dir = process.argv[1];",
+            "const ver = process.argv[2];",
+            "mkdirSync(dir, { recursive: true });",
+            "const stat = readFileSync('/proc/self/stat', 'utf8');",
+            "const startTime = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ')[19];",
+            "const now = Date.now();",
+            "writeFileSync(join(dir, 'daemon.pid'), String(process.pid) + String.fromCharCode(10));",
+            "writeFileSync(join(dir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken: 'linux:' + startTime, acquiredAt: now, socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [] }));",
+            "writeFileSync(join(dir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: ver, startedAt: now, socketPath: join(dir, 'daemon.sock') }));",
+            "setInterval(() => {}, 1000);",
+          ].join('; ');
+          const child = spawn(process.execPath, ['-e', childScript, stateDir, startVer], { detached: true, stdio: 'ignore' });
+          child.unref();
+        `,
+      );
+      const restartCmdScript = join(root, 'causal-restart.sh');
+      writeFileSync(restartCmdScript, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(restartWrapper)}\n`, { mode: 0o755 });
+
+      const launchedOutFile = join(root, 'launched-result.json');
+      const daemonModuleUrl = new URL('../../src/daemon/daemon-runtime-upgrade.ts', import.meta.url).href;
+
+      const oldDaemonScript = `
+        import { readFileSync, writeFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        import { spawn } from 'node:child_process';
+        const stateDir = ${JSON.stringify(stateDir)};
+        const stat = readFileSync('/proc/self/stat', 'utf8');
+        const startTime = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ')[19];
+        const now = Date.now();
+        writeFileSync(${JSON.stringify(oldPidFile)}, String(process.pid));
+        writeFileSync(join(stateDir, 'daemon.pid'), process.pid + '\\n');
+        writeFileSync(join(stateDir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken: 'linux:' + startTime, acquiredAt: now, socketPath: join(stateDir, 'daemon.sock'), sessionIds: [], residualResources: [] }));
+        writeFileSync(join(stateDir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: '1.1.0', startedAt: now, socketPath: join(stateDir, 'daemon.sock') }));
+
+        const mod = await import(${JSON.stringify(daemonModuleUrl)});
+        const useSystemd = ${systemdUserAvailable ? 'true' : 'false'};
+        const launched = await mod.launchDetachedDaemonRuntimeSwitchRunner({
+          platform: 'linux',
+          runtimeRoot: ${JSON.stringify(runtimeRoot)},
+          stagedReleaseDir: ${JSON.stringify(rel120)},
+          previousTarget: ${JSON.stringify(rel110)},
+          previousVersion: '1.1.0',
+          previousNodePath: ${JSON.stringify(lay110.nodePath)},
+          previousEntryPath: ${JSON.stringify(lay110.entryPath)},
+          wasRunning: true,
+          targetVersion: '1.2.0',
+          stateDir,
+          homeDir: ${JSON.stringify(root)},
+          env: { ...process.env, HOME: ${JSON.stringify(root)}, IMCODES_HOME: stateDir },
+          keepTargets: [${JSON.stringify(rel120)}, ${JSON.stringify(rel110)}],
+          lockOwnerToken: ${JSON.stringify(lockHandle.ownerToken)},
+          restartCommand: ${JSON.stringify(restartCmdScript)},
+          healthCheckTimeoutMs: 2000,
+          settleMs: 120,
+          requireIsolatedHost: useSystemd,
+          ...(!useSystemd ? {
+            spawnRunner: (scriptPath, args) => {
+              const c = spawn(process.execPath, [scriptPath, ...args], { detached: true, stdio: 'ignore' });
+              c.unref();
+            },
+          } : {}),
+        });
+        writeFileSync(${JSON.stringify(launchedOutFile)}, JSON.stringify(launched));
+        await new Promise(() => {});
+      `;
+
+      const oldDaemonProc = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '--eval', oldDaemonScript],
+        { detached: true, stdio: 'ignore' },
+      );
+      oldDaemonProc.unref();
+      try {
+        await waitUntil(() => existsSync(launchedOutFile), 20_000);
+        const launchedMeta = JSON.parse(readFileSync(launchedOutFile, 'utf8')) as {
+          scriptDir: string;
+          resultFile: string;
+          isolationMode: string;
+        };
+        if (systemdUserAvailable) {
+          expect(launchedMeta.isolationMode).toBe('linux_systemd_run');
+        }
+
+        const followCode = await followDetachedDaemonRuntimeSwitch(
+          {
+            scriptDir: launchedMeta.scriptDir,
+            targetVersion: '1.2.0',
+            runtimeRoot,
+            writableRootKind: 'in_place',
+          },
+          { pollMs: 50, followLimitMs: 20_000, write: () => {} },
+        );
+
+        // Old daemon MUST have been killed by its own restartCommand kill-domain sweep
+        expect(() => process.kill(oldDaemonProc.pid!, 0)).toThrow();
+        expect(existsSync(killDomainSweptMarker)).toBe(true);
+        // Runtime upgrade lock MUST be released by surviving switch-runner
+        expect(existsSync(join(stateDir, DAEMON_RUNTIME_LOCK_DIR_NAME))).toBe(false);
+
+        const finalIdentity = readVerifiedDaemonIdentity(stateDir, 'linux');
+        expect(finalIdentity).toBeTruthy();
+
+        if (opts.badTarget) {
+          expect(followCode).toBe(1);
+          expect(realpathSync(join(runtimeRoot, 'current'))).toBe(realpathSync(rel110));
+          expect(finalIdentity!.version).toBe('1.1.0');
+          const swState = JSON.parse(readFileSync(join(runtimeRoot, DAEMON_RUNTIME_SWITCH_STATE_FILE), 'utf8'));
+          expect(swState.phase).toBe('rolled_back');
+        } else {
+          expect(followCode).toBe(0);
+          expect(realpathSync(join(runtimeRoot, 'current'))).toBe(realpathSync(rel120));
+          expect(finalIdentity!.version).toBe('1.2.0');
+          expect(existsSync(join(stateDir, UPGRADE_COOLDOWN_SENTINEL_FILE))).toBe(true);
+        }
+        try { process.kill(finalIdentity!.pid, 'SIGKILL'); } catch {}
+      } finally {
+        try { process.kill(-oldDaemonProc.pid!, 'SIGKILL'); } catch {}
+        try {
+          const leftover = Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8').trim());
+          if (leftover > 0) process.kill(leftover, 'SIGKILL');
+        } catch {}
+      }
+    };
+
+    await runCausalScenario({ badTarget: false });
+    await runCausalScenario({ badTarget: true });
+  }, 60_000);
 });

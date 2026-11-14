@@ -1048,9 +1048,19 @@ program
         targetVersion: /^\d/.test(pkgTag) ? pkgTag : 'latest',
         entryScriptPath: process.argv[1],
         allowLegacyCliFallback: true,
-        detachedHandoff: false,
+        detachedHandoff: true,
       });
       if (res.status === 'upgraded') {
+        if (res.detachedScriptDir) {
+          const { followDetachedDaemonRuntimeSwitch } = await import('./cli/upgrade-detached.js');
+          const exitCode = await followDetachedDaemonRuntimeSwitch({
+            scriptDir: res.detachedScriptDir,
+            targetVersion: res.targetVersion,
+            runtimeRoot: res.runtimeRoot,
+            writableRootKind: res.writableRootKind,
+          });
+          process.exit(exitCode);
+        }
         console.log(`Upgraded daemon-runtime to v${res.targetVersion} (${res.writableRootKind}: ${res.runtimeRoot})`);
         process.exit(0);
       }

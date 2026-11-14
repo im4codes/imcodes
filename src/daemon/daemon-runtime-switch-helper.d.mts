@@ -115,6 +115,14 @@ export interface DetachedSwitchConfig {
   healthCheckTimeoutMs?: number;
   settleMs?: number;
   logFile?: string;
+  resultFile?: string;
+  envOverrides?: Record<string, string>;
+  transientWindowsTask?: string;
+  transientTaskXmlPath?: string;
+  schtasksExe?: string;
+  transientLaunchAgentLabel?: string;
+  transientLaunchAgentDomain?: string;
+  transientLaunchAgentPlist?: string;
 }
 
 export declare function sleepSync(ms: number): void;

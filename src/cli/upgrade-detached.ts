@@ -175,6 +175,50 @@ export function readWindowsUpgradeResult(logFile: string): UpgradeResult | null 
   return null;
 }
 
+/** How a bundled daemon-runtime detached switch runner ended (`switch-result.json`), or null while running. */
+export function readDaemonRuntimeSwitchResult(resultFile: string): UpgradeResult | null {
+  try {
+    const raw = JSON.parse(readFileSync(resultFile, 'utf8')) as { status?: unknown };
+    if (raw.status === 'ok') return 'ok';
+    if (raw.status === 'rolled_back') return 'rolled_back';
+    if (raw.status === 'failed') return 'failed';
+  } catch {
+    // not written yet
+  }
+  return null;
+}
+
+/**
+ * `imcodes upgrade` for bundled daemon-runtime layouts: hands off to the OS-isolated
+ * switch runner (same runner/host as daemon-triggered upgrade) and streams its log until completion.
+ */
+export async function followDetachedDaemonRuntimeSwitch(
+  input: {
+    scriptDir: string;
+    targetVersion: string;
+    runtimeRoot: string;
+    writableRootKind: string;
+  },
+  deps: {
+    write?: (line: string) => void;
+    pollMs?: number;
+    followLimitMs?: number;
+  } = {},
+): Promise<number> {
+  const write = deps.write ?? ((line: string) => { console.log(line); });
+  const logFile = join(input.scriptDir, 'runtime-upgrade.log');
+  const resultFile = join(input.scriptDir, 'switch-result.json');
+  write(`Daemon-runtime switch runner started in background (v${input.targetVersion}, ${input.writableRootKind}: ${input.runtimeRoot}). Log: ${logFile}`);
+  return followUpgrade({
+    logFile,
+    readResult: () => readDaemonRuntimeSwitchResult(resultFile),
+    childExited: () => false,
+    write,
+    pollMs: deps.pollMs ?? 250,
+    limit: Date.now() + (deps.followLimitMs ?? 120_000),
+  });
+}
+
 /**
  * `imcodes upgrade` on Windows: the same hand-off. The existing Windows runner (staged
  * alone into a scratch directory, started hidden through wscript) does the install, the
