@@ -242,6 +242,103 @@ describe('onlyoffice-preload', () => {
     expect((finalFrames[0] as HTMLIFrameElement).src).toBe(`${publicB}/web-apps/apps/api/documents/preload.html`);
   });
 
+  it('repairs and isolates late-executing stale script globals across success, blank-200 failure, and same-URL retry (F2 R2)', async () => {
+    const urlA = 'https://office-a.example/onlyoffice/web-apps/apps/api/documents/api.js';
+    const urlB = 'https://office-b.example/onlyoffice/web-apps/apps/api/documents/api.js';
+
+    // Timing 1: A in-flight -> reset -> B succeeds -> A executes late overwriting window.DocsAPI -> B remains authoritative without extra request
+    const EditorA1 = class EditorA1 {};
+    const EditorB1 = class EditorB1 {};
+    const loadA1 = loadOnlyOfficeScript(urlA);
+    const scriptA1 = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+    expect(scriptA1?.dataset.onlyofficeSrc).toBe(urlA);
+
+    resetOnlyOfficePrewarm();
+    const loadB1 = loadOnlyOfficeScript(urlB);
+    const scriptB1 = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+    expect(scriptB1?.dataset.onlyofficeSrc).toBe(urlB);
+
+    const docsApiB1 = { DocEditor: EditorB1 };
+    (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = docsApiB1;
+    scriptB1?.onload?.(new Event('load'));
+    await expect(loadB1).resolves.toBeUndefined();
+
+    // Late A1 executes after B1 already resolved
+    (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: EditorA1 };
+    scriptA1?.onload?.(new Event('load'));
+    await expect(loadA1).rejects.toThrow('Stale ONLYOFFICE API script load superseded');
+    expect(window.DocsAPI?.DocEditor).toBe(EditorB1);
+
+    // Even if window.DocsAPI is later corrupted before a same-generation loadOnlyOfficeScript(urlB), cached binding heals without adding another script tag
+    (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: EditorA1 };
+    await expect(loadOnlyOfficeScript(urlB)).resolves.toBeUndefined();
+    expect(window.DocsAPI?.DocEditor).toBe(EditorB1);
+    expect(document.querySelectorAll('script[data-onlyoffice-src]')).toHaveLength(1);
+
+    // Timing 2: A in-flight -> reset -> B in-flight -> A executes late -> B finishes with blank 200 (no DocsAPI write) -> B must reject and allow retry
+    resetOnlyOfficePrewarm();
+    const EditorA2 = class EditorA2 {};
+    const EditorB2 = class EditorB2 {};
+    const loadA2 = loadOnlyOfficeScript(urlA);
+    const scriptA2 = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+
+    resetOnlyOfficePrewarm();
+    const loadB2 = loadOnlyOfficeScript(urlB);
+    const scriptB2 = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+    expect(scriptB2?.dataset.onlyofficeSrc).toBe(urlB);
+
+    // A2 executes while B2 is still pending
+    (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: EditorA2 };
+    scriptA2?.onload?.(new Event('load'));
+    await expect(loadA2).rejects.toThrow('Stale ONLYOFFICE API script load superseded');
+    expect((window as unknown as { DocsAPI?: unknown }).DocsAPI).toBeUndefined();
+
+    // B2 responds blank without setting window.DocsAPI
+    scriptB2?.onload?.(new Event('load'));
+    await expect(loadB2).rejects.toThrow('ONLYOFFICE API script loaded without DocsAPI.DocEditor');
+
+    // Retry for B loads a fresh script and succeeds with EditorB2
+    const retryB2 = loadOnlyOfficeScript(urlB);
+    const retryScriptB2 = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+    expect(retryScriptB2).not.toBe(scriptB2);
+    (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: EditorB2 };
+    retryScriptB2?.onload?.(new Event('load'));
+    await expect(retryB2).resolves.toBeUndefined();
+    expect(window.DocsAPI?.DocEditor).toBe(EditorB2);
+
+    // Timing 3: Pre-existing unverified global DocsAPI must NOT bypass loadOnlyOfficeScript
+    resetOnlyOfficePrewarm();
+    const UntrustedEditor = class UntrustedEditor {};
+    (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: UntrustedEditor };
+    const loadUntrusted = loadOnlyOfficeScript(urlB);
+    const scriptUntrusted = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+    expect(scriptUntrusted).not.toBeNull();
+    expect((window as unknown as { DocsAPI?: unknown }).DocsAPI).toBeUndefined();
+    scriptUntrusted?.onload?.(new Event('load'));
+    await expect(loadUntrusted).rejects.toThrow('ONLYOFFICE API script loaded without DocsAPI.DocEditor');
+
+    // Timing 4: Same-URL reset followed by stale onerror must not clear the active second-generation load record
+    resetOnlyOfficePrewarm();
+    const sameUrlFirst = loadOnlyOfficeScript(urlA);
+    const firstTag = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+    resetOnlyOfficePrewarm();
+    const sameUrlSecond = loadOnlyOfficeScript(urlA);
+    const secondTag = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+    expect(secondTag).not.toBe(firstTag);
+
+    firstTag?.onerror?.(new Event('error'));
+    await expect(sameUrlFirst).rejects.toThrow('Failed to load ONLYOFFICE API script');
+
+    // Concurrent call during second generation still deduplicates onto secondTag instead of starting a third load
+    const sameUrlSecondConcurrent = loadOnlyOfficeScript(urlA);
+    expect(document.querySelectorAll('script[data-onlyoffice-src]')).toHaveLength(1);
+    const EditorA3 = class EditorA3 {};
+    (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: EditorA3 };
+    secondTag?.onload?.(new Event('load'));
+    await Promise.all([sameUrlSecond, sameUrlSecondConcurrent]);
+    expect(window.DocsAPI?.DocEditor).toBe(EditorA3);
+  });
+
   it('supports deferred scheduling and cancellation on logout before idle trigger', async () => {
     vi.useFakeTimers();
     apiMockState.fetchOnlyOfficeStatus.mockResolvedValue({ enabled: false });

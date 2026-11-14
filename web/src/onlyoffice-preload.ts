@@ -18,15 +18,65 @@ declare global {
   }
 }
 
-const scriptLoadPromises = new Map<string, Promise<void>>();
+type VerifiedDocsApiBinding = {
+  scriptUrl: string;
+  epoch: number;
+  docsApi: NonNullable<Window['DocsAPI']>;
+  docEditor: NonNullable<Window['DocsAPI']>['DocEditor'];
+};
+
+type ActiveScriptLoad = {
+  scriptUrl: string;
+  epoch: number;
+  promise: Promise<void>;
+  tag: HTMLScriptElement;
+};
+
 let prewarmPromise: Promise<void> | null = null;
 let prewarmSeq = 0;
 let loaderEpoch = 0;
-let activeTargetUrl: string | null = null;
-let loadedScriptUrl: string | null = null;
-let loadedDocEditor: unknown = null;
-let staleDocEditor: unknown = null;
+let verifiedBinding: VerifiedDocsApiBinding | null = null;
+let activeLoad: ActiveScriptLoad | null = null;
 let cachedStatus: OnlyOfficeStatusResponse | null = null;
+const staleDocsApis = new WeakSet<object>();
+const staleDocEditors = new WeakSet<object>();
+
+function markDocsApiStale(docsApi: Window['DocsAPI'] | undefined): void {
+  if (!docsApi || typeof docsApi !== 'object') return;
+  staleDocsApis.add(docsApi);
+  if (typeof docsApi.DocEditor === 'function') {
+    staleDocEditors.add(docsApi.DocEditor);
+  }
+}
+
+function clearGlobalDocsApi(): void {
+  if (typeof window === 'undefined') return;
+  markDocsApiStale(window.DocsAPI);
+  try {
+    delete window.DocsAPI;
+  } catch {
+    window.DocsAPI = undefined;
+  }
+}
+
+function restoreVerifiedDocsApi(binding: VerifiedDocsApiBinding): void {
+  if (typeof window === 'undefined') return;
+  if (binding.docsApi.DocEditor !== binding.docEditor) {
+    binding.docsApi = { ...binding.docsApi, DocEditor: binding.docEditor };
+  }
+  window.DocsAPI = binding.docsApi;
+}
+
+function invalidateLoaderState(): void {
+  loaderEpoch += 1;
+  if (verifiedBinding) {
+    markDocsApiStale(verifiedBinding.docsApi);
+    staleDocEditors.add(verifiedBinding.docEditor);
+    verifiedBinding = null;
+  }
+  activeLoad = null;
+  clearGlobalDocsApi();
+}
 
 function resolveOrigin(url: string): string | null {
   try {
@@ -112,91 +162,112 @@ function removeManagedDomNodes(): void {
  * On load failure or missing initialization, evicts failed cache/tag state so retries start fresh.
  */
 export function loadOnlyOfficeScript(scriptUrl: string): Promise<void> {
-  const liveEditor = typeof window !== 'undefined' ? window.DocsAPI?.DocEditor : undefined;
-  if (typeof liveEditor === 'function' && liveEditor !== staleDocEditor) {
-    if (loadedScriptUrl === scriptUrl && liveEditor === loadedDocEditor) {
-      return Promise.resolve();
+  if (
+    verifiedBinding &&
+    verifiedBinding.scriptUrl === scriptUrl &&
+    verifiedBinding.epoch === loaderEpoch
+  ) {
+    if (
+      typeof window !== 'undefined' &&
+      (window.DocsAPI !== verifiedBinding.docsApi || window.DocsAPI?.DocEditor !== verifiedBinding.docEditor)
+    ) {
+      restoreVerifiedDocsApi(verifiedBinding);
     }
-    if (loadedScriptUrl === null && activeTargetUrl === null) {
-      // Pre-injected outside this loader (e.g. unit test doubles) with no URL conflict.
-      return Promise.resolve();
-    }
+    return Promise.resolve();
   }
 
-  const existing = scriptLoadPromises.get(scriptUrl);
-  if (existing) return existing;
-
-  if (activeTargetUrl !== scriptUrl || (loadedScriptUrl !== null && loadedScriptUrl !== scriptUrl)) {
-    loaderEpoch += 1;
-    activeTargetUrl = scriptUrl;
-    if (loadedScriptUrl !== null && loadedScriptUrl !== scriptUrl) {
-      staleDocEditor = loadedDocEditor ?? staleDocEditor;
-      loadedScriptUrl = null;
-      loadedDocEditor = null;
-    }
-    scriptLoadPromises.clear();
+  if (activeLoad && activeLoad.scriptUrl === scriptUrl && activeLoad.epoch === loaderEpoch) {
+    return activeLoad.promise;
   }
+
+  if (typeof document === 'undefined') {
+    invalidateLoaderState();
+    return Promise.reject(new Error('Document is unavailable'));
+  }
+
+  invalidateLoaderState();
+  removeManagedScriptTags();
 
   const epoch = loaderEpoch;
+  const script = document.createElement('script');
+  script.src = scriptUrl;
+  script.async = true;
+  script.dataset.onlyofficeSrc = scriptUrl;
+
+  let resolveLoad!: () => void;
+  let rejectLoad!: (error: Error) => void;
   const promise = new Promise<void>((resolve, reject) => {
-    if (typeof document === 'undefined') {
-      if (scriptLoadPromises.get(scriptUrl) === promise) {
-        scriptLoadPromises.delete(scriptUrl);
+    resolveLoad = resolve;
+    rejectLoad = reject;
+  });
+
+  const record: ActiveScriptLoad = {
+    scriptUrl,
+    epoch,
+    promise,
+    tag: script,
+  };
+  activeLoad = record;
+
+  script.onload = () => {
+    if (record.epoch !== loaderEpoch || activeLoad !== record) {
+      // Stale script finished late after reset/switch: repair current verified binding or wipe untrusted global state.
+      const currentDocsApi = typeof window !== 'undefined' ? window.DocsAPI : undefined;
+      if (verifiedBinding && verifiedBinding.epoch === loaderEpoch) {
+        if (currentDocsApi && currentDocsApi !== verifiedBinding.docsApi) {
+          markDocsApiStale(currentDocsApi);
+        } else if (
+          currentDocsApi?.DocEditor &&
+          currentDocsApi.DocEditor !== verifiedBinding.docEditor
+        ) {
+          staleDocEditors.add(currentDocsApi.DocEditor);
+        }
+        if (currentDocsApi !== verifiedBinding.docsApi || currentDocsApi?.DocEditor !== verifiedBinding.docEditor) {
+          restoreVerifiedDocsApi(verifiedBinding);
+        }
+      } else {
+        clearGlobalDocsApi();
       }
-      if (activeTargetUrl === scriptUrl) activeTargetUrl = null;
-      reject(new Error('Document is unavailable'));
+      script.remove();
+      rejectLoad(new Error('Stale ONLYOFFICE API script load superseded'));
       return;
     }
 
+    const docsApi = typeof window !== 'undefined' ? window.DocsAPI : undefined;
+    const docEditor = docsApi?.DocEditor;
     if (
-      typeof window !== 'undefined' &&
-      window.DocsAPI?.DocEditor &&
-      (window.DocsAPI.DocEditor === staleDocEditor || window.DocsAPI.DocEditor === loadedDocEditor)
+      !docsApi ||
+      typeof docsApi !== 'object' ||
+      typeof docEditor !== 'function' ||
+      staleDocsApis.has(docsApi) ||
+      staleDocEditors.has(docEditor)
     ) {
-      delete window.DocsAPI;
+      activeLoad = null;
+      clearGlobalDocsApi();
+      script.remove();
+      rejectLoad(new Error('ONLYOFFICE API script loaded without DocsAPI.DocEditor'));
+      return;
     }
 
-    removeManagedScriptTags();
-    const script = document.createElement('script');
-    script.src = scriptUrl;
-    script.async = true;
-    script.dataset.onlyofficeSrc = scriptUrl;
-    script.onload = () => {
-      if (epoch !== loaderEpoch) {
-        if (scriptLoadPromises.get(scriptUrl) === promise) {
-          scriptLoadPromises.delete(scriptUrl);
-        }
-        script.remove();
-        reject(new Error('Stale ONLYOFFICE API script load superseded'));
-        return;
-      }
-      const initializedEditor = typeof window !== 'undefined' ? window.DocsAPI?.DocEditor : undefined;
-      if (typeof initializedEditor !== 'function' || initializedEditor === staleDocEditor) {
-        if (scriptLoadPromises.get(scriptUrl) === promise) {
-          scriptLoadPromises.delete(scriptUrl);
-        }
-        if (activeTargetUrl === scriptUrl) activeTargetUrl = null;
-        script.remove();
-        reject(new Error('ONLYOFFICE API script loaded without DocsAPI.DocEditor'));
-        return;
-      }
-      loadedScriptUrl = scriptUrl;
-      loadedDocEditor = initializedEditor;
-      staleDocEditor = null;
-      resolve();
+    activeLoad = null;
+    verifiedBinding = {
+      scriptUrl,
+      epoch,
+      docsApi,
+      docEditor,
     };
-    script.onerror = () => {
-      if (scriptLoadPromises.get(scriptUrl) === promise) {
-        scriptLoadPromises.delete(scriptUrl);
-      }
-      if (activeTargetUrl === scriptUrl) activeTargetUrl = null;
-      script.remove();
-      reject(new Error('Failed to load ONLYOFFICE API script'));
-    };
-    document.head.appendChild(script);
-  });
+    resolveLoad();
+  };
 
-  scriptLoadPromises.set(scriptUrl, promise);
+  script.onerror = () => {
+    if (activeLoad === record) {
+      activeLoad = null;
+    }
+    script.remove();
+    rejectLoad(new Error('Failed to load ONLYOFFICE API script'));
+  };
+
+  document.head.appendChild(script);
   return promise;
 }
 
@@ -273,19 +344,13 @@ export function scheduleOnlyOfficePrewarm(): () => void {
 /** Clear cached prewarm state and invalidate prior script bindings on auth switch/logout or inside tests. */
 export function resetOnlyOfficePrewarm(opts?: { clearScriptCache?: boolean; removeDomNodes?: boolean }): void {
   prewarmSeq += 1;
-  loaderEpoch += 1;
   prewarmPromise = null;
   cachedStatus = null;
-  activeTargetUrl = null;
-  const previousEditor =
-    loadedDocEditor ?? (loadedScriptUrl !== null && typeof window !== 'undefined' ? window.DocsAPI?.DocEditor : null);
-  if (previousEditor) {
-    staleDocEditor = previousEditor;
-  }
-  loadedScriptUrl = null;
-  loadedDocEditor = null;
   if (opts?.clearScriptCache !== false) {
-    scriptLoadPromises.clear();
+    invalidateLoaderState();
+  } else {
+    loaderEpoch += 1;
+    activeLoad = null;
   }
   if (opts?.removeDomNodes !== false) {
     removeManagedDomNodes();

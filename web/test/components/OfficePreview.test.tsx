@@ -27,6 +27,22 @@ function installFetchStub(bytes = new Uint8Array([0, 0]).buffer): void {
   })));
 }
 
+/** Simulates browser api.js execution + onload when loadOnlyOfficeScript appends a script tag in jsdom. */
+function installOnlyOfficeScriptLoadMock(docEditor: unknown): ReturnType<typeof vi.spyOn> {
+  const originalAppend = document.head.appendChild.bind(document.head);
+  return vi.spyOn(document.head, 'appendChild').mockImplementation((node: Node) => {
+    const res = originalAppend(node);
+    const el = node as HTMLScriptElement;
+    if (el.tagName === 'SCRIPT' && el.dataset?.onlyofficeSrc) {
+      setTimeout(() => {
+        (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: docEditor };
+        el.onload?.(new Event('load'));
+      }, 0);
+    }
+    return res;
+  });
+}
+
 const pdfjsApi = vi.hoisted(() => ({
   GlobalWorkerOptions: { workerSrc: '' },
   getDocument: vi.fn(),
@@ -241,9 +257,12 @@ describe('OfficePreview — XLSX sanitization', () => {
 describe('OfficePreview — Embedded ONLYOFFICE & permission controls', () => {
   const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanup();
+    const { resetOnlyOfficePrewarm } = await import('../../src/onlyoffice-preload.js');
+    resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
     delete (window as unknown as { DocsAPI?: unknown }).DocsAPI;
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -251,9 +270,7 @@ describe('OfficePreview — Embedded ONLYOFFICE & permission controls', () => {
     const docEditorSpy = vi.fn().mockImplementation(() => ({
       destroyEditor: vi.fn(),
     }));
-    (window as unknown as { DocsAPI: { DocEditor: typeof docEditorSpy } }).DocsAPI = {
-      DocEditor: docEditorSpy,
-    };
+    installOnlyOfficeScriptLoadMock(docEditorSpy);
 
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const urlStr = String(input);
@@ -452,9 +469,7 @@ describe('OfficePreview — Embedded ONLYOFFICE & permission controls', () => {
     // Switching to another document resets forceLocal so ONLYOFFICE editor mounts when DocsAPI is available
     appendSpy.mockRestore();
     const docEditorSpy = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
-    (window as unknown as { DocsAPI: { DocEditor: typeof docEditorSpy } }).DocsAPI = {
-      DocEditor: docEditorSpy,
-    };
+    installOnlyOfficeScriptLoadMock(docEditorSpy);
 
     rerender(
       <OfficePreview
@@ -930,13 +945,9 @@ describe('OfficePreview fallback document transitions', () => {
       },
     } as unknown as Awaited<ReturnType<typeof api.fetchCloudDocOnlyOfficeConfig>>);
 
-    const script = document.createElement('script');
-    script.src = 'https://onlyoffice.test/web-apps/apps/api/documents/api.js';
-    document.head.appendChild(script);
     const originalDocsApi = window.DocsAPI;
-    window.DocsAPI = {
-      DocEditor: vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() })),
-    };
+    const toolbarEditorSpy = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+    const scriptSpy = installOnlyOfficeScriptLoadMock(toolbarEditorSpy);
 
     try {
       const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
@@ -980,7 +991,7 @@ describe('OfficePreview fallback document transitions', () => {
       expect(mobileCss).toContain('.office-preview-btn-label {\n    display: none;\n  }');
     } finally {
       window.DocsAPI = originalDocsApi;
-      script.remove();
+      scriptSpy.mockRestore();
     }
   });
 
