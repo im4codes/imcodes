@@ -494,7 +494,10 @@ describe('Windows zip PowerShell -File invocation without -Command/$args', () =>
     expect(artifactsSrc).not.toMatch(/\$args\[\d+\]/);
     expect(ps1Src).toContain("ValidateSet('Expand', 'Compress')");
     expect(ps1Src).toContain('Expand-Archive -LiteralPath $SourcePath -DestinationPath $DestinationPath -Force');
-    expect(ps1Src).toContain('Compress-Archive -LiteralPath ($Items | ForEach-Object { $_.FullName }) -DestinationPath $DestinationPath -CompressionLevel Optimal -Force');
+    expect(ps1Src).not.toContain('Compress-Archive');
+    expect(ps1Src).toContain('[System.IO.Compression.ZipFile]::Open');
+    expect(ps1Src).toContain('[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile');
+    expect(ps1Src).toContain(".Replace('\\', '/')");
   });
 
   it('passes literal -File script arguments with spaces and single quotes under win32', () => {
