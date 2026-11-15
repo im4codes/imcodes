@@ -22,14 +22,14 @@ import type { SessionInfoUpdate, ToolCallEvent } from '../../src/agent/transport
 
 const resources: Array<{ provider: AgyAcpProvider; root: string }> = [];
 afterEach(async () => { for (const { provider, root } of resources.splice(0)) { await provider.disconnect(); await rm(root, { recursive: true, force: true }); } vi.unstubAllEnvs(); });
-async function setup(scenario = '') {
+async function setup(scenario = '', extraEnv: Record<string, string> = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-acp-'));
   const binary = path.join(root, 'agy');
   const fixture = path.resolve('test/fixtures/agy-acp.mjs');
   await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${fixture}' "$@"\n`, { mode: 0o700 });
   const provider = new AgyAcpProvider(); resources.push({ provider, root });
   const log = path.join(root, 'rpc.jsonl');
-  await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: log, AGY_ACP_FIXTURE_SCENARIO: scenario } });
+  await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: log, AGY_ACP_FIXTURE_SCENARIO: scenario, ...extraEnv } });
   const requests = async () => (await readFile(log, 'utf8').catch(e => e?.code === 'ENOENT' ? '' : Promise.reject(e))).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   return { provider, root, binary, requests };
 }
@@ -2280,5 +2280,189 @@ rl.on('line', (line) => {
 
     await provider.endSession(idIncog);
     expect(incogState?.disposed).toBe(true);
+  });
+});
+
+describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
+  it('delivers sessionSystemText via session/new _meta, omits it from session/prompt and /compact, and never logs identity text', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    const debugSpy = vi.spyOn(logger, 'debug');
+    const warnSpy = vi.spyOn(logger, 'warn');
+    const errorSpy = vi.spyOn(logger, 'error');
+    try {
+      const { provider, requests } = await setup('usage-missing', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+      const id = await route(provider);
+      const complete = vi.fn();
+      provider.onComplete(complete);
+
+      const identityPayload = '<imcodes-agent-identity>\nSECRET_META_IDENTITY_TOKEN_991\n' + 'padding '.repeat(80) + '</imcodes-agent-identity>';
+      const makePayload = (msg: string) => {
+        const p = normalizeProviderPayload(msg);
+        p.sessionSystemText = identityPayload;
+        p.context = { ...p.context, sessionSystemText: identityPayload };
+        return p;
+      };
+
+      await provider.send(id, makePayload('A'));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect(complete.mock.calls[0]?.[1]?.metadata?.usage).toMatchObject({ context_usage_estimated: true });
+      expect(Number(complete.mock.calls[0]?.[1]?.metadata?.usage?.input_tokens)).toBeGreaterThan(50);
+
+      await provider.send(id, makePayload('/compact'));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+      await provider.send(id, makePayload('after compact'));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+      const reqs = await requests();
+      const newReq = reqs.find((x) => x.method === 'session/new');
+      expect(newReq?.params?._meta).toEqual({
+        antigravity: { systemPrompt: { append: identityPayload } },
+      });
+      expect(reqs.filter((x) => x.method === 'session/resume')).toHaveLength(0);
+
+      const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+      expect(prompts).toEqual(['A', '/compact', 'after compact']);
+      for (const promptText of prompts) {
+        expect(promptText).not.toContain('<imcodes-agent-identity>');
+        expect(promptText).not.toContain('SECRET_META_IDENTITY_TOKEN_991');
+      }
+
+      for (const spy of [infoSpy, debugSpy, warnSpy, errorSpy]) {
+        for (const call of spy.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain('SECRET_META_IDENTITY_TOKEN_991');
+        }
+      }
+    } finally {
+      infoSpy.mockRestore();
+      debugSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('delivers sessionSystemText via session/resume _meta on reconnect and keeps session/prompt clean', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_resume', { resumeId: 'saved-meta-1' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const identityPayload = '<imcodes-agent-identity>RESUMED_IDENTITY_77</imcodes-agent-identity>';
+    const p = normalizeProviderPayload('resumed hello');
+    p.sessionSystemText = identityPayload;
+    p.context = { ...p.context, sessionSystemText: identityPayload };
+
+    await provider.send(id, p);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const reqs = await requests();
+    const resumeReq = reqs.find((x) => x.method === 'session/resume');
+    expect(resumeReq?.params?.sessionId).toBe('saved-meta-1');
+    expect(resumeReq?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: identityPayload } },
+    });
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['resumed hello']);
+  });
+
+  it('refreshes, updates, and clears mid-session identity via session/resume _meta without leaking into session/prompt', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_mid_refresh');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const makePayload = (msg: string, sys?: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    const id1 = '<imcodes-agent-identity>IDENTITY_V1</imcodes-agent-identity>';
+    const id2 = '<imcodes-agent-identity>IDENTITY_V2</imcodes-agent-identity>';
+
+    await provider.send(id, makePayload('turn-1', id1));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-2-refresh', id1));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    await provider.send(id, makePayload('turn-3-update', id2));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+    await provider.send(id, makePayload('turn-4-clear', ''));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4), { timeout: 5000 });
+
+    await provider.send(id, makePayload('turn-5-still-empty', ''));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(5), { timeout: 5000 });
+
+    const reqs = await requests();
+    const newReq = reqs.find((x) => x.method === 'session/new');
+    expect(newReq?.params?._meta).toEqual({ antigravity: { systemPrompt: { append: id1 } } });
+
+    const resumes = reqs.filter((x) => x.method === 'session/resume');
+    expect(resumes.map((r) => r.params?._meta?.antigravity?.systemPrompt?.append)).toEqual([id1, id2, '']);
+
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['turn-1', 'turn-2-refresh', 'turn-3-update', 'turn-4-clear', 'turn-5-still-empty']);
+  });
+
+  it('omits _meta when sessionSystemText is initially empty and guards incognito from session/resume', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_empty');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    await provider.send(id, 'empty-1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await provider.send(id, 'empty-2');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const incogId = await route(provider, 'deck_test_meta_incog', { incognito: true });
+    const incogP1 = normalizeProviderPayload('incog-1');
+    incogP1.sessionSystemText = '<imcodes-agent-identity>INCOG_V1</imcodes-agent-identity>';
+    incogP1.context = { ...incogP1.context, sessionSystemText: incogP1.sessionSystemText };
+    await provider.send(incogId, incogP1);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+    const incogP2 = normalizeProviderPayload('incog-2');
+    incogP2.sessionSystemText = '<imcodes-agent-identity>INCOG_V2</imcodes-agent-identity>';
+    incogP2.context = { ...incogP2.context, sessionSystemText: incogP2.sessionSystemText };
+    await provider.send(incogId, incogP2);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4), { timeout: 5000 });
+
+    const reqs = await requests();
+    const newReqs = reqs.filter((x) => x.method === 'session/new');
+    expect(newReqs[0]?.params?._meta).toBeUndefined();
+    expect(newReqs[1]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: '<imcodes-agent-identity>INCOG_V1</imcodes-agent-identity>' } },
+    });
+    expect(reqs.filter((x) => x.method === 'session/resume')).toHaveLength(0);
+
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts[0]).toBe('empty-1');
+    expect(prompts[1]).toBe('empty-2');
+    expect(prompts[2]).toBe('incog-1');
+    expect(prompts[3]).toContain('INCOG_V2');
+  });
+
+  it('matches AgyForegroundOwnership cleanly against promptText without sessionSystemText', async () => {
+    const { provider, requests } = await setup('native-steering', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = await route(provider, 'deck_test_meta_foreground');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const p = normalizeProviderPayload('CLEAN_FOREGROUND_A');
+    p.sessionSystemText = '<imcodes-agent-identity>FOREGROUND_IDENTITY</imcodes-agent-identity>';
+    p.context = { ...p.context, sessionSystemText: p.sessionSystemText };
+
+    await provider.send(id, p);
+    await provider.notifyActiveDelegation(id, notification('CLEAN_FOREGROUND_B'));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0]?.[1]?.content).toBe('STEERED OWNED RESULT');
+
+    const prompts = (await requests()).filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['CLEAN_FOREGROUND_A', 'CLEAN_FOREGROUND_B']);
   });
 });

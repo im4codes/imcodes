@@ -3,6 +3,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 const logPath = process.env.AGY_ACP_FIXTURE_LOG;
 const scenario = process.env.AGY_ACP_FIXTURE_SCENARIO || '';
+const systemPromptMetaEnabled = process.env.AGY_ACP_FIXTURE_SYSTEM_PROMPT_META === '1';
 const sessions = new Map(); let nextId = 0; let modelAttempts = 0;
 const send = obj => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...obj }) + '\n');
 const ok = (id, result = {}) => send({ id, result });
@@ -90,7 +91,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         try { fs.unlinkSync(logPath + '.worker-enoent-clear-on-init'); } catch {}
       }
       record({ fixture: 'boot', pid: process.pid, version: process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4' });
-      return ok(req.id, { protocolVersion: 1, agentInfo: { name: process.env.AGY_ACP_FIXTURE_AGENT_NAME, version: process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4' }, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {}, list: {} } } });
+      const agentCapabilities = {
+        loadSession: true,
+        sessionCapabilities: { resume: {}, close: {}, list: {} },
+        ...(systemPromptMetaEnabled ? { _meta: { antigravity: { systemPrompt: { append: true } } } } : {}),
+      };
+      return ok(req.id, { protocolVersion: 1, agentInfo: { name: process.env.AGY_ACP_FIXTURE_AGENT_NAME, version: process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4' }, agentCapabilities });
     }
     case 'session/new': {
       if (logPath && fs.existsSync(logPath + '.worker-enoent')) {
@@ -105,7 +111,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       const nextLogSeq = logPath && fs.existsSync(logPath)
         ? fs.readFileSync(logPath, 'utf8').split('\n').filter(line => line.includes('"method":"session/new"')).length
         : 0;
-      const sessionId = `native-${Math.max(++nextId, nextLogSeq)}`; sessions.set(sessionId, { pending: [], inputs: [] });
+      const sessionId = `native-${Math.max(++nextId, nextLogSeq)}`; sessions.set(sessionId, { pending: [], inputs: [], systemPromptAppend: p?._meta?.antigravity?.systemPrompt?.append });
       return setTimeout(() => ok(req.id, { sessionId, models }), scenario === 'late-new' ? 150 : 0);
     }
     case 'session/resume': {
@@ -113,7 +119,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         return send({ id: req.id, error: { code: -32603, message: `Failed to start a Antigravity process for the session: starting worker: fork/exec ${process.env.AGY_ACP_FIXTURE_DELETED_EXE || '/secret/private/path/agy.1731.old'} (deleted): no such file or directory` } });
       }
       if (p.sessionId === 'missing-native') return error(req.id, 'Session not found');
-      sessions.set(p.sessionId, { pending: [], inputs: [] });
+      sessions.set(p.sessionId, { pending: [], inputs: [], systemPromptAppend: p?._meta?.antigravity?.systemPrompt?.append });
       if (scenario === 'resume-history') note(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OLD_ERROR from history' } });
       return ok(req.id, { sessionId: p.sessionId, models });
     }

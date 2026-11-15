@@ -168,6 +168,29 @@ function stableAcpMessageId(notificationId: string): string {
   return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
 }
 
+function isSystemPromptMetaAppendSupported(agentCapabilities: unknown): boolean {
+  if (!agentCapabilities || typeof agentCapabilities !== 'object') return false;
+  const meta = (agentCapabilities as { _meta?: unknown })._meta;
+  if (!meta || typeof meta !== 'object') return false;
+  const antigravity = (meta as { antigravity?: unknown }).antigravity;
+  if (!antigravity || typeof antigravity !== 'object') return false;
+  const systemPrompt = (antigravity as { systemPrompt?: unknown }).systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object') return false;
+  return (systemPrompt as { append?: unknown }).append === true;
+}
+
+function buildSystemPromptAppendMeta(systemPrompt: string): {
+  antigravity: { systemPrompt: { append: string } };
+} {
+  return {
+    antigravity: {
+      systemPrompt: {
+        append: systemPrompt,
+      },
+    },
+  };
+}
+
 export interface AcpCliProviderProfile {
   id: string;
   displayName: string;
@@ -299,6 +322,10 @@ interface KimiSdkSessionState {
   lastStatusSignature: string | null;
   /** Stable IM.codes context already injected into this ACP history. */
   sessionSystemTextInjected?: string;
+  /** True when the current live ACP session has received systemPrompt via `_meta.antigravity.systemPrompt.append`. */
+  sessionSystemTextMetaDelivered?: boolean;
+  /** True once initial out-of-band `_meta` system text has been added to `agyContextUsage`. */
+  agyContextUsageMetaSeeded?: boolean;
   /** Most recent ACP `usage_update.tokens` for this session — captured here so
    *  the onComplete `metadata.usage` can carry per-turn token counts to the
    *  daemon's transport-relay. */
@@ -348,6 +375,7 @@ interface AcpTransportSlot {
   connection: ClientSideConnection | null;
   initPromise: Promise<void> | null;
   sessionListSupported: boolean;
+  systemPromptMetaAppendSupported: boolean;
 }
 
 interface IsolatedAcpTransport extends AcpTransportSlot {
@@ -420,6 +448,8 @@ export class KimiSdkProvider implements TransportProvider {
   private cachedDefaultModel: string | null = null;
   /** Negotiated ACP support for durable `session/list` discovery. */
   private sessionListSupported = false;
+  /** Negotiated ACP support for `_meta.antigravity.systemPrompt.append`. */
+  private systemPromptMetaAppendSupported = false;
   private isDisconnecting = false;
   private sharedConnectInFlight: Promise<void> | null = null;
   private sharedRecycleInFlight: Promise<void> | null = null;
@@ -504,6 +534,12 @@ export class KimiSdkProvider implements TransportProvider {
     return this.usesIsolatedTransport(state) ? (state.isolatedTransport?.initPromise ?? null) : this.initPromise;
   }
 
+  private supportsSystemPromptMetaForState(state: KimiSdkSessionState): boolean {
+    return this.usesIsolatedTransport(state)
+      ? Boolean(state.isolatedTransport?.systemPromptMetaAppendSupported)
+      : this.systemPromptMetaAppendSupported;
+  }
+
   private async disposeIsolatedSession(
     state: KimiSdkSessionState,
     opts?: { removeSession?: boolean; bestEffortCloseSession?: boolean; preserveResumeId?: boolean },
@@ -549,6 +585,8 @@ export class KimiSdkProvider implements TransportProvider {
       state.modeApplied = false;
       state.confirmedModel = undefined;
       state.sessionSystemTextInjected = undefined;
+      state.sessionSystemTextMetaDelivered = undefined;
+      state.agyContextUsageMetaSeeded = undefined;
       if (opts?.removeSession && this.sessions.get(state.routeId) === state) {
         this.sessions.delete(state.routeId);
       }
@@ -560,6 +598,7 @@ export class KimiSdkProvider implements TransportProvider {
       transport.connection = null;
       transport.initPromise = null;
       transport.sessionListSupported = false;
+      transport.systemPromptMetaAppendSupported = false;
 
       if (isolatedChild) {
         // Call killProcessTree even when the root ACP child already exited: same-group
@@ -693,6 +732,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.cachedModels = null;
       this.cachedDefaultModel = null;
       this.sessionListSupported = false;
+      this.systemPromptMetaAppendSupported = false;
     } finally {
       this.isDisconnecting = false;
     }
@@ -769,6 +809,7 @@ export class KimiSdkProvider implements TransportProvider {
       lastStatusSignature: null,
       lastActivityAt: Date.now(),
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
+      sessionSystemTextMetaDelivered: existing?.sessionSystemTextMetaDelivered,
       agyForeground: this.id === AGY_SDK_PROVIDER_ID && existing?.acpSessionId === (config.resumeId ?? existing?.acpSessionId) && existing?.agyForeground?.authoritative
         ? Object.assign(new AgyForegroundOwnership(),{authoritative:true}) : undefined,
       ...(incognito ? {
@@ -778,6 +819,7 @@ export class KimiSdkProvider implements TransportProvider {
           connection: null,
           initPromise: null,
           sessionListSupported: false,
+          systemPromptMetaAppendSupported: false,
           sourceHome: baseSourceHome,
         },
       } : this.profile.perSessionTransport && !config.fresh && existing?.isolatedTransport ? {
@@ -1225,7 +1267,9 @@ export class KimiSdkProvider implements TransportProvider {
     const changed = await watermark.check(env.HOME || env.USERPROFILE, state.acpSessionId);
     if (this.sessions.get(sessionId) !== state || state.cancelled) return false;
     if (changed) {
-      state.sessionSystemTextInjected = undefined;
+      if (!this.supportsSystemPromptMetaForState(state)) {
+        state.sessionSystemTextInjected = undefined;
+      }
       (state.agyContextUsage ??= new AgyContextUsage()).resetToSummary(watermark.summaryTokens);
     }
     return changed;
@@ -1361,7 +1405,9 @@ export class KimiSdkProvider implements TransportProvider {
           }
           assertOwner();
           state.confirmedModel = model;
-          state.sessionSystemTextInjected = undefined;
+          if (!this.supportsSystemPromptMetaForState(state)) {
+            state.sessionSystemTextInjected = undefined;
+          }
         }
       });
       request = { model, revision, promise };
@@ -1719,6 +1765,7 @@ export class KimiSdkProvider implements TransportProvider {
       connection: null,
       initPromise: null,
       sessionListSupported: false,
+      systemPromptMetaAppendSupported: false,
     };
     state.isolatedTransport = transport;
     try {
@@ -1750,6 +1797,7 @@ export class KimiSdkProvider implements TransportProvider {
       connection: null,
       initPromise: null,
       sessionListSupported: false,
+      systemPromptMetaAppendSupported: false,
       incognitoEnv,
       sourceHome,
     };
@@ -1785,6 +1833,8 @@ export class KimiSdkProvider implements TransportProvider {
       const setInitPromise = (value: Promise<void> | null) => { this.initPromise = value; };
       const getSessionListSupported = () => this.sessionListSupported;
       const setSessionListSupported = (value: boolean) => { this.sessionListSupported = value; };
+      const getSystemPromptMetaAppendSupported = () => this.systemPromptMetaAppendSupported;
+      const setSystemPromptMetaAppendSupported = (value: boolean) => { this.systemPromptMetaAppendSupported = value; };
       return {
         get child() { return getChild(); },
         set child(value) { setChild(value); },
@@ -1794,6 +1844,8 @@ export class KimiSdkProvider implements TransportProvider {
         set initPromise(value) { setInitPromise(value); },
         get sessionListSupported() { return getSessionListSupported(); },
         set sessionListSupported(value) { setSessionListSupported(value); },
+        get systemPromptMetaAppendSupported() { return getSystemPromptMetaAppendSupported(); },
+        set systemPromptMetaAppendSupported(value) { setSystemPromptMetaAppendSupported(value); },
       };
     };
     const transport: AcpTransportSlot = isolatedFor
@@ -1878,7 +1930,11 @@ export class KimiSdkProvider implements TransportProvider {
       for (const sid of sessions) {
         const state = this.sessions.get(sid);
         if (state?.incognito) continue;
-        if (state) state.sessionSystemTextInjected = undefined;
+        if (state) {
+          state.sessionSystemTextInjected = undefined;
+          state.sessionSystemTextMetaDelivered = undefined;
+          state.agyContextUsageMetaSeeded = undefined;
+        }
         if (this.clearSessionWorkAfterFailure(sid)) {
           this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
         }
@@ -1887,6 +1943,7 @@ export class KimiSdkProvider implements TransportProvider {
       transport.connection = null;
       transport.initPromise = null;
       transport.sessionListSupported = false;
+      transport.systemPromptMetaAppendSupported = false;
     };
 
     child.on('exit', (code, signal) => {
@@ -2042,6 +2099,7 @@ export class KimiSdkProvider implements TransportProvider {
         `${this.profile.displayName} ACP initialized`,
       );
       transport.sessionListSupported = result.agentCapabilities.sessionCapabilities?.list != null;
+      transport.systemPromptMetaAppendSupported = isSystemPromptMetaAppendSupported(result.agentCapabilities);
       await this.validateConnectedAgent(result as unknown as Record<string, unknown>, config);
     })().catch((err: unknown) => {
       logger.error(
@@ -2165,7 +2223,12 @@ export class KimiSdkProvider implements TransportProvider {
     state.promptSubmittedGeneration = null;
     (state.activePromptGenerations ??= new Set()).add(generation);
     try {
-      await this.ensureSessionReady(sessionId, state);
+      const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+      const sessionContractKey = sessionSystemContractKey(sessionSystemText);
+      await this.ensureSessionReady(sessionId, state, {
+        sessionSystemText,
+        syncMetaOnLoaded: true,
+      });
       this.assertCurrentSession(sessionId, state);
       await this.startAgyBridge(sessionId, state);
       await this.checkSessionCompaction(sessionId);
@@ -2177,17 +2240,27 @@ export class KimiSdkProvider implements TransportProvider {
       state.currentText = '';
       state.currentMessageId = null;
       state.turnModel = this.profile.strictModelSelection ? state.confirmedModel : undefined;
-      const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
-      const sessionContractKey = sessionSystemContractKey(sessionSystemText);
-      const includeSessionSystemText = shouldInjectSessionSystemContract(
-        state.sessionSystemTextInjected,
-        sessionSystemText,
+      const metaAppendSupported = this.supportsSystemPromptMetaForState(state);
+      const deliveredViaMeta = Boolean(
+        metaAppendSupported
+        && (
+          sessionContractKey === undefined
+            ? !state.sessionSystemTextMetaDelivered
+            : state.sessionSystemTextMetaDelivered && state.sessionSystemTextInjected === sessionContractKey
+        ),
       );
+      const includeSessionSystemText = deliveredViaMeta
+        ? false
+        : shouldInjectSessionSystemContract(state.sessionSystemTextInjected, sessionSystemText);
       const compactControl = isSessionControlCommandText(payload.userMessage, 'compact');
       const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
       if (this.id === AGY_SDK_PROVIDER_ID) {
         const meter = state.agyContextUsage ??= new AgyContextUsage();
         meter.beginPrompt(composeMessageSideProviderPrompt(payload, { includeSessionSystemText }));
+        if (deliveredViaMeta && sessionSystemText && !state.agyContextUsageMetaSeeded) {
+          meter.addText(sessionSystemText);
+          state.agyContextUsageMetaSeeded = true;
+        }
       }
 
       // Long-lived call — invoking it submits A; its Promise resolves only
@@ -2344,7 +2417,9 @@ export class KimiSdkProvider implements TransportProvider {
       terminalReason: 'provider_error',
       decisionReason: 'turn_failed',
     });
-    state.sessionSystemTextInjected = undefined;
+    if (!this.supportsSystemPromptMetaForState(state)) {
+      state.sessionSystemTextInjected = undefined;
+    }
     this.cancelPendingApprovals(sessionId);
     this.clearStatus(sessionId, state);
     run?.complete();
@@ -2366,6 +2441,10 @@ export class KimiSdkProvider implements TransportProvider {
   private async ensureSessionReady(
     sessionId: string,
     state: KimiSdkSessionState,
+    sessionSystemOptions?: {
+      sessionSystemText?: string;
+      syncMetaOnLoaded?: boolean;
+    },
   ): Promise<void> {
     if (state.incognito) {
       if (state.disposed) {
@@ -2444,33 +2523,19 @@ export class KimiSdkProvider implements TransportProvider {
             // Resume an existing session (survives across CLI restarts via
             // ~/.kimi/tmp/<project>/chats/<id>.json).
             try {
-              const loader = this.profile.resumeWithoutReplay
-                ? (connection as AcpAgent).resumeSession
-                : (connection as AcpAgent).loadSession;
-              if (typeof loader !== 'function') {
-                throw new Error('Agent does not implement loadSession (capability mismatch)');
+              const useMeta = this.supportsSystemPromptMetaForState(state);
+              const trimmedSystemText = sessionSystemOptions?.sessionSystemText?.trim() || undefined;
+              const shouldClearMeta = useMeta && !trimmedSystemText && Boolean(state.sessionSystemTextMetaDelivered);
+              const metaToSend = useMeta
+                ? (trimmedSystemText ?? (shouldClearMeta ? '' : undefined))
+                : undefined;
+              await this.resumeOrLoadAcpSession(sessionId, state, connection, metaToSend);
+              if (useMeta) {
+                state.sessionSystemTextInjected = trimmedSystemText
+                  ? sessionSystemContractKey(trimmedSystemText)
+                  : undefined;
+                state.sessionSystemTextMetaDelivered = Boolean(trimmedSystemText);
               }
-              // `loadSession` streams the full message history back as
-              // session/update notifications *before* the RPC resolves. Set the
-              // replay flag so handleSessionUpdate drops those history chunks
-              // instead of forwarding them to the current-turn delta listeners.
-              state.replaying = true;
-              let loadResult: LoadSessionResponse | undefined;
-              try {
-                loadResult = await this.withAcpDiagnostics(this.profile.resumeWithoutReplay
-                  ? ACP_ERROR_PHASE.RESUME_SESSION : ACP_ERROR_PHASE.LOAD_SESSION, () => loader.call(connection, {
-                  sessionId: state.acpSessionId,
-                  cwd: state.cwd,
-                  mcpServers: this.mcpServersForState(state),
-                }));
-                if (state.wireOrderTail) await state.wireOrderTail;
-              } finally {
-                state.replaying = false;
-              }
-              this.assertCurrentSession(sessionId, state, connection);
-              state.loaded = true;
-              this.cacheModelsFromSessionResponse(loadResult);
-              this.applySessionMetadata(sessionId, state, loadResult);
             } catch (err) {
               if (isWorkerSpawnMissingExecutableError(err)) throw err;
               if (this.profile.loadFailure === 'error') throw err;
@@ -2485,10 +2550,29 @@ export class KimiSdkProvider implements TransportProvider {
               );
               this.releaseAcpRoute(state.acpSessionId, state.routeId);
               state.acpSessionId = undefined;
-              await this.createFreshAcpSession(sessionId, state);
+              await this.createFreshAcpSession(sessionId, state, sessionSystemOptions?.sessionSystemText);
             }
           } else {
-            await this.createFreshAcpSession(sessionId, state);
+            await this.createFreshAcpSession(sessionId, state, sessionSystemOptions?.sessionSystemText);
+          }
+        } else if (
+          sessionSystemOptions?.syncMetaOnLoaded
+          && this.supportsSystemPromptMetaForState(state)
+          && this.profile.resumeWithoutReplay
+          && !state.incognito
+          && state.acpSessionId
+          && !state.cancelled
+          && state.promptSubmittedGeneration === null
+          && (state.activePromptGenerations?.size ?? 0) <= 1
+        ) {
+          const trimmedSystemText = sessionSystemOptions.sessionSystemText?.trim() || undefined;
+          const targetKey = sessionSystemContractKey(trimmedSystemText);
+          const needsSetOrRefresh = targetKey !== undefined && state.sessionSystemTextInjected !== targetKey;
+          const needsClear = targetKey === undefined && Boolean(state.sessionSystemTextMetaDelivered);
+          if (needsSetOrRefresh || needsClear) {
+            await this.resumeOrLoadAcpSession(sessionId, state, connection, trimmedSystemText ?? '');
+            state.sessionSystemTextInjected = targetKey;
+            state.sessionSystemTextMetaDelivered = Boolean(trimmedSystemText);
           }
         }
 
@@ -2566,14 +2650,59 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  private async createFreshAcpSession(sessionId: string, state: KimiSdkSessionState): Promise<void> {
+  private async resumeOrLoadAcpSession(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    connection: ClientSideConnection,
+    metaSystemText?: string,
+  ): Promise<void> {
+    const loader = this.profile.resumeWithoutReplay
+      ? (connection as AcpAgent).resumeSession
+      : (connection as AcpAgent).loadSession;
+    if (typeof loader !== 'function') {
+      throw new Error('Agent does not implement loadSession (capability mismatch)');
+    }
+    // `loadSession` streams the full message history back as
+    // session/update notifications *before* the RPC resolves. Set the
+    // replay flag so handleSessionUpdate drops those history chunks
+    // instead of forwarding them to the current-turn delta listeners.
+    state.replaying = true;
+    let loadResult: LoadSessionResponse | undefined;
+    try {
+      loadResult = await this.withAcpDiagnostics(
+        this.profile.resumeWithoutReplay ? ACP_ERROR_PHASE.RESUME_SESSION : ACP_ERROR_PHASE.LOAD_SESSION,
+        () => loader.call(connection, {
+          sessionId: state.acpSessionId!,
+          cwd: state.cwd,
+          mcpServers: this.mcpServersForState(state),
+          ...(metaSystemText !== undefined ? { _meta: buildSystemPromptAppendMeta(metaSystemText) } : {}),
+        }),
+      );
+      if (state.wireOrderTail) await state.wireOrderTail;
+    } finally {
+      state.replaying = false;
+    }
+    this.assertCurrentSession(sessionId, state, connection);
+    state.loaded = true;
+    this.cacheModelsFromSessionResponse(loadResult);
+    this.applySessionMetadata(sessionId, state, loadResult);
+  }
+
+  private async createFreshAcpSession(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    sessionSystemText?: string,
+  ): Promise<void> {
     this.assertCurrentSession(sessionId, state);
     const connection = this.connectionForState(state)!;
+    const useMeta = this.supportsSystemPromptMetaForState(state);
+    const trimmedSystemText = useMeta ? sessionSystemText?.trim() || undefined : undefined;
     let result: NewSessionResponse;
     try {
       result = await this.withAcpDiagnostics(ACP_ERROR_PHASE.NEW_SESSION, () => connection.newSession({
         cwd: state.cwd,
         mcpServers: this.mcpServersForState(state),
+        ...(trimmedSystemText ? { _meta: buildSystemPromptAppendMeta(trimmedSystemText) } : {}),
       }));
     } catch (error) {
       // Even a clean RPC rejection need not mean the upstream did not persist
@@ -2595,7 +2724,9 @@ export class KimiSdkProvider implements TransportProvider {
     state.acpSessionId = result.sessionId;
     state.loaded = true;
     state.modeApplied = false;
-    state.sessionSystemTextInjected = undefined;
+    state.sessionSystemTextInjected = trimmedSystemText ? sessionSystemContractKey(trimmedSystemText) : undefined;
+    state.sessionSystemTextMetaDelivered = Boolean(trimmedSystemText);
+    state.agyContextUsageMetaSeeded = false;
     this.registerAcpRoute(state.acpSessionId, sessionId);
     this.cacheModelsFromSessionResponse(result);
     this.applySessionMetadata(sessionId, state, result);
@@ -2895,7 +3026,9 @@ export class KimiSdkProvider implements TransportProvider {
       }
 
       // stopReason === 'end_turn' (happy path).
-      if (compactControl) state.sessionSystemTextInjected = undefined;
+      if (compactControl && !this.supportsSystemPromptMetaForState(state)) {
+        state.sessionSystemTextInjected = undefined;
+      }
       const msg: AgentMessage = {
         id: messageId,
         sessionId,
@@ -3390,6 +3523,7 @@ export class KimiSdkProvider implements TransportProvider {
     this.connection = null;
     this.initPromise = null;
     this.sessionListSupported = false;
+    this.systemPromptMetaAppendSupported = false;
     if (child && !child.killed) {
       try { child.stdin.end(); } catch { /* noop */ }
       await killProcessTree(child, { ownsProcessGroup: true });
@@ -3589,6 +3723,8 @@ export class KimiSdkProvider implements TransportProvider {
         state.loaded = false;
         state.modeApplied = false;
         state.sessionSystemTextInjected = undefined;
+        state.sessionSystemTextMetaDelivered = undefined;
+        state.agyContextUsageMetaSeeded = undefined;
       }
       this.cachedModels = null;
       this.cachedDefaultModel = null;
