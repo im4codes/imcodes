@@ -413,6 +413,10 @@ ${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
 
     const issText = readFileSync(res.issPath, 'utf8');
     expect(issText).toContain('PrivilegesRequired=admin');
+    expect(issText).toContain('Compression=lzma2/fast');
+    expect(issText).toContain('SolidCompression=yes');
+    expect(issText).toContain('LZMAUseSeparateProcess=yes');
+    expect(issText).toContain('LZMANumBlockThreads=4');
     expect(issText).toContain('imcodes-windows-installer.ps1');
     expect(issText).toContain('imcodes-node.exe');
     expect(issText).toContain('[UninstallRun]');
