@@ -550,9 +550,9 @@ function OnlyOfficeEmbeddedEditor({
       style={{
         display: 'flex',
         flexDirection: 'column',
-        width: '100%',
-        height: isFullscreen ? '100vh' : '100%',
-        minHeight: isFullscreen ? '100vh' : 480,
+        width: isFullscreen ? 'var(--imcodes-ui-vw, 100%)' : '100%',
+        height: isFullscreen ? 'var(--vvh, var(--imcodes-ui-dvh))' : '100%',
+        minHeight: isFullscreen ? 'var(--vvh, var(--imcodes-ui-dvh))' : 480,
         position: isFullscreen ? 'fixed' : 'relative',
         inset: isFullscreen ? 0 : undefined,
         zIndex: isFullscreen ? 9999 : undefined,

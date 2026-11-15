@@ -12,6 +12,8 @@
  * list (the only scroll container) then scrolls inside it.
  */
 
+import { getActiveCssZoom, UI_SCALE_EVENT } from './ui-scale.js';
+
 /** CSS custom property read by `.task-pair-status-panel.is-mobile` in styles.css. */
 export const TASK_PAIR_PANEL_MAX_HEIGHT_VAR = '--task-pair-panel-max-h';
 
@@ -86,7 +88,8 @@ export function applyTaskPairPanelFit(panel: HTMLElement, onCramped: (cramped: b
     hostBottom: hostRect.bottom,
     viewportBottom: viewport ? viewport.offsetTop + viewport.height : window.innerHeight,
   });
-  panel.style.setProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR, `${fit.maxHeight}px`);
+  const zoom = getActiveCssZoom();
+  panel.style.setProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR, `${Math.floor(fit.maxHeight / zoom)}px`);
   onCramped(fit.cramped);
 }
 
@@ -116,6 +119,7 @@ export function bindTaskPairPanelFit(panel: HTMLElement, onCramped: (cramped: bo
   for (const el of new Set<Element>([host, titlebar])) observer?.observe(el);
   window.addEventListener('resize', schedule);
   window.addEventListener('orientationchange', schedule);
+  window.addEventListener(UI_SCALE_EVENT, schedule);
   window.visualViewport?.addEventListener('resize', schedule);
   window.visualViewport?.addEventListener('scroll', schedule);
   return () => {
@@ -123,6 +127,7 @@ export function bindTaskPairPanelFit(panel: HTMLElement, onCramped: (cramped: bo
     observer?.disconnect();
     window.removeEventListener('resize', schedule);
     window.removeEventListener('orientationchange', schedule);
+    window.removeEventListener(UI_SCALE_EVENT, schedule);
     window.visualViewport?.removeEventListener('resize', schedule);
     window.visualViewport?.removeEventListener('scroll', schedule);
     panel.style.removeProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);

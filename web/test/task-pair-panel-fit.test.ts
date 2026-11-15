@@ -188,7 +188,7 @@ describe('bindTaskPairPanelFit', () => {
 describe('stylesheet: mobile expanded panel is bounded by the measured variable', () => {
   const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
   const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
-  const bound = new RegExp(`max-height:\\s*var\\(${TASK_PAIR_PANEL_MAX_HEIGHT_VAR},\\s*min\\(65vh, calc\\(100dvh - 160px\\)\\)\\)`);
+  const bound = new RegExp(`max-height:\\s*var\\(${TASK_PAIR_PANEL_MAX_HEIGHT_VAR},\\s*min\\(calc\\(var\\(--imcodes-ui-vh, 100vh\\) \\* 0\\.65\\), calc\\(var\\(--imcodes-ui-dvh\\) - 160px\\)\\)\\)`);
 
   it('never uses the viewport-relative height for the expanded mobile panel (only as the pre-measurement fallback)', () => {
     const rules = [
@@ -199,13 +199,13 @@ describe('stylesheet: mobile expanded panel is bounded by the measured variable'
     for (const body of rules.filter((entry) => /position:\s*absolute|max-height/.test(entry))) {
       expect(body).toMatch(bound);
       expect(body).toMatch(/height:\s*auto/);
-      expect(body).not.toMatch(/(^|[;\s])height:\s*min\(65vh/);
+      expect(body).not.toMatch(/(^|[;\s])height:\s*min\(/);
     }
   });
 
   it('leaves the desktop panel rule unchanged (fixed 65vh box)', () => {
     const desktop = /\.chat-titlebar > \.task-pair-status-panel \{([^}]*)\}/.exec(css)?.[1] ?? '';
-    expect(desktop).toMatch(/height:\s*min\(65vh, calc\(100dvh - 160px\)\)/);
+    expect(desktop).toMatch(/height:\s*min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.65\), calc\(var\(--imcodes-ui-dvh\) - 160px\)\)/);
     expect(desktop).not.toContain(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
   });
 
@@ -227,14 +227,14 @@ describe('stylesheet: mobile expanded panel is bounded by the measured variable'
     expect(mobileMainFallback).toMatch(/bottom:\s*auto/);
     expect(mobileMainFallback).toContain(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
     const consoleMobile = /\.supervision-task-console\.is-mobile \{([^}]*)\}/.exec(css)?.[1] ?? '';
-    expect(consoleMobile).toMatch(/height:\s*var\(--vvh,\s*100dvh\)/);
+    expect(consoleMobile).toMatch(/height:\s*var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)/);
     expect(consoleMobile).toMatch(/safe-area-inset-top/);
     expect(consoleMobile).toMatch(/safe-area-inset-bottom/);
 
     const panelFullscreen = /\.task-pair-status-panel\.is-mobile\.is-fullscreen:not\(\.is-collapsed\),\s*\.chat-titlebar > \.task-pair-status-panel\.is-mobile\.is-fullscreen:not\(\.is-collapsed\),\s*\.chat-main > \.task-pair-status-panel\.is-mobile\.is-fullscreen:not\(\.is-collapsed\)\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
     expect(panelFullscreen).toMatch(/position:\s*fixed/);
     expect(panelFullscreen).toMatch(/inset:\s*0/);
-    expect(panelFullscreen).toMatch(/height:\s*var\(--vvh,\s*100dvh\)/);
+    expect(panelFullscreen).toMatch(/height:\s*var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)/);
     expect(panelFullscreen).toMatch(/safe-area-inset-top/);
     expect(panelFullscreen).toMatch(/safe-area-inset-bottom/);
     expect(panelFullscreen).toMatch(/z-index:\s*calc\(var\(--mobile-fullscreen-window-z\)\s*\+\s*2\)/);

@@ -495,6 +495,9 @@ export function RepoCallbackModal({
       style={{
         position: 'fixed',
         inset: 0,
+        width: 'var(--imcodes-ui-vw, 100%)',
+        height: 'var(--vvh, var(--imcodes-ui-dvh))',
+        boxSizing: 'border-box',
         zIndex: 9000,
         background: 'rgba(2, 6, 23, 0.72)',
         display: 'flex',
@@ -507,7 +510,7 @@ export function RepoCallbackModal({
         style={{
           width: '100%',
           maxWidth: 740,
-          maxHeight: '90vh',
+          maxHeight: 'calc(var(--imcodes-ui-vh, 100vh) * 0.9)',
           display: 'flex',
           flexDirection: 'column',
           background: '#0f172a',

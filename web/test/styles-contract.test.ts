@@ -210,7 +210,7 @@ describe('styles.css regression contracts', () => {
 
   it('keeps the Team discussion rail narrow, in root flex flow, and independently scrollable', () => {
     const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
-    expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*17vw,\s*220px\)/);
+    expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*calc\(var\(--imcodes-ui-vw, 100vw\) \* 0\.17\),\s*220px\)/);
 
     const hostRule = cssWithoutComments.match(/\.team-discussion-rail-host\s*\{[^}]*\}/)?.[0];
     expect(hostRule).toMatch(/display:\s*flex/);
@@ -347,11 +347,11 @@ describe('styles.css regression contracts', () => {
   it('uses half the desktop viewport and full mobile width for pinned-message previews', () => {
     const previewRule = css.match(/\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
     expect(previewRule).toBeTruthy();
-    expect(previewRule).toMatch(/width:\s*min\(50vw,\s*calc\(100vw - 24px\)\)/);
+    expect(previewRule).toMatch(/width:\s*min\(calc\(var\(--imcodes-ui-vw, 100vw\) \* 0\.5\),\s*calc\(var\(--imcodes-ui-vw, 100vw\) - 24px\)\)/);
 
     const mobileRule = css.match(/@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
     expect(mobileRule).toBeTruthy();
-    expect(mobileRule).toMatch(/width:\s*calc\(100vw - 16px\)/);
+    expect(mobileRule).toMatch(/width:\s*calc\(var\(--imcodes-ui-vw, 100vw\) - 16px\)/);
 
     const mobileActionsRule = css.match(/@media\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview \.zoom-text-actions\s*\{[^}]*\}/)?.[0];
     expect(mobileActionsRule).toBeTruthy();
@@ -718,7 +718,7 @@ describe('styles.css regression contracts', () => {
     const mobileP2pRule = css.match(/\.menu-dropdown-p2p\s*\{[^}]*position:\s*fixed[^}]*\}/);
     expect(mobileP2pRule).not.toBeNull();
     expect(mobileP2pRule![0]).toMatch(/z-index:\s*2147483646/);
-    expect(mobileP2pRule![0]).toMatch(/max-height:\s*min\(72vh,\s*calc\(var\(--vvh,\s*100dvh\)/);
+    expect(mobileP2pRule![0]).toMatch(/max-height:\s*min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.72\),\s*calc\(var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)/);
     expect(mobileP2pRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
@@ -867,7 +867,7 @@ describe('styles.css regression contracts', () => {
 
     const panelRule = css.match(/\.daemon-details-panel\s*\{[^}]*\}/);
     expect(panelRule).not.toBeNull();
-    expect(panelRule![0]).toMatch(/max-height:\s*min\(82dvh,\s*680px\)/);
+    expect(panelRule![0]).toMatch(/max-height:\s*min\(calc\(var\(--imcodes-ui-dvh\) \* 0\.82\),\s*680px\)/);
     expect(panelRule![0]).toMatch(/overflow:\s*auto/);
 
     const triggerRule = css.match(/\.daemon-stats-trigger\s*\{[^}]*\}/);
@@ -946,12 +946,12 @@ describe('styles.css regression contracts', () => {
     const mobileRule = inlineRules.find((rule) => /position:\s*fixed/.test(rule));
     expect(mobileRule).toBeTruthy();
     expect(mobileRule!).toMatch(/top:\s*var\(--sat,\s*0px\)/);
-    expect(mobileRule!).toMatch(/height:\s*calc\(var\(--vvh,\s*100dvh\)/);
+    expect(mobileRule!).toMatch(/height:\s*calc\(var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)/);
     expect(mobileRule!).toMatch(/overflow:\s*hidden/);
 
     const autoLauncherRule = css.match(/\.menu-dropdown-openspec-inline \.openspec-auto-launcher\s*\{[^}]*\}/);
     expect(autoLauncherRule).not.toBeNull();
-    expect(autoLauncherRule![0]).toMatch(/max-height:\s*min\(58vh/);
+    expect(autoLauncherRule![0]).toMatch(/max-height:\s*min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.58\)/);
     expect(autoLauncherRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
@@ -1012,13 +1012,13 @@ describe('styles.css regression contracts', () => {
   it('fullscreen HTML preview must be clamped to the browser viewport', () => {
     const overlayRule = css.match(/\.html-fullscreen-preview\s*\{[^}]*\}/);
     expect(overlayRule).not.toBeNull();
-    expect(overlayRule![0]).toMatch(/width:\s*100vw/);
-    expect(overlayRule![0]).toMatch(/max-width:\s*100vw/);
+    expect(overlayRule![0]).toMatch(/width:\s*var\(--imcodes-ui-vw, 100vw\)/);
+    expect(overlayRule![0]).toMatch(/max-width:\s*var\(--imcodes-ui-vw, 100vw\)/);
     expect(overlayRule![0]).toMatch(/overflow:\s*hidden/);
 
     const bodyRule = css.match(/\.html-fullscreen-preview-body\s*\{[^}]*\}/);
     expect(bodyRule).not.toBeNull();
-    expect(bodyRule![0]).toMatch(/max-width:\s*100vw/);
+    expect(bodyRule![0]).toMatch(/max-width:\s*var\(--imcodes-ui-vw, 100vw\)/);
     expect(bodyRule![0]).toMatch(/min-width:\s*0/);
 
     const iframeRule = css.match(/\.html-safe-preview-frame\s*\{[^}]*\}/);
@@ -1073,7 +1073,7 @@ describe('styles.css regression contracts', () => {
     const bodyRule = css.match(/\.mobile-server-menu-body\s*\{[^}]*\}/);
     expect(bodyRule).not.toBeNull();
     expect(bodyRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
-    expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+    expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     // Only the body scrolls; the language footer stays outside that scrollport.
@@ -1187,7 +1187,7 @@ describe('styles.css regression contracts', () => {
   it('session creation dialogs cannot exceed narrow mobile viewports', () => {
     const dialogRule = css.match(/\.dialog\s*\{[^}]*\}/);
     expect(dialogRule).not.toBeNull();
-    expect(dialogRule![0]).toMatch(/max-width:\s*calc\(100vw - env\(safe-area-inset-left/);
+    expect(dialogRule![0]).toMatch(/max-width:\s*calc\(var\(--imcodes-ui-vw, 100vw\) - env\(safe-area-inset-left/);
     expect(dialogRule![0]).toMatch(/min-width:\s*0/);
     expect(dialogRule![0]).toMatch(/box-sizing:\s*border-box/);
 
@@ -1195,7 +1195,7 @@ describe('styles.css regression contracts', () => {
     const subSessionDialog = readFileSync(resolve(__dirname, '../src/components/StartSubSessionDialog.tsx'), 'utf8');
     for (const source of [newSessionDialog, subSessionDialog]) {
       expect(source).toContain('responsiveDialogStyle');
-      expect(source).toContain('calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)');
+      expect(source).toContain('calc(var(--imcodes-ui-vw, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)');
       expect(source).toContain('boxSizing');
       expect(source).toContain('overflowWrap');
       expect(source).not.toContain('style={{ width: "100%", maxWidth: 380 }}');

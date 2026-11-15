@@ -352,7 +352,7 @@ export function FloatingPanel({
       zIndex + MOBILE_FLOATING_PANEL_Z_OFFSET,
     );
     return (
-      <div className={['floating-panel', className].filter(Boolean).join(' ')} style={{ position: 'fixed', inset: 0, zIndex: mobileZIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
+      <div className={['floating-panel', className].filter(Boolean).join(' ')} style={{ position: 'fixed', inset: 0, width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', maxHeight: 'var(--vvh, var(--imcodes-ui-dvh))', boxSizing: 'border-box', zIndex: mobileZIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
         <div className="floating-panel-safe-area" style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
         {!hideTitleBar && <div className="floating-panel-titlebar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 10px', minHeight: 28, background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
           <span

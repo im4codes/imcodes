@@ -2364,7 +2364,7 @@ describe('App shell', () => {
       expect(await screen.findByText('admin-page')).toBeTruthy();
       const overlay = screen.getByTestId('admin-page-overlay');
       expect(overlay.style.display).toBe('flex');
-      expect(overlay.style.height).toBe('100dvh');
+      expect(overlay.style.height).toBe('var(--vvh, var(--imcodes-ui-dvh))');
       expect(overlay.style.overflow).toBe('hidden');
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
@@ -6220,7 +6220,7 @@ describe('App shell', () => {
     const settingsOverlay = screen.getByTestId('settings-page-overlay');
     expect(settingsOverlay.style.display).toBe('flex');
     expect(settingsOverlay.style.flexDirection).toBe('column');
-    expect(settingsOverlay.style.height).toBe('var(--vvh, 100dvh)');
+    expect(settingsOverlay.style.height).toBe('var(--vvh, var(--imcodes-ui-dvh))');
     expect(settingsOverlay.style.overflow).toBe('hidden');
     fireEvent.click(screen.getByText('settings-display'));
     fireEvent.click(screen.getByText('settings-auth'));

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceStreamingRobot } from './VoiceStreamingRobot.js';
 import { holdScreenAwake } from '../screen-awake.js';
+import { getActiveCssZoom, UI_SCALE_EVENT } from '../ui-scale.js';
 import {
   NOTEPAD_DRAFT_SAVE_INTERVAL_MS,
   buildNotepadInlineMessage,
@@ -81,7 +82,7 @@ export function VoiceOverlay({
   const [recognizing, setRecognizing] = useState(false);
   const [hasText, setHasText] = useState(false);
   const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
-  const [maxH, setMaxH] = useState('var(--vvh, 100dvh)');
+  const [maxH, setMaxH] = useState('var(--vvh, var(--imcodes-ui-dvh))');
   const [streamMirror, setStreamMirror] = useState<{ before: string; after: string }>({ before: '', after: '' });
   const taRef = useRef<HTMLTextAreaElement>(null);
   const mirrorRef = useRef<HTMLDivElement>(null);
@@ -297,7 +298,7 @@ export function VoiceOverlay({
     // occludes the Send button. The keyboard only opens when the user manually taps the textarea.
     if (taRef.current) { taRef.current.value = init; }
     setHasText(!!init.trim());
-    setMaxH('var(--vvh, 100dvh)');
+    setMaxH('var(--vvh, var(--imcodes-ui-dvh))');
     setListening(false);
     setRecognizing(false);
     clearRecognizingTimer();
@@ -353,15 +354,17 @@ export function VoiceOverlay({
     const vv = window.visualViewport;
     const syncViewportHeight = () => {
       if (!vv) {
-        setMaxH('var(--vvh, 100dvh)');
+        setMaxH('var(--vvh, var(--imcodes-ui-dvh))');
         return;
       }
       const kbOpen = window.innerHeight - vv.height > 50;
-      setMaxH(kbOpen ? `${vv.height}px` : 'var(--vvh, 100dvh)');
+      const zoom = getActiveCssZoom();
+      setMaxH(kbOpen ? `${Math.round(vv.height / zoom)}px` : 'var(--vvh, var(--imcodes-ui-dvh))');
     };
     syncViewportHeight();
     vv?.addEventListener('resize', syncViewportHeight);
     vv?.addEventListener('scroll', syncViewportHeight);
+    window.addEventListener(UI_SCALE_EVENT, syncViewportHeight);
 
     // Start voice session immediately at end of initial text (not 0). An unfinished
     // notepad waits for the user's choice instead: dictation starting on its
@@ -397,6 +400,7 @@ export function VoiceOverlay({
       pendingFlushRef.current = null;
       vv?.removeEventListener('resize', syncViewportHeight);
       vv?.removeEventListener('scroll', syncViewportHeight);
+      window.removeEventListener(UI_SCALE_EVENT, syncViewportHeight);
       VoiceInput.onAudioLevel(null);
       VoiceInput.stopListening();
       // Effect cleanup also runs during unmount. Updating hook state here queues

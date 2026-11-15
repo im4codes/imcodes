@@ -12,7 +12,7 @@
  * `storage` event for cross-tab). Preferences are persisted per-machine
  * via localStorage under `imcodes_fontPrefs:<scope>`.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import {
@@ -23,9 +23,11 @@ import {
 } from '../global-font.js';
 import {
   formatUiScale,
+  getActiveCssZoom,
   markUiScalePrompted,
   MAX_UI_SCALE,
   MIN_UI_SCALE,
+  UI_SCALE_EVENT,
   UI_SCALE_STEP,
   useUiScale,
 } from '../ui-scale.js';
@@ -442,6 +444,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [globalDelta, setGlobalDelta] = useGlobalFontDelta();
   const [uiScale, setUiScale, defaultUiScale] = useUiScale();
   const wrapRef = useRef<HTMLDivElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
   const latestPrefsRef = useRef(prefs);
   latestPrefsRef.current = prefs;
   const lastSelectEventRef = useRef('');
@@ -477,6 +480,38 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     };
   }, [open]);
 
+  // Clamp horizontal position into the zoomed logical viewport so the popover
+  // never overflows off the right or left screen edge on narrow phones (e.g. 360dp @ 150%).
+  useLayoutEffect(() => {
+    if (!open || typeof window === 'undefined') return;
+    const clampHorizontal = () => {
+      const popEl = popRef.current;
+      if (!popEl) return;
+      popEl.style.left = '0px';
+      const popRect = popEl.getBoundingClientRect();
+      if (popRect.width <= 0 || window.innerWidth <= 0) return;
+      const rootRect = document.documentElement.getBoundingClientRect();
+      const viewportW = rootRect.width > 0 ? rootRect.width : window.innerWidth;
+      const rectToCssScale = rootRect.width > 0 && Math.abs(rootRect.width - window.innerWidth) > 2
+        ? 1
+        : getActiveCssZoom();
+      const margin = 8 / (rectToCssScale === 1 ? getActiveCssZoom() : 1);
+      const maxLeft = Math.max(margin, viewportW - margin - popRect.width);
+      const clampedLeft = Math.max(margin, Math.min(popRect.left, maxLeft));
+      const delta = clampedLeft - popRect.left;
+      if (Math.abs(delta) > 0.5) {
+        popEl.style.left = `${Math.round(delta / rectToCssScale)}px`;
+      }
+    };
+    clampHorizontal();
+    window.addEventListener('resize', clampHorizontal);
+    window.addEventListener(UI_SCALE_EVENT, clampHorizontal);
+    return () => {
+      window.removeEventListener('resize', clampHorizontal);
+      window.removeEventListener(UI_SCALE_EVENT, clampHorizontal);
+    };
+  }, [open, uiScale, globalDelta, prefs.size, activeTab]);
+
   const compact = variant === 'compact';
   const btnSize = compact ? 22 : 26;
 
@@ -503,14 +538,16 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const popStyle = {
     position: 'absolute' as const,
     top: 'calc(100% + 4px)',
-    // Anchor to the trigger's left edge — the trigger sits on the left side
-    // of the chat title bar, so a left-anchored popover stays on screen and
-    // reads naturally left-to-right on both desktop and mobile.
+    // Anchor to the trigger's left edge by default, then clamp into the zoomed
+    // viewport width via useLayoutEffect so narrow screens @ 150% never clip.
     left: 0,
     zIndex: 80,
-    minWidth: 236,
+    minWidth: 'min(236px, calc(var(--imcodes-ui-vw, 100vw) - 16px))',
     width: 'max-content',
-    maxWidth: 'min(92vw, 300px)',
+    maxWidth: 'min(300px, calc(var(--imcodes-ui-vw, 100vw) - 16px))',
+    maxHeight: 'calc(var(--vvh, var(--imcodes-ui-dvh)) - 56px)',
+    overflowY: 'auto' as const,
+    boxSizing: 'border-box' as const,
     background: '#1e293b',
     border: '1px solid #334155',
     borderRadius: 8,
@@ -525,7 +562,8 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 8,
+    flexWrap: 'wrap' as const,
+    gap: '4px 8px',
   } as const;
 
   const sizeRowLabelStyle = {
@@ -789,7 +827,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
         Aa
       </button>
       {open && (
-        <div style={popStyle} role="dialog" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
+        <div ref={popRef} data-testid="font-prefs-popover" style={popStyle} role="dialog" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
           {/* Row 0 — whole-page UI scale (− 100% +), scales chrome, icons, cards, modals, and text uniformly. */}
           <div style={sizeRowStyle} role="group" aria-label={t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}>
             <span style={sizeRowLabelStyle}>{t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}</span>

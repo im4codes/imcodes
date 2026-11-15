@@ -43,6 +43,7 @@ import type { AgentSkillEntry } from '@shared/agent-skills.js';
 import { agentSkillSourceLabel, buildAgentSkillMarker } from '@shared/agent-skill-references.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
+import { getActiveCssZoom } from '../ui-scale.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
@@ -4208,7 +4209,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const rect = (openSpecButtonRef.current ?? openSpecRef.current)?.getBoundingClientRect();
     if (!rect) {
       // Fallback: position at bottom-right so portaled dropdown is never off-screen
-      return { position: 'fixed', bottom: '60px', right: '12px', maxHeight: '60vh', zIndex: 2147483646 } as const;
+      return { position: 'fixed', bottom: '60px', right: '12px', maxHeight: 'calc(var(--imcodes-ui-vh, 100vh) * 0.6)', zIndex: 2147483646 } as const;
     }
     const availableHeight = Math.max(96, Math.floor(rect.top - 12));
     if (window.innerWidth > 640) {
@@ -8203,6 +8204,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         vv.height,
         window.innerHeight,
         document.documentElement.clientHeight,
+        getActiveCssZoom(),
       );
       if (viewportHeight === null) return;
       const shrink = Math.max(0, window.innerHeight - viewportHeight);

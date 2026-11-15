@@ -82,7 +82,7 @@ const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
   // which clips the custom-provider help text into one-character columns.
-  width: "calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
+  width: "calc(var(--imcodes-ui-vw, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
   maxWidth: 660,
   minWidth: 0,
   boxSizing: "border-box",

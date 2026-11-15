@@ -856,7 +856,7 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     try {
       const view = render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
       const overlay = document.querySelector('.voice-overlay') as HTMLElement;
-      expect(overlay.style.height).toBe('var(--vvh, 100dvh)');
+      expect(overlay.style.height).toBe('var(--vvh, var(--imcodes-ui-dvh))');
 
       // Soft keyboard opens -> shrinks to vv.height via resize and handles scroll
       vv.height = 510;
@@ -873,7 +873,7 @@ describe('VoiceOverlay mobile microphone gestures', () => {
       vv.height = 844;
       vv.dispatchEvent(new Event('resize'));
       await vi.advanceTimersByTimeAsync(0);
-      expect(overlay.style.height).toBe('var(--vvh, 100dvh)');
+      expect(overlay.style.height).toBe('var(--vvh, var(--imcodes-ui-dvh))');
 
       view.unmount();
       expect(removeSpy).toHaveBeenCalledWith('resize', expect.any(Function));

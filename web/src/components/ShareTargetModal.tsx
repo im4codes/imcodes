@@ -77,6 +77,9 @@ export function ShareTargetModal({
       style={{
         position: 'fixed',
         inset: 0,
+        width: 'var(--imcodes-ui-vw, 100%)',
+        height: 'var(--vvh, var(--imcodes-ui-dvh))',
+        boxSizing: 'border-box',
         background: 'rgba(2, 6, 23, 0.75)',
         display: 'flex',
         alignItems: 'center',
@@ -96,7 +99,7 @@ export function ShareTargetModal({
         style={{
           width: '100%',
           maxWidth: 460,
-          maxHeight: '85vh',
+          maxHeight: 'calc(var(--imcodes-ui-vh, 100vh) * 0.85)',
           background: '#0f172a',
           border: '1px solid #334155',
           borderRadius: 12,

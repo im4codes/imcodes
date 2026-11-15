@@ -289,6 +289,9 @@ export function DocShareDialog({
       style={{
         position: 'fixed',
         inset: 0,
+        width: 'var(--imcodes-ui-vw, 100%)',
+        height: 'var(--vvh, var(--imcodes-ui-dvh))',
+        boxSizing: 'border-box',
         zIndex: 10000,
         background: 'rgba(2, 6, 23, 0.75)',
         display: 'flex',
@@ -304,7 +307,7 @@ export function DocShareDialog({
         style={{
           width: '100%',
           maxWidth: 680,
-          maxHeight: '88vh',
+          maxHeight: 'calc(var(--imcodes-ui-vh, 100vh) * 0.88)',
           background: '#0f172a',
           border: '1px solid #334155',
           borderRadius: 10,
@@ -1481,7 +1484,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
       data-testid="external-doc-share-space"
       style={{
         width: '100%',
-        minHeight: '100vh',
+        minHeight: 'var(--imcodes-ui-dvh, 100vh)',
         background: '#020617',
         color: '#e2e8f0',
         display: 'flex',

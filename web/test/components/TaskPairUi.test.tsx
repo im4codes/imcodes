@@ -1151,7 +1151,7 @@ describe('TaskPairStatusPanel', () => {
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?top:\s*max\(calc\(100% \+ 4px\), 40px\)/);
     // Mobile expanded rules bound the height by the measured chat area (--task-pair-panel-max-h, see
     // task-pair-panel-fit.ts); the viewport-relative value survives as the fallback inside var().
-    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*(?:var\(--task-pair-panel-max-h,\s*)?min\(65vh/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*(?:var\(--task-pair-panel-max-h,\s*)?min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.65\)/);
   });
 
   it('gives the panel an opaque background from tokens that are actually defined, so it never renders transparent over the toolbar or chat text', () => {

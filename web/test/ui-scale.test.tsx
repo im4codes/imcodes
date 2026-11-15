@@ -246,11 +246,50 @@ describe('whole-page UI scale (%) setting & onboarding', () => {
     expect(document.documentElement.style.getPropertyValue(UI_SCALE_ZOOM_VAR)).toBe('1.25');
     expect(getActiveCssZoom()).toBe(1.25);
 
-    // Physical viewport height passes directly to boundedVisualViewportHeight while --vvh divides by zoom
+    // Physical viewport height normalizes zoomed documentElement.clientHeight across 60%..150% while --vvh divides by zoom
+    for (const pct of [60, 90, 100, 125, 130, 150]) {
+      writeUiScale(pct);
+      const z = getActiveCssZoom();
+      Object.defineProperty(document.documentElement, 'clientHeight', { value: Math.round(780 / z), configurable: true });
+      expect(boundedVisualViewportHeight(780, 780, document.documentElement.clientHeight, z)).toBe(780);
+      expect(boundedVisualViewportHeight(460, 780, document.documentElement.clientHeight, z)).toBe(460);
+    }
     writeUiScale(130);
-    Object.defineProperty(document.documentElement, 'clientHeight', { value: 780, configurable: true });
-    expect(boundedVisualViewportHeight(780, 780, document.documentElement.clientHeight)).toBe(780);
     expect(Math.round(780 / getActiveCssZoom())).toBe(600);
+  });
+
+  it('provides non-dvh fallback in :root and clamps FontPrefsDropdown within zoomed narrow viewports', () => {
+    const css = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    const rootRule = css.match(/:root\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(rootRule).toContain('--imcodes-ui-vw: calc(100vw / var(--imcodes-ui-zoom, 1));');
+    expect(rootRule).toContain('--imcodes-ui-vh: calc(100vh / var(--imcodes-ui-zoom, 1));');
+    expect(rootRule).toContain('--imcodes-ui-dvh: calc(100vh / var(--imcodes-ui-zoom, 1));');
+    expect(css).toMatch(/@supports\s*\(height:\s*100dvh\)\s*\{\s*:root\s*\{\s*--imcodes-ui-dvh:\s*calc\(100dvh\s*\/\s*var\(--imcodes-ui-zoom,\s*1\)\);/);
+
+    writeUiScale(150);
+    Object.defineProperty(window, 'innerWidth', { value: 360, configurable: true });
+    vi.spyOn(document.documentElement, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 360, bottom: 780, width: 360, height: 780, toJSON: () => ({}),
+    });
+    function NarrowFontHarness() {
+      const [prefs, updatePrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+      return <FontPrefsDropdown prefs={prefs} onChange={updatePrefs} />;
+    }
+    render(<NarrowFontHarness />);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this === document.documentElement) {
+        return { x: 0, y: 0, left: 0, top: 0, right: 360, bottom: 780, width: 360, height: 780, toJSON: () => ({}) };
+      }
+      if (this.getAttribute('data-testid') === 'font-prefs-popover') {
+        // Simulate trigger at x=300 on 360px screen with 336px rendered popover width -> overflows right by 276px
+        return { x: 300, y: 40, left: 300, top: 40, right: 636, bottom: 320, width: 336, height: 280, toJSON: () => ({}) };
+      }
+      return { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) };
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    const pop = screen.getByTestId('font-prefs-popover');
+    expect(Number.parseFloat(pop.style.left)).toBeLessThan(0);
+    expect(pop.style.maxHeight).toBe('calc(var(--vvh, var(--imcodes-ui-dvh)) - 56px)');
   });
 
   it('syncs UI Scale (%) across FontPrefsDropdown, SettingsPage, storage events, and Reset without breaking globalFontDelta', () => {

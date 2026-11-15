@@ -8,7 +8,7 @@
    dialog stretched across the whole window. Compound selector so this always
    wins, and cap it so it stays a normal-sized dialog on any screen. */
 .dialog.daemon-rd-setup {
-  width: min(520px, calc(100vw - 24px));
+  width: min(520px, calc(var(--imcodes-ui-vw, 100vw) - 24px));
   max-width: 520px;
 }
 

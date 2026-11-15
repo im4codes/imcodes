@@ -27,6 +27,7 @@ import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pendi
 import { hasActiveTimelineTurn, hasPendingUserSend } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import { getActiveCssZoom, UI_SCALE_EVENT } from '../ui-scale.js';
 import { useQuickData } from './QuickInputPanel.js';
 import { useSharedGitChanges } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
@@ -904,13 +905,20 @@ export function SubSessionWindow({
   }, [lastCostEvent?.costUsd, sub.sessionName]);
 
   const [vvh, setVvh] = useState(() => window.visualViewport?.height ?? window.innerHeight);
+  const [, setUiZoomTick] = useState(0);
   useEffect(() => {
     if (!isMobile) return;
     const vv = window.visualViewport;
-    if (!vv) return;
-    const update = () => setVvh(vv.height);
-    vv.addEventListener('resize', update);
-    return () => vv.removeEventListener('resize', update);
+    const update = () => {
+      setVvh(( window.visualViewport?.height ?? window.innerHeight));
+      setUiZoomTick((n) => n + 1);
+    };
+    vv?.addEventListener('resize', update);
+    window.addEventListener(UI_SCALE_EVENT, update);
+    return () => {
+      vv?.removeEventListener('resize', update);
+      window.removeEventListener(UI_SCALE_EVENT, update);
+    };
   }, [isMobile]);
 
   const [subSessionBarHeight, setSubSessionBarHeight] = useState(() => getInitialMobileSubSessionBarHeight(isMobile));
@@ -979,6 +987,7 @@ export function SubSessionWindow({
       attributeFilter: ['class'],
     });
     window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener(UI_SCALE_EVENT, scheduleUpdate);
     document.addEventListener('focusin', scheduleUpdate, true);
     document.addEventListener('focusout', scheduleUpdate, true);
     vv?.addEventListener('resize', scheduleUpdate);
@@ -988,6 +997,7 @@ export function SubSessionWindow({
       ro?.disconnect();
       mo?.disconnect();
       window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener(UI_SCALE_EVENT, scheduleUpdate);
       document.removeEventListener('focusin', scheduleUpdate, true);
       document.removeEventListener('focusout', scheduleUpdate, true);
       vv?.removeEventListener('resize', scheduleUpdate);
@@ -1002,15 +1012,20 @@ export function SubSessionWindow({
     return clampMaximizedGeom(bounds);
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
-  const mobileSubSessionBarHeight = Math.max(0, Math.min(subSessionBarHeight, Math.max(0, vvh - 120)));
+  const cssZoom = getActiveCssZoom();
+  const scaledVvh = cssZoom === 1 ? vvh : Math.round(vvh / cssZoom);
+  const scaledBarHeight = cssZoom === 1 ? subSessionBarHeight : Math.round(subSessionBarHeight / cssZoom);
+  const scaledTabsBottom = cssZoom === 1 ? sessionTabsBottom : Math.round(sessionTabsBottom / cssZoom);
+  const minRemainCss = cssZoom === 1 ? 120 : Math.round(120 / cssZoom);
+  const mobileSubSessionBarHeight = Math.max(0, Math.min(scaledBarHeight, Math.max(0, scaledVvh - minRemainCss)));
   const measuredMobileWindowTop = Math.max(
     0,
-    Math.min(sessionTabsBottom, Math.max(0, vvh - mobileSubSessionBarHeight)),
+    Math.min(scaledTabsBottom, Math.max(0, scaledVvh - mobileSubSessionBarHeight)),
   );
   const mobileWindowTop = measuredMobileWindowTop > 0
     ? `${measuredMobileWindowTop}px`
     : 'var(--sat, 0px)';
-  const mobileWindowHeight = `calc(${vvh}px - ${mobileWindowTop} - ${mobileSubSessionBarHeight}px)`;
+  const mobileWindowHeight = `calc(${scaledVvh}px - ${mobileWindowTop} - ${mobileSubSessionBarHeight}px)`;
 
   const style: Record<string, string | number> = isMobile
     ? {
@@ -1019,10 +1034,12 @@ export function SubSessionWindow({
         top: mobileWindowTop,
         left: 0,
         right: 0,
+        width: 'var(--imcodes-ui-vw, 100%)',
         bottom: `${mobileSubSessionBarHeight}px`,
         height: mobileWindowHeight,
         maxHeight: mobileWindowHeight,
         minHeight: 0,
+        boxSizing: 'border-box',
         zIndex,
       }
     : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };

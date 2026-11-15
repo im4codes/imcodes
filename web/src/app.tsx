@@ -1537,13 +1537,14 @@ function InternalMainApp() {
     let hadKeyboardOpen = false;
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
+      const cssZoom = getActiveCssZoom();
       const viewportHeight = boundedVisualViewportHeight(
         vv.height,
         window.innerHeight,
         document.documentElement.clientHeight,
+        cssZoom,
       );
       if (viewportHeight === null) return;
-      const cssZoom = getActiveCssZoom();
       const viewportCssValue = `${Math.round(viewportHeight / cssZoom)}px`;
       if (document.documentElement.style.getPropertyValue('--vvh') !== viewportCssValue) {
         document.documentElement.style.setProperty('--vvh', viewportCssValue);
@@ -1621,8 +1622,9 @@ function InternalMainApp() {
     vv.addEventListener('resize', scheduleUpdate);
     vv.addEventListener('scroll', scheduleUpdate);
     window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener('orientationchange', scheduleUpdate);
     window.addEventListener('pageshow', scheduleUpdate);
-    window.addEventListener(UI_SCALE_EVENT, update);
+    window.addEventListener(UI_SCALE_EVENT, scheduleUpdate);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
     // App-resume recovery: when the app returns from background (push-notification
@@ -1656,8 +1658,9 @@ function InternalMainApp() {
       vv.removeEventListener('resize', scheduleUpdate);
       vv.removeEventListener('scroll', scheduleUpdate);
       window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener('orientationchange', scheduleUpdate);
       window.removeEventListener('pageshow', scheduleUpdate);
-      window.removeEventListener(UI_SCALE_EVENT, update);
+      window.removeEventListener(UI_SCALE_EVENT, scheduleUpdate);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       document.removeEventListener('visibilitychange', onResume);
@@ -7400,7 +7403,7 @@ function InternalMainApp() {
         role="status"
         aria-live="polite"
         style={{
-          minHeight: '100vh',
+          minHeight: 'var(--imcodes-ui-dvh, 100vh)',
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
@@ -8500,7 +8503,7 @@ function InternalMainApp() {
       ? sharedEntriesError
       : null;
     return (
-      <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
+      <div style={{ position: 'fixed', inset: 0, width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
         <div class="spinner" style={{ width: 32, height: 32 }} />
         <div style={{ color: sharedRestoreError ? '#fca5a5' : '#64748b', fontSize: 14 }}>
           {sharedRestoreError ?? (connecting ? trans('common.reconnecting') : trans('common.loading'))}
@@ -9495,7 +9498,7 @@ function InternalMainApp() {
           <div ref={sidebarPanelRef} class="mobile-sidebar-panel">
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end', minWidth: 0 }}>
                 <button
                   class="mobile-sidebar-hdr-btn"
                   onClick={() => { handleBackToDashboard(); closeSidebar(); }}
@@ -9840,7 +9843,7 @@ function InternalMainApp() {
           data-testid="settings-page-overlay"
           style={{
             position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
-            width: '100%', height: 'var(--vvh, 100dvh)', maxHeight: 'var(--vvh, 100dvh)', minHeight: 0, boxSizing: 'border-box',
+            width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', maxHeight: 'var(--vvh, var(--imcodes-ui-dvh))', minHeight: 0, boxSizing: 'border-box',
             background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden',
           }}
         >
@@ -9862,7 +9865,14 @@ function InternalMainApp() {
       )}
 
       {showUsageSummaryPage && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <div
+          data-testid="usage-summary-overlay"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999,
+            width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', maxHeight: 'var(--vvh, var(--imcodes-ui-dvh))',
+            background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflowY: 'auto', boxSizing: 'border-box',
+          }}
+        >
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>{trans('common.loading')}</div>}>
             <UsageSummaryPage onBack={() => setShowUsageSummaryPage(false)} />
           </Suspense>
@@ -10113,7 +10123,7 @@ function InternalMainApp() {
           data-testid="admin-page-overlay"
           style={{
             position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
-            width: '100%', height: '100dvh', minHeight: 0, boxSizing: 'border-box',
+            width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', maxHeight: 'var(--vvh, var(--imcodes-ui-dvh))', minHeight: 0, boxSizing: 'border-box',
             background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden',
           }}
         >
@@ -10590,7 +10600,7 @@ function InternalMainApp() {
             right: 16,
             bottom: 16,
             zIndex: 10050,
-            width: 'min(360px, calc(100vw - 32px))',
+            width: 'min(360px, calc(var(--imcodes-ui-vw, 100vw) - 32px))',
             background: '#0f172a',
             border: '1px solid #38bdf8',
             borderRadius: 10,
@@ -10624,6 +10634,9 @@ function InternalMainApp() {
           style={{
             position: 'fixed',
             inset: 0,
+            width: 'var(--imcodes-ui-vw, 100%)',
+            height: 'var(--vvh, var(--imcodes-ui-dvh))',
+            boxSizing: 'border-box',
             zIndex: 10060,
             background: 'rgba(2, 6, 23, 0.72)',
             display: 'flex',
