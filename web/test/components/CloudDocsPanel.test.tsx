@@ -2177,4 +2177,128 @@ describe('CloudDocsPanel', () => {
     expect(screen.getByTestId('cloud-docs-tab-my-docs').getAttribute('aria-selected')).toBe('true');
     expect(await screen.findByTestId('cloud-doc-row-doc-sub-up')).toBeTruthy();
   });
+
+  it('opens editable Recent cloud_doc and server_file items in edit mode even when openMode is view, while keeping viewer items readOnly', async () => {
+    const ownedDoc = makeDoc({ id: 'doc-own-recent', name: 'Budget.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const sharedEditorDoc: SharedCloudDocItem = {
+      id: 'doc-shared-ed',
+      name: 'SharedEdit.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      sizeBytes: 120,
+      role: 'editor',
+      allowDownload: true,
+      updatedAt: 100,
+      lastOpenedAt: null,
+      ownerUsername: 'alice',
+      sharedTeamName: null,
+    };
+    const sharedViewerDoc: SharedCloudDocItem = {
+      id: 'doc-shared-view',
+      name: 'SharedView.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      sizeBytes: 120,
+      role: 'viewer',
+      allowDownload: true,
+      updatedAt: 100,
+      lastOpenedAt: null,
+      ownerUsername: 'alice',
+      sharedTeamName: null,
+    };
+    const recItems: RecentDocumentItem[] = [
+      {
+        id: 'rec-own-cloud',
+        userId: 'user-1',
+        sourceKind: 'cloud_doc',
+        sourceKey: 'cloud_doc:doc-own-recent',
+        serverId: null,
+        serverName: null,
+        sessionName: null,
+        filePath: null,
+        cloudDocId: 'doc-own-recent',
+        title: 'Budget.xlsx',
+        mimeType: ownedDoc.mimeType,
+        openMode: 'view',
+        openCount: 2,
+        lastOpenedAt: 300,
+        createdAt: 100,
+        accessible: true,
+        serverOnline: true,
+        accessReason: null,
+        allowDownload: true,
+      },
+      {
+        id: 'rec-srv-edit',
+        userId: 'user-1',
+        sourceKind: 'server_file',
+        sourceKey: 'server_file:srv-1:/repo/plan.xlsx',
+        serverId: 'srv-1',
+        serverName: 'dev',
+        sessionName: null,
+        filePath: '/repo/plan.xlsx',
+        cloudDocId: null,
+        title: 'plan.xlsx',
+        mimeType: ownedDoc.mimeType,
+        openMode: 'view',
+        openCount: 3,
+        lastOpenedAt: 250,
+        createdAt: 100,
+        accessible: true,
+        serverOnline: true,
+        accessReason: null,
+        role: 'editor',
+      },
+      {
+        id: 'rec-cloud-viewer',
+        userId: 'user-1',
+        sourceKind: 'cloud_doc',
+        sourceKey: 'cloud_doc:doc-shared-view',
+        serverId: null,
+        serverName: null,
+        sessionName: null,
+        filePath: null,
+        cloudDocId: 'doc-shared-view',
+        title: 'SharedView.docx',
+        mimeType: sharedViewerDoc.mimeType,
+        openMode: 'view',
+        openCount: 1,
+        lastOpenedAt: 200,
+        createdAt: 100,
+        accessible: true,
+        serverOnline: true,
+        accessReason: null,
+        role: 'viewer',
+        allowDownload: true,
+      },
+    ];
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [ownedDoc],
+      sharedFolders: [],
+      sharedDocs: [sharedEditorDoc, sharedViewerDoc],
+    });
+    listRecentDocumentsApiMock.mockResolvedValue({ items: recItems });
+
+    render(<CloudDocsPanel initialTab="recent" />);
+    await waitFor(() => expect(screen.getByTestId('recent-doc-row-rec-own-cloud')).toBeTruthy());
+
+    // 1. Owned Recent cloud_doc (even with missing role & openMode='view') -> readOnly=false, initialMode='edit'
+    fireEvent.click(screen.getByTestId('recent-doc-row-rec-own-cloud').querySelector('button.cloud-docs-row-main')!);
+    let preview = await screen.findByTestId('mock-office-preview');
+    expect(preview.getAttribute('data-read-only')).toBe('false');
+    expect(preview.getAttribute('data-initial-mode')).toBe('edit');
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+
+    // 2. Editable server_file in Recent (with openMode='view' from a prior preview switch) -> readOnly=false, initialMode='edit'
+    fireEvent.click((await screen.findByTestId('recent-doc-row-rec-srv-edit')).querySelector('button.cloud-docs-row-main')!);
+    preview = await screen.findByTestId('mock-office-preview');
+    expect(preview.getAttribute('data-read-only')).toBe('false');
+    expect(preview.getAttribute('data-initial-mode')).toBe('edit');
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+
+    // 3. Viewer Recent cloud_doc -> strictly readOnly=true, initialMode='view'
+    fireEvent.click((await screen.findByTestId('recent-doc-row-rec-cloud-viewer')).querySelector('button.cloud-docs-row-main')!);
+    preview = await screen.findByTestId('mock-office-preview');
+    expect(preview.getAttribute('data-read-only')).toBe('true');
+    expect(preview.getAttribute('data-initial-mode')).toBe('view');
+  });
 });

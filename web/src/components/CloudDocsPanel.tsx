@@ -1423,14 +1423,22 @@ export function CloudDocsPanel({
       return;
     }
     if (item.sourceKind === 'cloud_doc' && item.cloudDocId) {
-      const isShared = sharedDocs.some((sd) => sd.id === item.cloudDocId);
-      const isOwned = docs.some((d) => d.id === item.cloudDocId) || !isShared;
+      const ownDoc = docs.find((d) => d.id === item.cloudDocId);
+      const sharedDoc = sharedDocs.find((sd) => sd.id === item.cloudDocId);
+      const isOwned = Boolean(ownDoc) || (!sharedDoc && item.role !== 'viewer');
+      const readOnly = ownDoc
+        ? false
+        : item.role
+          ? item.role !== 'editor'
+          : sharedDoc
+            ? sharedDoc.role !== 'editor'
+            : false;
       openPreview({
         kind: 'cloud_doc',
         id: item.cloudDocId,
         name: item.title,
         mimeType: item.mimeType,
-        readOnly: item.role ? item.role !== 'editor' : item.openMode === 'view',
+        readOnly,
         allowDownload: item.allowDownload !== false,
         isOwner: isOwned,
       });
@@ -1446,7 +1454,7 @@ export function CloudDocsPanel({
         path: item.filePath,
         title: item.title,
         mimeType: item.mimeType,
-        readOnly: item.openMode === 'view',
+        readOnly: item.role ? item.role !== 'editor' : false,
       });
     }
   };

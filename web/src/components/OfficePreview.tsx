@@ -531,7 +531,10 @@ function OnlyOfficeEmbeddedEditor({
     );
   }
 
-  const canEdit = ooConfig.role === 'editor';
+  const canEdit =
+    ooConfig.role === 'editor'
+    && ooConfig.config?.documentType !== 'pdf'
+    && ooConfig.config?.document?.fileType !== 'pdf';
   const allowDownload = ooConfig.allowDownload;
   const effectiveDownloadUrl = downloadUrl || ooConfig.config?.document?.url;
   const modeViewLabel = t('office_preview.mode_view', 'Preview');
@@ -542,6 +545,7 @@ function OnlyOfficeEmbeddedEditor({
   const fullscreenLabel = isFullscreen
     ? t('office_preview.exit_fullscreen', 'Exit Fullscreen')
     : t('office_preview.fullscreen', 'Fullscreen');
+  const isCompactMobile = isMobileOnlyOfficeViewport();
 
   return (
     <div
@@ -550,9 +554,15 @@ function OnlyOfficeEmbeddedEditor({
       style={{
         display: 'flex',
         flexDirection: 'column',
+        flex: isFullscreen ? undefined : '1 1 0',
         width: isFullscreen ? 'var(--imcodes-ui-vw, 100%)' : '100%',
         height: isFullscreen ? 'var(--vvh, var(--imcodes-ui-dvh))' : '100%',
-        minHeight: isFullscreen ? 'var(--vvh, var(--imcodes-ui-dvh))' : 480,
+        maxHeight: isFullscreen ? 'var(--vvh, var(--imcodes-ui-dvh))' : '100%',
+        minHeight: isFullscreen ? 'var(--vvh, var(--imcodes-ui-dvh))' : (isCompactMobile ? 0 : 480),
+        overflow: 'hidden',
+        boxSizing: isFullscreen ? 'border-box' : undefined,
+        paddingTop: isFullscreen ? 'env(safe-area-inset-top, 0px)' : undefined,
+        paddingBottom: isFullscreen ? 'env(safe-area-inset-bottom, 0px)' : undefined,
         position: isFullscreen ? 'fixed' : 'relative',
         inset: isFullscreen ? 0 : undefined,
         zIndex: isFullscreen ? 9999 : undefined,
@@ -573,6 +583,7 @@ function OnlyOfficeEmbeddedEditor({
           fontSize: 12,
           color: '#e2e8f0',
           flexWrap: 'wrap',
+          flexShrink: 0,
         }}
       >
         <div className="office-preview-toolbar-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -745,7 +756,7 @@ function OnlyOfficeEmbeddedEditor({
           </button>
         </div>
       </div>
-      <div className="office-preview-editor-wrap" style={{ flex: 1, width: '100%', minHeight: 420, position: 'relative' }}>
+      <div className="office-preview-editor-wrap" style={{ flex: '1 1 0', width: '100%', minHeight: isCompactMobile ? 0 : 420, position: 'relative', overflow: 'hidden' }}>
         <div id={holderIdRef.current} data-testid="onlyoffice-editor-holder" style={{ width: '100%', height: '100%' }} />
       </div>
     </div>

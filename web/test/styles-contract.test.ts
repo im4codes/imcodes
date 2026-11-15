@@ -1821,4 +1821,33 @@ describe('styles.css regression contracts', () => {
     expect(miniChatViewRule).toMatch(/-webkit-overflow-scrolling:\s*touch/);
     expect(miniChatViewRule).toMatch(/touch-action:\s*pan-y/);
   });
+
+  it('bounds CloudDocs ONLYOFFICE preview flex chain and bottom tabs on mobile without breaking non-ONLYOFFICE scrolling', () => {
+    const previewHeaderRule = cssWithoutComments.match(/\.cloud-docs-preview-header\s*\{[^}]*\}/)?.[0];
+    const previewStageRule = cssWithoutComments.match(/\.cloud-docs-preview-stage\s*\{[^}]*\}/)?.[0];
+    const embeddedStageRule = cssWithoutComments.match(/\.cloud-docs-preview-stage:has\(>\s*\.office-preview-embedded\)\s*\{[^}]*\}/)?.[0];
+    const iframeRule = cssWithoutComments.match(/\.office-preview-editor-wrap\s*>\s*div,\s*\.office-preview-editor-wrap\s+iframe\s*\{[^}]*\}/)?.[0];
+
+    expect(previewHeaderRule).toMatch(/flex-shrink:\s*0/);
+    expect(previewStageRule).toMatch(/min-height:\s*0/);
+    expect(previewStageRule).toMatch(/overflow:\s*auto/);
+    expect(embeddedStageRule).toMatch(/overflow:\s*hidden/);
+    expect(iframeRule).toMatch(/height:\s*100%\s*!important/);
+    expect(iframeRule).toMatch(/max-height:\s*100%\s*!important/);
+
+    for (const mq of [/@media \(max-width:\s*600px\)/, /@media \(max-width:\s*767px\)/]) {
+      const blocks = extractBalancedAtRuleBlocks(cssWithoutComments, mq);
+      expect(blocks.length).toBeGreaterThan(0);
+      const mobileBlock = blocks.join('\n');
+      const mobileStage = extractDirectStyleRule(mobileBlock, /\.cloud-docs-preview-stage:has\(>\s*\.office-preview-embedded\)/);
+      const mobileEmbedded = extractDirectStyleRule(mobileBlock, /\.office-preview-embedded/);
+      const mobileWrap = extractDirectStyleRule(mobileBlock, /\.office-preview-editor-wrap/);
+      expect(mobileStage).toMatch(/overflow:\s*hidden/);
+      expect(mobileStage).toMatch(/env\(safe-area-inset-bottom/);
+      expect(mobileEmbedded).toMatch(/min-height:\s*0\s*!important/);
+      expect(mobileEmbedded).toMatch(/overflow:\s*hidden/);
+      expect(mobileWrap).toMatch(/min-height:\s*0\s*!important/);
+      expect(mobileWrap).toMatch(/overflow:\s*hidden/);
+    }
+  });
 });

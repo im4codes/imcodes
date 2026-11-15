@@ -2682,7 +2682,7 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
       );
     }
 
-    // 2. Mobile + view (?mode=view&mobile=1): top-level type='mobile' + compact view customization signed in ooJwt
+    // 2. Mobile + view (?mode=view&mobile=1): uses desktop shell with compact customization (avoids broken mobile shell)
     const mobileViewRes = await app.request(
       `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=view&mobile=1`,
       { headers: { Authorization: bearer('owner-1') } },
@@ -2695,19 +2695,26 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
         token: string;
       };
     };
-    expect(mobileViewBody.config.type).toBe('mobile');
+    expect(mobileViewBody.config.type).toBe('desktop');
     expect(mobileViewBody.config.editorConfig.mode).toBe('view');
     expect(mobileViewBody.config.editorConfig.customization).toEqual({
       forcesave: true,
       compactHeader: true,
       compactToolbar: true,
-      toolbarHideFileName: true,
+      toolbarNoTabs: true,
+      hideRightMenu: true,
+      hideRulers: true,
+      layout: {
+        leftMenu: false,
+        rightMenu: false,
+      },
       help: false,
       feedback: false,
       chat: false,
+      toolbarHideFileName: true,
     });
     const mobileViewClaims = verifyJwt(mobileViewBody.config.token, ooSecret) as Record<string, unknown>;
-    expect(mobileViewClaims.type).toBe('mobile');
+    expect(mobileViewClaims.type).toBe('desktop');
     expect((mobileViewClaims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
       mobileViewBody.config.editorConfig.customization,
     );

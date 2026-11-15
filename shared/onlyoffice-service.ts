@@ -72,20 +72,6 @@ export function buildOnlyOfficeEditorPresentation(options: {
       },
     };
   }
-  if (options.mode === 'view') {
-    return {
-      type: 'mobile',
-      customization: {
-        forcesave: true,
-        compactHeader: true,
-        compactToolbar: true,
-        toolbarHideFileName: true,
-        help: false,
-        feedback: false,
-        chat: false,
-      },
-    };
-  }
   return {
     type: 'desktop',
     customization: {
