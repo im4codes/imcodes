@@ -2721,7 +2721,10 @@
     "callback_triggered_at": "コールバック時刻: {{time}}",
     "callback_completed_at": "完了時刻: {{time}}",
     "callback_open_link": "詳細を開く",
-    "callback_related_task": "関連タスク: {{taskId}}"
+    "callback_related_task": "関連タスク: {{taskId}}",
+    "callback_prev_page": "前へ",
+    "callback_next_page": "次へ",
+    "callback_page_info": "{{current}} / {{total}} ページ（{{pageSize}}件/ページ）"
   },
   "transport_chat": {
     "inputPlaceholder": "メッセージを入力...",

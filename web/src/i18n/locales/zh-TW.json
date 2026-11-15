@@ -2722,7 +2722,10 @@
     "callback_triggered_at": "回調時間：{{time}}",
     "callback_completed_at": "完成時間：{{time}}",
     "callback_open_link": "查看詳情",
-    "callback_related_task": "關聯任務：{{taskId}}"
+    "callback_related_task": "關聯任務：{{taskId}}",
+    "callback_prev_page": "上一頁",
+    "callback_next_page": "下一頁",
+    "callback_page_info": "第 {{current}} / {{total}} 頁（{{pageSize}}/頁）"
   },
   "transport_chat": {
     "inputPlaceholder": "輸入訊息...",

@@ -15,6 +15,7 @@ import {
 import type { CallbackTaskRecord } from '@shared/callback-types.js';
 import type { WsClient, ServerMessage } from '../src/ws-client.js';
 import { RepoPage } from '../src/pages/RepoPage.js';
+import { REPO_CALLBACK_PAGE_SIZE } from '../src/components/RepoCallbackModal.js';
 import { buildRepoCallbackTargetOptions, saveRepoCallbackRepoConfig } from '../src/repo-callback-prefs.js';
 import { getUserPref } from '../src/api.js';
 
@@ -94,6 +95,11 @@ vi.mock('react-i18next', () => ({
       if (key === 'repo.callback_completed_at') return `Completed: ${opts?.time ?? ''}`;
       if (key === 'repo.callback_open_link') return 'Open link';
       if (key === 'repo.callback_related_task') return `Related task: ${opts?.taskId ?? ''}`;
+      if (key === 'repo.callback_prev_page') return 'Previous';
+      if (key === 'repo.callback_next_page') return 'Next';
+      if (key === 'repo.callback_page_info') {
+        return `Page ${opts?.current ?? ''} / ${opts?.total ?? ''} (${opts?.pageSize ?? ''}/page)`;
+      }
       if (key === 'repo.callback_check_now') return 'Check now';
       if (key === 'common.close') return 'Close';
       return key;
@@ -830,5 +836,170 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
       expect(nativeMockState.browserOpen).toHaveBeenCalledWith({ url: 'https://github.com/acme/repo-ts/actions/runs/5' });
     });
     expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it('paginates recent callbacks at 10 per page and resets/clamps page across empty, 10, 19, filter changes, shrink, reopen, and project switch', async () => {
+    expect(REPO_CALLBACK_PAGE_SIZE).toBe(10);
+
+    const makeCallbacks = (count: number, scopeKey = '/work/repo-page'): CallbackTaskRecord[] =>
+      Array.from({ length: count }, (_, idx) => {
+        const n = idx + 1;
+        const status = n <= 12 ? 'done' : n <= 16 ? 'failed' : 'pending';
+        return {
+          callbackId: `cb_${scopeKey}_${n}`,
+          source: 'repo',
+          eventType: 'ci_failed',
+          scopeKey,
+          entityKey: `run#${n}`,
+          dedupKey: `repo:${scopeKey}:ci_failed:${n}`,
+          title: `Callback Item #${n}`,
+          targetSession: 'deck_proj_brain',
+          status,
+          summary: `Summary for #${n}`,
+          createdAt: 10_000 - n,
+          updatedAt: 10_000 - n,
+        };
+      });
+
+    const ws = createMockWs();
+    const { rerender } = render(<RepoPage ws={ws} serverId="srv-1" projectDir="/work/repo-page" />);
+
+    // 0 items boundary: empty state shown, no pagination controls
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-page',
+      enabled: true,
+      checking: false,
+      callbacks: [],
+    });
+
+    await openModalAndAwaitPrefs();
+    expect(screen.getByText('Recent callbacks (0)')).toBeTruthy();
+    expect(screen.getByText('No callbacks recorded')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Previous' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Next' })).toBeNull();
+
+    // Exact 10 items boundary: single page renders all 10 without pagination controls
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-page',
+      enabled: true,
+      checking: false,
+      callbacks: makeCallbacks(10),
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Recent callbacks (10)')).toBeTruthy();
+    });
+    expect(screen.getByText('Callback Item #1')).toBeTruthy();
+    expect(screen.getByText('Callback Item #10')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Previous' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Next' })).toBeNull();
+
+    // 19 items scenario: 2 pages (10 + 9), title retains total (19)
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-page',
+      enabled: true,
+      checking: false,
+      callbacks: makeCallbacks(19),
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Recent callbacks (19)')).toBeTruthy();
+    });
+    expect(screen.getByText('Page 1 / 2 (10/page)')).toBeTruthy();
+    expect(screen.getByText('Callback Item #1')).toBeTruthy();
+    expect(screen.getByText('Callback Item #10')).toBeTruthy();
+    expect(screen.queryByText('Callback Item #11')).toBeNull();
+    expect((screen.getByRole('button', { name: 'Previous' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Next' }) as HTMLButtonElement).disabled).toBe(false);
+
+    // Navigate to Page 2: renders items #11..#19, Next disabled, Previous enabled
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Recent callbacks (19)')).toBeTruthy();
+    expect(screen.getByText('Page 2 / 2 (10/page)')).toBeTruthy();
+    expect(screen.queryByText('Callback Item #1')).toBeNull();
+    expect(screen.queryByText('Callback Item #10')).toBeNull();
+    expect(screen.getByText('Callback Item #11')).toBeTruthy();
+    expect(screen.getByText('Callback Item #19')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Previous' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: 'Next' }) as HTMLButtonElement).disabled).toBe(true);
+
+    // Filter switch from Page 2 to 'Done' (12 items > 10): resets to Page 1
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+    expect(screen.getByText('Recent callbacks (12)')).toBeTruthy();
+    expect(screen.getByText('Page 1 / 2 (10/page)')).toBeTruthy();
+    expect(screen.getByText('Callback Item #1')).toBeTruthy();
+    expect(screen.queryByText('Callback Item #11')).toBeNull();
+
+    // Advance to Page 2 of 'Done', then switch to 'Failed' (4 items <= 10): resets to Page 1 & hides pagination
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Callback Item #12')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Failed' }));
+    expect(screen.getByText('Recent callbacks (4)')).toBeTruthy();
+    expect(screen.getByText('Callback Item #13')).toBeTruthy();
+    expect(screen.getByText('Callback Item #16')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Previous' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Next' })).toBeNull();
+
+    // Switch back to 'All', go to Page 2, then shrink data from 19 -> 8: clamps to Page 1 with zero blank state
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Page 2 / 2 (10/page)')).toBeTruthy();
+
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-page',
+      enabled: true,
+      checking: false,
+      callbacks: makeCallbacks(8),
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Recent callbacks (8)')).toBeTruthy();
+    });
+    expect(screen.getByText('Callback Item #1')).toBeTruthy();
+    expect(screen.getByText('Callback Item #8')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Next' })).toBeNull();
+
+    // Restore 19 items, go to Page 2, close & reopen modal: resets to Page 1
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-page',
+      enabled: true,
+      checking: false,
+      callbacks: makeCallbacks(19),
+    });
+    await waitFor(() => {
+      expect(screen.getByText('Recent callbacks (19)')).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Page 2 / 2 (10/page)')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    await openModalAndAwaitPrefs();
+    expect(screen.getByText('Page 1 / 2 (10/page)')).toBeTruthy();
+    expect(screen.getByText('Callback Item #1')).toBeTruthy();
+    expect(screen.queryByText('Callback Item #11')).toBeNull();
+
+    // Go to Page 2, then switch projectDir while modal is open: resets to Page 1
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('Page 2 / 2 (10/page)')).toBeTruthy();
+
+    rerender(<RepoPage ws={ws} serverId="srv-1" projectDir="/work/repo-page-2" />);
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-page-2',
+      enabled: true,
+      checking: false,
+      callbacks: makeCallbacks(19, '/work/repo-page-2'),
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Page 1 / 2 (10/page)')).toBeTruthy();
+    });
+    expect(screen.getByText('Callback Item #1')).toBeTruthy();
+    expect(screen.queryByText('Callback Item #11')).toBeNull();
   });
 });

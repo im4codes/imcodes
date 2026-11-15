@@ -2721,7 +2721,10 @@
     "callback_triggered_at": "콜백 시간: {{time}}",
     "callback_completed_at": "완료 시간: {{time}}",
     "callback_open_link": "링크 열기",
-    "callback_related_task": "연결된 작업: {{taskId}}"
+    "callback_related_task": "연결된 작업: {{taskId}}",
+    "callback_prev_page": "이전",
+    "callback_next_page": "다음",
+    "callback_page_info": "{{current}} / {{total}}페이지 ({{pageSize}}개/페이지)"
   },
   "transport_chat": {
     "inputPlaceholder": "메시지를 입력하세요...",

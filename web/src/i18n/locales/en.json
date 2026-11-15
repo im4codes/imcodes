@@ -2722,7 +2722,10 @@
     "callback_triggered_at": "Callback: {{time}}",
     "callback_completed_at": "Completed: {{time}}",
     "callback_open_link": "Open link",
-    "callback_related_task": "Related task: {{taskId}}"
+    "callback_related_task": "Related task: {{taskId}}",
+    "callback_prev_page": "Previous",
+    "callback_next_page": "Next",
+    "callback_page_info": "Page {{current}} / {{total}} ({{pageSize}}/page)"
   },
   "transport_chat": {
     "inputPlaceholder": "Type a message...",

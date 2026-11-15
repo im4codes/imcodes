@@ -839,4 +839,19 @@ describe('generic i18n coverage guard', () => {
       }
     }
   });
+
+  it('keeps repo callback pagination keys and placeholders present across all 7 locales', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      for (const key of ['repo.callback_prev_page', 'repo.callback_next_page', 'repo.callback_page_info']) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string).trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+      const pageInfo = String(readPath(messages, 'repo.callback_page_info') ?? '');
+      expect(pageInfo, `${locale}:repo.callback_page_info {{current}}`).toContain('{{current}}');
+      expect(pageInfo, `${locale}:repo.callback_page_info {{total}}`).toContain('{{total}}');
+      expect(pageInfo, `${locale}:repo.callback_page_info {{pageSize}}`).toContain('{{pageSize}}');
+    }
+  });
 });

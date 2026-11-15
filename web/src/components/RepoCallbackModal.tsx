@@ -34,6 +34,7 @@ export interface RepoCallbackTargetOption {
 }
 
 export type CallbackListFilter = 'all' | 'active' | 'done' | 'ignored' | 'failed';
+export const REPO_CALLBACK_PAGE_SIZE = 10;
 
 interface Props {
   open: boolean;
@@ -147,6 +148,11 @@ export function RepoCallbackModal({
   const [expandedEvent, setExpandedEvent] = useState<RepoCallbackEventType | null>('ci_failed');
   const [templateNameDraft, setTemplateNameDraft] = useState('');
   const [filter, setFilter] = useState<CallbackListFilter>('all');
+  const [page, setPage] = useState(1);
+
+  useEffect(() => {
+    setPage(1);
+  }, [open, serverId, projectDir]);
 
   useEffect(() => {
     if (!open) return;
@@ -183,6 +189,20 @@ export function RepoCallbackModal({
       return cb.status === filter;
     });
   }, [callbacks, filter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredCallbacks.length / REPO_CALLBACK_PAGE_SIZE));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const pagedCallbacks = useMemo(
+    () => filteredCallbacks.slice((safePage - 1) * REPO_CALLBACK_PAGE_SIZE, safePage * REPO_CALLBACK_PAGE_SIZE),
+    [filteredCallbacks, safePage],
+  );
+
+  useEffect(() => {
+    setPage((prev) => {
+      const clamped = Math.min(Math.max(1, prev), totalPages);
+      return clamped === prev ? prev : clamped;
+    });
+  }, [totalPages]);
 
   const targetOptions = useMemo(() => {
     const known = new Map<string, RepoCallbackTargetOption>();
@@ -891,7 +911,10 @@ export function RepoCallbackModal({
                     type="button"
                     class="btn btn-sm"
                     aria-pressed={filter === key}
-                    onClick={() => setFilter(key)}
+                    onClick={() => {
+                      setFilter(key);
+                      setPage(1);
+                    }}
                     style={{
                       fontSize: 11,
                       padding: '2px 8px',
@@ -912,7 +935,7 @@ export function RepoCallbackModal({
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {filteredCallbacks.map((cb) => {
+                {pagedCallbacks.map((cb) => {
                   const palette = statusColors(cb.status);
                   const safeUrl = getSafeExternalUrl(cb.url);
                   const eventAtMs = cb.metadata?.failedAt ?? cb.metadata?.eventAt;
@@ -1029,6 +1052,60 @@ export function RepoCallbackModal({
                     </div>
                   );
                 })}
+                {totalPages > 1 && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 8,
+                      flexWrap: 'wrap',
+                      paddingTop: 4,
+                    }}
+                  >
+                    <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                      {t('repo.callback_page_info', {
+                        current: safePage,
+                        total: totalPages,
+                        pageSize: REPO_CALLBACK_PAGE_SIZE,
+                      })}
+                    </span>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        type="button"
+                        class="btn btn-sm"
+                        disabled={safePage <= 1}
+                        onClick={() => setPage(Math.max(1, safePage - 1))}
+                        style={{
+                          fontSize: 11,
+                          padding: '2px 10px',
+                          background: '#1e293b',
+                          color: safePage <= 1 ? '#64748b' : '#cbd5e1',
+                          border: '1px solid #334155',
+                          cursor: safePage <= 1 ? 'not-allowed' : 'pointer',
+                        }}
+                      >
+                        {t('repo.callback_prev_page')}
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-sm"
+                        disabled={safePage >= totalPages}
+                        onClick={() => setPage(Math.min(totalPages, safePage + 1))}
+                        style={{
+                          fontSize: 11,
+                          padding: '2px 10px',
+                          background: '#1e293b',
+                          color: safePage >= totalPages ? '#64748b' : '#cbd5e1',
+                          border: '1px solid #334155',
+                          cursor: safePage >= totalPages ? 'not-allowed' : 'pointer',
+                        }}
+                      >
+                        {t('repo.callback_next_page')}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
