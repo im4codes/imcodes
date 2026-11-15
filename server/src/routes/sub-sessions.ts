@@ -33,34 +33,8 @@ import {
   extractSessionCompactHijackMode,
   hasCompactHijackField,
   hasInvalidCompactHijackSetting,
-  stripCompactHijackFromTransportConfig,
+  sanitizeShareTransportConfigRow,
 } from '../../../shared/compact-hijack.js';
-
-function sanitizeShareSubSessionRow<T extends Record<string, unknown>>(sub: T): T {
-  const rawConfig = sub.transport_config ?? sub.transportConfig;
-  let parsed: Record<string, unknown> | null = null;
-  if (typeof rawConfig === 'string') {
-    try {
-      const candidate = JSON.parse(rawConfig) as unknown;
-      if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
-        parsed = candidate as Record<string, unknown>;
-      }
-    } catch {
-      parsed = null;
-    }
-  } else if (rawConfig && typeof rawConfig === 'object' && !Array.isArray(rawConfig)) {
-    parsed = rawConfig as Record<string, unknown>;
-  }
-  if (!parsed || !hasCompactHijackField(parsed)) return sub;
-  const stripped = stripCompactHijackFromTransportConfig(parsed);
-  return {
-    ...sub,
-    ...('transport_config' in sub
-      ? { transport_config: typeof rawConfig === 'string' ? (stripped ? JSON.stringify(stripped) : null) : stripped }
-      : {}),
-    ...('transportConfig' in sub ? { transportConfig: stripped } : {}),
-  };
-}
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 type SubSessionRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
@@ -97,14 +71,26 @@ subSessionRoutes.get('/:id/sub-sessions', async (c) => {
   // Normal sub-session listing surface: execution clones are excluded (default)
   // so ephemeral clone workers never clutter the normal sub-session list.
   const subSessions = (await getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false })) ?? [];
-  if (member.ok) return c.json({ subSessions });
+  if (member.ok) {
+    const serverAccess = await resolveHttpShareAccess(c.env.DB, {
+      serverId,
+      userId,
+      target: { kind: 'server', serverId },
+    });
+    const isShareCaller = serverAccess?.actor?.kind === 'share';
+    return c.json({
+      subSessions: isShareCaller
+        ? subSessions.map((sub) => sanitizeShareTransportConfigRow(sub as unknown as Record<string, unknown>))
+        : subSessions,
+    });
+  }
   const visible = (await Promise.all(subSessions.map(async (sub) => {
     const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
       serverId,
       userId,
       target: { kind: 'subsession', serverId, subSessionId: sub.id },
     });
-    return access.actor.kind === 'share' ? sanitizeShareSubSessionRow(sub as unknown as Record<string, unknown>) : null;
+    return access.actor.kind === 'share' ? sanitizeShareTransportConfigRow(sub as unknown as Record<string, unknown>) : null;
   }))).filter((sub): sub is NonNullable<typeof sub> => sub !== null);
   return c.json({ subSessions: visible });
 });

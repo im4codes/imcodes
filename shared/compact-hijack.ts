@@ -131,6 +131,41 @@ export function stripCompactHijackFromTransportConfig(transportConfig: unknown):
   return Object.keys(copy).length > 0 ? copy : null;
 }
 
+function parseTransportConfigValue(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw === 'string') {
+    try {
+      const candidate = JSON.parse(raw) as unknown;
+      return candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+        ? (candidate as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  return null;
+}
+
+/**
+ * Strip `compactHijack` from serialized or object `transport_config`/`transportConfig`
+ * fields on DB/response rows returned to share callers, leaving owner/admin rows untouched.
+ */
+export function sanitizeShareTransportConfigRow<T extends Record<string, unknown>>(row: T): T {
+  let updated: T | null = null;
+  for (const key of ['transport_config', 'transportConfig'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(row, key)) continue;
+    const raw = row[key];
+    const parsed = parseTransportConfigValue(raw);
+    if (!parsed || !hasCompactHijackField(parsed)) continue;
+    const stripped = stripCompactHijackFromTransportConfig(parsed);
+    const nextVal = typeof raw === 'string' ? (stripped ? JSON.stringify(stripped) : null) : stripped;
+    updated = { ...(updated ?? row), [key]: nextVal };
+  }
+  return updated ?? row;
+}
+
 export function resolveCompactHijackEnabled(
   sessionOverride: unknown,
   globalEnabled: boolean,

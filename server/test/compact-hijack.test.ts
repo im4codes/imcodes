@@ -19,6 +19,7 @@ const mockDb = {
 const mockSetUserPref = vi.fn();
 const mockDeleteUserPref = vi.fn();
 const mockGetDbSessionByName = vi.fn();
+const mockGetDbSessionsByServer = vi.fn(async () => []);
 const mockGetSubSessionById = vi.fn();
 const mockGetSubSessionsByServer = vi.fn(async () => []);
 const mockUpdateSession = vi.fn();
@@ -53,7 +54,7 @@ vi.mock('../src/db/queries.js', async (importOriginal) => ({
   getServerById: vi.fn(async () => ({ id: 'srv-1', user_id: 'owner-user', node_role: NODE_ROLE.FULL })),
   setUserPref: (...args: unknown[]) => mockSetUserPref(...args),
   deleteUserPref: (...args: unknown[]) => mockDeleteUserPref(...args),
-  getDbSessionsByServer: vi.fn(async () => []),
+  getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
   getDbSessionByName: (...args: unknown[]) => mockGetDbSessionByName(...args),
   getSubSessionById: (...args: unknown[]) => mockGetSubSessionById(...args),
   getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
@@ -326,5 +327,81 @@ describe('Compact Hijack server routes & owner-only WS daemon push', () => {
       }),
     });
     expect(postRes.status).toBe(403);
+  });
+
+  it('strips compactHijack from GET /sessions, /session-snapshot, and whole-server share GET /sub-sessions while keeping owner rows intact', async () => {
+    const app = buildApp();
+    const sessionRow = {
+      id: 'sess-1',
+      server_id: 'srv-1',
+      name: 'deck_proj_brain',
+      project_name: 'proj',
+      role: 'brain',
+      agent_type: 'claude-code-sdk',
+      project_dir: '/tmp/proj',
+      state: 'idle',
+      transport_config: JSON.stringify({ compactHijack: 'on', uiLocale: 'zh-CN' }),
+    };
+    const subRow = {
+      id: 'sub1',
+      server_id: 'srv-1',
+      type: 'claude-code-sdk',
+      cwd: '/tmp/proj',
+      parent_session: 'deck_proj_brain',
+      transport_config: JSON.stringify({ compactHijack: 'off', uiLocale: 'en' }),
+    };
+    mockGetDbSessionsByServer.mockResolvedValue([sessionRow] as never);
+    mockGetSubSessionsByServer.mockResolvedValue([subRow] as never);
+
+    // Whole-server share participant: resolveServerMemberAccessOrShareDeny maps them to role='owner',
+    // while resolveHttpShareAccess preserves actor.kind === 'share'.
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccess.mockResolvedValue({
+      ok: true,
+      allowed: true,
+      shareProvenance: 'server',
+      actor: { kind: 'share', role: 'participant', shareId: 'sh-1', grantKind: 'server', userId: 'guest-user' },
+    });
+
+    const shareSessRes = await app.request('/api/server/srv-1/sessions');
+    expect(shareSessRes.status).toBe(200);
+    const shareSessBody = await shareSessRes.json() as { sessions: Array<{ transport_config?: string | null }> };
+    expect(JSON.parse(shareSessBody.sessions[0].transport_config ?? '{}')).toEqual({ uiLocale: 'zh-CN' });
+
+    const shareSnapRes = await app.request('/api/server/srv-1/session-snapshot');
+    expect(shareSnapRes.status).toBe(200);
+    const shareSnapBody = await shareSnapRes.json() as {
+      sessions: Array<{ transport_config?: Record<string, unknown> | null }>;
+      subSessions: Array<{ transport_config?: Record<string, unknown> | null }>;
+    };
+    expect(shareSnapBody.sessions[0].transport_config).toEqual({ uiLocale: 'zh-CN' });
+    expect(shareSnapBody.subSessions[0].transport_config).toEqual({ uiLocale: 'en' });
+
+    const shareSubRes = await app.request('/api/server/srv-1/sub-sessions');
+    expect(shareSubRes.status).toBe(200);
+    const shareSubBody = await shareSubRes.json() as { subSessions: Array<{ transport_config?: string | null }> };
+    expect(JSON.parse(shareSubBody.subSessions[0].transport_config ?? '{}')).toEqual({ uiLocale: 'en' });
+
+    // Real owner preserves compactHijack on all three endpoints
+    mockResolveHttpShareAccess.mockResolvedValue({
+      ok: true,
+      allowed: true,
+      shareProvenance: null,
+      actor: { kind: 'server-member', effectiveActorRole: 'server-manager', role: 'owner', userId: 'owner-user' },
+    });
+
+    const ownerSessRes = await app.request('/api/server/srv-1/sessions');
+    expect(ownerSessRes.status).toBe(200);
+    const ownerSessBody = await ownerSessRes.json() as { sessions: Array<{ transport_config?: string | null }> };
+    expect(JSON.parse(ownerSessBody.sessions[0].transport_config ?? '{}')).toEqual({ compactHijack: 'on', uiLocale: 'zh-CN' });
+
+    const ownerSnapRes = await app.request('/api/server/srv-1/session-snapshot');
+    expect(ownerSnapRes.status).toBe(200);
+    const ownerSnapBody = await ownerSnapRes.json() as {
+      sessions: Array<{ transport_config?: Record<string, unknown> | null }>;
+      subSessions: Array<{ transport_config?: Record<string, unknown> | null }>;
+    };
+    expect(ownerSnapBody.sessions[0].transport_config).toEqual({ compactHijack: 'on', uiLocale: 'zh-CN' });
+    expect(ownerSnapBody.subSessions[0].transport_config).toEqual({ compactHijack: 'off', uiLocale: 'en' });
   });
 });

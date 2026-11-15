@@ -59,6 +59,7 @@ import {
   extractSessionCompactHijackMode,
   hasCompactHijackField,
   hasInvalidCompactHijackSetting,
+  sanitizeShareTransportConfigRow,
   stripCompactHijackFromTransportConfig,
 } from '../../../shared/compact-hijack.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -150,6 +151,12 @@ sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c)
   const serverId = c.req.param('id')!;
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const shareAccess = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  const isShareCaller = shareAccess?.actor?.kind === 'share';
 
   try {
     const [allSessions, subSessions] = await Promise.all([
@@ -157,9 +164,14 @@ sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c)
       // Session-mgmt snapshot listing: exclude ephemeral execution clones (default).
       getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false }),
     ]);
-    const sessions = allSessions.filter((s) => !s.name.startsWith('deck_sub_'));
-    const normalizedSessions = normalizeWorkerSessionRows(sessions);
-    const normalizedSubSessions = normalizeWorkerSubSessionRows(subSessions);
+    const sessions = allSessions
+      .filter((s) => !s.name.startsWith('deck_sub_'))
+      .map((s) => (isShareCaller ? sanitizeShareTransportConfigRow(s as unknown as Record<string, unknown>) : s));
+    const visibleSubSessions = isShareCaller
+      ? subSessions.map((sub) => sanitizeShareTransportConfigRow(sub as unknown as Record<string, unknown>))
+      : subSessions;
+    const normalizedSessions = normalizeWorkerSessionRows(sessions as typeof allSessions);
+    const normalizedSubSessions = normalizeWorkerSubSessionRows(visibleSubSessions as typeof subSessions);
     if (!normalizedSessions.ok || !normalizedSubSessions.ok) {
       logger.warn({
         serverId,
@@ -192,9 +204,17 @@ sessionMgmtRoutes.get('/:id/sessions', async (c) => {
   const serverId = c.req.param('id')!;
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const shareAccess = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  const isShareCaller = shareAccess?.actor?.kind === 'share';
 
   const all = await getDbSessionsByServer(c.env.DB, serverId);
-  const sessions = all.filter((s) => !s.name.startsWith('deck_sub_'));
+  const sessions = all
+    .filter((s) => !s.name.startsWith('deck_sub_'))
+    .map((s) => (isShareCaller ? sanitizeShareTransportConfigRow(s as unknown as Record<string, unknown>) : s));
   return c.json({ sessions });
 });
 
