@@ -708,4 +708,112 @@ describe('task-pairs shared-host machine authority propagation & anti-escalation
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('safely backfills owner authority on pair_task_update (Brain only) and pair_pause without overriding participant pairs', async () => {
+    const ownerJwt1 = mintOwnerJwt(BRAIN, 'act-owner-1');
+    const ownerJwt2 = mintOwnerJwt(BRAIN, 'act-owner-2');
+    const participantJwt = mintParticipantJwt(PARTICIPANT_USER, BRAIN, 'act-part-1');
+
+    const handlers = mcpHandlers();
+    // 1. Seed a legacy un-bound pair owned by Brain
+    const store = getTaskPairStore();
+    store.savePair(PROJECT, {
+      taskId: 'tsk_backfill_owner',
+      title: 'Backfill owner',
+      project: PROJECT,
+      engine: 'pairs',
+      brain: BRAIN,
+      executor: EXEC,
+      auditor: 'none',
+      status: 'working',
+      round: 1,
+      deliveryRound: 1,
+      worktree: '',
+      base: '',
+      head: '',
+      note: '',
+      previousExecutors: [],
+      previousAuditors: [],
+      createdAt: 1,
+      updatedAt: 2,
+    });
+    mocks.runtimes.set(BRAIN, ownerTurnRuntime(ownerJwt1));
+    await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]({
+      taskId: 'tsk_backfill_owner',
+      markdown: '## Updated brief',
+    });
+    expect(store.getPair(PROJECT, 'tsk_backfill_owner')?.authority).toEqual({
+      kind: 'owner',
+      ownerMachineAuthority: ownerJwt1,
+    });
+
+    // Refresh via PAIR_PAUSE with newer owner token
+    mocks.runtimes.set(BRAIN, ownerTurnRuntime(ownerJwt2));
+    await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]({
+      taskId: 'tsk_backfill_owner',
+      mode: 'manual',
+      note: 'pause with fresh owner token',
+    });
+    expect(store.getPair(PROJECT, 'tsk_backfill_owner')?.authority).toEqual({
+      kind: 'owner',
+      ownerMachineAuthority: ownerJwt2,
+    });
+
+    // 2. Seed a participant pair: Brain update and pause MUST NEVER override participant -> owner
+    store.savePair(PROJECT, {
+      taskId: 'tsk_participant_locked',
+      title: 'Participant locked',
+      project: PROJECT,
+      engine: 'pairs',
+      brain: BRAIN,
+      executor: EXEC,
+      auditor: 'none',
+      status: 'working',
+      round: 1,
+      deliveryRound: 1,
+      worktree: '',
+      base: '',
+      head: '',
+      note: '',
+      previousExecutors: [],
+      previousAuditors: [],
+      createdAt: 1,
+      updatedAt: 2,
+    }, {
+      authority: {
+        kind: 'participant',
+        sharedActor: {
+          actorUserId: PARTICIPANT_USER,
+          actorDisplayName: 'Part',
+          snapshot: {
+            target: { kind: 'main', serverId: 'local', sessionName: BRAIN },
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: [],
+            primaryShareId: null,
+            authorizedAt: 1,
+          },
+          primaryShareId: null,
+          effectiveActorRole: 'participant',
+          actionId: 'act-lock',
+          origin: 'server-member',
+          authorizedAt: 1,
+          queuedAt: 1,
+        },
+        sharedMachineAuthority: participantJwt,
+      },
+    });
+    await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]({
+      taskId: 'tsk_participant_locked',
+      markdown: '## Brain edits participant pair',
+    });
+    await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]({
+      taskId: 'tsk_participant_locked',
+      mode: 'manual',
+      note: 'pause participant pair',
+    });
+    const afterParticipant = store.getPair(PROJECT, 'tsk_participant_locked')?.authority;
+    expect(afterParticipant?.kind).toBe('participant');
+  });
 });

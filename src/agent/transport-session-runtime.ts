@@ -1,6 +1,10 @@
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
+import {
+  buildAuthorizedSendOptions,
+  pickTurnAuthorityFields,
+} from '../daemon/machine-authority.js';
 import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
@@ -33,7 +37,9 @@ import {
   SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   SESSION_COMPACT_COMMAND,
+  isSessionClearCommandText,
   isSessionCompactCommandText,
+  isSessionHandoffCommandText,
   shouldResetTransportPreferenceContextForSessionControl,
 } from '../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
@@ -299,6 +305,17 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   delete publicEntry.queueHandoff;
   delete publicEntry.registeredSystemContract;
   return publicEntry;
+}
+
+export interface TransportDelegationNotification extends ProviderDelegationNotification {
+  /** Author of the reply notification (typically `CHAT_MESSAGE_ORIGINS.SYSTEM`). */
+  messageOrigin?: ChatMessageOrigin;
+  /** Server-authored share actor carried from the delegation origin; never injected into provider prompts. */
+  sharedActor?: SharedActorEnvelope;
+  /** @internal: opaque server-signed device authority for shared participant replies. */
+  sharedMachineAuthority?: string;
+  /** @internal: opaque server-signed owner-turn device authority for owner replies. */
+  ownerMachineAuthority?: string;
 }
 
 export interface TransportSendMetadata {
@@ -727,6 +744,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     turn: unknown;
     entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'messageOrigin'>>;
   } | null = null;
+  /**
+   * Last verified clean owner machine authority carried into post-idle autonomous
+   * provider continuations (e.g. background subagent wake) when `origins.length === 0`.
+   * Cleared immediately on any participant/mixed/unstamped-non-system origin or cancel/kill/reset.
+   */
+  private _lastOwnerMachineAuthority: string | null = null;
   /** Last single-message turn that reached provider completion. Consumed by
    * the authoritative idle projection; never inferred from timeline order. */
   private _lastCompletedTurn: PeerAuditCompletedTurnEvidence | null = null;
@@ -924,6 +947,8 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
           this._activeTurn = null;
+          this._lastOwnerMachineAuthority = null;
+          this._appendedTurnOrigins = null;
           this._activeDispatchEntries = [];
           this._activeDispatchCancelled = false;
           this._activeDispatchProviderStarted = false;
@@ -974,6 +999,8 @@ export class TransportSessionRuntime implements SessionRuntime {
             }
           : null;
         this.commitActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
+        this.syncLastOwnerAuthorityOnTurnSettle();
+        this._appendedTurnOrigins = null;
         this._activeTurn?.resolve();
         this._activeTurn = null;
         this._activeDispatchEntries = [];
@@ -1166,6 +1193,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         // Only drain pending on recoverable/cancel errors — unrecoverable errors
         // (auth failure, provider down) would just fail again and consume queued messages.
         const canDrain = error.code === 'CANCELLED' || error.recoverable;
+        if (!canDrain || error.code === 'CANCELLED' || this._activeDispatchCancelled) {
+          this._lastOwnerMachineAuthority = null;
+        } else {
+          this.syncLastOwnerAuthorityOnTurnSettle();
+        }
+        this._appendedTurnOrigins = null;
         this._activeDispatchCancelled = false;
         if (canDrain) {
           this._activeDispatchEntries = [];
@@ -1477,9 +1510,101 @@ export class TransportSessionRuntime implements SessionRuntime {
     const stillSameTurn = appended !== null && (
       appended.dispatchId !== null
         ? appended.dispatchId === this._activeDispatchId
-        : appended.turn !== null && appended.turn === this._activeTurn
+        : appended.turn !== null
+          ? appended.turn === this._activeTurn
+          : (this._activeDispatchId === null && this._activeTurn === null && this.hasActiveTurnWork())
     );
     return stillSameTurn ? [...this._activeDispatchEntries, ...appended.entries] : this._activeDispatchEntries;
+  }
+
+  private isPureDaemonSystemEntry(
+    entry: Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'messageOrigin'>,
+  ): boolean {
+    return entry.messageOrigin === CHAT_MESSAGE_ORIGINS.SYSTEM
+      && !entry.sharedActor
+      && !entry.sharedMachineAuthority;
+  }
+
+  private resolveTurnEntriesOwnerAuthority(
+    origins: ReadonlyArray<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'messageOrigin'>>,
+  ): string | null {
+    if (origins.some((entry) => entry.sharedActor?.effectiveActorRole === 'participant')) {
+      return null;
+    }
+    let latestOwnerToken: string | null = null;
+    for (const entry of origins) {
+      if (entry.ownerMachineAuthority) {
+        latestOwnerToken = entry.ownerMachineAuthority;
+        continue;
+      }
+      if (!this.isPureDaemonSystemEntry(entry)) return null;
+    }
+    return latestOwnerToken;
+  }
+
+  private syncLastOwnerAuthorityOnDispatch(
+    entries: ReadonlyArray<PendingTransportMessage>,
+    isControlReset: boolean,
+  ): void {
+    if (isControlReset || entries.some((entry) => entry.sharedActor?.effectiveActorRole === 'participant')) {
+      this._lastOwnerMachineAuthority = null;
+      return;
+    }
+    const resolved = this.resolveTurnEntriesOwnerAuthority(entries);
+    if (resolved) {
+      this._lastOwnerMachineAuthority = resolved;
+    } else if (entries.some((entry) => !this.isPureDaemonSystemEntry(entry))) {
+      this._lastOwnerMachineAuthority = null;
+    }
+  }
+
+  private syncLastOwnerAuthorityOnTurnSettle(): void {
+    if (this.requiresSharedMachineAuthority()) {
+      this._lastOwnerMachineAuthority = null;
+      return;
+    }
+    const origins = this.turnOriginEntries();
+    if (origins.length === 0) return;
+    const resolved = this.resolveTurnEntriesOwnerAuthority(origins);
+    if (resolved) {
+      this._lastOwnerMachineAuthority = resolved;
+    } else if (origins.some((entry) => !this.isPureDaemonSystemEntry(entry))) {
+      this._lastOwnerMachineAuthority = null;
+    }
+  }
+
+  private recordActiveTurnAppendedOrigins(
+    newEntries: ReadonlyArray<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'messageOrigin'>>,
+  ): void {
+    if (newEntries.length === 0) return;
+    const normalized = newEntries.map((entry) => ({
+      ...pickTurnAuthorityFields(entry),
+      ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
+    }));
+    const appended = this._appendedTurnOrigins;
+    const sameTurn = appended !== null && (
+      appended.dispatchId !== null
+        ? appended.dispatchId === this._activeDispatchId
+        : appended.turn !== null
+          ? appended.turn === this._activeTurn
+          : (this._activeDispatchId === null && this._activeTurn === null && this.hasActiveTurnWork())
+    );
+    const kept = sameTurn ? appended.entries : [];
+    this._appendedTurnOrigins = {
+      dispatchId: this._activeDispatchId,
+      turn: this._activeTurn,
+      entries: [...kept, ...normalized],
+    };
+    if (this.requiresSharedMachineAuthority()) {
+      this._lastOwnerMachineAuthority = null;
+      return;
+    }
+    const resolved = this.resolveTurnEntriesOwnerAuthority(this.turnOriginEntries());
+    if (resolved) {
+      this._lastOwnerMachineAuthority = resolved;
+    } else if (normalized.some((entry) => !this.isPureDaemonSystemEntry(entry))) {
+      this._lastOwnerMachineAuthority = null;
+    }
   }
 
   /** Opaque authority for the active turn only; ambiguity fails closed. */
@@ -1494,19 +1619,10 @@ export class TransportSessionRuntime implements SessionRuntime {
   getActiveOwnerMachineAuthority(): string | null {
     if (this.requiresSharedMachineAuthority()) return null;
     const origins = this.turnOriginEntries();
-    if (origins.length === 0) return null;
-    let latestOwnerToken: string | null = null;
-    for (const entry of origins) {
-      if (entry.ownerMachineAuthority) {
-        latestOwnerToken = entry.ownerMachineAuthority;
-        continue;
-      }
-      const isPureDaemonSystemAppend = entry.messageOrigin === CHAT_MESSAGE_ORIGINS.SYSTEM
-        && !entry.sharedActor
-        && !entry.sharedMachineAuthority;
-      if (!isPureDaemonSystemAppend) return null;
+    if (origins.length === 0) {
+      return this.hasActiveTurnWork() ? this._lastOwnerMachineAuthority : null;
     }
-    return latestOwnerToken;
+    return this.resolveTurnEntriesOwnerAuthority(origins);
   }
 
   requiresSharedMachineAuthority(): boolean {
@@ -2088,6 +2204,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     this._sending = false;
     this.commitActiveSummarySyncReservation(dispatchId ?? undefined);
+    this.syncLastOwnerAuthorityOnTurnSettle();
+    this._appendedTurnOrigins = null;
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -3152,13 +3270,21 @@ export class TransportSessionRuntime implements SessionRuntime {
    * as stale so the durable delegation outbox can retry against fresh state.
    */
   async deliverDelegationNotification(
-    notification: ProviderDelegationNotification,
+    notification: TransportDelegationNotification,
   ): Promise<AgentDelegationNotificationResult> {
     if (!this._providerSessionId) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
 
+    const providerNotification: ProviderDelegationNotification = {
+      notificationId: notification.notificationId,
+      delegationId: notification.delegationId,
+      sourceSessionName: notification.sourceSessionName,
+      text: notification.text,
+      deliveryKind: notification.deliveryKind ?? PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
+    };
+
     const existingAdmission = this._activeDelegationNotificationAdmissions.get(notification.notificationId);
     if (existingAdmission) {
-      if (!sameDelegationNotification(existingAdmission.notification, notification)) {
+      if (!sameDelegationNotification(existingAdmission.notification, providerNotification)) {
         logger.warn({
           sessionKey: this.sessionKey,
           notificationId: notification.notificationId,
@@ -3206,23 +3332,29 @@ export class TransportSessionRuntime implements SessionRuntime {
         }, 'active delegation notification admission limit reached; retaining durable retry');
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
-      const providerNotification: ProviderDelegationNotification = {
-          ...notification,
-          deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
-      };
       const admission = Promise.resolve().then(() => this.provider.notifyActiveDelegation!(
         this._providerSessionId!,
         providerNotification,
       ));
       const trackedAdmission: ActiveDelegationNotificationAdmission = {
-        notification: { ...notification },
+        notification: { ...providerNotification },
         promise: admission,
         status: 'pending',
       };
       this._activeDelegationNotificationAdmissions.set(notification.notificationId, trackedAdmission);
+      let originRecorded = false;
+      const recordNativeOrigin = () => {
+        if (originRecorded) return;
+        originRecorded = true;
+        this.recordActiveTurnAppendedOrigins([{
+          messageOrigin: notification.messageOrigin ?? CHAT_MESSAGE_ORIGINS.SYSTEM,
+          ...pickTurnAuthorityFields(notification),
+        }]);
+      };
       void admission.then((result) => {
         if (this._activeDelegationNotificationAdmissions.get(notification.notificationId) !== trackedAdmission) return;
         if (result === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+          recordNativeOrigin();
           trackedAdmission.status = 'delivered';
           this.pruneActiveDelegationNotificationAdmissions();
         } else {
@@ -3250,11 +3382,26 @@ export class TransportSessionRuntime implements SessionRuntime {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
       const result = outcome.value;
+      if (result === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        recordNativeOrigin();
+      }
       if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE || this.hasActiveTurnWork()) {
         return result;
       }
     }
 
+    const sendAuthority = notification.sharedActor?.effectiveActorRole === 'participant'
+      ? ({
+          kind: 'participant',
+          sharedActor: notification.sharedActor,
+          ...(notification.sharedMachineAuthority ? { sharedMachineAuthority: notification.sharedMachineAuthority } : {}),
+        } as const)
+      : notification.ownerMachineAuthority
+        ? ({ kind: 'owner', ownerMachineAuthority: notification.ownerMachineAuthority } as const)
+        : undefined;
+    const authorizedSend = buildAuthorizedSendOptions(sendAuthority, {
+      messageOrigin: notification.messageOrigin ?? CHAT_MESSAGE_ORIGINS.SYSTEM,
+    });
     const disposition = this.send(
       notification.text,
       notification.notificationId,
@@ -3263,6 +3410,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       {
         timelineCommitted: true,
         historyCommitted: true,
+        ...authorizedSend,
         delegationReply: { delegationId: notification.delegationId },
       },
     );
@@ -3521,28 +3669,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     // The provider took these messages INTO the running turn: record who spoke, so the turn's origin includes them from now on.
-    {
-      const appended = this._appendedTurnOrigins;
-      const sameTurn = appended !== null && (
-        appended.dispatchId !== null
-          ? appended.dispatchId === this._activeDispatchId
-          : appended.turn !== null && appended.turn === this._activeTurn
-      );
-      const kept = sameTurn ? appended.entries : [];
-      this._appendedTurnOrigins = {
-        dispatchId: this._activeDispatchId,
-        turn: this._activeTurn,
-        entries: [
-          ...kept,
-          ...selected.map((entry) => ({
-            ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-            ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
-            ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
-            ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
-          })),
-        ],
-      };
-    }
+    this.recordActiveTurnAppendedOrigins(selected);
 
     // Provider acceptance is irreversible, but queue finalization/history
     // persistence can still fail or the daemon can crash before either runs.
@@ -3844,6 +3971,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
+    this._lastOwnerMachineAuthority = null;
+    this._appendedTurnOrigins = null;
     if (options?.waitForProvider && !this._activeTurn && !this._sending) {
       // The explicit Stop selection owns these rows. Unlike ordinary Stop,
       // do not discard a selected retry while settling its backoff.
@@ -4033,6 +4162,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.rollbackActiveSummarySyncReservation();
     this._sending = false;
     this._activeTurn = null;
+    this._lastOwnerMachineAuthority = null;
+    this._appendedTurnOrigins = null;
     this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
       providerStarted: this._activeDispatchProviderStarted,
       providerAccepted: this._activeDispatchProviderAccepted,
@@ -4836,11 +4967,19 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.retireExternalCompletionGrace();
     this._activeDispatchId = dispatchId;
     this._activeDispatchStaleRecoveryStarted = false;
+    this._appendedTurnOrigins = null;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
       ...(attachments?.length ? { attachments } : {}),
     }]).map((entry) => ({ ...entry }));
+    this.syncLastOwnerAuthorityOnDispatch(
+      this._activeDispatchEntries,
+      isSessionClearCommandText(message)
+        || isSessionHandoffCommandText(message)
+        || (shouldResetTransportPreferenceContextForSessionControl(message)
+          && !this._activeDispatchEntries.some((entry) => Boolean(entry.ownerMachineAuthority))),
+    );
     const isPrivateControlDispatch = this._activeDispatchEntries.length > 0
       && this._activeDispatchEntries.every((entry) => !!entry.peerAudit || !!entry.delegationReply);
     // A command-mode turn is byte-clean exactly like a provider slash control:
@@ -5860,6 +5999,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._locallyCancelledDispatchIds.delete(dispatchId);
       return;
     }
+    this._lastOwnerMachineAuthority = null;
+    this._appendedTurnOrigins = null;
     this.markCurrentActivityGenerationLocallyCancelled();
     if (!this._activeTurn && !this._sending) {
       this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);

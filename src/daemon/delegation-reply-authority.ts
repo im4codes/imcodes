@@ -9,6 +9,11 @@ import {
   type CreatedDelegationReply,
   type DelegationReplyBoundIdentity,
 } from './delegation-reply-store.js';
+import {
+  mergeMachineAuthority,
+  type TurnMachineAuthorityContext,
+} from './machine-authority.js';
+import { captureDelegationOriginAuthority } from './machine-authority-send.js';
 
 function boundIdentity(record: SessionRecord): DelegationReplyBoundIdentity | null {
   const sessionInstanceId = record.sessionInstanceId?.trim();
@@ -32,11 +37,20 @@ export function createDelegationReplyAuthority(input: {
   assignmentId?: string;
   /** The task's ORIGINAL coordinator assignment; the durable return's authority. */
   coordinatorAssignmentId?: string;
+  originAuthority?: TurnMachineAuthorityContext;
+  fallbackOwnerMachineAuthority?: string;
   now?: number;
 }): (CreatedDelegationReply & { authority: AgentDelegationReplyAuthority }) | null {
   const origin = input.origin ? boundIdentity(input.origin) : null;
   const target = boundIdentity(input.target);
   if (!origin || !target) return null;
+  const capturedOriginAuthority = captureDelegationOriginAuthority(
+    origin.sessionName,
+    input.fallbackOwnerMachineAuthority,
+  );
+  const effectiveOriginAuthority = input.originAuthority
+    ? mergeMachineAuthority(capturedOriginAuthority, input.originAuthority)
+    : capturedOriginAuthority;
   const created = getDelegationReplyStore().create({
     origin,
     target,
@@ -45,6 +59,7 @@ export function createDelegationReplyAuthority(input: {
     ...(input.taskId ? { taskId: input.taskId } : {}),
     ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
     ...(input.coordinatorAssignmentId ? { coordinatorAssignmentId: input.coordinatorAssignmentId } : {}),
+    ...(effectiveOriginAuthority ? { originAuthority: effectiveOriginAuthority } : {}),
     ...(input.audit ? {
       purpose: input.audit.kind,
       auditAttemptId: input.audit.attemptId,

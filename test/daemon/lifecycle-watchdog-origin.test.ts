@@ -97,4 +97,68 @@ describe('watchdog continue origin', () => {
     expect(send).toHaveBeenCalledWith('continue', expect.any(String), undefined, undefined,
       expect.objectContaining({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM }));
   });
+
+  it('captures ownerMachineAuthority before cancel() when stalled Codex continue queues, and omits it for participant turns', async () => {
+    let authorityCleared = false;
+    let activeOwnerAuth: string | null = 'owner-jwt-wd';
+    const send = vi.fn(() => 'queued' as const);
+    const cancel = vi.fn(async () => {
+      authorityCleared = true;
+      activeOwnerAuth = null;
+    });
+    runtimeRef.current = {
+      send,
+      cancel,
+      getActiveOwnerMachineAuthority: () => activeOwnerAuth,
+      requiresSharedMachineAuthority: () => false,
+      getDiagnosticSnapshot: () => ({
+        sending: true,
+        activeDispatchCount: 1,
+        blockingWorkCount: 0,
+        status: 'streaming',
+        activeToolCount: 0,
+        lastActivityAgeMs: 13 * 60_000,
+        activityGeneration: 'gen-origin-owner',
+        pendingVersion: 1,
+      }),
+    };
+
+    expect(await recoverCodexStalledSession({ name: SESSION, agentType: 'codex-sdk' })).toBe(true);
+    expect(authorityCleared).toBe(true);
+    expect(send).toHaveBeenCalledWith(
+      'continue',
+      expect.any(String),
+      undefined,
+      undefined,
+      expect.objectContaining({
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-jwt-wd',
+      }),
+    );
+
+    // Participant / mixed-turn fail-closed: never propagate ownerMachineAuthority
+    send.mockClear();
+    activeOwnerAuth = 'owner-jwt-wd';
+    runtimeRef.current = {
+      send,
+      cancel: vi.fn(async () => undefined),
+      getActiveOwnerMachineAuthority: () => null,
+      requiresSharedMachineAuthority: () => true,
+      getDiagnosticSnapshot: () => ({
+        sending: true,
+        activeDispatchCount: 1,
+        blockingWorkCount: 0,
+        status: 'streaming',
+        activeToolCount: 0,
+        lastActivityAgeMs: 13 * 60_000,
+        activityGeneration: 'gen-origin-participant',
+        pendingVersion: 2,
+      }),
+    };
+
+    expect(await recoverCodexStalledSession({ name: SESSION, agentType: 'codex-sdk' })).toBe(true);
+    const opts = send.mock.calls[0]?.[4] as Record<string, unknown> | undefined;
+    expect(opts).toMatchObject({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
+    expect(opts?.ownerMachineAuthority).toBeUndefined();
+  });
 });

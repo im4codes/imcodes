@@ -2927,6 +2927,9 @@ export async function dispatchSendMessage(
           ...(supervisedCoordinatorAssignmentId
             ? { coordinatorAssignmentId: supervisedCoordinatorAssignmentId }
             : {}),
+          ...(input.internalOwnerMachineAuthority
+            ? { fallbackOwnerMachineAuthority: input.internalOwnerMachineAuthority }
+            : {}),
           now,
         });
       createdReplyAuthority = Boolean(replyAuthority);
@@ -3010,7 +3013,9 @@ export async function dispatchSendMessage(
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
     });
     try {
-      const actorOption = buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now);
+      const actorOption = buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now, {
+        fallbackOwnerMachineAuthority: input.internalOwnerMachineAuthority,
+      });
       const dispatchResult = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
@@ -3028,11 +3033,6 @@ export async function dispatchSendMessage(
           ? { supervision: { taskId: supervisedTaskId, assignmentId: supervisedAssignmentId } }
           : {}),
         ...actorOption,
-        ...(actorOption.sharedActor?.effectiveActorRole !== 'participant'
-          && !actorOption.ownerMachineAuthority
-          && input.internalOwnerMachineAuthority
-          ? { ownerMachineAuthority: input.internalOwnerMachineAuthority }
-          : {}),
       });
       const execution = resolveDeliveryExecution(target, supervisedAssignmentId);
       deliveries.push({
@@ -5539,6 +5539,9 @@ async function dispatchExecutionCloneSend(
     target: cloneRecord,
     dispatchId,
     messageId,
+    ...(input.internalOwnerMachineAuthority
+      ? { fallbackOwnerMachineAuthority: input.internalOwnerMachineAuthority }
+      : {}),
     now,
   });
   if (!replyAuthority) {
@@ -5745,7 +5748,9 @@ async function dispatchCommandSend(
   for (const target of gate.dispatchable) {
     const messageId = createSendMessageId();
     try {
-      const actorOption = buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now);
+      const actorOption = buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now, {
+        fallbackOwnerMachineAuthority: input.internalOwnerMachineAuthority,
+      });
       const dispatchResult = await d.dispatchMessage(target, buildSessionDispatchMessage({ message: text, command: true }), {
         dispatchId,
         messageId,
@@ -5755,11 +5760,6 @@ async function dispatchCommandSend(
         ...(input.emergency ? { emergency: true } : {}),
         ...(deps?.cancelSession ? { cancelSession: deps.cancelSession } : {}),
         ...actorOption,
-        ...(actorOption.sharedActor?.effectiveActorRole !== 'participant'
-          && !actorOption.ownerMachineAuthority
-          && input.internalOwnerMachineAuthority
-          ? { ownerMachineAuthority: input.internalOwnerMachineAuthority }
-          : {}),
       });
       deliveries.push({
         target: target.name,

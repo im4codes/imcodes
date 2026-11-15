@@ -8781,4 +8781,216 @@ ${PREFERENCE_CONTEXT_END}`;
       }));
     });
   });
+
+  describe('machine authority preservation across autonomous continuations and delegation notifications', () => {
+    it('retains last owner authority only while autonomous work is active and clears permanently on cancel, reset, participant, or unstamped message', async () => {
+      const mock = makeMockProvider();
+      let providerBusy = false;
+      (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => (
+        providerBusy
+          ? { status: 'current', activeWorkCount: 1, activeToolCount: 1, busyReasons: ['provider_tool_item'], updatedAt: Date.now() }
+          : { status: 'current', activeWorkCount: 0, activeToolCount: 0, busyReasons: [], updatedAt: Date.now() }
+      )) as never;
+      const rt = new TransportSessionRuntime(mock.provider, 'deck_auton_brain');
+      await rt.initialize({ ...defaultConfig, agentType: 'claude-code-sdk', sessionId: 'sess-1' });
+
+      expect(rt.send('owner turn 1', 'm-owner-1', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-1',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-1');
+
+      // Settle turn -> idle has NO active turn work, so authority must be null
+      mock.fireComplete('sess-1', {
+        id: 'a-1',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      expect(rt.hasActiveTurnWork()).toBe(false);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+
+      // Provider-initiated autonomous continuation (provider snapshot reports active turn, no queued dispatch) -> inherits owner-tok-1
+      providerBusy = true;
+      mock.fireTool('sess-1', { id: 'tool-auto-1', name: 'Bash', status: 'running' });
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-1');
+
+      // Unstamped non-system human message clears _lastOwnerMachineAuthority permanently
+      providerBusy = false;
+      mock.fireTool('sess-1', { id: 'tool-auto-1', name: 'Bash', status: 'complete' });
+      expect(rt.send('human unstamped', 'm-human-1')).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 2);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      mock.fireComplete('sess-1', {
+        id: 'a-2',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done2',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      providerBusy = false;
+
+      // Re-establish clean owner authority, then cancel() clears it permanently
+      expect(rt.send('owner turn 2', 'm-owner-2', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-2',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 3);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-2');
+      await rt.cancel();
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      providerBusy = false;
+
+      // /clear resets session control and clears authority
+      expect(rt.send('owner turn 3', 'm-owner-3', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-3',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 4);
+      mock.fireComplete('sess-1', {
+        id: 'a-3',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done3',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      expect(rt.send('/clear', 'm-clear-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 5);
+      mock.fireComplete('sess-1', {
+        id: 'a-4',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'cleared',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+    });
+
+    it('updates _appendedTurnOrigins and fails closed on native and idle deliverDelegationNotification', async () => {
+      const mock = makeMockProvider();
+      let providerBusy = false;
+      (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => (
+        providerBusy
+          ? { status: 'current', activeWorkCount: 1, activeToolCount: 1, busyReasons: ['provider_tool_item'], updatedAt: Date.now() }
+          : { status: 'current', activeWorkCount: 0, activeToolCount: 0, busyReasons: [], updatedAt: Date.now() }
+      )) as never;
+      (mock.provider.capabilities as Record<string, unknown>).activeDelegationNotification = 'native';
+      const notifyCalls: unknown[] = [];
+      mock.provider.notifyActiveDelegation = vi.fn(async (_sid, notif) => {
+        notifyCalls.push(notif);
+        return 'delivered';
+      });
+      const rt = new TransportSessionRuntime(mock.provider, 'deck_dlg_brain');
+      await rt.initialize({ ...defaultConfig, agentType: 'claude-code-sdk', sessionId: 'sess-1' });
+
+      // Start busy owner turn
+      expect(rt.send('owner turn', 'm-1', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-1',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 1);
+
+      // Native busy delivery of owner delegation reply updates authority without leaking token to provider
+      const r1 = await rt.deliverDelegationNotification({
+        notificationId: 'notif-owner-1',
+        delegationId: 'dlg-1',
+        sourceSessionName: 'deck_sub_w1',
+        text: 'worker finished',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-tok-2',
+      });
+      expect(r1).toBe('delivered');
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-2');
+      expect(JSON.stringify(notifyCalls)).not.toContain('owner-tok-2');
+
+      // Native busy delivery of participant delegation reply taints turn fail-closed
+      const participantActor: SharedActorEnvelope = {
+        actorUserId: 'part-user',
+        actorDisplayName: 'Part',
+        snapshot: {
+          target: { kind: 'main', serverId: 'local', sessionName: 'deck_dlg_brain' },
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: [],
+          primaryShareId: null,
+          authorizedAt: 1,
+        },
+        primaryShareId: null,
+        effectiveActorRole: 'participant',
+        actionId: 'act-p',
+        origin: 'server-member',
+        authorizedAt: 1,
+        queuedAt: 1,
+      };
+      const r2 = await rt.deliverDelegationNotification({
+        notificationId: 'notif-part-1',
+        delegationId: 'dlg-2',
+        sourceSessionName: 'deck_sub_w2',
+        text: 'participant worker finished',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        sharedActor: participantActor,
+        sharedMachineAuthority: 'part-tok-1',
+      });
+      expect(r2).toBe('delivered');
+      expect(rt.requiresSharedMachineAuthority()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+
+      // Subsequent owner delegation reply in same tainted turn MUST fail-closed (never escalate)
+      await rt.deliverDelegationNotification({
+        notificationId: 'notif-owner-2',
+        delegationId: 'dlg-3',
+        sourceSessionName: 'deck_sub_w1',
+        text: 'owner worker 2',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-tok-3',
+      });
+      expect(rt.requiresSharedMachineAuthority()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+
+      // Finish tainted turn -> autonomous wake STILL returns null
+      mock.fireComplete('sess-1', {
+        id: 'a-end',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      providerBusy = false;
+
+      // Idle fallback preserves owner authority
+      const rIdleOwner = await rt.deliverDelegationNotification({
+        notificationId: 'notif-idle-owner',
+        delegationId: 'dlg-4',
+        sourceSessionName: 'deck_sub_w1',
+        text: 'idle owner wake',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-tok-4',
+      });
+      expect(rIdleOwner).toBe('delivered');
+      await waitForProviderSendCount(mock.provider, 2);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-4');
+    });
+  });
 });

@@ -17,6 +17,11 @@ import {
 } from '../../shared/agent-delegation.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
+import {
+  parseMachineAuthority,
+  serializeMachineAuthority,
+  type TurnMachineAuthorityContext,
+} from './machine-authority.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -60,6 +65,8 @@ export interface DelegationReplyRecord {
   /** The task's ORIGINAL coordinator assignment; the only authority that may
    *  advance this return onto a re-authorized origin. */
   coordinatorAssignmentId?: string;
+  /** Captured initiator machine authority (owner or participant) for non-escalating reply delivery. */
+  originAuthority?: TurnMachineAuthorityContext;
   status: AgentDelegationReplyStatus;
   result?: string;
   createdAt: number;
@@ -82,6 +89,7 @@ export interface CreateDelegationReplyInput {
   /** The task's ORIGINAL coordinator assignment; the only authority that may
    *  advance this return onto a re-authorized origin. */
   coordinatorAssignmentId?: string;
+  originAuthority?: TurnMachineAuthorityContext;
   now?: number;
 }
 
@@ -161,6 +169,7 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
   const coordinatorAssignmentId = typeof row.coordinatorAssignmentId === 'string' && row.coordinatorAssignmentId
     ? row.coordinatorAssignmentId
     : undefined;
+  const originAuthority = parseMachineAuthority(row.originAuthorityJson);
   const messageKind = typeof row.messageKind === 'string' && row.messageKind
     ? row.messageKind as AgentDelegationReplyMessageKind
     : undefined;
@@ -188,6 +197,7 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
     ...(taskId ? { taskId } : {}),
     ...(assignmentId ? { assignmentId } : {}),
     ...(coordinatorAssignmentId ? { coordinatorAssignmentId } : {}),
+    ...(originAuthority ? { originAuthority } : {}),
     status: rowString(row, 'status') as AgentDelegationReplyStatus,
     ...(result !== undefined ? { result } : {}),
     createdAt: Number(row.createdAt ?? 0),
@@ -238,6 +248,7 @@ export class DelegationReplyStore {
         task_id TEXT,
         assignment_id TEXT,
         coordinator_assignment_id TEXT,
+        origin_authority_json TEXT,
         status TEXT NOT NULL,
         result TEXT,
         created_at INTEGER NOT NULL,
@@ -284,6 +295,9 @@ export class DelegationReplyStore {
     // coordinator can claim authority over a return that never recorded one.
     if (!names.has('coordinator_assignment_id')) {
       this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN coordinator_assignment_id TEXT');
+    }
+    if (!names.has('origin_authority_json')) {
+      this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN origin_authority_json TEXT');
     }
     const messageColumns = this.#db.prepare('PRAGMA table_info(delegation_reply_messages)').all() as Array<{ name?: unknown }>;
     if (!new Set(messageColumns.map((column) => String(column.name ?? ''))).has('message_kind')) {
@@ -390,9 +404,9 @@ export class DelegationReplyStore {
         target_session_name, target_session_instance_id, target_runtime_epoch,
         dispatch_id, message_id, notification_id, purpose, audit_attempt_id,
         audit_revision, audited_session_name, task_id, assignment_id,
-        coordinator_assignment_id, status,
+        coordinator_assignment_id, origin_authority_json, status,
         created_at, expires_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       delegationId,
       '',
@@ -412,6 +426,7 @@ export class DelegationReplyStore {
       input.taskId ?? null,
       input.assignmentId ?? null,
       input.coordinatorAssignmentId ?? null,
+      serializeMachineAuthority(input.originAuthority),
       AGENT_DELEGATION_REPLY_STATUSES.PENDING,
       now,
       now + AGENT_DELEGATION_REPLY_TTL_MS,
@@ -443,6 +458,7 @@ export class DelegationReplyStore {
         task_id AS taskId,
         assignment_id AS assignmentId,
         coordinator_assignment_id AS coordinatorAssignmentId,
+        origin_authority_json AS originAuthorityJson,
         status,
         result,
         created_at AS createdAt,
@@ -476,6 +492,7 @@ export class DelegationReplyStore {
         authority.task_id AS taskId,
         authority.assignment_id AS assignmentId,
         authority.coordinator_assignment_id AS coordinatorAssignmentId,
+        authority.origin_authority_json AS originAuthorityJson,
         message.status,
         message.result,
         authority.created_at AS createdAt,
@@ -1282,6 +1299,7 @@ export class DelegationReplyStore {
         authority.task_id AS taskId,
         authority.assignment_id AS assignmentId,
         authority.coordinator_assignment_id AS coordinatorAssignmentId,
+        authority.origin_authority_json AS originAuthorityJson,
         message.status,
         message.result,
         authority.created_at AS createdAt,
@@ -1316,6 +1334,7 @@ export class DelegationReplyStore {
         authority.audit_revision AS auditRevision, authority.audited_session_name AS auditedSessionName,
         authority.task_id AS taskId, authority.assignment_id AS assignmentId,
         authority.coordinator_assignment_id AS coordinatorAssignmentId,
+        authority.origin_authority_json AS originAuthorityJson,
         message.status, message.result, authority.created_at AS createdAt,
         authority.expires_at AS expiresAt, message.updated_at AS updatedAt,
         message.delivered_at AS deliveredAt

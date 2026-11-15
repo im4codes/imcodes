@@ -9,7 +9,8 @@ import {
 } from '../../shared/session-control-commands.js';
 import { createHash } from 'node:crypto';
 import { sendCommandText } from '../../shared/send-command-mode.js';
-import { readSenderOwnerMachineAuthority, readSenderParticipantTurn } from './sender-participant-turn.js';
+import { buildAuthorizedSendOptions, pickTurnAuthorityFields } from './machine-authority.js';
+import { captureSessionMachineAuthority } from './machine-authority-send.js';
 import { bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
 import { SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
@@ -221,23 +222,32 @@ export function buildServerMemberSharedActorOption(
   target: SessionRecord,
   actionId: string,
   now: number,
+  options?: { fallbackOwnerMachineAuthority?: string },
 ): SessionDispatchActorOption {
   if (!caller.sessionName || !isValidImcodesSessionName(caller.sessionName)) return {};
-  const senderTurn = readSenderParticipantTurn(caller.sessionName);
-  if (senderTurn) {
-    const stamped = buildServerMemberActorEnvelope(caller, callerRecord, target, actionId, now, senderTurn.actorUserId, 'participant');
-    return {
-      sharedActor: stamped,
-      ...(senderTurn.authority ? { sharedMachineAuthority: senderTurn.authority } : {}),
-    };
-  }
-  const ownerAuthority = readSenderOwnerMachineAuthority(caller.sessionName);
-  const attachActor = shouldAttachServerMemberActor(caller.sessionName, callerRecord, target);
-  if (!attachActor && !ownerAuthority) return {};
-  return {
-    ...(attachActor ? { sharedActor: buildServerMemberActorEnvelope(caller, callerRecord, target, actionId, now, caller.userId || caller.sessionName, 'server-member') } : {}),
-    ...(ownerAuthority ? { ownerMachineAuthority: ownerAuthority } : {}),
-  };
+  const captured = captureSessionMachineAuthority(caller.sessionName);
+  const attachActor = captured?.kind === 'participant'
+    || shouldAttachServerMemberActor(caller.sessionName, callerRecord, target);
+  const sharedActor = attachActor
+    ? buildServerMemberActorEnvelope(
+        caller,
+        callerRecord,
+        target,
+        actionId,
+        now,
+        captured?.kind === 'participant' ? captured.sharedActor.actorUserId : (caller.userId || caller.sessionName),
+        captured?.kind === 'participant' ? 'participant' : 'server-member',
+      )
+    : undefined;
+  const authorized = buildAuthorizedSendOptions(captured, {
+    fallbackOwnerMachineAuthority: options?.fallbackOwnerMachineAuthority,
+    forceParticipantQueue: false,
+  });
+  return pickTurnAuthorityFields({
+    ...(sharedActor ? { sharedActor } : {}),
+    ...(authorized.sharedMachineAuthority ? { sharedMachineAuthority: authorized.sharedMachineAuthority } : {}),
+    ...(authorized.ownerMachineAuthority ? { ownerMachineAuthority: authorized.ownerMachineAuthority } : {}),
+  });
 }
 
 function buildServerMemberActorEnvelope(
@@ -375,9 +385,7 @@ export async function dispatchSessionMessage(
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.command ? { commandMode: true as const } : {}),
-        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+        ...pickTurnAuthorityFields(options),
         ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
@@ -415,9 +423,7 @@ export async function dispatchSessionMessage(
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.command ? { commandMode: true as const } : {}),
-        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+        ...pickTurnAuthorityFields(options),
         ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
@@ -442,9 +448,7 @@ export async function dispatchSessionMessage(
       const privateMetadata = {
         timelineCommitted: options.suppressTimeline === true,
         ...originMetadata(options),
-        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+        ...pickTurnAuthorityFields(options),
       };
       const commandPrivateMetadata = Object.keys(privateMetadata).length > 0 ? privateMetadata : undefined;
       const result = typeof appendExternal === 'function'
@@ -472,9 +476,7 @@ export async function dispatchSessionMessage(
         const fallback = runtime.send(message, options.messageId, undefined, undefined, {
           deliveryMode,
           ...(shouldStop ? { queuePlacement: 'front' as const, emergency: true as const } : {}),
-          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-          ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-          ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...pickTurnAuthorityFields(options),
           ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
           ...(options.queueSupervisionReference
             ? { supervisionReference: options.queueSupervisionReference }
@@ -516,17 +518,13 @@ export async function dispatchSessionMessage(
     }
     const result = options.suppressTimeline
       ? runtime.send(message, options.messageId, undefined, undefined, {
-          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...pickTurnAuthorityFields(options),
           timelineCommitted: true,
           ...originMetadata(options),
         })
       : options.sharedActor || options.ownerMachineAuthority
       ? runtime.send(message, options.messageId, undefined, undefined, {
-          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-          ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-          ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...pickTurnAuthorityFields(options),
           ...originMetadata(options),
         })
       : options.messageOrigin || options.command

@@ -8,7 +8,10 @@
  */
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
+import { AMBIGUOUS_PARTICIPANT_ACTOR } from './machine-authority.js';
 import { readProcessSharedMachineAuthority, readProcessSharedMachineParticipants } from './shared-machine-authority-context.js';
+
+export { AMBIGUOUS_PARTICIPANT_ACTOR };
 
 export interface SenderParticipantTurn {
   /** The participant that started the turn; a placeholder when several users fed it. */
@@ -16,8 +19,6 @@ export interface SenderParticipantTurn {
   /** The server-minted token of the single participant; null when there is none or several (the receiver then fails closed). */
   authority: string | null;
 }
-
-export const AMBIGUOUS_PARTICIPANT_ACTOR = 'participant';
 
 /** Null when the sender is not in a participant turn (an owner turn, or no such session). Synchronous: in-memory registries only. */
 export function readSenderParticipantTurn(senderSessionName: string | null | undefined): SenderParticipantTurn | null {

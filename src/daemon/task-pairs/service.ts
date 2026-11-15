@@ -75,10 +75,8 @@ import {
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
 import { TaskPairWriteConflictError, flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairDecisionRecord, type TaskPairLiveness } from './store.js';
-import {
-  captureCallerPairAuthority,
-  type TaskPairAuthorityContext,
-} from './authority.js';
+import type { TaskPairAuthorityContext } from './authority.js';
+import { captureCallerPairAuthority } from '../machine-authority-send.js';
 import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';

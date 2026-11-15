@@ -12,7 +12,7 @@ import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
-import { captureCallerPairAuthority } from './task-pairs/authority.js';
+import { captureCallerPairAuthority } from './machine-authority-send.js';
 import { isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency, taskPairSupervisionStatus } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { describeExecutionSelection } from './task-pairs/pool.js';
@@ -2336,6 +2336,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const current = refreshPairChecklistAccess(caller, access.pair);
       if (current.status !== 'ok') return pairAccessError(current, caller);
       const pair = current.pair;
+      if (pair.state.brain === caller.sessionName) {
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+        if (callerAuthority?.kind === 'owner') {
+          getTaskPairStore().savePairAuthority(pair.project, pair.state.taskId, callerAuthority);
+        }
+      }
       if (viewers !== undefined) {
         if (!caller.serverId || pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may update legacy title viewer metadata');
         if (!taskPairService.grantTaskPairTitle(pair.project, pair.state.taskId, caller.serverId, viewers as string[], caller.sessionName, title)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid title or title viewer grant');
@@ -3873,6 +3879,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const mode = stringArg(args, 'mode') ?? TASK_PAIR_PAUSE_MODES[0];
       if (!(TASK_PAIR_PAUSE_MODES as readonly string[]).includes(mode)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'unknown pause mode');
       try {
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+        if (callerAuthority?.kind === 'owner') {
+          getTaskPairStore().savePairAuthority(access.pair.project, access.pair.state.taskId, callerAuthority);
+        }
         pausePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '', mode as 'manual' | 'dependencies', args.dependsOn, stringArg(args, 'note'));
         await taskPairAutomation.reconcileSuspensions();
         taskPairAutomation.publishBadges();

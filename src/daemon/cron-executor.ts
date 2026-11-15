@@ -15,6 +15,7 @@ import {
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
 import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
 import { bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
+import { buildAuthorizedSendOptions, captureInboundCommandAuthority } from './machine-authority.js';
 import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
@@ -157,10 +158,10 @@ async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
 
 export async function executeCronJob(msg: CronDispatchMessage, serverLink: ServerLink): Promise<void> {
   const { jobId, executionId, jobName, projectName, targetRole, targetSessionName } = msg;
-  const rawOwnerMachineAuthority = msg[OWNER_MACHINE_AUTHORITY_FIELD];
-  const ownerMachineAuthority = typeof rawOwnerMachineAuthority === 'string' && rawOwnerMachineAuthority.trim()
-    ? rawOwnerMachineAuthority.trim()
-    : undefined;
+  const cronAuthority = captureInboundCommandAuthority({
+    [OWNER_MACHINE_AUTHORITY_FIELD]: msg[OWNER_MACHINE_AUTHORITY_FIELD],
+  });
+  const ownerMachineAuthority = cronAuthority?.kind === 'owner' ? cronAuthority.ownerMachineAuthority : undefined;
   // The server outbox may resend after a crash between WS delivery and its
   // `dispatched` acknowledgement.  Claim the logical occurrence in the
   // daemon's durable SQLite ledger before resolving a target or invoking any
@@ -313,9 +314,10 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
           await transportRuntime.send(command, clientMessageId, undefined, undefined, {
             timelineCommitted: true,
-            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
-            ...(managedAgent ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
-            ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
+            ...buildAuthorizedSendOptions(cronAuthority, {
+              messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+              ...(managedAgent ? { defaultDeliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
+            }),
           });
           if (!timelineProjected && cronRun) {
             timelineEmitter.emit(name, 'user.message', {

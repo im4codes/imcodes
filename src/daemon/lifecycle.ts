@@ -6,6 +6,10 @@ import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './ta
 import { setTransportToolExecutionEvaluator } from './transport-relay.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import {
+  captureRuntimeOwnerAuthorityBeforeInterrupt,
+  sendRuntimeWithPreservedAuthority,
+} from './machine-authority-send.js';
 import { isAutoCreatedSubSessionName, isTerminalTaskPairStatus } from '../../shared/task-pair.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { isSessionWorking } from './session-working.js';
@@ -2651,7 +2655,8 @@ export async function recoverCodexStalledSession(
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
-  const sendResult = runtime.send('continue', commandId, undefined, undefined, {
+  const ownerAuthority = captureRuntimeOwnerAuthorityBeforeInterrupt(runtime);
+  const sendResult = sendRuntimeWithPreservedAuthority(runtime, 'continue', commandId, ownerAuthority, {
     queuePlacement: 'front',
     timelineCommitted: true,
     messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
@@ -2723,7 +2728,8 @@ export async function recoverMemoryCompressionStalledSession(
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
-  const sendResult = runtime.send('continue', commandId, undefined, undefined, {
+  const ownerAuthority = captureRuntimeOwnerAuthorityBeforeInterrupt(runtime);
+  const sendResult = sendRuntimeWithPreservedAuthority(runtime, 'continue', commandId, ownerAuthority, {
     queuePlacement: 'front',
     timelineCommitted: true,
     messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
