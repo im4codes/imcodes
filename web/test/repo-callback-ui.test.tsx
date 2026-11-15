@@ -73,6 +73,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'repo.callback_status_done') return 'Done';
       if (key === 'repo.callback_status_ignored') return 'Ignored';
       if (key === 'repo.callback_status_failed') return 'Failed';
+      if (key === 'repo.callback_triggered_at') return `Triggered: ${opts?.time ?? ''}`;
+      if (key === 'repo.callback_completed_at') return `Completed: ${opts?.time ?? ''}`;
       if (key === 'repo.callback_related_task') return `Related task: ${opts?.taskId ?? ''}`;
       if (key === 'repo.callback_check_now') return 'Check now';
       if (key === 'common.close') return 'Close';
@@ -629,5 +631,145 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
       expect(screen.getByText('repo.callback_missing_server')).toBeTruthy();
     });
     expect(screen.queryByText('repo.callback_tpl_saved_repo')).toBeNull();
+  });
+
+  it('renders triggeredAt on all valid cards, completedAt only on terminal cards (done/ignored/failed), and skips invalid timestamps cleanly', async () => {
+    const ws = createMockWs();
+    render(
+      <RepoPage
+        ws={ws}
+        serverId="srv-1"
+        projectDir="/work/repo-ts"
+        callbackTargets={[]}
+      />,
+    );
+
+    const tPending = 1_700_000_010_000;
+    const tProgressStart = 1_700_000_020_000;
+    const tProgressUpdate = 1_700_000_025_000;
+    const tDoneStart = 1_700_000_030_000;
+    const tDoneEnd = 1_700_000_040_000;
+    const tIgnoredStart = 1_700_000_050_000;
+    const tIgnoredEnd = 1_700_000_060_000;
+    const tFailedStart = 1_700_000_070_000;
+    const tFailedEnd = 1_700_000_080_000;
+
+    const callbacks: CallbackTaskRecord[] = [
+      {
+        callbackId: 'cb_pending',
+        source: 'repo',
+        eventType: 'ci_failed',
+        scopeKey: '/work/repo-ts',
+        entityKey: 'run#1',
+        dedupKey: 'repo:/work/repo-ts:ci_failed:1',
+        title: 'Pending CB',
+        targetSession: 'deck_proj_brain',
+        status: 'pending',
+        summary: '',
+        createdAt: tPending,
+        updatedAt: tPending + 5_000,
+      },
+      {
+        callbackId: 'cb_in_progress',
+        source: 'repo',
+        eventType: 'pr_new',
+        scopeKey: '/work/repo-ts',
+        entityKey: 'pr#2',
+        dedupKey: 'repo:/work/repo-ts:pr_new:2',
+        title: 'In Progress CB',
+        targetSession: 'deck_proj_brain',
+        status: 'in_progress',
+        summary: '',
+        createdAt: tProgressStart,
+        updatedAt: tProgressUpdate,
+      },
+      {
+        callbackId: 'cb_done',
+        source: 'repo',
+        eventType: 'issue_new',
+        scopeKey: '/work/repo-ts',
+        entityKey: 'issue#3',
+        dedupKey: 'repo:/work/repo-ts:issue_new:3',
+        title: 'Done CB',
+        targetSession: 'deck_proj_brain',
+        status: 'done',
+        summary: 'Fixed issue #3',
+        relatedTaskId: 'tsk_done_3',
+        createdAt: tDoneStart,
+        updatedAt: tDoneEnd,
+      },
+      {
+        callbackId: 'cb_ignored',
+        source: 'repo',
+        eventType: 'ci_failed',
+        scopeKey: '/work/repo-ts',
+        entityKey: 'run#4',
+        dedupKey: 'repo:/work/repo-ts:ci_failed:4',
+        title: 'Ignored CB',
+        targetSession: 'deck_proj_brain',
+        status: 'ignored',
+        summary: 'Noise',
+        createdAt: tIgnoredStart,
+        updatedAt: tIgnoredEnd,
+      },
+      {
+        callbackId: 'cb_failed',
+        source: 'repo',
+        eventType: 'ci_failed',
+        scopeKey: '/work/repo-ts',
+        entityKey: 'run#5',
+        dedupKey: 'repo:/work/repo-ts:ci_failed:5',
+        title: 'Failed CB',
+        targetSession: 'deck_proj_brain',
+        status: 'failed',
+        summary: '',
+        lastError: 'Timed out',
+        createdAt: tFailedStart,
+        updatedAt: tFailedEnd,
+      },
+      {
+        callbackId: 'cb_invalid',
+        source: 'repo',
+        eventType: 'pr_new',
+        scopeKey: '/work/repo-ts',
+        entityKey: 'pr#6',
+        dedupKey: 'repo:/work/repo-ts:pr_new:6',
+        title: 'Invalid TS CB',
+        targetSession: 'deck_proj_brain',
+        status: 'done',
+        summary: 'Bad timestamps',
+        createdAt: 0,
+        updatedAt: Number.NaN,
+      },
+    ];
+
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-ts',
+      enabled: true,
+      checking: false,
+      callbacks,
+    });
+
+    await openModalAndAwaitPrefs();
+
+    expect(screen.getByText(`Triggered: ${new Date(tPending).toLocaleString()}`)).toBeTruthy();
+    expect(screen.queryByText(`Completed: ${new Date(tPending + 5_000).toLocaleString()}`)).toBeNull();
+
+    expect(screen.getByText(`Triggered: ${new Date(tProgressStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.queryByText(`Completed: ${new Date(tProgressUpdate).toLocaleString()}`)).toBeNull();
+
+    expect(screen.getByText(`Triggered: ${new Date(tDoneStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Completed: ${new Date(tDoneEnd).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText('Related task: tsk_done_3')).toBeTruthy();
+
+    expect(screen.getByText(`Triggered: ${new Date(tIgnoredStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Completed: ${new Date(tIgnoredEnd).toLocaleString()}`)).toBeTruthy();
+
+    expect(screen.getByText(`Triggered: ${new Date(tFailedStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Completed: ${new Date(tFailedEnd).toLocaleString()}`)).toBeTruthy();
+
+    expect(screen.getByText('Invalid TS CB')).toBeTruthy();
+    expect(screen.queryByText(/Invalid Date/i)).toBeNull();
   });
 });

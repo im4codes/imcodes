@@ -2714,6 +2714,8 @@
     "callback_status_done": "Done",
     "callback_status_ignored": "Ignored",
     "callback_status_failed": "Failed",
+    "callback_triggered_at": "Triggered: {{time}}",
+    "callback_completed_at": "Completed: {{time}}",
     "callback_related_task": "Related task: {{taskId}}"
   },
   "transport_chat": {

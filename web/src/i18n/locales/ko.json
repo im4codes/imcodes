@@ -2713,6 +2713,8 @@
     "callback_status_done": "완료",
     "callback_status_ignored": "무시됨",
     "callback_status_failed": "실패",
+    "callback_triggered_at": "트리거 시간: {{time}}",
+    "callback_completed_at": "완료 시간: {{time}}",
     "callback_related_task": "연결된 작업: {{taskId}}"
   },
   "transport_chat": {

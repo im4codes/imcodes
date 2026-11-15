@@ -57,6 +57,17 @@ function formatIntervalLabel(ms: number): string {
   return `${mins}m`;
 }
 
+function formatCallbackTimestamp(ts: unknown): string | null {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return null;
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString();
+}
+
+function isTerminalCallbackStatus(status: CallbackStatus): boolean {
+  return status === 'done' || status === 'ignored' || status === 'failed';
+}
+
 function makeTemplateId(scope: RepoCallbackTemplateScope): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return `${scope}_${crypto.randomUUID().slice(0, 8)}`;
@@ -871,6 +882,10 @@ export function RepoCallbackModal({
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {filteredCallbacks.map((cb) => {
                   const palette = statusColors(cb.status);
+                  const triggeredTime = formatCallbackTimestamp(cb.createdAt);
+                  const completedTime = isTerminalCallbackStatus(cb.status)
+                    ? formatCallbackTimestamp(cb.updatedAt)
+                    : null;
                   return (
                     <div
                       key={cb.callbackId}
@@ -926,9 +941,17 @@ export function RepoCallbackModal({
                           {cb.lastError}
                         </div>
                       )}
-                      {cb.relatedTaskId && (
-                        <div style={{ fontSize: 11, color: '#94a3b8' }}>
-                          {t('repo.callback_related_task', { taskId: cb.relatedTaskId })}
+                      {(triggeredTime || completedTime || cb.relatedTaskId) && (
+                        <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', flexWrap: 'wrap', gap: '4px 12px' }}>
+                          {triggeredTime && (
+                            <span>{t('repo.callback_triggered_at', { time: triggeredTime })}</span>
+                          )}
+                          {completedTime && (
+                            <span>{t('repo.callback_completed_at', { time: completedTime })}</span>
+                          )}
+                          {cb.relatedTaskId && (
+                            <span>{t('repo.callback_related_task', { taskId: cb.relatedTaskId })}</span>
+                          )}
                         </div>
                       )}
                     </div>

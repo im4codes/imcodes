@@ -2714,6 +2714,8 @@
     "callback_status_done": "已完成",
     "callback_status_ignored": "已忽略",
     "callback_status_failed": "失敗",
+    "callback_triggered_at": "觸發時間：{{time}}",
+    "callback_completed_at": "完成時間：{{time}}",
     "callback_related_task": "關聯任務：{{taskId}}"
   },
   "transport_chat": {
