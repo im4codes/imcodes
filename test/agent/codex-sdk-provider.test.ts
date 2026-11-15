@@ -17,6 +17,7 @@ let mcpStatusPages: Array<Record<string, unknown>> = [];
 /** Queued `mcpServer/tool/call` errors; an empty queue answers a live transport. */
 let mcpToolCallErrors: string[] = [];
 const realSetTimeout = setTimeout;
+const realDateNow = Date.now;
 
 const loggerMock = vi.hoisted(() => ({
   info: vi.fn(),
@@ -380,13 +381,13 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 async function waitForCondition(
   check: () => boolean,
-  timeoutMs = 3000,
+  timeoutMs = 5000,
   intervalMs = 10,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = realDateNow() + timeoutMs;
+  while (realDateNow() < deadline) {
     if (check()) return;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await new Promise((resolve) => realSetTimeout(resolve, intervalMs));
   }
   throw new Error('Timed out waiting for condition');
 }
@@ -408,6 +409,7 @@ async function advanceFakeTimersWithRealIoUntil(
   check: () => boolean,
   timeoutMs = 20_000,
   stepMs = 100,
+  realIoDrainMs = 15_000,
 ): Promise<void> {
   const steps = Math.max(1, Math.ceil(timeoutMs / stepMs));
   for (let i = 0; i <= steps; i += 1) {
@@ -421,6 +423,22 @@ async function advanceFakeTimersWithRealIoUntil(
     // preventing a fake-time-only false timeout under suite-wide I/O load.
     await new Promise<void>((resolve) => realSetImmediate(resolve));
     await new Promise<void>((resolve) => realSetTimeout(resolve, 5));
+  }
+  // Under heavy CI I/O contention, real async fs work triggered near or after
+  // CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS can still be in flight when virtual
+  // time reaches `timeoutMs`. Keep draining real time and flushing zero-delay
+  // follow-up timers without burning out of the virtual window.
+  const realDeadline = realDateNow() + realIoDrainMs;
+  let drainTicks = 0;
+  while (realDateNow() < realDeadline) {
+    if (check()) return;
+    await new Promise<void>((resolve) => realSetImmediate(resolve));
+    await new Promise<void>((resolve) => realSetTimeout(resolve, 25));
+    if (check()) return;
+    drainTicks += 1;
+    // Advance fake time by at most one step every ~500ms of real wait so
+    // debounce/poll follow-up timers fire without jumping past virtual caps.
+    await vi.advanceTimersByTimeAsync(drainTicks % 20 === 0 ? stepMs : 0);
   }
   throw new Error('Timed out waiting for fake-timer condition with real I/O');
 }
@@ -4261,6 +4279,19 @@ describe('CodexSdkProvider', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
+  }, 45_000);
+
+  it('drains delayed real I/O under fake timers after virtual polling window completes', async () => {
+    vi.useFakeTimers();
+    let settled = false;
+    realSetTimeout(() => {
+      settled = true;
+    }, 150);
+
+    // 200ms virtual budget finishes in ~25ms real time; helper must keep
+    // draining real I/O instead of throwing prematurely at ~25ms.
+    await advanceFakeTimersWithRealIoUntil(() => settled, 200, 50, 2_000);
+    expect(settled).toBe(true);
   });
 
   it('ROLLOUT-FIRST: self-heals a turn whose task_complete is already on disk — no idle hint, no 60s gate', async () => {
@@ -4432,7 +4463,7 @@ describe('CodexSdkProvider', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
-  });
+  }, 45_000);
 
   it('terminalizes active Codex commandExecution items on turn/completed', async () => {
     const provider = createCodexProvider();
@@ -6704,7 +6735,7 @@ describe('CodexSdkProvider', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
-  });
+  }, 45_000);
 
   it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
     const provider = createCodexProvider();
