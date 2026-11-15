@@ -6,7 +6,8 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
-import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 
@@ -105,6 +106,8 @@ describe('NewSessionDialog', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    __clearTransportModelCacheForTests();
   });
 
   it('renders project name input', () => {
@@ -1231,5 +1234,52 @@ describe('NewSessionDialog', () => {
       agentType: AGY_SDK_PROVIDER_ID,
       requestedModel: 'gemini-2.5-pro',
     }));
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('gemini-2.5-pro');
+  });
+
+  it('defaults agy-sdk to gemini-4-hydrogen-high over upstream carbon-medium when no preference exists, then remembers user-selected AGY models on reopen', async () => {
+    const ws1 = makeWs();
+    const first = render(<NewSessionDialog ws={ws1 as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'agy-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/agy-app' } });
+    selectAgent(AGY_SDK_PROVIDER_ID);
+
+    const req1 = ws1.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === AGY_SDK_PROVIDER_ID
+    ))?.[0];
+    act(() => ws1.emit({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: req1?.requestId,
+      models: [
+        { id: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+        { id: AGY_DEFAULT_MODEL_ID, name: 'Gemini 4 Hydrogen (High)' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+      ],
+      defaultModel: 'gemini-4-carbon-medium',
+      isAuthenticated: true,
+    }));
+
+    const select1 = (await screen.findByRole('option', { name: 'gemini-4-argon-high' })).parentElement as HTMLSelectElement;
+    expect(select1.value).toBe(AGY_DEFAULT_MODEL_ID);
+
+    // User selects gemini-4-argon-high and starts the session:
+    fireEvent.input(select1, { target: { value: 'gemini-4-argon-high' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws1.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestedModel: 'gemini-4-argon-high',
+    }));
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('gemini-4-argon-high');
+
+    first.unmount();
+
+    // Reopening NewSessionDialog pre-fills the remembered gemini-4-argon-high model:
+    const ws2 = makeWs();
+    render(<NewSessionDialog ws={ws2 as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    selectAgent(AGY_SDK_PROVIDER_ID);
+    const select2 = (await screen.findByRole('option', { name: 'gemini-4-argon-high' })).parentElement as HTMLSelectElement;
+    expect(select2.value).toBe('gemini-4-argon-high');
   });
 });

@@ -96,6 +96,29 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(buildTransportResumeLaunchOpts(rec({ name: 'deck_sub_x', parentSession: 'deck_demo_brain' })))
       .toMatchObject({ parentSession: 'deck_demo_brain' });
   });
+
+  it('preserves explicit user requestedModel for agy-sdk while leaving unset requestedModel undefined so strictModelSelection default fallback handles synthetic and live catalogs', () => {
+    expect(buildTransportResumeLaunchOpts(rec({
+      agentType: AGY_SDK_PROVIDER_ID,
+      providerResumeId: 'agy-1',
+      requestedModel: undefined,
+      activeModel: 'gemini-4-carbon-medium',
+    })).requestedModel).toBeUndefined();
+
+    expect(buildTransportResumeLaunchOpts(rec({
+      agentType: AGY_SDK_PROVIDER_ID,
+      providerResumeId: 'agy-2',
+      requestedModel: 'gemini-4-argon-high',
+    })).requestedModel).toBe('gemini-4-argon-high');
+
+    for (const agentType of ['kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'grok-sdk'] as const) {
+      expect(buildTransportResumeLaunchOpts(rec({
+        agentType,
+        providerResumeId: 'other-1',
+        requestedModel: undefined,
+      })).requestedModel).toBeUndefined();
+    }
+  });
 });
 
 describe('findLegacyProviderResumeId', () => {

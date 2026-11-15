@@ -12194,6 +12194,8 @@ afterEach(() => {
       sessionName: 'agy-sdk-session',
       text: '/model gemini-2.5-flash',
     });
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('gemini-2.5-flash');
+    expect(localStorage.getItem('imcodes-agy-model:agy-sdk-session')).toBe('gemini-2.5-flash');
   });
 
   it('shortens long multi-segment agy-sdk model labels on the selector pill while keeping full IDs in title and /model commands', async () => {

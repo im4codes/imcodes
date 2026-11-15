@@ -13,7 +13,8 @@ import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
-import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { loadAgyModelPreference, saveAgyModelPreference } from '../agy-model-preference.js';
 import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import {
@@ -577,6 +578,15 @@ export function SessionSettingsDialog({
     if (nextType === 'codex') return CODEX_MODEL_IDS[0] ?? null;
     if (nextType === 'qwen') return getKnownQwenModelOptions()[0]?.id ?? null;
     const catalog = readCachedTransportModels(`${sessionName.trim()}\0${nextType}\0`, nextType);
+    if (nextType === AGY_SDK_PROVIDER_ID) {
+      const stored = loadAgyModelPreference();
+      if (stored && (!catalog?.models.length || catalog.models.some((model) => model.id === stored))) {
+        return stored;
+      }
+      if (!catalog?.models.length || catalog.models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)) {
+        return AGY_DEFAULT_MODEL_ID;
+      }
+    }
     return catalog?.models.some((model) => model.id === catalog.defaultModel)
       ? catalog.defaultModel ?? null
       : catalog?.models[0]?.id ?? null;
@@ -703,6 +713,9 @@ export function SessionSettingsDialog({
         cwd: initCwd,
         subSession: !!subSessionId,
       });
+      if (agentType === AGY_SDK_PROVIDER_ID) {
+        saveAgyModelPreference(nextModel, sessionName);
+      }
     } catch (err) {
       setPendingSessionModel(null);
       setModelApplyError(err instanceof Error ? err.message : String(err));
@@ -935,6 +948,9 @@ export function SessionSettingsDialog({
           else fields.agentType = agentType;
           fields.requestedModel = nextProviderModel;
           fields.activeModel = null;
+          if (agentType === AGY_SDK_PROVIDER_ID && nextProviderModel && providerModelManuallySelectedRef.current) {
+            saveAgyModelPreference(nextProviderModel, sessionName);
+          }
         }
       }
       if (surface !== 'session' && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)) {

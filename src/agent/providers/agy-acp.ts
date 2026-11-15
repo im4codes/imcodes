@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import type {
-  ProviderConfig, ProviderDelegationNotification, SessionConfig, TransportProvider,
+  ProviderConfig, ProviderDelegationNotification, ProviderModelList, SessionConfig, TransportProvider,
 } from '../transport-provider.js';
 import { PROVIDER_ERROR_CODES } from '../transport-provider.js';
 import {
@@ -9,7 +9,7 @@ import {
 } from '../../../shared/agent-delegation.js';
 import {
   AGY_SDK_PROVIDER_ID, AGY_CLI_BINARY, AGY_CLI_FLAG, AGY_NATIVE_START_NOT_ATTEMPTED,
-  AGY_ACP_AGENT_NAME, AGY_ACP_COMMAND, AGY_DEFAULT_MODEL_ID,
+  AGY_ACP_AGENT_NAME, AGY_ACP_COMMAND, AGY_DEFAULT_MODEL_ID, AGY_FALLBACK_MODEL_IDS,
 } from '../../../shared/agy-agent.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 import { execFileOffMain } from '../../util/exec-helper.js';
@@ -113,6 +113,36 @@ export class AgyAcpProvider extends KimiSdkProvider {
 
   applySessionModel(sessionId: string, model: string) {
     return this.applyStrictSessionModel(sessionId, model);
+  }
+
+  override getCachedModels(): ProviderModelList | null {
+    const cached = super.getCachedModels();
+    if (!cached?.models.length) return null;
+    return {
+      ...cached,
+      ...(cached.models.some((m) => m.id === AGY_DEFAULT_MODEL_ID)
+        ? { defaultModel: AGY_DEFAULT_MODEL_ID }
+        : {}),
+    };
+  }
+
+  override async listModels(force?: boolean): Promise<ProviderModelList> {
+    const cached = this.getCachedModels();
+    if (cached) return cached;
+    const listed = await super.listModels(force);
+    if (listed.models.length > 0) {
+      return {
+        ...listed,
+        ...(listed.models.some((m) => m.id === AGY_DEFAULT_MODEL_ID)
+          ? { defaultModel: AGY_DEFAULT_MODEL_ID }
+          : {}),
+      };
+    }
+    return {
+      models: AGY_FALLBACK_MODEL_IDS.map((id) => ({ id })),
+      defaultModel: AGY_DEFAULT_MODEL_ID,
+      isAuthenticated: true,
+    };
   }
 
   notifyActiveDelegation(sessionId: string, notification: ProviderDelegationNotification): Promise<AgentDelegationNotificationResult> {

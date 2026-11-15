@@ -792,12 +792,69 @@ describe('AG native ACP', () => {
     expect((await provider.listModels()).defaultModel).toBe('gemini-4-hydrogen-high');
     expect(provider.getCachedModels()?.defaultModel).toBe('gemini-4-hydrogen-high');
 
-    // Resumed native session without explicit agentId keeps its native currentModelId.
+    // Resumed native session without explicit agentId ALSO locks to gemini-4-hydrogen-high
+    // rather than adopting upstream's unpersisted default currentModelId.
     const resumedId = 'deck_test_agy_acp_resumed';
     await provider.createSession({ sessionKey: resumedId, sessionName: resumedId, cwd: process.cwd(), resumeId: 'owned-native' });
     await provider.send(resumedId, 'resumed turn');
     await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
-    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-3.8-flash-high');
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-4-hydrogen-high', 'gemini-4-hydrogen-high']);
+  });
+
+  it('locks both newSession and resumeSession against upstream gemini-4-carbon-medium while honoring explicit agentId and fallback listModels', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default');
+    // Before any ACP session loads, listModels falls back to static AGY models + gemini-4-hydrogen-high default.
+    expect(provider.getCachedModels()).toBeNull();
+    const preloaded = await provider.listModels();
+    expect(preloaded.defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(preloaded.isAuthenticated).toBe(true);
+    expect(preloaded.models.some(m => m.id === 'gemini-4-hydrogen-high')).toBe(true);
+
+    const emittedModels: Array<[string, string]> = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (info.model) emittedModels.push([sid, info.model]);
+    });
+    provider.onComplete(done);
+
+    // 1) Resumed session without explicit agentId: must apply gemini-4-hydrogen-high and never emit carbon-medium.
+    const defaultResume = 'deck_test_agy_carbon_default_resume';
+    await provider.createSession({ sessionKey: defaultResume, sessionName: defaultResume, cwd: process.cwd(), resumeId: 'native-default-1' });
+    expect(await provider.restoreSession(defaultResume)).toBe(true);
+    await provider.send(defaultResume, 'after daemon restart');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // 2) Resumed session WITH explicit user-selected model: must replay gemini-4-argon-high and never emit carbon-medium or hydrogen-high.
+    const customResume = 'deck_test_agy_carbon_custom_resume';
+    await provider.createSession({ sessionKey: customResume, sessionName: customResume, cwd: process.cwd(), resumeId: 'native-custom-1', agentId: 'gemini-4-argon-high' });
+    await provider.send(customResume, 'custom model turn');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    expect(emittedModels.some(([, m]) => m === 'gemini-4-carbon-medium')).toBe(false);
+    expect(emittedModels.filter(([sid]) => sid === defaultResume).every(([, m]) => m === 'gemini-4-hydrogen-high')).toBe(true);
+    expect(emittedModels.filter(([sid]) => sid === customResume).every(([, m]) => m === 'gemini-4-argon-high')).toBe(true);
+
+    const setModelCalls = (await requests()).filter(row => row.method === 'session/set_model').map(row => ({
+      sessionId: row.params.sessionId,
+      modelId: row.params.modelId,
+    }));
+    expect(setModelCalls).toEqual([
+      { sessionId: 'native-default-1', modelId: 'gemini-4-hydrogen-high' },
+      { sessionId: 'native-custom-1', modelId: 'gemini-4-argon-high' },
+    ]);
+
+    // 3) Cached/live listModels retains full upstream dynamic list for manual switching, with defaultModel locked to gemini-4-hydrogen-high.
+    const postLoaded = await provider.listModels();
+    expect(postLoaded.defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(postLoaded.models.map(m => m.id)).toEqual([
+      'gemini-4-carbon-medium',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(provider.getCachedModels()?.defaultModel).toBe('gemini-4-hydrogen-high');
   });
 
   it('does not submit a prompt if native model selection fails', async () => {

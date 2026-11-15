@@ -1,7 +1,7 @@
 import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { reclaimOrphanedAgyIncognitoHomes } from './agy-incognito-isolation.js';
-import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
@@ -732,6 +732,7 @@ export async function restoreFromStore(): Promise<void> {
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
     if (isStoredTransportSession(s)) {
+      healPersistedAgySessionModel(s);
       // Transport sessions are normally handed to restoreTransportSessions,
       // but that path intentionally assumes providers validate cwd later.
       // Mark a missing persisted directory here so an invalid transport cannot
@@ -2962,6 +2963,33 @@ async function reconcileTimelineRestoreOrphanSdkSubagents(sessionName: string, r
  */
 const transportSessionRestoreInFlight = new Map<string, Promise<void>>();
 
+function healPersistedAgySessionModel(record: SessionRecord): SessionRecord {
+  if (!isStoredTransportSession(record)
+    || (record.providerId ?? record.agentType) !== AGY_SDK_PROVIDER_ID
+    || isIncognitoSession(record)
+    || transportRuntimes.has(record.name)) {
+    return record;
+  }
+  const explicitModel = record.requestedModel?.trim() || undefined;
+  const targetActiveModel = explicitModel
+    ?? (record.activeModel === 'gemini-4-carbon-medium' || record.modelDisplay === 'gemini-4-carbon-medium'
+      ? AGY_DEFAULT_MODEL_ID
+      : undefined);
+  if (!targetActiveModel
+    || (record.activeModel === targetActiveModel && record.modelDisplay === targetActiveModel)) {
+    return record;
+  }
+  const healed: SessionRecord = {
+    ...record,
+    activeModel: targetActiveModel,
+    modelDisplay: targetActiveModel,
+  };
+  upsertSession(healed);
+  const persisted = getSession(healed.name) ?? healed;
+  emitSessionPersist(persisted, healed.name);
+  return persisted;
+}
+
 export async function restoreTransportSessions(
   providerId: string,
   options: {
@@ -2979,6 +3007,12 @@ export async function restoreTransportSessions(
   if (isNonDaemonProcess()) {
     logger.warn({ providerId, sessionName: options.sessionName }, 'restoreTransportSessions refused: this process is not the daemon');
     return;
+  }
+  if (providerId === AGY_SDK_PROVIDER_ID) {
+    for (const record of storeSessions()) {
+      if (options.sessionName && record.name !== options.sessionName) continue;
+      healPersistedAgySessionModel(record);
+    }
   }
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
@@ -3842,9 +3876,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
     throw new Error('AG conversation requires a trusted resume id; refusing an implicit fresh launch. Use Start over (session_restart reset=true) to explicitly create a new conversation. Restart cannot safely resume this session.');
   }
-  const storedRequestedModel = !opts.fresh
-    && (agentType !== AGY_SDK_PROVIDER_ID || existing?.agentType === AGY_SDK_PROVIDER_ID)
-    ? existing?.requestedModel : undefined;
+  // Session model choice is session configuration (not conversation history):
+  // preserve existing.requestedModel across fresh/reset ("Start over" / 重启新建)
+  // whenever the provider stays the same, while never inheriting a foreign
+  // provider's model ID on cross-provider switches.
+  const storedRequestedModel = (existing?.providerId ?? existing?.agentType) === agentType
+    ? existing?.requestedModel
+    : undefined;
   const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
     ? existing?.providerResumeId
     : undefined;

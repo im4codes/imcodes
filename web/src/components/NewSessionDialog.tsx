@@ -54,6 +54,7 @@ import {
 } from "@shared/cc-presets.js";
 import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
+import { loadAgyModelPreference, saveAgyModelPreference } from "../agy-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from "@shared/agent-types.js";
 import {
@@ -64,7 +65,7 @@ import {
   isCodeBuddyProviderId,
 } from "@shared/codebuddy.js";
 import { HERMES_AGENT_PROVIDER_ID } from "@shared/hermes-agent.js";
-import { AGY_SDK_PROVIDER_ID } from "@shared/agy-agent.js";
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from "@shared/agy-agent.js";
 import { SESSION_IDENTITY_SCOPES, normalizeSessionIdentityContent } from '@shared/session-identity.js';
 import { saveSessionIdentityProfile } from '../api.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
@@ -537,6 +538,9 @@ export function NewSessionDialog({
         requestedModel.trim()
       ) {
         extra.requestedModel = requestedModel.trim();
+        if (agentType === AGY_SDK_PROVIDER_ID) {
+          saveAgyModelPreference(requestedModel.trim());
+        }
       }
       ws.sendSessionCommand("start", {
         ...(incognito ? { incognito: true } : {}),
@@ -700,12 +704,22 @@ export function NewSessionDialog({
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 
+  const agyModelManuallySelectedRef = useRef(false);
   useEffect(() => {
-    if (agentType !== AGY_SDK_PROVIDER_ID) return;
+    if (agentType !== AGY_SDK_PROVIDER_ID) {
+      agyModelManuallySelectedRef.current = false;
+      return;
+    }
     setRequestedModel((current) => {
       const trimmed = current.trim();
-      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
-      const fallback = transportModels.defaultModel ?? AGY_SDK_MODEL_FALLBACK[0];
+      const stored = loadAgyModelPreference();
+      if (agyModelManuallySelectedRef.current && trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) {
+        return trimmed;
+      }
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) {
+        return stored;
+      }
+      const fallback = transportModels.defaultModel ?? AGY_DEFAULT_MODEL_ID;
       if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       return modelSuggestions[0] ?? fallback;
     });
@@ -995,9 +1009,10 @@ export function NewSessionDialog({
               <select
                 value={requestedModel}
                 disabled={starting}
-                onInput={(e) =>
-                  setRequestedModel((e.target as HTMLSelectElement).value)
-                }
+                onInput={(e) => {
+                  if (agentType === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                  setRequestedModel((e.target as HTMLSelectElement).value);
+                }}
                 style={{
                   width: "100%",
                   background: "#0f172a",
@@ -1025,7 +1040,10 @@ export function NewSessionDialog({
                 placeholder={t("session.supervision.selectModel")}
                 value={requestedModel}
                 disabled={starting}
-                onChange={setRequestedModel}
+                onChange={(val) => {
+                  if (agentType === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                  setRequestedModel(val);
+                }}
                 className="input"
                 style={{ width: "100%" }}
               />

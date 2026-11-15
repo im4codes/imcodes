@@ -17,7 +17,7 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { usesProviderResumeId } from '../agent/transport-resume-opts.js';
 import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
-import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
 
 import logger from '../util/logger.js';
@@ -687,6 +687,14 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       && existing.providerSessionId === existingRuntime?.providerSessionId;
     if (isTransportAgent(sub.type) || ownsLiveAgy) {
       const now = Date.now();
+      const targetAgentType = ownsLiveAgy ? existing.agentType : sub.type;
+      const isAgySub = targetAgentType === AGY_SDK_PROVIDER_ID;
+      const rebuiltRequestedModel = sub.requestedModel ?? existing?.requestedModel;
+      const candidateActiveModel = sub.activeModel ?? existing?.activeModel;
+      const rebuiltActiveModel = isAgySub && !ownsLiveAgy
+        ? (rebuiltRequestedModel
+          ?? (candidateActiveModel === 'gemini-4-carbon-medium' ? AGY_DEFAULT_MODEL_ID : candidateActiveModel))
+        : (isAgySub && ownsLiveAgy ? (existing.activeModel ?? candidateActiveModel) : candidateActiveModel);
       const nextRecord: SessionRecord = {
         ...existing,
         name: sessionName,
@@ -703,8 +711,11 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         updatedAt: now,
         label: sub.label ?? existing?.label,
         parentSession: sub.parentSession ?? existing?.parentSession,
-        requestedModel: sub.requestedModel ?? existing?.requestedModel,
-        activeModel: sub.activeModel ?? existing?.activeModel,
+        requestedModel: rebuiltRequestedModel,
+        activeModel: rebuiltActiveModel,
+        ...(isAgySub && !ownsLiveAgy && rebuiltActiveModel ? {
+          modelDisplay: rebuiltActiveModel,
+        } : {}),
         providerSessionId: sub.providerSessionId ?? existing?.providerSessionId,
         providerResumeId: sub.providerResumeId ?? ((existing?.providerId ?? existing?.agentType) === (sub.providerId ?? sub.type) ? existing?.providerResumeId : undefined),
         ccSessionId: sub.ccSessionId ?? existing?.ccSessionId,

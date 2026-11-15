@@ -5,7 +5,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/preact';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
-import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 
@@ -35,6 +36,7 @@ const makeWs = () => ({
 describe('StartSubSessionDialog', () => {
   afterEach(() => {
     localStorage.clear();
+    __clearTransportModelCacheForTests();
     cleanup();
   });
 
@@ -988,5 +990,72 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('cursor-headless', undefined, '/tmp', undefined, {
       requestedModel: 'gpt-5.2',
     });
+  });
+
+  it('defaults agy-sdk sub-sessions to gemini-4-hydrogen-high over upstream carbon-medium and remembers user-selected AGY models on reopen', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws1 = {
+      ...makeWs(),
+      connected: true,
+      onMessage: (cb: (message: unknown) => void) => {
+        handlers.add(cb);
+        return () => handlers.delete(cb);
+      },
+    };
+    const onStart1 = vi.fn();
+    const first = render(
+      <StartSubSessionDialog
+        ws={ws1 as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart1}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const req1 = ws1.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === AGY_SDK_PROVIDER_ID)?.[0];
+    act(() => handlers.forEach((cb) => cb({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: req1?.requestId,
+      models: [
+        { id: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+        { id: AGY_DEFAULT_MODEL_ID, name: 'Gemini 4 Hydrogen (High)' },
+        { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+      ],
+      defaultModel: 'gemini-4-carbon-medium',
+      isAuthenticated: true,
+    })));
+
+    const input1 = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    await waitFor(() => expect(input1.value).toBe(AGY_DEFAULT_MODEL_ID));
+
+    fireEvent.input(input1, { target: { value: 'claude-opus-5-5-high' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart1).toHaveBeenCalledWith(AGY_SDK_PROVIDER_ID, undefined, '/tmp', undefined, {
+      requestedModel: 'claude-opus-5-5-high',
+    });
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('claude-opus-5-5-high');
+
+    first.unmount();
+
+    // Reopening StartSubSessionDialog pre-fills the remembered claude-opus-5-5-high model:
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const input2 = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    await waitFor(() => expect(input2.value).toBe('claude-opus-5-5-high'));
   });
 });

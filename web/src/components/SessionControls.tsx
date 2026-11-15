@@ -149,6 +149,7 @@ import { shortModelLabel } from '../model-label.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
+import { saveAgyModelPreference } from '../agy-model-preference.js';
 import { dispatchSessionModelSwitch } from '../session-model-switch.js';
 import {
   canSessionRoleOwnAutomaticSupervision,
@@ -8024,6 +8025,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleGenericTransportModelSelect = (m: string) => {
     if (!dispatchModelSwitch(m)) return;
+    if (activeSession?.agentType === AGY_SDK_PROVIDER_ID) {
+      saveAgyModelPreference(m, activeSession.name);
+    }
     setModelOpen(false);
     onAfterAction?.();
   };

@@ -770,7 +770,8 @@ export class KimiSdkProvider implements TransportProvider {
       ? config.agentId.trim()
       : undefined;
     const inheritedModel = existing?.model;
-    const profileDefaultModel = !explicitAgentId && !inheritedModel && !config.resumeId
+    const profileDefaultModel = !explicitAgentId && !inheritedModel
+      && (!config.resumeId || this.profile.strictModelSelection)
       ? this.profile.defaultModel
       : undefined;
     const baseSourceHome = incognito
@@ -1378,6 +1379,7 @@ export class KimiSdkProvider implements TransportProvider {
       }
     };
     assertOwner();
+    let switchedConfirmedModel = false;
     let request = state.modelApplyRequest;
     if (!request || request.revision !== revision || request.model !== model) {
       // Order native writes, not merely their callbacks. A late B ACK must not
@@ -1405,6 +1407,7 @@ export class KimiSdkProvider implements TransportProvider {
           }
           assertOwner();
           state.confirmedModel = model;
+          switchedConfirmedModel = true;
           if (!this.supportsSystemPromptMetaForState(state)) {
             state.sessionSystemTextInjected = undefined;
           }
@@ -1431,6 +1434,11 @@ export class KimiSdkProvider implements TransportProvider {
       throw error;
     }
     assertOwner();
+    if (switchedConfirmedModel
+      && !state.modelControlIntent
+      && !(state.promptInFlight && state.turnModel && state.turnModel !== model)) {
+      this.emitSessionInfo(sessionId, { model });
+    }
   }
 
   refreshSessionSystemText(sessionId: string): void {
@@ -2307,11 +2315,13 @@ export class KimiSdkProvider implements TransportProvider {
           true,
         );
       }
-      if (state.turnGeneration === generation
-        && state.settledGeneration !== generation
-        && state.promptInFlight) {
-        state.promptSubmittedGeneration = generation;
-        if (this.profile.strictModelSelection && state.turnModel) {
+      if (state.turnGeneration === generation) {
+        if (state.settledGeneration !== generation && state.promptInFlight) {
+          state.promptSubmittedGeneration = generation;
+          if (this.profile.strictModelSelection && state.turnModel) {
+            this.emitSessionInfo(sessionId, { model: state.turnModel });
+          }
+        } else if (state.settledGeneration === generation && !state.stoppedByCancel && this.profile.strictModelSelection && state.turnModel) {
           this.emitSessionInfo(sessionId, { model: state.turnModel });
         }
       }
@@ -2851,7 +2861,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.profile.strictModelSelection && typeof currentModel === 'string') {
       state.confirmedModel = currentModel;
     }
-    if (typeof currentModel === 'string' && !state.model) {
+    if (typeof currentModel === 'string' && !state.model && !this.profile.strictModelSelection) {
       state.model = currentModel;
       this.emitSessionInfo(sessionId, { model: currentModel });
     }

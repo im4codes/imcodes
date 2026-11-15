@@ -1,7 +1,7 @@
 /**
  * StartSubSessionDialog — choose type (cc/cc-sdk/codex/codex-sdk/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
  */
-import { useState, useEffect, useMemo } from 'preact/hooks';
+import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
@@ -36,6 +36,7 @@ import {
 } from '@shared/cc-presets.js';
 import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
+import { loadAgyModelPreference, saveAgyModelPreference } from '../agy-model-preference.js';
 import {
   CODEBUDDY_CHINA_DEFAULT_MODEL,
   CODEBUDDY_CHINA_MODEL_FALLBACK,
@@ -44,7 +45,7 @@ import {
   isCodeBuddyProviderId,
 } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
-import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
 import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
 
@@ -339,7 +340,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) {
+      extra.requestedModel = requestedModel.trim();
+      if (type === AGY_SDK_PROVIDER_ID) {
+        saveAgyModelPreference(requestedModel.trim());
+      }
+    }
     if (type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'muse-code-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
     if (incognito) extra.incognito = true;
     if (launchCount > 1) extra.launchCount = launchCount;
@@ -469,12 +475,22 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 
+  const agyModelManuallySelectedRef = useRef(false);
   useEffect(() => {
-    if (type !== AGY_SDK_PROVIDER_ID) return;
+    if (type !== AGY_SDK_PROVIDER_ID) {
+      agyModelManuallySelectedRef.current = false;
+      return;
+    }
     setRequestedModel((current) => {
       const trimmed = current.trim();
-      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
-      const fallback = transportModels.defaultModel ?? AGY_SDK_MODEL_SUGGESTIONS[0];
+      const stored = loadAgyModelPreference();
+      if (agyModelManuallySelectedRef.current && trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) {
+        return trimmed;
+      }
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) {
+        return stored;
+      }
+      const fallback = transportModels.defaultModel ?? AGY_DEFAULT_MODEL_ID;
       if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       return modelSuggestions[0] ?? fallback;
     });
@@ -934,7 +950,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                 <select
                   class="input"
                   value={requestedModel}
-                  onInput={(e) => setRequestedModel((e.target as HTMLSelectElement).value)}
+                  onInput={(e) => {
+                    if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                    setRequestedModel((e.target as HTMLSelectElement).value);
+                  }}
                   style={{ width: '100%' }}
                 >
                   {modelSuggestions.map((model) => (
@@ -948,7 +967,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                   options={modelSuggestions}
                   placeholder={t('session.supervision.selectModel')}
                   value={requestedModel}
-                  onChange={setRequestedModel}
+                  onChange={(val) => {
+                    if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                    setRequestedModel(val);
+                  }}
                   style={{ width: '100%' }}
                 />
               )}

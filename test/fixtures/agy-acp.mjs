@@ -20,7 +20,16 @@ const models = scenario === 'legacy-flash-default'
         { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
       ],
     }
-  : { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }, { modelId: 'model-b', name: 'Model B' }] };
+  : scenario === 'upstream-carbon-default'
+    ? {
+        currentModelId: 'gemini-4-carbon-medium',
+        availableModels: [
+          { modelId: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+          { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
+          { modelId: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+        ],
+      }
+    : { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }, { modelId: 'model-b', name: 'Model B' }] };
 function startAutoWakeup(sid, state) {
   if (logPath && fs.existsSync(logPath + '.auto-start-hold')) {
     state.autoTimer = setTimeout(() => startAutoWakeup(sid, state), 10); return;

@@ -12677,7 +12677,23 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   }
 
   if (provider && typeof provider.listModels === 'function') {
-    return await provider.listModels(force);
+    const listed = await provider.listModels(force);
+    if (agentType === AGY_SDK_PROVIDER_ID) {
+      if (listed.models.length === 0 && !listed.error) {
+        return {
+          models: modelIdsToTransportModels(AGY_MODEL_IDS),
+          defaultModel: AGY_DEFAULT_MODEL_ID,
+          isAuthenticated: true,
+        };
+      }
+      if (listed.models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)) {
+        return {
+          ...listed,
+          defaultModel: AGY_DEFAULT_MODEL_ID,
+        };
+      }
+    }
+    return listed;
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
 }
@@ -12797,7 +12813,9 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
     const provider = getProvider(AGY_SDK_PROVIDER_ID) as import('../agent/providers/agy-sdk.js').AgySdkProvider | undefined;
     const cached = provider?.getCachedModels?.();
     if (cached?.models?.length) {
-      return cached;
+      return cached.models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)
+        ? { ...cached, defaultModel: AGY_DEFAULT_MODEL_ID }
+        : cached;
     }
     return {
       models: modelIdsToTransportModels(AGY_MODEL_IDS),

@@ -138,6 +138,7 @@ function makeIdentityAckWs() {
 describe('SessionSettingsDialog supervision', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     __clearTransportModelCacheForTests();
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
     fetchExecutionPoolCatalogMock.mockResolvedValue([]);
@@ -2112,7 +2113,7 @@ describe('SessionSettingsDialog supervision', () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it('uses a late AGY live default but does not override a later manual selection', async () => {
+  it('keeps gemini-4-hydrogen-high over upstream carbon-medium default, adopts a live default only when hydrogen-high is absent, and remembers manual AGY choices', async () => {
     const handlers = new Set<(message: unknown) => void>();
     const ws = { connected: true, onMessage: (cb: (message: unknown) => void) => { handlers.add(cb); return () => handlers.delete(cb); }, requestTransportModels: () => 'agy-switch' };
     render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
@@ -2120,9 +2121,17 @@ describe('SessionSettingsDialog supervision', () => {
       transportConfig={null} surface="session" ws={ws as any} onClose={vi.fn()} onSaved={vi.fn()} />);
     changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
     await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+
+    // Upstream carbon-medium must NOT override gemini-4-hydrogen-high when hydrogen-high is in the catalog.
     act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
-      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: AGY_DEFAULT_MODEL_ID }, { id: 'live-default' }, { id: 'manual-choice' }], defaultModel: 'live-default' })));
+      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: AGY_DEFAULT_MODEL_ID }, { id: 'gemini-4-carbon-medium' }, { id: 'manual-choice' }], defaultModel: 'gemini-4-carbon-medium' })));
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+
+    // When a catalog genuinely lacks gemini-4-hydrogen-high, fall back to its defaultModel unless manually overridden.
+    act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
+      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: 'live-default' }, { id: 'manual-choice' }], defaultModel: 'live-default' })));
     await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe('live-default'));
+
     changeSelect(screen.getByLabelText('label'), 'manual-choice');
     act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
       sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: AGY_DEFAULT_MODEL_ID }, { id: 'manual-choice' }, { id: 'later-default' }], defaultModel: 'later-default' })));
@@ -2131,6 +2140,7 @@ describe('SessionSettingsDialog supervision', () => {
     await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
       agentType: AGY_SDK_PROVIDER_ID, requestedModel: 'manual-choice', activeModel: null,
     }));
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('manual-choice');
   });
 
   it.each([

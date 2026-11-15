@@ -11,7 +11,7 @@ import { AgyAcpProvider } from '../../src/agent/providers/agy-acp.js';
 import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import * as store from '../../src/store/session-store.js';
-import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession, relaunchSessionWithSettings } from '../../src/agent/session-manager.js';
+import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession, relaunchSessionWithSettings, restoreFromStore, restoreTransportSessions, startProject } from '../../src/agent/session-manager.js';
 import { rebuildSubSessions } from '../../src/daemon/subsession-manager.js';
 import { AGY_NATIVE_START_NOT_ATTEMPTED, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { writeAgyNativeChildFixture } from '../helpers/agy-native-child.js';
@@ -472,5 +472,179 @@ describe('AG provider-switch failure recovery', () => {
     await send(name, 'second turn clean');
     const secondPrompt = JSON.stringify(rows().filter((row) => row.method === 'session/prompt').at(-1));
     expect(secondPrompt).not.toContain('HANDOFF_GOAL_ALPHA');
+  });
+
+  it('heals carbon-polluted legacy default AGY sessions while preserving explicit user-chosen AGY models across daemon restart, subsession rebuild, and fresh reset (Start over)', async () => {
+    await acp('upstream-carbon-default');
+    const defaultName = names[0];
+    const customName = names[1];
+
+    // 1. Fresh AGY launch without requestedModel keeps requestedModel undefined and confirms gemini-4-hydrogen-high on turn 1.
+    await launchTransportSession({
+      name: defaultName,
+      projectName: 'realproj',
+      role: 'brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home,
+      identityPrompt: 'fixture',
+      fresh: true,
+    });
+    expect(store.getSession(defaultName)?.requestedModel).toBeUndefined();
+    await send(defaultName, 'initial default turn');
+    const defaultNativeId = store.getSession(defaultName)!.providerResumeId!;
+    expect(defaultNativeId).toBeTruthy();
+    expect(store.getSession(defaultName)).toMatchObject({
+      requestedModel: undefined,
+      activeModel: 'gemini-4-hydrogen-high',
+      modelDisplay: 'gemini-4-hydrogen-high',
+    });
+
+    // 2. Custom AGY launch with user-selected gemini-4-argon-high.
+    await launchTransportSession({
+      name: customName,
+      projectName: 'realproj',
+      role: 'w1',
+      agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home,
+      identityPrompt: 'fixture',
+      requestedModel: 'gemini-4-argon-high',
+      fresh: true,
+    });
+    await send(customName, 'initial custom turn');
+    const customNativeId = store.getSession(customName)!.providerResumeId!;
+    expect(customNativeId).toBeTruthy();
+
+    // Simulate daemon stop + historical carbon-medium pollution in sessions.json:
+    // - defaultName has requestedModel=undefined and activeModel polluted to gemini-4-carbon-medium
+    // - customName kept requestedModel='gemini-4-argon-high' even though activeModel was polluted
+    await stopTransportRuntimeSession(defaultName);
+    await stopTransportRuntimeSession(customName);
+    store.upsertSession({
+      ...store.getSession(defaultName)!,
+      requestedModel: undefined,
+      activeModel: 'gemini-4-carbon-medium',
+      modelDisplay: 'gemini-4-carbon-medium',
+    });
+    store.upsertSession({
+      ...store.getSession(customName)!,
+      requestedModel: 'gemini-4-argon-high',
+      activeModel: 'gemini-4-carbon-medium',
+      modelDisplay: 'gemini-4-carbon-medium',
+    });
+    await store.flushStore({ requireWrite: true });
+    await store.loadStore({ probe: false });
+
+    // Even before any message is sent, restoreFromStore / rebuildSubSessions heals polluted records
+    // without fabricating requestedModel on defaultName.
+    await restoreFromStore();
+    await rebuildSubSessions([{
+      id: customName.slice('deck_sub_'.length),
+      type: AGY_SDK_PROVIDER_ID,
+      providerId: AGY_SDK_PROVIDER_ID,
+      cwd: home,
+      providerSessionId: store.getSession(customName)!.providerSessionId,
+      providerResumeId: customNativeId,
+      requestedModel: 'gemini-4-argon-high',
+      activeModel: 'gemini-4-carbon-medium',
+    }]);
+    expect(store.getSession(defaultName)?.requestedModel).toBeUndefined();
+    expect(store.getSession(defaultName)).toMatchObject({
+      activeModel: 'gemini-4-hydrogen-high',
+      modelDisplay: 'gemini-4-hydrogen-high',
+    });
+    expect(store.getSession(customName)).toMatchObject({
+      requestedModel: 'gemini-4-argon-high',
+      activeModel: 'gemini-4-argon-high',
+      modelDisplay: 'gemini-4-argon-high',
+    });
+
+    // Full runtime restore across daemon restart replays gemini-4-hydrogen-high (for default)
+    // and gemini-4-argon-high (for user-chosen) onto new ACP processes.
+    await restoreTransportSessions(AGY_SDK_PROVIDER_ID, { interSessionDelayMs: 0 });
+    await send(defaultName, 'after restart default');
+    await send(customName, 'after restart custom');
+
+    expect(store.getSession(defaultName)?.requestedModel).toBeUndefined();
+    expect(store.getSession(defaultName)).toMatchObject({
+      providerResumeId: defaultNativeId,
+      activeModel: 'gemini-4-hydrogen-high',
+      modelDisplay: 'gemini-4-hydrogen-high',
+    });
+    expect(store.getSession(customName)).toMatchObject({
+      providerResumeId: customNativeId,
+      requestedModel: 'gemini-4-argon-high',
+      activeModel: 'gemini-4-argon-high',
+      modelDisplay: 'gemini-4-argon-high',
+    });
+
+    // 3. "Start over / 重启新建" (opts.fresh === true on main session via startProject + reset:true on sub-session)
+    // MUST preserve the user's chosen model instead of resetting to default or carbon-medium!
+    const mainBrainName = 'deck_freshproj_brain';
+    await startProject({
+      name: 'freshproj',
+      dir: home,
+      brainType: AGY_SDK_PROVIDER_ID,
+      workerTypes: [],
+      fresh: true,
+      identityPrompt: 'fixture',
+    });
+    await expect(switchSessionModelNow(mainBrainName, 'gemini-4-argon-high')).resolves.toMatchObject({ ok: true });
+    await send(mainBrainName, 'main before start over');
+    const mainOldNativeId = store.getSession(mainBrainName)!.providerResumeId!;
+    expect(mainOldNativeId).toBeTruthy();
+
+    // Main session Web UI "Start over" calls startProject({ ..., fresh: true }) without requestedModel:
+    await startProject({
+      name: 'freshproj',
+      dir: home,
+      brainType: AGY_SDK_PROVIDER_ID,
+      workerTypes: [],
+      fresh: true,
+      identityPrompt: 'fixture',
+    });
+    expect(store.getSession(mainBrainName)?.requestedModel).toBe('gemini-4-argon-high');
+    expect(store.getSession(mainBrainName)?.providerResumeId).toBeUndefined();
+    await send(mainBrainName, 'main after start over');
+    const mainNewNativeId = store.getSession(mainBrainName)!.providerResumeId!;
+    expect(mainNewNativeId).toBeTruthy();
+    expect(mainNewNativeId).not.toBe(mainOldNativeId);
+    expect(store.getSession(mainBrainName)).toMatchObject({
+      requestedModel: 'gemini-4-argon-high',
+      activeModel: 'gemini-4-argon-high',
+      modelDisplay: 'gemini-4-argon-high',
+    });
+
+    // Sub-session restartSessionNow(..., { reset: true }) also preserves requestedModel='gemini-4-argon-high':
+    await restartSessionNow(customName, { reset: true });
+    expect(store.getSession(customName)?.requestedModel).toBe('gemini-4-argon-high');
+    expect(store.getSession(customName)?.providerResumeId).toBeUndefined();
+    await send(customName, 'sub after reset');
+    const customResetNativeId = store.getSession(customName)!.providerResumeId!;
+    expect(customResetNativeId).toBeTruthy();
+    expect(customResetNativeId).not.toBe(customNativeId);
+    expect(store.getSession(customName)).toMatchObject({
+      requestedModel: 'gemini-4-argon-high',
+      activeModel: 'gemini-4-argon-high',
+      modelDisplay: 'gemini-4-argon-high',
+    });
+
+    const setModels = rows()
+      .filter((row) => row.method === 'session/set_model')
+      .map((row) => ({ sessionId: row.params.sessionId, modelId: row.params.modelId }));
+    expect(setModels.some((call) => call.modelId === 'gemini-4-carbon-medium')).toBe(false);
+    expect(setModels.filter((call) => call.sessionId === defaultNativeId).map((c) => c.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+    expect(setModels.filter((call) => call.sessionId === customNativeId).map((c) => c.modelId)).toEqual([
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(setModels.filter((call) => call.sessionId === mainNewNativeId).map((c) => c.modelId)).toEqual([
+      'gemini-4-argon-high',
+    ]);
+    expect(setModels.filter((call) => call.sessionId === customResetNativeId).map((c) => c.modelId)).toEqual([
+      'gemini-4-argon-high',
+    ]);
   });
 });

@@ -292,4 +292,36 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(next.result.current.defaultModel).toBe('gemini-3.8-flash-high');
   });
 
+  it('forces defaultModel to gemini-4-hydrogen-high when upstream advertises gemini-4-carbon-medium alongside hydrogen-high', () => {
+    const upstreamModels = [
+      { id: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+      { id: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
+      { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+    ];
+    window.sessionStorage.setItem('imcodes:transport-models:carbon-session\0agy-sdk\0', JSON.stringify({
+      models: upstreamModels,
+      defaultModel: 'gemini-4-carbon-medium',
+    }));
+    let listener: ((msg: unknown) => void) | undefined;
+    const ws = {
+      connected: true,
+      onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; },
+      requestTransportModels: () => 'carbon-req',
+    } as unknown as WsClient;
+    const { result } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID, null, 'carbon-session'));
+    expect(result.current.defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(result.current.models).toEqual(upstreamModels);
+
+    act(() => listener?.({
+      type: TRANSPORT_MSG.MODELS_RESPONSE,
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: 'carbon-req',
+      models: upstreamModels,
+      defaultModel: 'gemini-4-carbon-medium',
+      isAuthenticated: true,
+    }));
+    expect(result.current.defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(result.current.models).toEqual(upstreamModels);
+  });
+
 });
