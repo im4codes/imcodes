@@ -2345,6 +2345,14 @@
         "modifiers_aria": "子会话数字快捷键修饰键组合",
         "min_one_hint": "至少保留一个修饰键。",
         "reset_aria": "重置子会话快捷键修饰键"
+      },
+      "mac_voice": {
+        "title": "Mac 应用内置语音输入",
+        "desc": "在 Mac 桌面应用中，快速双击所选修饰键可直接在当前输入框中开始/停止语音听写；识别期间再次双击将立即结束并发送。",
+        "trigger_label": "双击快捷键",
+        "modifiers_aria": "Mac 内置语音输入双击修饰键",
+        "disabled": "已禁用",
+        "reset_aria": "重置 Mac 内置语音双击修饰键"
       }
     }
   },

@@ -53,11 +53,49 @@ export type ResolvedShortcutSlotConflicts = Partial<
 export type ShortcutModifierKey = 'ctrl' | 'alt' | 'shift' | 'meta';
 export const SHORTCUT_MODIFIER_KEYS: readonly ShortcutModifierKey[] = ['ctrl', 'alt', 'shift', 'meta'];
 export const DEFAULT_SUBSESSION_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl'];
+export type MacVoiceInlineModifier = ShortcutModifierKey | null;
+export const DEFAULT_MAC_VOICE_INLINE_MODIFIER: ShortcutModifierKey = 'ctrl';
 
 export type KeyboardShortcutOverrides = Partial<Record<ShortcutActionId, string | null>> & {
   secondary?: Partial<Record<ShortcutActionId, string | null>>;
   subSessionQuickModifiers?: ShortcutModifierKey[];
+  macVoiceInlineModifier?: MacVoiceInlineModifier;
 };
+
+export function sanitizeMacVoiceInlineModifier(raw: unknown): MacVoiceInlineModifier | undefined {
+  if (raw === null) return null;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  if (trimmed === 'off' || trimmed === 'disabled' || trimmed === 'none') return null;
+  const normalized = normalizeModifierToken(trimmed);
+  if (!normalized || !SHORTCUT_MODIFIER_KEYS.includes(normalized)) return undefined;
+  return normalized;
+}
+
+export function resolveMacVoiceInlineModifier(
+  overrides?: KeyboardShortcutOverrides | null,
+): MacVoiceInlineModifier {
+  const clean = sanitizeShortcutOverrides(overrides);
+  if ('macVoiceInlineModifier' in clean) {
+    return clean.macVoiceInlineModifier ?? null;
+  }
+  return DEFAULT_MAC_VOICE_INLINE_MODIFIER;
+}
+
+export function applyMacVoiceInlineModifier(
+  overrides: KeyboardShortcutOverrides,
+  modifier: MacVoiceInlineModifier,
+): KeyboardShortcutOverrides {
+  const clean = sanitizeShortcutOverrides(overrides);
+  const next: KeyboardShortcutOverrides = { ...clean };
+  if (modifier === DEFAULT_MAC_VOICE_INLINE_MODIFIER) {
+    delete next.macVoiceInlineModifier;
+  } else {
+    next.macVoiceInlineModifier = modifier;
+  }
+  return next;
+}
 export type ResolvedKeyboardShortcuts = Record<ShortcutActionId, string | null>;
 
 export interface ParsedShortcutChord {
@@ -392,6 +430,12 @@ export function sanitizeShortcutOverrides(raw: unknown): KeyboardShortcutOverrid
     const cleanModifiers = sanitizeSubSessionQuickModifiers(input.subSessionQuickModifiers);
     if (cleanModifiers) {
       out.subSessionQuickModifiers = cleanModifiers;
+    }
+  }
+  if ('macVoiceInlineModifier' in input) {
+    const cleanVoiceMod = sanitizeMacVoiceInlineModifier(input.macVoiceInlineModifier);
+    if (cleanVoiceMod !== undefined) {
+      out.macVoiceInlineModifier = cleanVoiceMod;
     }
   }
   return out;

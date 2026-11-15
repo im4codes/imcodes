@@ -93,6 +93,9 @@ import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
 import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
+import { isNativeMacDesktop } from '../native-platform.js';
+import { subscribeDeviceLayoutChange } from '../mobile-device.js';
+import { registerMacVoiceComposerHandler } from '../mac-voice-shortcut.js';
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
@@ -779,6 +782,7 @@ export function readComposerElementText(
     }
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const element = node as HTMLElement;
+    if (element.dataset?.inlineVoiceRobot === 'true') return;
     const tag = element.tagName;
     const isBlock = isComposerBlockTag(tag);
     if (tag === 'BR') {
@@ -822,6 +826,221 @@ export function readComposerElementText(
 
 function setComposerElementText(root: HTMLElement, text: string): void {
   root.textContent = text.replace(/\r\n?/g, '\n');
+}
+
+function measureComposerOffsetAtPoint(root: HTMLElement, targetNode: Node, targetOffset: number): number {
+  let length = 0;
+  let pendingBlockBreak = false;
+  let hasContentBeforeBlock = false;
+  let stopped = false;
+
+  const walk = (node: Node): void => {
+    if (stopped) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const full = node.textContent ?? '';
+      const slice = node === targetNode ? full.slice(0, targetOffset) : full;
+      if (pendingBlockBreak && slice.length > 0) {
+        length += 1;
+        pendingBlockBreak = false;
+        hasContentBeforeBlock = false;
+      }
+      if (slice.length > 0) hasContentBeforeBlock = true;
+      length += slice.length;
+      if (node === targetNode) {
+        stopped = true;
+      }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const element = node as HTMLElement;
+    if (element.dataset?.inlineVoiceRobot === 'true') return;
+    const tag = element.tagName;
+    const isBlock = isComposerBlockTag(tag);
+    if (tag === 'BR') {
+      if (pendingBlockBreak) {
+        length += 1;
+        pendingBlockBreak = false;
+      }
+      if (hasFollowingVisibleContentInBlock(element, root)) {
+        length += 1;
+        hasContentBeforeBlock = false;
+      } else {
+        hasContentBeforeBlock = true;
+      }
+      if (node === targetNode) stopped = true;
+      return;
+    }
+    if (isBlock && (pendingBlockBreak || hasContentBeforeBlock)) {
+      length += 1;
+      pendingBlockBreak = false;
+      hasContentBeforeBlock = false;
+    }
+    const maxChildren = node === targetNode ? Math.min(targetOffset, element.childNodes.length) : element.childNodes.length;
+    for (let i = 0; i < maxChildren; i++) {
+      walk(element.childNodes[i]);
+      if (stopped) return;
+    }
+    if (node === targetNode) {
+      stopped = true;
+      return;
+    }
+    if (isBlock) {
+      pendingBlockBreak = true;
+      hasContentBeforeBlock = false;
+    }
+  };
+
+  if (root === targetNode) {
+    const maxChildren = Math.min(targetOffset, root.childNodes.length);
+    for (let i = 0; i < maxChildren; i++) {
+      walk(root.childNodes[i]);
+      if (stopped) break;
+    }
+    return length;
+  }
+
+  for (let i = 0; i < root.childNodes.length; i++) {
+    walk(root.childNodes[i]);
+    if (stopped) break;
+  }
+  return length;
+}
+
+function getComposerSelectionOffsets(root: HTMLElement): { start: number; end: number } | null {
+  if (typeof window === 'undefined' || typeof window.getSelection !== 'function') return null;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  try {
+    const range = sel.getRangeAt(0);
+    if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) {
+      return null;
+    }
+    const start = measureComposerOffsetAtPoint(root, range.startContainer, range.startOffset);
+    const end = range.collapsed
+      ? start
+      : measureComposerOffsetAtPoint(root, range.endContainer, range.endOffset);
+    return start <= end ? { start, end } : { start: end, end: start };
+  } catch {
+    return null;
+  }
+}
+
+function setComposerCaretOffset(root: HTMLElement, offset: number): void {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  try {
+    const sel = window.getSelection();
+    if (!sel || typeof document.createRange !== 'function') return;
+    let remaining = Math.max(0, offset);
+    const range = document.createRange();
+    let placed = false;
+
+    const walk = (node: Node): void => {
+      if (placed) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        const len = node.textContent?.length ?? 0;
+        if (remaining <= len) {
+          range.setStart(node, remaining);
+          range.collapse(true);
+          placed = true;
+          return;
+        }
+        remaining -= len;
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const element = node as HTMLElement;
+      if (element.dataset?.inlineVoiceRobot === 'true') return;
+      if (element.tagName === 'BR') {
+        if (remaining <= 0) {
+          range.setStartBefore(element);
+          range.collapse(true);
+          placed = true;
+          return;
+        }
+        remaining = Math.max(0, remaining - 1);
+        return;
+      }
+      for (let i = 0; i < element.childNodes.length; i++) {
+        walk(element.childNodes[i]);
+        if (placed) return;
+      }
+    };
+
+    for (let i = 0; i < root.childNodes.length; i++) {
+      walk(root.childNodes[i]);
+      if (placed) break;
+    }
+    if (!placed) {
+      range.selectNodeContents(root);
+      range.collapse(false);
+    }
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {
+    /* ignore selection errors in environments lacking full Range support */
+  }
+}
+
+function createInlineVoiceRobotHost(): HTMLSpanElement {
+  const host = document.createElement('span');
+  host.className = 'controls-inline-voice-robot-host';
+  host.setAttribute('contenteditable', 'false');
+  host.dataset.inlineVoiceRobot = 'true';
+  host.setAttribute('aria-hidden', 'true');
+  return host;
+}
+
+function detachInlineVoiceRobotHost(host: HTMLSpanElement | null): void {
+  if (!host) return;
+  const parent = host.parentNode;
+  if (!parent) return;
+  host.remove();
+  if (typeof (parent as Element).normalize === 'function') {
+    (parent as Element).normalize();
+  }
+}
+
+function writeInlineVoiceSegmentDom(
+  root: HTMLElement,
+  before: string,
+  after: string,
+  robotHost: HTMLSpanElement | null,
+  restoreCaret: boolean,
+): void {
+  while (root.firstChild) {
+    root.removeChild(root.firstChild);
+  }
+  const cleanBefore = before.replace(/\r\n?/g, '\n');
+  const cleanAfter = after.replace(/\r\n?/g, '\n');
+  let beforeNode: Text | null = null;
+  if (cleanBefore.length > 0) {
+    beforeNode = document.createTextNode(cleanBefore);
+    root.appendChild(beforeNode);
+  }
+  if (robotHost) {
+    root.appendChild(robotHost);
+  }
+  if (cleanAfter.length > 0) {
+    root.appendChild(document.createTextNode(cleanAfter));
+  }
+  if (restoreCaret && typeof window !== 'undefined' && typeof document !== 'undefined') {
+    try {
+      const sel = window.getSelection();
+      if (sel && typeof document.createRange === 'function') {
+        const range = document.createRange();
+        if (beforeNode) {
+          range.setStart(beforeNode, beforeNode.data.length);
+        } else {
+          range.setStart(root, 0);
+        }
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 const COMPOSER_LINE_RECT_TOLERANCE_PX = 3;
@@ -935,6 +1154,7 @@ function hasStructuralLineBreakRelativeToCaret(
 
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const element = node as HTMLElement;
+    if (element.dataset?.inlineVoiceRobot === 'true') return;
     const tag = element.tagName;
     if (tag === 'BR') {
       if (pendingBlockBreak) {
@@ -1637,9 +1857,38 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
+  const [macDesktop, setMacDesktop] = useState(() => isNativeMacDesktop());
+  const macDesktopRef = useRef(macDesktop);
+  macDesktopRef.current = macDesktop;
+  useEffect(() => subscribeDeviceLayoutChange(() => {
+    setMacDesktop(isNativeMacDesktop());
+  }, { includeResize: false }), []);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [voiceOverlayInitialText, setVoiceOverlayInitialText] = useState<string | null>(null);
   const [voiceOverlayAutoStart, setVoiceOverlayAutoStart] = useState(true);
+  const [inlineVoiceActive, setInlineVoiceActive] = useState(false);
+  const [inlineVoiceRecognizing, setInlineVoiceRecognizing] = useState(false);
+  const inlineVoiceActiveRef = useRef(false);
+  const inlineVoiceTokenRef = useRef(0);
+  const inlineVoiceRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inlineVoiceRobotHostRef = useRef<HTMLSpanElement | null>(null);
+  const programmaticVoiceWriteRef = useRef(false);
+  const inlineVoiceSegmentRef = useRef<{
+    prefix: string;
+    selectedText: string;
+    suffix: string;
+    partial: string;
+    hasCommittedPartial: boolean;
+    caretAfterSegment: number;
+  }>({
+    prefix: '',
+    selectedText: '',
+    suffix: '',
+    partial: '',
+    hasCommittedPartial: false,
+    caretAfterSegment: 0,
+  });
+  const interruptInlineVoiceRef = useRef<(() => void) | null>(null);
   const [voiceHoldPending, setVoiceHoldPending] = useState(false);
   const [voiceHoldActive, setVoiceHoldActive] = useState(false);
   const [voiceHoldHudActive, setVoiceHoldHudActive] = useState(false);
@@ -2316,6 +2565,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const handleCompositionStart = () => {
       imeComposingRef.current = true;
       markImeActivity();
+      if (inlineVoiceActiveRef.current && !programmaticVoiceWriteRef.current) {
+        interruptInlineVoiceRef.current?.();
+      }
     };
     const handleCompositionEnd = () => {
       imeComposingRef.current = false;
@@ -3684,7 +3936,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     const currentHasText = !!readComposerElementText(root).trim();
     const singleLineTrailingCount = serverId
-      ? (VoiceInput.isAvailable() && !currentHasText ? 2 : 1)
+      ? (VoiceInput.isAvailable() && (macDesktopRef.current || !currentHasText) ? 2 : 1)
       : 0;
     // Require real second-line clearance beyond single-line font/ascender/subpixel
     // variance (mobile 16px * 1.45 = 23.2px + 14px padding = 37.2px for 1 line vs
@@ -5476,7 +5728,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return finalizeSend(payload, options);
   }, [clearSendWarning, closeQuickSuggestions, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
+  const stopInlineVoice = useCallback((options?: {
+    abort?: boolean;
+    restoreCaret?: boolean;
+    skipStateUpdate?: boolean;
+  }) => {
+    const wasActive = inlineVoiceActiveRef.current;
+    inlineVoiceTokenRef.current += 1;
+    if (inlineVoiceRecognizingTimerRef.current !== null) {
+      clearTimeout(inlineVoiceRecognizingTimerRef.current);
+      inlineVoiceRecognizingTimerRef.current = null;
+    }
+    inlineVoiceActiveRef.current = false;
+    if (!options?.skipStateUpdate) {
+      setInlineVoiceActive(false);
+      setInlineVoiceRecognizing(false);
+    }
+    const caretTarget = inlineVoiceSegmentRef.current.caretAfterSegment;
+    detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
+    if (
+      options?.restoreCaret
+      && divRef.current
+      && typeof document !== 'undefined'
+      && document.activeElement === divRef.current
+    ) {
+      setComposerCaretOffset(divRef.current, caretTarget);
+    }
+    if (wasActive) {
+      void Promise.resolve(VoiceInput.stopListening({ abort: options?.abort ?? true })).catch(() => {});
+    }
+  }, []);
+
   const handleSend = useCallback(() => {
+    if (inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false });
+    }
     const outcome = requestSend(buildSendPayload(), { clearComposer: true });
     if (outcome === 'rejected' && !inputDisabledRef.current && divRef.current) {
       const el = divRef.current;
@@ -5648,6 +5934,225 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setVoiceOverlayAutoStart(true);
     setVoiceOpen(true);
   }, [hasVoiceNotepadDraft]);
+
+  const pulseInlineRecognizing = useCallback(() => {
+    setInlineVoiceRecognizing(true);
+    if (inlineVoiceRecognizingTimerRef.current !== null) {
+      clearTimeout(inlineVoiceRecognizingTimerRef.current);
+    }
+    inlineVoiceRecognizingTimerRef.current = setTimeout(() => {
+      inlineVoiceRecognizingTimerRef.current = null;
+      setInlineVoiceRecognizing(false);
+    }, 900);
+  }, []);
+
+  const interruptInlineVoiceForManualEdit = useCallback(() => {
+    if (!inlineVoiceActiveRef.current) return;
+    inlineVoiceTokenRef.current += 1;
+    if (inlineVoiceRecognizingTimerRef.current !== null) {
+      clearTimeout(inlineVoiceRecognizingTimerRef.current);
+      inlineVoiceRecognizingTimerRef.current = null;
+    }
+    inlineVoiceActiveRef.current = false;
+    setInlineVoiceActive(false);
+    setInlineVoiceRecognizing(false);
+    // Detach the robot badge without rewriting root text so browser-inserted edits stay intact.
+    detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
+    void Promise.resolve(VoiceInput.stopListening({ abort: true })).catch(() => {});
+  }, []);
+  interruptInlineVoiceRef.current = interruptInlineVoiceForManualEdit;
+
+  const startInlineVoice = useCallback((): boolean => {
+    if (inputDisabledRef.current || !VoiceInput.isAvailable()) return false;
+    const el = divRef.current;
+    if (!el || !el.isConnected) return false;
+    const existingSel = getComposerSelectionOffsets(el);
+    if (typeof document === 'undefined' || document.activeElement !== el) {
+      focusComposerForTyping(existingSel ? undefined : { moveCursorToEnd: true });
+      if (existingSel) {
+        setComposerCaretOffset(el, existingSel.end);
+      }
+    }
+    const fullText = readComposerElementText(el, { preserveEditingLines: true });
+    const start = existingSel ? Math.min(existingSel.start, fullText.length) : fullText.length;
+    const end = existingSel ? Math.min(existingSel.end, fullText.length) : fullText.length;
+    const prefix = fullText.slice(0, start);
+    const selectedText = fullText.slice(start, end);
+    const suffix = fullText.slice(end);
+    const robotHost = inlineVoiceRobotHostRef.current ?? createInlineVoiceRobotHost();
+    inlineVoiceRobotHostRef.current = robotHost;
+    inlineVoiceSegmentRef.current = {
+      prefix,
+      selectedText,
+      suffix,
+      partial: '',
+      hasCommittedPartial: false,
+      caretAfterSegment: start + selectedText.length,
+    };
+
+    programmaticVoiceWriteRef.current = true;
+    try {
+      writeInlineVoiceSegmentDom(el, prefix + selectedText, suffix, robotHost, true);
+    } finally {
+      programmaticVoiceWriteRef.current = false;
+    }
+
+    const token = ++inlineVoiceTokenRef.current;
+    inlineVoiceActiveRef.current = true;
+    setInlineVoiceActive(true);
+    setInlineVoiceRecognizing(false);
+    primeVoiceInputGesture({ deferAudioPause: false });
+
+    let started = false;
+    void Promise.resolve(VoiceInput.startListening(
+      (partial) => {
+        if (inlineVoiceTokenRef.current !== token || !inlineVoiceActiveRef.current) return;
+        const target = divRef.current;
+        if (!target) return;
+        const seg = inlineVoiceSegmentRef.current;
+        if (!partial && !seg.hasCommittedPartial) return;
+        seg.hasCommittedPartial = true;
+        seg.partial = partial;
+        const needSep = seg.prefix.length > 0
+          && !/[\s\n]$/.test(seg.prefix)
+          && partial.length > 0
+          && !/^[,.!?;:，。！？；：\s]/.test(partial);
+        const sep = needSep ? ' ' : '';
+        const before = `${seg.prefix}${sep}${partial}`;
+        seg.caretAfterSegment = before.length;
+
+        programmaticVoiceWriteRef.current = true;
+        try {
+          writeInlineVoiceSegmentDom(
+            target,
+            before,
+            seg.suffix,
+            inlineVoiceRobotHostRef.current,
+            typeof document !== 'undefined' && document.activeElement === target,
+          );
+        } finally {
+          programmaticVoiceWriteRef.current = false;
+        }
+
+        const currentPlain = readComposerElementText(target);
+        const currentEditing = readComposerElementText(target, { preserveEditingLines: true });
+        setHasText(!!currentPlain.trim());
+        publishComposerText(currentPlain);
+        syncHistoryEditOrDraft(
+          currentEditing,
+          getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+        );
+        syncMobileComposerMetrics();
+        pulseInlineRecognizing();
+      },
+      (listening) => {
+        if (inlineVoiceTokenRef.current !== token) return;
+        if (listening) {
+          started = true;
+          return;
+        }
+        if (started && inlineVoiceActiveRef.current) {
+          stopInlineVoice({
+            abort: false,
+            restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+          });
+        }
+      },
+      (err) => {
+        if (inlineVoiceTokenRef.current !== token) return;
+        stopInlineVoice({
+          abort: true,
+          restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+        });
+        if (err && err.trim()) {
+          showSendWarning(err);
+        }
+      },
+    )).then((ok) => {
+      if (inlineVoiceTokenRef.current !== token) return;
+      if (ok === false && inlineVoiceActiveRef.current) {
+        stopInlineVoice({
+          abort: true,
+          restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+        });
+      }
+    }).catch(() => {
+      if (inlineVoiceTokenRef.current !== token) return;
+      if (inlineVoiceActiveRef.current) {
+        stopInlineVoice({
+          abort: true,
+          restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+        });
+      }
+    });
+
+    return true;
+  }, [
+    activeSession?.name,
+    activeSessionIncognito,
+    focusComposerForTyping,
+    publishComposerText,
+    pulseInlineRecognizing,
+    quickData.data,
+    showSendWarning,
+    stopInlineVoice,
+    syncHistoryEditOrDraft,
+    syncMobileComposerMetrics,
+  ]);
+
+  const handleVoiceButtonActivate = useCallback(() => {
+    if (inputDisabledRef.current) return;
+    if (macDesktopRef.current || isNativeMacDesktop()) {
+      if (inlineVoiceActiveRef.current) {
+        stopInlineVoice({ abort: true, restoreCaret: true });
+      } else {
+        startInlineVoice();
+      }
+      return;
+    }
+    openStandardVoiceOverlay();
+  }, [openStandardVoiceOverlay, startInlineVoice, stopInlineVoice]);
+
+  const keyboardActiveRef = useRef(keyboardActive);
+  keyboardActiveRef.current = keyboardActive;
+  const pendingDelegateTargetRef = useRef(pendingDelegateTarget);
+  pendingDelegateTargetRef.current = pendingDelegateTarget;
+  const handleSendRef = useRef(handleSend);
+  handleSendRef.current = handleSend;
+
+  const handleMacVoiceShortcutTrigger = useCallback((): boolean => {
+    if (inputDisabledRef.current || !VoiceInput.isAvailable()) return false;
+    if (inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false });
+      const currentText = divRef.current ? readComposerElementText(divRef.current).trim() : '';
+      if (currentText.length > 0 || attachmentDraftRef.current.length > 0 || pendingDelegateTargetRef.current) {
+        handleSendRef.current();
+      }
+      return true;
+    }
+    return startInlineVoice();
+  }, [startInlineVoice, stopInlineVoice]);
+
+  useEffect(() => registerMacVoiceComposerHandler({
+    isActive: () => keyboardActiveRef.current !== false,
+    isInlineVoiceActive: () => inlineVoiceActiveRef.current,
+    isFocused: () => composerFocusedRef.current || (
+      typeof document !== 'undefined' && !!divRef.current && document.activeElement === divRef.current
+    ),
+    triggerToggleOrSubmit: handleMacVoiceShortcutTrigger,
+  }), [handleMacVoiceShortcutTrigger]);
+
+  useEffect(() => {
+    if (inputDisabled && inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false });
+    }
+  }, [inputDisabled, stopInlineVoice]);
+
+  useEffect(() => () => {
+    if (inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false, skipStateUpdate: !mountedRef.current });
+    }
+  }, [activeSession?.name, stopInlineVoice]);
 
   const clearVoiceHoldStartTimeout = useCallback((expectedTx?: NonNullable<typeof voiceHoldTxRef.current>) => {
     if (expectedTx && voiceHoldStartTimeoutOwnerRef.current !== expectedTx) {
@@ -7357,6 +7862,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
     const ce = e as ClipboardEvent;
+    if (inlineVoiceActiveRef.current && !programmaticVoiceWriteRef.current) {
+      interruptInlineVoiceForManualEdit();
+    }
     closeQuickSuggestions();
     const files = ce.clipboardData?.files;
     if (files && files.length > 0) {
@@ -7553,7 +8061,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, [syncMobileComposerMetrics]);
-  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
+  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && (macDesktop || !hasText);
   const showMobileStackedAttachmentButton = isMobileLayout
     && isTransport
     && !!serverId
@@ -7608,7 +8116,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !machinePickerOpen
     && !p2pOpen
     && !quickOpen;
-  const voiceHoldReady = isMobileLayout && hasSession && connected && !inputDisabled && VoiceInput.isAvailable();
+  const voiceHoldReady = isMobileLayout && !macDesktop && hasSession && connected && !inputDisabled && VoiceInput.isAvailable();
   voiceHoldReadyRef.current = voiceHoldReady;
   composerFocusedRef.current = composerFocused;
   mobileComposerExpandedRef.current = mobileComposerExpanded;
@@ -9721,6 +10229,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               }
             }}
             onInput={(event) => {
+              if (inlineVoiceActiveRef.current && !programmaticVoiceWriteRef.current) {
+                interruptInlineVoiceForManualEdit();
+              }
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               const editingText = divRef.current
                 ? readComposerElementText(divRef.current, { preserveEditingLines: true })
@@ -9892,7 +10403,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             <div class="controls-composer-trailing-actions">
               {showEmbeddedVoiceButton && (
                 <button
-                  class="btn btn-voice btn-voice-embedded"
+                  class={`btn btn-voice btn-voice-embedded${inlineVoiceActive ? ' btn-voice-inline-active' : ''}`}
                   // Open on pointerdown (fires synchronously at touch-start) so the
                   // tap is never lost to the ~300ms click delay or to a re-render
                   // unmounting this conditionally-rendered button mid-gesture, and
@@ -9908,7 +10419,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       suppressNextVoiceButtonClickTimerRef.current = null;
                       suppressNextVoiceButtonClickRef.current = false;
                     }, 400);
-                    openStandardVoiceOverlay();
+                    handleVoiceButtonActivate();
                   }}
                   onClick={() => {
                     if (suppressNextVoiceButtonClickRef.current) {
@@ -9919,9 +10430,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       }
                       return;
                     }
-                    openStandardVoiceOverlay();
+                    handleVoiceButtonActivate();
                   }}
                   disabled={inputDisabled}
+                  aria-pressed={macDesktop ? inlineVoiceActive : undefined}
+                  data-voice-trigger="embedded"
+                  data-inline-voice-active={inlineVoiceActive ? 'true' : undefined}
                   data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
                   title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
                   aria-label={t('voice.voice_input')}
@@ -9999,9 +10513,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         )}
         {!isMobileLayout && VoiceInput.isAvailable() && (
           <button
-            class="btn btn-voice"
-            onClick={() => openStandardVoiceOverlay()}
+            class={`btn btn-voice${inlineVoiceActive ? ' btn-voice-inline-active' : ''}`}
+            onPointerDown={(e) => e.preventDefault()}
+            onClick={() => handleVoiceButtonActivate()}
             disabled={inputDisabled}
+            aria-pressed={macDesktop ? inlineVoiceActive : undefined}
+            data-voice-trigger="desktop"
+            data-inline-voice-active={inlineVoiceActive ? 'true' : undefined}
             data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
             title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
           >
@@ -10291,6 +10809,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           </div>
         </div>
       </div>
+    )}
+    {inlineVoiceActive && inlineVoiceRobotHostRef.current && createPortal(
+      <VoiceStreamingRobot active={inlineVoiceActive || inlineVoiceRecognizing} />,
+      inlineVoiceRobotHostRef.current,
     )}
     <VoiceOverlay
       open={voiceOpen}

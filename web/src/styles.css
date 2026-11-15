@@ -3148,6 +3148,36 @@ html.native-ios-mac .chat-dl-btn {
 .btn-voice { background: rgba(15,23,42,0.52); border: 1px solid rgba(125,211,252,0.14); color: #7b8797; cursor: pointer; padding: 4px 7px; font-size: 18px; line-height: 1; border-radius: 7px; transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s; flex-shrink: 0; }
 .btn-voice:hover:not(:disabled) { color: #dbeafe; background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); box-shadow: 0 0 12px rgba(34,211,238,0.12); }
 .btn-voice-active { color: #ef4444; animation: voice-pulse 1s ease-in-out infinite; }
+.btn-voice.btn-voice-inline-active {
+  position: relative;
+  color: #38bdf8;
+  background: rgba(8,145,178,0.18);
+  border-color: rgba(34,211,238,0.45);
+  box-shadow: 0 0 14px rgba(34,211,238,0.24);
+}
+.btn-voice.btn-voice-inline-active::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 9px;
+  padding: 2px;
+  pointer-events: none;
+  background: conic-gradient(from var(--voice-ring-angle), transparent 12%, #22d3ee 28%, transparent 44%, #a78bfa 68%, #38bdf8 80%, transparent 96%);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  animation: voice-editor-orbit 2.4s linear infinite;
+}
+.controls-inline-voice-robot-host {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin-left: 3px;
+  pointer-events: none;
+  user-select: none;
+  line-height: 1;
+}
 @keyframes voice-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 /* ── Voice Overlay (fullscreen; shrinks to visualViewport.height when IME opens) ── */
@@ -3970,6 +4000,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 @media (prefers-reduced-motion: reduce) {
   .btn-voice-active,
+  .btn-voice.btn-voice-inline-active::before,
   .voice-overlay,
   .voice-overlay-grid,
   .voice-status-dot-active,

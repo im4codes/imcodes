@@ -113,10 +113,16 @@ import {
   readLegacyTabOrder,
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcutSlots,
+  resolveMacVoiceInlineModifier,
   resolveSubSessionQuickModifiers,
   sortSessionsByTabOrder,
   type KeyboardShortcutOverrides,
 } from './keyboard-shortcuts.js';
+import {
+  installMacVoiceShortcutListener,
+  setFallbackMacVoiceModifier,
+  triggerRegisteredMacVoiceComposer,
+} from './mac-voice-shortcut.js';
 import {
   attachMobileNavigationGestures,
   getMobileNavigationGestureKeycaps,
@@ -2663,6 +2669,10 @@ function InternalMainApp() {
   );
   const resolvedSubSessionQuickModifiers = useMemo(
     () => resolveSubSessionQuickModifiers(shortcutOverrides),
+    [shortcutOverrides],
+  );
+  const resolvedMacVoiceModifier = useMemo(
+    () => resolveMacVoiceInlineModifier(shortcutOverrides),
     [shortcutOverrides],
   );
   const [pinnedSubSessionArr, setPinnedSubSessionArr] = useSyncedPreference<string[]>('subsession_pinned', [], 0);
@@ -7614,6 +7624,9 @@ function InternalMainApp() {
   resolvedShortcutSlotsRef.current = resolvedShortcutSlots;
   const resolvedSubSessionQuickModifiersRef = useRef(resolvedSubSessionQuickModifiers);
   resolvedSubSessionQuickModifiersRef.current = resolvedSubSessionQuickModifiers;
+  const resolvedMacVoiceModifierRef = useRef(resolvedMacVoiceModifier);
+  resolvedMacVoiceModifierRef.current = resolvedMacVoiceModifier;
+  setFallbackMacVoiceModifier(resolvedMacVoiceModifier);
   const orderedVisibleSubSessionsRef = useRef(visibleSubSessions);
   const openSubSessionWindowRef = useRef(openSubSessionWindow);
   openSubSessionWindowRef.current = openSubSessionWindow;
@@ -7809,6 +7822,14 @@ function InternalMainApp() {
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
   }, [isMobile, navigateServerByStep, navigateTabByStep]);
+
+  useEffect(() => installMacVoiceShortcutListener({
+    getTargetModifier: () => resolvedMacVoiceModifierRef.current,
+    isBlocked: () => hasBlockingComposerOverlayRef.current,
+    onDoubleTap: () => {
+      triggerRegisteredMacVoiceComposer();
+    },
+  }), []);
 
   useEffect(() => {
     setMobileGestureProgress(null);

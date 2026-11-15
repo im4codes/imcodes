@@ -2345,6 +2345,14 @@
         "modifiers_aria": "Sub-session quick shortcut modifier keys",
         "min_one_hint": "Keep at least one modifier key selected.",
         "reset_aria": "Reset sub-session quick shortcut modifiers"
+      },
+      "mac_voice": {
+        "title": "Mac App Inline Voice Input",
+        "desc": "In the Mac desktop app, double-tap the selected modifier key to dictate directly inside the active message composer; double-tap again to stop and send.",
+        "trigger_label": "Double-tap shortcut",
+        "modifiers_aria": "Double-tap modifier key for Mac inline voice input",
+        "disabled": "Disabled",
+        "reset_aria": "Reset Mac inline voice double-tap modifier"
       }
     }
   },

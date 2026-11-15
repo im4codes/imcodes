@@ -2345,6 +2345,14 @@
         "modifiers_aria": "子會話數字快捷鍵修飾鍵組合",
         "min_one_hint": "至少保留一個修飾鍵。",
         "reset_aria": "重設子會話快捷鍵修飾鍵"
+      },
+      "mac_voice": {
+        "title": "Mac 應用程式內建語音輸入",
+        "desc": "在 Mac 桌面應用程式中，快速連按兩下所選修飾鍵可直接在目前輸入框開始／停止語音聽寫；辨識期間再次雙擊將立即結束並傳送。",
+        "trigger_label": "雙擊快捷鍵",
+        "modifiers_aria": "Mac 內建語音輸入雙擊修飾鍵",
+        "disabled": "已停用",
+        "reset_aria": "重設 Mac 內建語音雙擊修飾鍵"
       }
     }
   },

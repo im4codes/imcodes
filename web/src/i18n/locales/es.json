@@ -2345,6 +2345,14 @@
         "modifiers_aria": "Teclas modificadoras de atajos rápidos de subsesión",
         "min_one_hint": "Mantén seleccionada al menos una tecla modificadora.",
         "reset_aria": "Restablecer modificadores de atajos rápidos de subsesión"
+      },
+      "mac_voice": {
+        "title": "Entrada de voz integrada en Mac",
+        "desc": "En la app de escritorio para Mac, pulsa dos veces la tecla modificadora elegida para dictar directamente en el cuadro de mensaje activo; vuelve a pulsarla dos veces para detener y enviar.",
+        "trigger_label": "Atajo de doble pulsación",
+        "modifiers_aria": "Tecla modificadora de doble pulsación para voz integrada en Mac",
+        "disabled": "Desactivado",
+        "reset_aria": "Restablecer tecla modificadora de doble pulsación para voz en Mac"
       }
     }
   },

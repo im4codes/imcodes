@@ -89,7 +89,8 @@ export function isNativeMacDesktop(env: NativePlatformEnvironment = readNativePl
   }
 
   const hasDesktopPointer = env.matchMedia?.('(hover: hover) and (pointer: fine)').matches === true;
-  return hasDesktopPointer && !/iPhone|iPod/i.test(userAgent);
+  if (!hasDesktopPointer) return false;
+  return maxTouchPoints <= 1 || !/iPhone|iPod/i.test(userAgent);
 }
 
 export function shouldUseIosMacTextScale(env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {

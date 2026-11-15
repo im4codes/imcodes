@@ -73,6 +73,12 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.subsession_quick.modifiers_aria': 'Sub-session quick shortcut modifier keys',
         'settings.shortcuts.subsession_quick.min_one_hint': 'Keep at least one modifier key selected.',
         'settings.shortcuts.subsession_quick.reset_aria': 'Reset sub-session quick shortcut modifiers',
+        'settings.shortcuts.mac_voice.title': 'Mac App Inline Voice Input',
+        'settings.shortcuts.mac_voice.desc': 'Double-tap modifier key to dictate directly inside composer.',
+        'settings.shortcuts.mac_voice.trigger_label': 'Double-tap shortcut',
+        'settings.shortcuts.mac_voice.modifiers_aria': 'Double-tap modifier key for Mac inline voice input',
+        'settings.shortcuts.mac_voice.disabled': 'Disabled',
+        'settings.shortcuts.mac_voice.reset_aria': 'Reset Mac inline voice double-tap modifier',
       };
       let out = dict[key] ?? key;
       if (opts) {
@@ -438,5 +444,54 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     fireEvent.click(screen.getByTestId('shortcut-reset-subSessionCloseAll'));
     expect(closeAllBtn.textContent).toContain('Ctrl');
     expect(closeAllBtn.textContent).toContain('0');
+  });
+
+  it('configures Mac inline voice double-tap modifier (Ctrl/Option/Cmd/Shift/Disabled) and persists to keyboard_shortcuts_v1', () => {
+    render(<KeyboardShortcutsSection isMacOverride />);
+
+    const section = screen.getByTestId('mac-voice-inline-shortcut-section');
+    expect(section).not.toBeNull();
+    expect(screen.getByTestId('mac-voice-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('mac-voice-mod-alt').getAttribute('aria-pressed')).toBe('false');
+    expect(screen.queryByTestId('mac-voice-mod-reset')).toBeNull();
+
+    // Switch to Option (alt)
+    fireEvent.click(screen.getByTestId('mac-voice-mod-alt'));
+    expect(screen.getByTestId('mac-voice-mod-alt').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('mac-voice-inline-preview').textContent).toContain('⌥');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"macVoiceInlineModifier":"alt"'),
+      expect.anything(),
+    );
+
+    // Switch to Cmd (meta)
+    fireEvent.click(screen.getByTestId('mac-voice-mod-meta'));
+    expect(screen.getByTestId('mac-voice-mod-meta').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('mac-voice-inline-preview').textContent).toContain('⌘');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"macVoiceInlineModifier":"meta"'),
+      expect.anything(),
+    );
+
+    // Switch to Shift
+    fireEvent.click(screen.getByTestId('mac-voice-mod-shift'));
+    expect(screen.getByTestId('mac-voice-mod-shift').getAttribute('aria-pressed')).toBe('true');
+
+    // Disable double-tap shortcut (null)
+    fireEvent.click(screen.getByTestId('mac-voice-mod-off'));
+    expect(screen.getByTestId('mac-voice-mod-off').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('mac-voice-inline-preview').textContent).toContain('Disabled');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"macVoiceInlineModifier":null'),
+      expect.anything(),
+    );
+
+    // Reset back to default Ctrl
+    fireEvent.click(screen.getByTestId('mac-voice-mod-reset'));
+    expect(screen.getByTestId('mac-voice-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByTestId('mac-voice-mod-reset')).toBeNull();
   });
 });

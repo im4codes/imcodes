@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
+  DEFAULT_MAC_VOICE_INLINE_MODIFIER,
   KEYBOARD_SHORTCUTS_PREF_KEY,
   SHORTCUT_ACTION_IDS,
   SHORTCUT_MODIFIER_KEYS,
   SHORTCUT_SLOTS,
+  applyMacVoiceInlineModifier,
   applyShortcutSlotOverride,
   applySubSessionQuickModifiers,
   areSubSessionQuickModifiersEqual,
@@ -19,9 +21,11 @@ import {
   isMacPlatform,
   normalizeShortcutChordString,
   resolveKeyboardShortcutSlots,
+  resolveMacVoiceInlineModifier,
   resolveSubSessionQuickModifiers,
   sanitizeShortcutOverrides,
   type KeyboardShortcutOverrides,
+  type MacVoiceInlineModifier,
   type ShortcutActionId,
   type ShortcutModifierKey,
   type ShortcutSlot,
@@ -101,12 +105,32 @@ function KeyboardShortcutsSectionInner({
     [subSessionModifiers, isMac],
   );
 
+  const macVoiceModifier = useMemo(
+    () => resolveMacVoiceInlineModifier(cleanOverrides),
+    [cleanOverrides],
+  );
+  const isCustomMacVoiceModifier = macVoiceModifier !== DEFAULT_MAC_VOICE_INLINE_MODIFIER;
+  const macVoiceModifierCaps = useMemo(
+    () => (macVoiceModifier ? formatSubSessionQuickModifierKeycaps([macVoiceModifier], isMac) : []),
+    [macVoiceModifier, isMac],
+  );
+
   const hasAnyOverride = useMemo(
-    () => isCustomSubSessionModifiers || SHORTCUT_ACTION_IDS.some(
+    () => isCustomSubSessionModifiers || isCustomMacVoiceModifier || SHORTCUT_ACTION_IDS.some(
       (id) => resolvedSlots[id].primary !== primaryDefaults[id]
         || resolvedSlots[id].secondary !== secondaryDefaults[id],
     ),
-    [isCustomSubSessionModifiers, resolvedSlots, primaryDefaults, secondaryDefaults],
+    [isCustomSubSessionModifiers, isCustomMacVoiceModifier, resolvedSlots, primaryDefaults, secondaryDefaults],
+  );
+
+  const formatModifierName = (mod: ShortcutModifierKey) => (
+    mod === 'meta'
+      ? (isMac ? 'Cmd' : 'Win')
+      : mod === 'alt'
+        ? (isMac ? 'Option' : 'Alt')
+        : mod === 'shift'
+          ? 'Shift'
+          : 'Ctrl'
   );
 
   const handleToggleSubSessionModifier = (mod: ShortcutModifierKey) => {
@@ -127,6 +151,16 @@ function KeyboardShortcutsSectionInner({
   const handleResetSubSessionModifiers = () => {
     setStatusNotice(null);
     onChangeOverrides((prev) => applySubSessionQuickModifiers(prev, defaultSubSessionModifiers));
+  };
+
+  const handleSelectMacVoiceModifier = (mod: MacVoiceInlineModifier) => {
+    setStatusNotice(null);
+    onChangeOverrides((prev) => applyMacVoiceInlineModifier(prev, mod));
+  };
+
+  const handleResetMacVoiceModifier = () => {
+    setStatusNotice(null);
+    onChangeOverrides((prev) => applyMacVoiceInlineModifier(prev, DEFAULT_MAC_VOICE_INLINE_MODIFIER));
   };
 
   const formatTargetLabel = (target: ShortcutSlotTarget) => {
@@ -475,13 +509,7 @@ function KeyboardShortcutsSectionInner({
                 const active = subSessionModifiers.includes(mod);
                 const lockedLast = active && subSessionModifiers.length <= 1;
                 const keycap = formatSubSessionQuickModifierKeycaps([mod], isMac)[0];
-                const name = mod === 'meta'
-                  ? (isMac ? 'Cmd' : 'Win')
-                  : mod === 'alt'
-                    ? (isMac ? 'Option' : 'Alt')
-                    : mod === 'shift'
-                      ? 'Shift'
-                      : 'Ctrl';
+                const name = formatModifierName(mod);
                 return (
                   <button
                     key={mod}
@@ -506,6 +534,86 @@ function KeyboardShortcutsSectionInner({
                 class="settings-btn-secondary settings-shortcut-mini-btn"
                 aria-label={t('settings.shortcuts.subsession_quick.reset_aria')}
                 onClick={handleResetSubSessionModifiers}
+              >
+                {t('settings.shortcuts.reset')}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-shortcuts-subsession" data-testid="mac-voice-inline-shortcut-section">
+        <div class="settings-shortcut-row settings-shortcut-row-subsession">
+          <div class="settings-shortcut-info">
+            <div class="settings-shortcut-title">
+              {t('settings.shortcuts.mac_voice.title')}
+            </div>
+            <div class="settings-shortcut-desc">
+              {t('settings.shortcuts.mac_voice.desc')}
+            </div>
+            <div class="settings-shortcut-subsession-previews">
+              <div class="settings-shortcut-preview-item" data-testid="mac-voice-inline-preview">
+                <span class="settings-shortcut-preview-label">
+                  {t('settings.shortcuts.mac_voice.trigger_label')}
+                </span>
+                {macVoiceModifier ? (
+                  <span class="settings-shortcut-keycaps">
+                    {macVoiceModifierCaps.map((cap) => (
+                      <kbd key={`voice-1-${cap}`} class="settings-kbd">{cap}</kbd>
+                    ))}
+                    <span aria-hidden="true">+</span>
+                    {macVoiceModifierCaps.map((cap) => (
+                      <kbd key={`voice-2-${cap}`} class="settings-kbd">{cap}</kbd>
+                    ))}
+                  </span>
+                ) : (
+                  <span class="settings-shortcut-unassigned">{t('settings.shortcuts.mac_voice.disabled')}</span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-shortcut-subsession-controls">
+            <div
+              class="settings-shortcut-modifier-group"
+              role="group"
+              aria-label={t('settings.shortcuts.mac_voice.modifiers_aria')}
+            >
+              {SHORTCUT_MODIFIER_KEYS.map((mod) => {
+                const active = macVoiceModifier === mod;
+                const keycap = formatSubSessionQuickModifierKeycaps([mod], isMac)[0];
+                const name = formatModifierName(mod);
+                return (
+                  <button
+                    key={mod}
+                    type="button"
+                    data-testid={`mac-voice-mod-${mod}`}
+                    aria-pressed={active}
+                    class={`settings-shortcut-mod-btn${active ? ' is-active' : ''}`}
+                    onClick={() => handleSelectMacVoiceModifier(mod)}
+                  >
+                    <kbd class="settings-kbd">{keycap}</kbd>
+                    <span>{name}</span>
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                data-testid="mac-voice-mod-off"
+                aria-pressed={macVoiceModifier === null}
+                class={`settings-shortcut-mod-btn${macVoiceModifier === null ? ' is-active' : ''}`}
+                onClick={() => handleSelectMacVoiceModifier(null)}
+              >
+                <span>{t('settings.shortcuts.mac_voice.disabled')}</span>
+              </button>
+            </div>
+            {isCustomMacVoiceModifier && (
+              <button
+                type="button"
+                data-testid="mac-voice-mod-reset"
+                class="settings-btn-secondary settings-shortcut-mini-btn"
+                aria-label={t('settings.shortcuts.mac_voice.reset_aria')}
+                onClick={handleResetMacVoiceModifier}
               >
                 {t('settings.shortcuts.reset')}
               </button>

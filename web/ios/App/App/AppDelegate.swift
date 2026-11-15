@@ -346,6 +346,61 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         webView?.scrollView.keyboardDismissMode = .interactive
     }
 
+    private static func nativeModifierName(for keyCode: UIKeyboardHIDUsage) -> String? {
+        switch keyCode {
+        case .keyboardLeftControl, .keyboardRightControl:
+            return "ctrl"
+        case .keyboardLeftAlt, .keyboardRightAlt:
+            return "alt"
+        case .keyboardLeftShift, .keyboardRightShift:
+            return "shift"
+        case .keyboardLeftGUI, .keyboardRightGUI:
+            return "meta"
+        default:
+            return nil
+        }
+    }
+
+    private func forwardNativeModifierPresses(_ presses: Set<UIPress>, phase: String) {
+        guard Self.currentMacHostFlags().isMacDesktop else { return }
+        guard let webView = (window?.rootViewController as? CAPBridgeViewController)?.bridge?.webView else { return }
+        for press in presses {
+            guard let key = press.key else { continue }
+            var detail: [String: Any] = [
+                "source": "native",
+                "phase": phase
+            ]
+            if let modifier = Self.nativeModifierName(for: key.keyCode) {
+                detail["modifier"] = modifier
+            } else if phase == "down" {
+                detail["phase"] = "other"
+            } else {
+                continue
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: detail),
+                  let json = String(data: data, encoding: .utf8) else {
+                continue
+            }
+            let script = "window.dispatchEvent(new CustomEvent('imcodes:native-modifier-press', { detail: \(json) }));"
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        forwardNativeModifierPresses(presses, phase: "down")
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        forwardNativeModifierPresses(presses, phase: "up")
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        forwardNativeModifierPresses(presses, phase: "cancel")
+        super.pressesCancelled(presses, with: event)
+    }
+
     private static let nativeBundledBuildIdKey = "imcodes_native_bundled_build_id"
     private static let nativeBundledBuildTimeKey = "imcodes_native_bundled_build_time"
     private static let capgoServerBasePathKey = "serverBasePath"

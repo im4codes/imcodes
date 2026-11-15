@@ -3,6 +3,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_MAC_VOICE_INLINE_MODIFIER,
+  applyMacVoiceInlineModifier,
   applyShortcutSlotOverride,
   applySubSessionQuickModifiers,
   areSubSessionQuickModifiersEqual,
@@ -27,7 +29,9 @@ import {
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcuts,
   resolveKeyboardShortcutSlots,
+  resolveMacVoiceInlineModifier,
   resolveSubSessionQuickModifiers,
+  sanitizeMacVoiceInlineModifier,
   sanitizeShortcutOverrides,
   sanitizeSubSessionQuickModifiers,
   serializeShortcutChord,
@@ -778,5 +782,37 @@ describe('keyboard-shortcuts core helpers', () => {
       metaKey: false,
       isComposing: true,
     }, ['ctrl'])).toBeNull();
+  });
+
+  it('sanitizes, resolves, and applies Mac inline voice double-tap modifier overrides', () => {
+    expect(DEFAULT_MAC_VOICE_INLINE_MODIFIER).toBe('ctrl');
+    expect(resolveMacVoiceInlineModifier(undefined)).toBe('ctrl');
+    expect(resolveMacVoiceInlineModifier({})).toBe('ctrl');
+
+    expect(sanitizeMacVoiceInlineModifier('ctrl')).toBe('ctrl');
+    expect(sanitizeMacVoiceInlineModifier('Option')).toBe('alt');
+    expect(sanitizeMacVoiceInlineModifier('cmd')).toBe('meta');
+    expect(sanitizeMacVoiceInlineModifier('Shift')).toBe('shift');
+    expect(sanitizeMacVoiceInlineModifier(null)).toBeNull();
+    expect(sanitizeMacVoiceInlineModifier('off')).toBeNull();
+    expect(sanitizeMacVoiceInlineModifier('invalid-key')).toBeUndefined();
+
+    expect(sanitizeShortcutOverrides({ macVoiceInlineModifier: 'meta' })).toEqual({
+      macVoiceInlineModifier: 'meta',
+    });
+    expect(sanitizeShortcutOverrides({ macVoiceInlineModifier: null })).toEqual({
+      macVoiceInlineModifier: null,
+    });
+    expect(sanitizeShortcutOverrides({ macVoiceInlineModifier: 'bogus' })).toEqual({});
+
+    expect(resolveMacVoiceInlineModifier({ macVoiceInlineModifier: 'alt' })).toBe('alt');
+    expect(resolveMacVoiceInlineModifier({ macVoiceInlineModifier: null })).toBeNull();
+
+    const withShift = applyMacVoiceInlineModifier({}, 'shift');
+    expect(withShift).toEqual({ macVoiceInlineModifier: 'shift' });
+    const withDisabled = applyMacVoiceInlineModifier(withShift, null);
+    expect(withDisabled).toEqual({ macVoiceInlineModifier: null });
+    const resetDefault = applyMacVoiceInlineModifier(withDisabled, 'ctrl');
+    expect(resetDefault).toEqual({});
   });
 });

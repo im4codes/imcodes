@@ -128,6 +128,28 @@ describe('native platform text scaling', () => {
       matchMedia: (q) => ({ matches: q === '(hover: hover) and (pointer: fine)' }),
       innerWidth: 600,
     }))).toBe(true);
+
+    // Apple Silicon Mac running an iPhone-compat iOS build exposes zero touch points and a fine pointer.
+    expect(isNativeMacDesktop(env({
+      navigator: {
+        platform: 'iPhone',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        maxTouchPoints: 0,
+      },
+      matchMedia: (q) => ({ matches: q === '(hover: hover) and (pointer: fine)' }),
+      innerWidth: 420,
+    }))).toBe(true);
+
+    // Real iPhone/touch phone with maxTouchPoints > 1 must still be rejected even if matchMedia lies.
+    expect(isNativeMacDesktop(env({
+      navigator: {
+        platform: 'iPhone',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        maxTouchPoints: 5,
+      },
+      matchMedia: (q) => ({ matches: q === '(hover: hover) and (pointer: fine)' }),
+      innerWidth: 390,
+    }))).toBe(false);
   });
 
   it('keeps iOS AppDelegate Mac pageZoom + host signal above Foundation-only OTA helper slice', () => {
@@ -138,6 +160,9 @@ describe('native platform text scaling', () => {
     expect(appDelegate).toContain('webView.pageZoom = Self.macDesignedForIpadPageZoom');
     expect(appDelegate).toContain('window.__IMCODES_NATIVE_HOST__');
     expect(appDelegate).toContain("CustomEvent('imcodes:native-host')");
+    expect(appDelegate).toContain('pressesBegan');
+    expect(appDelegate).toContain('pressesEnded');
+    expect(appDelegate).toContain('imcodes:native-modifier-press');
     expect(appDelegate).toContain('"native-1x"');
     expect(appDelegate).toContain('"native-page-zoom"');
     expect(appDelegate).toContain('"none"');
