@@ -187,13 +187,14 @@ describe('global font scaling', () => {
     spy.mockRestore();
   });
 
-  it('transforms CSS px font-size declarations globally without breaking em/rem/inherit/comments/clamp', () => {
+  it('transforms CSS px and rem font-size declarations globally without breaking em/inherit/comments/clamp', () => {
     const input = `
-      /* font-size: 14px inside comment must stay */
+      /* font-size: 14px and 0.75rem inside comment must stay */
       .sidebar-header { font-size: 12px; }
       .tab { font-size: 13.5px !important; }
       .heading-em { font-size: 1.25em; }
       .label-rem { font-size: 0.78rem; }
+      .label-short-rem { font-size: .75rem; }
       .inherit-node { font-size: inherit; }
       .watermark { font-size: clamp(42px, 6.2vw, 76px); }
       .native-chat { font-size: var(--imcodes-chat-font-size, 16px); }
@@ -201,18 +202,45 @@ describe('global font scaling', () => {
     `;
     const output = transformCssFontSizes(input);
 
-    expect(output).toContain('/* font-size: 14px inside comment must stay */');
+    expect(output).toContain('/* font-size: 14px and 0.75rem inside comment must stay */');
     expect(output).toContain('.sidebar-header { font-size: max(8px, calc(12px + var(--imcodes-global-font-delta, 0px))); }');
     expect(output).toContain('.tab { font-size: max(8px, calc(13.5px + var(--imcodes-global-font-delta, 0px))) !important; }');
     expect(output).toContain('.heading-em { font-size: 1.25em; }');
-    expect(output).toContain('.label-rem { font-size: 0.78rem; }');
+    expect(output).toContain('.label-rem { font-size: max(8px, calc(0.78rem + var(--imcodes-global-font-delta, 0px))); }');
+    expect(output).toContain('.label-short-rem { font-size: max(8px, calc(.75rem + var(--imcodes-global-font-delta, 0px))); }');
     expect(output).toContain('.inherit-node { font-size: inherit; }');
     expect(output).toContain('.watermark { font-size: clamp(max(8px, calc(42px + var(--imcodes-global-font-delta, 0px))), calc(6.2vw + var(--imcodes-global-font-delta, 0px)), max(8px, calc(76px + var(--imcodes-global-font-delta, 0px)))); }');
     expect(output).toContain('.native-chat { font-size: var(--imcodes-chat-font-size, max(8px, calc(16px + var(--imcodes-global-font-delta, 0px)))); }');
     expect(output).toContain('.already { font-size: max(8px, calc(14px + var(--imcodes-global-font-delta, 0px))); }');
   });
 
-  it('scales inline numeric and px Preact styles via vnode hook without mutating shared style objects or em units', () => {
+  it('transforms all rem and px selectors in src/styles.css including cron labels and reflects +/-1 root delta', () => {
+    const rawStyles = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
+    const transformed = transformCssFontSizes(rawStyles);
+
+    expect(transformed).toMatch(/\.chat-cron-run-chip\s*\{[^}]*font-size:\s*max\(8px,\s*calc\(0\.75rem \+ var\(--imcodes-global-font-delta, 0px\)\)\)/);
+    expect(transformed).toMatch(/\.chat-cron-run-detail-row\s*\{[^}]*font-size:\s*[^;]*max\(8px,\s*calc\(0\.78rem \+ var\(--imcodes-global-font-delta, 0px\)\)\)/);
+    expect(transformed).toMatch(/\.chat-cron-run-contract\s*\{[^}]*font-size:\s*max\(8px,\s*calc\(0\.75rem \+ var\(--imcodes-global-font-delta, 0px\)\)\)/);
+    expect(transformed).toMatch(/\.chat-cron-run-task-label\s*\{[^}]*font-size:\s*max\(8px,\s*calc\(0\.78rem \+ var\(--imcodes-global-font-delta, 0px\)\)\)/);
+
+    // Every non-em, non-inherit font-size in styles.css must carry either --imcodes-global-font-delta or --imcodes-chat-font-size
+    const unscaledAbsoluteDeclarations: string[] = [];
+    for (const match of transformed.matchAll(/font-size\s*:\s*([^;{}]+)/gi)) {
+      const value = match[1].trim();
+      if (/(?:\d|\.)em\b|inherit/i.test(value)) continue;
+      if (!value.includes(GLOBAL_FONT_DELTA_VAR) && !value.includes(CHAT_FONT_SIZE_VAR)) {
+        unscaledAbsoluteDeclarations.push(value);
+      }
+    }
+    expect(unscaledAbsoluteDeclarations).toEqual([]);
+
+    writeGlobalFontDelta(1);
+    expect(document.documentElement.style.getPropertyValue(GLOBAL_FONT_DELTA_VAR)).toBe('1px');
+    writeGlobalFontDelta(-1);
+    expect(document.documentElement.style.getPropertyValue(GLOBAL_FONT_DELTA_VAR)).toBe('-1px');
+  });
+
+  it('scales inline numeric, px, and rem Preact styles via vnode hook without mutating shared style objects or em units', () => {
     installGlobalFontVnodeHook();
 
     const sharedFrozenStyle = Object.freeze({ fontSize: 12, color: '#cbd5e1' });
@@ -220,9 +248,11 @@ describe('global font scaling', () => {
       <div>
         <span data-testid="num" style={sharedFrozenStyle}>A</span>
         <span data-testid="px" style={{ fontSize: '15px' }}>B</span>
+        <span data-testid="rem" style={{ fontSize: '0.78rem' }}>R</span>
         <span data-testid="em" style={{ fontSize: '0.75em' }}>C</span>
         <span data-testid="chat" style={{ fontSize: scaledCssFontPx(14) }}>D</span>
         <span data-testid="str" style="color:red;font-size:11px">E</span>
+        <span data-testid="str-rem" style="font-size:.75rem">G</span>
         <svg><text data-testid="svg-text" fontSize="10">F</text></svg>
       </div>,
     );
@@ -230,9 +260,11 @@ describe('global font scaling', () => {
     expect(sharedFrozenStyle.fontSize).toBe(12);
     expect(screen.getByTestId('num').getAttribute('style')).toContain('max(8px, calc(12px + var(--imcodes-global-font-delta, 0px)))');
     expect(screen.getByTestId('px').getAttribute('style')).toContain('max(8px, calc(15px + var(--imcodes-global-font-delta, 0px)))');
+    expect(screen.getByTestId('rem').getAttribute('style')).toContain('max(8px, calc(0.78rem + var(--imcodes-global-font-delta, 0px)))');
     expect(screen.getByTestId('em').getAttribute('style')).toContain('0.75em');
     expect(screen.getByTestId('chat').getAttribute('style')).toContain('max(8px, calc(14px + var(--imcodes-global-font-delta, 0px)))');
     expect(screen.getByTestId('str').getAttribute('style')).toContain('max(8px, calc(11px + var(--imcodes-global-font-delta, 0px)))');
+    expect(screen.getByTestId('str-rem').getAttribute('style')).toContain('max(8px, calc(.75rem + var(--imcodes-global-font-delta, 0px)))');
     expect(screen.getByTestId('svg-text').getAttribute('font-size')).toBe('10');
   });
 

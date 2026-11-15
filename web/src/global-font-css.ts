@@ -3,21 +3,25 @@ export const CHAT_FONT_SIZE_VAR = '--imcodes-chat-font-size';
 export const MIN_SCALED_FONT_PX = 8;
 
 const CSS_TOKEN_OR_FONT_SIZE_RE = /(\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(font-size\s*:\s*)([^;{}]+)/gi;
-const CSS_COMMENT_OR_PX_RE = /(\/\*[\s\S]*?\*\/)|(\d+(?:\.\d+)?)px\b/gi;
+const CSS_COMMENT_OR_LENGTH_RE = /(\/\*[\s\S]*?\*\/)|(?<![a-zA-Z0-9_.-])((?:\d+(?:\.\d+)?|\.\d+)(?:px|rem))\b/gi;
 const CLAMP_VW_MID_RE = /(,\s*)(\d+(?:\.\d+)?v[wh])(\s*,)/gi;
 
+export function scaledCssFontLength(amount: number, unit: 'px' | 'rem' = 'px'): string {
+  const safe = Number.isFinite(amount) ? amount : (unit === 'rem' ? 0.875 : 14);
+  return `max(${MIN_SCALED_FONT_PX}px, calc(${safe}${unit} + var(${GLOBAL_FONT_DELTA_VAR}, 0px)))`;
+}
+
 export function scaledCssFontPx(px: number): string {
-  const safe = Number.isFinite(px) ? px : 14;
-  return `max(${MIN_SCALED_FONT_PX}px, calc(${safe}px + var(${GLOBAL_FONT_DELTA_VAR}, 0px)))`;
+  return scaledCssFontLength(px, 'px');
 }
 
 export function scaleFontSizeCssValue(rawValue: string): string {
   if (rawValue.includes(GLOBAL_FONT_DELTA_VAR)) return rawValue;
 
-  let next = rawValue.replace(CSS_COMMENT_OR_PX_RE, (full, comment: string | undefined, pxNum: string | undefined) => {
+  let next = rawValue.replace(CSS_COMMENT_OR_LENGTH_RE, (full, comment: string | undefined, lengthToken: string | undefined) => {
     if (comment) return comment;
-    if (pxNum !== undefined) {
-      return `max(${MIN_SCALED_FONT_PX}px, calc(${pxNum}px + var(${GLOBAL_FONT_DELTA_VAR}, 0px)))`;
+    if (lengthToken !== undefined) {
+      return `max(${MIN_SCALED_FONT_PX}px, calc(${lengthToken} + var(${GLOBAL_FONT_DELTA_VAR}, 0px)))`;
     }
     return full;
   });
@@ -32,9 +36,9 @@ export function scaleFontSizeCssValue(rawValue: string): string {
 }
 
 /**
- * Rewrites static `px` lengths inside CSS `font-size` declarations so every UI
- * rule scales by `--imcodes-global-font-delta` (`1px` per `+1` step) without
- * altering `em`/`rem`/`inherit` or breaking viewport geometry (`100dvh`/`--vvh`).
+ * Rewrites static `px` and `rem` lengths inside CSS `font-size` declarations so
+ * every UI rule scales by `--imcodes-global-font-delta` (`1px` per `+1` step)
+ * without altering `em`/`inherit` semantics or viewport geometry (`100dvh`/`--vvh`).
  */
 export function transformCssFontSizes(css: string): string {
   if (!css.includes('font-size')) return css;

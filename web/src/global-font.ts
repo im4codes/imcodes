@@ -4,6 +4,7 @@ import {
   CHAT_FONT_SIZE_VAR,
   GLOBAL_FONT_DELTA_VAR,
   MIN_SCALED_FONT_PX,
+  scaledCssFontLength,
   scaledCssFontPx,
   transformCssFontSizes,
 } from './global-font-css.js';
@@ -12,6 +13,7 @@ export {
   CHAT_FONT_SIZE_VAR,
   GLOBAL_FONT_DELTA_VAR,
   MIN_SCALED_FONT_PX,
+  scaledCssFontLength,
   scaledCssFontPx,
   transformCssFontSizes,
 };
@@ -23,7 +25,7 @@ export const DEFAULT_GLOBAL_FONT_DELTA = 0;
 export const MIN_GLOBAL_FONT_DELTA = -6;
 export const MAX_GLOBAL_FONT_DELTA = 12;
 
-const PX_LITERAL_RE = /^\s*(\d+(?:\.\d+)?)px\s*$/i;
+const FONT_SIZE_LITERAL_RE = /^\s*(\d+(?:\.\d+)?|\.\d+)(px|rem)\s*$/i;
 
 export function clampGlobalFontDelta(delta: number): number {
   if (typeof delta !== 'number' || !Number.isFinite(delta)) {
@@ -119,10 +121,11 @@ function scaleInlineFontSizeValue(value: unknown): string | undefined {
     return scaledCssFontPx(value);
   }
   if (typeof value === 'string') {
-    const match = PX_LITERAL_RE.exec(value);
+    const match = FONT_SIZE_LITERAL_RE.exec(value);
     if (match) {
       const num = Number(match[1]);
-      if (Number.isFinite(num)) return scaledCssFontPx(num);
+      const unit = match[2].toLowerCase() as 'px' | 'rem';
+      if (Number.isFinite(num)) return scaledCssFontLength(num, unit);
     }
   }
   return undefined;
