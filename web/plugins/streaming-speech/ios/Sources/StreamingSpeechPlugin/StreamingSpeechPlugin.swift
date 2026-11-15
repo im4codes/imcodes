@@ -1154,7 +1154,11 @@ final class SpeechDecoder {
     }
 
     func rollbackPrefix(_ tokens: [Int32], rollbackCount: Int = SpeechWindow.unfixedTokenNum) -> [Int32] {
-        recognizer.model.safePrefixTokensForRollback(tokens, rollbackCount: rollbackCount)
+        recognizer.model.safePrefixTokensForRollback(
+            tokens,
+            rollbackCount: rollbackCount,
+            expectLanguageHeader: Qwen3ASRModel.resolveLanguage(language) == nil
+        )
     }
 }
 

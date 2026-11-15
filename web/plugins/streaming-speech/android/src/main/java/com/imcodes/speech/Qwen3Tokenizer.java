@@ -397,17 +397,28 @@ public final class Qwen3Tokenizer {
      * multi-byte UTF-8 sequences (U+FFFD) just like iOS Qwen3ASR.swift.
      */
     public int[] safePrefixTokensForRollback(int[] tokens, int rollbackCount) {
+        return safePrefixTokensForRollback(tokens, rollbackCount, false);
+    }
+
+    public int[] safePrefixTokensForRollback(int[] tokens, int rollbackCount, boolean expectLanguageHeader) {
         if (tokens == null || tokens.length == 0) return new int[0];
         int end = tokens.length;
         while (end > 0 && (tokens[end - 1] == eosTokenId || tokens[end - 1] == padTokenId)) {
             end--;
         }
-        int headerEnd = 0;
+        int headerEnd = -1;
         for (int i = end - 1; i >= 0; i--) {
             if (tokens[i] == asrTextTokenId) {
                 headerEnd = i + 1;
                 break;
             }
+        }
+        if (headerEnd < 0) {
+            if (expectLanguageHeader) {
+                // In auto-detect mode, never freeze a prefix before `language <Lang><asr_text>` completes.
+                return new int[0];
+            }
+            headerEnd = 0;
         }
         int trim = Math.max(0, rollbackCount);
         if (end - headerEnd <= trim) {
@@ -429,12 +440,16 @@ public final class Qwen3Tokenizer {
      * decodes UTF-8 speech tokens, and drops trailing incomplete replacement chars.
      */
     public String extractFinalText(int[] tokens) {
+        return extractFinalText(tokens, false);
+    }
+
+    public String extractFinalText(int[] tokens, boolean expectLanguageHeader) {
         if (tokens == null || tokens.length == 0) return "";
         int end = tokens.length;
         while (end > 0 && (tokens[end - 1] == eosTokenId || tokens[end - 1] == padTokenId)) {
             end--;
         }
-        int start = 0;
+        int start = -1;
         int prefixWindow = Math.min(16, end);
         for (int i = 0; i < prefixWindow; i++) {
             if (tokens[i] == asrTextTokenId) {
@@ -442,12 +457,19 @@ public final class Qwen3Tokenizer {
                     start = 1;
                 } else {
                     String prefixText = decode(tokens, 0, i + 1, false);
-                    if (prefixText.startsWith("language ") && prefixText.endsWith("<asr_text>")) {
+                    if (expectLanguageHeader || (prefixText.startsWith("language ") && prefixText.endsWith("<asr_text>"))) {
                         start = i + 1;
                     }
                 }
                 break;
             }
+        }
+        if (start < 0) {
+            if (expectLanguageHeader) {
+                // In auto-detect mode, tokens before `<asr_text>` are an incomplete header, not speech text.
+                return "";
+            }
+            start = 0;
         }
         String decoded = decode(tokens, start, end, true);
         if (decoded.indexOf('\uFFFD') >= 0) {

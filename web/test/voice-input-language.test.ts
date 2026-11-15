@@ -85,6 +85,61 @@ describe('multilingual plugin session ownership', () => {
     expect(bridges.streaming.start).toHaveBeenCalledWith(expect.objectContaining({ language: 'ja-JP' }));
   });
 
+  it('uses browser navigator locale instead of empty string or <html lang> in Web Speech auto mode while keeping native auto unconstrained', async () => {
+    const prevDocLang = document.documentElement.lang;
+    document.documentElement.lang = 'en';
+    localStorage.setItem('imcodes_lang', 'en');
+    try {
+      vi.stubGlobal('navigator', { languages: ['zh-Hans-CN', 'en-US'], language: 'zh-CN' });
+      expect(input.pickWebAutoLocale()).toBe('zh-CN');
+      vi.stubGlobal('navigator', { languages: ['zh-TW'], language: 'zh-TW' });
+      expect(input.pickWebAutoLocale()).toBe('zh-TW');
+      vi.stubGlobal('navigator', { languages: ['fr-FR'], language: 'fr-FR' });
+      expect(input.pickWebAutoLocale()).toBe('fr-FR');
+
+      // Native StreamingSpeech in auto mode still omits language for on-device auto-detect.
+      input.setVoiceLanguageMode('auto');
+      expect(input.pickRecognitionLocale()).toBeUndefined();
+      expect(await input.startListening(vi.fn())).toBe(true);
+      expect(bridges.streaming.start).toHaveBeenCalledTimes(1);
+      expect(bridges.streaming.start.mock.calls[0][0]).not.toHaveProperty('language');
+      await input.stopListening();
+
+      // Web Speech API in auto mode must resolve from navigator.languages/navigator.language,
+      // never passing '' (which inherits <html lang="en">).
+      const instances: Array<{ lang?: string; onstart?: () => void; onend?: () => void; start: ReturnType<typeof vi.fn>; abort: ReturnType<typeof vi.fn> }> = [];
+      class MockWebSpeech {
+        lang = '';
+        continuous = false;
+        interimResults = false;
+        maxAlternatives = 1;
+        onstart?: () => void;
+        onend?: () => void;
+        start = vi.fn(() => { queueMicrotask(() => this.onstart?.()); });
+        stop = vi.fn(() => { queueMicrotask(() => this.onend?.()); });
+        abort = vi.fn(() => { queueMicrotask(() => this.onend?.()); });
+        constructor() { instances.push(this); }
+      }
+      vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
+      vi.stubGlobal('SpeechRecognition', MockWebSpeech as any);
+      vi.stubGlobal('navigator', { languages: ['zh-CN', 'en-US'], language: 'zh-CN' });
+
+      expect(await input.startListening(vi.fn())).toBe(true);
+      expect(instances).toHaveLength(1);
+      expect(instances[0].lang).toBe('zh-CN');
+      await input.stopListening();
+
+      // In follow mode, Web Speech still follows imcodes_lang ('ja' -> 'ja-JP').
+      localStorage.setItem('imcodes_lang', 'ja');
+      input.setVoiceLanguageMode('follow');
+      expect(await input.startListening(vi.fn())).toBe(true);
+      expect(instances).toHaveLength(2);
+      expect(instances[1].lang).toBe('ja-JP');
+    } finally {
+      document.documentElement.lang = prevDocLang;
+    }
+  });
+
   it('strictly prioritizes custom offline StreamingSpeech and falls back to platform SpeechRecognition only when StreamingSpeech is unavailable or fails to start', async () => {
     localStorage.setItem('imcodes_lang', 'ja');
     // 1. When StreamingSpeech is available, platform recognizer is never touched

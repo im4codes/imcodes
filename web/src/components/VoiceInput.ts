@@ -70,9 +70,9 @@ export function pickLocale(preferredLang?: string): string {
   return 'en-US';
 }
 
-/** Web Speech API locale tags (BCP-47, region-specific). */
-export function pickWebLocale(preferredLang?: string): string {
-  const lang = resolvePreferredLanguageTag(preferredLang).toLowerCase();
+function mapWebLocaleTag(rawTag: string, preserveOtherRegion = false): string {
+  const trimmed = rawTag.trim();
+  const lang = trimmed.toLowerCase();
   if (lang.startsWith('zh')) {
     return lang.includes('tw') || lang.includes('hk') || lang.includes('hant') ? 'zh-TW' : 'zh-CN';
   }
@@ -80,7 +80,31 @@ export function pickWebLocale(preferredLang?: string): string {
   if (lang.startsWith('ko')) return 'ko-KR';
   if (lang.startsWith('es')) return 'es-ES';
   if (lang.startsWith('ru')) return 'ru-RU';
+  if (preserveOtherRegion && trimmed.includes('-')) return trimmed;
   return 'en-US';
+}
+
+function resolveSystemLanguageTag(): string {
+  if (typeof navigator !== 'undefined') {
+    const langs = Array.isArray(navigator.languages) ? navigator.languages : [];
+    for (const entry of langs) {
+      if (typeof entry === 'string' && entry.trim()) return entry.trim();
+    }
+    if (typeof navigator.language === 'string' && navigator.language.trim()) {
+      return navigator.language.trim();
+    }
+  }
+  return 'en-US';
+}
+
+/** Web Speech API auto-mode fallback locale from browser system language (ignores `<html lang>` and `imcodes_lang`). */
+export function pickWebAutoLocale(): string {
+  return mapWebLocaleTag(resolveSystemLanguageTag(), true);
+}
+
+/** Web Speech API locale tags (BCP-47, region-specific). */
+export function pickWebLocale(preferredLang?: string): string {
+  return mapWebLocaleTag(resolvePreferredLanguageTag(preferredLang), false);
 }
 
 function isNative(): boolean {
@@ -1103,7 +1127,7 @@ function startWebListening(
         void startWebLevelMeter(generation);
       }
     };
-    rec.lang = getVoiceLanguageMode() === 'auto' ? '' : pickWebLocale();
+    rec.lang = getVoiceLanguageMode() === 'auto' ? pickWebAutoLocale() : pickWebLocale();
     rec.continuous = true;
     rec.interimResults = true;
     rec.maxAlternatives = 1;

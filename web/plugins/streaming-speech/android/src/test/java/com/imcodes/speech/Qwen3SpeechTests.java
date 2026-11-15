@@ -496,7 +496,20 @@ public final class Qwen3SpeechTests {
         checkEquals("你好", tok.extractFinalText(generatedWithoutHeader), "extractFinalText decodes direct speech tokens");
         // When auto-detect leaves <asr_text> out of prompt, decoder emits header + text which extractFinalText strips
         int[] generatedWithHeader = new int[] { 300, 301, 151704, 305, 306, 307, 151645 };
-        checkEquals("你好", tok.extractFinalText(generatedWithHeader), "extractFinalText still strips auto-detected header");
+        checkEquals("你好", tok.extractFinalText(generatedWithHeader, true), "extractFinalText strips auto-detected header");
+        // Incomplete header without <asr_text> in auto-detect mode must never leak "language ..."
+        int[] incompleteHeader = new int[] { 300, 301 };
+        checkEquals("", tok.extractFinalText(incompleteHeader, true), "extractFinalText drops incomplete auto-detect header");
+        check(Arrays.equals(new int[0], tok.safePrefixTokensForRollback(incompleteHeader, 0, true)),
+            "safePrefixTokensForRollback returns empty before <asr_text> in auto-detect mode");
+        // With complete header + speech tokens, rollback preserves header + confirmed speech tokens
+        int[] partialWithHeader = new int[] { 300, 301, 151704, 305, 306, 307, 151645 };
+        int[] rollback = tok.safePrefixTokensForRollback(partialWithHeader, 1, true);
+        check(Arrays.equals(new int[] { 300, 301, 151704, 305 }, rollback),
+            "safePrefixTokensForRollback keeps auto-detect header and trims trailing multi-token char");
+        // Forced mode keeps text starting with "language ..." when expectLanguageHeader=false
+        checkEquals("language", tok.extractFinalText(new int[] { 300 }, false),
+            "forced mode does not suppress literal 'language' transcript without <asr_text>");
     }
 
     private static List<String> pretokenizeChunks(String input) {

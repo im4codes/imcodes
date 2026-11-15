@@ -306,6 +306,10 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         return tokenizer.safePrefixTokensForRollback(tokens, rollbackCount);
     }
 
+    public int[] safePrefixTokensForRollback(int[] tokens, int rollbackCount, boolean expectLanguageHeader) {
+        return tokenizer.safePrefixTokensForRollback(tokens, rollbackCount, expectLanguageHeader);
+    }
+
     /** Encodes the assistant prompt suffix tokens for the given language (or default unconstrained auto-detect suffix). */
     public static int[] encodePromptAfterIds(Qwen3Tokenizer tokenizer, String rawLanguage) {
         return tokenizer.encode(buildAssistantSuffix(rawLanguage));
@@ -407,6 +411,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         if (!shouldContinue.getAsBoolean()) return null;
 
         String canonicalLanguage = resolveLanguage(language);
+        boolean expectLanguageHeader = canonicalLanguage == null;
         int[] activePromptAfterIds = canonicalLanguage == null
             ? promptAfterIds
             : encodePromptAfterIds(tokenizer, canonicalLanguage);
@@ -435,7 +440,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         for (int id : activePromptAfterIds) sourceIds[p++] = id;
         for (int id : activePrefix) sourceIds[p++] = id;
 
-        return runDecoderLoop(trimmedAudioFeatures, validAudioLen, hiddenDim, sourceIds, activePrefix, shouldContinue);
+        return runDecoderLoop(trimmedAudioFeatures, validAudioLen, hiddenDim, sourceIds, activePrefix, expectLanguageHeader, shouldContinue);
     }
 
     private Qwen3SpeechWindow.DecodeResult runDecoderLoop(
@@ -444,6 +449,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         int hiddenDim,
         long[] sourceIds,
         int[] activePrefix,
+        boolean expectLanguageHeader,
         BooleanSupplier shouldContinue
     ) throws OrtException {
         OnnxTensor audioTensor = null;
@@ -503,7 +509,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
             }
 
             if (nextId < 0 || nextId == tokenizer.eosTokenId) {
-                return buildDecodeResult(activePrefix, new int[0], 0);
+                return buildDecodeResult(activePrefix, new int[0], 0, expectLanguageHeader);
             }
 
             int[] generated = new int[maxNewTokens];
@@ -558,7 +564,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
                 }
             }
 
-            return buildDecodeResult(activePrefix, generated, genCount);
+            return buildDecodeResult(activePrefix, generated, genCount, expectLanguageHeader);
         } finally {
             closeQuietly(audioTensor);
             for (OnnxTensor t : cacheKeyTensors) closeQuietly(t);
@@ -566,7 +572,12 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         }
     }
 
-    private Qwen3SpeechWindow.DecodeResult buildDecodeResult(int[] activePrefix, int[] generated, int genCount) {
+    private Qwen3SpeechWindow.DecodeResult buildDecodeResult(
+        int[] activePrefix,
+        int[] generated,
+        int genCount,
+        boolean expectLanguageHeader
+    ) {
         int cleanGen = genCount;
         while (cleanGen > 0 && (generated[cleanGen - 1] == tokenizer.eosTokenId || generated[cleanGen - 1] == tokenizer.padTokenId)) {
             cleanGen--;
@@ -579,7 +590,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         if (cleanGen > 0) {
             System.arraycopy(generated, 0, fullTokens, prefixLen, cleanGen);
         }
-        String text = tokenizer.extractFinalText(fullTokens);
+        String text = tokenizer.extractFinalText(fullTokens, expectLanguageHeader);
         return new Qwen3SpeechWindow.DecodeResult(text, fullTokens);
     }
 

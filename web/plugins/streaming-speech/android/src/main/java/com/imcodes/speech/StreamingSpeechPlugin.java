@@ -313,7 +313,9 @@ public class StreamingSpeechPlugin extends Plugin {
             activeDecoder = ensureDecoder();
             if (session.isDiscarded() || generation.get() != owner) return;
             final Qwen3OnnxDecoder dec = activeDecoder;
-            final Qwen3SpeechWindow.RollbackFn rollbackFn = dec::safePrefixTokensForRollback;
+            final boolean expectLanguageHeader = Qwen3OnnxDecoder.resolveLanguage(session.language) == null;
+            final Qwen3SpeechWindow.RollbackFn rollbackFn = (tokens, rollbackCount) ->
+                dec.safePrefixTokensForRollback(tokens, rollbackCount, expectLanguageHeader);
             final Qwen3SpeechWindow.DecodeFn decodeFn = (pcm, count, prefixTokens) -> {
                 try {
                     return decodeSamples(dec, pcm, count, prefixTokens, session, owner);
@@ -360,9 +362,10 @@ public class StreamingSpeechPlugin extends Plugin {
             if (!failed && !session.isDiscarded() && generation.get() == owner && activeDecoder != null) {
                 try {
                     final Qwen3OnnxDecoder dec = activeDecoder;
+                    final boolean expectLanguageHeader = Qwen3OnnxDecoder.resolveLanguage(session.language) == null;
                     String full = window.finish(
                         () -> !session.isDiscarded() && generation.get() == owner,
-                        dec::safePrefixTokensForRollback,
+                        (tokens, rollbackCount) -> dec.safePrefixTokensForRollback(tokens, rollbackCount, expectLanguageHeader),
                         (pcm, count, prefixTokens) -> {
                             try {
                                 return decodeSamples(dec, pcm, count, prefixTokens, session, owner);

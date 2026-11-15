@@ -1885,7 +1885,7 @@ describe('Web Mobile final drain', () => {
       expect('language' in autoArgs).toBe(false);
       await VoiceInput.stopListening({ abort: true });
 
-      // 4. Web Speech follows UI language in 'follow' mode and sets empty lang in 'auto' mode
+      // 4. Web Speech follows UI language in 'follow' mode and resolves browser system locale (never '') in 'auto' mode
       const instances = browser();
       VoiceInput.setVoiceLanguageMode('follow');
       mockStorage.setItem('imcodes_lang', 'ja');
@@ -1893,9 +1893,10 @@ describe('Web Mobile final drain', () => {
       expect(instances[0].lang).toBe('ja-JP');
       await VoiceInput.stopListening({ abort: true });
 
+      vi.stubGlobal('navigator', { languages: ['zh-CN', 'en-US'], language: 'zh-CN' });
       VoiceInput.setVoiceLanguageMode('auto');
       await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
-      expect(instances[1].lang).toBe('');
+      expect(instances[1].lang).toBe('zh-CN');
       await VoiceInput.stopListening({ abort: true });
     } finally {
       vi.unstubAllGlobals();

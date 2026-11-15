@@ -1006,7 +1006,16 @@ final class Qwen3ASRModel {
         if cancelAfterCheck { throw CancellationError() }
         return ("  ok:\\(audio.count)  ", prefixTokens + [10, 11])
     }
-    func safePrefixTokensForRollback(_ tokens: [Int32], rollbackCount: Int = 5) -> [Int32] {
+    static func resolveLanguage(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        let lower = trimmed.lowercased()
+        if lower == "auto" { return nil }
+        if lower.hasPrefix("zh") || lower == "chinese" { return "Chinese" }
+        if lower.hasPrefix("en") || lower == "english" { return "English" }
+        return trimmed
+    }
+    func safePrefixTokensForRollback(_ tokens: [Int32], rollbackCount: Int = 5, expectLanguageHeader: Bool = false) -> [Int32] {
+        _ = expectLanguageHeader
         guard tokens.count > rollbackCount else { return [] }
         return Array(tokens.dropLast(rollbackCount))
     }
@@ -1653,11 +1662,12 @@ it.skipIf(!swiftCompiler)('executes Qwen3Tokenizer U+FFFD rollback boundary guar
     qwenSrc.indexOf('    /// Shared implementation behind')
   );
   const promptSlice = qwenSrc.slice(
-    qwenSrc.indexOf('    static func buildPromptTokenIds('),
+    qwenSrc.indexOf('    private static let supportedLanguageMap'),
     qwenSrc.indexOf('    static func buildInputEmbeds(')
   );
   expect(rollbackSlice).toContain('hasSuffix("\\u{FFFD}")');
   expect(promptSlice).toContain('suffix.append(contentsOf: prefixTokens)');
+  expect(promptSlice).toContain('if let lang = resolveLanguage(language)');
 
   const file = join(root, 'TokenizerRollbackTests.swift'), executable = join(root, 'tokenizer-rollback-tests');
   await writeFile(file, `${tokenizerSrc}
@@ -1721,10 +1731,25 @@ assert(rolledHeader == [200, Int32(Qwen3ASRTokens.asrTextTokenId), 201], "header
 assert(PrefixRollbackBridge.safePrefixTokensForRollback([201, 202, 203], rollbackCount: 5, tokenizer: tokenizer).isEmpty, "short sequence must return []")
 print("HEADER_AND_SHORT_GUARD:PASS")
 
-// buildPromptTokenIds inserts prefixTokens strictly after T.asrTextTokenId
-let (_, suffixEmpty) = PrefixRollbackBridge.buildPromptTokenIds(language: nil, context: nil, tokenizer: tokenizer)
-assert(suffixEmpty.last == Int32(Qwen3ASRTokens.asrTextTokenId), "empty prefixTokens must end with asrTextTokenId")
-let (_, suffixWithPrefix) = PrefixRollbackBridge.buildPromptTokenIds(language: nil, context: nil, tokenizer: tokenizer, prefixTokens: [201, 202, 203])
+// Auto-detect (language: nil / "auto") ends at assistant newline without pre-inserting <asr_text>.
+let (_, suffixAutoEmpty) = PrefixRollbackBridge.buildPromptTokenIds(language: nil, context: nil, tokenizer: tokenizer)
+assert(suffixAutoEmpty.last == Int32(Qwen3ASRTokens.newlineTokenId) && !suffixAutoEmpty.contains(Int32(Qwen3ASRTokens.asrTextTokenId)), "auto empty prefixTokens must end with assistant newline without asrTextTokenId: \\(suffixAutoEmpty)")
+let (_, suffixAutoKeyword) = PrefixRollbackBridge.buildPromptTokenIds(language: "auto", context: nil, tokenizer: tokenizer)
+assert(suffixAutoKeyword == suffixAutoEmpty, "'auto' keyword must match nil prompt suffix")
+
+// In auto-detect mode, incomplete header tokens without <asr_text> must not freeze a rollback prefix.
+assert(PrefixRollbackBridge.safePrefixTokensForRollback([200], rollbackCount: 0, tokenizer: tokenizer, expectLanguageHeader: true).isEmpty, "auto rollback without <asr_text> must return []")
+
+// Auto rollback prefix already contains language ...<asr_text>; prompt must preserve single <asr_text>.
+let autoPrefix: [Int32] = [200, Int32(Qwen3ASRTokens.asrTextTokenId), 201, 202, 203]
+let (_, suffixAutoCont) = PrefixRollbackBridge.buildPromptTokenIds(language: nil, context: nil, tokenizer: tokenizer, prefixTokens: autoPrefix)
+assert(suffixAutoCont.filter { $0 == Int32(Qwen3ASRTokens.asrTextTokenId) }.count == 1, "auto continuation must keep single asrTextTokenId: \\(suffixAutoCont)")
+assert(Array(suffixAutoCont.suffix(autoPrefix.count)) == autoPrefix, "auto continuation must append prefixTokens verbatim")
+
+// Forced language ("Chinese" / "zh-Hans") appends language <Lang><asr_text> and inserts prefixTokens strictly after <asr_text>.
+let (_, suffixForcedEmpty) = PrefixRollbackBridge.buildPromptTokenIds(language: "zh-Hans", context: nil, tokenizer: tokenizer)
+assert(suffixForcedEmpty.last == Int32(Qwen3ASRTokens.asrTextTokenId), "forced language empty prefixTokens must end with asrTextTokenId")
+let (_, suffixWithPrefix) = PrefixRollbackBridge.buildPromptTokenIds(language: "Chinese", context: nil, tokenizer: tokenizer, prefixTokens: [201, 202, 203])
 let asrIdx = suffixWithPrefix.firstIndex(of: Int32(Qwen3ASRTokens.asrTextTokenId))!
 assert(Array(suffixWithPrefix[(asrIdx + 1)...]) == [201, 202, 203], "prefixTokens missing after asrTextTokenId: \\(suffixWithPrefix)")
 print("PROMPT_PREFIX_INSERTION:PASS")

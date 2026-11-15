@@ -353,14 +353,24 @@ public class Qwen3ASRModel {
 
     /// Trim the trailing `rollbackCount` tokens after excluding EOS/PAD while snapping
     /// back across incomplete multi-byte UTF-8 BPE boundaries (`U+FFFD`).
-    public func safePrefixTokensForRollback(_ tokens: [Int32], rollbackCount: Int = 5) -> [Int32] {
-        Self.safePrefixTokensForRollback(tokens, rollbackCount: rollbackCount, tokenizer: tokenizer)
+    public func safePrefixTokensForRollback(
+        _ tokens: [Int32],
+        rollbackCount: Int = 5,
+        expectLanguageHeader: Bool = false
+    ) -> [Int32] {
+        Self.safePrefixTokensForRollback(
+            tokens,
+            rollbackCount: rollbackCount,
+            tokenizer: tokenizer,
+            expectLanguageHeader: expectLanguageHeader
+        )
     }
 
     public static func safePrefixTokensForRollback(
         _ tokens: [Int32],
         rollbackCount: Int = 5,
-        tokenizer: Qwen3Tokenizer?
+        tokenizer: Qwen3Tokenizer?,
+        expectLanguageHeader: Bool = false
     ) -> [Int32] {
         let eos = Int32(Qwen3ASRTokens.eosTokenId)
         let pad = Int32(Qwen3ASRTokens.padTokenId)
@@ -368,9 +378,16 @@ public class Qwen3ASRModel {
         while end > 0 && (tokens[end - 1] == eos || tokens[end - 1] == pad) {
             end -= 1
         }
-        let headerEnd = tokens[..<end]
-            .lastIndex(of: Int32(Qwen3ASRTokens.asrTextTokenId))
-            .map { $0 + 1 } ?? 0
+        // In auto-detect mode the model must finish emitting `language <Lang><asr_text>`
+        // before any tokens are safe to reuse as a rollback continuation prefix.
+        let headerEnd: Int
+        if let asrIndex = tokens[..<end].lastIndex(of: Int32(Qwen3ASRTokens.asrTextTokenId)) {
+            headerEnd = asrIndex + 1
+        } else if expectLanguageHeader {
+            return []
+        } else {
+            headerEnd = 0
+        }
         let trim = max(0, rollbackCount)
         guard end - headerEnd > trim else { return [] }
         end -= trim
@@ -609,7 +626,12 @@ public class Qwen3ASRModel {
             continuation.removeLast()
         }
         let fullTokens = prefixTokens + continuation
-        let text = Self.decodeTokenBatch(allTokens: [fullTokens], tokenizer: tokenizer)[0]
+        let expectLanguageHeader = Self.resolveLanguage(language) == nil
+        let text = Self.decodeTokenBatch(
+            allTokens: [fullTokens],
+            tokenizer: tokenizer,
+            expectLanguageHeader: expectLanguageHeader
+        )[0]
         return (text, fullTokens)
     }
 
@@ -762,7 +784,14 @@ public class Qwen3ASRModel {
     ) -> [String] {
         let B = audioEmbedsBatch.count
         if B == 0 { return [] }
-        if maxTokens <= 0 { return Self.decodeTokenBatch(allTokens: Array(repeating: [], count: B), tokenizer: tokenizer) }
+        let expectLanguageHeader = Self.resolveLanguage(language) == nil
+        if maxTokens <= 0 {
+            return Self.decodeTokenBatch(
+                allTokens: Array(repeating: [], count: B),
+                tokenizer: tokenizer,
+                expectLanguageHeader: expectLanguageHeader
+            )
+        }
 
         let (prefixTokenIds, suffixTokenIds) = Self.buildPromptTokenIds(
             language: language, context: context, tokenizer: tokenizer
@@ -846,7 +875,11 @@ public class Qwen3ASRModel {
             currentBatchTokenIds = nextBatchTokenIds
         }
 
-        return Self.decodeTokenBatch(allTokens: allTokens, tokenizer: tokenizer)
+        return Self.decodeTokenBatch(
+            allTokens: allTokens,
+            tokenizer: tokenizer,
+            expectLanguageHeader: expectLanguageHeader
+        )
     }
 
     func generateTextBatched(
@@ -858,7 +891,14 @@ public class Qwen3ASRModel {
     ) -> [String] {
         let B = audioEmbedsBatch.count
         if B == 0 { return [] }
-        if maxTokens <= 0 { return Self.decodeTokenBatch(allTokens: Array(repeating: [], count: B), tokenizer: tokenizer) }
+        let expectLanguageHeader = Self.resolveLanguage(language) == nil
+        if maxTokens <= 0 {
+            return Self.decodeTokenBatch(
+                allTokens: Array(repeating: [], count: B),
+                tokenizer: tokenizer,
+                expectLanguageHeader: expectLanguageHeader
+            )
+        }
 
         precondition(
             audioEmbedsBatch.allSatisfy { $0.seqLen == audioEmbedsBatch[0].seqLen },
@@ -980,7 +1020,95 @@ public class Qwen3ASRModel {
             batchKVCache = cacheN1
         }
 
-        return Self.decodeTokenBatch(allTokens: allTokens, tokenizer: tokenizer)
+        return Self.decodeTokenBatch(
+            allTokens: allTokens,
+            tokenizer: tokenizer,
+            expectLanguageHeader: expectLanguageHeader
+        )
+    }
+
+    private static let supportedLanguageMap: [String: String] = [
+        "zh": "Chinese",
+        "cmn": "Chinese",
+        "chinese": "Chinese",
+        "yue": "Cantonese",
+        "cantonese": "Cantonese",
+        "en": "English",
+        "english": "English",
+        "ja": "Japanese",
+        "jp": "Japanese",
+        "japanese": "Japanese",
+        "ko": "Korean",
+        "korean": "Korean",
+        "es": "Spanish",
+        "spanish": "Spanish",
+        "ru": "Russian",
+        "russian": "Russian",
+        "fr": "French",
+        "french": "French",
+        "de": "German",
+        "german": "German",
+        "it": "Italian",
+        "italian": "Italian",
+        "pt": "Portuguese",
+        "portuguese": "Portuguese",
+        "ar": "Arabic",
+        "arabic": "Arabic",
+        "tr": "Turkish",
+        "turkish": "Turkish",
+        "vi": "Vietnamese",
+        "vietnamese": "Vietnamese",
+        "th": "Thai",
+        "thai": "Thai",
+        "id": "Indonesian",
+        "indonesian": "Indonesian",
+        "ms": "Malay",
+        "malay": "Malay",
+        "hi": "Hindi",
+        "hindi": "Hindi",
+        "nl": "Dutch",
+        "dutch": "Dutch",
+        "pl": "Polish",
+        "polish": "Polish",
+        "sv": "Swedish",
+        "swedish": "Swedish",
+        "da": "Danish",
+        "danish": "Danish",
+        "fi": "Finnish",
+        "finnish": "Finnish",
+        "cs": "Czech",
+        "czech": "Czech",
+        "el": "Greek",
+        "greek": "Greek",
+        "hu": "Hungarian",
+        "hungarian": "Hungarian",
+        "ro": "Romanian",
+        "romanian": "Romanian",
+        "fa": "Persian",
+        "persian": "Persian",
+        "fil": "Filipino",
+        "tl": "Filipino",
+        "filipino": "Filipino",
+        "mk": "Macedonian",
+        "macedonian": "Macedonian",
+    ]
+
+    /// Normalize a BCP-47 locale tag or Qwen3-ASR language name to its canonical
+    /// language string, or `nil` for auto-detect (`nil`, empty, `"auto"`, or unknown).
+    public static func resolveLanguage(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        let normalized = trimmed.replacingOccurrences(of: "_", with: "-").lowercased()
+        if normalized == "auto" {
+            return nil
+        }
+        if let exact = supportedLanguageMap[normalized] {
+            return exact
+        }
+        let primary = normalized.split(separator: "-", maxSplits: 1).first.map(String.init) ?? normalized
+        return supportedLanguageMap[primary]
     }
 
     /// Build the shared prompt prefix token IDs and per-item suffix.
@@ -1008,12 +1136,16 @@ public class Qwen3ASRModel {
         var suffix: [Int32] = []
         suffix.append(contentsOf: [T.audioEndTokenId, T.imEndTokenId, T.newlineTokenId].map { Int32($0) })
         suffix.append(contentsOf: [T.imStartTokenId, T.assistantTokenId, T.newlineTokenId].map { Int32($0) })
-        if let lang = language, let tokenizer = tokenizer {
-            let langPrefix = "language \(lang)"
-            let langTokens = tokenizer.encode(langPrefix)
-            suffix.append(contentsOf: langTokens.map { Int32($0) })
+        if let lang = resolveLanguage(language) {
+            // Forced-language prompt ends with `language <Lang><asr_text>`;
+            // auto-detect ends at `<|im_start|>assistant\n` so the model predicts
+            // `language <Detected><asr_text>` itself before transcription tokens.
+            if let tokenizer = tokenizer {
+                let langTokens = tokenizer.encode("language \(lang)")
+                suffix.append(contentsOf: langTokens.map { Int32($0) })
+            }
+            suffix.append(Int32(T.asrTextTokenId))
         }
-        suffix.append(Int32(T.asrTextTokenId))
         if !prefixTokens.isEmpty {
             suffix.append(contentsOf: prefixTokens)
         }
@@ -1041,15 +1173,21 @@ public class Qwen3ASRModel {
 
     static func decodeTokenBatch(
         allTokens: [[Int32]],
-        tokenizer: Qwen3Tokenizer?
+        tokenizer: Qwen3Tokenizer?,
+        expectLanguageHeader: Bool = false
     ) -> [String] {
         guard let tokenizer = tokenizer else {
             return allTokens.map { $0.map { String($0) }.joined(separator: " ") }
         }
         return allTokens.map { tokens in
             let rawText = tokenizer.decode(tokens: tokens.map { Int($0) })
-            if let range = rawText.range(of: "<asr_text>") {
-                return String(rawText[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if let range = rawText.range(of: "<asr_text>", options: .backwards) {
+                return String(rawText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if expectLanguageHeader {
+                // Before `<asr_text>` arrives in auto-detect mode, decoded text is only
+                // a partial `language ...` header and must not leak as spoken transcript.
+                return ""
             }
             return rawText
         }
