@@ -1156,11 +1156,18 @@ export function CloudDocsPanel({
       return;
     }
 
+    const targetFolderId = activeTab === 'my_docs' ? currentFolderId : null;
     setBusy(true);
     setError(null);
     try {
-      const res = await uploadCloudDocApi(file, { folderId: activeTab === 'my_docs' ? currentFolderId : null });
+      const res = await uploadCloudDocApi(file, { folderId: targetFolderId });
       if (!mountedRef.current) return;
+      if (activeTab !== 'my_docs') {
+        setCurrentFolderId(res?.doc?.folderId ?? targetFolderId);
+        setActiveTab('my_docs');
+        setContextMenu(null);
+        setOpenMenu(null);
+      }
       if (res?.doc) {
         applyDocsProjection((prev) => [...prev.filter((d) => d.id !== res.doc.id), res.doc]);
       } else {
