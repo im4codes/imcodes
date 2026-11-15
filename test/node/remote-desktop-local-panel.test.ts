@@ -855,17 +855,18 @@ describe('local panel Coding Daemon endpoints and UI', () => {
       },
     });
     const doc = dom.window.document;
-    await new Promise((r) => setTimeout(r, 80));
-
     const daemonCard = doc.getElementById('daemonCard') as HTMLElement;
-    expect(daemonCard.hidden).toBe(false);
-    expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Stopped');
+    await vi.waitFor(() => {
+      expect(daemonCard.hidden).toBe(false);
+      expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Stopped');
+    }, { timeout: 3_000 });
 
     // Start action updates card state
     (doc.getElementById('daemonStart') as HTMLButtonElement).click();
-    await new Promise((r) => setTimeout(r, 80));
-    expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START)).toBe(true);
-    expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Running');
+    await vi.waitFor(() => {
+      expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START)).toBe(true);
+      expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Running');
+    }, { timeout: 3_000 });
 
     // Bind modal clears secret input immediately upon submit
     (doc.getElementById('daemonBindBtn') as HTMLButtonElement).click();
@@ -874,13 +875,15 @@ describe('local panel Coding Daemon endpoints and UI', () => {
     const form = doc.getElementById('daemonBindForm') as HTMLFormElement;
     form.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
     expect(bindInput.value).toBe('');
-    await new Promise((r) => setTimeout(r, 80));
-    expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && d.bindUrl === 'https://app.example.test/bind/secret_key_xyz')).toBe(true);
+    await vi.waitFor(() => {
+      expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && d.bindUrl === 'https://app.example.test/bind/secret_key_xyz')).toBe(true);
+    }, { timeout: 3_000 });
 
     // Logs modal fetches and shows textContent cleanly
     (doc.getElementById('daemonLogsBtn') as HTMLButtonElement).click();
-    await new Promise((r) => setTimeout(r, 80));
-    expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('hello from daemon log');
+    await vi.waitFor(() => {
+      expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('hello from daemon log');
+    }, { timeout: 3_000 });
 
     dom.window.close();
   });
@@ -951,13 +954,15 @@ describe('local panel Coding Daemon endpoints and UI', () => {
       },
     });
     const doc = dom.window.document;
-    await new Promise((r) => setTimeout(r, 80));
-    expect(doc.getElementById('daemonHint')?.textContent).toContain('tokenizer ready');
-    expect(doc.getElementById('daemonHint')?.textContent).not.toContain('state-json-secret');
+    await vi.waitFor(() => {
+      expect(doc.getElementById('daemonHint')?.textContent).toContain('tokenizer ready');
+      expect(doc.getElementById('daemonHint')?.textContent).not.toContain('state-json-secret');
+    }, { timeout: 3_000 });
     (doc.getElementById('daemonLogsBtn') as HTMLButtonElement).click();
-    await new Promise((r) => setTimeout(r, 80));
-    expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('token count: 7');
-    expect(doc.getElementById('daemonLogsPre')?.textContent).not.toContain('dom-json-secret');
+    await vi.waitFor(() => {
+      expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('token count: 7');
+      expect(doc.getElementById('daemonLogsPre')?.textContent).not.toContain('dom-json-secret');
+    }, { timeout: 3_000 });
     dom.window.close();
 
     // Concurrency isolation: start a blocked daemon bind, verify Remote Desktop pause finishes immediately
