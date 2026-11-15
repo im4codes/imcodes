@@ -6,7 +6,7 @@ import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
 import { TRANSPORT_STOP_QUEUE_OUTCOMES, TRANSPORT_STOP_QUEUE_TIMEOUT_MS } from '../../shared/transport-queue-types.js';
 import { TRANSPORT_APPEND_FALLBACK_REASONS, readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
-import { isChatMessageOrigin, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
+import { CHAT_MESSAGE_ORIGINS, isChatMessageOrigin, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { randomUUID } from 'node:crypto';
 import type { SessionRecord } from '../store/session-store.js';
@@ -725,7 +725,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _appendedTurnOrigins: {
     dispatchId: number | null;
     turn: unknown;
-    entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>>;
+    entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'messageOrigin'>>;
   } | null = null;
   /** Last single-message turn that reached provider completion. Consumed by
    * the authoritative idle projection; never inferred from timeline order. */
@@ -1472,7 +1472,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * Every message that fed the CURRENT turn: the dispatched entries and whatever was appended into the running turn since. The turn's
    * origin class is the weakest of them (a participant anywhere makes it participant-origin).
    */
-  private turnOriginEntries(): Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>> {
+  private turnOriginEntries(): Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'messageOrigin'>> {
     const appended = this._appendedTurnOrigins;
     const stillSameTurn = appended !== null && (
       appended.dispatchId !== null
@@ -1490,12 +1490,23 @@ export class TransportSessionRuntime implements SessionRuntime {
     return tokens.size === 1 ? [...tokens][0]! : null;
   }
 
-  /** Opaque owner-turn authority for non-participant turns only; any participant or unstamped origin fails closed. */
+  /** Opaque owner-turn authority for non-participant turns only; any participant or unstamped non-system origin fails closed. */
   getActiveOwnerMachineAuthority(): string | null {
     if (this.requiresSharedMachineAuthority()) return null;
     const origins = this.turnOriginEntries();
-    if (origins.length === 0 || origins.some((entry) => !entry.ownerMachineAuthority)) return null;
-    return origins[origins.length - 1]!.ownerMachineAuthority!;
+    if (origins.length === 0) return null;
+    let latestOwnerToken: string | null = null;
+    for (const entry of origins) {
+      if (entry.ownerMachineAuthority) {
+        latestOwnerToken = entry.ownerMachineAuthority;
+        continue;
+      }
+      const isPureDaemonSystemAppend = entry.messageOrigin === CHAT_MESSAGE_ORIGINS.SYSTEM
+        && !entry.sharedActor
+        && !entry.sharedMachineAuthority;
+      if (!isPureDaemonSystemAppend) return null;
+    }
+    return latestOwnerToken;
   }
 
   requiresSharedMachineAuthority(): boolean {
@@ -3527,6 +3538,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
             ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
+            ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
           })),
         ],
       };

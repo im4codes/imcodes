@@ -7,6 +7,7 @@ import { taskPairService } from './service.js';
 import { buildPairConsoleRow } from '../supervision-console-pair-projection.js';
 import { buildDependencyTitleRecord } from '../../../shared/task-pair-display.js';
 import { taskPairDecisionRevision } from './decision-context.js';
+import { captureInboundCommandAuthority } from './authority.js';
 
 /** A rejected write must remain rejected; clients can refresh before confirming again. */
 export class TaskPairDecisionContextError extends Error {
@@ -41,6 +42,7 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
       if (input.optionId && !choice) throw new Error('Unknown choice');
       if ((!feedback && !choice) || feedback.length > TASK_PAIR_DECISION_LIMITS.SUMMARY) throw new Error('Feedback is empty or too long');
       const reason = activeQuestion?.question || activeQuestion?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note || 'Please clarify the blocking condition and available options.';
+      const authority = captureInboundCommandAuthority(input);
       taskPairService.recordDecision({
         project: scope.projectName, taskId, round: Math.max(1, pair.round), kind: TASK_PAIR_DECISION_KIND.FEEDBACK,
         conclusion: choice?.label || 'Human feedback', summary: feedback || choice!.label,
@@ -48,6 +50,7 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
         ...(choice ? { selectedOptionId: choice.id } : {}),
         author: 'human', idempotencyKey: `human:${input.requestId}`,
         at: Math.max(Date.now(), (rawQuestion?.at ?? 0) + 1),
+        ...(authority ? { authority } : {}),
       });
     }
   }

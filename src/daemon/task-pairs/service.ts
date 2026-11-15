@@ -75,6 +75,10 @@ import {
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
 import { TaskPairWriteConflictError, flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairDecisionRecord, type TaskPairLiveness } from './store.js';
+import {
+  captureCallerPairAuthority,
+  type TaskPairAuthorityContext,
+} from './authority.js';
 import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
@@ -189,6 +193,10 @@ export interface ApplyMarkerInput {
   suppressAutomaticBrief?: boolean;
   /** Runtime assistant-timeline ingestion rejects new Brain pairs unless pair_create was used. */
   requireStructuredPairCreate?: boolean;
+  /** Internal machine-control authority context captured from the caller turn. */
+  authority?: TaskPairAuthorityContext;
+  /** Explicit Brain lifecycle transitions (`pair_dispatch`, `pair_resume`, `pair_reassign`, `pair_next_round`) may replace an earlier participant binding with an active Owner token. */
+  allowOwnerOverride?: boolean;
 }
 
 export interface TaskPairBriefDelivery {
@@ -536,7 +544,7 @@ export class TaskPairService {
   }
 
   /** Persist a request/final decision and notify the Brain (and both participants for a final decision). */
-  recordDecision(input: Omit<TaskPairDecisionRecord, 'id' | 'at'> & { at?: number }): { record: TaskPairDecisionRecord; created: boolean; notified: string[] } {
+  recordDecision(input: Omit<TaskPairDecisionRecord, 'id' | 'at'> & { at?: number; authority?: TaskPairAuthorityContext }): { record: TaskPairDecisionRecord; created: boolean; notified: string[] } {
     const store = getTaskPairStore();
     const pair = store.getPair(input.project, input.taskId);
     if (!pair) throw new Error('task pair not found');
@@ -550,6 +558,13 @@ export class TaskPairService {
     }
     const result = store.recordDecision({ ...input, deliveryRound, at: input.at ?? Date.now() });
     if (!result.created) return { ...result, notified: [] };
+    if (input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK && input.authority?.kind === 'owner') {
+      store.savePairAuthority(input.project, input.taskId, input.authority);
+    }
+    const notificationAuthority = input.authority
+      ?? (input.author && input.author !== 'human' ? captureCallerPairAuthority(input.author) : undefined)
+      ?? store.getPair(input.project, input.taskId)?.authority
+      ?? pair.authority;
     const fresh = store.getPair(input.project, input.taskId);
     if (fresh) {
       store.saveLiveness(input.project, input.taskId, {
@@ -571,6 +586,7 @@ export class TaskPairService {
     for (const target of uniqueTargets) store.enqueueDecisionNotification({
       project: input.project, taskId: input.taskId, decisionId: result.record.id, target,
       reason: target === pair.state.brain ? TASK_PAIR_DECISION_BRAIN_NOTICE_REASON : `decision-${input.kind}`, text: message,
+      ...(notificationAuthority ? { authority: notificationAuthority } : {}),
     });
     this.#track(this.retryDecisionNotifications());
     emitTaskPairDaemonEvent(pair.state, {
@@ -623,7 +639,7 @@ export class TaskPairService {
       }
       try { store.markDecisionNotificationAttempt(pending.id, now); } catch { return; }
       let status: TaskPairDeliveryResult = 'failed';
-      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text, pending.decisionId); } catch { /* retain the row for the next heartbeat */ }
+      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text, pending.decisionId, undefined, pending.authority); } catch { /* retain the row for the next heartbeat */ }
       // skipped_pending can be only the process-local in-flight gate; the
       // original send may still fail, so keep this row pending for retry.
       if (status === 'sent' || status === 'queued') {
@@ -966,10 +982,13 @@ export class TaskPairService {
             workspace: { ...workspace, status: 'active' as const, endedAt: undefined, keptReason: undefined, strippedAt: undefined },
           }
         : transition.pair;
+      const resolvedAuthority = input.authority ?? captureCallerPairAuthority(input.writer);
       stored = store.savePair(input.project, redirectMaterialToCurrentWorkspace(pairToSave), {
         expectedRevision: existing?.revision,
         event,
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
+        ...(resolvedAuthority ? { authority: resolvedAuthority } : {}),
+        ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
       });
       if (busySessions.size > 0) stored = this.#noteParticipantConflicts(input.project, stored, busySessions);
       this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
@@ -1316,6 +1335,10 @@ export class TaskPairService {
      *  A pair minted for a plain send_message (no metadata) has none of the
      *  Brain's own task description -- see suppressAutoPickAuditor. */
     hasObjective?: boolean;
+    /** Internal machine-control authority context captured from the caller turn. */
+    authority?: TaskPairAuthorityContext;
+    /** Explicit Brain action allowed to override a prior participant binding with an active Owner token. */
+    allowOwnerOverride?: boolean;
     /** The send's own text (objective, or the plain message as a fallback):
      *  stored as the pair's brief when this creates a new pair with none, so
      *  pair_task_get and a later re-dispatch/REASSIGN still have the actual
@@ -1327,9 +1350,13 @@ export class TaskPairService {
   }): TaskPairTransition | undefined {
     const project = input.project ?? projectOfSession(input.sender) ?? projectOfSession(input.target);
     if (!project || !isTaskPairsAvailable(project)) return undefined;
+    const effectiveAuthority = input.authority ?? captureCallerPairAuthority(input.sender);
     const store = getTaskPairStore();
     const existing = store.getPair(project, input.taskId);
     if (existing) {
+      if (effectiveAuthority) {
+        store.savePairAuthority(project, input.taskId, effectiveAuthority, { allowOwnerOverride: input.allowOwnerOverride });
+      }
       this.ensureTaskPairTitle(project, input.taskId, input.brief ?? existing.state.brief ?? existing.state.title, input.sender, { mechanicalTitle: input.titleExplicit !== true });
       if (input.sender === existing.state.brain
         && (input.target === existing.state.executor
@@ -1358,6 +1385,8 @@ export class TaskPairService {
           project, writer: input.sender,
           marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: input.taskId, attrs: {} },
           source: 'implicit_dispatch', eventId: input.eventId,
+          ...(effectiveAuthority ? { authority: effectiveAuthority } : {}),
+          ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
         });
         noteTaskPairFocus(input.target, input.taskId);
         return resumed;
@@ -1450,6 +1479,8 @@ export class TaskPairService {
       source: input.structuredPairCreate ? 'mcp' : 'implicit_dispatch',
       eventId: input.eventId,
       suppressAutomaticBrief: input.suppressAutomaticBrief,
+      ...(effectiveAuthority ? { authority: effectiveAuthority } : {}),
+      ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
       // Only when named the auditor is applied immediately as before; a bare
       // dispatch with none holds the auto-pick for the grace window unless
       // this send itself carried a real objective (clearly new work, no

@@ -12,6 +12,7 @@ import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
+import { captureCallerPairAuthority } from './task-pairs/authority.js';
 import { isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency, taskPairSupervisionStatus } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { describeExecutionSelection } from './task-pairs/pool.js';
@@ -1820,6 +1821,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     attrs: Record<string, string>;
     idempotencyKey?: string;
     turnText?: string;
+    allowOwnerOverride?: boolean;
     authorize: (pair: StoredTaskPair) => ToolResult | undefined;
   }): Promise<ToolResult> => {
     const store = getTaskPairStore();
@@ -1829,6 +1831,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     if (authorization) return authorization;
     const eventId = structuredPairLifecycleEventId(input.project, input.taskId, input.verb, input.attrs, input.idempotencyKey);
     const replay = store.hasEvent(eventId);
+    const authority = captureCallerPairAuthority(caller.sessionName);
     const transition = taskPairService.applyMarker({
       project: input.project,
       writer: caller.sessionName!,
@@ -1837,6 +1840,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       eventId,
       suppressAutomaticBrief: false,
       ...(input.turnText ? { turnText: input.turnText } : {}),
+      ...(authority ? { authority } : {}),
+      ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
     });
     await taskPairService.waitForIdle();
     const after = store.getPair(input.project, input.taskId);
@@ -3630,11 +3635,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, String(cause));
       }
       try {
+        const authority = captureCallerPairAuthority(caller.sessionName);
         const result = taskPairService.recordDecision({
           ...details,
           project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
           ...(related && related.length > 0 ? { related } : {}),
           ...(stringArg(args, 'idempotencyKey')?.trim() ? { idempotencyKey: stringArg(args, 'idempotencyKey')!.trim() } : {}),
+          ...(authority ? { authority } : {}),
         });
         return { status: 'ok', created: result.created, decision: result.record, notified: result.notified };
       } catch (cause) { return error(MCP_ERROR_REASONS.VALIDATION_FAILED, String(cause)); }
@@ -3748,6 +3755,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         }
         const busyTarget = executorRecord?.state === 'running'
           || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && byName.get(auditor)?.state === 'running');
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
         const transition = dependencies.length > 0 || busyTarget || !executor
           ? taskPairService.applyMarker({
               project: context.project,
@@ -3767,6 +3775,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
                 brief,
               },
               source: 'mcp', eventId,
+              ...(callerAuthority ? { authority: callerAuthority } : {}),
             })
           : taskPairService.implicitDispatch({
               project: context.project,
@@ -3785,6 +3794,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               structuredPairCreate: true,
               eventId,
               suppressAutomaticBrief: true,
+              ...(callerAuthority ? { authority: callerAuthority } : {}),
             });
         // A pair with no named executor starts through the queue right away (the daemon picks from the pool, or the no-pool default).
         if (dependencies.length) await taskPairAutomation.reconcileSuspensions();
@@ -3836,6 +3846,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, ...supervisionFields(context.project), deliveries };
       }
       if (stored.state.status !== 'queued') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair is not queued (${stored.state.status})`);
+      const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+      if (callerAuthority) store.savePairAuthority(context.project, taskId, callerAuthority, { allowOwnerOverride: true });
       await taskPairAutomation.runQueue(context.project, caller.sessionName);
       const after = store.getPair(context.project, taskId);
       if (!after) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair disappeared during dispatch');
@@ -3873,6 +3885,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const access = pairChecklistAccess(caller, await sendSessions(), stringArg(args, 'taskId'));
       if (access.status !== 'ok') return pairAccessError(access, caller);
       try {
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+        if (callerAuthority && caller.sessionName === access.pair.state.brain) {
+          getTaskPairStore().savePairAuthority(access.pair.project, access.pair.state.taskId, callerAuthority, { allowOwnerOverride: true });
+        }
         resumePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '');
         await taskPairAutomation.reconcileSuspensions();
         taskPairAutomation.publishBadges();
@@ -3943,6 +3959,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (namedProblems.length > 0) return sessionNotLiveError(taskId, namedProblems, { nothingChanged: true });
       const reassigned = await applyStructuredPairLifecycle({
         project: context.project, taskId, verb: 'REASSIGN', attrs, idempotencyKey,
+        allowOwnerOverride: true,
         authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_reassign requires the pair Brain'),
       });
       // A reassignment by model may have provisioned or picked a session: report a result whose sessions are not live as the failure it is.
@@ -3973,6 +3990,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (stored && isTerminalTaskPairStatus(stored.state.status) && !replay) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot open a round on terminal pair (${stored.state.status})`);
       return applyStructuredPairLifecycle({
         project: context.project, taskId, verb: 'NEXT_ROUND', attrs, idempotencyKey,
+        allowOwnerOverride: true,
         authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_next_round requires the pair Brain'),
       });
     },

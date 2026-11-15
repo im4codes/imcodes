@@ -5,7 +5,7 @@ import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
 import { TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
@@ -723,6 +723,7 @@ export function evaluateShareCommand(input: {
       const {
         sharedActor: _clientActor,
         [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
+        [OWNER_MACHINE_AUTHORITY_FIELD]: _clientOwnerAuthority,
         ...rest
       } = input.msg;
       return {
@@ -730,6 +731,27 @@ export function evaluateShareCommand(input: {
         stampedMessage: {
           ...rest,
           sharedActor: buildSharedActorEnvelope(input.state, `share-input-${input.state.userId}`, input.now),
+        },
+      };
+    }
+    if (type === TASK_PAIR_DECISION_MSG.FEEDBACK) {
+      if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+        return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+      }
+      const {
+        sharedActor: _clientActor,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
+        [OWNER_MACHINE_AUTHORITY_FIELD]: _clientOwnerAuthority,
+        ...rest
+      } = input.msg;
+      const actionId = typeof input.msg.requestId === 'string' && input.msg.requestId.trim()
+        ? `pair-feedback-${input.msg.requestId.trim()}`
+        : `pair-feedback-${input.state.userId}`;
+      return {
+        allowed: true,
+        stampedMessage: {
+          ...rest,
+          sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
         },
       };
     }

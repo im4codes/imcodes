@@ -7952,6 +7952,37 @@ ${PREFERENCE_CONTEXT_END}`;
       await flushDispatch();
       expect(runtime.requiresSharedMachineAuthority()).toBe(true);
       expect(runtime.getActiveSharedMachineAuthority()).toBeNull();
+      expect(runtime.getActiveOwnerMachineAuthority()).toBeNull();
+    });
+
+    it('preserves active ownerMachineAuthority when a pure daemon SYSTEM message is appended into an owner turn, while failing closed for unstamped non-system appends', async () => {
+      enableNativeAppend();
+      runtime.send('owner work', 'owner-turn-sys', undefined, undefined, { ownerMachineAuthority: 'OWNER_JWT_1' });
+      await flushDispatch();
+      expect(runtime.getActiveOwnerMachineAuthority()).toBe('OWNER_JWT_1');
+
+      runtime.send('task pair reminder', 'sys-append-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      });
+      const sysResult = await runtime.appendPendingMessagesToActiveTurn(['sys-append-1'], 'append-sys-1');
+      expect(sysResult.status).toBe('delivered');
+      expect(runtime.requiresSharedMachineAuthority()).toBe(false);
+      expect(runtime.getActiveOwnerMachineAuthority()).toBe('OWNER_JWT_1');
+
+      // An unstamped non-system append (e.g. legacy/external origin without owner token) still fails closed.
+      runtime.send('unstamped human message', 'human-append-1');
+      const humanResult = await runtime.appendPendingMessagesToActiveTurn(['human-append-1'], 'append-human-1');
+      expect(humanResult.status).toBe('delivered');
+      expect(runtime.getActiveOwnerMachineAuthority()).toBeNull();
+    });
+
+    it('never produces ownerMachineAuthority on a standalone SYSTEM turn with no owner token', async () => {
+      runtime.send('daemon system only', 'sys-only-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      });
+      await flushDispatch();
+      expect(runtime.requiresSharedMachineAuthority()).toBe(false);
+      expect(runtime.getActiveOwnerMachineAuthority()).toBeNull();
     });
   });
 

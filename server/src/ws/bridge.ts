@@ -53,6 +53,7 @@ import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { TERMINAL_CONTROL, TERMINAL_STREAM_RESET_REASON } from '../../../shared/terminal-protocol.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
+import { TASK_PAIR_DECISION_MSG } from '../../../shared/task-pair-decision.js';
 import {
   CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME,
   validateControlledNodeLocalDaemonsMessage,
@@ -7810,24 +7811,39 @@ export class WsBridge {
         return;
       }
 
-      if (!shareState && (browserMessageType === 'session.send' || SHARE_PROCESS_INPUT_COMMANDS.has(browserMessageType))) {
-        const targetSession = typeof msg.sessionName === 'string'
+      if (!shareState && (
+        browserMessageType === 'session.send'
+        || browserMessageType === TASK_PAIR_DECISION_MSG.FEEDBACK
+        || SHARE_PROCESS_INPUT_COMMANDS.has(browserMessageType)
+      )) {
+        const feedbackScopeSession = browserMessageType === TASK_PAIR_DECISION_MSG.FEEDBACK
+          && msg.scope
+          && typeof msg.scope === 'object'
+          && typeof (msg.scope as Record<string, unknown>).coordinatorSessionName === 'string'
+          ? String((msg.scope as Record<string, unknown>).coordinatorSessionName).trim()
+          : '';
+        const targetSession = typeof msg.sessionName === 'string' && msg.sessionName.trim()
           ? msg.sessionName.trim()
-          : (typeof msg.session === 'string' ? msg.session.trim() : '');
+          : (typeof msg.session === 'string' && msg.session.trim()
+            ? msg.session.trim()
+            : feedbackScopeSession);
         const capturedMsg = msg;
         const capturedRaw = raw;
         await this.enqueueOwnerCommand(ws, async () => {
           let stampedMsg = capturedMsg;
           let stampedRaw = capturedRaw;
           if (targetSession && this.db && this.directFileTransferTicketSigningKey && userId) {
-            const token = browserMessageType === 'session.send'
+            const actionId = typeof capturedMsg.commandId === 'string' && capturedMsg.commandId
+              ? capturedMsg.commandId
+              : (typeof capturedMsg.requestId === 'string' && capturedMsg.requestId
+                ? `owner-decision-${capturedMsg.requestId}`
+                : `owner-send-${randomHex(8)}`);
+            const token = (browserMessageType === 'session.send' || browserMessageType === TASK_PAIR_DECISION_MSG.FEEDBACK)
               ? await issueOwnerMachineAuthorityForSession(this.db, {
                   actorUserId: userId,
                   sourceServerId: this.serverId,
                   sessionName: targetSession,
-                  actionId: typeof capturedMsg.commandId === 'string' && capturedMsg.commandId
-                    ? capturedMsg.commandId
-                    : `owner-send-${randomHex(8)}`,
+                  actionId,
                   signingKey: this.directFileTransferTicketSigningKey,
                 })
               : await this.ownerInputMachineAuthority(ws, userId, targetSession);
@@ -8114,7 +8130,7 @@ export class WsBridge {
       runtimeType,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
     });
-    if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
+    if (decision.allowed && sessionName && (msg.type === 'session.send' || msg.type === TASK_PAIR_DECISION_MSG.FEEDBACK) && decision.stampedMessage) {
       const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
       const token = actor ? await this.issueShareMachineAuthority(actor, sessionName) : null;
       if (!token) {

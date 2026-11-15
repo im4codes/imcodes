@@ -268,4 +268,27 @@ describe('transport resend delivery policy', () => {
       { deliveryMode: 'append', registeredSystemContract },
     );
   });
+
+  it('threads ownerMachineAuthority through native append without falling back to FIFO', async () => {
+    const harness = runtimeHarness();
+    harness.appendExternalMessageToActiveTurn.mockResolvedValue('appended');
+
+    await expect(deliverTransportResendEntry(harness.runtime, {
+      text: 'pair notice',
+      commandId: 'cmd-pair-owner',
+      clientMessageId: 'task-pair-nudge:T1:owner',
+      deliveryMode: 'append',
+      ownerMachineAuthority: 'owner-jwt-token',
+      queuedAt: Date.now(),
+    })).resolves.toBe('appended');
+
+    expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+      'pair notice',
+      'task-pair-nudge:T1:owner',
+      undefined,
+      undefined,
+      { ownerMachineAuthority: 'owner-jwt-token' },
+    );
+    expect(harness.send).not.toHaveBeenCalled();
+  });
 });

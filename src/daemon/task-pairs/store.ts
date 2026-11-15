@@ -29,6 +29,12 @@ import {
 import { assertNotRealImcodesPathInTests } from '../../util/test-home-guard.js';
 import { imcodesStateDir } from '../../util/imcodes-state-dir.js';
 import { randomUUID } from 'node:crypto';
+import {
+  mergePairAuthority,
+  parseTaskPairAuthority,
+  serializeTaskPairAuthority,
+  type TaskPairAuthorityContext,
+} from './authority.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -137,6 +143,8 @@ export interface StoredTaskPair {
   /** Opaque, store-local CAS token: the exact persisted state_json, never a wire field. */
   revision?: string;
   legacyTaskId?: string;
+  /** Internal persisted machine-control authority for this pair; never exported to UI/MCP snapshots. */
+  authority?: TaskPairAuthorityContext;
 }
 
 /** A full-state write was based on an authority snapshot that no longer exists. */
@@ -180,6 +188,8 @@ export interface TaskPairDecisionNotification {
   attempts: number;
   lastAttemptAt?: number;
   deliveredAt?: number;
+  /** Internal server-stamped authority for this notification delivery; never exported publicly. */
+  authority?: TaskPairAuthorityContext;
 }
 
 function emptyLiveness(now: number): TaskPairLiveness {
@@ -249,6 +259,7 @@ function freezeShared(pair: StoredTaskPair): StoredTaskPair {
   };
   freeze(pair.state);
   freeze(pair.liveness);
+  if (pair.authority) freeze(pair.authority);
   return pair;
 }
 
@@ -307,6 +318,7 @@ export class TaskPairStore {
         legacy_task_id TEXT,
         state_json TEXT NOT NULL,
         liveness_json TEXT NOT NULL,
+        authority_json TEXT,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (project, task_id)
       );
@@ -369,6 +381,7 @@ export class TaskPairStore {
         target TEXT NOT NULL,
         reason TEXT NOT NULL,
         text TEXT NOT NULL,
+        authority_json TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         last_attempt_at INTEGER,
         delivered_at INTEGER,
@@ -377,13 +390,19 @@ export class TaskPairStore {
       CREATE INDEX IF NOT EXISTS task_pair_decision_notifications_pending_idx ON task_pair_decision_notifications (delivered_at, last_attempt_at);
     `);
     // Additive and restart-safe for databases created by older daemons.
-    const decisionColumns = this.#db.prepare('PRAGMA table_info(task_pair_decisions)').all() as Array<{ name: string }>;
-    if (!decisionColumns.some((column) => column.name === 'details_json')) {
-      try { this.#db.exec('ALTER TABLE task_pair_decisions ADD COLUMN details_json TEXT'); }
-      catch (error) {
-        const columns = this.#db.prepare('PRAGMA table_info(task_pair_decisions)').all() as Array<{ name: string }>;
-        if (!columns.some((column) => column.name === 'details_json')) throw error;
-      }
+    this.#ensureColumn('task_pair_decisions', 'details_json', 'TEXT');
+    this.#ensureColumn('task_pairs', 'authority_json', 'TEXT');
+    this.#ensureColumn('task_pair_decision_notifications', 'authority_json', 'TEXT');
+  }
+
+  #ensureColumn(table: 'task_pairs' | 'task_pair_decisions' | 'task_pair_decision_notifications', column: string, definition: string): void {
+    const columns = this.#db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some((entry) => entry.name === column)) return;
+    try {
+      this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    } catch (error) {
+      const rechecked = this.#db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!rechecked.some((entry) => entry.name === column)) throw error;
     }
   }
 
@@ -649,11 +668,18 @@ export class TaskPairStore {
     legacyTaskId?: string;
     /** Lifecycle marker receipt and its state transition commit together. */
     event?: TaskPairEventRecord;
+    authority?: TaskPairAuthorityContext;
+    allowOwnerOverride?: boolean;
   } = {}): StoredTaskPair {
     const existing = this.getPair(project, state.taskId);
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();
     const legacyTaskId = options.legacyTaskId ?? existing?.legacyTaskId;
+    const authorityJson = options.authority !== undefined
+      ? serializeTaskPairAuthority(
+          mergePairAuthority(existing?.authority, options.authority, { allowOwnerOverride: options.allowOwnerOverride }),
+        )
+      : null;
     const titleState = `CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') IS NOT NULL
       THEN json_set(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}'))
       ELSE json_remove(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') END`;
@@ -662,8 +688,8 @@ export class TaskPairStore {
     let saved: Record<string, unknown>;
     try {
       const row = this.#db.prepare(`
-      INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, updated_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, authority_json, updated_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE ? IS NULL OR EXISTS (SELECT 1 FROM task_pairs WHERE project = ? AND task_id = ? AND state_json = ?)
       ON CONFLICT (project, task_id) DO UPDATE SET
         status = excluded.status, brain = excluded.brain, executor = excluded.executor, auditor = excluded.auditor,
@@ -672,12 +698,14 @@ export class TaskPairStore {
         state_json = CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}') IS NOT NULL
           THEN json_set(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}'))
           ELSE json_remove(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}') END,
-        liveness_json = excluded.liveness_json, updated_at = excluded.updated_at
+        liveness_json = excluded.liveness_json,
+        authority_json = COALESCE(excluded.authority_json, task_pairs.authority_json),
+        updated_at = excluded.updated_at
       WHERE task_pairs.state_json = ?
       RETURNING *
     `).get(
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
-      queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
+      queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), authorityJson, state.updatedAt,
       expected, project, state.taskId, expected, expected,
     ) as Record<string, unknown> | undefined;
       if (!row || (options.event && !this.recordEvent(options.event))) {
@@ -696,6 +724,28 @@ export class TaskPairStore {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
     return rowToPair(saved);
+  }
+
+  /**
+   * Persist or refresh internal machine authority without triggering a public
+   * supervision-console snapshot broadcast or mutating pair state.
+   */
+  savePairAuthority(
+    project: string,
+    taskId: string,
+    authority: TaskPairAuthorityContext | undefined,
+    options?: { allowOwnerOverride?: boolean },
+  ): StoredTaskPair | undefined {
+    if (!authority) return this.getPair(project, taskId);
+    const existing = this.getPair(project, taskId);
+    if (!existing) return undefined;
+    const merged = mergePairAuthority(existing.authority, authority, options);
+    const nextJson = serializeTaskPairAuthority(merged);
+    if (nextJson === serializeTaskPairAuthority(existing.authority)) return existing;
+    this.#db.prepare('UPDATE task_pairs SET authority_json = ? WHERE project = ? AND task_id = ?')
+      .run(nextJson, project, taskId);
+    this.#refreshIndexEntry(project, taskId);
+    return this.getPair(project, taskId);
   }
 
   /** Atomic metadata patch: never replace lifecycle, liveness or another MCP writer's unrelated fields. */
@@ -889,8 +939,9 @@ export class TaskPairStore {
 
   enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification & { inserted: boolean } {
     const id = `${input.decisionId}:${input.target}`;
-    const result = this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
-      id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text,
+    const authorityJson = serializeTaskPairAuthority(input.authority);
+    const result = this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, authority_json, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`).run(
+      id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text, authorityJson,
     );
     const row = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE id = ?').get(id) as Record<string, unknown>;
     return Object.assign(decisionNotificationFromRow(row), { inserted: result.changes > 0 });
@@ -1026,6 +1077,7 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.decisionLastAt)) ? { decisionLastAt: Number(raw.decisionLastAt) } : {}),
     ...(Number.isFinite(Number(raw.decisionReminderAt)) ? { decisionReminderAt: Number(raw.decisionReminderAt) } : {}),
   };
+  const authority = parseTaskPairAuthority(row.authority_json);
   return {
     project: String(row.project),
     revision: String(row.state_json),
@@ -1033,6 +1085,7 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     liveness,
     queueOrder: Number(row.queue_order),
     ...(row.legacy_task_id ? { legacyTaskId: String(row.legacy_task_id) } : {}),
+    ...(authority ? { authority } : {}),
   };
 }
 
@@ -1056,11 +1109,13 @@ function decisionFromRow(row: Record<string, unknown>): TaskPairDecisionRecord {
 }
 
 function decisionNotificationFromRow(row: Record<string, unknown>): TaskPairDecisionNotification {
+  const authority = parseTaskPairAuthority(row.authority_json);
   return {
     id: String(row.id), project: String(row.project), taskId: String(row.task_id), decisionId: String(row.decision_id),
     target: String(row.target), reason: String(row.reason), text: String(row.text), attempts: Number(row.attempts ?? 0),
     ...(row.last_attempt_at != null ? { lastAttemptAt: Number(row.last_attempt_at) } : {}),
     ...(row.delivered_at != null ? { deliveredAt: Number(row.delivered_at) } : {}),
+    ...(authority ? { authority } : {}),
   };
 }
 

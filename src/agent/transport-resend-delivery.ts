@@ -69,7 +69,6 @@ function canUseNativeAppend(entry: ResendEntry): boolean {
     && !entry.messagePreamble
     && !entry.registeredSystemContract
     && !entry.sharedMachineAuthority
-    && !entry.ownerMachineAuthority
     && !entry.historyCommitted
     && (entry.attachments?.length ?? 0) === 0;
 }

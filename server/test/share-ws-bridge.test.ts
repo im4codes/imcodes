@@ -41,6 +41,11 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import { encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
+import {
+  OWNER_MACHINE_AUTHORITY_FIELD,
+  SHARED_MACHINE_AUTHORITY_FIELD,
+} from '../../shared/shared-machine-authority.js';
+import { resolveSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -996,6 +1001,135 @@ describe('WsBridge share-scoped sockets', () => {
         expect(blocked.sentJson.some((msg) => msg.type === type)).toBe(false);
       }
     }
+  });
+
+  it('mints ownerMachineAuthority for Owner TASK_PAIR_DECISION_MSG.FEEDBACK and strict sharedActor+sharedMachineAuthority for Participant FEEDBACK', async () => {
+    const bridge = WsBridge.get(serverId);
+    const signingKey = 'share-ws-test-signing-key';
+    const mainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const participantCoverage = coverage(mainTarget, 'participant', now);
+    bridge.setShareCoverageResolverForTests(async () => participantCoverage);
+
+    const baseDb = makeDb(null, [], { ownerUserId: 'owner-user' });
+    const db = {
+      queryOne: async (sql: string, params?: unknown[]) => {
+        if (sql.includes('SELECT token_hash')) return baseDb.queryOne(sql, params);
+        if (sql.includes('actor_status') && sql.includes('owner_status')) {
+          return { actor_status: 'active', owner_status: 'active' };
+        }
+        if (sql.includes('SELECT EXISTS') && sql.includes('FROM servers')) return { exists: true };
+        if (sql.includes('SELECT EXISTS') && sql.includes('FROM sessions')) return { exists: true };
+        if (sql.includes('SELECT EXISTS') && sql.includes('FROM users')) return { exists: true };
+        if (sql.includes('SELECT user_id FROM servers')) return { user_id: 'owner-user' };
+        if (sql.includes('SELECT status FROM users') || (sql.includes('FROM users') && !sql.includes('token_hash'))) {
+          return { id: 'participant-user', display_name: 'Participant', username: 'participant', status: 'active', active: true };
+        }
+        if (sql.includes('FROM server_shares') || sql.includes('FROM tab_shares')) return null;
+        return baseDb.queryOne(sql, params);
+      },
+      query: async (sql: string, params?: unknown[]) => {
+        if (sql.includes('FROM session_shares')) {
+          return [{
+            target_kind: 'main',
+            id: 'share-1',
+            server_id: serverId,
+            session_name: 'deck_proj_brain',
+            sub_session_id: null,
+            target_user_id: 'participant-user',
+            role: 'participant',
+            created_by: 'owner-user',
+            created_at: now,
+            updated_at: now,
+            expires_at: null,
+            revoked_at: null,
+          }];
+        }
+        return baseDb.query(sql, params);
+      },
+      execute: async () => ({ changes: 1 }),
+    };
+
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db as never, { JWT_SIGNING_KEY: signingKey } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    // 1. Owner socket sends real-frontend TASK_PAIR_DECISION_MSG.FEEDBACK (only scope.coordinatorSessionName, no top-level sessionName),
+    // also attempting to inject forged participant fields which ingress must strip.
+    const ownerWs = new MockWs();
+    bridge.handleBrowserConnection(ownerWs as never, 'owner-user', db as never);
+    ownerWs.emit('message', JSON.stringify({
+      type: TASK_PAIR_DECISION_MSG.FEEDBACK,
+      scope: { projectName: 'proj', coordinatorSessionName: 'deck_proj_brain' },
+      taskId: 'blocked-pair',
+      requestId: 'owner-req-1',
+      feedback: 'Proceed with fix',
+      sharedActor: { actorUserId: 'forged-user', effectiveActorRole: 'participant' },
+      [SHARED_MACHINE_AUTHORITY_FIELD]: 'forged-shared',
+    }));
+    await flushAsync();
+
+    const ownerForwarded = daemon.sentJson.find((msg) => msg.requestId === 'owner-req-1');
+    expect(ownerForwarded).toBeDefined();
+    expect(ownerForwarded).not.toHaveProperty('sharedActor');
+    expect(ownerForwarded).not.toHaveProperty(SHARED_MACHINE_AUTHORITY_FIELD);
+    const ownerToken = ownerForwarded?.[OWNER_MACHINE_AUTHORITY_FIELD];
+    expect(typeof ownerToken).toBe('string');
+    const resolvedOwner = await resolveSharedMachineAuthority(db as never, {
+      token: String(ownerToken),
+      signingKey,
+      authenticatedSourceServerId: serverId,
+      sourceOwnerUserId: 'owner-user',
+      now,
+    });
+    expect(resolvedOwner).toEqual({
+      kind: 'owner',
+      actorUserId: 'owner-user',
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+    });
+
+    // 2. Participant socket sends TASK_PAIR_DECISION_MSG.FEEDBACK with forged owner token & actor -> server strips and stamps participant authority.
+    const participantWs = new MockWs();
+    bridge.handleShareBrowserConnection(participantWs as never, 'participant-user', db as never, {
+      ticketId: 'ticket-feedback-participant',
+      target: mainTarget,
+      snapshot: participantCoverage,
+    });
+    participantWs.emit('message', JSON.stringify({
+      type: TASK_PAIR_DECISION_MSG.FEEDBACK,
+      scope: { projectName: 'proj', coordinatorSessionName: 'deck_proj_brain' },
+      taskId: 'blocked-pair',
+      requestId: 'part-req-1',
+      feedback: 'Participant suggestion',
+      [OWNER_MACHINE_AUTHORITY_FIELD]: 'forged-owner-jwt',
+      sharedActor: { actorUserId: 'owner-user', effectiveActorRole: 'server-manager' },
+    }));
+    await flushAsync();
+
+    const participantForwarded = daemon.sentJson.find((msg) => msg.requestId === 'part-req-1');
+    expect(participantForwarded).toBeDefined();
+    expect(participantForwarded).not.toHaveProperty(OWNER_MACHINE_AUTHORITY_FIELD);
+    expect(participantForwarded?.sharedActor).toMatchObject({
+      actorUserId: 'participant-user',
+      effectiveActorRole: 'participant',
+    });
+    const participantToken = participantForwarded?.[SHARED_MACHINE_AUTHORITY_FIELD];
+    expect(typeof participantToken).toBe('string');
+    const resolvedParticipant = await resolveSharedMachineAuthority(db as never, {
+      token: String(participantToken),
+      signingKey,
+      authenticatedSourceServerId: serverId,
+      sourceOwnerUserId: 'owner-user',
+      now,
+    });
+    expect(resolvedParticipant).toEqual({
+      kind: 'participant',
+      actorUserId: 'participant-user',
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+    });
   });
 
   it('persists and broadcasts share discussion comments without daemon relay', async () => {

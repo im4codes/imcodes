@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { getSession } from '../../store/session-store.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import { getTransportRuntime } from '../../agent/session-manager.js';
-import { dispatchSessionMessage } from '../session-dispatch.js';
+import { dispatchSessionMessage, type SessionDispatchActorOption } from '../session-dispatch.js';
 import { createSendDispatchId, type SendMessageId } from '../../../shared/send-message-id.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
 import {
@@ -26,6 +26,11 @@ import {
   isTerminalTaskPairStatus,
   type TaskPairDeliveryResult,
 } from '../../../shared/task-pair.js';
+import {
+  resolveAggregatePairAuthority,
+  toSessionDispatchActorOption,
+  type TaskPairAuthorityContext,
+} from './authority.js';
 import { recordBrainNoticeOutcome } from './brain-notice.js';
 import { getTaskPairStore } from './store.js';
 import { noteTaskPairFocus, resetTaskPairFocusForTests, taskPairFocusOf } from './focus.js';
@@ -53,7 +58,7 @@ export function hasPendingTaskPairMessage(sessionName: string, taskId: string, r
 export { noteTaskPairFocus, taskPairFocusOf, resetTaskPairFocusForTests };
 
 export interface TaskPairDeliveryDeps {
-  send?: (target: string, text: string, messageId: string) => Promise<void>;
+  send?: (target: string, text: string, messageId: string, actorOption?: SessionDispatchActorOption) => Promise<void>;
 }
 
 let testDeps: TaskPairDeliveryDeps | undefined;
@@ -77,6 +82,39 @@ export function resetTaskPairDeliveryInFlightForTests(): void {
   inFlightTaskPairMessages.clear();
 }
 
+function resolveTaskPairDeliveryAuthority(
+  target: string,
+  taskId: string,
+  bindings: readonly TaskPairWakeBinding[],
+  authorityOverride?: TaskPairAuthorityContext,
+): TaskPairAuthorityContext | undefined {
+  if (authorityOverride) return authorityOverride;
+  const store = getTaskPairStore();
+  if (taskId.startsWith('__')) {
+    const fromBindings = bindings.map((binding) => store.getPair(binding.project, binding.taskId)?.authority);
+    if (fromBindings.some(Boolean)) return resolveAggregatePairAuthority(fromBindings);
+    const activeBrainPairs = store.pairsForSession(target).filter((pair) => pair.state.brain === target);
+    if (activeBrainPairs.length > 0) {
+      return resolveAggregatePairAuthority(activeBrainPairs.map((pair) => pair.authority));
+    }
+    const targetProject = getSession(target)?.projectName;
+    if (targetProject) {
+      const donePairs = store.listRecentDonePairs(Date.now() - 14 * 86_400_000, 100)
+        .filter((pair) => pair.state.brain === target && pair.project === targetProject);
+      if (donePairs.length > 0) return resolveAggregatePairAuthority(donePairs.map((pair) => pair.authority));
+    }
+    return undefined;
+  }
+  const activeMatch = store.pairsForSession(target).find((pair) => pair.state.taskId === taskId);
+  if (activeMatch) return activeMatch.authority;
+  const targetProject = getSession(target)?.projectName;
+  if (targetProject) {
+    const stored = store.getPair(targetProject, taskId);
+    if (stored) return stored.authority;
+  }
+  return store.listActivePairs().find((pair) => pair.state.taskId === taskId)?.authority;
+}
+
 export async function sendTaskPairMessage(
   target: string,
   taskId: string,
@@ -84,8 +122,9 @@ export async function sendTaskPairMessage(
   text: string,
   dedupeScope?: string,
   wakeBindings?: TaskPairWakeBinding[],
+  authorityOverride?: TaskPairAuthorityContext,
 ): Promise<TaskPairDeliveryResult> {
-  const result = await deliverTaskPairMessage(target, taskId, reason, text, dedupeScope, wakeBindings);
+  const result = await deliverTaskPairMessage(target, taskId, reason, text, dedupeScope, wakeBindings, authorityOverride);
   // Brain's side of a pair: remember what became of the notice. Aggregate
   // notices (`__...` ids) name no single pair; their senders record per pair.
   if (!taskId.startsWith('__')) {
@@ -103,6 +142,7 @@ async function deliverTaskPairMessage(
   text: string,
   dedupeScope?: string,
   wakeBindings?: TaskPairWakeBinding[],
+  authorityOverride?: TaskPairAuthorityContext,
 ): Promise<TaskPairDeliveryResult> {
   const bindings = wakeBindings ?? pairWakeBindings(target, taskId);
   if (!pairWakeAllowed(bindings, reason, target)) return 'suspended';
@@ -136,6 +176,8 @@ async function deliverTaskPairMessage(
       store.saveLiveness(stored.project, taskId, liveness);
     }
   }
+  const resolvedAuthority = resolveTaskPairDeliveryAuthority(target, taskId, bindings, authorityOverride);
+  const actorOption = toSessionDispatchActorOption(resolvedAuthority);
   if (testDeps?.send) {
     inFlightTaskPairMessages.add(dedupeKey);
     try {
@@ -144,7 +186,7 @@ async function deliverTaskPairMessage(
       // cannot leak a pending key into the next test's fresh dependency
       // instance.  The real transport path below retains the await-backed
       // gate, which is the production concurrency protection.
-      const send = testDeps.send(target, text, messageId);
+      const send = testDeps.send(target, text, messageId, actorOption);
       inFlightTaskPairMessages.delete(dedupeKey);
       await send;
       return 'sent';
@@ -177,6 +219,7 @@ async function deliverTaskPairMessage(
       deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       suppressTimeline: true,
       messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      ...actorOption,
     });
     return result === 'queued' ? 'queued' : 'sent';
   } catch (error) {
