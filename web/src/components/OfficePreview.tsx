@@ -13,6 +13,7 @@ import {
   type OnlyOfficeConfigResponse,
 } from '../api.js';
 import { loadOnlyOfficeScript } from '../onlyoffice-preload.js';
+import { scaledCssFontPx } from '../global-font.js';
 
 export { loadOnlyOfficeScript };
 
@@ -152,7 +153,7 @@ function PdfPreview({ data }: { data: ArrayBuffer }) {
       if (cancelled || generation !== renderGeneration) return;
       if (pdfDoc.numPages > maxPages) {
         const note = document.createElement('div');
-        note.style.cssText = 'text-align:center;color:#64748b;padding:12px;font-size:12px';
+        note.style.cssText = `text-align:center;color:#64748b;padding:12px;font-size:${scaledCssFontPx(12)}`;
         note.textContent = `Showing ${maxPages} of ${pdfDoc.numPages} pages`;
         container.appendChild(note);
       }

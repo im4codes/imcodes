@@ -110,6 +110,9 @@ import {
   type ChatPathDownloadHandler,
 } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
+import { scaledCssFontPx, CHAT_FONT_SIZE_VAR } from '../global-font.js';
+import { shouldUseIosMacTextScale } from '../native-platform.js';
+import { subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_MESSAGE_PIN_PREVIEW_MODE, PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
@@ -4641,9 +4644,24 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // because each machine's display, OS font availability, and viewing
   // distance differ. Surfaced via the title-bar dropdown on every platform
   // — phones included — so users can pick the font that reads best for them.
-  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  const [iosMacTextScale, setIosMacTextScale] = useState(() => shouldUseIosMacTextScale());
+  useEffect(() => {
+    const sync = () => setIosMacTextScale(shouldUseIosMacTextScale());
+    sync();
+    return subscribeDeviceLayoutChange(sync, { includeResize: false });
+  }, []);
+  const effectiveDefaultChatFont = useMemo(
+    () => (iosMacTextScale ? { ...DEFAULT_CHAT_FONT, size: 16 } : DEFAULT_CHAT_FONT),
+    [iosMacTextScale],
+  );
+  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', effectiveDefaultChatFont);
+  const scaledChatFontSize = scaledCssFontPx(chatFontPrefs.size);
   const chatFontStyle = !preview
-    ? { fontSize: `${chatFontPrefs.size}px`, fontFamily: chatFontPrefs.family }
+    ? ({
+        fontSize: scaledChatFontSize,
+        fontFamily: chatFontPrefs.family,
+        [CHAT_FONT_SIZE_VAR]: scaledChatFontSize,
+      } as h.JSX.CSSProperties)
     : undefined;
   const historySteps = useMemo(() => {
     if (!historyStatus || historyStatus.phase === 'idle') return [];

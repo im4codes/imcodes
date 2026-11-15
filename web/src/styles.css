@@ -336,12 +336,12 @@ html.native-ios-mac .chat-user,
 html.native-ios-mac .chat-assistant,
 html.native-ios-mac .chat-rich-text,
 html.native-ios-mac .chat-bubble-content {
-  font-size: 16px;
+  font-size: var(--imcodes-chat-font-size, 16px);
 }
 html.native-ios-mac .chat-tool,
 html.native-ios-mac .chat-tool-name,
 html.native-ios-mac .chat-tool-input {
-  font-size: 15px;
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 16px) - 1px));
 }
 html.native-ios-mac .chat-tool-activity,
 html.native-ios-mac .chat-tool-activity-label,
@@ -363,7 +363,7 @@ html.native-ios-mac .chat-file-change-title,
 html.native-ios-mac .chat-file-change-path,
 html.native-ios-mac .chat-file-change-diff-pre,
 html.native-ios-mac .chat-snapshot-content {
-  font-size: 13px;
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 16px) - 3px));
 }
 html.native-ios-mac .chat-tool-chooser-subtitle,
 html.native-ios-mac .chat-tool-chooser-btn-hint,
@@ -22188,7 +22188,7 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
   html[data-native-platform="android"] .chat-user,
   html[data-native-platform="android"] .chat-assistant,
   html[data-native-platform="android"] .chat-bubble-content {
-    font-size: 13.5px;
+    font-size: var(--imcodes-chat-font-size, 13.5px);
     line-height: 1.45;
   }
 }

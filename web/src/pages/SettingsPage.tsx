@@ -30,6 +30,12 @@ import { GuidePage } from './GuidePage.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
 import { KeyboardShortcutsSection } from '../components/KeyboardShortcutsSection.js';
 import type { KeyboardShortcutOverrides } from '../keyboard-shortcuts.js';
+import {
+  formatGlobalFontDelta,
+  MAX_GLOBAL_FONT_DELTA,
+  MIN_GLOBAL_FONT_DELTA,
+  useGlobalFontDelta,
+} from '../global-font.js';
 
 interface PushServerItem {
   id: string;
@@ -76,6 +82,7 @@ export function SettingsPage({
   onUserAuthUpdated,
 }: Props) {
   const { t } = useTranslation();
+  const [globalFontDelta, setGlobalFontDelta] = useGlobalFontDelta();
 
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -545,6 +552,58 @@ export function SettingsPage({
               aria-labelledby="settings-tab-profile"
               aria-label={t('settings.tab_profile')}
             >
+              <div class="settings-card" data-testid="settings-global-font-size">
+                <h2 class="settings-card-heading">
+                  {t('settings.appearance_title', { defaultValue: 'Appearance' })}
+                </h2>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                  <div style={{ minWidth: 0, flex: '1 1 180px' }}>
+                    <div style={inlineLabelStyle}>{t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}</div>
+                    <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.45 }}>
+                      {t('settings.global_font_size_desc', { defaultValue: 'Adjusts font size across the entire app (+1 / -1 px).' })}
+                    </div>
+                  </div>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                    <button
+                      type="button"
+                      class="settings-btn-secondary"
+                      onClick={() => setGlobalFontDelta((prev) => prev - 1)}
+                      disabled={globalFontDelta <= MIN_GLOBAL_FONT_DELTA}
+                      aria-label={t('chat.font.globalDecrease', { defaultValue: 'Decrease global font size' })}
+                      style={{ minWidth: 32, padding: '6px 10px' }}
+                    >
+                      −
+                    </button>
+                    <span
+                      data-testid="settings-global-font-delta-readout"
+                      style={{ minWidth: 42, textAlign: 'center', fontVariantNumeric: 'tabular-nums', fontSize: '14px', fontWeight: 600, color: '#e2e8f0' }}
+                    >
+                      {formatGlobalFontDelta(globalFontDelta)}
+                    </span>
+                    <button
+                      type="button"
+                      class="settings-btn-secondary"
+                      onClick={() => setGlobalFontDelta((prev) => prev + 1)}
+                      disabled={globalFontDelta >= MAX_GLOBAL_FONT_DELTA}
+                      aria-label={t('chat.font.globalIncrease', { defaultValue: 'Increase global font size' })}
+                      style={{ minWidth: 32, padding: '6px 10px' }}
+                    >
+                      +
+                    </button>
+                    {globalFontDelta !== 0 && (
+                      <button
+                        type="button"
+                        class="settings-btn-secondary"
+                        onClick={() => setGlobalFontDelta(0)}
+                        style={{ padding: '6px 10px', fontSize: '12px' }}
+                      >
+                        {t('chat.font.globalReset', { defaultValue: 'Reset' })}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
               <div class="settings-card">
                 <h2 class="settings-card-heading">
                   {t('settings.account_identity')}

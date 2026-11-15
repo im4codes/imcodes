@@ -1,8 +1,26 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import preact from '@preact/preset-vite';
 import path from 'path';
 import { createHash } from 'node:crypto';
 import { remoteDesktopAppManifestPlugin } from './vite-plugin-remote-desktop-app';
+import { transformCssFontSizes } from './src/global-font-css';
+
+function globalFontCssPlugin(): Plugin {
+  const srcRoot = `${path.resolve(__dirname, 'src')}${path.sep}`;
+  return {
+    name: 'imcodes-global-font-css',
+    enforce: 'pre',
+    transform(code, id) {
+      const cleanId = id.split('?')[0] ?? id;
+      if (!cleanId.endsWith('.css')) return null;
+      if (cleanId.includes('node_modules')) return null;
+      if (!cleanId.startsWith(srcRoot)) return null;
+      const next = transformCssFontSizes(code);
+      if (next === code) return null;
+      return { code: next, map: null };
+    },
+  };
+}
 
 // VITE_REGION selects the regional push channel at compile time:
 //   - 'global' (default) — FCM on Android via @capacitor/push-notifications
@@ -24,6 +42,7 @@ export default defineConfig(({ mode }) => ({
     __PUSH_REGION__: JSON.stringify(pushRegion),
   },
   plugins: [
+    globalFontCssPlugin(),
     preact(),
     remoteDesktopAppManifestPlugin(),
     {

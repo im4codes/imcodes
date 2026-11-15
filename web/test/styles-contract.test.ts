@@ -1652,7 +1652,7 @@ describe('styles.css regression contracts', () => {
     const iosMacChatRule = cssWithoutComments.match(
       /html\.native-ios-mac\s+\.chat-user,[\s\S]*?html\.native-ios-mac\s+\.chat-bubble-content\s*\{[^}]*\}/,
     )?.[0];
-    expect(iosMacChatRule).toMatch(/font-size:\s*16px/);
+    expect(iosMacChatRule).toMatch(/font-size:\s*var\(--imcodes-chat-font-size,\s*16px\)/);
 
     const chatUserRule = cssWithoutComments.match(/\n\.chat-user\s*\{[^}]*\}/)?.[0] ?? '';
     expect(chatUserRule).toMatch(/word-break:\s*break-all/);

@@ -15,6 +15,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
+import {
+  formatGlobalFontDelta,
+  MAX_GLOBAL_FONT_DELTA,
+  MIN_GLOBAL_FONT_DELTA,
+  useGlobalFontDelta,
+} from '../global-font.js';
 
 export interface FontPrefs {
   family: string;
@@ -249,6 +255,17 @@ export function useFontPrefs(scope: string, defaults: FontPrefs): [FontPrefs, (n
   defaultsRef.current = defaults;
 
   useEffect(() => {
+    try {
+      if (typeof localStorage !== 'undefined' && localStorage.getItem(STORAGE_PREFIX + scope) !== null) {
+        return;
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+    setPrefs(readFontPrefs(scope, defaultsRef.current));
+  }, [scope, defaults.family, defaults.cjkFamily, defaults.size]);
+
+  useEffect(() => {
     const refresh = () => setPrefs(readFontPrefs(scope, defaultsRef.current));
     const onSameTab = (e: Event) => {
       const detail = (e as CustomEvent<{ scope?: string }>).detail;
@@ -414,6 +431,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [activeTab, setActiveTab] = useState<FontTab>('code');
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const [showAllSystemCJK, setShowAllSystemCJK] = useState(false);
+  const [globalDelta, setGlobalDelta] = useGlobalFontDelta();
   const wrapRef = useRef<HTMLDivElement>(null);
   const latestPrefsRef = useRef(prefs);
   latestPrefsRef.current = prefs;
@@ -454,8 +472,8 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const btnSize = compact ? 22 : 26;
 
   const triggerStyle = {
-    width: btnSize,
-    height: btnSize,
+    minWidth: btnSize,
+    minHeight: btnSize,
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -468,7 +486,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     fontWeight: 600,
     fontFamily: 'system-ui',
     lineHeight: 1,
-    padding: 0,
+    padding: '0 4px',
     transition: 'background 0.12s, border-color 0.12s',
     flexShrink: 0,
   } as const;
@@ -481,7 +499,9 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     // reads naturally left-to-right on both desktop and mobile.
     left: 0,
     zIndex: 80,
-    width: 220,
+    minWidth: 236,
+    width: 'max-content',
+    maxWidth: 'min(92vw, 300px)',
     background: '#1e293b',
     border: '1px solid #334155',
     borderRadius: 8,
@@ -495,7 +515,23 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const sizeRowStyle = {
     display: 'flex',
     alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  } as const;
+
+  const sizeRowLabelStyle = {
+    fontSize: 11,
+    fontWeight: 600,
+    fontFamily: 'system-ui',
+    color: '#cbd5e1',
+    whiteSpace: 'nowrap' as const,
+  } as const;
+
+  const sizeControlsGroupStyle = {
+    display: 'inline-flex',
+    alignItems: 'center',
     gap: 4,
+    flexShrink: 0,
   } as const;
 
   const tabRowStyle = {
@@ -576,8 +612,8 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   } as const;
 
   const sizeBtnStyle = (disabled: boolean) => ({
-    width: 30,
-    height: 26,
+    minWidth: 28,
+    minHeight: 26,
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -585,12 +621,12 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     color: '#e2e8f0',
     border: '1px solid #334155',
     borderRadius: 6,
-    fontSize: 16,
+    fontSize: 15,
     fontFamily: 'system-ui',
     fontWeight: 500,
     cursor: disabled ? 'not-allowed' : 'pointer',
     opacity: disabled ? 0.4 : 1,
-    padding: 0,
+    padding: '2px 6px',
     lineHeight: 1,
   } as const);
 
@@ -635,6 +671,12 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     // on press as well would double-count the later click and commit cancels.
     setSize(delta);
   }, [setSize]);
+
+  const handleGlobalDeltaClick = useCallback((step: number) => (e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setGlobalDelta((prev) => prev + step);
+  }, [setGlobalDelta]);
 
   const pickCodeFamily = (cssValue: string) => {
     const cjkFamily = prefs.cjkFamily ?? DEFAULT_CJK_FAMILY;
@@ -725,28 +767,57 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
       </button>
       {open && (
         <div style={popStyle} role="dialog" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
-          {/* Row 1 — size adjuster (− current +). Always first so the most
-              common adjustment is the closest to the trigger. */}
-          <div style={sizeRowStyle}>
-            <button
-              type="button"
-              onClick={handleSizeClick(-1)}
-              disabled={prefs.size <= MIN_SIZE}
-              aria-label="−"
-              style={sizeBtnStyle(prefs.size <= MIN_SIZE)}
-            >
-              −
-            </button>
-            <div style={sizeReadoutStyle}>{prefs.size}</div>
-            <button
-              type="button"
-              onClick={handleSizeClick(1)}
-              disabled={prefs.size >= MAX_SIZE}
-              aria-label="+"
-              style={sizeBtnStyle(prefs.size >= MAX_SIZE)}
-            >
-              +
-            </button>
+          {/* Row 1 — global UI font size delta (− 0 +), scales all app typography by ±1px per step. */}
+          <div style={sizeRowStyle} role="group" aria-label={t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}>
+            <span style={sizeRowLabelStyle}>{t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}</span>
+            <div style={sizeControlsGroupStyle}>
+              <button
+                type="button"
+                onClick={handleGlobalDeltaClick(-1)}
+                disabled={globalDelta <= MIN_GLOBAL_FONT_DELTA}
+                aria-label={t('chat.font.globalDecrease', { defaultValue: 'Decrease global font size' })}
+                style={sizeBtnStyle(globalDelta <= MIN_GLOBAL_FONT_DELTA)}
+              >
+                −
+              </button>
+              <div style={sizeReadoutStyle} data-testid="global-font-delta-readout">
+                {formatGlobalFontDelta(globalDelta)}
+              </div>
+              <button
+                type="button"
+                onClick={handleGlobalDeltaClick(1)}
+                disabled={globalDelta >= MAX_GLOBAL_FONT_DELTA}
+                aria-label={t('chat.font.globalIncrease', { defaultValue: 'Increase global font size' })}
+                style={sizeBtnStyle(globalDelta >= MAX_GLOBAL_FONT_DELTA)}
+              >
+                +
+              </button>
+            </div>
+          </div>
+          {/* Row 2 — chat message font size adjuster (− current +). */}
+          <div style={sizeRowStyle} role="group" aria-label={t('chat.font.chatSizeLabel', { defaultValue: 'Chat size' })}>
+            <span style={sizeRowLabelStyle}>{t('chat.font.chatSizeLabel', { defaultValue: 'Chat size' })}</span>
+            <div style={sizeControlsGroupStyle}>
+              <button
+                type="button"
+                onClick={handleSizeClick(-1)}
+                disabled={prefs.size <= MIN_SIZE}
+                aria-label="−"
+                style={sizeBtnStyle(prefs.size <= MIN_SIZE)}
+              >
+                −
+              </button>
+              <div style={sizeReadoutStyle} data-testid="chat-font-size-readout">{prefs.size}</div>
+              <button
+                type="button"
+                onClick={handleSizeClick(1)}
+                disabled={prefs.size >= MAX_SIZE}
+                aria-label="+"
+                style={sizeBtnStyle(prefs.size >= MAX_SIZE)}
+              >
+                +
+              </button>
+            </div>
           </div>
           <div style={tabRowStyle} role="tablist" aria-label={t('chat.font.typeLabel', { defaultValue: 'Font type' })}>
             <button

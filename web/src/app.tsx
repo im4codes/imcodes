@@ -129,6 +129,7 @@ import {
   type UnifiedServerItem,
 } from './unified-server-projection.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
+import { applyGlobalFontDelta, useGlobalFontDelta } from './global-font.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
@@ -924,6 +925,10 @@ function InternalMainApp() {
   useEffect(() => {
     applyGlobalFontPrefs(globalFontPrefs);
   }, [globalFontPrefs.family, globalFontPrefs.cjkFamily]);
+  const [globalFontDelta] = useGlobalFontDelta();
+  useEffect(() => {
+    applyGlobalFontDelta(globalFontDelta);
+  }, [globalFontDelta]);
   const [auth, setAuth] = useState<AuthState | null>(() => {
     try {
       const raw = localStorage.getItem('rcc_auth');

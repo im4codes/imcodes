@@ -9,6 +9,7 @@ import type { TerminalDiff } from '../types.js';
 import type { TerminalDiffRegistration } from '../terminal-diff-registry.js';
 import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
 import { isMobileDevice, subscribeDeviceLayoutChange } from '../mobile-device.js';
+import { useGlobalFontDelta } from '../global-font.js';
 import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { applyDiffToRows, fullFrameWriteFromDiff, isRenderableLineIndex, resolveDiffRows } from '../terminal-frame.js';
 
@@ -163,6 +164,9 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   const [showScrollbar, setShowScrollbar] = useState(false);
   const [recoveryError, setRecoveryError] = useState(false);
   const [useIosMacTextScale, setUseIosMacTextScale] = useState(() => shouldUseIosMacTextScale());
+  const [globalFontDelta] = useGlobalFontDelta();
+  const globalFontDeltaRef = useRef(globalFontDelta);
+  globalFontDeltaRef.current = globalFontDelta;
 
   useEffect(() => {
     const syncPlatform = () => {
@@ -172,7 +176,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       setUseIosMacTextScale((prev) => (prev === nextScale ? prev : nextScale));
       const term = termRef.current;
       if (term) {
-        term.options.fontSize = nextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13;
+        const baseFontSize = nextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13;
+        term.options.fontSize = Math.max(8, baseFontSize + globalFontDeltaRef.current);
         term.options.lineHeight = nextScale ? 1.45 : 1.4;
         term.options.disableStdin = nextMobile && !mobileInput;
         fitRef.current?.fit();
@@ -180,7 +185,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     };
     syncPlatform();
     return subscribeDeviceLayoutChange(syncPlatform, { includeResize: false });
-  }, [mobileInput]);
+  }, [mobileInput, globalFontDelta]);
 
   const clearRawFlushTimer = useCallback(() => {
     if (rawFlushTimerRef.current) {
@@ -320,7 +325,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         selectionBackground: '#1d4ed860',
       },
       fontFamily: "'Cascadia Code', 'Fira Code', 'SF Mono', monospace",
-      fontSize: useIosMacTextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13,
+      fontSize: Math.max(8, (useIosMacTextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13) + globalFontDeltaRef.current),
       lineHeight: useIosMacTextScale ? 1.45 : 1.4,
       convertEol: true,
       scrollback: preview ? 2000 : 5000,

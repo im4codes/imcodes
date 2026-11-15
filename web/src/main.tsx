@@ -9,7 +9,8 @@ import {
   REMOTE_DESKTOP_NATIVE_STEP_UP_PATH,
   RemoteDesktopNativeStepUp,
 } from './pages/RemoteDesktopNativeStepUp.js';
-import { applyNativePlatformClasses } from './native-platform.js';
+import { applyNativePlatformClasses, NATIVE_HOST_EVENT } from './native-platform.js';
+import { initGlobalFontScale } from './global-font.js';
 import {
   isRemoteDesktopWallWindow,
   readRemoteDesktopWindowServerId,
@@ -46,6 +47,10 @@ marked.use({
 });
 
 applyNativePlatformClasses();
+initGlobalFontScale();
+window.addEventListener(NATIVE_HOST_EVENT, () => {
+  applyNativePlatformClasses();
+});
 
 // The installable remote desktop app (`/remote-desktop/app/`) reuses the two standalone-window screens: the machine wall, or the one
 // machine a `?machine=` deep link names. The manifest link is added here so an installed app's own start page keeps it up to date.

@@ -8,7 +8,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
     var window: UIWindow?
     private var didRegisterLocalPlugins = false
-    private var didConfigureWebViewChrome = false
+    private var configuredWebViewId: ObjectIdentifier?
     private static let macDesignedForIpadPageZoom: CGFloat = 1.0 / 0.77
     // #080d16 (--chrome-bg) — prevents light/black host flashes during macOS Space transitions.
     private static let macHostBackgroundColor = UIColor(red: 8.0 / 255.0, green: 13.0 / 255.0, blue: 22.0 / 255.0, alpha: 1.0)
@@ -189,9 +189,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             didRegisterLocalPlugins = true
         }
 
-        if !didConfigureWebViewChrome, let webView = bridge.webView {
-            configureInputChrome(webView)
-            didConfigureWebViewChrome = true
+        if let webView = bridge.webView {
+            let webViewId = ObjectIdentifier(webView)
+            if configuredWebViewId != webViewId {
+                configureInputChrome(webView)
+                configuredWebViewId = webViewId
+            } else {
+                refreshMacPageZoomAndHostSignal(webView)
+            }
         }
     }
 
@@ -261,16 +266,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     /// itself. This used to run only for the iOS-app-on-Mac idiom, but the
     /// exact same bar shows up identically on a real iPhone/iPad, so it now
     /// always runs.
-    private func configureInputChrome(_ webView: WKWebView?) {
-        self.configureMacHostAppearance(webView: webView)
+    private func buildNativeHostSignalScript() -> (script: String, pageZoomApplied: Bool) {
         let hostFlags = Self.currentMacHostFlags()
-        var pageZoomApplied = false
-        if #available(iOS 14.0, *), hostFlags.needsDesignedForIpadPageZoom, let webView = webView {
-            // macOS "Designed for iPad" scales UIKit points by 0.77x; compensating at the
-            // WKWebView level keeps desktop typography, icons, and layout parity 1:1.
-            webView.pageZoom = Self.macDesignedForIpadPageZoom
-            pageZoomApplied = true
-        }
+        let pageZoomApplied = hostFlags.needsDesignedForIpadPageZoom
         let scaleMode: String
         if !hostFlags.isMacDesktop {
             scaleMode = "none"
@@ -299,14 +297,48 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         ]
         if let hostData = try? JSONSerialization.data(withJSONObject: hostPayload),
            let hostJson = String(data: hostData, encoding: .utf8) {
-            scripts.append("window.__IMCODES_NATIVE_HOST__ = \(hostJson);")
-            scripts.append("window.dispatchEvent(new CustomEvent('imcodes:native-host'));")
+            scripts.append("""
+            (function(){
+              var next = \(hostJson);
+              var prev = window.__IMCODES_NATIVE_HOST__;
+              window.__IMCODES_NATIVE_HOST__ = next;
+              if (!prev || prev.isMacDesktop !== next.isMacDesktop || prev.pageZoomApplied !== next.pageZoomApplied || prev.scaleMode !== next.scaleMode) {
+                window.dispatchEvent(new CustomEvent('imcodes:native-host'));
+              }
+            })();
+            """)
         }
-        if !scripts.isEmpty {
-            let combinedScript = scripts.joined(separator: "\n")
-            let userScript = WKUserScript(source: combinedScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        return (scripts.joined(separator: "\n"), pageZoomApplied)
+    }
+
+    private func refreshMacPageZoomAndHostSignal(_ webView: WKWebView) {
+        self.configureMacHostAppearance(webView: webView)
+        let hostFlags = Self.currentMacHostFlags()
+        if #available(iOS 14.0, *), hostFlags.needsDesignedForIpadPageZoom,
+           abs(webView.pageZoom - Self.macDesignedForIpadPageZoom) > 0.001 {
+            // macOS "Designed for iPad" scales UIKit points by 0.77x; compensating at the
+            // WKWebView level keeps desktop typography, icons, and layout parity 1:1.
+            webView.pageZoom = Self.macDesignedForIpadPageZoom
+        }
+        let signal = buildNativeHostSignalScript()
+        if !signal.script.isEmpty {
+            webView.evaluateJavaScript(signal.script, completionHandler: nil)
+        }
+    }
+
+    private func configureInputChrome(_ webView: WKWebView?) {
+        self.configureMacHostAppearance(webView: webView)
+        let hostFlags = Self.currentMacHostFlags()
+        if #available(iOS 14.0, *), hostFlags.needsDesignedForIpadPageZoom, let webView = webView {
+            // macOS "Designed for iPad" scales UIKit points by 0.77x; compensating at the
+            // WKWebView level keeps desktop typography, icons, and layout parity 1:1.
+            webView.pageZoom = Self.macDesignedForIpadPageZoom
+        }
+        let signal = buildNativeHostSignalScript()
+        if !signal.script.isEmpty {
+            let userScript = WKUserScript(source: signal.script, injectionTime: .atDocumentStart, forMainFrameOnly: true)
             webView?.configuration.userContentController.addUserScript(userScript)
-            webView?.evaluateJavaScript(combinedScript, completionHandler: nil)
+            webView?.evaluateJavaScript(signal.script, completionHandler: nil)
         }
         guard #available(iOS 14.0, *) else { return }
         webView?.inputAssistantItem.leadingBarButtonGroups = []
