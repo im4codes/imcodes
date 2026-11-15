@@ -1140,4 +1140,148 @@ describe('imcodes cloud-docs CLI', () => {
     const segments = splitTextByCloudDocQuoteTags(`已重命名为 ${trickyJson.citation}，请查看 ${trickyJson.citation}。`);
     expect(segments.filter((s) => s.type === 'cloud_doc')).toHaveLength(2);
   });
+
+  it('emits source [CloudDoc: ... | id=...] and data.citation while preserving savedTo across read --convert-to, convert --out, download --out, and --no-save', async () => {
+    const authEnv = {
+      IMCODES_SERVER_URL: baseUrl,
+      IMCODES_SERVER_ID: 'srv-export',
+      IMCODES_TOKEN: 'tok-export',
+    };
+    const pdfBytes = Buffer.from('%PDF-export-test', 'utf8');
+
+    // 1. read --convert-to without --out
+    responder = () => ({
+      json: {
+        fileName: 'Report.pdf',
+        mimeType: 'application/pdf',
+        bytesWritten: pdfBytes.length,
+        bytesBase64: pdfBytes.toString('base64'),
+      },
+    });
+    const readConvNoOutText = await runCloudDocsCli(['read', 'cdoc_src_1', '--convert-to', 'pdf'], { env: authEnv });
+    expect(readConvNoOutText.exitCode).toBe(0);
+    expect(readConvNoOutText.stdout).toContain('[CloudDoc: Report.pdf | id=cdoc_src_1]');
+    const readConvNoOutJson = await runCloudDocsCli(['read', 'cdoc_src_1', '--convert-to', 'pdf', '--json'], { env: authEnv });
+    expect(readConvNoOutJson.exitCode).toBe(0);
+    expect(JSON.parse(readConvNoOutJson.stdout).citation).toBe('[CloudDoc: Report.pdf | id=cdoc_src_1]');
+
+    // 2. read --convert-to --out (with doc metadata overriding converted filename as latest source name)
+    const readConvOutPath = join(workDir, 'exports', 'read-converted.pdf');
+    responder = () => ({
+      json: {
+        doc: { id: 'cdoc_src_1', name: 'SourceBrief.docx', ext: '.docx', docVersion: 4 },
+        fileName: 'SourceBrief.pdf',
+        mimeType: 'application/pdf',
+        bytesWritten: pdfBytes.length,
+        bytesBase64: pdfBytes.toString('base64'),
+      },
+    });
+    const readConvOutText = await runCloudDocsCli(
+      ['read', 'cdoc_src_1', '--convert-to', 'pdf', '--out', readConvOutPath],
+      { env: authEnv },
+    );
+    expect(readConvOutText.exitCode).toBe(0);
+    expect(readConvOutText.stdout).toContain('[CloudDoc: SourceBrief.docx | id=cdoc_src_1]');
+    expect(readConvOutText.stdout).toContain(readConvOutPath);
+    const readConvOutJson = await runCloudDocsCli(
+      ['read', 'cdoc_src_1', '--convert-to', 'pdf', '--out', readConvOutPath, '--json'],
+      { env: authEnv },
+    );
+    expect(readConvOutJson.exitCode).toBe(0);
+    expect(JSON.parse(readConvOutJson.stdout)).toMatchObject({
+      citation: '[CloudDoc: SourceBrief.docx | id=cdoc_src_1]',
+      savedTo: readConvOutPath,
+    });
+
+    // 3. convert --out and convert without --out
+    const convOutPath = join(workDir, 'exports', 'conv-out.pdf');
+    responder = () => ({
+      json: {
+        fileName: 'conv-out.pdf',
+        mimeType: 'application/pdf',
+        bytesWritten: pdfBytes.length,
+        bytesBase64: pdfBytes.toString('base64'),
+      },
+    });
+    const convOutText = await runCloudDocsCli(['convert', 'cdoc_conv_1', '--to', 'pdf', '--out', convOutPath], { env: authEnv });
+    expect(convOutText.exitCode).toBe(0);
+    expect(convOutText.stdout).toContain('[CloudDoc: conv-out.pdf | id=cdoc_conv_1]');
+    expect(convOutText.stdout).toContain(convOutPath);
+    const convOutJson = await runCloudDocsCli(['convert', 'cdoc_conv_1', '--to', 'pdf', '--out', convOutPath, '--json'], { env: authEnv });
+    expect(convOutJson.exitCode).toBe(0);
+    expect(JSON.parse(convOutJson.stdout)).toMatchObject({
+      docId: 'cdoc_conv_1',
+      citation: '[CloudDoc: conv-out.pdf | id=cdoc_conv_1]',
+      savedTo: convOutPath,
+    });
+    const convNoOutText = await runCloudDocsCli(['convert', 'cdoc_conv_1', '--to', 'pdf'], { env: authEnv });
+    expect(convNoOutText.exitCode).toBe(0);
+    expect(convNoOutText.stdout).toContain('[CloudDoc: conv-out.pdf | id=cdoc_conv_1]');
+
+    // 4. download --out (text + JSON with RFC 5987 UTF-8 filename, plus fallback without Content-Disposition)
+    const rawDl = Buffer.from('PK-download-bytes', 'utf8');
+    const dlOutPath = join(workDir, 'exports', 'downloaded.xlsx');
+    responder = () => ({
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="fallback.xlsx"; filename*=UTF-8''${encodeURIComponent('冬日傍晚的一杯热茶.xlsx')}`,
+      },
+      body: rawDl,
+    });
+    const dlText = await runCloudDocsCli(['download', 'cdoc_dl_1', '--out', dlOutPath], { env: authEnv });
+    expect(dlText.exitCode).toBe(0);
+    expect(dlText.stdout).toContain('[CloudDoc: 冬日傍晚的一杯热茶.xlsx | id=cdoc_dl_1]');
+    expect(dlText.stdout).toContain(dlOutPath);
+    const dlJson = await runCloudDocsCli(['download', 'cdoc_dl_1', '--out', dlOutPath, '--json'], { env: authEnv });
+    expect(dlJson.exitCode).toBe(0);
+    expect(JSON.parse(dlJson.stdout)).toMatchObject({
+      docId: 'cdoc_dl_1',
+      citation: '[CloudDoc: 冬日傍晚的一杯热茶.xlsx | id=cdoc_dl_1]',
+      savedTo: dlOutPath,
+    });
+
+    responder = () => ({
+      status: 200,
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: rawDl,
+    });
+    const dlNoNameOut = join(workDir, 'exports', 'noname.bin');
+    const dlNoNameJson = await runCloudDocsCli(['download', 'cdoc_dl_noname', '--out', dlNoNameOut, '--json'], { env: authEnv });
+    expect(dlNoNameJson.exitCode).toBe(0);
+    expect(JSON.parse(dlNoNameJson.stdout)).toMatchObject({
+      docId: 'cdoc_dl_noname',
+      citation: '[CloudDoc: cdoc_dl_noname.bin | id=cdoc_dl_noname]',
+      savedTo: dlNoNameOut,
+    });
+
+    // 5. edit --no-save & builder --no-save even when response omits `doc` metadata
+    const noSaveOut = join(workDir, 'exports', 'nosave.docx');
+    responder = () => ({
+      json: {
+        outputName: 'nosave.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        bytesWritten: pdfBytes.length,
+        bytesBase64: pdfBytes.toString('base64'),
+      },
+    });
+    const editNoSaveJson = await runCloudDocsCli(
+      ['edit', 'cdoc_edit_ns', '--script', 'Api.GetDocument();', '--no-save', '--out', noSaveOut, '--json'],
+      { env: authEnv },
+    );
+    expect(editNoSaveJson.exitCode).toBe(0);
+    expect(JSON.parse(editNoSaveJson.stdout)).toMatchObject({
+      citation: '[CloudDoc: nosave.docx | id=cdoc_edit_ns]',
+      savedTo: noSaveOut,
+    });
+    const builderNoSaveJson = await runCloudDocsCli(
+      ['builder', 'cdoc_bld_ns', '--script', 'Api.GetDocument();', '--no-save', '--out', noSaveOut, '--json'],
+      { env: authEnv },
+    );
+    expect(builderNoSaveJson.exitCode).toBe(0);
+    expect(JSON.parse(builderNoSaveJson.stdout)).toMatchObject({
+      citation: '[CloudDoc: nosave.docx | id=cdoc_bld_ns]',
+      savedTo: noSaveOut,
+    });
+  });
 });

@@ -378,10 +378,27 @@ function formatReadableDocContent(payload: CloudDocContentPayload): string {
   return lines.join('\n');
 }
 
-function withDocCitation<T extends { doc?: CloudDocItem }>(payload: T): T & { citation?: string } {
-  return payload.doc
-    ? { ...payload, citation: formatCloudDocCitation(payload.doc.name, payload.doc.id) }
-    : payload;
+function resolveSourceCloudDocCitation(
+  doc: CloudDocItem | undefined,
+  docId: string,
+  fallbackName?: string,
+): string {
+  return doc
+    ? formatCloudDocCitation(doc.name, doc.id)
+    : formatCloudDocCitation(fallbackName ?? docId, docId);
+}
+
+function withDocCitation<T extends object>(
+  payload: T & { doc?: CloudDocItem },
+  fallback?: { docId: string; name?: string },
+): T & { doc?: CloudDocItem; citation?: string } {
+  if (payload.doc) {
+    return { ...payload, citation: formatCloudDocCitation(payload.doc.name, payload.doc.id) };
+  }
+  if (fallback?.docId) {
+    return { ...payload, citation: formatCloudDocCitation(fallback.name ?? fallback.docId, fallback.docId) };
+  }
+  return payload;
 }
 
 function formatDocSummary(doc: CloudDocItem, prefix = 'OK'): string {
@@ -565,22 +582,26 @@ export async function runCloudDocsCli(
           targetType: targetType as CloudDocConvertTargetType,
         });
         await finishClientResult(res, ctx.flags.json, async (ok) => {
+          const okDoc = 'doc' in ok ? (ok.doc as CloudDocItem | undefined) : undefined;
           if ('bytesBase64' in ok && typeof ok.bytesBase64 === 'string') {
             let savedTo: string | undefined;
             if (opts.out) {
               const bytes = Buffer.from(ok.bytesBase64, 'base64');
               savedTo = await writeBinaryOutFile(opts.out, ok.fileName, bytes, cwd);
             }
-            const payload = savedTo
+            const sourceCitation = resolveSourceCloudDocCitation(okDoc, docId, ok.fileName);
+            const basePayload = savedTo
               ? { docId, fileName: ok.fileName, mimeType: ok.mimeType, bytesWritten: ok.bytesWritten, savedTo }
               : { docId, ...ok };
+            const payload = withDocCitation(basePayload, { docId, name: okDoc?.name ?? ok.fileName });
             const summary = savedTo
-              ? `Read (converted) ${ok.fileName} (${ok.bytesWritten} bytes) -> ${savedTo}`
-              : `Converted ${ok.fileName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
+              ? `Read (converted) ${sourceCitation} -> ${ok.fileName} (${ok.bytesWritten} bytes) -> ${savedTo}`
+              : `Converted ${sourceCitation} -> ${ok.fileName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
             succeed(payload, summary, ctx.flags.json);
             return;
           }
-          succeed(ok, 'Converted document', ctx.flags.json);
+          const sourceCitation = resolveSourceCloudDocCitation(okDoc, docId);
+          succeed(withDocCitation(ok as { doc?: CloudDocItem }, { docId }), `Converted ${sourceCitation}`, ctx.flags.json);
         });
         return;
       }
@@ -875,8 +896,8 @@ export async function runCloudDocsCli(
             const basePayload = savedTo
               ? { doc: ok.doc, outputName: ok.outputName, mimeType: ok.mimeType, bytesWritten: ok.bytesWritten, savedTo }
               : ok;
-            const payload = withDocCitation(basePayload);
-            const sourceCitation = ok.doc ? formatCloudDocCitation(ok.doc.name, ok.doc.id) : docId;
+            const payload = withDocCitation(basePayload, { docId, name: ok.outputName });
+            const sourceCitation = resolveSourceCloudDocCitation(ok.doc, docId, ok.outputName);
             const summary = savedTo
               ? `Exported via edit --no-save from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes) -> ${savedTo}`
               : `Exported via edit --no-save from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
@@ -1062,8 +1083,9 @@ export async function runCloudDocsCli(
                 ...(ok.onlyofficeUrls ? { onlyofficeUrls: ok.onlyofficeUrls } : {}),
               }
             : ok;
-          const payload = withDocCitation(basePayload);
-          const sourceCitation = ok.doc ? formatCloudDocCitation(ok.doc.name, ok.doc.id) : docId;
+          const fallbackDocId = ok.doc?.id ?? docId ?? ok.outputName;
+          const payload = withDocCitation(basePayload, { docId: fallbackDocId, name: ok.outputName });
+          const sourceCitation = resolveSourceCloudDocCitation(ok.doc, fallbackDocId, ok.outputName);
           const summary = savedTo
             ? `Exported via DocBuilder from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes) -> ${savedTo}`
             : `Exported via DocBuilder from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
@@ -1127,12 +1149,15 @@ export async function runCloudDocsCli(
             const bytes = Buffer.from(ok.bytesBase64, 'base64');
             savedTo = await writeBinaryOutFile(opts.out, ok.fileName, bytes, cwd);
           }
-          const payload = savedTo
-            ? { fileName: ok.fileName, mimeType: ok.mimeType, bytesWritten: ok.bytesWritten, savedTo }
-            : ok;
+          const okDoc = 'doc' in ok ? (ok.doc as CloudDocItem | undefined) : undefined;
+          const sourceCitation = resolveSourceCloudDocCitation(okDoc, docId, ok.fileName);
+          const basePayload = savedTo
+            ? { docId, fileName: ok.fileName, mimeType: ok.mimeType, bytesWritten: ok.bytesWritten, savedTo }
+            : { docId, ...ok };
+          const payload = withDocCitation(basePayload, { docId, name: okDoc?.name ?? ok.fileName });
           const summary = savedTo
-            ? `Converted to ${ok.fileName} (${ok.bytesWritten} bytes) -> ${savedTo}`
-            : `Converted to ${ok.fileName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
+            ? `Converted ${sourceCitation} -> ${ok.fileName} (${ok.bytesWritten} bytes) -> ${savedTo}`
+            : `Converted ${sourceCitation} -> ${ok.fileName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
           succeed(payload, summary, ctx.flags.json);
           return;
         }
@@ -1235,14 +1260,16 @@ export async function runCloudDocsCli(
       await finishClientResult(res, ctx.flags.json, async (ok) => {
         const fallback = ok.fileName ?? `${sanitizeCloudDocTransferFilename(docId)}.bin`;
         const savedTo = await writeBinaryOutFile(opts.out, fallback, ok.bytes, cwd);
+        const sourceCitation = formatCloudDocCitation(fallback, docId);
         const payload = {
           docId,
           fileName: fallback,
+          citation: sourceCitation,
           ...(ok.contentType ? { contentType: ok.contentType } : {}),
           bytesWritten: ok.bytesRead,
           savedTo,
         };
-        succeed(payload, `Downloaded ${fallback} (${ok.bytesRead} bytes) -> ${savedTo}`, ctx.flags.json);
+        succeed(payload, `Downloaded ${sourceCitation} (${ok.bytesRead} bytes) -> ${savedTo}`, ctx.flags.json);
       });
     });
 
