@@ -5,8 +5,7 @@ export interface FileTransferKeepAlivePlugin {
   stop(): Promise<void>;
 }
 
-const FileTransferKeepAlive = registerPlugin<FileTransferKeepAlivePlugin>('FileTransferKeepAlive');
-
+let keepAlivePlugin: FileTransferKeepAlivePlugin | null = null;
 let activeTransferCount = 0;
 let currentLabels: { title?: string; text?: string } = {};
 
@@ -18,6 +17,14 @@ function isKeepAliveSupportedNative(): boolean {
   } catch {
     return false;
   }
+}
+
+function getKeepAlivePlugin(): FileTransferKeepAlivePlugin | null {
+  if (!isKeepAliveSupportedNative()) return null;
+  if (!keepAlivePlugin) {
+    keepAlivePlugin = registerPlugin<FileTransferKeepAlivePlugin>('FileTransferKeepAlive');
+  }
+  return keepAlivePlugin;
 }
 
 export function setBackgroundTransferKeepAliveLabels(labels: { title?: string; text?: string }): void {
@@ -34,6 +41,7 @@ export function getBackgroundTransferKeepAliveCount(): number {
 export function resetBackgroundTransferKeepAliveForTests(): void {
   activeTransferCount = 0;
   currentLabels = {};
+  keepAlivePlugin = null;
 }
 
 /**
@@ -43,15 +51,21 @@ export function resetBackgroundTransferKeepAliveForTests(): void {
 export function acquireBackgroundTransferKeepAlive(): () => void {
   let released = false;
   activeTransferCount += 1;
-  if (activeTransferCount === 1 && isKeepAliveSupportedNative()) {
-    void FileTransferKeepAlive.start(currentLabels).catch(() => {});
+  if (activeTransferCount === 1) {
+    const plugin = getKeepAlivePlugin();
+    if (plugin) {
+      void plugin.start(currentLabels).catch(() => {});
+    }
   }
   return () => {
     if (released) return;
     released = true;
     activeTransferCount = Math.max(0, activeTransferCount - 1);
-    if (activeTransferCount === 0 && isKeepAliveSupportedNative()) {
-      void FileTransferKeepAlive.stop().catch(() => {});
+    if (activeTransferCount === 0) {
+      const plugin = getKeepAlivePlugin();
+      if (plugin) {
+        void plugin.stop().catch(() => {});
+      }
     }
   };
 }

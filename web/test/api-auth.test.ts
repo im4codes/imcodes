@@ -85,6 +85,7 @@ describe('auth nonce exchange API', () => {
     }));
 
     const { exchangeNonce } = await import('../src/api.js');
+    expect((globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor?.getPlatform?.()).toBe('android');
     const result = await exchangeNonce('https://server.example', 'nonce-123');
 
     expect(result).toEqual({
@@ -917,5 +918,28 @@ describe('auth nonce exchange API', () => {
     onAuthExpired(expired);
     await expect(apiFetch('/api/aliases')).rejects.toBeInstanceOf(ApiError);
     expect(expired).not.toHaveBeenCalled();
+  });
+
+  it('preserves stubbed global Capacitor and avoids duplicate FileTransferKeepAlive registration warnings across module resets', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const capStub = { getPlatform: () => 'android' };
+    vi.stubGlobal('Capacitor', capStub);
+
+    await import('../src/api.js');
+    expect((globalThis as { Capacitor?: unknown }).Capacitor).toBe(capStub);
+
+    for (let i = 0; i < 2; i += 1) {
+      vi.resetModules();
+      vi.stubGlobal('Capacitor', { getPlatform: () => 'web', isNativePlatform: () => false });
+      const keepalive = await import('../src/background-transfer-keepalive.js');
+      keepalive.setBackgroundTransferKeepAliveLabels({ title: 'Uploading', text: 'Working' });
+      const release = keepalive.acquireBackgroundTransferKeepAlive();
+      release();
+      await keepalive.withBackgroundTransferKeepAlive(async () => 'ok');
+    }
+
+    const warnings = [...warnSpy.mock.calls, ...errorSpy.mock.calls].flat().map(String);
+    expect(warnings.some((line) => line.includes('FileTransferKeepAlive') && line.includes('already registered'))).toBe(false);
   });
 });

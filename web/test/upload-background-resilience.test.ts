@@ -6,6 +6,7 @@ const capacitorState = vi.hoisted(() => ({
   platform: 'android' as 'android' | 'ios' | 'web',
   startMock: vi.fn(async () => ({ started: true })),
   stopMock: vi.fn(async () => {}),
+  registerPluginMock: vi.fn(),
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -13,10 +14,13 @@ vi.mock('@capacitor/core', () => ({
     isNativePlatform: () => capacitorState.native,
     getPlatform: () => capacitorState.platform,
   },
-  registerPlugin: () => ({
-    start: capacitorState.startMock,
-    stop: capacitorState.stopMock,
-  }),
+  registerPlugin: (name: string) => {
+    capacitorState.registerPluginMock(name);
+    return {
+      start: capacitorState.startMock,
+      stop: capacitorState.stopMock,
+    };
+  },
 }));
 
 vi.mock('@capacitor/browser', () => ({ Browser: { open: vi.fn() } }));
@@ -91,6 +95,7 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     capacitorState.platform = 'android';
     capacitorState.startMock.mockClear();
     capacitorState.stopMock.mockClear();
+    capacitorState.registerPluginMock.mockClear();
     FakeXhr.instances = [];
     FakeXhr.handlers = [];
     vi.stubGlobal('XMLHttpRequest', FakeXhr);
@@ -294,5 +299,31 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     await vi.advanceTimersByTimeAsync(260);
     await expect(wTimeout).resolves.toBe(true);
     expect(getUploadResumeWaiterCountForTests()).toBe(0);
+  });
+
+  it('skips FileTransferKeepAlive plugin registration on web and caches lazy registration on native with error cleanup', async () => {
+    const keepalive = await import('../src/background-transfer-keepalive.js');
+    keepalive.resetBackgroundTransferKeepAliveForTests();
+    capacitorState.registerPluginMock.mockClear();
+
+    capacitorState.native = false;
+    capacitorState.platform = 'web';
+    keepalive.setBackgroundTransferKeepAliveLabels({ title: 'Uploading', text: 'Web' });
+    const webRelease = keepalive.acquireBackgroundTransferKeepAlive();
+    webRelease();
+    await keepalive.withBackgroundTransferKeepAlive(async () => 'web-ok');
+    expect(capacitorState.registerPluginMock).not.toHaveBeenCalled();
+    expect(capacitorState.startMock).not.toHaveBeenCalled();
+    expect(capacitorState.stopMock).not.toHaveBeenCalled();
+
+    capacitorState.native = true;
+    capacitorState.platform = 'android';
+    await expect(keepalive.withBackgroundTransferKeepAlive(async () => {
+      throw new Error('boom');
+    })).rejects.toThrow('boom');
+    expect(capacitorState.registerPluginMock).toHaveBeenCalledTimes(1);
+    expect(capacitorState.startMock).toHaveBeenCalledTimes(1);
+    expect(capacitorState.stopMock).toHaveBeenCalledTimes(1);
+    expect(keepalive.getBackgroundTransferKeepAliveCount()).toBe(0);
   });
 });
