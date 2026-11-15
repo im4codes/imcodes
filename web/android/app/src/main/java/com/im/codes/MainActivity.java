@@ -4,7 +4,6 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.WebSettings;
@@ -14,7 +13,6 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.getcapacitor.BridgeActivity;
-import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginHandle;
 import com.imcodes.speech.SpeechModelExtractor;
 import com.imcodes.speech.StreamingSpeechPlugin;
@@ -33,21 +31,6 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(NativeClipboardPlugin.class);
         if (!isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")) {
             registerPlugin(StreamingSpeechPlugin.class);
-        }
-        // JPushPlugin only exists in the `china` flavor source set. Load it via
-        // reflection so the `global` flavor compiles and runs without any JPush
-        // class dependency. (BuildConfig.HAS_JPUSH is set per-flavor in app/build.gradle.)
-        if (BuildConfig.HAS_JPUSH) {
-            try {
-                @SuppressWarnings("unchecked")
-                Class<? extends Plugin> jpushClass =
-                    (Class<? extends Plugin>) Class.forName("com.im.codes.JPushPlugin");
-                registerPlugin(jpushClass);
-            } catch (ClassNotFoundException e) {
-                Log.w("MainActivity", "JPushPlugin not present despite HAS_JPUSH=true — china flavor sources missing?");
-            } catch (Throwable t) {
-                Log.e("MainActivity", "Failed to register JPushPlugin", t);
-            }
         }
         super.onCreate(savedInstanceState);
         SpeechModelExtractor.warmUpAsync(this);

@@ -22,15 +22,14 @@ function globalFontCssPlugin(): Plugin {
   };
 }
 
-// VITE_REGION selects the regional push channel at compile time:
-//   - 'global' (default) — FCM on Android via @capacitor/push-notifications
-//   - 'china'             — 极光推送 JPush on Android via our custom plugin
-// On iOS the value is ignored (APNs is used regardless).
+// VITE_PUSH_VARIANT selects the Android package's push capability. iOS always
+// keeps APNs. VITE_REGION remains accepted for existing inline/test builds.
+const pushVariant = process.env.VITE_PUSH_VARIANT === 'without-fcm' ? 'without-fcm' : 'with-fcm';
 const pushRegion = process.env.VITE_REGION === 'china' ? 'china' : 'global';
 const buildTime = process.env.BUILD_TIME ?? new Date().toISOString();
 const webBuildId = process.env.WEB_BUILD_ID
   ?? createHash('sha256')
-    .update(`${process.env.npm_package_version ?? '0.0.0'}|${buildTime}|${pushRegion}`)
+    .update(`${process.env.npm_package_version ?? '0.0.0'}|${buildTime}|${pushVariant}|${pushRegion}`)
     .digest('hex')
     .slice(0, 12);
 
@@ -40,6 +39,7 @@ export default defineConfig(({ mode }) => ({
     __BUILD_TIME__: JSON.stringify(buildTime),
     __WEB_BUILD_ID__: JSON.stringify(webBuildId),
     __PUSH_REGION__: JSON.stringify(pushRegion),
+    __PUSH_FCM__: JSON.stringify(pushVariant === 'with-fcm'),
   },
   plugins: [
     globalFontCssPlugin(),
@@ -57,6 +57,7 @@ export default defineConfig(({ mode }) => ({
             buildTime,
             packageVersion: process.env.npm_package_version ?? null,
             pushRegion,
+            pushVariant,
           }, null, 2)}\n`,
         });
       },

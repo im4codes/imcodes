@@ -70,6 +70,80 @@ describe('push notification badge reset', () => {
     });
   });
 
+  it('is a safe no-op for the Android without-FCM build', async () => {
+    (globalThis as Record<string, unknown>).__PUSH_FCM__ = false;
+    (globalThis as Record<string, unknown>).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'android',
+    };
+
+    try {
+      const { initPushNotifications, isPushSupported } = await import('../src/push-notifications.js');
+      await initPushNotifications('api-key', 'https://app.im.codes');
+
+      expect(pushCheckPermissionsMock).not.toHaveBeenCalled();
+      expect(pushRequestPermissionsMock).not.toHaveBeenCalled();
+      expect(pushRegisterMock).not.toHaveBeenCalled();
+      expect(pushAddListenerMock).not.toHaveBeenCalled();
+      expect(isPushSupported()).toBe(false);
+    } finally {
+      delete (globalThis as Record<string, unknown>).__PUSH_FCM__;
+    }
+  });
+
+  it('registers Android FCM notifications when __PUSH_FCM__ is true', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+    (globalThis as Record<string, unknown>).__PUSH_FCM__ = true;
+    (globalThis as Record<string, unknown>).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'android',
+    };
+
+    try {
+      const { initPushNotifications, isPushSupported } = await import('../src/push-notifications.js');
+      await initPushNotifications('api-key', 'https://app.im.codes');
+
+      expect(pushCheckPermissionsMock).toHaveBeenCalledTimes(1);
+      expect(pushRegisterMock).toHaveBeenCalledTimes(1);
+      expect(isPushSupported()).toBe(true);
+
+      await pushListeners.registration?.({ value: 'fcm-token-1' });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(String(init.body))).toEqual({ token: 'fcm-token-1', platform: 'android' });
+    } finally {
+      vi.unstubAllGlobals();
+      delete (globalThis as Record<string, unknown>).__PUSH_FCM__;
+    }
+  });
+
+  it('keeps iOS APNs registration active regardless of __PUSH_FCM__', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+    (globalThis as Record<string, unknown>).__PUSH_FCM__ = false;
+    (globalThis as Record<string, unknown>).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'ios',
+    };
+
+    try {
+      const { initPushNotifications, isPushSupported } = await import('../src/push-notifications.js');
+      await initPushNotifications('api-key', 'https://app.im.codes');
+
+      expect(pushRegisterMock).toHaveBeenCalledTimes(1);
+      expect(isPushSupported()).toBe(true);
+
+      await pushListeners.registration?.({ value: 'apns-token-env-independent' });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(String(init.body))).toEqual({ token: 'apns-token-env-independent', platform: 'ios' });
+    } finally {
+      vi.unstubAllGlobals();
+      delete (globalThis as Record<string, unknown>).__PUSH_FCM__;
+    }
+  });
+
   it('resets server badge through apiFetch', async () => {
     const { resetPushBadge } = await import('../src/push-notifications.js');
 

@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "build:global": "tsc --noEmit && VITE_REGION=global vite build",
-    "build:china": "tsc --noEmit && VITE_REGION=china vite build",
+    "build:with-fcm": "tsc --noEmit && VITE_REGION=global VITE_PUSH_VARIANT=with-fcm vite build",
+    "build:without-fcm": "tsc --noEmit && VITE_REGION=global VITE_PUSH_VARIANT=without-fcm vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "typecheck:legacy": "tsc6 --noEmit",

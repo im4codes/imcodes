@@ -130,8 +130,8 @@ describe('Qwen3-ASR mobile assets', () => {
     const androidBuildGradle = await readFile(new URL('android/build.gradle', base), 'utf8');
     const appBuildGradle = await readFile(new URL('../../web/android/app/build.gradle', import.meta.url), 'utf8');
     const mainActivity = await readFile(new URL('../../web/android/app/src/main/java/com/im/codes/MainActivity.java', import.meta.url), 'utf8');
-    const globalApp = await readFile(new URL('../../web/android/app/src/global/java/com/im/codes/AppApplication.java', import.meta.url), 'utf8');
-    const chinaApp = await readFile(new URL('../../web/android/app/src/china/java/com/im/codes/AppApplication.java', import.meta.url), 'utf8');
+    const withFcmApp = await readFile(new URL('../../web/android/app/src/withFcm/java/com/im/codes/AppApplication.java', import.meta.url), 'utf8');
+    const withoutFcmApp = await readFile(new URL('../../web/android/app/src/withoutFcm/java/com/im/codes/AppApplication.java', import.meta.url), 'utf8');
     const capacitorPluginsUrl = new URL('../../web/android/app/src/main/assets/capacitor.plugins.json', import.meta.url);
     const consumerRules = await readFile(new URL('android/consumer-rules.pro', base), 'utf8');
     const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
@@ -153,8 +153,8 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(mainActivity).toContain('import com.imcodes.speech.StreamingSpeechPlugin;');
     expect(mainActivity).toContain('import com.imcodes.speech.SpeechModelExtractor;');
     expect(mainActivity).toContain('SpeechModelExtractor.warmUpAsync(this);');
-    expect(globalApp).toContain('SpeechModelExtractor.warmUpAsync(this);');
-    expect(chinaApp).toContain('SpeechModelExtractor.warmUpAsync(this);');
+    expect(withFcmApp).toContain('SpeechModelExtractor.warmUpAsync(this);');
+    expect(withoutFcmApp).toContain('SpeechModelExtractor.warmUpAsync(this);');
     expect(mainActivity).toContain('registerPlugin(StreamingSpeechPlugin.class);');
     expect(mainActivity).toContain('isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")');
     expect(mainActivity).toContain('settings.setTextZoom(100);');
@@ -200,7 +200,7 @@ describe('Qwen3-ASR mobile assets', () => {
     // API 24 compatibility guard: no java.nio.file (API 26+) or InputStream.readAllBytes/Files.readString (API 33+/Java 11) in production sources without coreLibraryDesugaring
     expect(androidTokenizer).toContain('readUtf8File(');
     expect(androidTokenizer).toContain('FileInputStream');
-    for (const javaSrc of [mainActivity, globalApp, chinaApp, android, extractor, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
+    for (const javaSrc of [mainActivity, withFcmApp, withoutFcmApp, android, extractor, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
       expect(javaSrc).not.toMatch(/\bjava\.nio\.file\b|\bFiles\b|\.toPath\s*\(|\breadAllBytes\s*\(|\bFiles\s*\.\s*(?:readString|writeString)\s*\(|\bByteArrayOutputStream[^;]*toString\s*\(\s*StandardCharsets/);
     }
     // Android ICU Pattern & minSdk 24 (Java 8 / no coreLibraryDesugaring) compatibility guard:

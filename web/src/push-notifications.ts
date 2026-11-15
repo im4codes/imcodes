@@ -1,15 +1,9 @@
 /**
  * Push notification registration for Capacitor apps.
  *
- * Three flows, picked at runtime by Capacitor platform × compile-time region:
- *   - iOS:                                APNs (via @capacitor/push-notifications)
- *   - Android, International edition:     FCM  (via @capacitor/push-notifications)
- *   - Android, Mainland China edition:    JPush 极光推送 (via our custom JPush plugin)
- *
- * The Mainland China branch sends platform='android-jpush' to /api/push/register
- * so the server's dispatchPush() routes the message to the JPush v3 REST API
- * instead of FCM. See shared/push-notifications.ts for the platform constants
- * and server/src/routes/push.ts for the dispatch side.
+ * iOS uses APNs and Android withFcm uses FCM, both through the Capacitor push
+ * plugin. Android withoutFcm is a deliberately pure build and returns before
+ * importing or registering any native push plugin.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const isNative = (): boolean => typeof (globalThis as any).Capacitor?.isNativePlatform === 'function' && (globalThis as any).Capacitor.isNativePlatform();
@@ -19,7 +13,6 @@ const getPlatform = (): string => (globalThis as any).Capacitor?.getPlatform?.()
 import {
   PUSH_PLATFORM_IOS,
   PUSH_PLATFORM_ANDROID_FCM,
-  PUSH_PLATFORM_ANDROID_JPUSH,
   DEFAULT_PUSH_NOTIFICATION_TYPES,
   DEFAULT_PUSH_ENABLED_SERVER_IDS,
   isPushNotificationType,
@@ -64,11 +57,17 @@ export async function initPushNotifications(
   if (!isNative()) return;
 
   const platform = getPlatform();
-  if (platform === 'android' && __PUSH_REGION__ === 'china') {
-    await initJpush(apiKey, cfWorkerUrl);
-  } else {
-    await initApnsOrFcm(apiKey, cfWorkerUrl);
+  if (platform === 'android' && !isFcmBuild()) {
+    pushSupported = false;
+    return;
   }
+  await initApnsOrFcm(apiKey, cfWorkerUrl);
+}
+
+function isFcmBuild(): boolean {
+  // Inline Vite/Vitest harnesses do not define the production macro. Preserve
+  // the historical default (FCM enabled) while making the pure build explicit.
+  return typeof __PUSH_FCM__ === 'undefined' || __PUSH_FCM__;
 }
 
 // ── APNs (iOS) / FCM (International Android) via @capacitor/push-notifications ──
@@ -102,78 +101,6 @@ async function initApnsOrFcm(apiKey: string, cfWorkerUrl: string): Promise<void>
     const data = action.notification.data as Record<string, string> | undefined;
     handleNotificationOpen(data);
   });
-}
-
-// ── JPush 极光推送 (Mainland China Android) ──────────────────────────────────
-
-interface JPushPluginShape {
-  getRegistrationID(): Promise<{ registrationID: string }>;
-  clearAllNotifications(): Promise<void>;
-  addListener(
-    eventName: 'registration',
-    handler: (data: { registrationID: string }) => void,
-  ): Promise<unknown>;
-  addListener(
-    eventName: 'notificationOpened' | 'notificationReceived',
-    handler: (data: { title?: string; alert?: string; extras?: Record<string, unknown> }) => void,
-  ): Promise<unknown>;
-}
-
-async function initJpush(apiKey: string, cfWorkerUrl: string): Promise<void> {
-  // The JPush plugin only exists in the Mainland China flavor APK.
-  // registerPlugin returns a proxy that throws on first call if the native
-  // impl is missing, so wrap it in try/catch to fail soft on the International
-  // flavor APK if it ever reaches this branch.
-  let JPush: JPushPluginShape;
-  try {
-    // Dynamic import keeps @capacitor/core out of pre-mount code paths.
-    const { registerPlugin } = await import('@capacitor/core');
-    JPush = registerPlugin<JPushPluginShape>('JPush');
-  } catch (err) {
-    console.warn('JPush plugin unavailable — push disabled this session', err);
-    return;
-  }
-
-  pushSupported = true;
-
-  // Listener for late-arriving registration_id (JPush SDK provisions
-  // asynchronously after JPushInterface.init in AppApplication).
-  await JPush.addListener('registration', async (data) => {
-    if (data.registrationID) {
-      await registerDeviceToken(
-        data.registrationID,
-        PUSH_PLATFORM_ANDROID_JPUSH,
-        apiKey,
-        cfWorkerUrl,
-      );
-    }
-  });
-
-  await JPush.addListener('notificationReceived', (data) => {
-    console.log('JPush received:', data);
-  });
-
-  await JPush.addListener('notificationOpened', (data) => {
-    console.log('JPush opened:', data);
-    handleNotificationOpen(data.extras as Record<string, string> | undefined);
-  });
-
-  // Best-effort immediate fetch: if the SDK has already provisioned the id
-  // (warm start), this resolves quickly and we don't need to wait for the
-  // 'registration' event.
-  try {
-    const { registrationID } = await JPush.getRegistrationID();
-    if (registrationID) {
-      await registerDeviceToken(
-        registrationID,
-        PUSH_PLATFORM_ANDROID_JPUSH,
-        apiKey,
-        cfWorkerUrl,
-      );
-    }
-  } catch {
-    // Cold start: the 'registration' listener above will catch it instead.
-  }
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
