@@ -194,7 +194,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
                 configureInputChrome(webView)
                 configuredWebViewId = webViewId
             } else {
-                refreshMacPageZoomAndHostSignal(webView)
+                refreshMacHostSignal(webView)
             }
         }
     }
@@ -308,12 +308,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         return scripts.joined(separator: "\n")
     }
 
-    private func refreshMacPageZoomAndHostSignal(_ webView: WKWebView) {
+    private func refreshMacHostSignal(_ webView: WKWebView) {
         self.configureMacHostAppearance(webView: webView)
-        if #available(iOS 14.0, *), abs(webView.pageZoom - 1.0) > 0.001 {
-            // Keep WKWebView.pageZoom at 1.0; Designed-for-iPad Mac defaults UI Scale to 125% in the web layer.
-            webView.pageZoom = 1.0
-        }
         let signalScript = buildNativeHostSignalScript()
         if !signalScript.isEmpty {
             webView.evaluateJavaScript(signalScript, completionHandler: nil)
@@ -322,9 +318,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
     private func configureInputChrome(_ webView: WKWebView?) {
         self.configureMacHostAppearance(webView: webView)
-        if #available(iOS 14.0, *), let webView = webView, abs(webView.pageZoom - 1.0) > 0.001 {
-            webView.pageZoom = 1.0
-        }
         let signalScript = buildNativeHostSignalScript()
         if !signalScript.isEmpty {
             let userScript = WKUserScript(source: signalScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)

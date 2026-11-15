@@ -159,13 +159,14 @@ describe('native platform detection and uniform UI scaling', () => {
     }))).toBe(false);
   });
 
-  it('keeps iOS AppDelegate pageZoom at 1.0 + host signal above Foundation-only OTA helper slice', () => {
+  it('keeps iOS AppDelegate free of WKWebView.pageZoom reads/writes while keeping host signal above Foundation-only OTA helper slice', () => {
     const dir = dirname(fileURLToPath(import.meta.url));
     const appDelegate = readFileSync(resolve(dir, '../ios/App/App/AppDelegate.swift'), 'utf8');
     expect(appDelegate).toContain('ProcessInfo.processInfo.isiOSAppOnMac');
     expect(appDelegate).toContain('targetEnvironment(macCatalyst)');
-    expect(appDelegate).toContain('webView.pageZoom = 1.0');
+    expect(appDelegate).not.toMatch(/\.pageZoom\b/);
     expect(appDelegate).not.toContain('macDesignedForIpadPageZoom');
+    expect(appDelegate).toContain('let pageZoomApplied = false');
     expect(appDelegate).toContain('window.__IMCODES_NATIVE_HOST__');
     expect(appDelegate).toContain("CustomEvent('imcodes:native-host')");
     expect(appDelegate).toContain('pressesBegan');
