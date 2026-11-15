@@ -101,8 +101,11 @@ export interface EnvConfig {
   /** APNs bundle ID (e.g. app.imcodes) */
   APNS_BUNDLE_ID?: string;
 
-  // FCM push notifications (Android, International edition)
-  FCM_SERVER_KEY?: string;
+  // FCM HTTP v1 push notifications (Android, International edition)
+  /** Firebase service-account JSON (raw or base64-encoded). */
+  FCM_SERVICE_ACCOUNT_JSON?: string;
+  /** Optional project_id override for FCM HTTP v1. */
+  FCM_PROJECT_ID?: string;
 
   // JPush 极光推送 (Android, Mainland China edition — aggregates Huawei /
   // Xiaomi / OPPO / vivo / Honor vendor channels)
@@ -199,7 +202,8 @@ export function loadEnv(): EnvConfig {
     APNS_KEY_ID: process.env.APNS_KEY_ID,
     APNS_TEAM_ID: process.env.APNS_TEAM_ID,
     APNS_BUNDLE_ID: process.env.APNS_BUNDLE_ID ?? 'app.imcodes',
-    FCM_SERVER_KEY: process.env.FCM_SERVER_KEY,
+    FCM_SERVICE_ACCOUNT_JSON: process.env.FCM_SERVICE_ACCOUNT_JSON,
+    FCM_PROJECT_ID: process.env.FCM_PROJECT_ID,
     JPUSH_APP_KEY: process.env.JPUSH_APP_KEY,
     JPUSH_MASTER_SECRET: process.env.JPUSH_MASTER_SECRET,
     PUSH_RELAY_URL: process.env.PUSH_RELAY_URL,

@@ -4,7 +4,7 @@
  * Dispatch: send push on session events (idle, notification, ask, error)
  *
  * iOS:                              APNs HTTP/2 with JWT auth
- * Android (International edition):  FCM legacy HTTP API
+ * Android (International edition):  FCM HTTP v1 API
  * Android (Mainland China edition): JPush v3 REST API (aggregates the Huawei /
  *                                   Xiaomi / OPPO / vivo / Honor vendor channels)
  *
@@ -224,7 +224,7 @@ pushRoutes.post('/relay', async (c) => {
   // (Used to require APNs only; relaxed when JPush was added so a relay
   // server that holds only China credentials could still serve android-jpush.)
   const hasApns = !!(c.env.APNS_KEY && c.env.APNS_KEY_ID && c.env.APNS_TEAM_ID);
-  const hasFcm = !!c.env.FCM_SERVER_KEY;
+  const hasFcm = !!c.env.FCM_SERVICE_ACCOUNT_JSON?.trim();
   const hasJpush = !!(c.env.JPUSH_APP_KEY && c.env.JPUSH_MASTER_SECRET);
   if (!hasApns && !hasFcm && !hasJpush) {
     return c.json({ error: 'push relay not available on this server' }, 503);
@@ -244,7 +244,7 @@ pushRoutes.post('/relay', async (c) => {
       await sendApns(body.token, relayPayload, c.env);
       return c.json({ ok: true });
     } else if (body.platform === PUSH_PLATFORM_ANDROID_FCM && hasFcm) {
-      await sendFcm(body.token, relayPayload, c.env.FCM_SERVER_KEY!);
+      await sendFcm(body.token, relayPayload, c.env.FCM_SERVICE_ACCOUNT_JSON!, c.env.FCM_PROJECT_ID);
       return c.json({ ok: true });
     } else if (body.platform === PUSH_PLATFORM_ANDROID_JPUSH && hasJpush) {
       await sendJpush(body.token, relayPayload, c.env.JPUSH_APP_KEY!, c.env.JPUSH_MASTER_SECRET!);
@@ -366,7 +366,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   payload.badge = badgeCount;
 
   const hasApns = !!(env.APNS_KEY && env.APNS_KEY_ID && env.APNS_TEAM_ID);
-  const hasFcm = !!env.FCM_SERVER_KEY;
+  const hasFcm = !!env.FCM_SERVICE_ACCOUNT_JSON?.trim();
   const hasJpush = !!(env.JPUSH_APP_KEY && env.JPUSH_MASTER_SECRET);
   // Self-hosted server detection: no push credentials of any kind configured
   // → this is a self-hosted instance, relay everything through the central
@@ -382,7 +382,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
       } else if (platform === PUSH_PLATFORM_IOS && hasApns) {
         await sendApns(token, payload, env);
       } else if (platform === PUSH_PLATFORM_ANDROID_FCM && hasFcm) {
-        await sendFcm(token, payload, env.FCM_SERVER_KEY!);
+        await sendFcm(token, payload, env.FCM_SERVICE_ACCOUNT_JSON!, env.FCM_PROJECT_ID);
       } else if (platform === PUSH_PLATFORM_ANDROID_JPUSH && hasJpush) {
         await sendJpush(token, payload, env.JPUSH_APP_KEY!, env.JPUSH_MASTER_SECRET!);
       }
@@ -419,7 +419,7 @@ async function relayPush(relayBaseUrl: string, token: string, platform: string, 
   }
 }
 
-class PushError extends Error {
+export class PushError extends Error {
   constructor(message: string, public unregistered = false) {
     super(message);
   }
@@ -518,28 +518,186 @@ async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Pr
   }
 }
 
-// ── FCM (Android) ─────────────────────────────────────────────────────────────
+// ── FCM HTTP v1 (Android) ────────────────────────────────────────────────────
 
-async function sendFcm(deviceToken: string, payload: PushPayload, serverKey: string): Promise<void> {
-  const body = {
-    to: deviceToken,
-    notification: { title: payload.title, body: payload.body },
-    data: payload.data ?? {},
-  };
+const FCM_SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
+const DEFAULT_FCM_TOKEN_URI = 'https://oauth2.googleapis.com/token';
+const FCM_TOKEN_REFRESH_LEEWAY_MS = 5 * 60 * 1000;
 
-  const res = await fetch('https://fcm.googleapis.com/fcm/send', {
+interface FcmServiceAccount {
+  project_id: string;
+  client_email: string;
+  private_key: string;
+  token_uri?: string;
+}
+
+interface FcmTokenCacheEntry {
+  accessToken: string;
+  expiresAt: number;
+}
+
+const fcmTokenCache = new Map<string, FcmTokenCacheEntry>();
+const fcmTokenFlights = new Map<string, Promise<string>>();
+
+/** Clear FCM OAuth state between tests and after credential rotation. */
+export function resetFcmAuthCacheForTesting(): void {
+  fcmTokenCache.clear();
+  fcmTokenFlights.clear();
+}
+
+function parseFcmServiceAccount(raw: string): FcmServiceAccount {
+  const source = raw.trim();
+  if (!source) throw new Error('FCM_SERVICE_ACCOUNT_JSON is empty');
+
+  let json = source;
+  if (!source.startsWith('{')) {
+    try {
+      json = Buffer.from(source, 'base64').toString('utf8');
+    } catch {
+      throw new Error('FCM_SERVICE_ACCOUNT_JSON is not valid JSON or base64 JSON');
+    }
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error('FCM_SERVICE_ACCOUNT_JSON is not valid JSON');
+  }
+  if (!parsed || typeof parsed !== 'object') throw new Error('FCM service account must be a JSON object');
+  const value = parsed as Record<string, unknown>;
+  const projectId = typeof value.project_id === 'string' ? value.project_id.trim() : '';
+  const clientEmail = typeof value.client_email === 'string' ? value.client_email.trim() : '';
+  const privateKey = typeof value.private_key === 'string' ? value.private_key.replace(/\\n/g, '\n') : '';
+  if (!projectId || !clientEmail || !privateKey) {
+    throw new Error('FCM service account requires project_id, client_email, and private_key');
+  }
+  const tokenUri = typeof value.token_uri === 'string' && value.token_uri.trim()
+    ? value.token_uri.trim()
+    : DEFAULT_FCM_TOKEN_URI;
+  let parsedUri: URL;
+  try {
+    parsedUri = new URL(tokenUri);
+  } catch {
+    throw new Error('FCM service account token_uri must be a valid HTTPS URL');
+  }
+  if (parsedUri.protocol !== 'https:') throw new Error('FCM service account token_uri must use HTTPS');
+  return { project_id: projectId, client_email: clientEmail, private_key: privateKey, token_uri: parsedUri.toString() };
+}
+
+async function fetchFcmAccessToken(account: FcmServiceAccount): Promise<FcmTokenCacheEntry> {
+  const tokenUri = account.token_uri ?? DEFAULT_FCM_TOKEN_URI;
+  const key = await importPKCS8(account.private_key, 'RS256');
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = await new SignJWT({ scope: FCM_SCOPE })
+    .setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
+    .setIssuer(account.client_email)
+    .setSubject(account.client_email)
+    .setAudience(tokenUri)
+    .setIssuedAt(now)
+    .setExpirationTime(now + 3600)
+    .sign(key);
+
+  const response = await fetch(tokenUri, {
     method: 'POST',
-    headers: {
-      Authorization: `key=${serverKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
   });
+  const text = await response.text().catch(() => '');
+  let body: { access_token?: unknown; expires_in?: unknown; error?: unknown } = {};
+  try { body = JSON.parse(text) as typeof body; } catch { /* handled below */ }
+  if (!response.ok || typeof body.access_token !== 'string') {
+    throw new Error(`FCM OAuth token request failed (${response.status}): ${text}`);
+  }
+  const expiresIn = typeof body.expires_in === 'number' && Number.isFinite(body.expires_in)
+    ? body.expires_in
+    : 3600;
+  return {
+    accessToken: body.access_token,
+    expiresAt: Date.now() + Math.max(60, expiresIn) * 1000,
+  };
+}
 
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    const unregistered = errBody.includes('NotRegistered');
-    throw new PushError(`FCM ${res.status}: ${errBody}`, unregistered);
+async function getFcmAccessToken(account: FcmServiceAccount): Promise<string> {
+  const cacheKey = `${account.project_id}:${account.client_email}`;
+  const cached = fcmTokenCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt - FCM_TOKEN_REFRESH_LEEWAY_MS) return cached.accessToken;
+
+  const existingFlight = fcmTokenFlights.get(cacheKey);
+  if (existingFlight) return existingFlight;
+
+  const flight = (async () => {
+    const entry = await fetchFcmAccessToken(account);
+    fcmTokenCache.set(cacheKey, entry);
+    return entry.accessToken;
+  })();
+  fcmTokenFlights.set(cacheKey, flight);
+  try {
+    return await flight;
+  } finally {
+    if (fcmTokenFlights.get(cacheKey) === flight) fcmTokenFlights.delete(cacheKey);
+  }
+}
+
+function fcmData(payload: PushPayload): Record<string, string> {
+  const data: Record<string, string> = {};
+  for (const [key, value] of Object.entries(payload.data ?? {})) {
+    if (value !== undefined && value !== null) data[key] = String(value);
+  }
+  return data;
+}
+
+function fcmErrorIsUnregistered(status: number, text: string): boolean {
+  let body: { error?: { status?: string; details?: Array<{ errorCode?: string }> } } = {};
+  try { body = JSON.parse(text) as typeof body; } catch { /* non-JSON error */ }
+  const details = body.error?.details ?? [];
+  const hasUnregisteredDetail = details.some((detail) => detail?.errorCode === 'UNREGISTERED');
+  return status === 410 || hasUnregisteredDetail;
+}
+
+export async function sendFcm(
+  deviceToken: string,
+  payload: PushPayload,
+  serviceAccountRaw: string,
+  projectIdOverride?: string,
+): Promise<void> {
+  const account = parseFcmServiceAccount(serviceAccountRaw);
+  const projectId = projectIdOverride?.trim() || account.project_id;
+  if (!projectId) throw new Error('FCM project_id is required');
+  const cacheKey = `${projectId}:${account.client_email}`;
+  const data = fcmData(payload);
+  const message: Record<string, unknown> = {
+    token: deviceToken,
+    notification: { title: payload.title, body: payload.body },
+    android: {
+      priority: 'HIGH',
+      notification: { sound: 'default' },
+    },
+  };
+  if (Object.keys(data).length > 0) message.data = data;
+
+  let retriedAuth = false;
+  while (true) {
+    const accessToken = await getFcmAccessToken({ ...account, project_id: projectId });
+    const response = await fetch(
+      `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      },
+    );
+    const text = await response.text().catch(() => '');
+    if (response.ok) return;
+    if (response.status === 401 && !retriedAuth) {
+      fcmTokenCache.delete(cacheKey);
+      retriedAuth = true;
+      continue;
+    }
+    throw new PushError(`FCM ${response.status}: ${text}`, fcmErrorIsUnregistered(response.status, text));
   }
 }
 
