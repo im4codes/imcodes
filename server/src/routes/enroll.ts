@@ -97,7 +97,6 @@ import {
   aideskLocalUiExecutableFileName,
 } from '../../../shared/aidesk-local-ui-artifact.js';
 import {
-  REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
   REMOTE_DESKTOP_MACOS_ARCHITECTURES,
   REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
   REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES,
@@ -105,16 +104,13 @@ import {
   encodeRemoteDesktopMacosComponentSetPrefix,
   remoteDesktopMacosComponentSetFilename,
   remoteDesktopMacosComponentSetSize,
-  REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
-  REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
   REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
   REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
   validateRemoteDesktopWorkerReleaseManifest,
   type RemoteDesktopMacosArchitecture,
   type RemoteDesktopMacosWorkerManifest,
-  validateRemoteDesktopWorkerManifest,
   validateRemoteDesktopLinuxWorkerManifest,
 } from '../../../shared/remote-desktop-worker.js';
 import {
@@ -122,6 +118,7 @@ import {
   defaultArtifactCatalog,
   openDaemonRuntimeArtifact,
   openDesktopReleaseManifestArtifact,
+  openRemoteDesktopWorkerArtifact,
   type ArtifactCatalog,
   type ArtifactDescriptor,
 } from '../services/controlled-node-artifact-catalog.js';
@@ -1424,180 +1421,6 @@ async function openAideskLocalUiArtifact(dir: string, asset: AideskLocalUiArtifa
       ? AIDESK_LOCAL_UI_MANIFEST_MAX_BYTES
       : AIDESK_LOCAL_UI_NOTICES_MAX_BYTES;
   return await openPinnedArtifactFile(join(dir, aideskLocalUiArtifactRelativeDirectory(os, arch), filename), filename, maxBytes);
-}
-
-async function openRemoteDesktopWorkerArtifact(
-  dir: string,
-  asset: typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
-    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
-  legacyManifest = false,
-): Promise<{
-  handle?: FileHandle;
-  bytes?: Buffer;
-  close: () => Promise<void>;
-  filename: string;
-  sizeBytes: number;
-  sha256: string;
-  version: string;
-} | null> {
-  const workerDir = join(dir, 'remote-desktop-worker', 'win32-x64');
-  const executablePath = join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME);
-  const manifestFilename = `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
-  const manifestPath = join(workerDir, manifestFilename);
-  const virtualDisplayPath = join(workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME);
-  let executable: FileHandle | null = null;
-  let manifestHandle: FileHandle | null = null;
-  let virtualDisplayHandle: FileHandle | null = null;
-  let requested: FileHandle | null = null;
-  try {
-    const [executablePathStat, manifestPathStat, virtualDisplayPathStat] = await Promise.all([
-      lstat(executablePath),
-      lstat(manifestPath),
-      lstat(virtualDisplayPath),
-    ]);
-    if (!executablePathStat.isFile() || executablePathStat.isSymbolicLink()
-      || !manifestPathStat.isFile() || manifestPathStat.isSymbolicLink()
-      || !virtualDisplayPathStat.isFile() || virtualDisplayPathStat.isSymbolicLink()
-      || manifestPathStat.size <= 0 || manifestPathStat.size > 64 * 1024) return null;
-    manifestHandle = await open(manifestPath, 'r');
-    const manifestStat = await manifestHandle.stat();
-    if (!manifestStat.isFile() || manifestStat.size !== manifestPathStat.size
-      || manifestStat.mtimeMs !== manifestPathStat.mtimeMs
-      || manifestStat.ctimeMs !== manifestPathStat.ctimeMs) return null;
-    // Keep the exact bytes used for the HTTP digest. Decoding and re-encoding
-    // would make the advertised SHA-256 differ from the bytes held by this
-    // pinned descriptor if a malformed UTF-8 sequence ever reached disk.
-    const rawManifest = await manifestHandle.readFile();
-    await manifestHandle.close();
-    manifestHandle = null;
-    const manifest = validateRemoteDesktopWorkerManifest(JSON.parse(rawManifest.toString('utf8')));
-    if (!manifest || manifest.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
-      || manifest.size !== executablePathStat.size
-      || manifest.virtualDisplay.size !== virtualDisplayPathStat.size) return null;
-
-    executable = await open(executablePath, 'r');
-    const executableStat = await executable.stat();
-    if (!executableStat.isFile() || executableStat.size !== executablePathStat.size
-      || executableStat.mtimeMs !== executablePathStat.mtimeMs
-      || executableStat.ctimeMs !== executablePathStat.ctimeMs) return null;
-    const executableHash = createHash('sha256');
-    const executableBuffer = Buffer.alloc(64 * 1024);
-    let executablePosition = 0;
-    while (executablePosition < executableStat.size) {
-      const { bytesRead } = await executable.read(
-        executableBuffer,
-        0,
-        Math.min(executableBuffer.length, executableStat.size - executablePosition),
-        executablePosition,
-      );
-      if (bytesRead <= 0) return null;
-      executableHash.update(executableBuffer.subarray(0, bytesRead));
-      executablePosition += bytesRead;
-    }
-    if (executableHash.digest('hex') !== manifest.sha256) return null;
-
-    virtualDisplayHandle = await open(virtualDisplayPath, 'r');
-    const virtualDisplayStat = await virtualDisplayHandle.stat();
-    if (!virtualDisplayStat.isFile()
-      || virtualDisplayStat.size !== virtualDisplayPathStat.size
-      || virtualDisplayStat.mtimeMs !== virtualDisplayPathStat.mtimeMs
-      || virtualDisplayStat.ctimeMs !== virtualDisplayPathStat.ctimeMs) {
-      return null;
-    }
-    const virtualDisplayHash = createHash('sha256');
-    const virtualDisplayBuffer = Buffer.alloc(64 * 1024);
-    let virtualDisplayPosition = 0;
-    while (virtualDisplayPosition < virtualDisplayStat.size) {
-      const { bytesRead } = await virtualDisplayHandle.read(
-        virtualDisplayBuffer,
-        0,
-        Math.min(virtualDisplayBuffer.length, virtualDisplayStat.size - virtualDisplayPosition),
-        virtualDisplayPosition,
-      );
-      if (bytesRead <= 0) {
-        return null;
-      }
-      virtualDisplayHash.update(virtualDisplayBuffer.subarray(0, bytesRead));
-      virtualDisplayPosition += bytesRead;
-    }
-    if (virtualDisplayHash.digest('hex') !== manifest.virtualDisplay.sha256) {
-      return null;
-    }
-
-    if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-      && legacyManifest) {
-      const bytes = Buffer.from(JSON.stringify({
-        ...manifest,
-        protocolVersion: REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
-      }));
-      await executable.close();
-      executable = null;
-      await virtualDisplayHandle.close();
-      virtualDisplayHandle = null;
-      return {
-        bytes,
-        close: async () => {},
-        filename: manifestFilename,
-        sizeBytes: bytes.length,
-        sha256: createHash('sha256').update(bytes).digest('hex'),
-        version: manifest.workerVersion,
-      };
-    }
-
-    const requestedPath = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
-      ? executablePath
-      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-        ? manifestPath : virtualDisplayPath;
-    const requestedPathStat = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
-      ? executablePathStat
-      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-        ? manifestPathStat : virtualDisplayPathStat;
-    requested = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
-      ? executable
-      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY
-        ? virtualDisplayHandle : await open(requestedPath, 'r');
-    if (requested === executable) executable = null;
-    if (requested === virtualDisplayHandle) virtualDisplayHandle = null;
-    else {
-      await virtualDisplayHandle.close();
-      virtualDisplayHandle = null;
-    }
-    const requestedStat = await requested.stat();
-    if (!requestedStat.isFile() || requestedStat.size !== requestedPathStat.size
-      || requestedStat.mtimeMs !== requestedPathStat.mtimeMs
-      || requestedStat.ctimeMs !== requestedPathStat.ctimeMs) return null;
-    const requestedHash = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
-      ? manifest.sha256
-      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-        ? createHash('sha256').update(rawManifest).digest('hex')
-        : manifest.virtualDisplay.sha256;
-    let closed = false;
-    const pinned = requested;
-    requested = null;
-    return {
-      handle: pinned,
-      close: async () => {
-        if (closed) return;
-        closed = true;
-        await pinned.close().catch(() => {});
-      },
-      filename: asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
-        ? REMOTE_DESKTOP_WORKER_FILENAME
-        : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-          ? manifestFilename : REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
-      sizeBytes: requestedStat.size,
-      sha256: requestedHash,
-      version: manifest.workerVersion,
-    };
-  } catch {
-    return null;
-  } finally {
-    await executable?.close().catch(() => {});
-    await manifestHandle?.close().catch(() => {});
-    await virtualDisplayHandle?.close().catch(() => {});
-    await requested?.close().catch(() => {});
-  }
 }
 
 /**

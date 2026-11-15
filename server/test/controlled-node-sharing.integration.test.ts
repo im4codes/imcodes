@@ -407,6 +407,77 @@ describe('controlled-node version reporting', () => {
       else process.env.APP_VERSION = previousAppVersion;
     }
   });
+
+  it('hides updateAvailable/failed status and refuses manual upgrade cleanly against Postgres when Windows artifacts are not built', async () => {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    await createUser(db, ownerId);
+    const winNode = await controlledNode(ownerId);
+    const linuxNode = await controlledNode(ownerId);
+    await db.execute(
+      `UPDATE servers
+          SET os = 'win', arch = 'x64', abi_profile = 'modern',
+              daemon_version = $2,
+              controlled_upgrade_status = 'failed',
+              controlled_upgrade_target_version = $3,
+              controlled_upgrade_reason = 'download_failed_503'
+        WHERE id = $1`,
+      [winNode, '2026.11.6629-dev.6677', '2026.11.6643-dev.6687'],
+    );
+    await db.execute(
+      `UPDATE servers
+          SET os = 'linux', arch = 'x64', abi_profile = 'modern',
+              daemon_version = $2
+        WHERE id = $1`,
+      [linuxNode, '2026.11.6629-dev.6677'],
+    );
+
+    const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const artifactDir = mkdtempSync(join(tmpdir(), 'imcodes-int-avail-'));
+    const linuxBytes = Buffer.from('linux-bin-int');
+    writeFileSync(join(artifactDir, 'imcodes-node-linux'), linuxBytes);
+    writeFileSync(join(artifactDir, 'imcodes-node-linux.manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        os: 'linux',
+        arch: 'x64',
+        fileName: 'imcodes-node-linux',
+        size: linuxBytes.length,
+        sha256: sha256(linuxBytes.toString()),
+      },
+      build: { version: '2026.11.6643-dev.6687' },
+    }));
+
+    const previousAppVersion = process.env.APP_VERSION;
+    const previousExeDir = process.env.IMCODES_NODE_EXE_DIR;
+    process.env.APP_VERSION = '2026.11.6643-dev.6687';
+    process.env.IMCODES_NODE_EXE_DIR = artifactDir;
+    try {
+      const browser = await (await app.request('/api/machines', { headers: webAuth(ownerId) })).json() as {
+        machines: Array<{ serverId: string; updateAvailable?: boolean; upgradeStatus?: string; upgradeReason?: string }>;
+      };
+      const byId = new Map(browser.machines.map((m) => [m.serverId, m]));
+      expect(byId.get(winNode)?.updateAvailable).toBeUndefined();
+      expect(byId.get(winNode)?.upgradeStatus).toBeUndefined();
+      expect(byId.get(winNode)?.upgradeReason).toBeUndefined();
+      expect(byId.get(linuxNode)?.updateAvailable).toBe(true);
+
+      const upgradeRes = await app.request(`/api/machines/${winNode}/upgrade`, {
+        method: 'POST',
+        headers: webAuth(ownerId),
+      });
+      expect(upgradeRes.status).toBe(409);
+      expect(await upgradeRes.json()).toEqual({ error: 'executable_not_built' });
+    } finally {
+      if (previousAppVersion === undefined) delete process.env.APP_VERSION;
+      else process.env.APP_VERSION = previousAppVersion;
+      if (previousExeDir === undefined) delete process.env.IMCODES_NODE_EXE_DIR;
+      else process.env.IMCODES_NODE_EXE_DIR = previousExeDir;
+      rmSync(artifactDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('controlled-node shared action admission', () => {

@@ -72,6 +72,7 @@ import {
   CONTROLLED_NODE_WORKER_REFRESH_PHASE,
   type ControlledNodeWorkerRefreshPhase,
 } from '../../../shared/controlled-node-worker-refresh.js';
+import { checkControlledNodeUpgradeArtifactAvailability } from '../services/controlled-node-artifact-catalog.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -92,6 +93,8 @@ interface ControlledRow {
   last_heartbeat_at: number | null;
   exec_enabled: boolean;
   os: string | null;
+  arch?: string | null;
+  abi_profile?: unknown;
   daemon_version: string | null;
   auto_unlock_configured: boolean;
   controlled_upgrade_status: string | null;
@@ -147,7 +150,29 @@ export async function listControlledMachines(
     : await listAccessibleControlledMachines(db, userId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
   // The bound is on the authenticated actual actor's fleet, not the source owner's.
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
-  const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
+  const page = rows.slice(0, MACHINE_LIST_MAX_ITEMS);
+  const availabilityByPlatformKey = new Map<string, boolean>();
+  if (process.env.IMCODES_NODE_EXE_DIR?.trim()) {
+    const uniquePlatforms = new Map<string, { os: string | null; arch: string | null; abiProfile: unknown }>();
+    for (const r of page) {
+      const osKey = typeof r.os === 'string' ? r.os.trim().toLowerCase() : '';
+      const archKey = typeof r.arch === 'string' ? r.arch.trim().toLowerCase() : '';
+      const abiKey = typeof r.abi_profile === 'string' ? r.abi_profile.trim().toLowerCase() : '';
+      const key = `${osKey}|${archKey}|${abiKey}`;
+      if (!uniquePlatforms.has(key)) {
+        uniquePlatforms.set(key, {
+          os: r.os ?? null,
+          arch: r.arch ?? null,
+          abiProfile: r.abi_profile,
+        });
+      }
+    }
+    await Promise.all([...uniquePlatforms.entries()].map(async ([key, target]) => {
+      const availability = await checkControlledNodeUpgradeArtifactAvailability(target);
+      availabilityByPlatformKey.set(key, availability.available);
+    }));
+  }
+  const machines = page.map((r) => {
     if (!isControlledNodeId(r.node_id)) {
       throw new Error(`controlled_node_missing_canonical_node_id:${r.id}`);
     }
@@ -185,17 +210,21 @@ export async function listControlledMachines(
         recordedAt: r.controlled_worker_refresh_recorded_at,
       }
       : undefined);
+    const platformKey = `${typeof r.os === 'string' ? r.os.trim().toLowerCase() : ''}|${typeof r.arch === 'string' ? r.arch.trim().toLowerCase() : ''}|${typeof r.abi_profile === 'string' ? r.abi_profile.trim().toLowerCase() : ''}`;
+    const artifactAvailable = availabilityByPlatformKey.get(platformKey) ?? true;
     const persistedUpgradeStatus = Object.values(CONTROLLED_NODE_UPGRADE_STATUS)
       .includes(r.controlled_upgrade_status as ControlledNodeUpgradeStatus)
       ? r.controlled_upgrade_status as ControlledNodeUpgradeStatus
       : null;
-    const upgrade = persistedUpgradeStatus
-      ? {
-        status: persistedUpgradeStatus,
-        ...(r.controlled_upgrade_target_version ? { targetVersion: r.controlled_upgrade_target_version } : {}),
-        ...(r.controlled_upgrade_reason ? { reason: r.controlled_upgrade_reason } : {}),
-      }
-      : liveUpgrade;
+    const upgrade = !artifactAvailable
+      ? null
+      : persistedUpgradeStatus
+        ? {
+          status: persistedUpgradeStatus,
+          ...(r.controlled_upgrade_target_version ? { targetVersion: r.controlled_upgrade_target_version } : {}),
+          ...(r.controlled_upgrade_reason ? { reason: r.controlled_upgrade_reason } : {}),
+        }
+        : liveUpgrade;
     const canExecute = evaluateMachineAction({
       accessRole: r.access_role,
       accessSource: r.access_source,
@@ -242,7 +271,7 @@ export async function listControlledMachines(
       ...(daemonVersion ? { daemonVersion } : {}),
       // The comparison stays here: only the Server knows its release target,
       // and a browser must not have to guess what "current" means.
-      ...(isImcodesVersionOutdated(daemonVersion, process.env.APP_VERSION)
+      ...(artifactAvailable && isImcodesVersionOutdated(daemonVersion, process.env.APP_VERSION)
         ? { updateAvailable: true }
         : {}),
       // Upgrade lifecycle is process-local to the authenticated WS bridge. It
@@ -358,12 +387,27 @@ machinesRoutes.post('/:serverId/upgrade', requireAuth(), async (c) => {
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!access) return c.json({ error: 'not_found' }, 404);
-  const row = await c.env.DB.queryOne<{ node_role: string; revoked_at: number | null }>(
-    'SELECT node_role, revoked_at FROM servers WHERE id = $1',
+  const row = await c.env.DB.queryOne<{
+    node_role: string;
+    revoked_at: number | null;
+    os: string | null;
+    arch: string | null;
+    abi_profile: unknown;
+  }>(
+    'SELECT node_role, revoked_at, os, arch, abi_profile FROM servers WHERE id = $1',
     [serverId],
   );
   if (!row || row.revoked_at !== null || row.node_role !== NODE_ROLE.CONTROLLED) {
     return c.json({ error: 'not_found' }, 404);
+  }
+  const availability = await checkControlledNodeUpgradeArtifactAvailability({
+    os: row.os,
+    arch: row.arch,
+    abiProfile: row.abi_profile,
+  });
+  WsBridge.find(serverId)?.syncControlledNodeArtifactAvailability(availability);
+  if (!availability.available) {
+    return c.json({ error: availability.reason ?? 'executable_not_built' }, 409);
   }
   const result = WsBridge.get(serverId).requestDaemonUpgrade({
     targetVersion: process.env.APP_VERSION,
