@@ -33,7 +33,11 @@ import { sanitizeCloudDocTransferFilename } from '../../src/daemon/cloud-docs-mc
 import { currentDaemonProcessIdentity } from '../../src/daemon/instance-lock.js';
 import { publishHookAuthority } from '../../src/daemon/hook-port.js';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
-import { formatCloudDocQuoteBadge } from '../../web/src/cloud-docs-reference.js';
+import {
+  formatCloudDocQuoteBadge,
+  parseCloudDocQuoteTag,
+  splitTextByCloudDocQuoteTags,
+} from '../../web/src/cloud-docs-reference.js';
 
 interface RecordedHttpRequest {
   method: string;
@@ -988,5 +992,152 @@ describe('imcodes cloud-docs CLI', () => {
     const troubleshootingGuide = await runCloudDocsCli(['docs', '--topic', 'troubleshooting'], { env: {} });
     expect(troubleshootingGuide.exitCode).toBe(0);
     expect(troubleshootingGuide.stdout).toContain('ONLYOFFICE DocBuilder document generation error (-3)');
+  });
+
+  it('outputs canonical [CloudDoc: <name> | id=<docId>] citations and structured citation fields across subcommands and edge-case names', async () => {
+    const authEnv = {
+      IMCODES_SERVER_URL: baseUrl,
+      IMCODES_SERVER_ID: 'srv-cite',
+      IMCODES_TOKEN: 'tok-cite',
+    };
+
+    // 1. list: Owned Docs, Shared Docs, and Recent Documents (cloudDocId) emit canonical citations; Folders (cfld_...) and server_file do NOT.
+    responder = (req) => {
+      if (req.url === '/api/cloud-docs') {
+        return {
+          json: {
+            folders: [{ id: 'cfld_folder_1', name: 'Work Folder', parentId: null, createdAt: 1, updatedAt: 1 }],
+            docs: [{ id: 'cdoc_owned_1', name: '无标题表格.xlsx', ext: '.xlsx', docVersion: 2, folderId: 'cfld_folder_1' }],
+            sharedFolders: [],
+            sharedDocs: [{ id: 'cdoc_shared_1', name: 'Shared Budget.xlsx', ext: '.xlsx', role: 'editor', docVersion: 3 }],
+          },
+        };
+      }
+      if (req.url === '/api/recent-documents') {
+        return {
+          json: {
+            items: [
+              { id: 'rec_1', title: 'Recent Sheet.xlsx', sourceKind: 'cloud_doc', cloudDocId: 'cdoc_recent_1', updatedAt: 10 },
+              { id: 'rec_2', title: 'local-only.log', filePath: '/tmp/local-only.log', sourceKind: 'server_file', updatedAt: 9 },
+            ],
+          },
+        };
+      }
+      return { json: {} };
+    };
+    const listRes = await runCloudDocsCli(['list', '--recent'], { env: authEnv });
+    expect(listRes.exitCode).toBe(0);
+    expect(listRes.stdout).toContain('[CloudDoc: 无标题表格.xlsx | id=cdoc_owned_1]');
+    expect(listRes.stdout).toContain('[CloudDoc: Shared Budget.xlsx | id=cdoc_shared_1]');
+    expect(listRes.stdout).toContain('[CloudDoc: Recent Sheet.xlsx | id=cdoc_recent_1]');
+    expect(listRes.stdout).toContain('Work Folder [cfld_folder_1]');
+    expect(listRes.stdout).not.toContain('[CloudDoc: Work Folder');
+    expect(listRes.stdout).not.toContain('无标题表格.xlsx (id=');
+    expect(listRes.stdout).toContain('/tmp/local-only.log (server_file');
+
+    // 2. edit --name rename: both text output and JSON data.citation use the latest renamed name with the same id.
+    responder = () => ({
+      json: {
+        ok: true,
+        doc: { id: 'cdoc_e9d1465bcd3b44d988ee', name: '冬日傍晚的一杯热茶.xlsx', ext: '.xlsx', docVersion: 4 },
+      },
+    });
+    const renameRes = await runCloudDocsCli(['edit', 'cdoc_e9d1465bcd3b44d988ee', '--name', '冬日傍晚的一杯热茶.xlsx', '--json'], { env: authEnv });
+    expect(renameRes.exitCode).toBe(0);
+    const renameJson = JSON.parse(renameRes.stdout);
+    expect(renameJson.citation).toBe('[CloudDoc: 冬日傍晚的一杯热茶.xlsx | id=cdoc_e9d1465bcd3b44d988ee]');
+    expect(renameJson.doc.name).toBe('冬日傍晚的一杯热茶.xlsx');
+    const renameText = await runCloudDocsCli(['edit', 'cdoc_e9d1465bcd3b44d988ee', '--name', '冬日傍晚的一杯热茶.xlsx'], { env: authEnv });
+    expect(renameText.exitCode).toBe(0);
+    expect(renameText.stdout).toContain('Updated: [CloudDoc: 冬日傍晚的一杯热茶.xlsx | id=cdoc_e9d1465bcd3b44d988ee]');
+
+    // 3. create, create --file, upload (new & --replace), builder, convert --save-as-new, edit --file, edit --no-save --out, read:
+    responder = () => ({
+      json: { doc: { id: 'cdoc_created_1', name: 'Plan 2026.docx', ext: '.docx', docVersion: 1 }, created: true },
+    });
+    const createText = await runCloudDocsCli(['create', '--type', 'docx', '--name', 'Plan 2026.docx'], { env: authEnv });
+    expect(createText.exitCode).toBe(0);
+    expect(createText.stdout).toContain('Created: [CloudDoc: Plan 2026.docx | id=cdoc_created_1]');
+
+    const srcPath = join(workDir, 'upload-sample.docx');
+    writeFileSync(srcPath, 'PK-sample');
+    responder = () => ({
+      json: { doc: { id: 'cdoc_uploaded_1', name: 'upload-sample.docx', ext: '.docx', docVersion: 1 } },
+    });
+    const uploadText = await runCloudDocsCli(['upload', '--file', srcPath], { env: authEnv });
+    expect(uploadText.exitCode).toBe(0);
+    expect(uploadText.stdout).toContain('Uploaded: [CloudDoc: upload-sample.docx | id=cdoc_uploaded_1]');
+
+    responder = () => ({
+      json: { doc: { id: 'cdoc_uploaded_1', name: 'upload-sample.docx', ext: '.docx', docVersion: 2 }, ok: true },
+    });
+    const replaceText = await runCloudDocsCli(['upload', '--file', srcPath, '--replace', 'cdoc_uploaded_1'], { env: authEnv });
+    expect(replaceText.exitCode).toBe(0);
+    expect(replaceText.stdout).toContain('Replaced file: [CloudDoc: upload-sample.docx | id=cdoc_uploaded_1]');
+
+    responder = () => ({
+      json: {
+        doc: { id: 'cdoc_saved_conv', name: 'Exported.pdf', ext: '.pdf', docVersion: 1 },
+        fileName: 'Exported.pdf',
+        mimeType: 'application/pdf',
+        bytesWritten: 4,
+      },
+    });
+    const convertText = await runCloudDocsCli(['convert', 'cdoc_uploaded_1', '--to', 'pdf', '--save-as-new'], { env: authEnv });
+    expect(convertText.exitCode).toBe(0);
+    expect(convertText.stdout).toContain('Converted & saved as new Cloud Doc: [CloudDoc: Exported.pdf | id=cdoc_saved_conv]');
+
+    // edit --no-save --out keeps real local savedTo path alongside canonical CloudDoc citation
+    const localPreviewPath = join(workDir, 'preview-out.docx');
+    const previewBytes = Buffer.from('PK-preview-data');
+    responder = () => ({
+      json: {
+        doc: { id: 'cdoc_preview_1', name: 'Brief.docx', ext: '.docx', docVersion: 3 },
+        bytesBase64: previewBytes.toString('base64'),
+        outputName: 'preview-out.docx',
+        bytesWritten: previewBytes.length,
+      },
+    });
+    const noSaveText = await runCloudDocsCli(
+      ['edit', 'cdoc_preview_1', '--script', 'Api.GetDocument();', '--no-save', '--out', localPreviewPath],
+      { env: authEnv },
+    );
+    expect(noSaveText.exitCode).toBe(0);
+    expect(noSaveText.stdout).toContain('Exported via edit --no-save from [CloudDoc: Brief.docx | id=cdoc_preview_1]');
+    expect(noSaveText.stdout).toContain(localPreviewPath);
+
+    // read header uses canonical citation too
+    responder = () => ({
+      json: {
+        doc: { id: 'cdoc_read_1', name: 'Notes.md', ext: '.md', docVersion: 2 },
+        role: 'owner',
+        format: 'text',
+        content: '# Hello',
+        readOnly: false,
+      },
+    });
+    const readText = await runCloudDocsCli(['read', 'cdoc_read_1'], { env: authEnv });
+    expect(readText.exitCode).toBe(0);
+    expect(readText.stdout).toContain('[CloudDoc: Notes.md | id=cdoc_read_1] v2');
+    expect(readText.stdout).toContain('Chat reply MUST cite exact token: [CloudDoc: Notes.md | id=cdoc_read_1]');
+
+    // 4. Special characters boundary check: '|', ']', and newlines in doc name sanitize and round-trip cleanly through parser.
+    const trickyName = 'Q1 | Budget ] Draft\nv2.xlsx';
+    responder = () => ({
+      json: {
+        ok: true,
+        doc: { id: 'cdoc_tricky_1', name: trickyName, ext: '.xlsx', docVersion: 5 },
+      },
+    });
+    const trickyRes = await runCloudDocsCli(['edit', 'cdoc_tricky_1', '--name', trickyName, '--json'], { env: authEnv });
+    expect(trickyRes.exitCode).toBe(0);
+    const trickyJson = JSON.parse(trickyRes.stdout);
+    const parsed = parseCloudDocQuoteTag(trickyJson.citation);
+    expect(parsed).toEqual({
+      docId: 'cdoc_tricky_1',
+      name: 'Q1 Budget Draft v2.xlsx',
+    });
+    const segments = splitTextByCloudDocQuoteTags(`已重命名为 ${trickyJson.citation}，请查看 ${trickyJson.citation}。`);
+    expect(segments.filter((s) => s.type === 'cloud_doc')).toHaveLength(2);
   });
 });

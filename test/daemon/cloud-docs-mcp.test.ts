@@ -339,4 +339,51 @@ describe('MCP cloud_docs CLI-passthrough tool', () => {
       await unbound.close();
     }
   });
+
+  it('returns canonical [CloudDoc: <name> | id=<docId>] text and data.citation for rename and list via MCP cloud_docs', async () => {
+    const conn = await openClient({ catalogMode: 'static_full' });
+    try {
+      mockStatus = 200;
+      mockBody = null;
+      mockJson = {
+        ok: true,
+        doc: { id: 'cdoc_mcp_1', name: '冬日傍晚的一杯热茶.xlsx', ext: '.xlsx', docVersion: 6 },
+      };
+      const renameRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { args: ['edit', 'cdoc_mcp_1', '--name', '冬日傍晚的一杯热茶.xlsx'] },
+      });
+      expect(renameRes.isError).not.toBe(true);
+      expect(renameRes.structuredContent).toMatchObject({
+        status: 'ok',
+        data: {
+          citation: '[CloudDoc: 冬日傍晚的一杯热茶.xlsx | id=cdoc_mcp_1]',
+          doc: { id: 'cdoc_mcp_1', name: '冬日傍晚的一杯热茶.xlsx', docVersion: 6 },
+        },
+      });
+      const textContent = renameRes.content.find((item) => item.type === 'text');
+      expect(textContent && 'text' in textContent ? textContent.text : '').toContain(
+        '[CloudDoc: 冬日傍晚的一杯热茶.xlsx | id=cdoc_mcp_1]',
+      );
+
+      mockJson = {
+        folders: [{ id: 'cfld_mcp_1', name: 'Root', parentId: null, createdAt: 1, updatedAt: 1 }],
+        docs: [{ id: 'cdoc_mcp_1', name: '冬日傍晚的一杯热茶.xlsx', ext: '.xlsx', docVersion: 6 }],
+        sharedFolders: [],
+        sharedDocs: [],
+      };
+      const listRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { args: ['list'] },
+      });
+      expect(listRes.isError).not.toBe(true);
+      const listText = listRes.content.find((item) => item.type === 'text');
+      const rendered = listText && 'text' in listText ? listText.text : '';
+      expect(rendered).toContain('[CloudDoc: 冬日傍晚的一杯热茶.xlsx | id=cdoc_mcp_1]');
+      expect(rendered).toContain('Root [cfld_mcp_1]');
+      expect(rendered).not.toContain('冬日傍晚的一杯热茶.xlsx (id=');
+    } finally {
+      await conn.close();
+    }
+  });
 });

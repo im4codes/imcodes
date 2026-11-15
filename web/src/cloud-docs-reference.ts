@@ -1,5 +1,12 @@
 import type { WorkspaceBounds, WindowGeometry } from './desktop-window-maximize.js';
 import { getFrontmostSubSessionId, type MutableDesktopWindowStack } from './window-stack.js';
+import {
+  formatCloudDocCitation,
+  sanitizeCloudDocCitationId,
+  sanitizeCloudDocQuoteName,
+} from '../../shared/cloud-docs.js';
+
+export { sanitizeCloudDocQuoteName };
 
 export type CloudDocQuoteTarget =
   | {
@@ -25,24 +32,11 @@ const DEFAULT_DOCK_GAP_ABOVE_COMPOSER_PX = 12;
 const DEFAULT_DOCK_EDGE_PADDING_PX = 8;
 const DEFAULT_FALLBACK_COMPOSER_RESERVE_PX = 140;
 
-export function sanitizeCloudDocQuoteName(raw: string): string {
-  const cleaned = raw
-    .replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ')
-    .replace(/[|\]]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return cleaned || 'Untitled';
-}
-
-function sanitizeCloudDocQuoteIdOrPath(raw: string): string {
-  return raw.replace(/[\r\n\t\x00-\x1f\x7f]/g, '').trim();
-}
-
 export function getCloudDocQuoteKey(target: CloudDocQuoteTarget): string {
   if (target.kind === 'cloud_doc') {
-    return `cloud_doc:${sanitizeCloudDocQuoteIdOrPath(target.docId)}`;
+    return `cloud_doc:${sanitizeCloudDocCitationId(target.docId)}`;
   }
-  return `server_file:${target.serverId ?? ''}:${sanitizeCloudDocQuoteIdOrPath(target.path)}`;
+  return `server_file:${target.serverId ?? ''}:${sanitizeCloudDocCitationId(target.path)}`;
 }
 
 /**
@@ -59,11 +53,9 @@ export function formatCloudDocQuoteText(target: CloudDocQuoteTarget): string {
  */
 export function formatCloudDocQuoteBadge(target: CloudDocQuoteTarget): string {
   if (target.kind === 'cloud_doc') {
-    const cleanName = sanitizeCloudDocQuoteName(target.name);
-    const cleanId = sanitizeCloudDocQuoteIdOrPath(target.docId);
-    return `[CloudDoc: ${cleanName} | id=${cleanId}]`;
+    return formatCloudDocCitation(target.name, target.docId);
   }
-  const cleanPath = sanitizeCloudDocQuoteIdOrPath(target.path);
+  const cleanPath = sanitizeCloudDocCitationId(target.path);
   return cleanPath.startsWith('@') ? cleanPath : `@${cleanPath}`;
 }
 

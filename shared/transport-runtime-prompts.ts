@@ -41,7 +41,11 @@ import { IMCODES_SESSION_ENV } from './imcodes-send.js';
 import { SSH_TARGET_ROUTING_GUIDANCE } from './ssh-target-guidance.js';
 import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
 import { VERIFICATION_MACHINE_MCP_TOOLS } from './verification-machine.js';
-import { FILE_OUTPUT_CONTRACT_ID, buildFileOutputContract } from './file-output-contract.js';
+import {
+  FILE_OUTPUT_CONTRACT_ID,
+  buildCloudDocOutputContract,
+  buildFileOutputContract,
+} from './file-output-contract.js';
 
 /**
  * Shared device-target authority rules. A target explicitly supplied in the
@@ -112,12 +116,11 @@ export function buildGeneratedImageReportingPrompt(): string {
 }
 
 /**
- * Render the File Path Reporting protocol. This is provider-neutral:
- * any agent can create artifacts or ask IM.codes/the user to open,
- * preview, download, or send a file. The frontend resolves those
- * actions most reliably from absolute paths, so keep this short and
- * daemon-injected outside user-authored prompt caps.
+ * Render the File Path & Cloud Doc Reporting protocols. This is provider-neutral:
+ * any agent can create artifacts, reference Cloud Docs, or ask IM.codes/the user
+ * to open, preview, download, or send a file. Keep both compact and daemon-injected
+ * outside user-authored prompt caps.
  */
 export function buildFilePathReportingPrompt(): string {
-  return buildFileOutputContract();
+  return `${buildFileOutputContract()}\n${buildCloudDocOutputContract()}`;
 }

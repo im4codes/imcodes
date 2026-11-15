@@ -119,5 +119,9 @@ describe('shared MCP tool distribution contract', () => {
     const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain(canonicalPattern);
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('id=<docId>');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/every turn|turn 1|turn 2/i);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/rename/i);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/every mention/i);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('bare filename');
   });
 });

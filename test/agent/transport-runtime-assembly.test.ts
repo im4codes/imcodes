@@ -24,7 +24,7 @@ import {
   TASK_PAIR_SPLIT_UNRELATED_RULE,
   TASK_PAIR_SPLIT_UNRELATED_TOKEN,
 } from '../../shared/task-pair.js';
-import { buildFileOutputContract } from '../../shared/file-output-contract.js';
+import { buildCloudDocOutputContract, buildFileOutputContract } from '../../shared/file-output-contract.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { buildBrainWorkDelegationContractRef } from '../../src/daemon/supervision-prompts.js';
@@ -145,6 +145,9 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
     expect(payload.systemText).toContain('"contractId":"file_output_v1"');
     expect(payload.systemText).toContain('[display name](/absolute/full/path)');
+    expect(payload.systemText).toContain('"scope":"local_files_only_never_cloud_docs"');
+    expect(payload.systemText).toContain('"contractId":"cloud_doc_output_v1"');
+    expect(payload.systemText).toContain('[CloudDoc: <name> | id=<docId>]');
   });
 
   it('keeps the synchronized identity contract intact in stable session system text', () => {
@@ -477,9 +480,18 @@ describe('buildProviderContextPayload', () => {
         expect(payload.systemText).not.toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
       }
       expect(payload.systemText?.split(buildFileOutputContract())).toHaveLength(2);
+      expect(payload.systemText?.split(buildCloudDocOutputContract())).toHaveLength(2);
       expect(payload.systemText?.match(/file_output_v1/g)).toHaveLength(1);
+      expect(payload.systemText?.match(/"contractId":"cloud_doc_output_v1"/g)).toHaveLength(1);
       expect(payload.systemText).toContain('[display name](/absolute/full/path)');
       expect(payload.systemText).toContain('"repoRelative":"resolve_against_workspace_if_only_known"');
+      expect(payload.systemText).toContain('"scope":"local_files_only_never_cloud_docs"');
+      expect(payload.systemText).toContain('"cloudDocs":"use_cloud_doc_output_v1"');
+      expect(payload.systemText).toContain('[CloudDoc: <name> | id=<docId>]');
+      expect(payload.systemText).toContain('"turns":"required_in_turn_1_turn_2_and_all_later_replies"');
+      expect(payload.systemText).toContain('"repeatedMentions":"full_token_on_every_occurrence_never_drop_id"');
+      expect(payload.systemText).toContain('"afterRename":"use_latest_name_and_keep_same_id"');
+      expect(payload.systemText).toContain('"forbidden"');
       expect(payload.sessionSystemText).toContain('cross-sdk identity sentinel');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }

@@ -458,12 +458,16 @@ describe('memory MCP shared contracts', () => {
     expect((updateProps.expiresAt as { description?: string }).description).toContain('future sends only');
   });
 
-  it('documents the canonical CloudDoc chat citation format matching formatCloudDocQuoteBadge', () => {
+  it('documents the canonical CloudDoc chat citation format matching formatCloudDocQuoteBadge across turns and renames', () => {
     const cloudDocs = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS];
     const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
     expect(canonicalPattern).toBe('[CloudDoc: <name> | id=<docId>]');
     expect(cloudDocs.description).toContain(canonicalPattern);
     expect(cloudDocs.description).toContain('id=<docId>');
+    expect(cloudDocs.description).toMatch(/every turn|turn 1|turn 2/i);
+    expect(cloudDocs.description).toMatch(/rename|edit/i);
+    expect(cloudDocs.description).toMatch(/every mention/i);
+    expect(cloudDocs.description).toContain('bare filename');
   });
 
   // ── memory-source-server-routing change ─────────────────────────────

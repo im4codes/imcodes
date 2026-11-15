@@ -497,6 +497,29 @@ export interface CloudDocFileUpdateResponse {
   bytesWritten: number;
 }
 
+export function sanitizeCloudDocQuoteName(raw: string): string {
+  const cleaned = raw
+    .replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ')
+    .replace(/[|\]]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || 'Untitled';
+}
+
+export function sanitizeCloudDocCitationId(raw: string): string {
+  return raw.replace(/[\r\n\t\x00-\x1f\x7f]/g, '').trim();
+}
+
+/**
+ * Format the canonical chat citation token `[CloudDoc: <name> | id=<docId>]`
+ * shared across daemon CLI output, MCP responses, and web composer/markdown helpers.
+ */
+export function formatCloudDocCitation(name: string | undefined | null, docId: string): string {
+  const cleanName = sanitizeCloudDocQuoteName(typeof name === 'string' ? name : '');
+  const cleanId = sanitizeCloudDocCitationId(docId);
+  return `[CloudDoc: ${cleanName} | id=${cleanId}]`;
+}
+
 /**
  * Returns true if the given filename/path or MIME type represents a Markdown document.
  * Markdown files must only be recorded into recent_documents when genuinely opened via ONLYOFFICE.

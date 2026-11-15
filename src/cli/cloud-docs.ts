@@ -11,6 +11,7 @@ import {
   CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS,
   CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES,
   CLOUD_DOC_EDIT_MODES,
+  formatCloudDocCitation,
   getCloudDocExt,
   getCloudDocMeta,
   isConvertTargetType,
@@ -347,7 +348,8 @@ async function writeBinaryOutFile(
 
 function formatReadableDocContent(payload: CloudDocContentPayload): string {
   const lines: string[] = [];
-  lines.push(`${payload.doc.name} (${payload.doc.id}) v${payload.doc.docVersion} [${payload.role}]`);
+  const citation = formatCloudDocCitation(payload.doc.name, payload.doc.id);
+  lines.push(`${citation} v${payload.doc.docVersion} [${payload.role}]`);
   if (payload.truncated) {
     lines.push('(content truncated)');
   }
@@ -376,8 +378,15 @@ function formatReadableDocContent(payload: CloudDocContentPayload): string {
   return lines.join('\n');
 }
 
+function withDocCitation<T extends { doc?: CloudDocItem }>(payload: T): T & { citation?: string } {
+  return payload.doc
+    ? { ...payload, citation: formatCloudDocCitation(payload.doc.name, payload.doc.id) }
+    : payload;
+}
+
 function formatDocSummary(doc: CloudDocItem, prefix = 'OK'): string {
-  return `${prefix}: ${doc.name} (id=${doc.id}, ext=${doc.ext}, version=${doc.docVersion}, bytes=${doc.sizeBytes})`;
+  const citation = formatCloudDocCitation(doc.name, doc.id);
+  return `${prefix}: ${citation} (ext=${doc.ext}, version=${doc.docVersion}, bytes=${doc.sizeBytes})\nChat reply MUST cite exact token: ${citation}`;
 }
 
 export async function runCloudDocsCli(
@@ -475,9 +484,10 @@ export async function runCloudDocsCli(
         [
           '',
           'Chat citation format:',
-          '  When creating, editing, or mentioning a Cloud Doc in chat replies, always cite it as:',
+          '  Mandatory in EVERY turn and EVERY mention when creating, reading, renaming, editing, sharing, or mentioning a Cloud Doc in chat replies:',
           '  [CloudDoc: <name> | id=<docId>]',
-          '  (Must include `id=<docId>`; never output a bare filename or local path alone.)',
+          '  - Required in turn 1, turn 2+, follow-ups, after rename (use latest <name> + same id=<docId>), and on repeated mentions in the same reply.',
+          '  - NEVER emit a bare filename, `<name>`, `<name> (id=...)`, or a local Markdown link `[<name>](/path)`.',
         ].join('\n'),
       ),
   );
@@ -507,7 +517,7 @@ export async function runCloudDocsCli(
         const lines: string[] = [
           `Folders (${ok.folders.length}): ${ok.folders.map((f) => `${f.name} [${f.id}]`).join(', ') || 'none'}`,
           `Docs (${ok.docs.length}):`,
-          ...ok.docs.map((d) => `  - ${d.name} (id=${d.id}, ext=${d.ext}, v=${d.docVersion}, bytes=${d.sizeBytes})`),
+          ...ok.docs.map((d) => `  - ${formatCloudDocCitation(d.name, d.id)} (ext=${d.ext}, v=${d.docVersion}, bytes=${d.sizeBytes})`),
         ];
         if (ok.sharedFolders.length > 0) {
           lines.push(`Shared Folders (${ok.sharedFolders.length}):`);
@@ -515,11 +525,16 @@ export async function runCloudDocsCli(
         }
         if (ok.sharedDocs.length > 0) {
           lines.push(`Shared Docs (${ok.sharedDocs.length}):`);
-          lines.push(...ok.sharedDocs.map((d) => `  - ${d.name} (id=${d.id}, role=${d.role}, v=${d.docVersion})`));
+          lines.push(...ok.sharedDocs.map((d) => `  - ${formatCloudDocCitation(d.name, d.id)} (role=${d.role}, v=${d.docVersion})`));
         }
         if (ok.recentDocuments) {
           lines.push(`Recent Documents (${ok.recentDocuments.length}):`);
-          lines.push(...ok.recentDocuments.map((r) => `  - ${r.title} (id=${r.cloudDocId ?? r.id})`));
+          lines.push(...ok.recentDocuments.map((r) => {
+            const docId = r.cloudDocId ?? (r.sourceKind === 'cloud_doc' || String(r.id).startsWith('cdoc_') ? r.id : null);
+            return docId
+              ? `  - ${formatCloudDocCitation(r.title, docId)}`
+              : `  - ${r.filePath ?? r.title} (server_file, recentId=${r.id})`;
+          }));
         }
         succeed(ok, lines.join('\n'), ctx.flags.json);
       });
@@ -584,14 +599,16 @@ export async function runCloudDocsCli(
       });
       await finishClientResult(res, ctx.flags.json, async (ok) => {
         const formatted = formatReadableDocContent(ok);
+        const citation = formatCloudDocCitation(ok.doc.name, ok.doc.id);
         let savedTo: string | undefined;
         if (opts.out) {
           const textBody = typeof ok.content === 'string' && ok.content.length > 0 ? ok.content : formatted;
           const fallback = `${ok.doc.name}.txt`;
           savedTo = await writeBinaryOutFile(opts.out, fallback, Buffer.from(textBody, 'utf8'), cwd);
         }
-        const payload = savedTo ? { ...ok, savedTo } : ok;
-        succeed(payload, savedTo ? `${formatted}\n\nSaved to: ${savedTo}` : formatted, ctx.flags.json);
+        const payload = withDocCitation(savedTo ? { ...ok, savedTo } : ok);
+        const summary = `${formatted}${savedTo ? `\n\nSaved to: ${savedTo}` : ''}\n\nChat reply MUST cite exact token: ${citation}`;
+        succeed(payload, summary, ctx.flags.json);
       });
     });
 
@@ -668,7 +685,7 @@ export async function runCloudDocsCli(
           ...(local.mimeType ? { mimeType: local.mimeType } : {}),
         });
         await finishClientResult(res, ctx.flags.json, (ok) => {
-          succeed(ok, formatDocSummary(ok.doc, 'Created from file'), ctx.flags.json);
+          succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Created from file'), ctx.flags.json);
         });
         return;
       }
@@ -700,7 +717,7 @@ export async function runCloudDocsCli(
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
         const text = ok.doc ? formatDocSummary(ok.doc, 'Created') : 'Created';
-        succeed(ok, text, ctx.flags.json);
+        succeed(ok.doc ? withDocCitation(ok) : ok, text, ctx.flags.json);
       });
     });
 
@@ -824,7 +841,7 @@ export async function runCloudDocsCli(
           ...(local.mimeType ? { mimeType: local.mimeType } : {}),
         });
         await finishClientResult(res, ctx.flags.json, (ok) => {
-          succeed(ok, formatDocSummary(ok.doc, 'Replaced file'), ctx.flags.json);
+          succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Replaced file'), ctx.flags.json);
         });
         return;
       }
@@ -855,16 +872,18 @@ export async function runCloudDocsCli(
               const bytes = Buffer.from(ok.bytesBase64, 'base64');
               savedTo = await writeBinaryOutFile(opts.out, ok.outputName, bytes, cwd);
             }
-            const payload = savedTo
+            const basePayload = savedTo
               ? { doc: ok.doc, outputName: ok.outputName, mimeType: ok.mimeType, bytesWritten: ok.bytesWritten, savedTo }
               : ok;
+            const payload = withDocCitation(basePayload);
+            const sourceCitation = ok.doc ? formatCloudDocCitation(ok.doc.name, ok.doc.id) : docId;
             const summary = savedTo
-              ? `Exported via edit --no-save: ${ok.outputName} (${ok.bytesWritten} bytes) -> ${savedTo}`
-              : `Exported via edit --no-save: ${ok.outputName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
+              ? `Exported via edit --no-save from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes) -> ${savedTo}`
+              : `Exported via edit --no-save from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
             succeed(payload, summary, ctx.flags.json);
             return;
           }
-          succeed(ok, formatDocSummary(ok.doc, 'Updated via DocBuilder'), ctx.flags.json);
+          succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Updated via DocBuilder'), ctx.flags.json);
         });
         return;
       }
@@ -891,7 +910,7 @@ export async function runCloudDocsCli(
         ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
-        succeed(ok, formatDocSummary(ok.doc, 'Updated'), ctx.flags.json);
+        succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Updated'), ctx.flags.json);
       });
     });
 
@@ -991,7 +1010,7 @@ export async function runCloudDocsCli(
           ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
         });
         await finishClientResult(res, ctx.flags.json, (ok) => {
-          succeed(ok, formatDocSummary(ok.doc, 'Created via DocBuilder'), ctx.flags.json);
+          succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Created via DocBuilder'), ctx.flags.json);
         });
         return;
       }
@@ -1033,7 +1052,7 @@ export async function runCloudDocsCli(
             const bytes = Buffer.from(ok.bytesBase64, 'base64');
             savedTo = await writeBinaryOutFile(opts.out, ok.outputName, bytes, cwd);
           }
-          const payload = savedTo
+          const basePayload = savedTo
             ? {
                 doc: ok.doc,
                 outputName: ok.outputName,
@@ -1043,13 +1062,15 @@ export async function runCloudDocsCli(
                 ...(ok.onlyofficeUrls ? { onlyofficeUrls: ok.onlyofficeUrls } : {}),
               }
             : ok;
+          const payload = withDocCitation(basePayload);
+          const sourceCitation = ok.doc ? formatCloudDocCitation(ok.doc.name, ok.doc.id) : docId;
           const summary = savedTo
-            ? `Exported via DocBuilder: ${ok.outputName} (${ok.bytesWritten} bytes) -> ${savedTo}`
-            : `Exported via DocBuilder: ${ok.outputName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
+            ? `Exported via DocBuilder from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes) -> ${savedTo}`
+            : `Exported via DocBuilder from ${sourceCitation}: ${ok.outputName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
           succeed(payload, summary, ctx.flags.json);
           return;
         }
-        succeed(ok, formatDocSummary(ok.doc, 'Updated via DocBuilder'), ctx.flags.json);
+        succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Updated via DocBuilder'), ctx.flags.json);
       });
     });
 
@@ -1116,7 +1137,7 @@ export async function runCloudDocsCli(
           return;
         }
         if ('doc' in ok && ok.doc) {
-          succeed(ok, formatDocSummary(ok.doc, 'Converted & saved as new Cloud Doc'), ctx.flags.json);
+          succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Converted & saved as new Cloud Doc'), ctx.flags.json);
         }
       });
     });
@@ -1184,7 +1205,7 @@ export async function runCloudDocsCli(
           ...(local.mimeType ? { mimeType: local.mimeType } : {}),
         });
         await finishClientResult(res, ctx.flags.json, (ok) => {
-          succeed(ok, formatDocSummary(ok.doc, 'Replaced file'), ctx.flags.json);
+          succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Replaced file'), ctx.flags.json);
         });
         return;
       }
@@ -1197,7 +1218,7 @@ export async function runCloudDocsCli(
         ...(local.mimeType ? { mimeType: local.mimeType } : {}),
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
-        succeed(ok, formatDocSummary(ok.doc, 'Uploaded'), ctx.flags.json);
+        succeed(withDocCitation(ok), formatDocSummary(ok.doc, 'Uploaded'), ctx.flags.json);
       });
     });
 

@@ -37,7 +37,7 @@ import {
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_INERT_AUTHORIZATION_RULE, TASK_PAIR_MULTI_PHASE_CRON_TOKEN, TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE, TASK_PAIR_SPLIT_UNRELATED_TOKEN, TASK_PAIR_USER_FACING_TITLE_TOKEN, type TaskPairEngineState } from '../../shared/task-pair.js';
 import { TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN } from '../../shared/task-pair-workspace.js';
-import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
+import { CLOUD_DOC_OUTPUT_CONTRACT_ID, FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
 import {
   LOAD_VALIDATION_SAFETY_BY_LOCALE,
   LOAD_VALIDATION_SAFETY_CLAUSE,
@@ -894,7 +894,7 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    `${FILE_OUTPUT_CONTRACT_ID}; auto-audit enabled; Brain coordinates and integrates.`,
+    `${CLOUD_DOC_OUTPUT_CONTRACT_ID}; ${FILE_OUTPUT_CONTRACT_ID}; auto-audit enabled; Brain coordinates and integrates.`,
     JSON.stringify({ auditMode: true, beforePass: 'no_delivery_finalization', rework: 'fix_validate_fresh_audit', evidence: 'code_plus_exact_report_no_duplicate_run' }),
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
@@ -913,7 +913,7 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    `${FILE_OUTPUT_CONTRACT_ID}; auto-audit off.`,
+    `${CLOUD_DOC_OUTPUT_CONTRACT_ID}; ${FILE_OUTPUT_CONTRACT_ID}; auto-audit off.`,
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
   ].join('');
