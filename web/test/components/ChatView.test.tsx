@@ -3373,4 +3373,42 @@ describe('ChatView', () => {
     expect(onPreviewFile).toHaveBeenCalledTimes(1);
     expect(onPreviewFile.mock.calls[0]?.[0]).toMatchObject({ path: '/tmp/local.xlsx' });
   });
+
+  it('hides split file panel toggle and right file browser when hideFilePanel is true', () => {
+    const mockWs = {
+      fsReadFile: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const findFilePanelToggle = (root: HTMLElement) =>
+      Array.from(root.querySelectorAll('button.chat-panel-toggle')).find((btn) => btn.textContent?.trim() === '⊞') ?? null;
+
+    localStorage.setItem('chatFilePanelOpen:deck_minichat_fp', '1');
+    try {
+      const { container: normalContainer } = render(
+        <ChatView
+          events={[]}
+          loading={false}
+          sessionId="deck_minichat_fp"
+          ws={mockWs}
+        />,
+      );
+      expect(findFilePanelToggle(normalContainer)).toBeTruthy();
+      expect(normalContainer.querySelector('.chat-split')).toBeTruthy();
+
+      const { container: hiddenContainer } = render(
+        <ChatView
+          events={[]}
+          loading={false}
+          sessionId="deck_minichat_fp"
+          ws={mockWs}
+          hideFilePanel
+        />,
+      );
+      expect(findFilePanelToggle(hiddenContainer)).toBeNull();
+      expect(hiddenContainer.querySelector('.chat-split')).toBeNull();
+    } finally {
+      localStorage.removeItem('chatFilePanelOpen:deck_minichat_fp');
+    }
+  });
 });

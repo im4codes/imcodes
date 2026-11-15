@@ -6290,9 +6290,9 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-sidebar-hdr-btn.active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); box-shadow: 0 0 12px rgba(34,211,238,0.14); }
 
 /* ── Chat view ──────────────────────────────────────────────────── */
-.chat-view-wrap { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; }
+.chat-view-wrap { flex: 1; min-height: 0; position: relative; overflow: hidden; display: flex; flex-direction: column; }
 .chat-split { flex-direction: row !important; }
-.chat-main { flex: 1; min-width: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+.chat-main { flex: 1; min-width: 0; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
 /* Pinned "Last sent" banner — appears only when the original user bubble has
    scrolled off the top of the chat viewport. Sits above the scroll area so it
    doesn't bob with the user's scroll position, only its visibility changes. */
@@ -20609,6 +20609,11 @@ button.quick-agent-delegation-preset.active {
 .cloud-docs-mini-chat-messages .chat-view {
   flex: 1;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
 }
 
 .cloud-docs-mini-chat-doc-strip {

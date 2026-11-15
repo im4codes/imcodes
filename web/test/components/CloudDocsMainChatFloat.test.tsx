@@ -33,20 +33,33 @@ vi.mock('../../src/api.js', async (importOriginal) => {
 });
 
 const chatViewPropsSpy = vi.fn();
-vi.mock('../../src/components/ChatView.js', () => ({
-  ChatView: (props: { events: TimelineEvent[]; visible?: boolean; preview?: boolean }) => {
-    chatViewPropsSpy(props);
-    return (
-      <div data-testid="mock-mini-chat-view" data-visible={String(Boolean(props.visible))}>
-        {props.events.map((ev) => (
-          <div key={ev.eventId} data-testid={`mini-event-${ev.type}`}>
-            {String(ev.payload.text ?? ev.type)}
-          </div>
-        ))}
-      </div>
-    );
-  },
-}));
+const chatScrollBottomSpy = vi.fn();
+vi.mock('../../src/components/ChatView.js', async () => {
+  const { useEffect } = await import('preact/hooks');
+  return {
+    ChatView: (props: {
+      events: TimelineEvent[];
+      visible?: boolean;
+      preview?: boolean;
+      hideFilePanel?: boolean;
+      onScrollBottomFn?: (fn: () => void) => void;
+    }) => {
+      chatViewPropsSpy(props);
+      useEffect(() => {
+        props.onScrollBottomFn?.(chatScrollBottomSpy);
+      }, [props.onScrollBottomFn]);
+      return (
+        <div data-testid="mock-mini-chat-view" data-visible={String(Boolean(props.visible))}>
+          {props.events.map((ev) => (
+            <div key={ev.eventId} data-testid={`mini-event-${ev.type}`}>
+              {String(ev.payload.text ?? ev.type)}
+            </div>
+          ))}
+        </div>
+      );
+    },
+  };
+});
 
 const controlsPropsSpy = vi.fn();
 vi.mock('../../src/components/StableSessionControls.js', () => ({
@@ -166,6 +179,7 @@ describe('CloudDocsMainChatFloat', () => {
     __resetTimelineCacheForTests();
     __clearPersistedTimelineSnapshotsForTests();
     chatViewPropsSpy.mockClear();
+    chatScrollBottomSpy.mockClear();
     controlsPropsSpy.mockClear();
     cleanup();
   });
@@ -294,5 +308,37 @@ describe('CloudDocsMainChatFloat', () => {
     );
     await waitFor(() => expect(screen.getByTestId('mini-quote-pill-0')).toBeTruthy());
     expect(screen.getByTestId('mini-quote-pill-0').textContent).toContain('@/srv/docs/Architecture.md');
+  });
+
+  it('mounts ChatView in interactive scrollable mode (no preview, hideFilePanel, wired pagination) and scrolls to bottom on re-expand', async () => {
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    render(<CloudDocsMainChatFloat mainChat={mainChat} />);
+
+    // Expand mini-chat
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy());
+
+    await waitFor(() => expect(chatViewPropsSpy).toHaveBeenCalled());
+    const lastProps = chatViewPropsSpy.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(lastProps.preview).toBeUndefined();
+    expect(lastProps.hideFilePanel).toBe(true);
+    expect(typeof lastProps.onLoadOlder).toBe('function');
+    expect(typeof lastProps.onLoadMessageContext).toBe('function');
+    expect(typeof lastProps.hasOlderHistory).toBe('boolean');
+    expect(typeof lastProps.loadingOlder).toBe('boolean');
+    expect(lastProps).toHaveProperty('historyStatus');
+    expect(lastProps).toHaveProperty('historyGap');
+    await waitFor(() => expect(chatScrollBottomSpy).toHaveBeenCalled());
+
+    // Collapse and re-expand -> scrolls to bottom again
+    chatScrollBottomSpy.mockClear();
+    fireEvent.click(screen.getByTestId('cloud-docs-mini-chat-close'));
+    await waitFor(() => expect(screen.queryByTestId('cloud-docs-mini-chat')).toBeNull());
+
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy());
+    await waitFor(() => expect(chatScrollBottomSpy).toHaveBeenCalled());
   });
 });

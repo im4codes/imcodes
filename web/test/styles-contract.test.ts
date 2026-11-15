@@ -1803,4 +1803,22 @@ describe('styles.css regression contracts', () => {
     expect(toolbarRules).not.toMatch(/backdrop-filter/);
     expect(qualityPopoverRule).not.toMatch(/backdrop-filter/);
   });
+
+  it('keeps CloudDocs mini-chat flex wrappers bounded (min-height: 0) and inner .chat-view touch/wheel scrollable', () => {
+    const viewWrapRule = cssWithoutComments.match(/\.chat-view-wrap\s*\{[^}]*\}/)?.[0];
+    const chatMainRule = cssWithoutComments.match(/\.chat-main\s*\{[^}]*\}/)?.[0];
+    const miniMessagesRule = cssWithoutComments.match(/\.cloud-docs-mini-chat-messages\s*\{[^}]*\}/)?.[0];
+    const miniChatViewRule = cssWithoutComments.match(/\.cloud-docs-mini-chat-messages\s+\.chat-view\s*\{[^}]*\}/)?.[0];
+
+    expect(viewWrapRule).toMatch(/min-height:\s*0/);
+    expect(chatMainRule).toMatch(/min-height:\s*0/);
+    expect(miniMessagesRule).toMatch(/min-height:\s*0/);
+    expect(miniMessagesRule).toMatch(/overflow:\s*hidden/);
+    expect(miniChatViewRule).toMatch(/min-height:\s*0/);
+    expect(miniChatViewRule).toMatch(/overflow-y:\s*auto/);
+    expect(miniChatViewRule).toMatch(/overflow-x:\s*hidden/);
+    expect(miniChatViewRule).toMatch(/overscroll-behavior:\s*contain/);
+    expect(miniChatViewRule).toMatch(/-webkit-overflow-scrolling:\s*touch/);
+    expect(miniChatViewRule).toMatch(/touch-action:\s*pan-y/);
+  });
 });

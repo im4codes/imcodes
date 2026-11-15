@@ -238,6 +238,8 @@ interface Props {
   scopeTaskPairs?: boolean;
   /** Isolated split-executor visit; independent of the canonical session filter. */
   taskPairPanelVisitKey?: string;
+  /** Compact floating panels hide the split file-panel toggle so narrow views stay unobstructed. */
+  hideFilePanel?: boolean;
 }
 
 function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
@@ -2823,7 +2825,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
-function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -3442,7 +3444,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const showAgentsPane = canShowAgentsControl
     && hasAgentsStatusRows
     && (runningAgentsCount > 0 ? desiredAgentsOpen : inspectRecentAgentsOpen);
-  const canShowFilePanel = !preview && !!ws;
+  const canShowFilePanel = !preview && !hideFilePanel && !!ws;
   useLayoutEffect(() => {
     const titlebar = chatTitlebarRef.current;
     const actions = chatTopActionsRef.current;

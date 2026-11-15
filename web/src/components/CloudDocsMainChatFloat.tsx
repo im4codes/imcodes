@@ -56,6 +56,12 @@ export function CloudDocsMainChatFloat({
     events: timelineEvents,
     loading: timelineLoading,
     refreshing: timelineRefreshing,
+    historyStatus,
+    loadingOlder,
+    hasOlderHistory,
+    loadOlderEvents,
+    historyGap,
+    loadMessageContext,
     addOptimisticUserMessage,
     removeOptimisticMessage,
     markOptimisticFailed,
@@ -261,6 +267,12 @@ export function CloudDocsMainChatFloat({
               events={timelineEvents}
               loading={timelineLoading}
               refreshing={timelineRefreshing}
+              historyStatus={historyStatus}
+              loadingOlder={loadingOlder}
+              hasOlderHistory={hasOlderHistory}
+              onLoadOlder={loadOlderEvents}
+              historyGap={historyGap}
+              onLoadMessageContext={loadMessageContext}
               onForceSync={timelineForceRefresh}
               sessionId={sessionName}
               sessions={mainChat.sessions}
@@ -275,7 +287,7 @@ export function CloudDocsMainChatFloat({
               onCloudDocClick={onOpenDoc}
               agentType={session.agentType}
               onResendFailed={handleResendFailed}
-              preview
+              hideFilePanel
             />
           </div>
 
