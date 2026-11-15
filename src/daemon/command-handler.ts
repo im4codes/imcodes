@@ -468,43 +468,6 @@ import {
 let lastObservedServerLink: ServerLink | undefined;
 const manualCompactProcessTurns = new Map<string, number>();
 
-export function noteManualCompactProcessTurn(sessionName: string, now = Date.now()): void {
-  manualCompactProcessTurns.set(sessionName, now + 120_000);
-}
-
-export function consumeManualCompactProcessTurn(sessionName: string, now = Date.now()): boolean {
-  const expiresAt = manualCompactProcessTurns.get(sessionName);
-  manualCompactProcessTurns.delete(sessionName);
-  return typeof expiresAt === 'number' && expiresAt >= now;
-}
-
-function resolveIncomingTransportConfigForCompactHijack(
-  cmd: Record<string, unknown>,
-  rawIncomingConfig: Record<string, unknown> | undefined,
-  existingConfig: Record<string, unknown> | undefined,
-): { ok: true; transportConfig: Record<string, unknown> | undefined } | { ok: false; reason: string } {
-  const isSharedCaller = Boolean(cmd.sharedActor && typeof cmd.sharedActor === 'object');
-  if (isSharedCaller) {
-    if (hasCompactHijackField(rawIncomingConfig)) {
-      return { ok: false, reason: 'shared_caller_cannot_modify_compact_hijack' };
-    }
-    const preservedMode = extractSessionCompactHijackMode(existingConfig);
-    return {
-      ok: true,
-      transportConfig: buildTransportConfigWithCompactHijack(rawIncomingConfig, preservedMode) ?? undefined,
-    };
-  }
-  if (hasInvalidCompactHijackSetting(rawIncomingConfig)) {
-    return { ok: false, reason: 'invalid_compact_hijack' };
-  }
-  return {
-    ok: true,
-    transportConfig: buildTransportConfigWithCompactHijack(
-      rawIncomingConfig,
-      extractSessionCompactHijackMode(rawIncomingConfig),
-    ) ?? undefined,
-  };
-}
 import type {
   ContextMemoryProjectView,
   ContextMemoryStatsView,
@@ -796,6 +759,44 @@ const processAutomationQueues = new Map<string, QueuedProcessAutomationMessage[]
 const processAutomationDrainInFlight = new Set<string>();
 const scheduledProcessAutomationDrains = new Set<string>();
 let processAutomationHooksRegistered = false;
+
+export function noteManualCompactProcessTurn(sessionName: string, now = Date.now()): void {
+  manualCompactProcessTurns.set(sessionName, now + 120_000);
+}
+
+export function consumeManualCompactProcessTurn(sessionName: string, now = Date.now()): boolean {
+  const expiresAt = manualCompactProcessTurns.get(sessionName);
+  manualCompactProcessTurns.delete(sessionName);
+  return typeof expiresAt === 'number' && expiresAt >= now;
+}
+
+function resolveIncomingTransportConfigForCompactHijack(
+  cmd: Record<string, unknown>,
+  rawIncomingConfig: Record<string, unknown> | undefined,
+  existingConfig: Record<string, unknown> | undefined,
+): { ok: true; transportConfig: Record<string, unknown> | undefined } | { ok: false; reason: string } {
+  const isSharedCaller = Boolean(cmd.sharedActor && typeof cmd.sharedActor === 'object');
+  if (isSharedCaller) {
+    if (hasCompactHijackField(rawIncomingConfig)) {
+      return { ok: false, reason: 'shared_caller_cannot_modify_compact_hijack' };
+    }
+    const preservedMode = extractSessionCompactHijackMode(existingConfig);
+    return {
+      ok: true,
+      transportConfig: buildTransportConfigWithCompactHijack(rawIncomingConfig, preservedMode) ?? undefined,
+    };
+  }
+  if (hasInvalidCompactHijackSetting(rawIncomingConfig)) {
+    return { ok: false, reason: 'invalid_compact_hijack' };
+  }
+  return {
+    ok: true,
+    transportConfig: buildTransportConfigWithCompactHijack(
+      rawIncomingConfig,
+      extractSessionCompactHijackMode(rawIncomingConfig),
+    ) ?? undefined,
+  };
+}
 
 function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
   return `${sessionName}\u0000${clientMessageId}`;
