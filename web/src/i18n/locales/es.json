@@ -2714,8 +2714,11 @@
     "callback_status_done": "Hecho",
     "callback_status_ignored": "Ignorado",
     "callback_status_failed": "Fallido",
-    "callback_triggered_at": "Activado: {{time}}",
+    "callback_failed_at": "Falló: {{time}}",
+    "callback_event_at": "Ocurrió: {{time}}",
+    "callback_triggered_at": "Callback: {{time}}",
     "callback_completed_at": "Completado: {{time}}",
+    "callback_open_link": "Abrir enlace",
     "callback_related_task": "Tarea relacionada: {{taskId}}"
   },
   "transport_chat": {

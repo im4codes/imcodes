@@ -2713,8 +2713,11 @@
     "callback_status_done": "Готово",
     "callback_status_ignored": "Пропущено",
     "callback_status_failed": "Ошибка",
-    "callback_triggered_at": "Время запуска: {{time}}",
+    "callback_failed_at": "Время сбоя: {{time}}",
+    "callback_event_at": "Время события: {{time}}",
+    "callback_triggered_at": "Время коллбэка: {{time}}",
     "callback_completed_at": "Время завершения: {{time}}",
+    "callback_open_link": "Открыть ссылку",
     "callback_related_task": "Связанная задача: {{taskId}}"
   },
   "transport_chat": {

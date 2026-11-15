@@ -20,6 +20,7 @@ import {
   type RepoCallbackTemplateScope,
 } from '@shared/repo-callback.js';
 import type { WsClient } from '../ws-client.js';
+import { isNative } from '../native.js';
 import {
   loadRepoCallbackPrefs,
   saveRepoCallbackGlobalTemplates,
@@ -66,6 +67,34 @@ function formatCallbackTimestamp(ts: unknown): string | null {
 
 function isTerminalCallbackStatus(status: CallbackStatus): boolean {
   return status === 'done' || status === 'ignored' || status === 'failed';
+}
+
+function getSafeExternalUrl(rawUrl: unknown): string | null {
+  if (typeof rawUrl !== 'string') return null;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function openCallbackExternalUrl(url: string): Promise<void> {
+  const safeUrl = getSafeExternalUrl(url);
+  if (!safeUrl) return;
+  if (isNative()) {
+    try {
+      const { Browser } = await import('@capacitor/browser');
+      await Browser.open({ url: safeUrl });
+      return;
+    } catch {
+      // Fall back to window.open if Capacitor Browser plugin is unavailable.
+    }
+  }
+  window.open(safeUrl, '_blank', 'noopener,noreferrer');
 }
 
 function makeTemplateId(scope: RepoCallbackTemplateScope): string {
@@ -882,6 +911,9 @@ export function RepoCallbackModal({
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {filteredCallbacks.map((cb) => {
                   const palette = statusColors(cb.status);
+                  const safeUrl = getSafeExternalUrl(cb.url);
+                  const eventAtMs = cb.metadata?.failedAt ?? cb.metadata?.eventAt;
+                  const eventTime = formatCallbackTimestamp(eventAtMs);
                   const triggeredTime = formatCallbackTimestamp(cb.createdAt);
                   const completedTime = isTerminalCallbackStatus(cb.status)
                     ? formatCallbackTimestamp(cb.updatedAt)
@@ -912,12 +944,24 @@ export function RepoCallbackModal({
                           {statusLabel(cb.status)}
                         </span>
                         <code style={{ fontSize: 10, color: '#94a3b8' }}>{cb.eventType}</code>
-                        {cb.url ? (
+                        {safeUrl ? (
                           <a
-                            href={cb.url}
+                            href={safeUrl}
                             target="_blank"
                             rel="noreferrer"
-                            style={{ fontSize: 12, fontWeight: 500, color: '#93c5fd', flex: 1, minWidth: 140, textDecoration: 'none' }}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              void openCallbackExternalUrl(safeUrl);
+                            }}
+                            style={{
+                              fontSize: 12,
+                              fontWeight: 500,
+                              color: '#93c5fd',
+                              flex: 1,
+                              minWidth: 140,
+                              textDecoration: 'underline',
+                              cursor: 'pointer',
+                            }}
                           >
                             {cb.title}
                           </a>
@@ -925,6 +969,24 @@ export function RepoCallbackModal({
                           <span style={{ fontSize: 12, fontWeight: 500, color: '#e2e8f0', flex: 1, minWidth: 140 }}>
                             {cb.title}
                           </span>
+                        )}
+                        {safeUrl && (
+                          <button
+                            type="button"
+                            onClick={() => void openCallbackExternalUrl(safeUrl)}
+                            style={{
+                              fontSize: 10,
+                              color: '#93c5fd',
+                              background: 'rgba(59,130,246,0.12)',
+                              border: '1px solid rgba(59,130,246,0.35)',
+                              borderRadius: 4,
+                              padding: '1px 6px',
+                              cursor: 'pointer',
+                              flexShrink: 0,
+                            }}
+                          >
+                            {`${t('repo.callback_open_link')} ↗`}
+                          </button>
                         )}
                         <span style={{ fontSize: 10, color: '#64748b' }}>
                           {cb.targetSession}
@@ -941,8 +1003,15 @@ export function RepoCallbackModal({
                           {cb.lastError}
                         </div>
                       )}
-                      {(triggeredTime || completedTime || cb.relatedTaskId) && (
+                      {(eventTime || triggeredTime || completedTime || cb.relatedTaskId) && (
                         <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', flexWrap: 'wrap', gap: '4px 12px' }}>
+                          {eventTime && (
+                            <span>
+                              {cb.eventType === 'ci_failed'
+                                ? t('repo.callback_failed_at', { time: eventTime })
+                                : t('repo.callback_event_at', { time: eventTime })}
+                            </span>
+                          )}
                           {triggeredTime && (
                             <span>{t('repo.callback_triggered_at', { time: triggeredTime })}</span>
                           )}

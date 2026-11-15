@@ -2713,8 +2713,11 @@
     "callback_status_done": "完了",
     "callback_status_ignored": "無視",
     "callback_status_failed": "失敗",
-    "callback_triggered_at": "トリガー時刻: {{time}}",
+    "callback_failed_at": "失敗時刻: {{time}}",
+    "callback_event_at": "発生時刻: {{time}}",
+    "callback_triggered_at": "コールバック時刻: {{time}}",
     "callback_completed_at": "完了時刻: {{time}}",
+    "callback_open_link": "詳細を開く",
     "callback_related_task": "関連タスク: {{taskId}}"
   },
   "transport_chat": {

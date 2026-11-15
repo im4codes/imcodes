@@ -927,6 +927,13 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
     expect(texts).not.toContain('Skipped sub-step');
     expect(texts).toContain('Failed job "Test Job" -> steps: 2. Failing vitest');
 
+    const stored = store.listCallbacks(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 10);
+    expect(stored).toHaveLength(3);
+    for (const record of stored) {
+      expect(record.metadata?.eventAt).toBe(1_700_000_010_000);
+      expect(record.metadata?.failedAt).toBe(1_700_000_010_000);
+    }
+
     store.close();
   });
 

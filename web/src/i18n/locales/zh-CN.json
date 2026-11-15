@@ -2714,8 +2714,11 @@
     "callback_status_done": "已完成",
     "callback_status_ignored": "已忽略",
     "callback_status_failed": "失败",
-    "callback_triggered_at": "触发时间：{{time}}",
+    "callback_failed_at": "失败时间：{{time}}",
+    "callback_event_at": "发生时间：{{time}}",
+    "callback_triggered_at": "回调时间：{{time}}",
     "callback_completed_at": "完成时间：{{time}}",
+    "callback_open_link": "查看详情",
     "callback_related_task": "关联任务：{{taskId}}"
   },
   "transport_chat": {

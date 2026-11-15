@@ -1008,27 +1008,36 @@ export class RepoCallbackMonitor {
       const res = await provider.listPRs({ state: 'all', page, perPage: this.perPage });
       return {
         hasMore: res.hasMore,
-        items: res.items.map((pr: RepoPR) => ({
-          seq: pr.number,
-          pending: false,
-          markSeenOnBaseline: true,
-          createdAtMs: toTimestampMs(pr.createdAt),
-          dedupKey: buildRepoCallbackDedupKey(projectDir, 'pr_new', String(pr.number)),
-          candidate: {
-            eventType: 'pr_new',
-            entityKey: `pr#${pr.number}`,
+        items: res.items.map((pr: RepoPR) => {
+          const createdAtMs = toTimestampMs(pr.createdAt);
+          return {
+            seq: pr.number,
+            pending: false,
+            markSeenOnBaseline: true,
+            createdAtMs,
             dedupKey: buildRepoCallbackDedupKey(projectDir, 'pr_new', String(pr.number)),
-            title: `PR #${pr.number}: ${pr.title}`,
-            url: pr.url,
-            number: String(pr.number),
-            author: pr.author,
-            branch: `${pr.head} -> ${pr.base}`,
-            status: pr.state,
-            conclusion: pr.reviewDecision ?? '',
-            details: pr.draft ? 'Draft PR' : (pr.state === 'open' ? 'Open PR' : `PR (${pr.state})`),
-            metadata: { number: pr.number, head: pr.head, base: pr.base, state: pr.state },
-          },
-        })),
+            candidate: {
+              eventType: 'pr_new',
+              entityKey: `pr#${pr.number}`,
+              dedupKey: buildRepoCallbackDedupKey(projectDir, 'pr_new', String(pr.number)),
+              title: `PR #${pr.number}: ${pr.title}`,
+              url: pr.url,
+              number: String(pr.number),
+              author: pr.author,
+              branch: `${pr.head} -> ${pr.base}`,
+              status: pr.state,
+              conclusion: pr.reviewDecision ?? '',
+              details: pr.draft ? 'Draft PR' : (pr.state === 'open' ? 'Open PR' : `PR (${pr.state})`),
+              metadata: {
+                number: pr.number,
+                head: pr.head,
+                base: pr.base,
+                state: pr.state,
+                ...(createdAtMs !== undefined ? { eventAt: createdAtMs } : {}),
+              },
+            },
+          };
+        }),
       };
     }
 
@@ -1036,29 +1045,37 @@ export class RepoCallbackMonitor {
       const res = await provider.listIssues({ state: 'all', page, perPage: this.perPage });
       return {
         hasMore: res.hasMore,
-        items: res.items.map((issue: RepoIssue) => ({
-          seq: issue.number,
-          pending: false,
-          markSeenOnBaseline: true,
-          createdAtMs: toTimestampMs(issue.createdAt),
-          dedupKey: buildRepoCallbackDedupKey(projectDir, 'issue_new', String(issue.number)),
-          candidate: {
-            eventType: 'issue_new',
-            entityKey: `issue#${issue.number}`,
+        items: res.items.map((issue: RepoIssue) => {
+          const createdAtMs = toTimestampMs(issue.createdAt);
+          return {
+            seq: issue.number,
+            pending: false,
+            markSeenOnBaseline: true,
+            createdAtMs,
             dedupKey: buildRepoCallbackDedupKey(projectDir, 'issue_new', String(issue.number)),
-            title: `Issue #${issue.number}: ${issue.title}`,
-            url: issue.url,
-            number: String(issue.number),
-            author: issue.author,
-            branch: '',
-            status: issue.state,
-            conclusion: '',
-            details: issue.labels.length > 0
-              ? `Labels: ${issue.labels.join(', ')}`
-              : (issue.state === 'open' ? 'Open issue' : `Issue (${issue.state})`),
-            metadata: { number: issue.number, labels: issue.labels, state: issue.state },
-          },
-        })),
+            candidate: {
+              eventType: 'issue_new',
+              entityKey: `issue#${issue.number}`,
+              dedupKey: buildRepoCallbackDedupKey(projectDir, 'issue_new', String(issue.number)),
+              title: `Issue #${issue.number}: ${issue.title}`,
+              url: issue.url,
+              number: String(issue.number),
+              author: issue.author,
+              branch: '',
+              status: issue.state,
+              conclusion: '',
+              details: issue.labels.length > 0
+                ? `Labels: ${issue.labels.join(', ')}`
+                : (issue.state === 'open' ? 'Open issue' : `Issue (${issue.state})`),
+              metadata: {
+                number: issue.number,
+                labels: issue.labels,
+                state: issue.state,
+                ...(createdAtMs !== undefined ? { eventAt: createdAtMs } : {}),
+              },
+            },
+          };
+        }),
       };
     }
 
@@ -1084,13 +1101,16 @@ export class RepoCallbackMonitor {
         const attempt = stateResolution.attempt;
         const attemptStr = String(attempt);
         const dedupKey = buildRepoCallbackDedupKey(projectDir, 'ci_failed', String(run.id), attemptStr);
+        const createdAtMs = toTimestampMs(run.createdAt);
+        const updatedAtMs = toTimestampMs(run.updatedAt);
+        const eventAtMs = updatedAtMs ?? createdAtMs;
         return {
           seq: run.id,
           pending,
           markSeenOnBaseline: failed,
           runAttempt: attempt,
-          createdAtMs: toTimestampMs(run.createdAt),
-          updatedAtMs: toTimestampMs(run.updatedAt),
+          createdAtMs,
+          updatedAtMs,
           dedupKey,
           ciStateUpsert: stateResolution.upsert,
           candidate: failed
@@ -1109,8 +1129,10 @@ export class RepoCallbackMonitor {
                 metadata: {
                   runId: run.id,
                   runAttempt: attempt,
+                  ...(typeof run.runNumber === 'number' && Number.isFinite(run.runNumber) ? { runNumber: run.runNumber } : {}),
                   branch: run.branch,
                   commitSha: run.commitSha,
+                  ...(eventAtMs !== undefined ? { eventAt: eventAtMs, failedAt: eventAtMs } : {}),
                   _run: run,
                 },
               }

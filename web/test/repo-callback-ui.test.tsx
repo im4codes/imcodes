@@ -18,6 +18,21 @@ import { RepoPage } from '../src/pages/RepoPage.js';
 import { buildRepoCallbackTargetOptions, saveRepoCallbackRepoConfig } from '../src/repo-callback-prefs.js';
 import { getUserPref } from '../src/api.js';
 
+const nativeMockState = vi.hoisted(() => ({
+  isNative: false,
+  browserOpen: vi.fn(async (_opts: { url: string }) => {}),
+}));
+
+vi.mock('../src/native.js', () => ({
+  isNative: () => nativeMockState.isNative,
+}));
+
+vi.mock('@capacitor/browser', () => ({
+  Browser: {
+    open: (opts: { url: string }) => nativeMockState.browserOpen(opts),
+  },
+}));
+
 const prefStore = new Map<string, unknown>();
 
 vi.mock('../src/api.js', () => ({
@@ -73,8 +88,11 @@ vi.mock('react-i18next', () => ({
       if (key === 'repo.callback_status_done') return 'Done';
       if (key === 'repo.callback_status_ignored') return 'Ignored';
       if (key === 'repo.callback_status_failed') return 'Failed';
-      if (key === 'repo.callback_triggered_at') return `Triggered: ${opts?.time ?? ''}`;
+      if (key === 'repo.callback_failed_at') return `Failed: ${opts?.time ?? ''}`;
+      if (key === 'repo.callback_event_at') return `Occurred: ${opts?.time ?? ''}`;
+      if (key === 'repo.callback_triggered_at') return `Callback: ${opts?.time ?? ''}`;
       if (key === 'repo.callback_completed_at') return `Completed: ${opts?.time ?? ''}`;
+      if (key === 'repo.callback_open_link') return 'Open link';
       if (key === 'repo.callback_related_task') return `Related task: ${opts?.taskId ?? ''}`;
       if (key === 'repo.callback_check_now') return 'Check now';
       if (key === 'common.close') return 'Close';
@@ -128,9 +146,14 @@ function createMockWs() {
 beforeEach(() => {
   prefStore.clear();
   for (const k of Object.keys(localStorageStore)) delete localStorageStore[k];
+  nativeMockState.isNative = false;
+  nativeMockState.browserOpen.mockClear();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 async function openModalAndAwaitPrefs() {
   const prevCalls = vi.mocked(getUserPref).mock.calls.length;
@@ -633,8 +656,9 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     expect(screen.queryByText('repo.callback_tpl_saved_repo')).toBeNull();
   });
 
-  it('renders triggeredAt on all valid cards, completedAt only on terminal cards (done/ignored/failed), and skips invalid timestamps cleanly', async () => {
+  it('renders failure/event time, callback time, terminal completion time, and opens safe http(s) URLs via web window.open or native Browser.open', async () => {
     const ws = createMockWs();
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
     render(
       <RepoPage
         ws={ws}
@@ -645,12 +669,15 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     );
 
     const tPending = 1_700_000_010_000;
+    const tProgressEvent = 1_700_000_018_000;
     const tProgressStart = 1_700_000_020_000;
     const tProgressUpdate = 1_700_000_025_000;
+    const tDoneEvent = 1_700_000_028_000;
     const tDoneStart = 1_700_000_030_000;
     const tDoneEnd = 1_700_000_040_000;
     const tIgnoredStart = 1_700_000_050_000;
     const tIgnoredEnd = 1_700_000_060_000;
+    const tFailedEvent = 1_700_000_065_000;
     const tFailedStart = 1_700_000_070_000;
     const tFailedEnd = 1_700_000_080_000;
 
@@ -663,6 +690,7 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
         entityKey: 'run#1',
         dedupKey: 'repo:/work/repo-ts:ci_failed:1',
         title: 'Pending CB',
+        url: 'https://github.com/acme/repo-ts/actions/runs/1',
         targetSession: 'deck_proj_brain',
         status: 'pending',
         summary: '',
@@ -680,6 +708,7 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
         targetSession: 'deck_proj_brain',
         status: 'in_progress',
         summary: '',
+        metadata: { eventAt: tProgressEvent },
         createdAt: tProgressStart,
         updatedAt: tProgressUpdate,
       },
@@ -695,6 +724,7 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
         status: 'done',
         summary: 'Fixed issue #3',
         relatedTaskId: 'tsk_done_3',
+        metadata: { eventAt: tDoneEvent },
         createdAt: tDoneStart,
         updatedAt: tDoneEnd,
       },
@@ -720,10 +750,12 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
         entityKey: 'run#5',
         dedupKey: 'repo:/work/repo-ts:ci_failed:5',
         title: 'Failed CB',
+        url: 'https://github.com/acme/repo-ts/actions/runs/5',
         targetSession: 'deck_proj_brain',
         status: 'failed',
         summary: '',
         lastError: 'Timed out',
+        metadata: { failedAt: tFailedEvent, eventAt: tFailedEvent },
         createdAt: tFailedStart,
         updatedAt: tFailedEnd,
       },
@@ -735,9 +767,11 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
         entityKey: 'pr#6',
         dedupKey: 'repo:/work/repo-ts:pr_new:6',
         title: 'Invalid TS CB',
+        url: 'javascript:alert(1)',
         targetSession: 'deck_proj_brain',
         status: 'done',
         summary: 'Bad timestamps',
+        metadata: { eventAt: Number.NaN },
         createdAt: 0,
         updatedAt: Number.NaN,
       },
@@ -753,23 +787,48 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
 
     await openModalAndAwaitPrefs();
 
-    expect(screen.getByText(`Triggered: ${new Date(tPending).toLocaleString()}`)).toBeTruthy();
+    // Timestamps: failure/event time + callback time + terminal completion time
+    expect(screen.getByText(`Callback: ${new Date(tPending).toLocaleString()}`)).toBeTruthy();
     expect(screen.queryByText(`Completed: ${new Date(tPending + 5_000).toLocaleString()}`)).toBeNull();
 
-    expect(screen.getByText(`Triggered: ${new Date(tProgressStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Occurred: ${new Date(tProgressEvent).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Callback: ${new Date(tProgressStart).toLocaleString()}`)).toBeTruthy();
     expect(screen.queryByText(`Completed: ${new Date(tProgressUpdate).toLocaleString()}`)).toBeNull();
 
-    expect(screen.getByText(`Triggered: ${new Date(tDoneStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Occurred: ${new Date(tDoneEvent).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Callback: ${new Date(tDoneStart).toLocaleString()}`)).toBeTruthy();
     expect(screen.getByText(`Completed: ${new Date(tDoneEnd).toLocaleString()}`)).toBeTruthy();
     expect(screen.getByText('Related task: tsk_done_3')).toBeTruthy();
 
-    expect(screen.getByText(`Triggered: ${new Date(tIgnoredStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Callback: ${new Date(tIgnoredStart).toLocaleString()}`)).toBeTruthy();
     expect(screen.getByText(`Completed: ${new Date(tIgnoredEnd).toLocaleString()}`)).toBeTruthy();
 
-    expect(screen.getByText(`Triggered: ${new Date(tFailedStart).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Failed: ${new Date(tFailedEvent).toLocaleString()}`)).toBeTruthy();
+    expect(screen.getByText(`Callback: ${new Date(tFailedStart).toLocaleString()}`)).toBeTruthy();
     expect(screen.getByText(`Completed: ${new Date(tFailedEnd).toLocaleString()}`)).toBeTruthy();
 
-    expect(screen.getByText('Invalid TS CB')).toBeTruthy();
+    // Invalid timestamps never show Invalid Date, and unsafe javascript: URL is not rendered as an anchor
+    const invalidTitleEl = screen.getByText('Invalid TS CB');
+    expect(invalidTitleEl.tagName).toBe('SPAN');
     expect(screen.queryByText(/Invalid Date/i)).toBeNull();
+
+    // Safe URLs: clicking title anchor or Open link button invokes window.open on web
+    const pendingTitleLink = screen.getByRole('link', { name: 'Pending CB' });
+    fireEvent.click(pendingTitleLink);
+    expect(openSpy).toHaveBeenCalledWith('https://github.com/acme/repo-ts/actions/runs/1', '_blank', 'noopener,noreferrer');
+
+    const openLinkButtons = screen.getAllByRole('button', { name: 'Open link ↗' });
+    expect(openLinkButtons).toHaveLength(2);
+    fireEvent.click(openLinkButtons[1]!);
+    expect(openSpy).toHaveBeenCalledWith('https://github.com/acme/repo-ts/actions/runs/5', '_blank', 'noopener,noreferrer');
+
+    // Native app path: Browser.open({ url }) is used instead of window.open
+    openSpy.mockClear();
+    nativeMockState.isNative = true;
+    fireEvent.click(screen.getByRole('link', { name: 'Failed CB' }));
+    await waitFor(() => {
+      expect(nativeMockState.browserOpen).toHaveBeenCalledWith({ url: 'https://github.com/acme/repo-ts/actions/runs/5' });
+    });
+    expect(openSpy).not.toHaveBeenCalled();
   });
 });
