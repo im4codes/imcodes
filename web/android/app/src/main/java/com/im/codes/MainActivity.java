@@ -16,6 +16,7 @@ import androidx.core.view.WindowInsetsCompat;
 import com.getcapacitor.BridgeActivity;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginHandle;
+import com.imcodes.speech.SpeechModelExtractor;
 import com.imcodes.speech.StreamingSpeechPlugin;
 
 import java.io.BufferedReader;
@@ -49,6 +50,7 @@ public class MainActivity extends BridgeActivity {
             }
         }
         super.onCreate(savedInstanceState);
+        SpeechModelExtractor.warmUpAsync(this);
         // Lock OS-level accessibility font scaling so fixed-width mobile controls/cards stay proportional.
         if (getBridge() != null && getBridge().getWebView() != null) {
             WebSettings settings = getBridge().getWebView().getSettings();

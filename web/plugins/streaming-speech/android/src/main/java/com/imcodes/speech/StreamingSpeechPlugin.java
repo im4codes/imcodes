@@ -19,12 +19,8 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -39,18 +35,6 @@ import java.util.function.DoubleConsumer;
 public class StreamingSpeechPlugin extends Plugin {
     private static final int SAMPLE_RATE = Qwen3SpeechWindow.SAMPLE_RATE;
     private static final int READ_CHUNK_SAMPLES = 800; // 50ms chunks matching iOS 20fps audioLevel cadence
-    private static final String MODEL_CACHE_DIR = "qwen3-asr-9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e";
-    private static final String[] MODEL_FILES = {
-        "conv_frontend.onnx",
-        "encoder.int4.onnx",
-        "encoder.int4.weights",
-        "decoder.int4.onnx",
-        "decoder.int4.weights",
-        "tokenizer/vocab.json",
-        "tokenizer/merges.txt",
-        "tokenizer/tokenizer_config.json",
-        "hotwords.txt"
-    };
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicLong generation = new AtomicLong();
@@ -75,48 +59,9 @@ public class StreamingSpeechPlugin extends Plugin {
     private Qwen3OnnxDecoder ensureDecoder() throws IOException, OrtException {
         if (decoder != null) return decoder;
         // ORT cannot resolve external .weights from an in-memory Android asset.
-        // Publish complete files into this model revision's private no-backup cache.
-        File root = new File(getContext().getNoBackupFilesDir(), MODEL_CACHE_DIR);
-        File readyMarker = new File(root, ".cache-complete");
-        boolean cacheValid = readyMarker.isFile();
-        if (cacheValid) {
-            for (String name : MODEL_FILES) {
-                File cached = new File(root, name);
-                if (!cached.isFile() || (!"hotwords.txt".equals(name) && cached.length() == 0)) {
-                    cacheValid = false;
-                    break;
-                }
-            }
-        }
-        if (!cacheValid) {
-            readyMarker.delete();
-            for (String name : MODEL_FILES) {
-                extractAssetFile(root, name);
-            }
-            File pendingMarker = new File(root, ".cache-complete.part");
-            try {
-                try (FileOutputStream markerOut = new FileOutputStream(pendingMarker)) {
-                    markerOut.write(MODEL_CACHE_DIR.getBytes(StandardCharsets.UTF_8));
-                }
-                if (!pendingMarker.renameTo(readyMarker)) {
-                    throw new IOException("Speech cache marker publish failed");
-                }
-            } finally {
-                pendingMarker.delete();
-            }
-        } else {
-            // Keep tiny optional hotwords.txt synchronized even when large weights are cached.
-            extractAssetFile(root, "hotwords.txt");
-        }
-        String hotwords = "";
-        try (BufferedReader reader = new BufferedReader(
-            new InputStreamReader(getContext().getAssets().open("hotwords.txt"), StandardCharsets.UTF_8)
-        )) {
-            hotwords = String.join(
-                " ",
-                reader.lines().map(String::trim).filter(line -> !line.isEmpty()).toArray(String[]::new)
-            );
-        }
+        // Coordinate through the shared single-flight extractor so startup warmup and plugin calls never race.
+        File root = SpeechModelExtractor.ensureExtracted(getContext());
+        String hotwords = SpeechModelExtractor.readHotwords(getContext());
         decoder = new Qwen3OnnxDecoder(
             root,
             hotwords,
@@ -125,29 +70,6 @@ public class StreamingSpeechPlugin extends Plugin {
             Qwen3OnnxDecoder.DEFAULT_MAX_NEW_TOKENS
         );
         return decoder;
-    }
-
-    private void extractAssetFile(File root, String name) throws IOException {
-        File file = new File(root, name);
-        File parent = file.getParentFile();
-        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
-            throw new IOException("Speech cache directory unavailable");
-        }
-        try (java.io.InputStream input = getContext().getAssets().open(name)) {
-            File pending = new File(file.getPath() + ".part");
-            try {
-                try (FileOutputStream output = new FileOutputStream(pending)) {
-                    byte[] buffer = new byte[65536];
-                    int count;
-                    while ((count = input.read(buffer)) != -1) {
-                        output.write(buffer, 0, count);
-                    }
-                }
-                if (!pending.renameTo(file)) throw new IOException("Speech cache publish failed");
-            } finally {
-                pending.delete();
-            }
-        }
     }
 
     private Qwen3SpeechWindow.DecodeResult decodeSamples(
@@ -170,6 +92,7 @@ public class StreamingSpeechPlugin extends Plugin {
 
     @PluginMethod
     public void prewarm(PluginCall call) {
+        SpeechModelExtractor.warmUpAsync(getContext());
         worker.execute(() -> {
             try {
                 ensureDecoder();
@@ -184,16 +107,11 @@ public class StreamingSpeechPlugin extends Plugin {
     public void available(PluginCall call) {
         Boolean cached = cachedAssetsAvailable;
         if (cached == null) {
-            boolean ready = true;
-            for (String name : MODEL_FILES) {
-                try (java.io.InputStream input = getContext().getAssets().open(name)) {
-                    if (!name.equals("hotwords.txt") && input.read() < 0) ready = false;
-                } catch (IOException e) {
-                    ready = false;
-                }
-            }
+            boolean ready = SpeechModelExtractor.areAssetsAvailable(getContext());
             cached = ready;
-            cachedAssetsAvailable = cached;
+            if (ready) {
+                cachedAssetsAvailable = cached;
+            }
         }
         JSObject result = new JSObject();
         result.put("available", cached);

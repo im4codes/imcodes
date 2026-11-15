@@ -49,6 +49,16 @@ android {
         versionCode 2
         versionName "1.1"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        def abiFiltersProp = findProperty('androidAbiFilters')?.toString()?.trim()
+        def resolvedAbiFilters = abiFiltersProp
+            ? abiFiltersProp.split(',').collect { it.trim() }.findAll { !it.isEmpty() }
+            : ['arm64-v8a']
+        if (resolvedAbiFilters.isEmpty()) {
+            resolvedAbiFilters = ['arm64-v8a']
+        }
+        ndk {
+            abiFilters(*resolvedAbiFilters)
+        }
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
@@ -102,8 +112,13 @@ android {
         }
     }
 
-    // Keep the offline model directly readable by AssetManager/ONNX Runtime.
-    androidResources { noCompress += ['onnx', 'weights'] }
+    // Model weights are deflated in the APK and extracted into noBackupFilesDir on startup.
+    // Compress native libs in the APK so PackageManager extracts arm64-v8a at install time.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 
     buildFeatures {
         buildConfig = true

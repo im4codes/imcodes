@@ -11,7 +11,6 @@ android {
         sourceCompatibility JavaVersion.VERSION_21
         targetCompatibility JavaVersion.VERSION_21
     }
-    androidResources { noCompress += ['onnx', 'weights'] }
     sourceSets.main.assets.srcDirs = ['../models']
 }
 
@@ -20,6 +19,7 @@ dependencies {
     implementation "androidx.appcompat:appcompat:${rootProject.ext.androidxAppCompatVersion}"
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.28.0'
     implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.1.0'
+    testImplementation "junit:junit:${rootProject.findProperty('junitVersion') ?: '4.13.2'}"
 }
 
 // Do not silently ship an APK missing its offline recognizer/model.

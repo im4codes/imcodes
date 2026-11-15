@@ -3,6 +3,8 @@ package com.im.codes;
 import android.app.Application;
 import android.util.Log;
 
+import com.imcodes.speech.SpeechModelExtractor;
+
 import cn.jpush.android.api.JPushInterface;
 
 /**
@@ -19,6 +21,7 @@ public class AppApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        SpeechModelExtractor.warmUpAsync(this);
 
         // Enable verbose JPush logging in debug builds for triage. Always set
         // BEFORE init() so the init pass itself is logged.

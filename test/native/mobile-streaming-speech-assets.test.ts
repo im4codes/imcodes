@@ -130,9 +130,12 @@ describe('Qwen3-ASR mobile assets', () => {
     const androidBuildGradle = await readFile(new URL('android/build.gradle', base), 'utf8');
     const appBuildGradle = await readFile(new URL('../../web/android/app/build.gradle', import.meta.url), 'utf8');
     const mainActivity = await readFile(new URL('../../web/android/app/src/main/java/com/im/codes/MainActivity.java', import.meta.url), 'utf8');
+    const globalApp = await readFile(new URL('../../web/android/app/src/global/java/com/im/codes/AppApplication.java', import.meta.url), 'utf8');
+    const chinaApp = await readFile(new URL('../../web/android/app/src/china/java/com/im/codes/AppApplication.java', import.meta.url), 'utf8');
     const capacitorPluginsUrl = new URL('../../web/android/app/src/main/assets/capacitor.plugins.json', import.meta.url);
     const consumerRules = await readFile(new URL('android/consumer-rules.pro', base), 'utf8');
     const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
+    const extractor = await readFile(new URL('android/src/main/java/com/imcodes/speech/SpeechModelExtractor.java', base), 'utf8');
     const androidDecoder = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3OnnxDecoder.java', base), 'utf8');
     const androidTokenizer = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3Tokenizer.java', base), 'utf8');
     const androidMel = await readFile(new URL('android/src/main/java/com/imcodes/speech/WhisperMelExtractor.java', base), 'utf8');
@@ -140,11 +143,18 @@ describe('Qwen3-ASR mobile assets', () => {
     const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
     const qwenAsr = await readFile(new URL('ios/Sources/Qwen3ASR/Qwen3ASR.swift', base), 'utf8');
     expect(androidBuildGradle).toContain("com.microsoft.onnxruntime:onnxruntime-android:1.28.0");
-    expect(androidBuildGradle).toContain("noCompress += ['onnx', 'weights']");
-    expect(appBuildGradle).toContain("noCompress += ['onnx', 'weights']");
+    expect(androidBuildGradle).not.toContain('noCompress');
+    expect(appBuildGradle).not.toContain('noCompress');
+    expect(appBuildGradle).toContain("abiFilters(*resolvedAbiFilters)");
+    expect(appBuildGradle).toContain("['arm64-v8a']");
+    expect(appBuildGradle).toContain("useLegacyPackaging = true");
     expect(androidBuildGradle).not.toContain('sherpa-onnx');
     expect(appBuildGradle).not.toContain('sherpa-onnx');
     expect(mainActivity).toContain('import com.imcodes.speech.StreamingSpeechPlugin;');
+    expect(mainActivity).toContain('import com.imcodes.speech.SpeechModelExtractor;');
+    expect(mainActivity).toContain('SpeechModelExtractor.warmUpAsync(this);');
+    expect(globalApp).toContain('SpeechModelExtractor.warmUpAsync(this);');
+    expect(chinaApp).toContain('SpeechModelExtractor.warmUpAsync(this);');
     expect(mainActivity).toContain('registerPlugin(StreamingSpeechPlugin.class);');
     expect(mainActivity).toContain('isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")');
     expect(mainActivity).toContain('settings.setTextZoom(100);');
@@ -157,12 +167,13 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(consumerRules).not.toContain('sherpa');
     expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
     expect(ios).toContain(`jsName = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
-    for (const name of modelFiles) { expect(android).toContain('"' + name + '"'); }
+    for (const name of modelFiles) { expect(extractor).toContain('"' + name + '"'); }
     for (const name of iosModelFiles) { expect(ios).toContain('"' + name + '"'); }
     for (const name of ['listeningState', 'audioLevel', 'partialResults', 'recognitionError']) { expect(android).toContain('"' + name + '"'); expect(ios).toContain('"' + name + '"'); }
-    expect(android).toContain('getNoBackupFilesDir()');
-    expect(android).toContain('.cache-complete');
-    expect(android).not.toContain('input.available()');
+    const androidPluginAndExtractor = `${android}\n${extractor}`;
+    expect(androidPluginAndExtractor).toContain('getNoBackupFilesDir()');
+    expect(androidPluginAndExtractor).toContain('.cache-complete');
+    expect(androidPluginAndExtractor).not.toContain('input.available()');
     expect(android).toContain('READ_CHUNK_SAMPLES = 800');
     expect(android).toContain('new Qwen3OnnxDecoder(');
     expect(android).toContain('new Qwen3SpeechWindow()');
@@ -189,7 +200,7 @@ describe('Qwen3-ASR mobile assets', () => {
     // API 24 compatibility guard: no java.nio.file (API 26+) or InputStream.readAllBytes/Files.readString (API 33+/Java 11) in production sources without coreLibraryDesugaring
     expect(androidTokenizer).toContain('readUtf8File(');
     expect(androidTokenizer).toContain('FileInputStream');
-    for (const javaSrc of [mainActivity, android, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
+    for (const javaSrc of [mainActivity, globalApp, chinaApp, android, extractor, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
       expect(javaSrc).not.toMatch(/\bjava\.nio\.file\b|\bFiles\b|\.toPath\s*\(|\breadAllBytes\s*\(|\bFiles\s*\.\s*(?:readString|writeString)\s*\(|\bByteArrayOutputStream[^;]*toString\s*\(\s*StandardCharsets/);
     }
     // Android ICU Pattern & minSdk 24 (Java 8 / no coreLibraryDesugaring) compatibility guard:
@@ -427,6 +438,16 @@ public class Bridge {
   public Bridge(android.view.View webView){ this.webView=webView; }
   public android.view.View getWebView(){ return webView; }
 }`,
+      'android/content/res/AssetManager.java': `package android.content.res;
+public class AssetManager {
+  public java.io.InputStream open(String path) throws java.io.IOException { throw new java.io.IOException("unimplemented"); }
+}`,
+      'android/content/Context.java': `package android.content;
+public class Context {
+  public Context getApplicationContext(){ return this; }
+  public android.content.res.AssetManager getAssets(){ return new android.content.res.AssetManager(); }
+  public java.io.File getNoBackupFilesDir(){ return new java.io.File(System.getProperty("java.io.tmpdir"),"speech-private"); }
+}`,
       'com/getcapacitor/Plugin.java': `package com.getcapacitor;
 public class Plugin {
   public final java.util.List<String> events=java.util.Collections.synchronizedList(new java.util.ArrayList<>());
@@ -441,10 +462,11 @@ public class Plugin {
   public void requestPermissionForAlias(String a,PluginCall c,String callback){}
   public Context getContext(){ return new Context(); }
   public Activity getActivity(){ return new Activity(); }
-  public static class Context { public Assets getAssets(){ return new Assets(); } public java.io.File getNoBackupFilesDir(){ return new java.io.File(System.getProperty("java.io.tmpdir"),"speech-private"); } }
-  public static class Assets {
+  public static class Context extends android.content.Context { @Override public Assets getAssets(){ return new Assets(); } }
+  public static class Assets extends android.content.res.AssetManager {
     private static final String VOCAB_JSON = ${JSON.stringify(minimalVocabJson)};
     private static final String CONFIG_JSON = ${JSON.stringify(minimalConfigJson)};
+    @Override
     public java.io.InputStream open(String path) throws java.io.IOException {
       byte[] bytes;
       if (path.equals("hotwords.txt")) bytes = new byte[0];
@@ -911,7 +933,7 @@ public class Harness {
     };
     const sources: string[] = [];
     for (const [relative, content] of Object.entries(files)) { const full=join(srcDir, relative); await mkdir(dirname(full),{recursive:true});await writeFile(full,content);sources.push(full); }
-    for (const name of ['SpeechGain.java', 'StreamingSpeechPlugin.java', 'Qwen3OnnxDecoder.java', 'Qwen3SpeechWindow.java', 'Qwen3Tokenizer.java', 'WhisperMelExtractor.java']) {
+    for (const name of ['SpeechGain.java', 'SpeechModelExtractor.java', 'StreamingSpeechPlugin.java', 'Qwen3OnnxDecoder.java', 'Qwen3SpeechWindow.java', 'Qwen3Tokenizer.java', 'WhisperMelExtractor.java']) {
       sources.push(fileURLToPath(new URL(`../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/${name}`, import.meta.url)));
     }
     sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/test/java/com/imcodes/speech/SpeechGainTest.java', import.meta.url)));
