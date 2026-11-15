@@ -597,8 +597,8 @@ describe('TerminalView — Mac native host scaling modes', () => {
     unmount();
   });
 
-  it('retains 15px fallback on legacy iOS-on-Mac shells and downgrades cleanly when late native-host arrives without resize', async () => {
-    const { NATIVE_HOST_EVENT, IOS_MAC_TERMINAL_FONT_SIZE } = await import('../../src/native-platform.js');
+  it('uses uniform 13px / 1.4 terminal font metrics without unbalanced Mac inflation and handles late native-host events cleanly', async () => {
+    const { NATIVE_HOST_EVENT } = await import('../../src/native-platform.js');
     const { FitAddon } = await import('@xterm/addon-fit');
     stubNativeEnv(undefined);
     (TerminalMock as unknown as ReturnType<typeof vi.fn>).mockClear();
@@ -606,8 +606,8 @@ describe('TerminalView — Mac native host scaling modes', () => {
 
     const { unmount } = render(<TerminalView sessionName="term-legacy-then-late" />);
     const ctorOpts = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
-    expect(ctorOpts.fontSize).toBe(IOS_MAC_TERMINAL_FONT_SIZE);
-    expect(ctorOpts.lineHeight).toBe(1.45);
+    expect(ctorOpts.fontSize).toBe(13);
+    expect(ctorOpts.lineHeight).toBe(1.4);
     expect(ctorOpts.disableStdin).toBe(false);
 
     const termInstance = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;

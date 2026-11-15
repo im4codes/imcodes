@@ -11,6 +11,10 @@ html {
   text-size-adjust: 100%;
 }
 :root {
+  --imcodes-ui-zoom: 1;
+  --imcodes-ui-vw: calc(100vw / var(--imcodes-ui-zoom, 1));
+  --imcodes-ui-vh: calc(100vh / var(--imcodes-ui-zoom, 1));
+  --imcodes-ui-dvh: calc(100dvh / var(--imcodes-ui-zoom, 1));
   --sat: env(safe-area-inset-top, 0px);
   --sab: env(safe-area-inset-bottom, 0px);
   --chrome-bg: #080d16;
@@ -391,7 +395,7 @@ html.native-ios-mac .chat-dl-btn {
 
 /* Layout — accounts for iOS safe area (status bar/notch) and mobile keyboard (--vvh) */
 /* Layout — accounts for iOS safe area (status bar/notch) and mobile keyboard (--vvh) */
-.layout { display: flex; height: calc(100vh - env(safe-area-inset-top, 0px)); height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px)); margin-top: env(safe-area-inset-top); }
+.layout { display: flex; height: calc(var(--imcodes-ui-vh, 100vh) - env(safe-area-inset-top, 0px)); height: calc(var(--vvh, var(--imcodes-ui-dvh, 100dvh)) - env(safe-area-inset-top, 0px)); margin-top: env(safe-area-inset-top); }
 .sidebar { width: 220px; min-width: 180px; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.025) 22px 23px), linear-gradient(180deg, #0d1422 0%, #080d16 100%); border-right: 1px solid rgba(34,211,238,0.18); box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 8px 0 24px rgba(0,0,0,0.24); display: flex; flex-direction: column; overflow-y: auto; }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: #070b13; }
 
@@ -18791,8 +18795,8 @@ button.quick-agent-delegation-preset.active {
 .cloud-docs-standalone-root,
 .cloud-docs-standalone-root body,
 .cloud-docs-standalone-root #app {
-  width: 100vw;
-  height: 100dvh;
+  width: var(--imcodes-ui-vw, 100vw);
+  height: var(--imcodes-ui-dvh, 100dvh);
   margin: 0;
   overflow: hidden;
   background: #0b1120;

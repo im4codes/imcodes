@@ -36,8 +36,8 @@
    its own size here -- inheriting `height: 100%` from a parent that is no
    longer laying it out leaves it collapsed in the corner of a black screen. */
 .remote-desktop-workspace:fullscreen {
-  width: 100vw;
-  height: 100vh;
+  width: var(--imcodes-ui-vw, 100vw);
+  height: var(--imcodes-ui-vh, 100vh);
   border-radius: 0;
 }
 

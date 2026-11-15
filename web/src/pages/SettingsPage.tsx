@@ -36,6 +36,14 @@ import {
   MIN_GLOBAL_FONT_DELTA,
   useGlobalFontDelta,
 } from '../global-font.js';
+import {
+  formatUiScale,
+  markUiScalePrompted,
+  MAX_UI_SCALE,
+  MIN_UI_SCALE,
+  UI_SCALE_STEP,
+  useUiScale,
+} from '../ui-scale.js';
 
 interface PushServerItem {
   id: string;
@@ -83,6 +91,7 @@ export function SettingsPage({
 }: Props) {
   const { t } = useTranslation();
   const [globalFontDelta, setGlobalFontDelta] = useGlobalFontDelta();
+  const [uiScale, setUiScale, defaultUiScale] = useUiScale();
 
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -556,50 +565,109 @@ export function SettingsPage({
                 <h2 class="settings-card-heading">
                   {t('settings.appearance_title', { defaultValue: 'Appearance' })}
                 </h2>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-                  <div style={{ minWidth: 0, flex: '1 1 180px' }}>
-                    <div style={inlineLabelStyle}>{t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}</div>
-                    <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.45 }}>
-                      {t('settings.global_font_size_desc', { defaultValue: 'Adjusts font size across the entire app (+1 / -1 px).' })}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                    <div style={{ minWidth: 0, flex: '1 1 180px' }}>
+                      <div style={inlineLabelStyle}>{t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}</div>
+                      <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.45 }}>
+                        {t('settings.ui_scale_desc', { defaultValue: 'Uniformly scales the entire interface (buttons, sidebars, icons, modals, and text).' })}
+                      </div>
                     </div>
-                  </div>
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-                    <button
-                      type="button"
-                      class="settings-btn-secondary"
-                      onClick={() => setGlobalFontDelta((prev) => prev - 1)}
-                      disabled={globalFontDelta <= MIN_GLOBAL_FONT_DELTA}
-                      aria-label={t('chat.font.globalDecrease', { defaultValue: 'Decrease global font size' })}
-                      style={{ minWidth: 32, padding: '6px 10px' }}
-                    >
-                      −
-                    </button>
-                    <span
-                      data-testid="settings-global-font-delta-readout"
-                      style={{ minWidth: 42, textAlign: 'center', fontVariantNumeric: 'tabular-nums', fontSize: '14px', fontWeight: 600, color: '#e2e8f0' }}
-                    >
-                      {formatGlobalFontDelta(globalFontDelta)}
-                    </span>
-                    <button
-                      type="button"
-                      class="settings-btn-secondary"
-                      onClick={() => setGlobalFontDelta((prev) => prev + 1)}
-                      disabled={globalFontDelta >= MAX_GLOBAL_FONT_DELTA}
-                      aria-label={t('chat.font.globalIncrease', { defaultValue: 'Increase global font size' })}
-                      style={{ minWidth: 32, padding: '6px 10px' }}
-                    >
-                      +
-                    </button>
-                    {globalFontDelta !== 0 && (
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
                       <button
                         type="button"
                         class="settings-btn-secondary"
-                        onClick={() => setGlobalFontDelta(0)}
-                        style={{ padding: '6px 10px', fontSize: '12px' }}
+                        onClick={() => {
+                          markUiScalePrompted();
+                          setUiScale((prev) => prev - UI_SCALE_STEP);
+                        }}
+                        disabled={uiScale <= MIN_UI_SCALE}
+                        aria-label={t('chat.font.uiScaleDecrease', { defaultValue: 'Decrease UI scale' })}
+                        style={{ minWidth: 32, padding: '6px 10px' }}
                       >
-                        {t('chat.font.globalReset', { defaultValue: 'Reset' })}
+                        −
                       </button>
-                    )}
+                      <span
+                        data-testid="settings-ui-scale-readout"
+                        style={{ minWidth: 48, textAlign: 'center', fontVariantNumeric: 'tabular-nums', fontSize: '14px', fontWeight: 600, color: '#e2e8f0' }}
+                      >
+                        {formatUiScale(uiScale)}
+                      </span>
+                      <button
+                        type="button"
+                        class="settings-btn-secondary"
+                        onClick={() => {
+                          markUiScalePrompted();
+                          setUiScale((prev) => prev + UI_SCALE_STEP);
+                        }}
+                        disabled={uiScale >= MAX_UI_SCALE}
+                        aria-label={t('chat.font.uiScaleIncrease', { defaultValue: 'Increase UI scale' })}
+                        style={{ minWidth: 32, padding: '6px 10px' }}
+                      >
+                        +
+                      </button>
+                      {uiScale !== defaultUiScale && (
+                        <button
+                          type="button"
+                          class="settings-btn-secondary"
+                          data-testid="settings-ui-scale-reset"
+                          aria-label={t('chat.font.uiScaleReset', { defaultValue: 'Reset UI scale' })}
+                          onClick={() => {
+                            markUiScalePrompted();
+                            setUiScale(defaultUiScale);
+                          }}
+                          style={{ padding: '6px 10px', fontSize: '12px' }}
+                        >
+                          {t('chat.font.globalReset', { defaultValue: 'Reset' })}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                    <div style={{ minWidth: 0, flex: '1 1 180px' }}>
+                      <div style={inlineLabelStyle}>{t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}</div>
+                      <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.45 }}>
+                        {t('settings.global_font_size_desc', { defaultValue: 'Adjusts font size across the entire app (+1 / -1 px).' })}
+                      </div>
+                    </div>
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                      <button
+                        type="button"
+                        class="settings-btn-secondary"
+                        onClick={() => setGlobalFontDelta((prev) => prev - 1)}
+                        disabled={globalFontDelta <= MIN_GLOBAL_FONT_DELTA}
+                        aria-label={t('chat.font.globalDecrease', { defaultValue: 'Decrease global font size' })}
+                        style={{ minWidth: 32, padding: '6px 10px' }}
+                      >
+                        −
+                      </button>
+                      <span
+                        data-testid="settings-global-font-delta-readout"
+                        style={{ minWidth: 42, textAlign: 'center', fontVariantNumeric: 'tabular-nums', fontSize: '14px', fontWeight: 600, color: '#e2e8f0' }}
+                      >
+                        {formatGlobalFontDelta(globalFontDelta)}
+                      </span>
+                      <button
+                        type="button"
+                        class="settings-btn-secondary"
+                        onClick={() => setGlobalFontDelta((prev) => prev + 1)}
+                        disabled={globalFontDelta >= MAX_GLOBAL_FONT_DELTA}
+                        aria-label={t('chat.font.globalIncrease', { defaultValue: 'Increase global font size' })}
+                        style={{ minWidth: 32, padding: '6px 10px' }}
+                      >
+                        +
+                      </button>
+                      {globalFontDelta !== 0 && (
+                        <button
+                          type="button"
+                          class="settings-btn-secondary"
+                          onClick={() => setGlobalFontDelta(0)}
+                          style={{ padding: '6px 10px', fontSize: '12px' }}
+                        >
+                          {t('chat.font.globalReset', { defaultValue: 'Reset' })}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>

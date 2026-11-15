@@ -11,6 +11,7 @@ import {
 } from './pages/RemoteDesktopNativeStepUp.js';
 import { applyNativePlatformClasses, NATIVE_HOST_EVENT } from './native-platform.js';
 import { initGlobalFontScale } from './global-font.js';
+import { applyUiScale, initUiScale, readUiScale } from './ui-scale.js';
 import {
   isRemoteDesktopWallWindow,
   readRemoteDesktopWindowServerId,
@@ -48,8 +49,10 @@ marked.use({
 
 applyNativePlatformClasses();
 initGlobalFontScale();
+initUiScale();
 window.addEventListener(NATIVE_HOST_EVENT, () => {
   applyNativePlatformClasses();
+  applyUiScale(readUiScale());
 });
 
 // The installable remote desktop app (`/remote-desktop/app/`) reuses the two standalone-window screens: the machine wall, or the one

@@ -9,7 +9,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     var window: UIWindow?
     private var didRegisterLocalPlugins = false
     private var configuredWebViewId: ObjectIdentifier?
-    private static let macDesignedForIpadPageZoom: CGFloat = 1.0 / 0.77
     // #080d16 (--chrome-bg) — prevents light/black host flashes during macOS Space transitions.
     private static let macHostBackgroundColor = UIColor(red: 8.0 / 255.0, green: 13.0 / 255.0, blue: 22.0 / 255.0, alpha: 1.0)
 
@@ -266,18 +265,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     /// itself. This used to run only for the iOS-app-on-Mac idiom, but the
     /// exact same bar shows up identically on a real iPhone/iPad, so it now
     /// always runs.
-    private func buildNativeHostSignalScript() -> (script: String, pageZoomApplied: Bool) {
+    private func buildNativeHostSignalScript() -> String {
         let hostFlags = Self.currentMacHostFlags()
-        let pageZoomApplied = hostFlags.needsDesignedForIpadPageZoom
+        let pageZoomApplied = false
         let scaleMode: String
         if !hostFlags.isMacDesktop {
             scaleMode = "none"
-        } else if pageZoomApplied {
-            scaleMode = "native-page-zoom"
-        } else if !hostFlags.needsDesignedForIpadPageZoom {
-            scaleMode = "native-1x"
+        } else if hostFlags.needsDesignedForIpadPageZoom {
+            scaleMode = "designed-for-ipad"
         } else {
-            scaleMode = "legacy-css"
+            scaleMode = "native-1x"
         }
 
         var scripts: [String] = []
@@ -308,37 +305,31 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             })();
             """)
         }
-        return (scripts.joined(separator: "\n"), pageZoomApplied)
+        return scripts.joined(separator: "\n")
     }
 
     private func refreshMacPageZoomAndHostSignal(_ webView: WKWebView) {
         self.configureMacHostAppearance(webView: webView)
-        let hostFlags = Self.currentMacHostFlags()
-        if #available(iOS 14.0, *), hostFlags.needsDesignedForIpadPageZoom,
-           abs(webView.pageZoom - Self.macDesignedForIpadPageZoom) > 0.001 {
-            // macOS "Designed for iPad" scales UIKit points by 0.77x; compensating at the
-            // WKWebView level keeps desktop typography, icons, and layout parity 1:1.
-            webView.pageZoom = Self.macDesignedForIpadPageZoom
+        if #available(iOS 14.0, *), abs(webView.pageZoom - 1.0) > 0.001 {
+            // Keep WKWebView.pageZoom at 1.0; Designed-for-iPad Mac defaults UI Scale to 125% in the web layer.
+            webView.pageZoom = 1.0
         }
-        let signal = buildNativeHostSignalScript()
-        if !signal.script.isEmpty {
-            webView.evaluateJavaScript(signal.script, completionHandler: nil)
+        let signalScript = buildNativeHostSignalScript()
+        if !signalScript.isEmpty {
+            webView.evaluateJavaScript(signalScript, completionHandler: nil)
         }
     }
 
     private func configureInputChrome(_ webView: WKWebView?) {
         self.configureMacHostAppearance(webView: webView)
-        let hostFlags = Self.currentMacHostFlags()
-        if #available(iOS 14.0, *), hostFlags.needsDesignedForIpadPageZoom, let webView = webView {
-            // macOS "Designed for iPad" scales UIKit points by 0.77x; compensating at the
-            // WKWebView level keeps desktop typography, icons, and layout parity 1:1.
-            webView.pageZoom = Self.macDesignedForIpadPageZoom
+        if #available(iOS 14.0, *), let webView = webView, abs(webView.pageZoom - 1.0) > 0.001 {
+            webView.pageZoom = 1.0
         }
-        let signal = buildNativeHostSignalScript()
-        if !signal.script.isEmpty {
-            let userScript = WKUserScript(source: signal.script, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        let signalScript = buildNativeHostSignalScript()
+        if !signalScript.isEmpty {
+            let userScript = WKUserScript(source: signalScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)
             webView?.configuration.userContentController.addUserScript(userScript)
-            webView?.evaluateJavaScript(signal.script, completionHandler: nil)
+            webView?.evaluateJavaScript(signalScript, completionHandler: nil)
         }
         guard #available(iOS 14.0, *) else { return }
         webView?.inputAssistantItem.leadingBarButtonGroups = []

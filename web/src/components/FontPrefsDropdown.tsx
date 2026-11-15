@@ -21,6 +21,14 @@ import {
   MIN_GLOBAL_FONT_DELTA,
   useGlobalFontDelta,
 } from '../global-font.js';
+import {
+  formatUiScale,
+  markUiScalePrompted,
+  MAX_UI_SCALE,
+  MIN_UI_SCALE,
+  UI_SCALE_STEP,
+  useUiScale,
+} from '../ui-scale.js';
 
 export interface FontPrefs {
   family: string;
@@ -432,6 +440,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const [showAllSystemCJK, setShowAllSystemCJK] = useState(false);
   const [globalDelta, setGlobalDelta] = useGlobalFontDelta();
+  const [uiScale, setUiScale, defaultUiScale] = useUiScale();
   const wrapRef = useRef<HTMLDivElement>(null);
   const latestPrefsRef = useRef(prefs);
   latestPrefsRef.current = prefs;
@@ -678,6 +687,20 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     setGlobalDelta((prev) => prev + step);
   }, [setGlobalDelta]);
 
+  const handleUiScaleClick = useCallback((step: number) => (e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    markUiScalePrompted();
+    setUiScale((prev) => prev + step);
+  }, [setUiScale]);
+
+  const handleUiScaleResetClick = useCallback((e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    markUiScalePrompted();
+    setUiScale(defaultUiScale);
+  }, [setUiScale, defaultUiScale]);
+
   const pickCodeFamily = (cssValue: string) => {
     const cjkFamily = prefs.cjkFamily ?? DEFAULT_CJK_FAMILY;
     const nextFamily = buildFontFamily(cssValue, cjkFamily);
@@ -767,6 +790,44 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
       </button>
       {open && (
         <div style={popStyle} role="dialog" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
+          {/* Row 0 — whole-page UI scale (− 100% +), scales chrome, icons, cards, modals, and text uniformly. */}
+          <div style={sizeRowStyle} role="group" aria-label={t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}>
+            <span style={sizeRowLabelStyle}>{t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}</span>
+            <div style={sizeControlsGroupStyle}>
+              {uiScale !== defaultUiScale && (
+                <button
+                  type="button"
+                  onClick={handleUiScaleResetClick}
+                  data-testid="ui-scale-reset"
+                  aria-label={t('chat.font.uiScaleReset', { defaultValue: 'Reset UI scale' })}
+                  style={{ ...sizeBtnStyle(false), fontSize: 11, padding: '0 6px' }}
+                >
+                  {t('chat.font.globalReset', { defaultValue: 'Reset' })}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleUiScaleClick(-UI_SCALE_STEP)}
+                disabled={uiScale <= MIN_UI_SCALE}
+                aria-label={t('chat.font.uiScaleDecrease', { defaultValue: 'Decrease UI scale' })}
+                style={sizeBtnStyle(uiScale <= MIN_UI_SCALE)}
+              >
+                −
+              </button>
+              <div style={{ ...sizeReadoutStyle, minWidth: 38 }} data-testid="ui-scale-readout">
+                {formatUiScale(uiScale)}
+              </div>
+              <button
+                type="button"
+                onClick={handleUiScaleClick(UI_SCALE_STEP)}
+                disabled={uiScale >= MAX_UI_SCALE}
+                aria-label={t('chat.font.uiScaleIncrease', { defaultValue: 'Increase UI scale' })}
+                style={sizeBtnStyle(uiScale >= MAX_UI_SCALE)}
+              >
+                +
+              </button>
+            </div>
+          </div>
           {/* Row 1 — global UI font size delta (− 0 +), scales all app typography by ±1px per step. */}
           <div style={sizeRowStyle} role="group" aria-label={t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}>
             <span style={sizeRowLabelStyle}>{t('chat.font.globalSizeLabel', { defaultValue: 'Global size' })}</span>

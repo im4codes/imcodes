@@ -11,6 +11,7 @@ import {
   IOS_MAC_TERMINAL_FONT_SIZE,
   NATIVE_HOST_EVENT,
   applyNativePlatformClasses,
+  isDesignedForIpadMac,
   isNativeMacDesktop,
   shouldUseIosMacTextScale,
   type NativePlatformEnvironment,
@@ -34,36 +35,41 @@ function env(overrides: Partial<NativePlatformEnvironment> = {}): NativePlatform
   };
 }
 
-describe('native platform text scaling', () => {
-  it('enables larger text for the packaged iOS app running on Mac', () => {
-    expect(shouldUseIosMacTextScale(env())).toBe(true);
+describe('native platform detection and uniform UI scaling', () => {
+  it('identifies Designed-for-iPad Mac without enabling unbalanced chat-only text inflation', () => {
+    expect(isDesignedForIpadMac(env())).toBe(true);
+    expect(shouldUseIosMacTextScale(env())).toBe(false);
     expect(IOS_MAC_TERMINAL_FONT_SIZE).toBeGreaterThan(13);
   });
 
-  it('does not enable the Mac text scale for touch iPadOS', () => {
-    expect(shouldUseIosMacTextScale(env({
+  it('does not treat touch iPadOS as Mac desktop or Designed-for-iPad Mac', () => {
+    const ipad = env({
       navigator: {
         platform: 'MacIntel',
         userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
         maxTouchPoints: 5,
       },
-    }))).toBe(false);
+    });
+    expect(isDesignedForIpadMac(ipad)).toBe(false);
+    expect(shouldUseIosMacTextScale(ipad)).toBe(false);
   });
 
-  it('does not enable the native-only text scale in web mode', () => {
-    expect(shouldUseIosMacTextScale(env({
+  it('does not mark web mode as native Mac desktop', () => {
+    const webEnv = env({
       capacitor: {
         isNativePlatform: () => false,
         getPlatform: () => 'web',
       },
-    }))).toBe(false);
+    });
+    expect(isDesignedForIpadMac(webEnv)).toBe(false);
+    expect(shouldUseIosMacTextScale(webEnv)).toBe(false);
   });
 
-  it('applies and removes the html marker class from the same contract', () => {
+  it('applies and removes native-mac-desktop while leaving legacy native-ios-mac off', () => {
     const root = document.createElement('html');
     applyNativePlatformClasses(root, env());
     expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(true);
-    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(true);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
     expect(root.dataset.nativePlatform).toBe('ios');
 
     applyNativePlatformClasses(root, env({
@@ -77,7 +83,7 @@ describe('native platform text scaling', () => {
     expect(root.dataset.nativePlatform).toBeUndefined();
   });
 
-  it('uses authoritative native host info when available and avoids double-scaling under WKWebView pageZoom', () => {
+  it('respects authoritative native host info and avoids double-scaling intermediate pageZoom binaries', () => {
     const macWithZoom = env({
       navigator: {
         platform: 'iPad',
@@ -88,6 +94,7 @@ describe('native platform text scaling', () => {
       nativeHost: { isMacDesktop: true, pageZoomApplied: true },
     });
     expect(isNativeMacDesktop(macWithZoom)).toBe(true);
+    expect(isDesignedForIpadMac(macWithZoom)).toBe(false);
     expect(shouldUseIosMacTextScale(macWithZoom)).toBe(false);
 
     const root = document.createElement('html');
@@ -152,19 +159,20 @@ describe('native platform text scaling', () => {
     }))).toBe(false);
   });
 
-  it('keeps iOS AppDelegate Mac pageZoom + host signal above Foundation-only OTA helper slice', () => {
+  it('keeps iOS AppDelegate pageZoom at 1.0 + host signal above Foundation-only OTA helper slice', () => {
     const dir = dirname(fileURLToPath(import.meta.url));
     const appDelegate = readFileSync(resolve(dir, '../ios/App/App/AppDelegate.swift'), 'utf8');
     expect(appDelegate).toContain('ProcessInfo.processInfo.isiOSAppOnMac');
     expect(appDelegate).toContain('targetEnvironment(macCatalyst)');
-    expect(appDelegate).toContain('webView.pageZoom = Self.macDesignedForIpadPageZoom');
+    expect(appDelegate).toContain('webView.pageZoom = 1.0');
+    expect(appDelegate).not.toContain('macDesignedForIpadPageZoom');
     expect(appDelegate).toContain('window.__IMCODES_NATIVE_HOST__');
     expect(appDelegate).toContain("CustomEvent('imcodes:native-host')");
     expect(appDelegate).toContain('pressesBegan');
     expect(appDelegate).toContain('pressesEnded');
     expect(appDelegate).toContain('imcodes:native-modifier-press');
     expect(appDelegate).toContain('"native-1x"');
-    expect(appDelegate).toContain('"native-page-zoom"');
+    expect(appDelegate).toContain('"designed-for-ipad"');
     expect(appDelegate).toContain('"none"');
 
     const otaStart = appDelegate.indexOf('private static let nativeBundledBuildIdKey');
@@ -175,37 +183,40 @@ describe('native platform text scaling', () => {
     expect(otaSlice).not.toContain('UIDevice');
   });
 
-  it('distinguishes native-1x Catalyst .mac, native-page-zoom iOS-on-Mac, and legacy shell fallback', () => {
+  it('distinguishes native-1x Catalyst .mac, designed-for-ipad Mac shells, and legacy shells', () => {
     const catalystMac = env({
       nativeHost: { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'native-1x' },
     });
     expect(isNativeMacDesktop(catalystMac)).toBe(true);
+    expect(isDesignedForIpadMac(catalystMac)).toBe(false);
     expect(shouldUseIosMacTextScale(catalystMac)).toBe(false);
 
-    // Even when a host omits scaleMode and sends { isMacDesktop: true, pageZoomApplied: false },
-    // the authoritative Mac host does not want legacy CSS double-scaling.
+    // Explicit { isMacDesktop: true, pageZoomApplied: false } without designed-for-ipad mode is treated as 1x.
     const catalystMacImplicit = env({
       nativeHost: { isMacDesktop: true, pageZoomApplied: false },
     });
     expect(isNativeMacDesktop(catalystMacImplicit)).toBe(true);
+    expect(isDesignedForIpadMac(catalystMacImplicit)).toBe(false);
     expect(shouldUseIosMacTextScale(catalystMacImplicit)).toBe(false);
     const root = document.createElement('html');
     applyNativePlatformClasses(root, catalystMacImplicit);
     expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
 
-    const designedForIpadZoom = env({
+    const intermediateZoomShell = env({
       nativeHost: { isMacDesktop: true, pageZoomApplied: true, scaleMode: 'native-page-zoom' },
     });
-    expect(isNativeMacDesktop(designedForIpadZoom)).toBe(true);
-    expect(shouldUseIosMacTextScale(designedForIpadZoom)).toBe(false);
+    expect(isNativeMacDesktop(intermediateZoomShell)).toBe(true);
+    expect(isDesignedForIpadMac(intermediateZoomShell)).toBe(false);
+    expect(shouldUseIosMacTextScale(intermediateZoomShell)).toBe(false);
 
-    const explicitLegacy = env({
-      nativeHost: { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'legacy-css' },
+    const newDesignedForIpadShell = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'designed-for-ipad' },
     });
-    expect(shouldUseIosMacTextScale(explicitLegacy)).toBe(true);
-    applyNativePlatformClasses(root, explicitLegacy);
+    expect(isDesignedForIpadMac(newDesignedForIpadShell)).toBe(true);
+    expect(shouldUseIosMacTextScale(newDesignedForIpadShell)).toBe(false);
+    applyNativePlatformClasses(root, newDesignedForIpadShell);
     expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(true);
-    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(true);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
 
     // Real iPadOS / iOS must never receive native-mac-desktop or native-ios-mac.
     const realIpad = env({

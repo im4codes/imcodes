@@ -10,6 +10,7 @@ import type { TerminalDiffRegistration } from '../terminal-diff-registry.js';
 import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
 import { isMobileDevice, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { useGlobalFontDelta } from '../global-font.js';
+import { useUiScale } from '../ui-scale.js';
 import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { applyDiffToRows, fullFrameWriteFromDiff, isRenderableLineIndex, resolveDiffRows } from '../terminal-frame.js';
 
@@ -165,10 +166,12 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   const [recoveryError, setRecoveryError] = useState(false);
   const [useIosMacTextScale, setUseIosMacTextScale] = useState(() => shouldUseIosMacTextScale());
   const [globalFontDelta] = useGlobalFontDelta();
+  const [uiScale] = useUiScale();
   const globalFontDeltaRef = useRef(globalFontDelta);
   globalFontDeltaRef.current = globalFontDelta;
 
   useEffect(() => {
+    let rafId = 0;
     const syncPlatform = () => {
       const nextMobile = isMobileDevice();
       const nextScale = shouldUseIosMacTextScale();
@@ -181,11 +184,17 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         term.options.lineHeight = nextScale ? 1.45 : 1.4;
         term.options.disableStdin = nextMobile && !mobileInput;
         fitRef.current?.fit();
+        cancelAnimationFrame(rafId);
+        rafId = requestAnimationFrame(() => fitRef.current?.fit());
       }
     };
     syncPlatform();
-    return subscribeDeviceLayoutChange(syncPlatform, { includeResize: false });
-  }, [mobileInput, globalFontDelta]);
+    const unsubscribe = subscribeDeviceLayoutChange(syncPlatform, { includeResize: false });
+    return () => {
+      cancelAnimationFrame(rafId);
+      unsubscribe();
+    };
+  }, [mobileInput, globalFontDelta, uiScale]);
 
   const clearRawFlushTimer = useCallback(() => {
     if (rawFlushTimerRef.current) {

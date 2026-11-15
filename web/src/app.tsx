@@ -135,7 +135,14 @@ import {
   type UnifiedServerItem,
 } from './unified-server-projection.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
+import { UiScaleOnboardingCard } from './components/UiScaleOnboardingCard.js';
 import { applyGlobalFontDelta, useGlobalFontDelta } from './global-font.js';
+import {
+  UI_SCALE_EVENT,
+  applyUiScale,
+  getActiveCssZoom,
+  useUiScale,
+} from './ui-scale.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
@@ -935,6 +942,10 @@ function InternalMainApp() {
   useEffect(() => {
     applyGlobalFontDelta(globalFontDelta);
   }, [globalFontDelta]);
+  const [uiScale] = useUiScale();
+  useEffect(() => {
+    applyUiScale(uiScale);
+  }, [uiScale]);
   const [auth, setAuth] = useState<AuthState | null>(() => {
     try {
       const raw = localStorage.getItem('rcc_auth');
@@ -1530,7 +1541,8 @@ function InternalMainApp() {
         document.documentElement.clientHeight,
       );
       if (viewportHeight === null) return;
-      const viewportCssValue = `${viewportHeight}px`;
+      const cssZoom = getActiveCssZoom();
+      const viewportCssValue = `${Math.round(viewportHeight / cssZoom)}px`;
       if (document.documentElement.style.getPropertyValue('--vvh') !== viewportCssValue) {
         document.documentElement.style.setProperty('--vvh', viewportCssValue);
       }
@@ -1545,7 +1557,7 @@ function InternalMainApp() {
       // behind the keyboard. Subtract offsetTop for the iOS case where the visual
       // viewport is pushed down rather than purely shortened.
       document.documentElement.style.setProperty(
-        '--kbh', `${Math.max(0, shrink - (vv.offsetTop || 0))}px`,
+        '--kbh', `${Math.round(Math.max(0, shrink - (vv.offsetTop || 0)) / cssZoom)}px`,
       );
       const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
       hadKeyboardOpen = state.hadKeyboardOpen;
@@ -1608,6 +1620,7 @@ function InternalMainApp() {
     vv.addEventListener('scroll', scheduleUpdate);
     window.addEventListener('resize', scheduleUpdate);
     window.addEventListener('pageshow', scheduleUpdate);
+    window.addEventListener(UI_SCALE_EVENT, update);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
     // App-resume recovery: when the app returns from background (push-notification
@@ -1642,6 +1655,7 @@ function InternalMainApp() {
       vv.removeEventListener('scroll', scheduleUpdate);
       window.removeEventListener('resize', scheduleUpdate);
       window.removeEventListener('pageshow', scheduleUpdate);
+      window.removeEventListener(UI_SCALE_EVENT, update);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       document.removeEventListener('visibilitychange', onResume);
@@ -10741,6 +10755,9 @@ function InternalMainApp() {
           </>
         );
       })()}
+
+      {/* First-install native UI scale onboarding card */}
+      <UiScaleOnboardingCard />
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (
