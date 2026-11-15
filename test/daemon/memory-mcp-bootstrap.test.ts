@@ -114,7 +114,10 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(Date.now() - started).toBeLessThan(2_000);
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'future/notification', params: {} })}\n`);
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'initialize', method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'probe-fallback', version: '1' } } })}\n`);
-    expect(await waitFor(() => messages.find(message => message.id === 'initialize'))).toHaveProperty('result.serverInfo.name', 'imcodes-memory');
+    const initReply = await waitFor(() => messages.find(message => message.id === 'initialize'));
+    expect(initReply).toHaveProperty('result.serverInfo.name', 'imcodes-memory');
+    expect(initReply).toHaveProperty('result.instructions');
+    expect(String((initReply?.result as { instructions?: unknown })?.instructions ?? '')).toContain('[CloudDoc: <name> | id=<docId>]');
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })}\n`);
     expect(await waitFor(() => messages.find(message => message.id === 2))).toHaveProperty('result.tools');

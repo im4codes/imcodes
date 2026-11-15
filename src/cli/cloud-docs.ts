@@ -14,6 +14,7 @@ import {
   formatCloudDocCitation,
   getCloudDocExt,
   getCloudDocMeta,
+  isCloudDocRecordId,
   isConvertTargetType,
   isDocBuilderOutputType,
   type CloudDocContentPayload,
@@ -547,10 +548,11 @@ export async function runCloudDocsCli(
         if (ok.recentDocuments) {
           lines.push(`Recent Documents (${ok.recentDocuments.length}):`);
           lines.push(...ok.recentDocuments.map((r) => {
-            const docId = r.cloudDocId ?? (r.sourceKind === 'cloud_doc' || String(r.id).startsWith('cdoc_') ? r.id : null);
+            const candidateId = r.cloudDocId ?? (r.sourceKind === 'cloud_doc' || String(r.id).startsWith('cdoc_') ? r.id : null);
+            const docId = isCloudDocRecordId(candidateId) && r.sourceKind !== 'server_file' ? candidateId : null;
             return docId
               ? `  - ${formatCloudDocCitation(r.title, docId)}`
-              : `  - ${r.filePath ?? r.title} (server_file, recentId=${r.id})`;
+              : `  - ${r.filePath ?? r.title} (${r.sourceKind ?? 'recent'}, recentId=${r.id})`;
           }));
         }
         succeed(ok, lines.join('\n'), ctx.flags.json);

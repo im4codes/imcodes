@@ -1,5 +1,6 @@
 import {
   CLOUD_DOCS_MAX_UPLOAD_BYTES,
+  CLOUD_DOC_CHAT_CITATION_PATTERN,
   CLOUD_DOC_CONTENT_MAX_CHARS,
   CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS,
   CLOUD_DOC_CONVERT_TARGET_TYPES,
@@ -26,6 +27,9 @@ export type CloudDocsGuideTopic = (typeof CLOUD_DOCS_GUIDE_TOPICS)[number];
 export function isCloudDocsGuideTopic(value: string): value is CloudDocsGuideTopic {
   return (CLOUD_DOCS_GUIDE_TOPICS as readonly string[]).includes(value);
 }
+
+const CLOUD_DOC_STRICT_CITATION_RULE =
+  `Chat citation format (mandatory in EVERY reply turn and EVERY mention, including renames, follow-ups, and repeated mentions): cite every Cloud Doc as \`${CLOUD_DOC_CHAT_CITATION_PATTERN}\` with its latest name; NEVER output a bare or backticked filename (\`name.ext\`), split \`name (id=cdoc_...)\`, or local link \`[name](/path)\` (use markdown paths only for real local \`--out\` files).`;
 
 const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
   index: [
@@ -134,6 +138,8 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '  imcodes cloud-docs builder --type docx --name Report.docx --script-file ./make-doc.js --arg-json \'{"title":"Q4 Plan"}\'',
     '  imcodes cloud-docs create --type docx --file ./LocalBrief.docx [--folder <folderId>]',
     'Note: If `--name` ends with `.docx`, `--type` is inferred automatically; `--output-name` must match the target extension if specified.',
+    '',
+    CLOUD_DOC_STRICT_CITATION_RULE,
   ].join('\n'),
 
   xlsx: [
@@ -160,6 +166,8 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '',
     'CLI invocation:',
     '  imcodes cloud-docs builder --type xlsx --name Revenue.xlsx --script-file ./make-sheet.js',
+    '',
+    CLOUD_DOC_STRICT_CITATION_RULE,
   ].join('\n'),
 
   pptx: [
@@ -190,6 +198,8 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '',
     'CLI invocation:',
     '  imcodes cloud-docs builder --type pptx --name Deck.pptx --script-file ./make-deck.js',
+    '',
+    CLOUD_DOC_STRICT_CITATION_RULE,
   ].join('\n'),
 
   edit: [
@@ -257,6 +267,8 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '   imcodes cloud-docs upload ./LocalReport.docx [--name Remote.docx] [--folder <id>]',
     '   imcodes cloud-docs upload ./Replacement.docx --doc-id <docId> [--version 3]',
     '   imcodes cloud-docs download <docId> [--out ./LocalCopy.docx]',
+    '',
+    CLOUD_DOC_STRICT_CITATION_RULE,
   ].join('\n'),
 
   share: [
@@ -303,6 +315,8 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '',
     '- Windows backslashes corrupted in shell:',
     '  Quote paths cleanly or pass an `args` array through the `cloud_docs` MCP tool so backslashes are never stripped.',
+    '',
+    CLOUD_DOC_STRICT_CITATION_RULE,
   ].join('\n'),
 };
 

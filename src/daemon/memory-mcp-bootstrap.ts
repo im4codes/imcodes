@@ -5,6 +5,7 @@ import {
   RETIRED_SUPERVISION_MCP_MESSAGE,
   RETIRED_SUPERVISION_MCP_TOOL_SET,
 } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_MCP_SERVER_INSTRUCTIONS } from '../../shared/mcp-tool-distribution.js';
 import {
   MCP_RESOURCE_PREFIX,
   SESSION_RESOURCE_HANDLE_TYPE,
@@ -101,6 +102,7 @@ function serverInfo(protocolVersion: unknown): JsonRpcMessage {
       protocolVersion: typeof protocolVersion === 'string' ? protocolVersion : '2024-11-05',
       capabilities: { tools: { listChanged: true } },
       serverInfo: { name: 'imcodes-memory', version: '0.1.0' },
+      instructions: MEMORY_MCP_SERVER_INSTRUCTIONS,
     },
   };
 }

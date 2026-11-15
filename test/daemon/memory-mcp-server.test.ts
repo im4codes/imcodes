@@ -19,6 +19,7 @@ import {
   MCP_TOOL_DISCOVERY_NAME,
   MCP_TOOL_GROUPS,
 } from '../../shared/mcp-tool-discovery.js';
+import { MEMORY_MCP_SERVER_INSTRUCTIONS } from '../../shared/mcp-tool-distribution.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -454,7 +455,9 @@ describe('memory MCP stdio server', () => {
       ]));
       expect(bootstrapNames).toContain(MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY);
       expect(mcpToolSurfaceBytes(bootstrap.tools)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
-      expect(client.getInstructions()).toBeUndefined();
+      expect(client.getInstructions()).toBe(MEMORY_MCP_SERVER_INSTRUCTIONS);
+      expect(client.getInstructions()?.length).toBeLessThanOrEqual(240);
+      expect(client.getInstructions()).toContain('[CloudDoc: <name> | id=<docId>]');
       const bootstrapDescriptions = bootstrap.tools.map((tool) => tool.description ?? '').join('\n');
       expect(bootstrapDescriptions.split(MCP_TOOL_DISCOVERY_DESCRIPTION)).toHaveLength(2);
       expect(bootstrapDescriptions.match(/mcp_tool_search/g)).toHaveLength(1);

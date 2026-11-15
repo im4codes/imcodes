@@ -21,6 +21,7 @@ import {
   sharedMachineAuthorityFromHookResponse,
 } from './shared-machine-authority.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { MEMORY_MCP_SERVER_INSTRUCTIONS } from '../../shared/mcp-tool-distribution.js';
 import {
   MemoryMcpCallerEnvError,
   parseMcpRuntimeCallerFromEnv,
@@ -435,6 +436,8 @@ export function createMemoryMcpServer(
   const server = new McpServer({
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
     version: '0.1.0',
+  }, {
+    instructions: MEMORY_MCP_SERVER_INSTRUCTIONS,
   });
   installMcpErrorResultBoundary(server);
   if (caller.transport === 'stdio') {

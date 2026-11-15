@@ -10,6 +10,7 @@ import {
 import {
   MCP_TOOL_DISCOVERY_NAME,
 } from '../../shared/mcp-tool-discovery.js';
+import { MEMORY_MCP_SERVER_INSTRUCTIONS } from '../../shared/mcp-tool-distribution.js';
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { parseMcpRuntimeCallerFromEnv, type McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { getDefaultMcpServers } from '../../src/agent/providers/getDefaultMcpServers.js';
@@ -71,7 +72,8 @@ describe('capability MCP tools', () => {
   it('advertises exactly the four capability tools on a registered FULL node', async () => {
     await withClient(caller(), service(), async (client) => {
       const tools = (await client.listTools()).tools;
-      expect(client.getInstructions()).toBeUndefined();
+      expect(client.getInstructions()).toBe(MEMORY_MCP_SERVER_INSTRUCTIONS);
+      expect(client.getInstructions()).not.toContain('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const names = tools.map((tool) => tool.name);
       expect(names.filter((name) => name.startsWith('capability_'))).toEqual([...CAPABILITY_MCP_TOOL_NAMES]);
       for (const name of CAPABILITY_MCP_TOOL_NAMES) {

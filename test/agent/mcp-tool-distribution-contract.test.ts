@@ -10,6 +10,7 @@ import {
   MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS,
   MCP_TOOL_DISTRIBUTION_CONTRACT_VERSION,
   MCP_TOOL_RUNTIME_BOUNDARIES,
+  MEMORY_MCP_SERVER_INSTRUCTIONS,
   getMcpToolDistributionContract,
 } from '../../shared/mcp-tool-distribution.js';
 import {
@@ -123,5 +124,8 @@ describe('shared MCP tool distribution contract', () => {
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/rename/i);
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/every mention/i);
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('bare filename');
+    expect(MEMORY_MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(240);
+    expect(MEMORY_MCP_SERVER_INSTRUCTIONS).toContain(canonicalPattern);
+    expect(MEMORY_MCP_SERVER_INSTRUCTIONS).toContain('EVERY turn and EVERY mention');
   });
 });

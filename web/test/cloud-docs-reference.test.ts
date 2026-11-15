@@ -2,6 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, expect, it, vi } from 'vitest';
+import { formatCloudDocCitation } from '../../shared/cloud-docs.js';
 import {
   computeRightHalfUnobstructedCloudDocsGeometry,
   executeCloudDocQuote,
@@ -402,5 +403,28 @@ describe('cloud-docs-reference helpers', () => {
     expect(splitPlainTextByCloudDocIds('请检查 budget.xlsx 与 notes.docx')).toEqual([
       { type: 'text', value: '请检查 budget.xlsx 与 notes.docx', start: 0, end: 28 },
     ]);
+  });
+
+  it('round-trips shared formatCloudDocCitation output through parseCloudDocQuoteTag and splitTextByCloudDocQuoteTags for extreme names', () => {
+    const cases: Array<{ rawName: string; docId: string; expectedName: string }> = [
+      { rawName: '冬日傍晚的一杯热茶.xlsx', docId: 'cdoc_e9d1465bcd3b44d988ee', expectedName: '冬日傍晚的一杯热茶.xlsx' },
+      { rawName: 'Q4 Report (Final) v2.docx', docId: 'cdoc_abc12345', expectedName: 'Q4 Report (Final) v2.docx' },
+      { rawName: 'Sales | 2026 ] Sheet\r\n\t.xlsx', docId: 'cdoc_edge_999', expectedName: 'Sales 2026 Sheet .xlsx' },
+      { rawName: '   ', docId: 'cdoc_empty_name', expectedName: 'Untitled' },
+    ];
+
+    for (const item of cases) {
+      const citation = formatCloudDocCitation(item.rawName, item.docId);
+      expect(parseCloudDocQuoteTag(citation)).toEqual({
+        docId: item.docId,
+        name: item.expectedName,
+      });
+      const segments = splitTextByCloudDocQuoteTags(`第 2 轮已重命名为 ${citation} 并补充数据。`);
+      expect(segments).toMatchObject([
+        { type: 'text', value: '第 2 轮已重命名为 ' },
+        { type: 'cloud_doc', docId: item.docId, label: item.expectedName, kind: 'quote', value: citation },
+        { type: 'text', value: ' 并补充数据。' },
+      ]);
+    }
   });
 });

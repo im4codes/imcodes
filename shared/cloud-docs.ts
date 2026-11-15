@@ -497,6 +497,8 @@ export interface CloudDocFileUpdateResponse {
   bytesWritten: number;
 }
 
+export const CLOUD_DOC_CHAT_CITATION_PATTERN = '[CloudDoc: <name> | id=<docId>]' as const;
+
 export function sanitizeCloudDocQuoteName(raw: string): string {
   const cleaned = raw
     .replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ')
@@ -508,6 +510,10 @@ export function sanitizeCloudDocQuoteName(raw: string): string {
 
 export function sanitizeCloudDocCitationId(raw: string): string {
   return raw.replace(/[\r\n\t\x00-\x1f\x7f]/g, '').trim();
+}
+
+export function isCloudDocRecordId(id: string | null | undefined): id is string {
+  return typeof id === 'string' && /^cdoc_[A-Za-z0-9_-]{4,}$/.test(id.trim());
 }
 
 /**

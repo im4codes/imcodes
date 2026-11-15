@@ -162,14 +162,13 @@ describe('imcodes cloud-docs CLI', () => {
     expect(idx.stdout).toContain(canonicalPattern);
     expect(idx.stdout).toContain('id=<docId>');
 
-    for (const topic of ['quickstart', 'docx', 'xlsx', 'pptx', 'edit', 'convert', 'share', 'troubleshooting', 'all']) {
+    for (const topic of ['index', 'quickstart', 'docx', 'xlsx', 'pptx', 'edit', 'convert', 'share', 'troubleshooting', 'all']) {
       const res = await runCloudDocsCli(['docs', '--topic', topic], { env: {} });
       expect(res.exitCode).toBe(0);
       expect(res.stdout.length).toBeGreaterThan(100);
-      if (topic === 'quickstart' || topic === 'edit' || topic === 'share' || topic === 'all') {
-        expect(res.stdout).toContain(canonicalPattern);
-        expect(res.stdout).toContain('id=<docId>');
-      }
+      expect(res.stdout).toContain(canonicalPattern);
+      expect(res.stdout).toContain('id=<docId>');
+      expect(res.stdout).toMatch(/EVERY reply turn and EVERY mention/i);
     }
 
     const docxJson = await runCloudDocsCli(['docs', 'docx', '--json'], { env: {} });
@@ -1019,6 +1018,7 @@ describe('imcodes cloud-docs CLI', () => {
             items: [
               { id: 'rec_1', title: 'Recent Sheet.xlsx', sourceKind: 'cloud_doc', cloudDocId: 'cdoc_recent_1', updatedAt: 10 },
               { id: 'rec_2', title: 'local-only.log', filePath: '/tmp/local-only.log', sourceKind: 'server_file', updatedAt: 9 },
+              { id: 'rec_3', title: 'orphan-recent.xlsx', sourceKind: 'cloud_doc', cloudDocId: null, updatedAt: 8 },
             ],
           },
         };
@@ -1032,8 +1032,10 @@ describe('imcodes cloud-docs CLI', () => {
     expect(listRes.stdout).toContain('[CloudDoc: Recent Sheet.xlsx | id=cdoc_recent_1]');
     expect(listRes.stdout).toContain('Work Folder [cfld_folder_1]');
     expect(listRes.stdout).not.toContain('[CloudDoc: Work Folder');
+    expect(listRes.stdout).not.toContain('id=rec_3');
     expect(listRes.stdout).not.toContain('无标题表格.xlsx (id=');
     expect(listRes.stdout).toContain('/tmp/local-only.log (server_file');
+    expect(listRes.stdout).toContain('orphan-recent.xlsx (cloud_doc, recentId=rec_3)');
 
     // 2. edit --name rename: both text output and JSON data.citation use the latest renamed name with the same id.
     responder = () => ({

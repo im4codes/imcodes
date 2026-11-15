@@ -1,5 +1,6 @@
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from './agent-types.js';
 import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
+import { CLOUD_DOC_CHAT_CITATION_PATTERN } from './cloud-docs.js';
 
 /** Canonical shared contract for every IM.codes MCP-consuming runtime. */
 export const MCP_TOOL_DISTRIBUTION_CONTRACT_VERSION = 1 as const;
@@ -106,6 +107,9 @@ export const MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS = [
   'For Cloud Docs, 云文档, cloud doc, ONLYOFFICE, DocBuilder, or shared collaborative document tasks, never infer unavailability from the initial callable list: search "cloud doc", "云文档", or exact group "group:cloud-docs" via mcp_tool_search to publish cloud_docs (executes the unified imcodes cloud-docs CLI; start with `["list"]`, `["read","<docId>"]`, or `["docs"]`, and load detailed topics on demand with `["docs","--topic","quickstart|docx|xlsx|pptx|edit|convert|share|troubleshooting"]`, or pass fallbackCall { name: "cloud_docs", arguments }); in EVERY chat reply turn (including turn 2+, follow-ups, and after rename/edit) and EVERY mention within a reply, always cite `[CloudDoc: <name> | id=<docId>]` with the latest filename and `id=<docId>` (never drop `id=<docId>` on repeated mentions, and never output a bare filename, `` `<name>` ``, `<name> (id=...)`, or local Markdown link `[<name>](/path)`).',
   'Unknown or unregistered names, caller-supplied schemas, wildcard/prefix fallback, and full long-tail publication must fail closed.',
 ].join(' ');
+
+export const MEMORY_MCP_SERVER_INSTRUCTIONS =
+  `Cloud Docs (\`cdoc_*\`): in EVERY turn and EVERY mention (including renames and repeats), cite \`${CLOUD_DOC_CHAT_CITATION_PATTERN}\`; never write bare/backticked filenames, split \`name (id=...)\`, or \`[name](/path)\`.`;
 
 export const MCP_TOOL_DISCOVERY_DESCRIPTION =
   'Use mcp_tool_search for one exact IM.codes tool/group. All are backend-active. After list_changed refetch every tools/list page; if the target stays absent, call again with exact fallbackCall { name, arguments }.';
