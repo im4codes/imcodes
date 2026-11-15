@@ -1357,17 +1357,17 @@ describe('OfficePreview fallback document transitions', () => {
                 scriptUrl: 'https://im.example.com/onlyoffice/web-apps/apps/api/documents/api.js',
                 docToken: 'doc_tok_mobile',
                 config: {
-                  type: url.includes('mobile=1') && isView ? 'mobile' : 'desktop',
-                  documentType: 'cell',
+                  type: 'desktop',
+                  documentType: url.includes('.pdf') ? 'pdf' : 'cell',
                   document: {
-                    fileType: 'xlsx',
+                    fileType: url.includes('.pdf') ? 'pdf' : 'xlsx',
                     key: `k_${requestedUrls.length}`,
-                    title: 'budget.xlsx',
+                    title: url.includes('.pdf') ? 'spec.pdf' : 'budget.xlsx',
                     url: 'https://im.example.com/api/onlyoffice/file/doc_tok_mobile',
-                    permissions: { edit: !isView, download: true },
+                    permissions: { edit: !isView && !url.includes('.pdf'), download: true },
                   },
                   editorConfig: {
-                    mode: isView ? 'view' : 'edit',
+                    mode: isView || url.includes('.pdf') ? 'view' : 'edit',
                     callbackUrl: 'https://im.example.com/api/onlyoffice/callback/doc_tok_mobile',
                     lang: 'en',
                     user: { id: 'u1', name: 'Alice' },
@@ -1384,7 +1384,7 @@ describe('OfficePreview fallback document transitions', () => {
       const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
 
       const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-      // 1. Mobile viewport (375px) + Cloud Doc -> sends mobile=1 and sets has-mode-toggle when editor
+      // 1. Mobile viewport (375px) + Cloud Doc -> defaults to mode=edit, sends mobile=1, bounds wrapper height, and sets has-mode-toggle when editor
       setViewport(375);
       const mobileCloud = render(
         <OfficePreview
@@ -1396,7 +1396,14 @@ describe('OfficePreview fallback document transitions', () => {
       );
       await waitFor(() => expect(mobileCloud.getByTestId('onlyoffice-toolbar')).toBeTruthy());
       expect(requestedUrls[0]).toContain('/api/cloud-docs/cd-1/onlyoffice/config');
+      expect(requestedUrls[0]).toContain('mode=edit');
       expect(requestedUrls[0]).toContain('mobile=1');
+      const mobileWrapper = mobileCloud.getByTestId('onlyoffice-embedded-wrapper') as HTMLElement;
+      expect(mobileWrapper.style.minHeight).toBe('0px');
+      expect(mobileWrapper.style.overflow).toBe('hidden');
+      const mobileEditorWrap = mobileWrapper.querySelector('.office-preview-editor-wrap') as HTMLElement;
+      expect(mobileEditorWrap.style.minHeight).toBe('0px');
+      expect(mobileEditorWrap.style.overflow).toBe('hidden');
       expect(mobileCloud.getByTestId('onlyoffice-toolbar').classList.contains('has-mode-toggle')).toBe(true);
       expect(mobileCloud.getByTestId('onlyoffice-mode-view')).toBeTruthy();
       expect(mobileCloud.getByTestId('onlyoffice-mode-edit')).toBeTruthy();
@@ -1406,7 +1413,7 @@ describe('OfficePreview fallback document transitions', () => {
       expect(mobileCloud.getByTestId('onlyoffice-fullscreen-btn')).toBeTruthy();
       mobileCloud.unmount();
 
-      // 2. Mobile viewport (375px) + server file read-only viewer -> sends mobile=1 and omits has-mode-toggle so read-only pill stays visible
+      // 2. Mobile viewport (375px) + server file read-only viewer -> sends mobile=1 and mode=view, omits has-mode-toggle so read-only pill stays visible
       roleState.role = 'viewer';
       const mobileServerViewer = render(
         <OfficePreview
@@ -1418,11 +1425,26 @@ describe('OfficePreview fallback document transitions', () => {
       );
       await waitFor(() => expect(mobileServerViewer.getByTestId('onlyoffice-toolbar')).toBeTruthy());
       expect(requestedUrls[1]).toContain('/api/server/srv-1/onlyoffice/config');
+      expect(requestedUrls[1]).toContain('mode=view');
       expect(requestedUrls[1]).toContain('mobile=1');
       expect(mobileServerViewer.getByTestId('onlyoffice-toolbar').classList.contains('has-mode-toggle')).toBe(false);
       mobileServerViewer.unmount();
 
-      // 3. Desktop viewport (1280px) -> does NOT send mobile=1
+      // 3. Mobile viewport (375px) + PDF -> stays read-only (no mode toggle) even if role is editor
+      roleState.role = 'editor';
+      const mobilePdfViewer = render(
+        <OfficePreview
+          serverId="srv-1"
+          mimeType="application/pdf"
+          path="/shared/spec.pdf"
+        />,
+      );
+      await waitFor(() => expect(mobilePdfViewer.getByTestId('onlyoffice-toolbar')).toBeTruthy());
+      expect(requestedUrls[2]).toContain('mobile=1');
+      expect(mobilePdfViewer.getByTestId('onlyoffice-toolbar').classList.contains('has-mode-toggle')).toBe(false);
+      mobilePdfViewer.unmount();
+
+      // 4. Desktop viewport (1280px) -> does NOT send mobile=1
       roleState.role = 'editor';
       setViewport(1280);
       const desktopView = render(
@@ -1433,8 +1455,8 @@ describe('OfficePreview fallback document transitions', () => {
         />,
       );
       await waitFor(() => expect(desktopView.getByTestId('onlyoffice-toolbar')).toBeTruthy());
-      expect(requestedUrls[2]).toContain('/api/server/srv-1/onlyoffice/config');
-      expect(requestedUrls[2]).not.toContain('mobile=1');
+      expect(requestedUrls[3]).toContain('/api/server/srv-1/onlyoffice/config');
+      expect(requestedUrls[3]).not.toContain('mobile=1');
       desktopView.unmount();
     } finally {
       Object.defineProperty(window, 'innerWidth', {

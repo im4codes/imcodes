@@ -10836,7 +10836,8 @@ html.mobile-nav-gesture-active .chat-view * {
   .fb-breadcrumb-seg { max-width: 11ch; }
   .fb-breadcrumb-seg.active { max-width: 16ch; }
   .fb-body-split > .fb-tree { display: none; }
-  .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-preview-z); background: #0f172a; display: flex; flex-direction: column; width: var(--imcodes-ui-vw, 100%); height: var(--vvh, var(--imcodes-ui-dvh)); }
+  .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-preview-z); background: #0f172a; display: flex; flex-direction: column; width: var(--imcodes-ui-vw, 100%); height: var(--vvh, var(--imcodes-ui-dvh)); max-height: var(--vvh, var(--imcodes-ui-dvh)); }
+  .fb-body-split .fb-preview:has(.office-preview-embedded) { overflow: hidden; padding-bottom: env(safe-area-inset-bottom, 0px); box-sizing: border-box; }
   .fb-preview-header { flex-wrap: wrap; align-items: center; }
   .fb-body-split .fb-preview > .fb-preview-header { padding-top: calc(7px + var(--sat)); }
   .fb-preview-name { flex: 1 1 120px; }
@@ -19676,6 +19677,7 @@ button.quick-agent-delegation-preset.active {
   border-bottom: 1px solid #1e293b;
   background: #0f172a;
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 
 .cloud-docs-preview-title-wrap {
@@ -19746,11 +19748,24 @@ button.quick-agent-delegation-preset.active {
 }
 
 .cloud-docs-preview-stage {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
   overflow: auto;
   display: flex;
   flex-direction: column;
+}
+
+.cloud-docs-preview-stage:has(> .office-preview-embedded) {
+  overflow: hidden;
+}
+
+.office-preview-editor-wrap > div,
+.office-preview-editor-wrap iframe {
+  width: 100% !important;
+  height: 100% !important;
+  max-height: 100% !important;
+  display: block;
+  border: 0;
 }
 
 .cloud-docs-modal-backdrop {
@@ -20188,13 +20203,26 @@ button.quick-agent-delegation-preset.active {
     flex-shrink: 0;
   }
 
+  .cloud-docs-preview-stage:has(> .office-preview-embedded) {
+    overflow: hidden;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-sizing: border-box;
+  }
+
   .office-preview-embedded {
+    flex: 1 1 0 !important;
+    height: 100% !important;
+    max-height: 100%;
     min-height: 0 !important;
     min-width: 0;
+    overflow: hidden;
   }
 
   .office-preview-editor-wrap {
-    min-height: 240px !important;
+    flex: 1 1 0 !important;
+    min-height: 0 !important;
+    height: 100%;
+    overflow: hidden;
   }
 
   .office-preview-toolbar {
@@ -20337,13 +20365,26 @@ button.quick-agent-delegation-preset.active {
     flex-shrink: 0;
   }
 
+  .cloud-docs-preview-stage:has(> .office-preview-embedded) {
+    overflow: hidden;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-sizing: border-box;
+  }
+
   .office-preview-embedded {
+    flex: 1 1 0 !important;
+    height: 100% !important;
+    max-height: 100%;
     min-height: 0 !important;
     min-width: 0;
+    overflow: hidden;
   }
 
   .office-preview-editor-wrap {
-    min-height: 240px !important;
+    flex: 1 1 0 !important;
+    min-height: 0 !important;
+    height: 100%;
+    overflow: hidden;
   }
 
   .office-preview-toolbar {

@@ -968,12 +968,13 @@ describe('cloud docs & recent documents', () => {
     const aliceRecent = await app.request('/api/recent-documents', { headers: bearerHeader('owner-1') });
     expect(((await aliceRecent.json()) as { items: unknown[] }).items).toHaveLength(0);
 
-    // Bob sees accessible = true
+    // Bob sees accessible = true and live role
     const bobRecent1 = await app.request('/api/recent-documents', { headers: bearerHeader('user-bob') });
-    const body1 = (await bobRecent1.json()) as { items: Array<{ id: string; openCount: number; accessible: boolean; accessReason: string | null }> };
+    const body1 = (await bobRecent1.json()) as { items: Array<{ id: string; openCount: number; accessible: boolean; accessReason: string | null; role?: string }> };
     expect(body1.items).toHaveLength(1);
     expect(body1.items[0]!.openCount).toBe(2);
     expect(body1.items[0]!.accessible).toBe(true);
+    expect(body1.items[0]!.role).toBe('editor');
 
     // 2. Owner removes Bob from team -> real-time access immediately flips accessible=false!
     memDb.teamMembers.delete('team-1:user-bob');
@@ -2371,7 +2372,7 @@ describe('cloud docs & recent documents', () => {
     const desktopClaims = verifyJwt(desktopBody.config.token, ooSecret) as Record<string, unknown>;
     expect(desktopClaims.type).toBeUndefined();
 
-    // 2. Mobile + view
+    // 2. Mobile + view (uses desktop shell with streamlined compact customization instead of broken mobile shell)
     const mobileViewRes = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config?mode=view&mobile=1`, {
       headers: bearerHeader('owner-1'),
     });
@@ -2379,19 +2380,26 @@ describe('cloud docs & recent documents', () => {
     const mobileViewBody = (await mobileViewRes.json()) as {
       config: { type?: string; editorConfig: { mode: string; customization: Record<string, unknown> }; token: string };
     };
-    expect(mobileViewBody.config.type).toBe('mobile');
+    expect(mobileViewBody.config.type).toBe('desktop');
     expect(mobileViewBody.config.editorConfig.mode).toBe('view');
     expect(mobileViewBody.config.editorConfig.customization).toEqual({
       forcesave: true,
       compactHeader: true,
       compactToolbar: true,
-      toolbarHideFileName: true,
+      toolbarNoTabs: true,
+      hideRightMenu: true,
+      hideRulers: true,
+      layout: {
+        leftMenu: false,
+        rightMenu: false,
+      },
       help: false,
       feedback: false,
       chat: false,
+      toolbarHideFileName: true,
     });
     const mobileViewClaims = verifyJwt(mobileViewBody.config.token, ooSecret) as Record<string, unknown>;
-    expect(mobileViewClaims.type).toBe('mobile');
+    expect(mobileViewClaims.type).toBe('desktop');
     expect((mobileViewClaims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
       mobileViewBody.config.editorConfig.customization,
     );

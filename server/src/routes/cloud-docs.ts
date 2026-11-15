@@ -2548,6 +2548,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         accessible: access.allowed,
         serverOnline,
         accessReason,
+        ...(access.allowed && access.role ? { role: access.role } : {}),
       };
     }));
 
@@ -2682,6 +2683,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
           accessible: true,
           serverOnline,
           accessReason: serverOnline ? null : 'server_offline',
+          role: access.role,
         } satisfies RecentDocumentItem,
       });
     }
