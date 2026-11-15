@@ -470,7 +470,41 @@ ${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
     ).jobs['controlled-node-executables'].steps;
     const ciWinStep = ciWinSteps.find((s) => (s.name ?? '').includes('Windows Inno Setup'));
     expect(ciWinStep?.run).toContain('--require-iscc');
+    expect(ciWinStep?.run).toContain('--runtime-dir');
+    expect(ciWinStep?.run).toContain('daemon-runtime-stage');
+    expect(ciWinStep?.run).not.toContain('--runtime-archive');
     expect(readFileSync('.dockerignore', 'utf8')).toContain('server/controlled-node-artifacts/installers');
+  });
+
+  it('consumes a retained staged --runtime-dir via CLI args without requiring or extracting a zip archive', async () => {
+    const root = makeTempDir();
+    const stageRoot = createFakeRuntimeDir(root, 'win32', '0.9.6');
+    writeFileSync(join(stageRoot, 'daemon-runtime.files.json'), JSON.stringify({ target: 'win32-x64', files: [] }));
+    const fakeExe = join(root, 'imcodes-node.exe');
+    writeFileSync(fakeExe, 'MZ-fake');
+    const outDir = join(root, 'win-out-cli');
+    const workDir = join(root, 'win-work-cli');
+
+    const { buildWindowsInstaller, parseCliArgs } = await import('../../scripts/build-windows-installer.mjs');
+    const parsed = parseCliArgs([
+      '--version',
+      '0.9.6',
+      '--runtime-dir',
+      stageRoot,
+      '--node-exe',
+      fakeExe,
+      '--out-dir',
+      outDir,
+    ]);
+    expect(parsed.runtimeDir).toBe(stageRoot);
+    expect(parsed.runtimeArchive).toBeUndefined();
+
+    const res = await buildWindowsInstaller({ ...parsed, workDir });
+    const stagedRuntimeDir = join(workDir, 'stage', 'daemon-runtime');
+    expect(existsSync(join(stagedRuntimeDir, 'node.exe'))).toBe(true);
+    expect(existsSync(join(stagedRuntimeDir, 'package', 'dist', 'src', 'index.js'))).toBe(true);
+    expect(existsSync(join(stagedRuntimeDir, 'daemon-runtime.files.json'))).toBe(true);
+    expect(readFileSync(res.issPath, 'utf8')).toContain('daemon-runtime');
   });
 
   it('embeds self-contained preinst in .deb and cleans up offline .sh extraction TMPDIR (F1, F9)', async () => {
