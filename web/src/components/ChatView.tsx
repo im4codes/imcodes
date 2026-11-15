@@ -111,6 +111,7 @@ import {
 } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { scaledCssFontPx, CHAT_FONT_SIZE_VAR } from '../global-font.js';
+const CHAT_FONT_FAMILY_VAR = '--imcodes-chat-font-family';
 import { shouldUseIosMacTextScale } from '../native-platform.js';
 import { subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
@@ -4661,6 +4662,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         fontSize: scaledChatFontSize,
         fontFamily: chatFontPrefs.family,
         [CHAT_FONT_SIZE_VAR]: scaledChatFontSize,
+        [CHAT_FONT_FAMILY_VAR]: chatFontPrefs.family,
       } as h.JSX.CSSProperties)
     : undefined;
   const historySteps = useMemo(() => {
@@ -5079,7 +5081,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             if (item.type === 'tool-activity') {
-              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} chatFontSize={!preview ? scaledChatFontSize : undefined} chatFontFamily={!preview ? chatFontPrefs.family : undefined} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
@@ -5560,6 +5562,8 @@ function ToolActivityPeek({
   duration,
   startTime,
   chatContainerRect,
+  chatFontSize,
+  chatFontFamily,
 }: {
   anchor: DOMRect;
   peekId: string;
@@ -5572,6 +5576,8 @@ function ToolActivityPeek({
   duration: string | null;
   startTime?: string | null;
   chatContainerRect?: DOMRect | null;
+  chatFontSize?: string;
+  chatFontFamily?: string;
 }) {
   const { t } = useTranslation();
   if (typeof document === 'undefined') return null;
@@ -5632,7 +5638,7 @@ function ToolActivityPeek({
     <div
       id={peekId}
       class={`chat-tool-peek${running ? ' is-running' : ''}${failed ? ' is-failed' : ''}`}
-      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
+      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position, [CHAT_FONT_SIZE_VAR]: chatFontSize, [CHAT_FONT_FAMILY_VAR]: chatFontFamily }}
       role="tooltip"
     >
       <div class="chat-tool-peek-frame" aria-hidden="true" />
@@ -5678,6 +5684,8 @@ function ToolActivitySummary({
   onImagePreview,
   onOpenLocalWebPreview,
   serverId,
+  chatFontSize,
+  chatFontFamily,
 }: {
   events: TimelineEvent[];
   visible?: boolean;
@@ -5689,6 +5697,8 @@ function ToolActivitySummary({
   onImagePreview?: ChatLocalImagePreviewLoader;
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
+  chatFontSize?: string;
+  chatFontFamily?: string;
 }) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -5840,6 +5850,8 @@ function ToolActivitySummary({
           startTime={lastStartTime}
           duration={lastDuration}
           chatContainerRect={chatContainerRect}
+          chatFontSize={chatFontSize}
+          chatFontFamily={chatFontFamily}
         />
       )}
       <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>

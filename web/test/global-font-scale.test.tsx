@@ -210,8 +210,13 @@ describe('global font scaling', () => {
     expect(output).toContain('.label-short-rem { font-size: max(8px, calc(.75rem + var(--imcodes-global-font-delta, 0px))); }');
     expect(output).toContain('.inherit-node { font-size: inherit; }');
     expect(output).toContain('.watermark { font-size: clamp(max(8px, calc(42px + var(--imcodes-global-font-delta, 0px))), calc(6.2vw + var(--imcodes-global-font-delta, 0px)), max(8px, calc(76px + var(--imcodes-global-font-delta, 0px)))); }');
-    expect(output).toContain('.native-chat { font-size: var(--imcodes-chat-font-size, max(8px, calc(16px + var(--imcodes-global-font-delta, 0px)))); }');
+    expect(output).toContain('.native-chat { font-size: var(--imcodes-chat-font-size, 16px); }');
     expect(output).toContain('.already { font-size: max(8px, calc(14px + var(--imcodes-global-font-delta, 0px))); }');
+  });
+
+  it('preserves chat font variable arithmetic during global CSS transformation', () => {
+    const input = '.chat-tool-input { font-size: max(8px, calc(var(--imcodes-chat-font-size, 16px) - 1px)); }';
+    expect(transformCssFontSizes(input)).toBe(input);
   });
 
   it('transforms all rem and px selectors in src/styles.css including cron labels and reflects +/-1 root delta', () => {
@@ -222,6 +227,8 @@ describe('global font scaling', () => {
     expect(transformed).toMatch(/\.chat-cron-run-detail-row\s*\{[^}]*font-size:\s*[^;]*max\(8px,\s*calc\(0\.78rem \+ var\(--imcodes-global-font-delta, 0px\)\)\)/);
     expect(transformed).toMatch(/\.chat-cron-run-contract\s*\{[^}]*font-size:\s*max\(8px,\s*calc\(0\.75rem \+ var\(--imcodes-global-font-delta, 0px\)\)\)/);
     expect(transformed).toMatch(/\.chat-cron-run-task-label\s*\{[^}]*font-size:\s*max\(8px,\s*calc\(0\.78rem \+ var\(--imcodes-global-font-delta, 0px\)\)\)/);
+    expect(transformed).toContain('font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 1px));');
+    expect(transformed).toContain('max-height: max(55px, 4.2em);');
 
     // Every non-em, non-inherit font-size in styles.css must carry either --imcodes-global-font-delta or --imcodes-chat-font-size
     const unscaledAbsoluteDeclarations: string[] = [];

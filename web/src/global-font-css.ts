@@ -16,7 +16,7 @@ export function scaledCssFontPx(px: number): string {
 }
 
 export function scaleFontSizeCssValue(rawValue: string): string {
-  if (rawValue.includes(GLOBAL_FONT_DELTA_VAR)) return rawValue;
+  if (rawValue.includes(GLOBAL_FONT_DELTA_VAR) || rawValue.includes(CHAT_FONT_SIZE_VAR)) return rawValue;
 
   let next = rawValue.replace(CSS_COMMENT_OR_LENGTH_RE, (full, comment: string | undefined, lengthToken: string | undefined) => {
     if (comment) return comment;

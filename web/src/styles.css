@@ -22279,3 +22279,119 @@ html.native-mac-desktop .remote-desktop-window-blocked {
     line-height: 1.45;
   }
 }
+
+/* Chat typography follows the Aa chat preference, including event cards and
+   portalled tool previews. Preview cards intentionally keep their compact
+   inherited sizing. */
+.chat-view:not(.chat-view-preview) [class*="chat-"],
+.chat-view:not(.chat-view-preview) [class*="delegation-"],
+.chat-view:not(.chat-view-preview) [class*="peer-audit"] {
+  font-family: var(--imcodes-chat-font-family, var(--imcodes-app-font-family, ui-monospace, monospace));
+}
+.chat-tool-peek {
+  font-family: var(--imcodes-chat-font-family, var(--imcodes-app-font-family, ui-monospace, monospace));
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 2px));
+}
+.chat-tool-peek * {
+  font-family: var(--imcodes-chat-font-family, var(--imcodes-app-font-family, ui-monospace, monospace));
+}
+.chat-tool-peek-status,
+.chat-tool-peek-start-time,
+.chat-tool-peek-label {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 3px));
+}
+.chat-view:not(.chat-view-preview) .chat-tool,
+.chat-view:not(.chat-view-preview) .chat-tool-icon,
+.chat-view:not(.chat-view-preview) .chat-tool-name,
+.chat-view:not(.chat-view-preview) .chat-tool-input,
+.chat-view:not(.chat-view-preview) .chat-tool-chooser-title,
+.chat-view:not(.chat-view-preview) .chat-tool-chooser-btn-label,
+.chat-view:not(.chat-view-preview) .chat-code-block pre,
+.chat-view:not(.chat-view-preview) .chat-code-lang,
+.chat-view:not(.chat-view-preview) .chat-file-change-title,
+.chat-view:not(.chat-view-preview) .chat-file-change-path,
+.chat-view:not(.chat-view-preview) .chat-tool-chooser-title,
+.chat-view:not(.chat-view-preview) .chat-tool-chooser-btn-label,
+.chat-view:not(.chat-view-preview) .chat-memory-context-title,
+.chat-view:not(.chat-view-preview) .chat-memory-context-item-summary,
+.chat-view:not(.chat-view-preview) .chat-memory-context-status-title,
+.chat-view:not(.chat-view-preview) .chat-memory-context-status-summary,
+.chat-view:not(.chat-view-preview) .chat-thinking-bar,
+.chat-view:not(.chat-view-preview) .chat-thinking-toggle,
+.chat-view:not(.chat-view-preview) .chat-thinking-label {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 1px));
+}
+.chat-view:not(.chat-view-preview) [class*="chat-tool-"],
+.chat-view:not(.chat-view-preview) [class*="chat-file-change-"],
+.chat-view:not(.chat-view-preview) [class*="chat-memory-context-"],
+.chat-view:not(.chat-view-preview) [class*="chat-cron-run-"],
+.chat-view:not(.chat-view-preview) [class*="chat-supervision-"] {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 2px));
+}
+.chat-view:not(.chat-view-preview) .chat-tool-activity,
+.chat-view:not(.chat-view-preview) .chat-tool-activity *,
+.chat-view:not(.chat-view-preview) .chat-tool-peek-status,
+.chat-view:not(.chat-view-preview) .chat-tool-peek-start-time,
+.chat-view:not(.chat-view-preview) .chat-file-change-chip,
+.chat-view:not(.chat-view-preview) .chat-memory-context-chip {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 3px));
+}
+.chat-view:not(.chat-view-preview) .chat-file-change-title,
+.chat-view:not(.chat-view-preview) .chat-file-change-path,
+.chat-view:not(.chat-view-preview) .chat-memory-context-title,
+.chat-view:not(.chat-view-preview) .chat-memory-context-item-summary,
+.chat-view:not(.chat-view-preview) .chat-memory-context-status-title,
+.chat-view:not(.chat-view-preview) .chat-memory-context-status-summary,
+.chat-view:not(.chat-view-preview) .chat-cron-run-task-label {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 1px));
+}
+.chat-view:not(.chat-view-preview) .chat-tool-fold-btn,
+.chat-view:not(.chat-view-preview) .chat-tool-fold-inline,
+.chat-view:not(.chat-view-preview) .chat-tool-fold-collapse,
+.chat-view:not(.chat-view-preview) .chat-tool-detail-summary,
+.chat-view:not(.chat-view-preview) .chat-tool-detail-label,
+.chat-view:not(.chat-view-preview) .chat-tool-detail-pre,
+.chat-view:not(.chat-view-preview) .chat-file-change-diff-pre,
+.chat-view:not(.chat-view-preview) .chat-file-change-coarse-text,
+.chat-view:not(.chat-view-preview) .chat-memory-context-summary,
+.chat-view:not(.chat-view-preview) .chat-memory-context-query,
+.chat-view:not(.chat-view-preview) .chat-memory-context-section-title,
+.chat-view:not(.chat-view-preview) .chat-memory-context-status-detail,
+.chat-view:not(.chat-view-preview) .chat-system,
+.chat-view:not(.chat-view-preview) .chat-mode,
+.chat-view:not(.chat-view-preview) .chat-bubble-time,
+.chat-view:not(.chat-view-preview) .chat-user-status,
+.chat-view:not(.chat-view-preview) [class*="chat-cron-run-"] {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 2px));
+}
+.chat-view:not(.chat-view-preview) .chat-execution-status-chip,
+.chat-view:not(.chat-view-preview) .chat-supervision-prompt-toggle,
+.chat-view:not(.chat-view-preview) .chat-supervision-prompt-details,
+.chat-view:not(.chat-view-preview) .chat-supervision-status-run-toggle,
+.chat-view:not(.chat-view-preview) .chat-file-change-chip,
+.chat-view:not(.chat-view-preview) .chat-memory-context-chip {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 3px));
+}
+.chat-view:not(.chat-view-preview) .chat-tool-state,
+.chat-view:not(.chat-view-preview) .chat-tool-result-preview,
+.chat-view:not(.chat-view-preview) .chat-tool-detail,
+.chat-view:not(.chat-view-preview) .chat-tool-fold,
+.chat-view:not(.chat-view-preview) .chat-file-change-diff-pre,
+.chat-view:not(.chat-view-preview) .chat-memory-context,
+.chat-view:not(.chat-view-preview) .chat-system,
+.chat-view:not(.chat-view-preview) .chat-mode,
+.chat-view:not(.chat-view-preview) .chat-supervision-prompt-details,
+.chat-view:not(.chat-view-preview) .chat-cron-run,
+.chat-view:not(.chat-view-preview) [class*="delegation-"],
+.chat-view:not(.chat-view-preview) [class*="peer-audit"] {
+  font-size: max(8px, calc(var(--imcodes-chat-font-size, 14px) - 2px));
+}
+.chat-tool-activity {
+  min-height: 26px;
+  height: auto;
+  padding: 4px 7px;
+}
+.chat-tool-activity-total { min-height: 16px; height: auto; }
+.chat-tool-block-fold.is-collapsed .chat-tool-block-fold-content {
+  max-height: max(55px, 4.2em);
+}
