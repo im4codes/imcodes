@@ -1,4 +1,7 @@
 import { beginDownloadTransfer, reportR2Preparation, completeDownloadTransfer, failDownloadTransfer } from './download-transfer-store.js';
+// background-transfer-keepalive.ts has zero top-level @capacitor/core imports (preserve globalThis.Capacitor)
+// and keeps uploadFile synchronous on tick 0 so XHR + AbortSignal initialize before returning.
+import { withBackgroundTransferKeepAlive } from './background-transfer-keepalive.js';
 import {
   createUploadLifecycleRecoveryState,
   getUploadBackgroundEpoch,
@@ -2120,9 +2123,6 @@ export async function uploadFile(
   sessionName?: string,
   destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
-  // background-transfer-keepalive.ts imports @capacitor/core, which overwrites globalThis.Capacitor on module load
-  // (breaking embedding shells and test stubs if pulled in eagerly by api.ts), so load it only during uploads.
-  const { withBackgroundTransferKeepAlive } = await import('./background-transfer-keepalive.js');
   return withBackgroundTransferKeepAlive(async () => {
     if (isR2RelaySelected() && !destinationDirectory) {
       const relayResult = await tryUploadR2File(serverId, file, onProgress, clientUploadId, signal, sessionName, destinationDirectory);

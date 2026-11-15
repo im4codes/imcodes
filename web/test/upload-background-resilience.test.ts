@@ -16,10 +16,18 @@ vi.mock('@capacitor/core', () => ({
   },
   registerPlugin: (name: string) => {
     capacitorState.registerPluginMock(name);
-    return {
-      start: capacitorState.startMock,
-      stop: capacitorState.stopMock,
+    const impl = {
+      start: (opts?: { title?: string; text?: string }) => capacitorState.startMock(opts),
+      stop: () => capacitorState.stopMock(),
     };
+    return new Proxy(impl, {
+      get(target, prop, receiver) {
+        if (prop === 'then') {
+          throw new Error('Capacitor plugin Proxy .then() must not be probed');
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
   },
 }));
 
@@ -99,6 +107,10 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     FakeXhr.instances = [];
     FakeXhr.handlers = [];
     vi.stubGlobal('XMLHttpRequest', FakeXhr);
+    vi.stubGlobal('Capacitor', {
+      isNativePlatform: () => capacitorState.native,
+      getPlatform: () => capacitorState.platform,
+    });
     setDocumentVisibility('visible');
     const keepalive = await import('../src/background-transfer-keepalive.js');
     keepalive.resetBackgroundTransferKeepAliveForTests();
@@ -115,6 +127,7 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
   it('reference-counts native keepalive start/stop across concurrent Android & iOS transfers', async () => {
     const {
       acquireBackgroundTransferKeepAlive,
+      flushBackgroundTransferKeepAliveForTests,
       getBackgroundTransferKeepAliveCount,
       setBackgroundTransferKeepAliveLabels,
     } = await import('../src/background-transfer-keepalive.js');
@@ -124,6 +137,7 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     const r1 = acquireBackgroundTransferKeepAlive();
     const r2 = acquireBackgroundTransferKeepAlive();
     expect(getBackgroundTransferKeepAliveCount()).toBe(2);
+    await flushBackgroundTransferKeepAliveForTests();
     expect(capacitorState.startMock).toHaveBeenCalledTimes(1);
     expect(capacitorState.startMock).toHaveBeenCalledWith({ title: 'Uploading', text: 'Active' });
 
@@ -131,22 +145,27 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     r1();
     r1(); // idempotent second release must not decrement again
     expect(getBackgroundTransferKeepAliveCount()).toBe(1);
+    await flushBackgroundTransferKeepAliveForTests();
     expect(capacitorState.stopMock).not.toHaveBeenCalled();
 
     r2();
     expect(getBackgroundTransferKeepAliveCount()).toBe(0);
+    await flushBackgroundTransferKeepAliveForTests();
     expect(capacitorState.stopMock).toHaveBeenCalledTimes(1);
 
     // Works on iOS as well
     capacitorState.platform = 'ios';
     const r3 = acquireBackgroundTransferKeepAlive();
+    await flushBackgroundTransferKeepAliveForTests();
     expect(capacitorState.startMock).toHaveBeenCalledTimes(2);
     r3();
+    await flushBackgroundTransferKeepAliveForTests();
     expect(capacitorState.stopMock).toHaveBeenCalledTimes(2);
   });
 
   it('survives 6 consecutive iOS background pauses where XHR error fires AFTER returning to foreground', async () => {
     const { uploadFile } = await import('../src/api.js');
+    const { flushBackgroundTransferKeepAliveForTests } = await import('../src/background-transfer-keepalive.js');
     const { notifyUploadAppStateChange } = await import('../src/upload-suspend-wait.js');
     const file = new File([new Uint8Array(64)], 'ios-large.bin', { type: 'application/octet-stream' });
     const clientUploadId = '11111111-2222-4333-8444-666666666666';
@@ -173,6 +192,8 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     });
 
     const promise = uploadFile('srv-1', file, undefined, clientUploadId);
+    // Tick-0 contract: XHR #1 must be created synchronously before any microtask!
+    expect(FakeXhr.instances).toHaveLength(1);
 
     // Drive timers for the 6 settle pauses (250ms each) without exhausting MAX_ATTEMPTS_WITHOUT_PROGRESS=4
     for (let i = 0; i < 6; i += 1) {
@@ -180,6 +201,7 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     }
 
     const res = await promise;
+    await flushBackgroundTransferKeepAliveForTests();
     expect(res.ok).toBe(true);
     expect(attemptIndex).toBe(7);
     expect(FakeXhr.instances).toHaveLength(7);
@@ -301,7 +323,7 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     expect(getUploadResumeWaiterCountForTests()).toBe(0);
   });
 
-  it('skips FileTransferKeepAlive plugin registration on web and caches lazy registration on native with error cleanup', async () => {
+  it('skips FileTransferKeepAlive plugin registration on web and reconciles sync/in-flight/async release races on native without leaking start', async () => {
     const keepalive = await import('../src/background-transfer-keepalive.js');
     keepalive.resetBackgroundTransferKeepAliveForTests();
     capacitorState.registerPluginMock.mockClear();
@@ -312,18 +334,50 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     const webRelease = keepalive.acquireBackgroundTransferKeepAlive();
     webRelease();
     await keepalive.withBackgroundTransferKeepAlive(async () => 'web-ok');
+    await keepalive.flushBackgroundTransferKeepAliveForTests();
     expect(capacitorState.registerPluginMock).not.toHaveBeenCalled();
     expect(capacitorState.startMock).not.toHaveBeenCalled();
     expect(capacitorState.stopMock).not.toHaveBeenCalled();
 
+    // 1) Immediate same-tick release or synchronous throw must never leave native service started
     capacitorState.native = true;
     capacitorState.platform = 'android';
+    const syncRelease = keepalive.acquireBackgroundTransferKeepAlive();
+    syncRelease();
+    expect(() => keepalive.withBackgroundTransferKeepAlive(() => {
+      throw new Error('sync-boom');
+    })).toThrow('sync-boom');
+    await keepalive.flushBackgroundTransferKeepAliveForTests();
+    expect(keepalive.getBackgroundTransferKeepAliveCount()).toBe(0);
+    expect(capacitorState.startMock).not.toHaveBeenCalled();
+    expect(capacitorState.stopMock).not.toHaveBeenCalled();
+
+    // 2) Async error after keepalive starts cleanly stops native service once
     await expect(keepalive.withBackgroundTransferKeepAlive(async () => {
-      throw new Error('boom');
-    })).rejects.toThrow('boom');
+      await keepalive.flushBackgroundTransferKeepAliveForTests();
+      throw new Error('async-boom');
+    })).rejects.toThrow('async-boom');
+    await keepalive.flushBackgroundTransferKeepAliveForTests();
     expect(capacitorState.registerPluginMock).toHaveBeenCalledTimes(1);
     expect(capacitorState.startMock).toHaveBeenCalledTimes(1);
     expect(capacitorState.stopMock).toHaveBeenCalledTimes(1);
     expect(keepalive.getBackgroundTransferKeepAliveCount()).toBe(0);
+
+    // 3) Release while plugin.start() is still in-flight must immediately stop once start() settles
+    let resolveStart: ((v: { started: boolean }) => void) | null = null;
+    let markStartEntered: (() => void) | null = null;
+    const startEntered = new Promise<void>((resolve) => { markStartEntered = resolve; });
+    capacitorState.startMock.mockImplementationOnce(() => {
+      markStartEntered?.();
+      return new Promise<{ started: boolean }>((resolve) => { resolveStart = resolve; });
+    });
+    const inFlightRelease = keepalive.acquireBackgroundTransferKeepAlive();
+    await startEntered;
+    expect(capacitorState.startMock).toHaveBeenCalledTimes(2);
+    inFlightRelease();
+    expect(keepalive.getBackgroundTransferKeepAliveCount()).toBe(0);
+    resolveStart?.({ started: true });
+    await keepalive.flushBackgroundTransferKeepAliveForTests();
+    expect(capacitorState.stopMock).toHaveBeenCalledTimes(2);
   });
 });
