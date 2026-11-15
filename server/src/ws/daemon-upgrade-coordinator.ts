@@ -426,6 +426,11 @@ export class DaemonUpgradeCoordinator {
     }
   }
 
+  /** Clear any tracked upgrade lifecycle unconditionally (e.g. artifact removed/unbuilt). */
+  clear(): void {
+    this.clearCurrent();
+  }
+
   parseQueuedUpgrade(raw: string): string | null {
     try {
       const parsed = JSON.parse(raw) as { type?: unknown; targetVersion?: unknown };

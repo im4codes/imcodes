@@ -456,6 +456,10 @@ import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
 } from '../../../shared/p2p-workflow-constants.js';
 import { DaemonUpgradeCoordinator, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import {
+  checkControlledNodeUpgradeArtifactAvailability,
+  type ControlledNodeUpgradeArtifactAvailability,
+} from '../services/controlled-node-artifact-catalog.js';
 import type { DaemonUpgradeSource } from '../../../shared/daemon-upgrade.js';
 import {
   DAEMON_AUTH_RECONCILE_BUDGET_MS,
@@ -2284,6 +2288,9 @@ export class WsBridge {
   private daemonVersion: string | null = null;
   private daemonControlledAbiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_ABI_MODERN;
   private daemonControlledOs: ControlledNodeOs | null = null;
+  private daemonControlledArch: string | null = null;
+  private controlledNodeArtifactAvailable = true;
+  private controlledNodeArtifactUnavailableReason: string | null = null;
   /** The authenticated controlled node's public ID (from `servers.node_id`), sent back in its heartbeat acks. */
   private daemonControlledNodeId: ControlledNodeId | null = null;
   private daemonOwnerUserId: string | null = null;
@@ -3169,11 +3176,41 @@ export class WsBridge {
     targetVersion?: string;
     reason?: string;
   } {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      return { status: CONTROLLED_NODE_UPGRADE_STATUS.CURRENT };
+    }
     return {
       status: this.autoUpgradeStatus,
       ...(this.autoUpgradeTargetVersion ? { targetVersion: this.autoUpgradeTargetVersion } : {}),
       ...(this.autoUpgradeReason ? { reason: this.autoUpgradeReason } : {}),
     };
+  }
+
+  /**
+   * Apply verified artifact availability for a controlled node and immediately
+   * clear any stale failed/deferred/available upgrade state if the running
+   * server image intentionally omits that platform's executable bundle.
+   */
+  syncControlledNodeArtifactAvailability(availability: ControlledNodeUpgradeArtifactAvailability): void {
+    this.controlledNodeArtifactAvailable = availability.available;
+    this.controlledNodeArtifactUnavailableReason = availability.available
+      ? null
+      : (availability.reason ?? 'executable_not_built');
+    if (!availability.available && this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      this.clearControlledNodeUnavailableUpgradeState();
+    }
+  }
+
+  private clearControlledNodeUnavailableUpgradeState(): void {
+    this.daemonUpgradeCoordinator.clear();
+    this.resetAutoUpgradeAttempts(null);
+    if (
+      this.autoUpgradeStatus !== CONTROLLED_NODE_UPGRADE_STATUS.CURRENT
+      || this.autoUpgradeTargetVersion !== null
+      || this.autoUpgradeReason !== null
+    ) {
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.CURRENT, null, null);
+    }
   }
 
   getControlledNodeWorkerRefreshStatus(): ControlledNodeWorkerRefreshStatusMessage | null {
@@ -6218,6 +6255,7 @@ export class WsBridge {
           node_role?: string | null;
           revoked_at?: number | null;
           os?: string | null;
+          arch?: string | null;
           node_id?: string | null;
           abi_profile?: unknown;
           owner_status?: string | null;
@@ -6239,11 +6277,17 @@ export class WsBridge {
             node_role?: string | null;
             revoked_at?: number | null;
             os?: string | null;
+            arch?: string | null;
             node_id?: string | null;
             abi_profile?: unknown;
+            owner_status?: string | null;
+            controlled_upgrade_status?: string | null;
+            controlled_upgrade_target_version?: string | null;
+            controlled_upgrade_reason?: string | null;
           }>(
-            `SELECT token_hash, user_id, node_role, revoked_at, os, node_id, abi_profile,
+            `SELECT token_hash, user_id, node_role, revoked_at, os, arch, node_id, abi_profile,
                     (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status,
+                    controlled_upgrade_status, controlled_upgrade_target_version, controlled_upgrade_reason,
                     controlled_worker_refresh_attempt_id, controlled_worker_refresh_phase,
                     controlled_worker_refresh_installed_version, controlled_worker_refresh_target_version,
                     controlled_worker_refresh_artifact_sha256, controlled_worker_refresh_reason,
@@ -6312,6 +6356,15 @@ export class WsBridge {
           && isControlledNodeOs(server.os)
           ? server.os
           : null;
+        this.daemonControlledArch = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+          ? (typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
+            ? msg.runtimeArch
+            : typeof server.arch === 'string' && isControlledNodeArch(server.arch)
+              ? server.arch
+              : null)
+          : null;
+        this.controlledNodeArtifactAvailable = true;
+        this.controlledNodeArtifactUnavailableReason = null;
         this.daemonControlledNodeId = this.daemonNodeRole === NODE_ROLE.CONTROLLED ? parseControlledNodeId(server.node_id) : null;
         const supportsUpgradeBlockedSync = this.daemonNodeRole === NODE_ROLE.FULL
           && msg[DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]
@@ -6427,6 +6480,21 @@ export class WsBridge {
           logLabel: 'Failed to update heartbeat on auth',
         });
         const postAuthTasks: Array<Promise<void>> = [];
+        if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          if (process.env.IMCODES_NODE_EXE_DIR?.trim()) {
+            postAuthTasks.push((async () => {
+              const availability = await checkControlledNodeUpgradeArtifactAvailability({
+                os: this.daemonControlledOs,
+                arch: this.daemonControlledArch,
+                abiProfile: this.daemonControlledAbiProfile,
+              });
+              if (!isCurrentAuthConnection()) return;
+              this.syncControlledNodeArtifactAvailability(availability);
+            })());
+          } else {
+            this.syncControlledNodeArtifactAvailability({ configured: false, available: true });
+          }
+        }
         // Full-daemon-only traffic (memory feature config + user identity) is NOT pushed to a
         // controlled node — it is a restricted presence/exec-result surface (10.2).
         if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && typeof server.user_id === 'string' && server.user_id.trim()) {
@@ -7009,7 +7077,10 @@ export class WsBridge {
         this.daemonP2pWorkflowCapabilities = null;
         this.controlledNodeCapabilities.clear();
         this.daemonControlledOs = null;
+        this.daemonControlledArch = null;
         this.daemonControlledNodeId = null;
+        this.controlledNodeArtifactAvailable = true;
+        this.controlledNodeArtifactUnavailableReason = null;
         this.daemonOwnerUserId = null;
         this.lastCapabilityHeartbeatRefreshAt = 0;
         this.activeCapabilityOperations.clear();
@@ -12136,6 +12207,14 @@ export class WsBridge {
       this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DAEMON_VERSION_UNKNOWN);
       return null;
     }
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      this.clearControlledNodeUnavailableUpgradeState();
+      this.logAutoUpgradeWait(
+        targetVersion,
+        this.controlledNodeArtifactUnavailableReason ?? 'executable_not_built',
+      );
+      return null;
+    }
     this.autoUpgradeTargetVersion = targetVersion;
     if (this.daemonNodeRole === NODE_ROLE.FULL && this.autoUpgradeDisabledOnDaemon
       && isDaemonAutoUpgradeAvailable(this.daemonVersion, targetVersion)) {
@@ -12369,6 +12448,15 @@ export class WsBridge {
     force?: boolean;
     isStillCurrent?: () => boolean;
   } = {}): RequestDaemonUpgradeResult {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      this.clearControlledNodeUnavailableUpgradeState();
+      return {
+        ok: false,
+        ...(typeof input.targetVersion === 'string' && input.targetVersion ? { targetVersion: input.targetVersion } : {}),
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
+        reason: this.controlledNodeArtifactUnavailableReason ?? 'executable_not_built',
+      };
+    }
     this.releaseManualUpgradeSentToEarlierConnection();
     const result = this.daemonUpgradeCoordinator.request({
       targetVersion: input.targetVersion,
@@ -12430,6 +12518,10 @@ export class WsBridge {
   }
 
   private flushPendingDaemonUpgrade(ws: WebSocket): RequestDaemonUpgradeResult | null {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      this.clearControlledNodeUnavailableUpgradeState();
+      return null;
+    }
     const result = this.daemonUpgradeCoordinator.flushPending({
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
@@ -12515,6 +12607,9 @@ export class WsBridge {
   }
 
   private needsLegacyWindowsUpgradeRescue(): boolean {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      return false;
+    }
     return (this.requiresLegacyWindowsUpgradeRescue()
       || this.upgradeLatchRescueRequiredGeneration === this.daemonGeneration)
       && this.legacyUpgradeRescuePreparedGeneration !== this.daemonGeneration;
@@ -12951,8 +13046,11 @@ export class WsBridge {
       this.daemonP2pWorkflowCapabilities = null;
       this.controlledNodeCapabilities.clear();
       this.daemonControlledOs = null;
+      this.daemonControlledArch = null;
       this.daemonControlledNodeId = null;
       this.daemonOwnerUserId = null;
+      this.controlledNodeArtifactAvailable = true;
+      this.controlledNodeArtifactUnavailableReason = null;
       this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
       this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
     }

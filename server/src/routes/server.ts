@@ -20,6 +20,8 @@ import { isSharedOrContributedServer, isWholeServerShareUser } from '../security
 import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { WsBridge } from '../ws/bridge.js';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
+import { checkControlledNodeUpgradeArtifactAvailability } from '../services/controlled-node-artifact-catalog.js';
 import { sha256Hex, randomHex } from '../security/crypto.js';
 import { requireAuth } from '../security/authorization.js';
 import { z } from 'zod';
@@ -448,6 +450,25 @@ serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (!role || role === 'none') {
     return c.json({ error: 'not_found' }, 404);
+  }
+  if (process.env.IMCODES_NODE_EXE_DIR?.trim()) {
+    const srv = await getServerById(c.env.DB, serverId) as (Awaited<ReturnType<typeof getServerById>> & {
+      node_role?: string | null;
+      os?: string | null;
+      arch?: string | null;
+      abi_profile?: unknown;
+    }) | null;
+    if (srv?.node_role === NODE_ROLE.CONTROLLED) {
+      const availability = await checkControlledNodeUpgradeArtifactAvailability({
+        os: srv.os,
+        arch: srv.arch,
+        abiProfile: srv.abi_profile,
+      });
+      WsBridge.find?.(serverId)?.syncControlledNodeArtifactAvailability?.(availability);
+      if (!availability.available) {
+        return c.json({ error: availability.reason ?? 'executable_not_built' }, 409);
+      }
+    }
   }
   // `force` is the operator's explicit "interrupt running work" confirmation
   // (the dialog path). Absent or anything but `true` means an ordinary manual
