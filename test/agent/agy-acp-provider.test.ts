@@ -2537,4 +2537,263 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     const prompts = (await requests()).filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
     expect(prompts).toEqual(['CLEAN_FOREGROUND_A', 'CLEAN_FOREGROUND_B']);
   });
+
+  it('re-confirms target model across syncMetaOnLoaded session/resume after system-prompt refresh or /model switch without reverting to gemini-4-carbon-medium', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_resume_meta_reconfirm';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    const emittedModels: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (sid === id && info.model) emittedModels.push(info.model);
+    });
+    provider.onComplete(done);
+
+    const makePayload = (msg: string, sys: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    const sys1 = '<imcodes-agent-identity>ID_V1</imcodes-agent-identity>';
+    const sys2 = '<imcodes-agent-identity>ID_V2</imcodes-agent-identity>';
+
+    // Turn 1: initial session/new confirms default gemini-4-hydrogen-high over upstream carbon-medium.
+    await provider.send(id, makePayload('turn-1', sys1));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Turn 2: refreshSessionSystemText / updated system prompt triggers syncMetaOnLoaded session/resume
+    // while state.model and state.modelRevision are unchanged.
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-2', sys2));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Turn 3: /model switch (applySessionModel + refreshSessionSystemText, matching TransportSessionRuntime.applyAgentId)
+    // followed by next turn triggering syncMetaOnLoaded session/resume.
+    expect(await provider.applySessionModel(id, 'gemini-4-argon-high')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-3', sys2));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    expect(emittedModels).not.toContain('gemini-4-carbon-medium');
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/resume')).toHaveLength(2);
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+    ]);
+  });
+
+  it('re-issues session/set_model on same-model applySessionModel when confirmedModel drifted to gemini-4-carbon-medium', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_same_model_self_heal';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    const emittedModels: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (sid === id && info.model) emittedModels.push(info.model);
+    });
+    provider.onComplete(done);
+
+    await provider.send(id, 'turn-1');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const conn = (provider as any).connectionForState(state);
+    // Simulate upstream session/resume resetting native model and confirmedModel to carbon-medium
+    // while state.model remains gemini-4-hydrogen-high and state.modelRevision is unchanged.
+    await (provider as any).resumeOrLoadAcpSession(id, state, conn, 'RESUMED_META');
+    expect(state.model).toBe('gemini-4-hydrogen-high');
+    expect(state.confirmedModel).toBe('gemini-4-carbon-medium');
+
+    expect(await provider.applySessionModel(id, 'gemini-4-hydrogen-high')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    expect(state.confirmedModel).toBe('gemini-4-hydrogen-high');
+
+    await provider.send(id, 'turn-2');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    expect(emittedModels).not.toContain('gemini-4-carbon-medium');
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+  });
+
+  it('re-confirms target model after disposeIsolatedSession idle hibernate wakeup and child exit respawn', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_hibernate_reconfirm';
+    await provider.createSession({
+      sessionKey: id,
+      sessionName: id,
+      cwd: process.cwd(),
+      agentId: 'gemini-4-argon-high',
+      fresh: true,
+    });
+    const emittedModels: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((sid, info) => {
+      if (sid === id && info.model) emittedModels.push(info.model);
+    });
+    provider.onComplete(done);
+
+    await provider.send(id, 'before-hibernate');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    const state = (provider as any).sessions.get(id);
+    const savedNativeId = state.acpSessionId;
+    await (provider as any).disposeIsolatedSession(state, { bestEffortCloseSession: true, preserveResumeId: true });
+    expect(state.loaded).toBe(false);
+    expect(state.confirmedModel).toBeUndefined();
+    expect(state.modelApplyRequest).toBeUndefined();
+    expect(state.acpSessionId).toBe(savedNativeId);
+
+    await provider.send(id, 'after-hibernate');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-argon-high');
+
+    // Also verify unexpected child process exit clears confirmedModel & modelApplyRequest and re-confirms on next turn.
+    const child = state.isolatedTransport?.child as import('node:child_process').ChildProcess | null;
+    expect(child).toBeTruthy();
+    child!.kill('SIGKILL');
+    await vi.waitFor(() => expect(state.loaded).toBe(false), { timeout: 5000 });
+    expect(state.confirmedModel).toBeUndefined();
+    expect(state.modelApplyRequest).toBeUndefined();
+
+    await provider.send(id, 'after-child-crash');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-argon-high');
+    expect(emittedModels).not.toContain('gemini-4-carbon-medium');
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+      'gemini-4-argon-high',
+    ]);
+  });
+
+  it('re-confirms model when LoadSessionResponse omits models ({}), createSession rebinds, or recycleSharedAcpServer recycles, while deduplicating concurrent in-flight confirmStrictSessionModel', async () => {
+    const { provider, requests, root, binary } = await setup('resume-empty-metadata', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_empty_resume_and_inflight';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    const done = vi.fn();
+    provider.onComplete(done);
+
+    const makePayload = (msg: string, sys: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    await provider.send(id, makePayload('turn-1', '<imcodes-agent-identity>META_1</imcodes-agent-identity>'));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // session/resume returns {} (missing models.currentModelId): must reset confirmedModel to undefined and re-send session/set_model.
+    provider.refreshSessionSystemText(id);
+    await provider.send(id, makePayload('turn-2', '<imcodes-agent-identity>META_2</imcodes-agent-identity>'));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Re-calling createSession without fresh:true creates loaded:false state and must not inherit stale confirmedModel.
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd() });
+    const reboundState = (provider as any).sessions.get(id);
+    expect(reboundState.loaded).toBe(false);
+    expect(reboundState.confirmedModel).toBeUndefined();
+    expect(reboundState.modelApplyRequest).toBeUndefined();
+
+    await provider.send(id, makePayload('turn-3', '<imcodes-agent-identity>META_2</imcodes-agent-identity>'));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // Concurrent in-flight deduplication: two simultaneous applySessionModel calls while RPC is held share 1 RPC.
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const first = provider.applySessionModel(id, 'gemini-4-argon-high');
+      await vi.waitFor(async () => {
+        const argonCalls = (await requests()).filter((r) => r.method === 'session/set_model' && r.params.modelId === 'gemini-4-argon-high');
+        expect(argonCalls).toHaveLength(1);
+      }, { timeout: 5000 });
+      const second = provider.applySessionModel(id, 'gemini-4-argon-high');
+      await rm(modelHold, { force: true });
+      expect(await Promise.all([first, second])).toEqual([SESSION_MODEL_APPLIED.LIVE, SESSION_MODEL_APPLIED.LIVE]);
+    } finally {
+      await rm(modelHold, { force: true });
+    }
+
+    const reqs = await requests();
+    expect(reqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-argon-high',
+    ]);
+    expect(reqs.filter((r) => r.fixture === 'completed-model').map((r) => r.model)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+
+    // Shared ACP server recycle path: clears confirmedModel & modelApplyRequest and re-confirms on next turn.
+    const sharedLog = path.join(root, 'shared-rpc.jsonl');
+    const sharedProvider = new AgyAcpProvider();
+    (sharedProvider as any).profile = { ...(sharedProvider as any).profile, perSessionTransport: false };
+    resources.push({ provider: sharedProvider, root });
+    await sharedProvider.connect({
+      binaryPath: binary,
+      env: {
+        HOME: root,
+        AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+        AGY_ACP_FIXTURE_LOG: sharedLog,
+        AGY_ACP_FIXTURE_SCENARIO: 'upstream-carbon-default',
+      },
+    });
+    const sharedId = 'deck_test_agy_shared_recycle';
+    const sharedDone = vi.fn();
+    sharedProvider.onComplete(sharedDone);
+    await sharedProvider.createSession({ sessionKey: sharedId, sessionName: sharedId, cwd: process.cwd(), fresh: true });
+    await sharedProvider.send(sharedId, 'shared-1');
+    await vi.waitFor(() => expect(sharedDone).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const sharedState = (sharedProvider as any).sessions.get(sharedId);
+    await (sharedProvider as any).recycleSharedAcpServer('test_recycle');
+    expect(sharedState.loaded).toBe(false);
+    expect(sharedState.confirmedModel).toBeUndefined();
+    expect(sharedState.modelApplyRequest).toBeUndefined();
+
+    await sharedProvider.send(sharedId, 'shared-2');
+    await vi.waitFor(() => expect(sharedDone).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(sharedDone.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    const sharedReqs = (await readFile(sharedLog, 'utf8')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(sharedReqs.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-high',
+    ]);
+  });
 });

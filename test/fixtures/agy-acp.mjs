@@ -20,7 +20,7 @@ const models = scenario === 'legacy-flash-default'
         { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
       ],
     }
-  : scenario === 'upstream-carbon-default'
+  : (scenario === 'upstream-carbon-default' || scenario === 'resume-empty-metadata')
     ? {
         currentModelId: 'gemini-4-carbon-medium',
         availableModels: [
@@ -130,6 +130,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       if (p.sessionId === 'missing-native') return error(req.id, 'Session not found');
       sessions.set(p.sessionId, { pending: [], inputs: [], systemPromptAppend: p?._meta?.antigravity?.systemPrompt?.append });
       if (scenario === 'resume-history') note(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OLD_ERROR from history' } });
+      if (scenario === 'resume-empty-metadata') return ok(req.id, {});
       return ok(req.id, { sessionId: p.sessionId, models });
     }
     case 'session/set_model': {
