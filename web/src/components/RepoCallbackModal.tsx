@@ -1,3 +1,4 @@
+import { createPortal } from 'preact/compat';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { CallbackStatus, CallbackTaskRecord } from '@shared/callback-types.js';
@@ -504,7 +505,7 @@ export function RepoCallbackModal({
     ws.repoCallbackCheckNow?.(projectDir);
   };
 
-  return (
+  const modalOverlay = (
     <div
       role="dialog"
       aria-modal="true"
@@ -518,19 +519,25 @@ export function RepoCallbackModal({
         width: 'var(--imcodes-ui-vw, 100%)',
         height: 'var(--vvh, var(--imcodes-ui-dvh))',
         boxSizing: 'border-box',
-        zIndex: 9000,
+        zIndex: 10000,
         background: 'rgba(2, 6, 23, 0.72)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        padding: 12,
+        paddingTop: 'max(12px, var(--sat, env(safe-area-inset-top, 0px)))',
+        paddingBottom: 'max(12px, var(--sab, env(safe-area-inset-bottom, 0px)))',
+        paddingLeft: 12,
+        paddingRight: 12,
+        overflowX: 'hidden',
       }}
     >
       <div
         style={{
           width: '100%',
           maxWidth: 740,
-          maxHeight: 'calc(var(--imcodes-ui-vh, 100vh) * 0.9)',
+          minWidth: 0,
+          boxSizing: 'border-box',
+          maxHeight: 'min(100%, calc(var(--imcodes-ui-vh, 100vh) * 0.9))',
           display: 'flex',
           flexDirection: 'column',
           background: '#0f172a',
@@ -550,12 +557,13 @@ export function RepoCallbackModal({
             padding: '12px 16px',
             borderBottom: '1px solid #1e293b',
             flexWrap: 'wrap',
+            minWidth: 0,
           }}
         >
-          <span style={{ fontWeight: 600, fontSize: 15, flex: 1 }}>
+          <span style={{ fontWeight: 600, fontSize: 15, flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>
             {t('repo.callback_modal_title')}
           </span>
-          <span style={{ fontSize: 11, color: runtimeEnabled ? '#4ade80' : '#94a3b8' }}>
+          <span style={{ fontSize: 11, color: runtimeEnabled ? '#4ade80' : '#94a3b8', minWidth: 0, overflowWrap: 'anywhere' }}>
             {checking
               ? t('repo.callback_checking')
               : runtimeEnabled
@@ -585,7 +593,7 @@ export function RepoCallbackModal({
         </div>
 
         {/* Body */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', padding: 16, boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: 16 }}>
           {loading && <div style={{ fontSize: 12, color: '#94a3b8' }}>{t('common.loading')}</div>}
 
           {lastError && (
@@ -596,6 +604,8 @@ export function RepoCallbackModal({
               background: 'rgba(127, 29, 29, 0.28)',
               border: '1px solid rgba(239, 68, 68, 0.4)',
               color: '#fecaca',
+              minWidth: 0,
+              overflowWrap: 'anywhere',
             }}>
               {t('repo.callback_last_error', { error: lastError })}
             </div>
@@ -611,6 +621,8 @@ export function RepoCallbackModal({
                 background: feedback.kind === 'error' ? 'rgba(127, 29, 29, 0.28)' : 'rgba(20, 83, 45, 0.28)',
                 border: `1px solid ${feedback.kind === 'error' ? 'rgba(239, 68, 68, 0.4)' : 'rgba(34, 197, 94, 0.4)'}`,
                 color: feedback.kind === 'error' ? '#fecaca' : '#bbf7d0',
+                minWidth: 0,
+                overflowWrap: 'anywhere',
               }}
             >
               {feedback.text}
@@ -626,9 +638,11 @@ export function RepoCallbackModal({
             display: 'flex',
             flexDirection: 'column',
             gap: 10,
+            minWidth: 0,
+            boxSizing: 'border-box',
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 500, cursor: readOnly ? 'default' : 'pointer' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, minWidth: 0 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 500, minWidth: 0, cursor: readOnly ? 'default' : 'pointer' }}>
                 <input
                   type="checkbox"
                   checked={draft.enabled}
@@ -645,14 +659,14 @@ export function RepoCallbackModal({
               )}
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 10 }}>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#cbd5e1' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(210px, 100%), 1fr))', gap: 10, minWidth: 0 }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#cbd5e1', minWidth: 0 }}>
                 <span>{t('repo.callback_interval_label')}</span>
                 <select
                   value={String(draft.intervalMs)}
                   disabled={readOnly}
                   onChange={(e) => setDraft((prev) => ({ ...prev, intervalMs: Number((e.target as HTMLSelectElement).value) }))}
-                  style={{ background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
+                  style={{ width: '100%', minWidth: 0, maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
                 >
                   {REPO_CALLBACK_INTERVAL_PRESETS_MS.map((ms) => (
                     <option key={ms} value={String(ms)}>
@@ -662,7 +676,7 @@ export function RepoCallbackModal({
                 </select>
               </label>
 
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#cbd5e1' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#cbd5e1', minWidth: 0 }}>
                 <span>{t('repo.callback_lookback_label')}</span>
                 <select
                   aria-label={t('repo.callback_lookback_label')}
@@ -674,7 +688,7 @@ export function RepoCallbackModal({
                     );
                     setDraft((prev) => ({ ...prev, lookbackWindow }));
                   }}
-                  style={{ background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
+                  style={{ width: '100%', minWidth: 0, maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
                 >
                   {REPO_CALLBACK_LOOKBACK_WINDOWS.map((win) => (
                     <option key={win} value={win}>
@@ -684,14 +698,14 @@ export function RepoCallbackModal({
                 </select>
               </label>
 
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#cbd5e1' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#cbd5e1', minWidth: 0 }}>
                 <span>{t('repo.callback_target_label')}</span>
                 <select
                   aria-label={t('repo.callback_target_label')}
                   value={draft.target}
                   disabled={readOnly}
                   onChange={(e) => setDraft((prev) => ({ ...prev, target: (e.target as HTMLSelectElement).value }))}
-                  style={{ background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
+                  style={{ width: '100%', minWidth: 0, maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
                 >
                   <option value={REPO_CALLBACK_TARGET_BRAIN}>{t('repo.callback_target_brain')}</option>
                   {targetOptions.map((opt) => (
@@ -705,7 +719,7 @@ export function RepoCallbackModal({
           </div>
 
           {/* Events & Two-Level Prompt Templates */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
               {t('repo.callback_events_title')}
             </div>
@@ -731,10 +745,12 @@ export function RepoCallbackModal({
                     display: 'flex',
                     flexDirection: 'column',
                     gap: 8,
+                    minWidth: 0,
+                    boxSizing: 'border-box',
                   }}
                 >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, fontSize: 13, fontWeight: isCi ? 600 : 500, cursor: readOnly ? 'default' : 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0, fontSize: 13, fontWeight: isCi ? 600 : 500, cursor: readOnly ? 'default' : 'pointer' }}>
                       <input
                         type="checkbox"
                         checked={setting.enabled}
@@ -750,7 +766,7 @@ export function RepoCallbackModal({
                           }));
                         }}
                       />
-                      <span>{eventLabel(eventType)}</span>
+                      <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>{eventLabel(eventType)}</span>
                       {isCi && (
                         <span style={{
                           fontSize: 10,
@@ -776,8 +792,8 @@ export function RepoCallbackModal({
                   </div>
 
                   {isExpanded && (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 6, borderTop: '1px solid rgba(51,65,85,0.45)' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 6, borderTop: '1px solid rgba(51,65,85,0.45)', minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
                         <label style={{ fontSize: 11, color: '#94a3b8' }}>
                           {t('repo.callback_template_label')}
                         </label>
@@ -786,7 +802,7 @@ export function RepoCallbackModal({
                           value={tplKey}
                           disabled={readOnly}
                           onChange={(e) => handleSelectTemplate(eventType, (e.target as HTMLSelectElement).value)}
-                          style={{ flex: 1, minWidth: 160, maxWidth: '100%', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
+                          style={{ flex: 1, minWidth: 'min(160px, 100%)', maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
                         >
                           <option value="default">{t('repo.callback_tpl_source_default')}</option>
                           {eligibleGlobal.map((tpl) => (
@@ -822,6 +838,8 @@ export function RepoCallbackModal({
                         onInput={(e) => handlePromptChange(eventType, (e.target as HTMLTextAreaElement).value)}
                         style={{
                           width: '100%',
+                          minWidth: 0,
+                          maxWidth: '100%',
                           boxSizing: 'border-box',
                           background: '#0f172a',
                           color: '#e2e8f0',
@@ -834,12 +852,12 @@ export function RepoCallbackModal({
                         }}
                       />
 
-                      <div style={{ fontSize: 11, color: '#64748b' }}>
+                      <div style={{ fontSize: 11, color: '#64748b', overflowWrap: 'anywhere' }}>
                         {t('repo.callback_template_vars_hint', { vars: REPO_CALLBACK_TEMPLATE_VARIABLES.join(' ') })}
                       </div>
 
                       {!readOnly && (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 }}>
                           <input
                             type="text"
                             aria-label={t('repo.callback_tpl_name_placeholder')}
@@ -848,7 +866,9 @@ export function RepoCallbackModal({
                             placeholder={t('repo.callback_tpl_name_placeholder')}
                             style={{
                               flex: 1,
-                              minWidth: 150,
+                              minWidth: 'min(150px, 100%)',
+                              maxWidth: '100%',
+                              boxSizing: 'border-box',
                               background: '#0f172a',
                               color: '#e2e8f0',
                               border: '1px solid #334155',
@@ -885,7 +905,7 @@ export function RepoCallbackModal({
           </div>
 
           {!readOnly && (
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', flexWrap: 'wrap', gap: 8 }}>
               <button
                 type="button"
                 class="btn btn-primary btn-sm"
@@ -899,8 +919,8 @@ export function RepoCallbackModal({
           )}
 
           {/* Independent Recent Callbacks List */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid #1e293b', paddingTop: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid #1e293b', paddingTop: 12, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, minWidth: 0 }}>
               <span style={{ fontSize: 12, fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
                 {t('repo.callback_recent_title')} ({filteredCallbacks.length})
               </span>
@@ -934,7 +954,7 @@ export function RepoCallbackModal({
                 {t('repo.callback_recent_empty')}
               </div>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
                 {pagedCallbacks.map((cb) => {
                   const palette = statusColors(cb.status);
                   const safeUrl = getSafeExternalUrl(cb.url);
@@ -955,9 +975,11 @@ export function RepoCallbackModal({
                         display: 'flex',
                         flexDirection: 'column',
                         gap: 4,
+                        minWidth: 0,
+                        boxSizing: 'border-box',
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 }}>
                         <span style={{
                           fontSize: 10,
                           fontWeight: 600,
@@ -969,7 +991,7 @@ export function RepoCallbackModal({
                         }}>
                           {statusLabel(cb.status)}
                         </span>
-                        <code style={{ fontSize: 10, color: '#94a3b8' }}>{cb.eventType}</code>
+                        <code style={{ fontSize: 10, color: '#94a3b8', overflowWrap: 'anywhere' }}>{cb.eventType}</code>
                         {safeUrl ? (
                           <a
                             href={safeUrl}
@@ -984,7 +1006,9 @@ export function RepoCallbackModal({
                               fontWeight: 500,
                               color: '#93c5fd',
                               flex: 1,
-                              minWidth: 140,
+                              minWidth: 'min(140px, 100%)',
+                              maxWidth: '100%',
+                              overflowWrap: 'anywhere',
                               textDecoration: 'underline',
                               cursor: 'pointer',
                             }}
@@ -992,7 +1016,7 @@ export function RepoCallbackModal({
                             {cb.title}
                           </a>
                         ) : (
-                          <span style={{ fontSize: 12, fontWeight: 500, color: '#e2e8f0', flex: 1, minWidth: 140 }}>
+                          <span style={{ fontSize: 12, fontWeight: 500, color: '#e2e8f0', flex: 1, minWidth: 'min(140px, 100%)', maxWidth: '100%', overflowWrap: 'anywhere' }}>
                             {cb.title}
                           </span>
                         )}
@@ -1014,7 +1038,7 @@ export function RepoCallbackModal({
                             {`${t('repo.callback_open_link')} ↗`}
                           </button>
                         )}
-                        <span style={{ fontSize: 10, color: '#64748b' }}>
+                        <span style={{ fontSize: 10, color: '#64748b', overflowWrap: 'anywhere' }}>
                           {cb.targetSession}
                         </span>
                       </div>
@@ -1030,7 +1054,7 @@ export function RepoCallbackModal({
                         </div>
                       )}
                       {(eventTime || triggeredTime || completedTime || cb.relatedTaskId) && (
-                        <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', flexWrap: 'wrap', gap: '4px 12px' }}>
+                        <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', flexWrap: 'wrap', gap: '4px 12px', minWidth: 0, overflowWrap: 'anywhere' }}>
                           {eventTime && (
                             <span>
                               {cb.eventType === 'ci_failed'
@@ -1113,4 +1137,6 @@ export function RepoCallbackModal({
       </div>
     </div>
   );
+
+  return typeof document !== 'undefined' ? createPortal(modalOverlay, document.body) : modalOverlay;
 }

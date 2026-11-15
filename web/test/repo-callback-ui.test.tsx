@@ -258,7 +258,7 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     expect(targetSelect.value).toBe('brain');
 
     // Switch target to sub-session and enable monitoring + pr_new
-    fireEvent.change(targetSelect, { target: { value: 'deck_sub_triage' } });
+    changeSelect(targetSelect, 'deck_sub_triage');
     fireEvent.click(screen.getByLabelText('Enable background repository monitoring'));
     fireEvent.click(screen.getByLabelText('New Pull Request'));
 
@@ -343,9 +343,11 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     const tplSelectB = screen.getByLabelText('New CI failure (Actions / Pipelines) Prompt template') as HTMLSelectElement;
     const globalOption = Array.from(tplSelectB.options).find((o) => o.text.includes('Shared CI Fix'));
     expect(globalOption).toBeTruthy();
-    fireEvent.change(tplSelectB, { target: { value: globalOption!.value } });
-    const promptB = screen.getByLabelText('New CI failure (Actions / Pipelines) Callback prompt') as HTMLTextAreaElement;
-    expect(promptB.value).toContain('Triage CI {{title}}');
+    changeSelect(tplSelectB, globalOption!.value);
+    await waitFor(() => {
+      const promptB = screen.getByLabelText('New CI failure (Actions / Pipelines) Callback prompt') as HTMLTextAreaElement;
+      expect(promptB.value).toContain('Triage CI {{title}}');
+    });
   });
 
   it('F3: preserves edited overrides over selected global/repo templates after save+reload while keeping unedited template references live-updatable', async () => {
@@ -495,6 +497,62 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
       // Monitor from selector should also be present in the settings grid
       const lookbackSelect = screen.getByLabelText('Monitor from') as HTMLSelectElement;
       expect(lookbackSelect.value).toBe('now');
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { value: origInnerWidth, configurable: true, writable: true });
+    }
+  });
+
+  it('portals callback modal to document.body above mobile sidebar drawer and constrains mobile widths/safe-area padding', async () => {
+    const origInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { value: 375, configurable: true, writable: true });
+    try {
+      const ws = createMockWs();
+      render(
+        <div
+          data-testid="mobile-sidebar-drawer-sim"
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            width: '320px',
+            overflow: 'hidden',
+            transform: 'translateX(0)',
+          }}
+        >
+          <RepoPage ws={ws} serverId="srv-1" projectDir="/work/repo-a" />
+        </div>,
+      );
+      await openModalAndAwaitPrefs();
+
+      const drawer = screen.getByTestId('mobile-sidebar-drawer-sim');
+      const dialog = screen.getByRole('dialog');
+      expect(drawer.contains(dialog)).toBe(false);
+      expect(dialog.parentElement).toBe(document.body);
+      expect(Number(dialog.style.zIndex)).toBeGreaterThanOrEqual(10000);
+      expect(dialog.style.overflowX).toBe('hidden');
+      expect(dialog.style.width).toBe('var(--imcodes-ui-vw, 100%)');
+      expect(dialog.style.height).toBe('var(--vvh, var(--imcodes-ui-dvh))');
+      expect(dialog.style.paddingTop).toContain('safe-area-inset-top');
+      expect(dialog.style.paddingBottom).toContain('safe-area-inset-bottom');
+
+      const modalCard = dialog.firstElementChild as HTMLElement | null;
+      expect(modalCard?.style.width).toBe('100%');
+      expect(modalCard?.style.minWidth).toBe('0px');
+      expect(modalCard?.style.boxSizing).toBe('border-box');
+      expect(modalCard?.style.overflow).toBe('hidden');
+
+      const lookbackSelect = screen.getByLabelText('Monitor from') as HTMLSelectElement;
+      expect(lookbackSelect.style.width).toBe('100%');
+      expect(lookbackSelect.style.minWidth).toBe('0px');
+      expect(lookbackSelect.style.maxWidth).toBe('100%');
+
+      const templateSelect = screen.getByLabelText('New CI failure (Actions / Pipelines) Prompt template') as HTMLSelectElement;
+      expect(templateSelect.style.maxWidth).toBe('100%');
+      expect(templateSelect.style.minWidth).toBe('min(160px, 100%)');
+
+      const templateNameInput = screen.getByLabelText('Template name (to save/reuse)') as HTMLInputElement;
+      expect(templateNameInput.style.maxWidth).toBe('100%');
+      expect(templateNameInput.style.minWidth).toBe('min(150px, 100%)');
     } finally {
       Object.defineProperty(window, 'innerWidth', { value: origInnerWidth, configurable: true, writable: true });
     }
