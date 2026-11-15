@@ -887,7 +887,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
-      controlled_node_matrix: ${{ steps.version.outputs.controlled_node_matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -899,16 +898,10 @@ jobs:
           COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
           if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
             APP_VERSION="$(date -u +%Y).$(date -u +%-m).${COMMIT_COUNT}-dev.${GITHUB_RUN_NUMBER}"
-            CONTROLLED_NODE_MATRIX='[{"key":"linux","runner":"ubuntu-latest","artifact":"imcodes-node-linux"},{"key":"macos","runner":"macos-15","artifact":"imcodes-node-macos"}]'
           else
             APP_VERSION="$(date -u +%Y.%-m).${COMMIT_COUNT}"
-            # Windows 2025 no longer includes the WDK/Inf2Cat tool required to
-            # produce the signed IddCx catalog. Keep the release toolchain on
-            # the current GitHub image that publishes WDK 10.1.26100.4202.
-            CONTROLLED_NODE_MATRIX='[{"key":"linux","runner":"ubuntu-latest","artifact":"imcodes-node-linux"},{"key":"macos","runner":"macos-15","artifact":"imcodes-node-macos"},{"key":"windows","runner":"windows-2022","artifact":"imcodes-node.exe"}]'
           fi
           echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "controlled_node_matrix=${CONTROLLED_NODE_MATRIX}" >> "$GITHUB_OUTPUT"
 
   controlled-node-executables:
     name: Controlled Node Executable (${{ matrix.key }})
@@ -922,9 +915,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Skip the slow Windows leg on daily refs/heads/dev pushes while
-        # keeping Linux, macOS, and Windows required on main/master.
-        include: ${{ fromJSON(needs.release_version.outputs.controlled_node_matrix) }}
+        include:
+          - key: linux
+            runner: ubuntu-latest
+            artifact: imcodes-node-linux
+          - key: macos
+            runner: macos-15
+            artifact: imcodes-node-macos
+          - key: windows
+            # Windows 2025 no longer includes the WDK/Inf2Cat tool required to
+            # produce the signed IddCx catalog. Keep the release toolchain on
+            # the current GitHub image that publishes WDK 10.1.26100.4202.
+            runner: windows-2022
+            artifact: imcodes-node.exe
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -1637,15 +1640,9 @@ jobs:
       - name: Verify controlled-node executable set
         env:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
-        run: |
-          set -euo pipefail
-          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
-            node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts \
-              imcodes-node-linux imcodes-node-macos imcodes-node-linux-glibc217
-          else
-            node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts \
-              imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
-          fi
+        run: >-
+          node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts
+          imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
 
       - name: Verify native artifacts came from this exact source revision
         env:
@@ -1653,13 +1650,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.release_version.outputs.app_version }}
         run: |
           set -euo pipefail
-          glibc217_id="$(node -p "require('./shared/controlled-node-abi-profiles.json').GLIBC217.id")"
-          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
-            platforms=(linux macos "$glibc217_id")
-          else
-            platforms=(linux macos windows "$glibc217_id")
-          fi
-          for platform in "${platforms[@]}"; do
+          for platform in linux macos windows "$(node -p "require('./shared/controlled-node-abi-profiles.json').GLIBC217.id")"; do
             marker="server/controlled-node-artifacts/source-commit-${platform}.txt"
             [ -f "$marker" ] || { echo "::error::missing $marker" >&2; exit 1; }
             actual="$(tr -d '\r\n' < "$marker")"
@@ -1708,15 +1699,13 @@ jobs:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF}" != "refs/heads/dev" ]; then
-            node scripts/remote-desktop-worker-artifacts.mjs verify \
-              server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64
-            # The Windows panel window host sidecar (its own manifest, signed exe and third-party notices; the server serves exactly these
-            # three files and answers 404 -- nodes skip -- when they are missing, so a missing one must fail HERE, not in the field).
-            node scripts/aidesk-ui-artifact.mjs verify \
-              server/controlled-node-artifacts/aidesk-local-ui/win32-x64 win32 x64 "$IMCODES_BUILD_VERSION"
-            test -s server/controlled-node-artifacts/aidesk-local-ui/win32-x64/THIRD-PARTY-NOTICES.txt
-          fi
+          node scripts/remote-desktop-worker-artifacts.mjs verify \
+            server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64
+          # The Windows panel window host sidecar (its own manifest, signed exe and third-party notices; the server serves exactly these
+          # three files and answers 404 -- nodes skip -- when they are missing, so a missing one must fail HERE, not in the field).
+          node scripts/aidesk-ui-artifact.mjs verify \
+            server/controlled-node-artifacts/aidesk-local-ui/win32-x64 win32 x64 "$IMCODES_BUILD_VERSION"
+          test -s server/controlled-node-artifacts/aidesk-local-ui/win32-x64/THIRD-PARTY-NOTICES.txt
           for arch in arm64 x64; do
             node scripts/remote-desktop-worker-artifacts.mjs verify \
               server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"
@@ -1732,12 +1721,7 @@ jobs:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
-            targets=(linux-x64 darwin-arm64)
-          else
-            targets=(linux-x64 darwin-arm64 win32-x64)
-          fi
-          for target in "${targets[@]}"; do
+          for target in linux-x64 darwin-arm64 win32-x64; do
             node scripts/daemon-runtime-artifacts.mjs verify \
               "server/controlled-node-artifacts/daemon-runtime/daemon-runtime-${target}.manifest.json" \
               --expected-version "$IMCODES_BUILD_VERSION"
@@ -1752,21 +1736,15 @@ jobs:
             server/controlled-node-artifacts \
             --version "$IMCODES_BUILD_VERSION" \
             --stage-dir dist-controlled-node-release
-          files=(
-            "desktop-release.manifest.json"
-            "desktop-release-linux-x64.manifest.json"
-            "desktop-release-darwin-arm64.manifest.json"
-            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb"
-            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh"
-            "imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg"
-          )
-          if [ "${GITHUB_REF}" != "refs/heads/dev" ]; then
-            files+=(
-              "desktop-release-win32-x64.manifest.json"
-              "imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe"
-            )
-          fi
-          for f in "${files[@]}"; do
+          for f in \
+            "desktop-release.manifest.json" \
+            "desktop-release-linux-x64.manifest.json" \
+            "desktop-release-darwin-arm64.manifest.json" \
+            "desktop-release-win32-x64.manifest.json" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe"; do
             test -s "dist-controlled-node-release/$f"
           done
           test -s "server/controlled-node-artifacts/desktop-release.manifest.json"
@@ -1893,30 +1871,22 @@ jobs:
           # other top-level eval failure surfaces here, before the image ships.
           docker run --rm --entrypoint node imcodes-smoke:test \
             -e "import('./dist/server/src/index.js').then(() => { console.log('OK: image loads cleanly'); process.exit(0); }).catch(e => { console.error('FAIL:', e.message); console.error(e.stack); process.exit(1); })"
-          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
-            docker run --rm --entrypoint node imcodes-smoke:test \
-              scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
-              imcodes-node-linux imcodes-node-macos imcodes-node-linux-glibc217
-          else
-            docker run --rm --entrypoint node imcodes-smoke:test \
-              scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
-              imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
-          fi
+          docker run --rm --entrypoint node imcodes-smoke:test \
+            scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
+            imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
           docker run --rm --entrypoint test imcodes-smoke:test -s /app/controlled-node-executables/release-artifacts-manifest.json
           docker run --rm --entrypoint node imcodes-smoke:test -e \
             "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync('/app/controlled-node-executables/release-provenance.json','utf8')); if(p.sourceCommit!=='${{ github.sha }}'||p.appVersion!=='${{ needs.release_version.outputs.app_version }}') throw new Error('release provenance mismatch'); console.log('release provenance verified:',p.sourceCommit,p.appVersion)"
-          if [ "${GITHUB_REF}" != "refs/heads/dev" ]; then
-            # Every target, named. This verifier defaults to the WINDOWS target
-            # when none is given, so this final gate -- the last check before the
-            # image ships -- passed on an image containing no macOS component set
-            # at all.
-            docker run --rm --entrypoint node imcodes-smoke:test \
-              scripts/remote-desktop-worker-artifacts.mjs verify \
-              /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" win32 x64
-            for f in aidesk-local-ui.exe aidesk-local-ui.manifest.json THIRD-PARTY-NOTICES.txt; do
-              docker run --rm --entrypoint test imcodes-smoke:test -s "/app/controlled-node-executables/aidesk-local-ui/win32-x64/$f"
-            done
-          fi
+          # Every target, named. This verifier defaults to the WINDOWS target
+          # when none is given, so this final gate -- the last check before the
+          # image ships -- passed on an image containing no macOS component set
+          # at all.
+          docker run --rm --entrypoint node imcodes-smoke:test \
+            scripts/remote-desktop-worker-artifacts.mjs verify \
+            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" win32 x64
+          for f in aidesk-local-ui.exe aidesk-local-ui.manifest.json THIRD-PARTY-NOTICES.txt; do
+            docker run --rm --entrypoint test imcodes-smoke:test -s "/app/controlled-node-executables/aidesk-local-ui/win32-x64/$f"
+          done
           for arch in arm64 x64; do
             docker run --rm --entrypoint node imcodes-smoke:test \
               scripts/remote-desktop-worker-artifacts.mjs verify \
@@ -1930,7 +1900,6 @@ jobs:
           docker run --rm \
             -e IMCODES_BUILD_VERSION="${{ needs.release_version.outputs.app_version }}" \
             -e SOURCE_COMMIT="${{ github.sha }}" \
-            -e GITHUB_REF="${GITHUB_REF}" \
             --entrypoint node imcodes-smoke:test -e "
             const fs = require('node:fs');
             const crypto = require('node:crypto');
@@ -1942,9 +1911,7 @@ jobs:
             import('/app/dist/shared/desktop-release-manifest.js').then((mod) => {
               const expectedVer = process.env.IMCODES_BUILD_VERSION;
               const expectedSha = process.env.SOURCE_COMMIT;
-              const targets = process.env.GITHUB_REF === 'refs/heads/dev'
-                ? ['linux-x64', 'darwin-arm64']
-                : ['linux-x64', 'darwin-arm64', 'win32-x64'];
+              const targets = ['linux-x64', 'darwin-arm64', 'win32-x64'];
               for (const t of targets) {
                 const perTarget = mod.validateDesktopReleaseManifest(JSON.parse(fs.readFileSync(path.join(root, 'desktop-release-' + t + '.manifest.json'), 'utf8')));
                 if (perTarget.releaseVersion !== expectedVer || perTarget.gitSha !== expectedSha || !perTarget.targets[t]) {

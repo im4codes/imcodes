@@ -1,12 +1,6 @@
-import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
-// @ts-expect-error ESM script module
-import { generateControlledNodeReleaseManifest } from '../../scripts/generate-controlled-node-manifest.mjs';
 
 describe('controlled-node executable release wiring', () => {
   it('packs the versioned, already-tested npm release before publishing without duplicate lifecycle tests', () => {
@@ -35,7 +29,7 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
     expect(workflow).toContain('remote-desktop-worker-artifacts.mjs verify');
     expect(workflow).toContain('npx tsx scripts/qualify-windows-self-upgrade.ts');
-    expect(workflow).toContain('"runner":"windows-2022"');
+    expect(workflow).toContain('runner: windows-2022');
     expect(workflow).toContain('node scripts/resolve-libwebrtc-sdk-release.mjs');
     expect(workflow).toContain('resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000');
     expect(workflow).toContain('steps.libwebrtc_sdk_cache.outputs.cache-hit');
@@ -98,7 +92,7 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}');
     expect(workflow).toContain('APP_VERSION=${{ needs.release_version.outputs.app_version }}');
-    expect(workflow).toContain('"runner":"macos-15"');
+    expect(workflow).toContain('runner: macos-15');
     const standaloneWorkflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
     expect(standaloneWorkflow).toContain('- os: windows-2022');
     expect(standaloneWorkflow).toContain('node scripts/resolve-libwebrtc-sdk-release.mjs');
@@ -713,168 +707,5 @@ describe('headless compatibility release wiring', () => {
       .split(/\r?\n/u)
       .map((line) => line.trim());
     expect(dockerignore).toContain('server/controlled-node-artifacts/installers');
-  });
-
-  it('skips Windows controlled-node build and Windows docker gates only on refs/heads/dev while keeping main/master strict', () => {
-    const workflow = parseYaml(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
-      jobs: {
-        release_version: {
-          outputs?: Record<string, string>;
-          steps: Array<{ id?: string; run?: string }>;
-        };
-        'controlled-node-executables': {
-          strategy?: { matrix?: { include?: string } };
-        };
-        docker: {
-          steps: Array<{ name?: string; run?: string }>;
-        };
-      };
-    };
-
-    expect(workflow.jobs.release_version.outputs?.controlled_node_matrix)
-      .toBe('${{ steps.version.outputs.controlled_node_matrix }}');
-    expect(workflow.jobs['controlled-node-executables'].strategy?.matrix?.include)
-      .toBe('${{ fromJSON(needs.release_version.outputs.controlled_node_matrix) }}');
-
-    const versionStep = workflow.jobs.release_version.steps.find((s) => s.id === 'version');
-    expect(versionStep?.run).toBeTruthy();
-
-    const tmpRoot = mkdtempSync(join(tmpdir(), 'imcodes-ci-matrix-'));
-    try {
-      const runVersionStep = (ref: string) => {
-        const outFile = join(tmpRoot, `out-${ref.replaceAll('/', '_')}.txt`);
-        writeFileSync(outFile, '');
-        execFileSync('bash', ['--noprofile', '--norc', '-c', versionStep!.run!], {
-          env: {
-            ...process.env,
-            GITHUB_REF: ref,
-            GITHUB_RUN_NUMBER: '42',
-            GITHUB_OUTPUT: outFile,
-          },
-          stdio: 'pipe',
-        });
-        const lines = readFileSync(outFile, 'utf8').trim().split('\n');
-        const matrixLine = lines.find((l) => l.startsWith('controlled_node_matrix='));
-        expect(matrixLine, ref).toBeTruthy();
-        return JSON.parse(matrixLine!.slice('controlled_node_matrix='.length)) as Array<{
-          key: string;
-          runner: string;
-          artifact: string;
-        }>;
-      };
-
-      const devMatrix = runVersionStep('refs/heads/dev');
-      expect(devMatrix).toEqual([
-        { key: 'linux', runner: 'ubuntu-latest', artifact: 'imcodes-node-linux' },
-        { key: 'macos', runner: 'macos-15', artifact: 'imcodes-node-macos' },
-      ]);
-
-      for (const releaseRef of ['refs/heads/main', 'refs/heads/master']) {
-        expect(runVersionStep(releaseRef)).toEqual([
-          { key: 'linux', runner: 'ubuntu-latest', artifact: 'imcodes-node-linux' },
-          { key: 'macos', runner: 'macos-15', artifact: 'imcodes-node-macos' },
-          { key: 'windows', runner: 'windows-2022', artifact: 'imcodes-node.exe' },
-        ]);
-      }
-    } finally {
-      rmSync(tmpRoot, { recursive: true, force: true });
-    }
-
-    const dockerSteps = workflow.jobs.docker.steps;
-    const byName = (name: string) => {
-      const step = dockerSteps.find((s) => s.name === name);
-      expect(step?.run, name).toBeTruthy();
-      return step!.run!;
-    };
-
-    const verifyExeSet = byName('Verify controlled-node executable set');
-    expect(verifyExeSet).toContain('if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then');
-    expect(verifyExeSet).toContain('imcodes-node-linux imcodes-node-macos imcodes-node-linux-glibc217');
-    expect(verifyExeSet).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217');
-
-    const verifyRevision = byName('Verify native artifacts came from this exact source revision');
-    expect(verifyRevision).toContain('platforms=(linux macos "$glibc217_id")');
-    expect(verifyRevision).toContain('platforms=(linux macos windows "$glibc217_id")');
-
-    const verifyWorker = byName('Verify remote-desktop worker artifacts for every target');
-    expect(verifyWorker).toContain('if [ "${GITHUB_REF}" != "refs/heads/dev" ]; then');
-    expect(verifyWorker).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64');
-
-    const verifyDaemonRuntime = byName('Verify daemon-runtime bundles for every desktop target');
-    expect(verifyDaemonRuntime).toContain('targets=(linux-x64 darwin-arm64)');
-    expect(verifyDaemonRuntime).toContain('targets=(linux-x64 darwin-arm64 win32-x64)');
-
-    const stageAssets = byName('Generate controlled-node release artifacts manifest and stage flat release assets');
-    expect(stageAssets).toContain('if [ "${GITHUB_REF}" != "refs/heads/dev" ]; then');
-    expect(stageAssets).toContain('desktop-release-win32-x64.manifest.json');
-    expect(stageAssets).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe');
-
-    const smoke = byName('Container startup smoke test');
-    expect(smoke).toContain('-e GITHUB_REF="${GITHUB_REF}"');
-    expect(smoke).toContain("process.env.GITHUB_REF === 'refs/heads/dev'");
-    expect(smoke).toContain("? ['linux-x64', 'darwin-arm64']");
-    expect(smoke).toContain(": ['linux-x64', 'darwin-arm64', 'win32-x64']");
-  });
-
-  it('generateControlledNodeReleaseManifest succeeds on dev artifacts without Windows binaries or manifests', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'imcodes-dev-manifest-'));
-    const stageDir = join(dir, 'stage');
-    const artifactsDir = join(dir, 'artifacts');
-    try {
-      mkdirSync(artifactsDir, { recursive: true });
-      const ver = '2026.11.100-dev.1';
-      const gitSha = 'a'.repeat(40);
-
-      for (const bin of [
-        { filename: 'imcodes-node-linux', os: 'linux', arch: 'x64' },
-        { filename: 'imcodes-node-macos', os: 'darwin', arch: 'universal' },
-        { filename: 'imcodes-node-linux-glibc217', os: 'linux', arch: 'x64' },
-      ]) {
-        const bytes = Buffer.from(`bin-${bin.filename}`);
-        writeFileSync(join(artifactsDir, bin.filename), bytes);
-        writeFileSync(join(artifactsDir, `${bin.filename}.manifest.json`), JSON.stringify({
-          schemaVersion: 1,
-          build: { version: ver },
-          artifact: {
-            fileName: bin.filename,
-            os: bin.os,
-            arch: bin.arch,
-            sha256: createHash('sha256').update(bytes).digest('hex'),
-            size: bytes.length,
-          },
-        }));
-      }
-
-      for (const target of ['linux-x64', 'darwin-arm64']) {
-        writeFileSync(join(artifactsDir, `desktop-release-${target}.manifest.json`), JSON.stringify({
-          schemaVersion: 1,
-          releaseVersion: ver,
-          gitSha,
-          targets: {
-            [target]: {
-              components: {},
-              installers: [],
-            },
-          },
-        }));
-      }
-
-      const { manifest } = generateControlledNodeReleaseManifest({
-        artifactsDir,
-        version: ver,
-        stageDir,
-      });
-
-      expect(manifest.artifacts['node:linux:x64']).toBeDefined();
-      expect(manifest.artifacts['node:mac:universal']).toBeDefined();
-      expect(manifest.artifacts['node:linux:x64:glibc217']).toBeDefined();
-      expect(manifest.artifacts['node:win:x64']).toBeUndefined();
-      expect(manifest.artifacts['desktop-release-manifest:linux:x64']).toBeDefined();
-      expect(manifest.artifacts['desktop-release-manifest:mac:arm64']).toBeDefined();
-      expect(manifest.artifacts['desktop-release-manifest:win:x64']).toBeUndefined();
-      expect(manifest.artifacts['desktop-release-manifest']).toBeDefined();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
   });
 });
