@@ -403,6 +403,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   completedTurn?: PeerAuditCompletedTurnEvidence;
   blockingWorkCount: number;
   backgroundWorkCount: number;
+  backgroundKeepsSessionRunning?: boolean;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
   /** Present for the whole episode (from the first capacity failure until the turn goes through, STOP, or a permanent error). */
@@ -1238,9 +1239,19 @@ export class TransportSessionRuntime implements SessionRuntime {
         // compact_boundary, Codex's inline auto-compaction). Remember it so the
         // turn's completion re-injects what compaction may have summarized.
         if (status?.status === 'compacting') this._compactionObservedInTurn = true;
-        if (!this._activeDispatchCancelled && this._status === 'idle' && status?.status && this.hasActiveTurnWork()) {
-          this.setStatus(status.status === 'waiting' ? 'tool_running' : 'thinking');
-        } else if (!status?.status && this._status === 'tool_running' && !this.hasLocalTurnInFlight() && !this.hasActiveTurnWork()) {
+        const activity = this.getActivitySnapshot();
+        const canKeepActive = this.hasActiveTurnWork() || activity.backgroundKeepsSessionRunning;
+        if (!this._activeDispatchCancelled && status?.status && canKeepActive) {
+          const nextStatus: AgentStatus = status.status === 'waiting' ? 'tool_running' : 'thinking';
+          if (this._status === 'idle' || (!this.hasLocalTurnInFlight() && activity.backgroundKeepsSessionRunning && this._status !== nextStatus)) {
+            this.setStatus(nextStatus);
+          }
+        } else if (
+          !status?.status
+          && (this._status === 'tool_running' || this._status === 'thinking')
+          && !this.hasLocalTurnInFlight()
+          && !canKeepActive
+        ) {
           this.setStatus('idle');
         }
       })] : []),
@@ -1669,6 +1680,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(this._lastCompletedTurn ? { completedTurn: { ...this._lastCompletedTurn } } : {}),
       blockingWorkCount: activitySnapshot.blockingWorkCount,
       backgroundWorkCount: activitySnapshot.backgroundWorkCount,
+      ...(activitySnapshot.backgroundKeepsSessionRunning ? { backgroundKeepsSessionRunning: true } : {}),
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
       ...(this._capacityRetryStartedAt > 0
@@ -2699,6 +2711,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private getActivitySnapshot(): {
     blockingWorkCount: number;
     backgroundWorkCount: number;
+    backgroundKeepsSessionRunning: boolean;
     activeToolCount: number;
     busyReasons: SessionActivityBusyReason[];
     providerSnapshot: ProviderActiveWorkSnapshot | null;
@@ -2706,6 +2719,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const busyReasons: SessionActivityBusyReason[] = [];
     let blockingWorkCount = 0;
     let backgroundWorkCount = 0;
+    let backgroundKeepsSessionRunning = false;
     const add = (reason: SessionActivityBusyReason, count = 1) => {
       if (count <= 0) return;
       blockingWorkCount += count;
@@ -2735,6 +2749,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           // blocking/idle behaviour is bit-for-bit unchanged.
           const providerWork = this.providerWorkBreakdown(providerSnapshot);
           backgroundWorkCount = providerWork.backgroundWorkCount;
+          backgroundKeepsSessionRunning = backgroundWorkCount > 0 && providerSnapshot.backgroundSessionStatus === 'running';
           const turnWork = providerWork.turnWorkCount;
           if (turnWork > 0 || providerWork.reportedBackgroundWorkCount === 0) {
             add(evaluation.reason, Math.max(1, turnWork || providerSnapshot.activeToolCount || 0));
@@ -2751,6 +2766,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     return {
       blockingWorkCount,
       backgroundWorkCount,
+      backgroundKeepsSessionRunning,
       activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
@@ -2811,7 +2827,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     if (!this._sending && !this._activeTurn && this._status !== 'idle') {
       const activity = this.getActivitySnapshot();
-      if (activity.blockingWorkCount === 0) {
+      if (activity.blockingWorkCount === 0 && !activity.backgroundKeepsSessionRunning) {
         this.setStatus('idle');
       }
     }
@@ -4261,10 +4277,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (status === 'idle' && this.drainPendingIfNoActiveTurn('setStatus')) return;
     if (status === 'idle') {
       const activity = this.getActivitySnapshot();
-      if (activity.blockingWorkCount > 0) {
+      if (activity.blockingWorkCount > 0 || activity.backgroundKeepsSessionRunning) {
         logger.warn(
           { sessionKey: this.sessionKey, activity },
-          'transport runtime clean idle deferred because activity reconciler still reports blocking work',
+          'transport runtime clean idle deferred because activity reconciler still reports active work',
         );
         status = 'tool_running';
       }

@@ -101,6 +101,15 @@ export interface ProviderActiveWorkSnapshot {
    * every other provider does, so their idle detection is unchanged.
    */
   backgroundWorkCount?: number;
+  /**
+   * Optional status hint when `backgroundWorkCount > 0` and turn work is 0:
+   * - omitted / `'idle'`: background work does not hold runtime/session state `'running'`
+   *   (preserves Claude Code SDK backgrounded Task subagent idle semantics).
+   * - `'running'`: background work remains non-blocking for dispatch (`blockingWorkCount === 0`)
+   *   while keeping runtime/session state active (`'tool_running'` / `'running'`) until finished
+   *   (used by AG SDK native background commands / timers / reactive turns).
+   */
+  backgroundSessionStatus?: 'idle' | 'running';
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
   /** Runtime-minted generation. Required for a clear snapshot to prove clean idle. */

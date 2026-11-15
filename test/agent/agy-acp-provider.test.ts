@@ -1206,7 +1206,7 @@ describe('AG native ACP', () => {
       }, { timeout: WAIT_FOR_TIMEOUT_MS });
       expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
       expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
-      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getStatus()).toBe('tool_running');
 
       // Completion SYSTEM_MESSAGE + reactive PLANNER_RESPONSE settles back to idle.
       await appendFile(
@@ -1267,7 +1267,7 @@ describe('AG native ACP', () => {
       }, { timeout: WAIT_FOR_TIMEOUT_MS });
       expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
       expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
-      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getStatus()).toBe('tool_running');
 
       await appendFile(
         file,
@@ -1282,7 +1282,7 @@ describe('AG native ACP', () => {
       await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0), { timeout: WAIT_FOR_TIMEOUT_MS });
       await vi.waitFor(() => expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(0), { timeout: WAIT_FOR_TIMEOUT_MS });
       expect(runtime.getStatus()).toBe('idle');
-      expect(statuses).not.toContain('tool_running');
+      expect(statuses).toContain('tool_running');
     } finally {
       await runtime.kill();
     }
@@ -1803,6 +1803,7 @@ rl.on('line', (line) => {
         busyReasons: ['background_monitor'],
       });
       expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('tool_running');
 
       expect(runtime.send('plain append while bg runs', 'bg-plain-1', undefined, undefined, {
         deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
@@ -2799,4 +2800,105 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       'gemini-4-hydrogen-high',
     ]);
   }, 60_000);
+
+  it('keeps AG reactive/native-output long tasks non-idle across multi-step tool calls, protects active long native turns from silent recovery, and returns to idle cleanly', async () => {
+    const { provider, root } = await setup('native-child-log');
+    const id = 'deck_test_agy_reactive_native_long';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    runtime.setProviderSessionId(id);
+
+    const done = vi.fn();
+    provider.onComplete(done);
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: WAIT_FOR_TIMEOUT_MS });
+    expect(runtime.send('launch', 'turn-1')).toBe('sent');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: WAIT_FOR_TIMEOUT_MS });
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: WAIT_FOR_TIMEOUT_MS });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+
+    // 1) Reactive [Message] wakeup sets agyReactive and stays non-idle even across useAgyNativeOutput and native tool steps.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 50,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-16T00:00:00Z sender=worker-a content=wake parent',
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyReactive).toBe(true);
+      expect(runtime.getStatus()).not.toBe('idle');
+    }, { timeout: WAIT_FOR_TIMEOUT_MS });
+    expect(runtime.getActivitySnapshot().backgroundKeepsSessionRunning).toBe(true);
+    expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+    (provider as any).useAgyNativeOutput(state);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    const prevActivityAt = state.lastActivityAt;
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 51,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000 } }],
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyNativeToolOrder?.length).toBeGreaterThan(0);
+    }, { timeout: WAIT_FOR_TIMEOUT_MS });
+    expect(state.lastActivityAt).toBeGreaterThanOrEqual(prevActivityAt);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    // Empty final non-tool-call PLANNER_RESPONSE settles reactive turn cleanly back to idle.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 52,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyReactive).toBe(false);
+      expect(runtime.getStatus()).toBe('idle');
+    }, { timeout: WAIT_FOR_TIMEOUT_MS });
+
+    // 2) cancel() during reactive turn clears agyReactive and settles to idle.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 53,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-16T00:01:00Z sender=worker-b content=wake again',
+      }) + '\n',
+    );
+    await vi.waitFor(() => expect(state.agyReactive).toBe(true), { timeout: WAIT_FOR_TIMEOUT_MS });
+    await provider.cancel(id);
+    expect(state.agyReactive).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+
+    // 3) During an in-flight native turn with active native tool calls, getActiveWorkSnapshot reports activeToolCount > 0
+    // and recoverSilentActiveTurn does not falsely settle the active long native turn at the short threshold.
+    state.promptInFlight = true;
+    state.agyReactive = true;
+    state.agyNativeToolOrder = [{ name: 'run_command', interactive: false }];
+    (runtime as any).setStatus('tool_running');
+    expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBeGreaterThan(0);
+    expect(runtime.recoverSilentActiveTurn({ nowMs: Date.now() + 10_000, staleMs: 5_000 })).toBe(false);
+    expect(runtime.getStatus()).toBe('tool_running');
+    state.agyNativeToolOrder = [];
+    state.promptInFlight = false;
+    state.agyReactive = false;
+    (provider as any).syncAgyStatusAfterTurn(id, state);
+    expect(runtime.getStatus()).toBe('idle');
+  });
 });

@@ -1,6 +1,6 @@
 import { AgyForegroundOwnership } from '../agy-foreground-ownership.js';
 import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptCursor, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
-import { AgySubagentTracker, extractAgySubagentEvidenceChildIds, isAgySubagentTool, normalizeAgyToolName, stableJson } from '../agy-subagents.js';
+import { AgySubagentTracker, extractAgySubagentEvidenceChildIds, isAgyInteractiveTool, isAgySubagentTool, normalizeAgyToolName, stableJson } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_RECOVERY_HINT } from '../../../shared/agy-agent.js';
 import { ACP_ERROR_PHASE, type AcpErrorPhase } from '../../../shared/provider-error-codes.js';
@@ -689,21 +689,32 @@ export class KimiSdkProvider implements TransportProvider {
     const backgroundTaskCount = this.id === AGY_SDK_PROVIDER_ID
       ? (state.agyBackgroundTasks?.size ?? 0)
       : 0;
-    const activeToolCount = [...state.toolCalls.values()]
-      .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
-    const orphanToolCount = !state.promptInFlight && !state.replaying && pendingApprovalCount === 0
-      ? activeToolCount
+    const reactiveWorkCount = this.id === AGY_SDK_PROVIDER_ID && state.agyReactive && !state.promptInFlight
+      ? 1
       : 0;
-    const activeWorkCount = Number(state.promptInFlight) + Number(state.replaying) + pendingApprovalCount + backgroundTaskCount + orphanToolCount;
+    const backgroundStatusCount = backgroundTaskCount + reactiveWorkCount;
+    const acpActiveToolCount = [...state.toolCalls.values()]
+      .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
+    const hasNativeRunningTool = this.id === AGY_SDK_PROVIDER_ID
+      && state.promptInFlight
+      && (state.agyNativeToolOrder?.some((entry) => !isAgyInteractiveTool(entry.name)) ?? false);
+    const activeToolCount = hasNativeRunningTool ? Math.max(acpActiveToolCount, 1) : acpActiveToolCount;
+    const orphanToolCount = !state.promptInFlight && !state.replaying && pendingApprovalCount === 0
+      ? acpActiveToolCount
+      : 0;
+    const activeWorkCount = Number(state.promptInFlight) + Number(state.replaying) + pendingApprovalCount + backgroundStatusCount + orphanToolCount;
     const busyReasons: ProviderActiveWorkSnapshot['busyReasons'] = [];
-    if (state.promptInFlight || pendingApprovalCount > 0) busyReasons.push('provider_wait');
+    if (state.promptInFlight || pendingApprovalCount > 0 || reactiveWorkCount > 0) busyReasons.push('provider_wait');
     if (state.replaying) busyReasons.push('provider_session_binding');
     if (activeToolCount > 0) busyReasons.push('open_tool_call');
     if (backgroundTaskCount > 0) busyReasons.push('background_monitor');
     return {
       status: 'current',
       activeWorkCount,
-      ...(this.id === AGY_SDK_PROVIDER_ID ? { backgroundWorkCount: backgroundTaskCount } : {}),
+      ...(this.id === AGY_SDK_PROVIDER_ID ? {
+        backgroundWorkCount: backgroundStatusCount,
+        ...(backgroundStatusCount > 0 ? { backgroundSessionStatus: 'running' as const } : {}),
+      } : {}),
       activeToolCount,
       busyReasons,
       providerDiagnosticGeneration: state.acpSessionId ?? null,
@@ -1013,6 +1024,31 @@ export class KimiSdkProvider implements TransportProvider {
    * so `end_turn` while a background command is still executing does not
    * falsely mark the session idle or trigger Task Pair both-idle nudges.
    */
+  /**
+   * Project AG non-prompt-RPC work (background commands/timers or a reactive
+   * native turn) onto status without clearing active state prematurely.
+   * Returns true iff status was cleared to idle.
+   */
+  private syncAgyStatusAfterTurn(sessionId: string, state: KimiSdkSessionState): boolean {
+    if (this.id !== AGY_SDK_PROVIDER_ID) {
+      this.clearStatus(sessionId, state);
+      return true;
+    }
+    if ((state.agyBackgroundTasks?.size ?? 0) > 0) {
+      state.lastStatusSignature = null;
+      this.emitStatus(sessionId, state, { status: 'waiting', label: 'Running background task' });
+      return false;
+    }
+    if (state.agyReactive) {
+      state.lastStatusSignature = null;
+      this.emitStatus(sessionId, state, { status: 'thinking', label: 'Thinking...' });
+      return false;
+    }
+    state.lastStatusSignature = null;
+    this.clearStatus(sessionId, state);
+    return true;
+  }
+
   private updateAgyBackgroundTasks(
     sessionId: string,
     state: KimiSdkSessionState,
@@ -1021,10 +1057,14 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.id !== AGY_SDK_PROVIDER_ID) return;
     const tasks = state.agyBackgroundTasks ??= new Set<string>();
     const prevSize = tasks.size;
+    const wasReactive = Boolean(state.agyReactive);
     const text = opts.text ?? '';
+    let restarted = false;
 
     if (opts.isSystemMessage && AGY_BACKGROUND_TASKS_RESTART_RE.test(text)) {
       tasks.clear();
+      state.agyReactive = false;
+      restarted = true;
     } else {
       if (!isAgySubagentTool(opts.toolName ?? '') && !isRecurringAgyScheduleTool(opts.toolName, opts.toolInput)) {
         for (const id of extractAgyBackgroundTaskStartIds(text)) tasks.add(id);
@@ -1036,12 +1076,10 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.promptInFlight) return;
     if (prevSize === 0 && nextSize > 0) {
       this.emitStatus(sessionId, state, { status: 'waiting', label: 'Running background task' });
-    } else if (prevSize > 0 && nextSize === 0 && !state.agyReactive) {
-      // Force-clear status even when settleTurn already recorded a null status
-      // signature, allowing TransportSessionRuntime to transition tool_running -> idle.
-      state.lastStatusSignature = null;
-      this.clearStatus(sessionId, state);
-      this.scheduleDeferredSharedRecycleIfDrained();
+    } else if ((prevSize > 0 || (restarted && wasReactive)) && nextSize === 0) {
+      if (this.syncAgyStatusAfterTurn(sessionId, state)) {
+        this.scheduleDeferredSharedRecycleIfDrained();
+      }
     }
   }
 
@@ -1133,7 +1171,7 @@ export class KimiSdkProvider implements TransportProvider {
       if ((state.activePromptGenerations?.size ?? 0) === 0) {
         state.promptInFlight = false;
         state.promptSubmittedGeneration = null;
-        this.clearStatus(state.routeId, state);
+        this.syncAgyStatusAfterTurn(state.routeId, state);
         this.retireOpenToolCalls(state.routeId, state, {
           terminalStatus: 'abandoned',
           terminalReason: 'generation_rollover',
@@ -1188,13 +1226,22 @@ export class KimiSdkProvider implements TransportProvider {
       return;
     }
     const claimedByForeground = state.agyForeground?.observe(row, cursor) === true;
-    if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) this.useAgyNativeOutput(state);
+    const isNativeMessageWakeup = row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '');
+    if (isNativeMessageWakeup) {
+      if (!state.agyForeground?.hasActiveLane()) state.agyReactive = true;
+      this.useAgyNativeOutput(state);
+    }
     if (row.type === 'USER_INPUT') {
       state.agyNativeToolOrder = [];
     }
     if (row.type === 'PLANNER_RESPONSE') {
       if (row.tool_calls?.length) {
-        if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) this.useAgyNativeOutput(state);
+        if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) {
+          if (state.autonomousTurnGeneration !== undefined && !state.agyBridging && !state.agyForeground?.hasActiveLane()) {
+            state.agyReactive = true;
+          }
+          this.useAgyNativeOutput(state);
+        }
         for (const [index,call] of row.tool_calls.entries()) (state.agyNativeToolOrder ??= []).push({name:call.name ?? '',input:call.args,step:row.step_index,index});
       } else {
         // Final response without tool_calls closes the tool batch so skipped/errored
@@ -1237,12 +1284,31 @@ export class KimiSdkProvider implements TransportProvider {
       }
     }
     if (row.type === 'USER_INPUT' || claimedByForeground) state.agyReactive = false;
-    if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '') && !state.agyForeground?.hasActiveLane()) state.agyReactive = true;
+    if (isNativeMessageWakeup && !state.agyForeground?.hasActiveLane()) {
+      state.agyReactive = true;
+    }
     if (row.type === 'SYSTEM_MESSAGE' && row.content) {
       this.updateAgyBackgroundTasks(sessionId, state, { text: row.content, isSystemMessage: true });
     }
-    if (claimedByForeground || row.type !== 'PLANNER_RESPONSE' || !row.content?.trim() || row.tool_calls?.length || !state.agyReactive) return;
+    if (state.promptInFlight || state.agyReactive) {
+      state.lastActivityAt = Date.now();
+      if (row.type === 'PLANNER_RESPONSE' || row.type === 'GENERIC' || row.type === 'SYSTEM_MESSAGE') {
+        this.emitAgyUsage(sessionId, state);
+      }
+    }
+    if (state.agyReactive && !state.promptInFlight && (state.agyBackgroundTasks?.size ?? 0) === 0
+      && !(row.type === 'PLANNER_RESPONSE' && !row.tool_calls?.length && row.status !== 'RUNNING')) {
+      this.emitStatus(sessionId, state, { status: 'thinking', label: 'Thinking...' });
+    }
+    if (claimedByForeground || row.type !== 'PLANNER_RESPONSE' || row.tool_calls?.length || !state.agyReactive) return;
+    if (row.status === 'RUNNING') return;
     state.agyReactive = false;
+    if (!row.content?.trim()) {
+      if (!state.promptInFlight && this.syncAgyStatusAfterTurn(sessionId, state)) {
+        this.scheduleDeferredSharedRecycleIfDrained();
+      }
+      return;
+    }
     (state.agyPendingResponses ??= new Map()).set(row.step_index, row);
     this.deliverAgyPendingResponses(sessionId,state);
   }
@@ -1583,6 +1649,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.modelRevision++;
     state.stoppedByCancel = true;
     const hadBackgroundOrOpenTools = (state.agyBackgroundTasks?.size ?? 0) > 0
+      || Boolean(state.agyReactive)
       || state.toolCalls.size > 0
       || [...this.pendingApprovals.values()].some((approval) => approval.routeId === sessionId);
     this.closeAgyBridges(state);
@@ -2979,7 +3046,11 @@ export class KimiSdkProvider implements TransportProvider {
         state.promptSubmittedGeneration = state.turnGeneration;
       }
     }
-    this.clearStatus(sessionId, state);
+    if (steeringFailure !== undefined || stopReason === 'cancelled' || state.cancelled || stopReason === 'refusal') {
+      this.clearStatus(sessionId, state);
+    } else {
+      this.syncAgyStatusAfterTurn(sessionId, state);
+    }
     if (this.id === AGY_SDK_PROVIDER_ID && state.agyBridges?.size) {
       if (nativeAutonomous && state.currentText.trim()) (state.agyNativeAcks ??= []).push({generation,text:state.currentText.trimEnd()});
       const bridge = state.agyBridges.get(state.acpSessionId!);
@@ -3602,6 +3673,7 @@ export class KimiSdkProvider implements TransportProvider {
       || (state.activePromptGenerations?.size ?? 0) > 0
       || state.autonomousTurnGeneration !== undefined
       || (state.agyBackgroundTasks?.size ?? 0) > 0
+      || Boolean(state.agyReactive)
       || [...state.toolCalls.values()].some((tool) => tool.status === 'pending' || tool.status === 'in_progress')
       || [...this.pendingApprovals.values()].some((approval) => approval.routeId === routeId)
     );
