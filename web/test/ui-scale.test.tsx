@@ -259,7 +259,10 @@ describe('whole-page UI scale (%) setting & onboarding', () => {
   });
 
   it('provides non-dvh fallback in :root and clamps FontPrefsDropdown within zoomed narrow viewports', () => {
-    const css = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    const cssPath = existsSync(resolve(process.cwd(), 'src/styles.css'))
+      ? resolve(process.cwd(), 'src/styles.css')
+      : resolve(process.cwd(), 'web/src/styles.css');
+    const css = readFileSync(cssPath, 'utf8');
     const rootRule = css.match(/:root\s*\{[^}]*\}/)?.[0] ?? '';
     expect(rootRule).toContain('--imcodes-ui-vw: calc(100vw / var(--imcodes-ui-zoom, 1));');
     expect(rootRule).toContain('--imcodes-ui-vh: calc(100vh / var(--imcodes-ui-zoom, 1));');

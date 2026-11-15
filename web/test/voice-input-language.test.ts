@@ -9,7 +9,7 @@ const bridges = vi.hoisted(() => {
 });
 vi.mock('@capacitor/core', () => ({ registerPlugin: () => bridges.streaming }));
 vi.mock('@capgo/capacitor-speech-recognition', () => ({ SpeechRecognition: bridges.platform }));
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -254,7 +254,7 @@ const swiftCompiler = process.env.SWIFTC || (existsSync('/usr/bin/swiftc') ? '/u
 describe.skipIf(!swiftCompiler)('native Inbox capacity and progress protocol', () => {
   let root: string, executable: string;
   beforeAll(() => {
-    root = mkdtempSync(join(tmpdir(), 'voice-share-inbox-'));
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'voice-share-inbox-')));
     executable = join(root, 'inbox-tests');
     const source = process.env.VOICE_INBOX_SOURCE ? readFileSync(process.env.VOICE_INBOX_SOURCE, 'utf8') : read('../ios/App/App/AuthSessionPlugin.swift');
     const receiver = source.slice(source.indexOf('@objc(ShareReceiverPlugin)'))

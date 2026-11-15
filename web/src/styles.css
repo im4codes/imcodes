@@ -22327,7 +22327,10 @@ html.native-mac-desktop .remote-desktop-window-blocked {
    inherited sizing. */
 .chat-view:not(.chat-view-preview) [class*="chat-"],
 .chat-view:not(.chat-view-preview) [class*="delegation-"],
-.chat-view:not(.chat-view-preview) [class*="peer-audit"] {
+.chat-view:not(.chat-view-preview) [class*="peer-audit"],
+.chat-view:not(.chat-view-preview) .chat-code-block code,
+.chat-view:not(.chat-view-preview) .delegation-claim-id code,
+.chat-view:not(.chat-view-preview) .delegation-protocol-card-field code {
   font-family: var(--imcodes-chat-font-family, var(--imcodes-app-font-family, ui-monospace, monospace));
 }
 .chat-tool-peek {
