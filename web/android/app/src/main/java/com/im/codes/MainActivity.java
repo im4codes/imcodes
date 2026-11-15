@@ -29,6 +29,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(AuthSessionPlugin.class);
         registerPlugin(ShareReceiverPlugin.class);
         registerPlugin(NativeClipboardPlugin.class);
+        registerPlugin(FileTransferKeepAlivePlugin.class);
         if (!isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")) {
             registerPlugin(StreamingSpeechPlugin.class);
         }
@@ -64,6 +65,18 @@ public class MainActivity extends BridgeActivity {
             }
         }
         ShareReceiverPlugin.handleShareIntent(this, getIntent());
+    }
+
+    @Override
+    public void onPause() {
+        super.onPause();
+        FileTransferKeepAlivePlugin.resumeWebViewTimersIfActive(getBridge());
+    }
+
+    @Override
+    public void onDestroy() {
+        FileTransferForegroundService.stop(this);
+        super.onDestroy();
     }
 
     @Override

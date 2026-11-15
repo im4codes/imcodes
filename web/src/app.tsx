@@ -6136,6 +6136,7 @@ function InternalMainApp() {
     // reset): `online` is unreliable behind proxies/captive portals, so we
     // never want it to clear cooldowns, only to nudge a catch-up attempt.
     const onOnline = () => {
+      resumeDirectFileTransfers(ws, selectedServerId);
       if (handleResume(false)) dispatchActiveTimelineRefresh();
     };
     window.addEventListener('online', onOnline);

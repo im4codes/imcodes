@@ -1,4 +1,10 @@
 import { beginDownloadTransfer, reportR2Preparation, completeDownloadTransfer, failDownloadTransfer } from './download-transfer-store.js';
+import { withBackgroundTransferKeepAlive } from './background-transfer-keepalive.js';
+import {
+  createUploadLifecycleRecoveryState,
+  getUploadBackgroundEpoch,
+  recoverUploadFromLifecycleIfNeeded,
+} from './upload-suspend-wait.js';
 import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_PHASE, R2_RELAY_ERROR, type R2RelayProgress, type R2RelayReady } from '@shared/r2-relay.js';
 import { isServerR2RelayEnabled, readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
 /**
@@ -2115,73 +2121,82 @@ export async function uploadFile(
   sessionName?: string,
   destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
-  if (isR2RelaySelected() && !destinationDirectory) {
-    const relayResult = await tryUploadR2File(serverId, file, onProgress, clientUploadId, signal, sessionName, destinationDirectory);
-    if (relayResult) return relayResult;
-  }
-  let highestProgress = 0;
-  const emitProgress = (pct: number) => {
-    highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
-    onProgress?.(highestProgress);
-  };
-  if (!clientUploadId) {
-    const result = await uploadFileRequest({
-      serverId, file, wholeFile: file, offset: 0, emitProgress, signal, sessionName, destinationDirectory,
-    });
-    if (!('attachment' in result)) throw new ApiError(500, 'upload_incomplete');
-    return result;
-  }
-
-  let offset = 0;
-  let failuresWithoutProgress = 0;
-  while (offset < file.size || (file.size === 0 && offset === 0)) {
-    const end = Math.min(file.size, offset + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
-    const chunk = file.slice(offset, end, file.type);
-    try {
-      const result = await uploadFileRequest({
-        serverId,
-        file: chunk,
-        wholeFile: file,
-        offset,
-        clientUploadId,
-        emitProgress,
-        signal,
-        sessionName,
-        destinationDirectory,
-      });
-      if ('attachment' in result) return result;
-      if (!Number.isSafeInteger(result.committedBytes)
-        || result.committedBytes <= offset
-        || result.committedBytes > file.size) {
-        throw new ApiError(409, 'upload_offset_mismatch');
-      }
-      offset = result.committedBytes;
-      // Some mobile WebViews do not dispatch XHR upload-progress events for
-      // multipart bodies. The server's committed offset is authoritative and
-      // arrives once each resumable chunk is accepted, so use it as the
-      // browser-upload half of progress instead of leaving a relay transfer
-      // at 0% until the final daemon commit line.
-      emitProgress(file.size > 0 ? (offset / file.size) * 50 : 50);
-      failuresWithoutProgress = 0;
-      if (file.size === 0) throw new ApiError(500, 'upload_incomplete');
-    } catch (error) {
-      if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
-      const receiverOffset = error instanceof ResumableUploadOffsetError ? error.committedBytes : -1;
-      if (Number.isSafeInteger(receiverOffset)
-        && receiverOffset >= 0 && receiverOffset <= file.size && receiverOffset !== offset) {
-        offset = receiverOffset;
-        failuresWithoutProgress = 0;
-        continue;
-      }
-      const retryable = error instanceof ApiError
-        && (error.status === 0 || RESUMABLE_DOWNLOAD_STATUSES.has(error.status)
-          || (error instanceof ResumableUploadOffsetError && error.committedBytes === offset));
-      if (!retryable || ++failuresWithoutProgress > FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) throw error;
-      const backoff = FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS;
-      await waitBeforeResume(backoff[Math.min(failuresWithoutProgress, backoff.length) - 1]!, signal);
+  return withBackgroundTransferKeepAlive(async () => {
+    if (isR2RelaySelected() && !destinationDirectory) {
+      const relayResult = await tryUploadR2File(serverId, file, onProgress, clientUploadId, signal, sessionName, destinationDirectory);
+      if (relayResult) return relayResult;
     }
-  }
-  throw new ApiError(500, 'upload_incomplete');
+    let highestProgress = 0;
+    const emitProgress = (pct: number) => {
+      highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
+      onProgress?.(highestProgress);
+    };
+    if (!clientUploadId) {
+      const result = await uploadFileRequest({
+        serverId, file, wholeFile: file, offset: 0, emitProgress, signal, sessionName, destinationDirectory,
+      });
+      if (!('attachment' in result)) throw new ApiError(500, 'upload_incomplete');
+      return result;
+    }
+
+    let offset = 0;
+    let failuresWithoutProgress = 0;
+    const lifecycleState = createUploadLifecycleRecoveryState();
+    while (offset < file.size || (file.size === 0 && offset === 0)) {
+      const end = Math.min(file.size, offset + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
+      const chunk = file.slice(offset, end, file.type);
+      const attemptEpoch = getUploadBackgroundEpoch();
+      try {
+        const result = await uploadFileRequest({
+          serverId,
+          file: chunk,
+          wholeFile: file,
+          offset,
+          clientUploadId,
+          emitProgress,
+          signal,
+          sessionName,
+          destinationDirectory,
+        });
+        if ('attachment' in result) return result;
+        if (!Number.isSafeInteger(result.committedBytes)
+          || result.committedBytes <= offset
+          || result.committedBytes > file.size) {
+          throw new ApiError(409, 'upload_offset_mismatch');
+        }
+        offset = result.committedBytes;
+        // Some mobile WebViews do not dispatch XHR upload-progress events for
+        // multipart bodies. The server's committed offset is authoritative and
+        // arrives once each resumable chunk is accepted, so use it as the
+        // browser-upload half of progress instead of leaving a relay transfer
+        // at 0% until the final daemon commit line.
+        emitProgress(file.size > 0 ? (offset / file.size) * 50 : 50);
+        failuresWithoutProgress = 0;
+        if (file.size === 0) throw new ApiError(500, 'upload_incomplete');
+      } catch (error) {
+        if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+        const receiverOffset = error instanceof ResumableUploadOffsetError ? error.committedBytes : -1;
+        if (Number.isSafeInteger(receiverOffset)
+          && receiverOffset >= 0 && receiverOffset <= file.size && receiverOffset !== offset) {
+          offset = receiverOffset;
+          failuresWithoutProgress = 0;
+          continue;
+        }
+        const retryable = error instanceof ApiError
+          && (error.status === 0 || RESUMABLE_DOWNLOAD_STATUSES.has(error.status)
+            || (error instanceof ResumableUploadOffsetError && error.committedBytes === offset));
+        if (!retryable) throw error;
+        const recovery = await recoverUploadFromLifecycleIfNeeded(attemptEpoch, lifecycleState, signal);
+        if (recovery !== 'none') {
+          continue;
+        }
+        if (++failuresWithoutProgress > FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) throw error;
+        const backoff = FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS;
+        await waitBeforeResume(backoff[Math.min(failuresWithoutProgress, backoff.length) - 1]!, signal);
+      }
+    }
+    throw new ApiError(500, 'upload_incomplete');
+  });
 }
 
 type UploadFileRequestResult =

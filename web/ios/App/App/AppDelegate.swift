@@ -199,6 +199,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             bridge.registerPluginInstance(AuthSessionPlugin())
             bridge.registerPluginInstance(WatchBridgePlugin())
             bridge.registerPluginInstance(ShareReceiverPlugin.shared)
+            bridge.registerPluginInstance(FileTransferKeepAlivePlugin())
             didRegisterLocalPlugins = true
         }
 

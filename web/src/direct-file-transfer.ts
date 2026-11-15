@@ -63,6 +63,14 @@ import {
   type AttachmentRefResponse,
 } from './api.js';
 import { canUseNativeFileShare, shareBlobOrDownload } from './browser-download.js';
+import { withBackgroundTransferKeepAlive } from './background-transfer-keepalive.js';
+import {
+  createUploadLifecycleRecoveryState,
+  getUploadBackgroundEpoch,
+  isUploadEnvironmentSuspended,
+  recoverUploadFromLifecycleIfNeeded,
+  waitForUploadResumeIfSuspended,
+} from './upload-suspend-wait.js';
 import { isNative } from './native.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
 
@@ -241,6 +249,9 @@ type Lease = {
    *  daemon restart the far side is gone and reusing it would hang every new
    *  channel. */
   peerDaemonGeneration: number | null;
+  /** Marked when control/WS resumed while active attempts existed; prevents reuse
+   *  once those attempts drain and forces a clean peer on the next attempt. */
+  peerStale: boolean;
   leaseSignalRequestId: string | null;
   /**
    * Browser WebSocket lifecycle generation. Any lease/SDP wait started on an
@@ -294,6 +305,9 @@ type ActiveAttempt = {
   channel: RTCDataChannel | null;
   /** Present for uploads only; fed by the daemon's committed-offset reports. */
   uploadCommit?: UploadCommitTracker;
+  /** Invoked when the app returns to foreground/online so a silently frozen
+   *  SCTP channel is probed and failed fast instead of waiting full timeouts. */
+  onForegroundResume?: () => void;
   signal?: AbortSignal;
 };
 
@@ -424,6 +438,7 @@ function resumableUploadIdentity(options: {
   sessionName?: string;
   destinationDirectory?: string;
   file: File;
+  clientUploadId?: string;
 }): { clientUploadId: string; storageKey: string | null } {
   // File metadata is available synchronously during the user gesture, so
   // deriving this lookup key never delays direct-channel setup or consumes
@@ -439,6 +454,18 @@ function resumableUploadIdentity(options: {
     options.file.type,
   ]);
   const storageKey = `${UPLOAD_RESUME_ID_STORAGE_PREFIX}${fingerprint}`;
+  if (options.clientUploadId) {
+    try {
+      sweepTransferResumeStorage(storageKey);
+      localStorage.setItem(storageKey, JSON.stringify({
+        clientUploadId: options.clientUploadId,
+        updatedAt: Date.now(),
+      } satisfies UploadResumeState));
+      return { clientUploadId: options.clientUploadId, storageKey };
+    } catch {
+      return { clientUploadId: options.clientUploadId, storageKey: null };
+    }
+  }
   try {
     sweepTransferResumeStorage(storageKey);
     const existing = localStorage.getItem(storageKey);
@@ -516,6 +543,16 @@ function writeDownloadResumeState(key: string, committedBytes: number, totalByte
 
 function clearDownloadResumeState(key: string): void {
   try { localStorage.removeItem(key); } catch { /* restricted storage */ }
+}
+
+export function resolveResumableUploadIdentity(options: {
+  serverId: string;
+  sessionName?: string;
+  destinationDirectory?: string;
+  file: File;
+  clientUploadId?: string;
+}): { clientUploadId: string; storageKey: string | null } {
+  return resumableUploadIdentity(options);
 }
 
 function clearResumableUploadIdentity(storageKey: string | null, clientUploadId: string): void {
@@ -654,6 +691,7 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     iceRestartedGeneration: null,
     peerCreating: null,
     peerDaemonGeneration: null,
+    peerStale: false,
     leaseSignalRequestId: null,
     controlEpoch: 0,
     controlAbort: new AbortController(),
@@ -942,9 +980,16 @@ export function resumeDirectFileTransfers(ws: WsClient, serverId?: string): void
   if (!byServer) return;
   for (const lease of byServer.values()) {
     if (serverId && lease.serverId !== serverId) continue;
-    if (lease.active.size !== 0 || lease.connectionStatus === DIRECT_FILE_CONNECTION_STATUS.RELAY) continue;
-    invalidateLeaseControl(lease);
-    if (lease.prewarmRefs > 0) queueMicrotask(() => warmRetainedLease(lease));
+    if (lease.active.size === 0) {
+      if (lease.connectionStatus === DIRECT_FILE_CONNECTION_STATUS.RELAY) continue;
+      invalidateLeaseControl(lease);
+      if (lease.prewarmRefs > 0) queueMicrotask(() => warmRetainedLease(lease));
+      continue;
+    }
+    if (lease.peer) lease.peerStale = true;
+    for (const active of lease.active.values()) {
+      active.onForegroundResume?.();
+    }
   }
 }
 
@@ -1302,6 +1347,7 @@ function closePeer(lease: Lease): void {
   lease.peer = null;
   lease.peerState = null;
   lease.peerDaemonGeneration = null;
+  lease.peerStale = false;
   lease.browserCandidateTypes.clear();
   lease.daemonCandidateTypes.clear();
   setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.NONE);
@@ -1354,6 +1400,12 @@ function invalidateLeaseControl(lease: Lease): void {
   // Active byte streams retain their immutable attempt binding and peer. Only
   // old-socket signalling listeners are impossible to recover; the fresh
   // daemon capability snapshot will rebind the control generation.
+  // Also mark the peer suspect so once active attempts drain (or fail on a
+  // frozen SCTP channel), a stale peer is closed instead of permanently reused.
+  if (lease.peer) lease.peerStale = true;
+  for (const active of lease.active.values()) {
+    active.onForegroundResume?.();
+  }
   try { lease.leaseIceOff?.(); } catch { /* best effort */ }
   lease.leaseIceOff = null;
   lease.leaseSignalRequestId = null;
@@ -1442,6 +1494,7 @@ async function ensureLeasePeer(
     || lease.peerDaemonGeneration === lease.daemonGeneration;
   const bootstrapCanCarryData = lease.bootstrapChannel?.readyState === 'open';
   if (lease.peer
+    && !lease.peerStale
     && generationMatches
     && bootstrapCanCarryData
     && lease.peer.connectionState !== 'failed'
@@ -1454,15 +1507,15 @@ async function ensureLeasePeer(
     reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN, lease);
     return;
   }
-  if (lease.peer && (!generationMatches
+  if (lease.peer && (lease.peerStale
+    || !generationMatches
     || (lease.peer.connectionState !== 'failed'
       && lease.peer.connectionState !== 'disconnected'
       && lease.peer.connectionState !== 'closed'
       && !bootstrapCanCarryData))) {
-    // WebKit can retain `connected` after SCTP has closed. The inert bootstrap
-    // channel belongs to that same association and is therefore the earliest
-    // reliable signal that a new operation channel would wait out the entire
-    // open budget. Rebuild now; do not spend a retry on the known-dead peer.
+    // WebKit can retain `connected` after SCTP has closed, and a mobile OS
+    // suspend while active leaves lease.peerStale marked. Rebuild now; do not
+    // spend a retry on the known-stale peer.
     closePeer(lease);
   }
   const peerNeedsIceRestart = lease.peer?.connectionState === 'failed'
@@ -1771,7 +1824,13 @@ function waitForChannelOpen(
   });
 }
 
-function waitForBufferedAmount(channel: RTCDataChannel, commit?: UploadCommitTracker): Promise<void> {
+function waitForBufferedAmount(channel: RTCDataChannel, commit?: UploadCommitTracker, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+  }
+  if (channel.readyState === 'closed' || channel.readyState === 'closing') {
+    return Promise.reject(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
+  }
   // Two bounds, both on existing water marks. `bufferedAmount` covers what SCTP
   // still holds locally; unacknowledged bytes cover what the receiver has not
   // yet durably written. Watching only the first lets a peer that accepts fast
@@ -1802,12 +1861,15 @@ function waitForBufferedAmount(channel: RTCDataChannel, commit?: UploadCommitTra
       clearTimeout(timer);
       channel.removeEventListener('bufferedamountlow', onLow);
       channel.removeEventListener('close', onClose);
+      signal?.removeEventListener('abort', onAbort);
       if (error) reject(error); else resolve();
     };
     const onLow = () => finish();
     const onClose = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
+    const onAbort = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
     channel.addEventListener('bufferedamountlow', onLow, { once: true });
     channel.addEventListener('close', onClose, { once: true });
+    signal?.addEventListener('abort', onAbort, { once: true });
     arm();
   });
 }
@@ -1891,7 +1953,7 @@ async function pumpUpload(
     if (commit?.fatal) throw commit.fatal;
     const end = Math.min(file.size, offset + DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES);
     const nextChunk = end < file.size ? readUploadChunk(file, end) : null;
-    await waitForBufferedAmount(channel, commit);
+    await waitForBufferedAmount(channel, commit, active.signal);
     channel.send(await pendingChunk!);
     pendingChunk = nextChunk;
     if (commit) commit.sentBytes = end;
@@ -1959,9 +2021,11 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     attempt,
   });
   const cleanup = () => {
+    active.onForegroundResume = undefined;
     lease.active.delete(active.requestId);
     try { active.channel?.close(); } catch { /* terminal/peer may already close it */ }
     active.channel = null;
+    if (lease.active.size === 0 && lease.peerStale) closePeer(lease);
     if (lease.active.size === 0 && lease.terminalGrace.size === 0) armLeaseIdleTimer(lease);
   };
   const cancel = () => {
@@ -2094,6 +2158,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       const finish = (error?: unknown, value?: OperationSuccess) => {
         if (settled) return;
         settled = true;
+        active.onForegroundResume = undefined;
         if (timer) clearTimeout(timer);
         timer = null;
         offControl();
@@ -2108,6 +2173,23 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
           const preserve = failureDisposition(error, attempt) !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL;
           void settleDownloadWriter(error, preserve).finally(() => finish(error));
         } else finish(error);
+      };
+      const FOREGROUND_RESUME_PROBE_MS = 2500;
+      active.onForegroundResume = () => {
+        if (settled) return;
+        if (channel.readyState === 'closed' || channel.readyState === 'closing') {
+          fail(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
+          return;
+        }
+        const peerState = lease.peer?.connectionState;
+        if (peerState === 'failed' || peerState === 'disconnected' || peerState === 'closed') {
+          fail(directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED));
+          return;
+        }
+        if (op.kind === 'upload' && uploadSourceFinished) {
+          if (requestUploadStatusRecovery()) return;
+        }
+        arm(FOREGROUND_RESUME_PROBE_MS);
       };
       const onAbort = () => fail(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
       const onClose = () => fail(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
@@ -2190,6 +2272,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
         const expectedBinding = expectedDataBinding(lease, active);
         if (!expectedBinding
           || !directFileTransferAttemptBindingMatches(expectedBinding, data as unknown as Record<string, unknown>)) return;
+        lease.peerStale = false;
         // Once the upload source is finished, a late/duplicate CREDIT echo for
         // bytes already sent is not new progress toward the still-missing
         // commit acknowledgement. Re-arming with the long default deadline
@@ -2426,6 +2509,9 @@ function waitForCaller<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T>
 }
 
 function failureDisposition(error: unknown, attemptsUsed: number) {
+  if (error instanceof Error && error.name === 'NotReadableError') {
+    return DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL;
+  }
   if (!(error instanceof DirectFileTransferFailure)) {
     return attemptsUsed < DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS
       ? DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.RETRY_DIRECT
@@ -2465,9 +2551,13 @@ async function retryDirect<T>(
   // finished attempt confirmed on its own live channel.
   let resumeFromBytes = initial?.resumeFromBytes ?? 0;
   let expectedDownloadBytes: number | undefined = initial?.expectedDownloadBytes;
+  const lifecycleState = createUploadLifecycleRecoveryState();
+  let skipNextBackoff = false;
   for (let attempt = 1; attempt <= DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS; attempt++) {
-    if (attempt > 1) await wait(retryDelay(attempt - 1, last), signal);
+    if (attempt > 1 && !skipNextBackoff) await wait(retryDelay(attempt - 1, last), signal);
+    skipNextBackoff = false;
     const attemptControlEpoch = lease.controlEpoch;
+    const attemptBackgroundEpoch = getUploadBackgroundEpoch();
     const operation = await createOperation(attempt);
     if (resumeFromBytes > 0) operation.resumeFromBytes = resumeFromBytes;
     if (operation.kind === 'download' && expectedDownloadBytes !== undefined) {
@@ -2487,9 +2577,21 @@ async function retryDirect<T>(
       // A retryable channel/ICE failure must not feed the next attempt back
       // into the same apparently-connected but dead mobile WebRTC peer. Do not
       // disturb sibling transfers that still own channels on the shared lease.
+      // Note: lease.peerStale covers the case where invalidateLeaseControl
+      // incremented lease.controlEpoch while this attempt was active.
       if (disposition !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL
-        && lease.active.size === 0 && lease.controlEpoch === attemptControlEpoch) {
+        && lease.active.size === 0
+        && (lease.controlEpoch === attemptControlEpoch || lease.peerStale)) {
         closePeer(lease);
+      }
+      if (disposition !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL && operation.kind === 'upload') {
+        const recovery = await recoverUploadFromLifecycleIfNeeded(attemptBackgroundEpoch, lifecycleState, signal);
+        if (recovery !== 'none') {
+          operation.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.RECOVERING);
+          attempt -= 1;
+          skipNextBackoff = true;
+          continue;
+        }
       }
       if (disposition !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.RETRY_DIRECT) {
         if (disposition === DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.HTTP_FALLBACK) {
@@ -2546,101 +2648,125 @@ export async function uploadFileDirect(
   }
 }
 
-export async function uploadFileWithDirectFallback(options: {
+export function uploadFileWithDirectFallback(options: {
   ws: WsClient | null;
   serverId: string;
   sessionName?: string;
   file: File;
+  clientUploadId?: string;
   onProgress?: (pct: number) => void;
   onMode?: (mode: FileUploadTransportMode) => void;
   signal?: AbortSignal;
   destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
-  const { clientUploadId, storageKey } = resumableUploadIdentity(options);
-  const r2 = isFileRelaySelected() && !options.destinationDirectory ? await tryUploadR2File(options.serverId, options.file, options.onProgress, clientUploadId,
-    options.signal, options.sessionName) : null;
-  if (r2) { clearResumableUploadIdentity(storageKey, clientUploadId); return r2; }
-  const broker = options.ws ? getBroker(options.ws, options.serverId) : null;
-  if (options.ws && supportsUpload(options.ws)
-    && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
-    options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
-    const directAbort = new AbortController();
-    let directConnectTimedOut = false;
-    let directConnected = false;
-    const abortDirect = () => directAbort.abort();
-    if (options.signal?.aborted) abortDirect();
-    else options.signal?.addEventListener('abort', abortDirect, { once: true });
-    const connectTimer = setTimeout(() => {
-      if (directConnected) return;
-      directConnectTimedOut = true;
-      directAbort.abort();
-    }, uploadDirectConnectFallbackMs(options.file.size));
-    try {
-      const direct = await uploadFileDirect(
-        options.ws,
-        options.file,
-        clientUploadId,
-        options.onProgress,
-        () => {
-          directConnected = true;
-          clearTimeout(connectTimer);
-          options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.DIRECT);
-        },
-        directAbort.signal,
-        options.sessionName,
-        options.serverId,
-        options.destinationDirectory,
-        options.onMode,
-      );
-      clearResumableUploadIdentity(storageKey, clientUploadId);
-      return direct;
-    } catch (error) {
-      // User cancellation is terminal. The internal 20-second deadline uses
-      // the same abort machinery, but intentionally continues through HTTP.
-      const forcedFallbackCancellation = directConnectTimedOut && isFileUploadCanceled(error);
-      if (options.signal?.aborted
-        || (!forcedFallbackCancellation
-          && (isFileUploadCanceled(error) || isTerminalDirectFailure(error)))) {
-        if (isFileUploadCanceled(error) || options.signal?.aborted) {
-          clearResumableUploadIdentity(storageKey, clientUploadId);
+  return withBackgroundTransferKeepAlive(async () => {
+    const { clientUploadId, storageKey } = resumableUploadIdentity(options);
+    const r2 = isFileRelaySelected() && !options.destinationDirectory ? await tryUploadR2File(options.serverId, options.file, options.onProgress, clientUploadId,
+      options.signal, options.sessionName) : null;
+    if (r2) { clearResumableUploadIdentity(storageKey, clientUploadId); return r2; }
+    const broker = options.ws ? getBroker(options.ws, options.serverId) : null;
+    if (options.ws && supportsUpload(options.ws)
+      && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
+      options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
+      const directAbort = new AbortController();
+      let directConnectTimedOut = false;
+      let directConnected = false;
+      const abortDirect = () => directAbort.abort();
+      if (options.signal?.aborted) abortDirect();
+      else options.signal?.addEventListener('abort', abortDirect, { once: true });
+      let connectTimer: ReturnType<typeof setTimeout> | null = null;
+      const armConnectTimer = () => {
+        if (connectTimer !== null) clearTimeout(connectTimer);
+        connectTimer = setTimeout(() => {
+          if (directConnected || directAbort.signal.aborted) return;
+          if (isUploadEnvironmentSuspended()) {
+            void waitForUploadResumeIfSuspended(directAbort.signal)
+              .then((waited) => {
+                if (waited && !directConnected && !directAbort.signal.aborted) {
+                  armConnectTimer();
+                }
+              })
+              .catch(() => {});
+            return;
+          }
+          directConnectTimedOut = true;
+          directAbort.abort();
+        }, uploadDirectConnectFallbackMs(options.file.size));
+      };
+      armConnectTimer();
+      try {
+        const direct = await uploadFileDirect(
+          options.ws,
+          options.file,
+          clientUploadId,
+          options.onProgress,
+          () => {
+            directConnected = true;
+            if (connectTimer !== null) {
+              clearTimeout(connectTimer);
+              connectTimer = null;
+            }
+            options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.DIRECT);
+          },
+          directAbort.signal,
+          options.sessionName,
+          options.serverId,
+          options.destinationDirectory,
+          options.onMode,
+        );
+        clearResumableUploadIdentity(storageKey, clientUploadId);
+        return direct;
+      } catch (error) {
+        // User cancellation is terminal. The internal 20-second deadline uses
+        // the same abort machinery, but intentionally continues through HTTP.
+        const forcedFallbackCancellation = directConnectTimedOut && isFileUploadCanceled(error);
+        if (options.signal?.aborted
+          || (!forcedFallbackCancellation
+            && (isFileUploadCanceled(error) || isTerminalDirectFailure(error)))) {
+          if (isFileUploadCanceled(error) || options.signal?.aborted) {
+            clearResumableUploadIdentity(storageKey, clientUploadId);
+          }
+          throw error;
         }
-        throw error;
+        if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+          throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
+        }
+        options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.FALLING_BACK);
+      } finally {
+        if (connectTimer !== null) {
+          clearTimeout(connectTimer);
+          connectTimer = null;
+        }
+        options.signal?.removeEventListener('abort', abortDirect);
       }
-      if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
-        throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
-      }
-      options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.FALLING_BACK);
-    } finally {
-      clearTimeout(connectTimer);
-      options.signal?.removeEventListener('abort', abortDirect);
+    } else if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+      throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
     }
-  } else if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
-    throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
-  }
-  if (broker) {
-    if (broker.active.size === 0) closePeer(broker);
-    setConnectionStatus(broker, DIRECT_FILE_CONNECTION_STATUS.RELAY);
-  }
-  options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.RELAY);
-  const result = options.destinationDirectory !== undefined
-    ? await uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName, options.destinationDirectory)
-    : options.sessionName
-    ? uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName)
-    : uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
-  try {
-    const settled = await result;
-    clearResumableUploadIdentity(storageKey, clientUploadId);
-    return settled;
-  } catch (error) {
-    if (error instanceof ApiError && (
-      error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.IDENTITY_MISMATCH
-      || error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.CONTENT_MISMATCH
-      || error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.EXPIRED
-    )) {
+    if (broker) {
+      if (broker.active.size === 0) closePeer(broker);
+      setConnectionStatus(broker, DIRECT_FILE_CONNECTION_STATUS.RELAY);
+    }
+    options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.RELAY);
+    const result = options.destinationDirectory !== undefined
+      ? await uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName, options.destinationDirectory)
+      : options.sessionName
+      ? uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName)
+      : uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
+    try {
+      const settled = await result;
       clearResumableUploadIdentity(storageKey, clientUploadId);
+      return settled;
+    } catch (error) {
+      if (error instanceof ApiError && (
+        error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.IDENTITY_MISMATCH
+        || error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.CONTENT_MISMATCH
+        || error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.EXPIRED
+      )) {
+        clearResumableUploadIdentity(storageKey, clientUploadId);
+      }
+      throw error;
     }
-    throw error;
-  }
+  });
 }
 
 export async function selectPreviewDownloadDestination(suggestedName?: string): Promise<DirectPreviewDownloadDestination | null> {

@@ -14,6 +14,11 @@
     <!-- Speech recognition -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Background file transfer keep-alive -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <application
         android:name=".AppApplication"
         android:allowBackup="true"
@@ -59,6 +64,11 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".FileTransferForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

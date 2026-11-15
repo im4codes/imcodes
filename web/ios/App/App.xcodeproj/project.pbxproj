@@ -27,6 +27,7 @@
 		BB0000011FED79650016851F /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = BB0000001FED79650016851F /* PrivacyInfo.xcprivacy */; };
 		C10000011FED79650016851F /* WatchBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000001FED79650016851F /* WatchBridge.swift */; };
 		C10000031FED79650016851F /* WatchBridgePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000021FED79650016851F /* WatchBridgePlugin.swift */; };
+		D10000011FED79650016851F /* FileTransferKeepAlivePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D10000001FED79650016851F /* FileTransferKeepAlivePlugin.swift */; };
 		D66084AA75A3D1FC73A1D2BB /* IMCodesWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5CFDB10A877F708FFF508FB /* IMCodesWatchApp.swift */; };
 		DB1DFB92B5470F732D848457 /* source-build */ = { isa = PBXBuildFile; fileRef = 83FCAB4F958B5EE020F4D49D /* ShareActionViewController.swift */; };
 		D4A1A9F71986D2386055F38B /* embed-build */ = { isa = PBXBuildFile; fileRef = 20E69F46F1EC7771384766E5 /* ShareActionExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -80,6 +81,7 @@
 		BB0000001FED79650016851F /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		C10000001FED79650016851F /* WatchBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchBridge.swift; sourceTree = "<group>"; };
 		C10000021FED79650016851F /* WatchBridgePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchBridgePlugin.swift; sourceTree = "<group>"; };
+		D10000001FED79650016851F /* FileTransferKeepAlivePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTransferKeepAlivePlugin.swift; sourceTree = "<group>"; };
 		C5CFDB10A877F708FFF508FB /* IMCodesWatchApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IMCodesWatchApp.swift; sourceTree = "<group>"; };
 		C653EF149F3AED223982F83D /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		CC0000001FED79650016851F /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
@@ -174,6 +176,7 @@
 				AA0000001FED79650016851F /* AuthSessionPlugin.swift */,
 				C10000001FED79650016851F /* WatchBridge.swift */,
 				C10000021FED79650016851F /* WatchBridgePlugin.swift */,
+				D10000001FED79650016851F /* FileTransferKeepAlivePlugin.swift */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
 				504EC3101FED79650016851F /* LaunchScreen.storyboard */,
@@ -320,6 +323,7 @@
 				AA0000011FED79650016851F /* AuthSessionPlugin.swift in Sources */,
 				C10000011FED79650016851F /* WatchBridge.swift in Sources */,
 				C10000031FED79650016851F /* WatchBridgePlugin.swift in Sources */,
+				D10000011FED79650016851F /* FileTransferKeepAlivePlugin.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

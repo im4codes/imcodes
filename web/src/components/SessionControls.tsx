@@ -95,9 +95,18 @@ import { formatTransferBytes, formatTransferDuration } from '../util/transfer-fo
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
 import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
 import { isNativeMacDesktop } from '../native-platform.js';
+import { isNative } from '../native.js';
+import { setBackgroundTransferKeepAliveLabels } from '../background-transfer-keepalive.js';
+import { isUploadEnvironmentSuspended } from '../upload-suspend-wait.js';
+import {
+  deletePendingUpload,
+  listPendingUploadsForKey,
+  PENDING_UPLOAD_MAX_FILE_BYTES,
+  persistPendingUploadFile,
+} from '../pending-upload-store.js';
 import { subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { registerMacVoiceComposerHandler } from '../mac-voice-shortcut.js';
-import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
+import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, resolveResumableUploadIdentity, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { collectSettledQueuedIds } from '../session-controls-queue.js';
@@ -1393,6 +1402,10 @@ type ComposerUploadItem = {
   updatedAt: number;
   /** The daemon path is recorded before the transient row can become done. */
   attachmentPath?: string;
+  /** False when failure is permanent (e.g. expired content:// URI needing reselect). */
+  retryable?: boolean;
+  /** Tracks whether this item already attempted automatic foreground/online retry. */
+  autoRetried?: boolean;
 };
 
 type ComposerUploadEntry = {
@@ -1411,7 +1424,17 @@ const composerUploadAbortControllers = new Map<string, AbortController>();
 // than forcing the user to pick and resend the whole file after a transient
 // direct+HTTP failure.
 const composerUploadRetryFiles = new Map<string, File>();
+const composerUploadClientIds = new Map<string, string>();
+const recoveredPendingUploadIds = new Set<string>();
 let composerUploadIdCounter = 0;
+
+export function resetPendingUploadRecoveryForTests(): void {
+  recoveredPendingUploadIds.clear();
+  composerUploadClientIds.clear();
+  composerUploadRetryFiles.clear();
+  composerUploadAbortControllers.clear();
+  composerUploadStore.clear();
+}
 
 function createComposerUploadId(): string {
   composerUploadIdCounter += 1;
@@ -7422,47 +7445,102 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     closeQuickSuggestions();
   };
 
-  const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
-    if (files.length === 0 || !serverId) return false;
+  const startComposerUploads = useCallback(async (
+    entries: ReadonlyArray<{ file: File; clientUploadId?: string; fromPersistedStore?: boolean }>,
+    autoRetried = false,
+  ): Promise<boolean> => {
+    if (entries.length === 0 || !serverId) return false;
+    setBackgroundTransferKeepAliveLabels({
+      title: t('upload.bg_notification_title'),
+      text: t('upload.bg_notification_text'),
+    });
     const uploadKey = composerUploadKey;
     const uploadAttachmentDraftKey = attachmentDraftKey;
-    const uploadItems = files.map((file) => {
+    const uploadSessionName = isShareScopedSession && activeSession?.name ? activeSession.name : undefined;
+    const prepared = entries.map((entry) => {
       const now = Date.now();
+      const id = createComposerUploadId();
+      const clientUploadId = entry.clientUploadId ?? resolveResumableUploadIdentity({
+        serverId,
+        ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
+        file: entry.file,
+      }).clientUploadId;
       return {
-        id: createComposerUploadId(),
-        name: file.name || 'file',
-        progress: 0,
-        status: 'uploading' as const,
-        transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
-        totalBytes: file.size,
-        startedAt: now,
-        lastSampleAt: now,
-        lastSampleBytes: 0,
-        speedBps: 0,
-        updatedAt: now,
+        file: entry.file,
+        clientUploadId,
+        fromPersistedStore: !!entry.fromPersistedStore,
+        item: {
+          id,
+          name: entry.file.name || 'file',
+          progress: 0,
+          status: 'uploading' as const,
+          transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
+          totalBytes: entry.file.size,
+          startedAt: now,
+          lastSampleAt: now,
+          lastSampleBytes: 0,
+          speedBps: 0,
+          updatedAt: now,
+          ...(autoRetried ? { autoRetried: true } : {}),
+        },
       };
     });
-    for (let index = 0; index < uploadItems.length; index += 1) {
-      composerUploadRetryFiles.set(uploadItems[index].id, files[index]);
+    for (const entry of prepared) {
+      composerUploadRetryFiles.set(entry.item.id, entry.file);
+      composerUploadClientIds.set(entry.item.id, entry.clientUploadId);
     }
-    addComposerUploadItems(uploadKey, uploadItems);
+    addComposerUploadItems(uploadKey, prepared.map((entry) => entry.item));
 
     const settledUploadIds: string[] = [];
     // Uploads run concurrently, but composer sequence numbers follow the
     // user's selection order rather than whichever transfer happens to finish
     // first.  Keep each completed path immediately, then project the completed
-    // subset in `uploadItems` order before the transient row becomes `done`.
+    // subset in `prepared` order before the transient row becomes `done`.
     const completedAttachments = new Map<string, ComposerAttachmentRecord>();
-    const uploadedAttachments = await Promise.all(files.map(async (file, index): Promise<ComposerAttachmentRecord | null> => {
-      const uploadItem = uploadItems[index];
+    const uploadedAttachments = await Promise.all(prepared.map(async (entry): Promise<ComposerAttachmentRecord | null> => {
+      const { file: initialFile, clientUploadId, fromPersistedStore, item: uploadItem } = entry;
+      let effectiveFile = initialFile;
       const abortController = new AbortController();
+      const persistAbortController = new AbortController();
+      const onUploadAbortForPersist = () => persistAbortController.abort();
+      abortController.signal.addEventListener('abort', onUploadAbortForPersist, { once: true });
       composerUploadAbortControllers.set(uploadItem.id, abortController);
       try {
+        // Stream 4 MiB chunks into IndexedDB (up to 128 MiB total budget) so
+        // peak memory stays bounded (~4 MiB) and files survive Android
+        // content:// / iOS tmp/ URI expiry or WKContent eviction.
+        // Native awaits the snapshot before reading temporary OS URIs; web
+        // snapshots concurrently so small/local transfers keep zero-delay start.
+        if (!fromPersistedStore && !activeSessionIncognito && initialFile.size <= PENDING_UPLOAD_MAX_FILE_BYTES) {
+          const persistPromise = persistPendingUploadFile({
+            clientUploadId,
+            serverId,
+            sessionName: uploadSessionName ?? '',
+            composerKey: uploadKey,
+            file: initialFile,
+            signal: persistAbortController.signal,
+          }).catch(() => ({ persisted: false, snapshotFile: null as File | null }));
+          if (isNative()) {
+            const persisted = await persistPromise;
+            if (abortController.signal.aborted) {
+              void deletePendingUpload(clientUploadId);
+              throw new DOMException('Aborted', 'AbortError');
+            }
+            if (persisted.snapshotFile) {
+              effectiveFile = persisted.snapshotFile;
+              composerUploadRetryFiles.set(uploadItem.id, effectiveFile);
+            }
+          } else {
+            void persistPromise;
+          }
+        }
+
         const result = await uploadFileWithDirectFallback({
           ws,
           serverId,
-          ...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {}),
-          file,
+          ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
+          file: effectiveFile,
+          clientUploadId,
           onProgress: (pct) => {
             updateComposerUploadProgress(uploadKey, uploadItem.id, pct);
           },
@@ -7480,24 +7558,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         // branch; marking the progress row done first briefly enabled Send
         // while `attachments` was still empty, which produced text-only sends.
         if (!daemonPath) throw new Error('attachment_path_missing');
+        persistAbortController.abort();
+        void deletePendingUpload(clientUploadId);
+        composerUploadClientIds.delete(uploadItem.id);
         const attachment: ComposerAttachmentRecord = {
           path: daemonPath,
-          name: file.name,
+          name: effectiveFile.name,
           seq: 0,
           ...(result.attachment.id ? { id: result.attachment.id } : {}),
           ...(result.attachment.serverId ? { serverId: result.attachment.serverId } : { serverId }),
         };
-        rememberAttachmentPreview(daemonPath, file);
+        rememberAttachmentPreview(daemonPath, effectiveFile);
         completedAttachments.set(uploadItem.id, attachment);
-        const orderedCompleted = uploadItems
-          .map((item) => completedAttachments.get(item.id))
-          .filter((entry): entry is ComposerAttachmentRecord => !!entry);
-        const completedPaths = new Set(orderedCompleted.map((entry) => entry.path));
+        const orderedCompleted = prepared
+          .map((preparedEntry) => completedAttachments.get(preparedEntry.item.id))
+          .filter((item): item is ComposerAttachmentRecord => !!item);
+        const completedPaths = new Set(orderedCompleted.map((item) => item.path));
         if (uploadAttachmentDraftKey) {
           appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
           const stored = parseStoredComposerAttachments(safeSessionStorageGetItem(uploadAttachmentDraftKey));
           const next = renumberAttachments([
-            ...stored.filter((entry) => !completedPaths.has(entry.path)),
+            ...stored.filter((item) => !completedPaths.has(item.path)),
             ...orderedCompleted,
           ]);
           // Unbounded: the default draft cap would truncate this JSON.
@@ -7507,7 +7588,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           }
         } else {
           setAttachments((prev) => renumberAttachments([
-            ...prev.filter((entry) => !completedPaths.has(entry.path)),
+            ...prev.filter((item) => !completedPaths.has(item.path)),
             ...orderedCompleted,
           ]));
         }
@@ -7520,6 +7601,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return attachment;
       } catch (err) {
         if (isFileUploadCanceled(err)) {
+          persistAbortController.abort();
+          void deletePendingUpload(clientUploadId);
+          composerUploadClientIds.delete(uploadItem.id);
           removeComposerUploadItems(uploadKey, [uploadItem.id]);
           settledUploadIds.push(uploadItem.id);
           return null;
@@ -7527,8 +7611,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
         let errorMessage: string;
-        if (err instanceof DirectFileTransferFailure && err.code === 'relay_size_limit') {
+        let retryable = true;
+        if ((err instanceof Error && err.name === 'NotReadableError') || body.includes('NotReadableError')) {
+          errorMessage = t('upload.file_unreadable_reselect');
+          retryable = false;
+          persistAbortController.abort();
+          void deletePendingUpload(clientUploadId);
+        } else if (err instanceof DirectFileTransferFailure && err.code === 'relay_size_limit') {
           errorMessage = t('upload.direct_required_large', { max: MAX_UPLOAD_SIZE_MB });
+          retryable = false;
+          persistAbortController.abort();
+          void deletePendingUpload(clientUploadId);
         } else if (
           (err instanceof DirectFileTransferFailure
             && err.code === DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY)
@@ -7539,14 +7632,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           errorMessage = t('upload.daemon_offline');
         } else if (body.includes('file_too_large')) {
           errorMessage = t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB });
+          retryable = false;
+          persistAbortController.abort();
+          void deletePendingUpload(clientUploadId);
         } else {
           errorMessage = t('upload.upload_failed');
         }
-        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'error' });
+        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'error', retryable });
         updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
         setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
         return null;
       } finally {
+        abortController.signal.removeEventListener('abort', onUploadAbortForPersist);
         composerUploadAbortControllers.delete(uploadItem.id);
       }
     }));
@@ -7556,29 +7653,142 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // visible with a retry action: removing every row here made a 99%-phase
     // failure disappear immediately and look like a silent success/failure.
     removeComposerUploadItems(uploadKey, settledUploadIds);
-    for (const id of settledUploadIds) composerUploadRetryFiles.delete(id);
+    for (const id of settledUploadIds) {
+      composerUploadRetryFiles.delete(id);
+      composerUploadClientIds.delete(id);
+    }
     return successfulAttachments.length > 0;
-  }, [activeSession?.name, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t]);
+  }, [activeSession?.name, activeSessionIncognito, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t, ws]);
+
+  const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => (
+    startComposerUploads(files.map((file) => ({ file })))
+  ), [startComposerUploads]);
 
 
   const handleCancelUpload = useCallback((item: ComposerUploadItem) => {
     if (!window.confirm(t('upload.cancel_confirm', { name: item.name }))) return;
+    const clientUploadId = composerUploadClientIds.get(item.id);
+    if (clientUploadId) {
+      void deletePendingUpload(clientUploadId);
+      composerUploadClientIds.delete(item.id);
+    }
     composerUploadAbortControllers.get(item.id)?.abort();
   }, [t]);
 
   const handleRetryUpload = useCallback((item: ComposerUploadItem) => {
     const file = composerUploadRetryFiles.get(item.id);
     if (!file) return;
+    const clientUploadId = composerUploadClientIds.get(item.id);
     composerUploadRetryFiles.delete(item.id);
+    composerUploadClientIds.delete(item.id);
     removeComposerUploadItems(composerUploadKey, [item.id]);
     updateComposerUploadSnapshot(composerUploadKey, { error: null });
-    void uploadAttachmentFiles([file]);
-  }, [composerUploadKey, uploadAttachmentFiles]);
+    void startComposerUploads([{ file, clientUploadId }]);
+  }, [composerUploadKey, startComposerUploads]);
 
   const handleDismissFailedUpload = useCallback((item: ComposerUploadItem) => {
+    const clientUploadId = composerUploadClientIds.get(item.id);
+    if (clientUploadId) {
+      void deletePendingUpload(clientUploadId);
+      composerUploadClientIds.delete(item.id);
+    }
     composerUploadRetryFiles.delete(item.id);
     removeComposerUploadItems(composerUploadKey, [item.id]);
   }, [composerUploadKey]);
+
+  const autoRetryFailedUploads = useCallback(() => {
+    if (!connected || isUploadEnvironmentSuspended()) return;
+    const snapshot = getComposerUploadSnapshot(composerUploadKey);
+    const candidates = snapshot.uploads.filter((item) => (
+      item.status === 'error'
+      && item.retryable !== false
+      && !item.autoRetried
+      && composerUploadRetryFiles.has(item.id)
+    ));
+    if (candidates.length === 0) return;
+    const entries: Array<{ file: File; clientUploadId?: string; fromPersistedStore?: boolean }> = [];
+    const removeIds: string[] = [];
+    for (const item of candidates) {
+      const file = composerUploadRetryFiles.get(item.id);
+      if (!file) continue;
+      const clientUploadId = composerUploadClientIds.get(item.id);
+      composerUploadRetryFiles.delete(item.id);
+      composerUploadClientIds.delete(item.id);
+      removeIds.push(item.id);
+      entries.push({ file, clientUploadId, fromPersistedStore: true });
+    }
+    if (entries.length === 0) return;
+    removeComposerUploadItems(composerUploadKey, removeIds);
+    updateComposerUploadSnapshot(composerUploadKey, { error: null });
+    void startComposerUploads(entries, true);
+  }, [composerUploadKey, connected, startComposerUploads]);
+
+  const autoRetryFailedUploadsRef = useRef(autoRetryFailedUploads);
+  autoRetryFailedUploadsRef.current = autoRetryFailedUploads;
+  const startComposerUploadsRef = useRef(startComposerUploads);
+  startComposerUploadsRef.current = startComposerUploads;
+  const prevConnectedForUploadRetryRef = useRef(connected);
+
+  useEffect(() => {
+    const wasConnected = prevConnectedForUploadRetryRef.current;
+    prevConnectedForUploadRetryRef.current = connected;
+    if (!connected) return;
+    if (!wasConnected) {
+      autoRetryFailedUploadsRef.current();
+    }
+    const onWake = () => autoRetryFailedUploadsRef.current();
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onWake);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', onWake);
+      window.addEventListener('pageshow', onWake);
+      window.addEventListener('online', onWake);
+    }
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onWake);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', onWake);
+        window.removeEventListener('pageshow', onWake);
+        window.removeEventListener('online', onWake);
+      }
+    };
+  }, [connected]);
+
+  useEffect(() => {
+    if (!serverId || !composerUploadKey || !connected || activeSessionIncognito) return;
+    if (attachmentDraftKey && hydratedAttachmentDraftKey !== attachmentDraftKey) return;
+    let canceled = false;
+    void listPendingUploadsForKey(composerUploadKey, serverId).then((entries) => {
+      if (canceled || entries.length === 0) return;
+      const snapshot = getComposerUploadSnapshot(composerUploadKey);
+      const activeClientIds = new Set(
+        snapshot.uploads
+          .map((item) => composerUploadClientIds.get(item.id))
+          .filter((id): id is string => !!id),
+      );
+      const pending = entries.filter(({ meta }) => {
+        if (activeClientIds.has(meta.clientUploadId)) return false;
+        if (recoveredPendingUploadIds.has(meta.clientUploadId)) return false;
+        recoveredPendingUploadIds.add(meta.clientUploadId);
+        return true;
+      });
+      if (pending.length === 0) return;
+      void startComposerUploadsRef.current(
+        pending.map(({ meta, file }) => ({
+          file,
+          clientUploadId: meta.clientUploadId,
+          fromPersistedStore: true,
+        })),
+        true,
+      );
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [activeSessionIncognito, attachmentDraftKey, composerUploadKey, connected, hydratedAttachmentDraftKey, serverId]);
 
   const handleRemoveAttachment = useCallback(async (attachment: ComposerAttachmentRecord) => {
     closeQuickSuggestions();
