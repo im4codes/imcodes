@@ -701,6 +701,7 @@ describe('headless compatibility release wiring', () => {
     expect(smokeStep?.run).toContain("fs.existsSync(path.join(root, 'installers'))");
     expect(smokeStep?.run).toContain('validateDesktopReleaseManifest');
     expect(smokeStep?.run).toContain('validateDaemonRuntimeManifest');
+    expect(smokeStep?.run).toMatch(/validateDaemonRuntimeManifest\([^;]+,\s*t\)/);
 
     const dockerignore = readFileSync('.dockerignore', 'utf8')
       .split(/\r?\n/u)

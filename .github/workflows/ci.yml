@@ -1904,7 +1904,7 @@ jobs:
                 if (drBytes.length !== drComp.sizeBytes || drSha !== drComp.sha256) {
                   throw new Error('daemon-runtime archive integrity mismatch inside image: ' + t);
                 }
-                const drManifest = mod.validateDaemonRuntimeManifest(JSON.parse(fs.readFileSync(path.join(root, 'daemon-runtime', drComp.manifestFileName), 'utf8')));
+                const drManifest = mod.validateDaemonRuntimeManifest(JSON.parse(fs.readFileSync(path.join(root, 'daemon-runtime', drComp.manifestFileName), 'utf8')), t);
                 if (drManifest.build.version !== expectedVer || drManifest.artifact.sha256 !== drSha) {
                   throw new Error('daemon-runtime manifest mismatch inside image: ' + t);
                 }
