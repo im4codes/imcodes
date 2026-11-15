@@ -363,7 +363,7 @@ describe('global font scaling', () => {
 
     const appDelegate = readFileSync(resolve(__dirname, '../ios/App/App/AppDelegate.swift'), 'utf8');
     expect(appDelegate).toContain('configuredWebViewId');
-    expect(appDelegate).toContain('refreshMacPageZoomAndHostSignal');
+    expect(appDelegate).toContain('refreshMacHostSignal');
     expect(appDelegate).toContain('isMacDesktopHost');
   });
 
