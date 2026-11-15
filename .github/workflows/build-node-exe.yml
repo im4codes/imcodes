@@ -397,38 +397,47 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          node scripts/build-daemon-runtime.mjs `
-            --target win32-x64 `
-            --out-dir dist-node-exe/daemon-runtime `
-            --build-version $env:IMCODES_BUILD_VERSION
-          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime build failed.' }
-          node scripts/daemon-runtime-artifacts.mjs verify `
-            dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.manifest.json `
-            --expected-version $env:IMCODES_BUILD_VERSION `
-            --archive-only
-          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime manifest verification failed.' }
-          $smokeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-smoke'
-          $homeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-home'
-          Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $homeRoot | Out-Null
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-stage'
+          Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
           try {
-            powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-              -File .\scripts\windows-zip-archive.ps1 `
-              -Mode Expand `
-              -SourcePath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' `
-              -DestinationPath $smokeRoot
-            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke extraction failed.' }
-            & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath (Join-Path $smokeRoot 'node.exe') -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
-            $prevHome = $env:IMCODES_HOME
-            $env:IMCODES_HOME = Join-Path $homeRoot '.imcodes'
-            try {
-              & (Join-Path $smokeRoot 'node.exe') (Join-Path $smokeRoot 'package\dist\src\index.js') --version
-              if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke execution failed.' }
-            } finally {
-              $env:IMCODES_HOME = $prevHome
-            }
-          } finally {
+            node scripts/build-daemon-runtime.mjs `
+              --target win32-x64 `
+              --out-dir dist-node-exe/daemon-runtime `
+              --stage-dir $stageRoot `
+              --keep-staging `
+              --build-version $env:IMCODES_BUILD_VERSION
+            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime build failed.' }
+            node scripts/daemon-runtime-artifacts.mjs verify `
+              dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.manifest.json `
+              --expected-version $env:IMCODES_BUILD_VERSION `
+              --archive-only
+            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime manifest verification failed.' }
+            $smokeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-smoke'
+            $homeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-home'
             Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $homeRoot | Out-Null
+            try {
+              powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File .\scripts\windows-zip-archive.ps1 `
+                -Mode Expand `
+                -SourcePath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' `
+                -DestinationPath $smokeRoot
+              if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke extraction failed.' }
+              & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath (Join-Path $smokeRoot 'node.exe') -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+              $prevHome = $env:IMCODES_HOME
+              $env:IMCODES_HOME = Join-Path $homeRoot '.imcodes'
+              try {
+                & (Join-Path $smokeRoot 'node.exe') (Join-Path $smokeRoot 'package\dist\src\index.js') --version
+                if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke execution failed.' }
+              } finally {
+                $env:IMCODES_HOME = $prevHome
+              }
+            } finally {
+              Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          } catch {
+            Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+            throw
           }
       - name: Build and smoke-test Linux unified installers (.deb + .sh)
         if: runner.os == 'Linux'
@@ -504,40 +513,45 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          $isccPath = $null
-          foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
-            if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
-          }
-          if (-not $isccPath -and (Get-Command choco -ErrorAction SilentlyContinue)) {
-            choco install innosetup --no-progress -y | Out-Null
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-stage'
+          try {
+            $isccPath = $null
             foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
               if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
             }
-          }
-          $localUiDir = if (Test-Path -LiteralPath 'dist-node-exe\aidesk-local-ui\win32-x64' -PathType Container) { 'dist-node-exe\aidesk-local-ui\win32-x64' } else { 'dist-node-exe\aidesk-local-ui' }
-          $buildArgs = @(
-            'scripts\build-windows-installer.mjs',
-            '--version', $env:IMCODES_BUILD_VERSION,
-            '--runtime-archive', 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip',
-            '--node-exe', 'dist-node-exe\imcodes-node.exe',
-            '--remote-desktop-dir', 'dist-node-exe\remote-desktop-worker\win32-x64',
-            '--computer-use-dir', 'dist-node-exe\computer-use-helper\win32-x64',
-            '--local-ui-dir', $localUiDir,
-            '--out-dir', 'dist-node-exe\installers'
-          )
-          if ($isccPath) { $buildArgs += @('--iscc-path', $isccPath) }
-          node @buildArgs
-          if ($LASTEXITCODE -ne 0) { throw 'Windows installer build failed.' }
-          $isoRoot = Join-Path $env:RUNNER_TEMP ('imcodes-win-inst-' + [guid]::NewGuid().ToString('N'))
-          $isoHome = Join-Path $isoRoot 'home'
-          New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
-          try {
-            & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode PostInstall -Version $env:IMCODES_BUILD_VERSION -IsolatedRoot $isoRoot -HomeDir $isoHome -StagedCliWrapper 'dist-node-exe\installers\imcodes.cmd' | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Windows isolated PostInstall failed.' }
-            & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode Rollback -IsolatedRoot $isoRoot -HomeDir $isoHome | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Windows isolated Rollback failed.' }
+            if (-not $isccPath -and (Get-Command choco -ErrorAction SilentlyContinue)) {
+              choco install innosetup --no-progress -y | Out-Null
+              foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+                if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+              }
+            }
+            $localUiDir = if (Test-Path -LiteralPath 'dist-node-exe\aidesk-local-ui\win32-x64' -PathType Container) { 'dist-node-exe\aidesk-local-ui\win32-x64' } else { 'dist-node-exe\aidesk-local-ui' }
+            $buildArgs = @(
+              'scripts\build-windows-installer.mjs',
+              '--version', $env:IMCODES_BUILD_VERSION,
+              '--runtime-dir', $stageRoot,
+              '--node-exe', 'dist-node-exe\imcodes-node.exe',
+              '--remote-desktop-dir', 'dist-node-exe\remote-desktop-worker\win32-x64',
+              '--computer-use-dir', 'dist-node-exe\computer-use-helper\win32-x64',
+              '--local-ui-dir', $localUiDir,
+              '--out-dir', 'dist-node-exe\installers'
+            )
+            if ($isccPath) { $buildArgs += @('--iscc-path', $isccPath) }
+            node @buildArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Windows installer build failed.' }
+            $isoRoot = Join-Path $env:RUNNER_TEMP ('imcodes-win-inst-' + [guid]::NewGuid().ToString('N'))
+            $isoHome = Join-Path $isoRoot 'home'
+            New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
+            try {
+              & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode PostInstall -Version $env:IMCODES_BUILD_VERSION -IsolatedRoot $isoRoot -HomeDir $isoHome -StagedCliWrapper 'dist-node-exe\installers\imcodes.cmd' | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Windows isolated PostInstall failed.' }
+              & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode Rollback -IsolatedRoot $isoRoot -HomeDir $isoHome | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Windows isolated Rollback failed.' }
+            } finally {
+              Remove-Item -LiteralPath $isoRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
           } finally {
-            Remove-Item -LiteralPath $isoRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
           }
       - name: Build and verify unified desktop release manifest (POSIX)
         if: runner.os != 'Windows'
