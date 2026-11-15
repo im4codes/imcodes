@@ -405,6 +405,12 @@ describe('daemon-runtime CI wiring and macOS entitlements', () => {
       expect(workflow, spec.file).toContain('chmod -R a-w "$SMOKE_ROOT"');
       expect(workflow, spec.file).toContain('Build, verify and smoke-test Windows daemon-runtime bundle');
       expect(workflow, spec.file).toContain('daemon-runtime-win32-x64.zip');
+      const winStart = workflow.indexOf('Build, verify and smoke-test Windows daemon-runtime bundle');
+      const winEnd = workflow.indexOf('\n      - name:', winStart);
+      const winStep = workflow.slice(winStart, winEnd);
+      expect(winStep, spec.file).toContain('--archive-only');
+      expect(winStep, spec.file).toContain('windows-zip-archive.ps1');
+      expect(winStep, spec.file).not.toContain('Expand-Archive');
       const buildStep = workflow.indexOf('Build, verify and smoke-test POSIX daemon-runtime bundle');
       const uploadStep = workflow.indexOf(spec.uploadName);
       const cleanupStep = workflow.indexOf('Remove macOS release-signing material');
@@ -493,12 +499,134 @@ describe('Windows zip PowerShell -File invocation without -Command/$args', () =>
     expect(artifactsSrc).not.toMatch(/['"]-Command['"]/);
     expect(artifactsSrc).not.toMatch(/\$args\[\d+\]/);
     expect(ps1Src).toContain("ValidateSet('Expand', 'Compress')");
-    expect(ps1Src).toContain('Expand-Archive -LiteralPath $SourcePath -DestinationPath $DestinationPath -Force');
+    expect(ps1Src).toContain("$ProgressPreference = 'SilentlyContinue'");
+    expect(ps1Src).not.toContain('Expand-Archive');
     expect(ps1Src).not.toContain('Compress-Archive');
+    expect(ps1Src).toContain('Resolve-SevenZipExecutable');
+    expect(ps1Src).toContain('IMCODES_WINDOWS_7Z_PATH');
+    expect(ps1Src).toContain('-mmt=on');
+    expect(ps1Src).toContain('[System.IO.Compression.ZipFile]::ExtractToDirectory');
+    expect(ps1Src).toContain('[System.IO.Compression.ZipFile]::OpenRead');
     expect(ps1Src).toContain('[System.IO.Compression.ZipFile]::Open');
     expect(ps1Src).toContain('[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile');
+    expect(ps1Src).toContain('[System.IO.Compression.CompressionLevel]::Fastest');
+    expect(ps1Src).toContain('Zip entry escapes destination directory');
     expect(ps1Src).toContain(".Replace('\\', '/')");
+    expect(buildSrc).toContain('filesDocument: preFilesDoc');
   });
+
+  it('reuses precomputed filesDocument in createDaemonRuntimeManifest and rejects mismatched metadata', async () => {
+    const work = tempDir('imcodes-dr-precomputed-');
+    const bundleRoot = join(work, 'bundle');
+    const outDir = join(work, 'out');
+    mkdirSync(bundleRoot, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+    createFakeBundle(bundleRoot, 'win32');
+    for (let i = 0; i < 40; i += 1) {
+      const sub = join(bundleRoot, 'package', 'node_modules', `pkg-${i}`);
+      mkdirSync(sub, { recursive: true });
+      writeFileSync(join(sub, 'index.js'), `export const n = ${i};\n`);
+    }
+
+    const localOpts = {
+      bundleRoot,
+      os: 'win32',
+      arch: 'x64',
+      nodeVersion: 'v24.16.0',
+      nodeProvider: 'local-node-bin',
+      nodeBinarySha256: sha256('local-node'),
+      buildCommit: 'f'.repeat(40),
+      buildVersion: '0.1.5',
+    };
+    const preFilesDoc = await createDaemonRuntimeFilesDocument(localOpts);
+    await writeDaemonRuntimeJson(join(bundleRoot, DAEMON_RUNTIME_FILES_FILENAME), preFilesDoc);
+
+    const archivePath = join(outDir, 'daemon-runtime-win32-x64.zip');
+    createArchiveFromDir(bundleRoot, archivePath, 'zip');
+
+    const { manifest } = await createDaemonRuntimeManifest({
+      ...localOpts,
+      archivePath,
+      filesDocument: preFilesDoc,
+    });
+    expect(manifest.fileCount).toBe(preFilesDoc.fileCount);
+    expect(manifest.files).toEqual(preFilesDoc.files);
+
+    const manifestPath = join(outDir, 'daemon-runtime-win32-x64.manifest.json');
+    await writeDaemonRuntimeJson(manifestPath, manifest);
+    const verified = await verifyDaemonRuntimeArchive(manifestPath, { requireOfficialNode: false });
+    expect(verified.fileCount).toBe(preFilesDoc.fileCount);
+
+    await expect(
+      createDaemonRuntimeManifest({
+        ...localOpts,
+        buildVersion: '0.1.6',
+        archivePath,
+        filesDocument: preFilesDoc,
+      }),
+    ).rejects.toThrow(/precomputed filesDocument metadata does not match/);
+  });
+
+  it.runIf(process.platform === 'win32')(
+    'round-trips win32 zip via both 7z and .NET ZipFile fallback (IMCODES_WINDOWS_7Z_PATH=none) including spaces, $, quotes, empty dirs, and overwrite',
+    async () => {
+      const root = tempDir('imcodes-dr-winzip-');
+      const bundleRoot = join(root, "stage 'win' $pkg");
+      const outDir = join(root, "out 'win' $dir");
+      mkdirSync(join(bundleRoot, 'package', 'empty-sub'), { recursive: true });
+      mkdirSync(outDir, { recursive: true });
+      createFakeBundle(bundleRoot, 'win32');
+
+      const localOpts = {
+        bundleRoot,
+        os: 'win32',
+        arch: 'x64',
+        nodeVersion: 'v24.16.0',
+        nodeProvider: 'local-node-bin',
+        nodeBinarySha256: sha256('local-node'),
+        buildCommit: '1'.repeat(40),
+        buildVersion: '0.1.6',
+      };
+      const filesDoc = await createDaemonRuntimeFilesDocument(localOpts);
+      await writeDaemonRuntimeJson(join(bundleRoot, DAEMON_RUNTIME_FILES_FILENAME), filesDoc);
+
+      for (const modeEnv of [{}, { IMCODES_WINDOWS_7Z_PATH: 'none' }]) {
+        const archivePath = join(outDir, 'daemon-runtime-win32-x64.zip');
+        const psExe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+        execFileSync(
+          psExe,
+          buildWindowsZipPowerShellArgs('Compress', bundleRoot, archivePath, { platform: 'win32' }),
+          { env: { ...process.env, ...modeEnv }, stdio: 'pipe' },
+        );
+
+        const { manifest } = await createDaemonRuntimeManifest({ ...localOpts, archivePath });
+        const manifestPath = join(outDir, 'daemon-runtime-win32-x64.manifest.json');
+        await writeDaemonRuntimeJson(manifestPath, manifest);
+        const verified = await verifyDaemonRuntimeArchive(manifestPath, { requireOfficialNode: false });
+        expect(verified.fileCount).toBe(manifest.fileCount);
+
+        // Extract into both empty and pre-populated (with read-only file) destinations.
+        const destEmpty = join(root, "dest empty 'win' $1");
+        const destExisting = join(root, "dest existing 'win' $2");
+        mkdirSync(destExisting, { recursive: true });
+        const roTarget = join(destExisting, 'node.exe');
+        writeFileSync(roTarget, 'old-readonly');
+        chmodSync(roTarget, 0o444);
+
+        for (const dest of [destEmpty, destExisting]) {
+          execFileSync(
+            psExe,
+            buildWindowsZipPowerShellArgs('Expand', archivePath, dest, { platform: 'win32' }),
+            { env: { ...process.env, ...modeEnv }, stdio: 'pipe' },
+          );
+          expect(existsSync(join(dest, 'package', 'empty-sub'))).toBe(true);
+          await verifyExtractedDaemonRuntime(dest, manifest.files, { checkExecutableBit: false });
+        }
+        removeDirForceSync(destEmpty);
+        removeDirForceSync(destExisting);
+      }
+    },
+  );
 
   it('passes literal -File script arguments with spaces and single quotes under win32', () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];

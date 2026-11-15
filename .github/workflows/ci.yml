@@ -1321,14 +1321,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime build failed.' }
           node scripts/daemon-runtime-artifacts.mjs verify `
             dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.manifest.json `
-            --expected-version $env:IMCODES_BUILD_VERSION
+            --expected-version $env:IMCODES_BUILD_VERSION `
+            --archive-only
           if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime manifest verification failed.' }
           $smokeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-smoke'
           $homeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-home'
           Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $homeRoot | Out-Null
           try {
-            Expand-Archive -LiteralPath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' -DestinationPath $smokeRoot -Force
+            powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+              -File .\scripts\windows-zip-archive.ps1 `
+              -Mode Expand `
+              -SourcePath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' `
+              -DestinationPath $smokeRoot
+            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke extraction failed.' }
             & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath (Join-Path $smokeRoot 'node.exe') -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
             $prevHome = $env:IMCODES_HOME
             $env:IMCODES_HOME = Join-Path $homeRoot '.imcodes'

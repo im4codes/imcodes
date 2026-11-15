@@ -504,6 +504,7 @@ async function main() {
       buildVersion,
       authenticodeSignerSha256,
       macosSigningIdentitySha1,
+      filesDocument: preFilesDoc,
     });
     await writeDaemonRuntimeJson(manifestPath, manifest);
 

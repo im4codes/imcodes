@@ -338,9 +338,10 @@ export function pruneStagedNodeModulesForTarget(nodeModulesDir, target, options 
 export async function collectBundleFileEntries(bundleRoot, options = {}) {
   const ignoreRelativePaths = new Set(options.ignoreRelativePaths ?? [DAEMON_RUNTIME_FILES_FILENAME]);
   const rootReal = realpathSync(resolve(bundleRoot));
-  const collected = [];
+  const rootPrefix = rootReal.endsWith(sep) ? rootReal : rootReal + sep;
+  const pending = [];
 
-  const walk = async (dirAbs, relPrefix) => {
+  const walk = (dirAbs, relPrefix) => {
     const names = readdirSync(dirAbs).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     for (const name of names) {
       const childAbs = join(dirAbs, name);
@@ -350,7 +351,7 @@ export async function collectBundleFileEntries(bundleRoot, options = {}) {
       }
       const relPosix = relPrefix ? `${relPrefix}/${name}` : name;
       if (lst.isDirectory()) {
-        await walk(childAbs, relPosix);
+        walk(childAbs, relPosix);
         continue;
       }
       if (!lst.isFile()) {
@@ -358,20 +359,37 @@ export async function collectBundleFileEntries(bundleRoot, options = {}) {
       }
       sanitizeBundleRelativePath(relPosix);
       if (ignoreRelativePaths.has(relPosix)) continue;
-      const rootPrefix = rootReal.endsWith(sep) ? rootReal : rootReal + sep;
       if (!realpathSync(childAbs).startsWith(rootPrefix)) {
         throw new Error(`daemon-runtime bundle entry escapes root: ${relPosix}`);
       }
-      collected.push({
+      pending.push({
+        absPath: childAbs,
         path: relPosix,
         size: lst.size,
-        sha256: await sha256File(childAbs),
         executable: (lst.mode & 0o111) !== 0,
       });
     }
   };
 
-  await walk(rootReal, '');
+  walk(rootReal, '');
+  const collected = new Array(pending.length);
+  const workerCount = Math.max(1, Math.min(options.concurrency ?? 16, pending.length || 1));
+  let nextIndex = 0;
+  const worker = async () => {
+    while (true) {
+      const idx = nextIndex;
+      nextIndex += 1;
+      if (idx >= pending.length) return;
+      const item = pending[idx];
+      collected[idx] = {
+        path: item.path,
+        size: item.size,
+        sha256: await sha256File(item.absPath),
+        executable: item.executable,
+      };
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
   collected.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return collected;
 }
@@ -466,6 +484,7 @@ export async function createDaemonRuntimeManifest({
   buildVersion,
   authenticodeSignerSha256,
   macosSigningIdentitySha1,
+  filesDocument: precomputedFilesDocument,
 }) {
   const target = parseDaemonRuntimeTarget(os, arch);
   if (authenticodeSignerSha256 !== undefined
@@ -477,18 +496,36 @@ export async function createDaemonRuntimeManifest({
     throw new Error('invalid macOS signing identity SHA-1');
   }
 
-  const filesDocument = await createDaemonRuntimeFilesDocument({
-    bundleRoot,
-    os: target.os,
-    arch: target.arch,
-    nodeVersion,
-    nodeProvider,
-    nodeArchive,
-    nodeArchiveSha256,
-    nodeBinarySha256,
-    buildCommit,
-    buildVersion,
-  });
+  let filesDocument;
+  if (precomputedFilesDocument) {
+    const expectedVersion = normalizeNodeExeBuildVersion(buildVersion);
+    const expectedCommit = typeof buildCommit === 'string' ? buildCommit.trim() : '';
+    if (
+      !isRecord(precomputedFilesDocument)
+      || precomputedFilesDocument.target?.os !== target.os
+      || precomputedFilesDocument.target?.arch !== target.arch
+      || precomputedFilesDocument.toolchain?.nodeVersion !== nodeVersion
+      || precomputedFilesDocument.toolchain?.nodeProvider !== nodeProvider
+      || precomputedFilesDocument.build?.commit !== expectedCommit
+      || precomputedFilesDocument.build?.version !== expectedVersion
+    ) {
+      throw new Error('precomputed filesDocument metadata does not match manifest arguments');
+    }
+    filesDocument = precomputedFilesDocument;
+  } else {
+    filesDocument = await createDaemonRuntimeFilesDocument({
+      bundleRoot,
+      os: target.os,
+      arch: target.arch,
+      nodeVersion,
+      nodeProvider,
+      nodeArchive,
+      nodeArchiveSha256,
+      nodeBinarySha256,
+      buildCommit,
+      buildVersion,
+    });
+  }
 
   const archiveStat = await stat(archivePath);
   if (!archiveStat.isFile() || archiveStat.size <= 0) {
