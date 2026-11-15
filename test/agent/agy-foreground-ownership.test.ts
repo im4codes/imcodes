@@ -75,6 +75,55 @@ describe('AG captured native foreground ownership', () => {
     owner.observe(row(3, 'PLANNER_RESPONSE', 'truncated prefix match ok'));
     expect((await owner.output(2))?.content).toBe('truncated prefix match ok');
   });
+  it('attributes Antigravity byte-truncated USER_REQUEST rows before the closing tag', async () => {
+    const owner = new AgyForegroundOwnership(50);
+    const identity = `<imcodes-agent-identity>\n${'identity '.repeat(15_000)}\n</imcodes-agent-identity>`;
+    const prompt = `Context instructions:\n${identity}\n\nInvestigate the vm-100 foreground attribution failure.`;
+    owner.register(1, prompt);
+    const truncated = `<USER_REQUEST>\n${prompt.slice(0, 102_445)}\n<truncated 424,338 bytes>`;
+    owner.observe(row(1309, 'USER_INPUT', truncated, 'USER_EXPLICIT'));
+    owner.observe(row(1310, 'PLANNER_RESPONSE', 'vm-100 attribution recovered'));
+    expect((await owner.output(1))?.content).toBe('vm-100 attribution recovered');
+
+    owner.register(2, prompt);
+    owner.observe(row(1311, 'USER_INPUT', `<USER_REQUEST>\r\n${prompt.slice(0, 180)}\r\n<truncated 1,234 bytes>\r\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    owner.observe(row(1312, 'PLANNER_RESPONSE', 'closed native truncation recovered'));
+    expect((await owner.output(2))?.content).toBe('closed native truncation recovered');
+  });
+  it('keeps byte-truncated companion echoes bound and rejects bare unclosed wrappers', async () => {
+    const owner = new AgyForegroundOwnership(50);
+    const header = `Context instructions:\n${'policy '.repeat(40)}`;
+    const primary = `${header}\n\nRun the requested foreground task.`;
+    const companion = `${header}\n\nRun the requested foreground task.`;
+    owner.register(1, primary, false, undefined, [companion]);
+    owner.observe(row(1, 'USER_INPUT', `<USER_REQUEST>\r\n${primary.slice(0, 150)}\r\n<truncated 1,234 bytes>\n`, 'USER_EXPLICIT'));
+    owner.observe(row(2, 'USER_INPUT', `<USER_REQUEST>\n${companion.slice(0, 150)}\n<truncated 987 bytes>`, 'USER_EXPLICIT'));
+    owner.observe(row(3, 'PLANNER_RESPONSE', 'companion lane remains active'));
+    expect((await owner.output(1))?.content).toBe('companion lane remains active');
+
+    const malformed = new AgyForegroundOwnership(20);
+    malformed.register(1, primary);
+    malformed.observe(row(1, 'USER_INPUT', `<USER_REQUEST>${primary}`, 'USER_EXPLICIT'));
+    malformed.observe(row(2, 'PLANNER_RESPONSE', 'must not bind'));
+    expect(await malformed.output(1)).toBeUndefined();
+  });
+  it('keeps native truncated prefix ambiguity fail-closed and accepts nested literal tags', async () => {
+    const shared = `Context instructions:\n${'shared header '.repeat(20)}`;
+    const ambiguous = new AgyForegroundOwnership(20);
+    ambiguous.register(1, `${shared}\n\nExecute ALPHA now.`);
+    ambiguous.register(2, `${shared}\n\nExecute BETA now.`);
+    ambiguous.observe(row(1, 'USER_INPUT', `<USER_REQUEST>\n${shared.slice(0, 180)}\n<truncated 1,234 bytes>`, 'USER_EXPLICIT'));
+    ambiguous.observe(row(2, 'PLANNER_RESPONSE', 'ambiguous native truncation'));
+    expect(await ambiguous.output(1)).toBeUndefined();
+    expect(await ambiguous.output(2)).toBeUndefined();
+
+    const nested = new AgyForegroundOwnership(50);
+    const nestedPrompt = `${shared}\n\nPreserve this literal <USER_REQUEST>example</USER_REQUEST> while investigating.`;
+    nested.register(1, nestedPrompt);
+    nested.observe(row(1, 'USER_INPUT', `<USER_REQUEST>\r\n${nestedPrompt.slice(0, 180)}\r\n<truncated 2,000 bytes>\n`, 'USER_EXPLICIT'));
+    nested.observe(row(2, 'PLANNER_RESPONSE', 'nested literal accepted'));
+    expect((await nested.output(1))?.content).toBe('nested literal accepted');
+  });
   it('does not mis-bind similar prefixes with divergent suffixes or ambiguous multiple pending prompts', async () => {
     const owner = new AgyForegroundOwnership(20);
     const sharedPrefix = 'Shared system context header block for agent session '.repeat(3); // > 150 chars

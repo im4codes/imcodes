@@ -13,7 +13,7 @@ const PREFIX_MIN_LENGTH = 80;
 const PREFIX_PROBE_LENGTH = 160;
 const USER_REQUEST_TAG_RE = /<\/?USER_REQUEST>/gi;
 const TRAILING_META_RE = /^\s*(?:<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)\b[\s\S]*)?$/i;
-const TRUNCATION_SUFFIX_RE = /(?:\s*\.{3,}|\s*…|\s*\[truncated\])+$/i;
+const TRUNCATION_SUFFIX_RE = /(?:\s*\.{3,}|\s*…|\s*\[truncated\]|\s*<truncated(?:\s+[\d,]+\s+bytes)?\s*>)+$/i;
 
 interface PromptAlias {
   text: string;
@@ -78,6 +78,13 @@ function parseNativeInputEnvelope(content: string): ParsedInputEnvelope {
     } else {
       depth++;
     }
+  }
+  // Antigravity caps oversized USER_INPUT rows and appends a terminal native
+  // truncation marker before the outer closing tag is ever written. Treat that
+  // explicit marker as a truncated wrapped envelope; bare unclosed wrappers
+  // remain invalid.
+  if (TRUNCATION_SUFFIX_RE.test(afterOpen.trim())) {
+    return { kind: 'wrapped', body: afterOpen };
   }
   return { kind: 'invalid', body: '' };
 }
