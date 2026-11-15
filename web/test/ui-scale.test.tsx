@@ -3,8 +3,9 @@
  */
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const termMockState = vi.hoisted(() => ({
   instances: [] as Array<{
@@ -413,7 +414,14 @@ describe('whole-page UI scale (%) setting & onboarding', () => {
       'uiScalePromptClose',
     ];
     for (const locale of locales) {
-      const json = JSON.parse(readFileSync(resolve(process.cwd(), `src/i18n/locales/${locale}.json`), 'utf8')) as {
+      const localeCandidates = [
+        fileURLToPath(new URL(`../src/i18n/locales/${locale}.json`, import.meta.url)),
+        resolve(process.cwd(), `src/i18n/locales/${locale}.json`),
+        resolve(process.cwd(), `web/src/i18n/locales/${locale}.json`),
+      ];
+      const localePath = localeCandidates.find((candidate) => existsSync(candidate));
+      if (!localePath) throw new Error(`Missing locale file: ${locale}`);
+      const json = JSON.parse(readFileSync(localePath, 'utf8')) as {
         chat: { font: Record<string, string> };
         settings: Record<string, string>;
       };

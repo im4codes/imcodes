@@ -1553,8 +1553,15 @@ rl.on('line', (line) => {
       }) + '\n',
     );
 
-    // Sibling MCP update arrives AFTER its transcript row; real-child must NOT receive MCPPARALLEL_RESULT.
-    await new Promise((r) => setTimeout(r, 150));
+    // Sibling MCP update arrives AFTER both transcript rows have been consumed;
+    // real-child must NOT receive MCPPARALLEL_RESULT. A fixed sleep is flaky on
+    // loaded macOS runners, so wait on the reader's observable native order.
+    await vi.waitFor(() => {
+      // The GENERIC row consumes send_list_targets immediately; the remaining
+      // invoke_subagent order entry proves both transcript rows were handled.
+      expect(state.agyNativeToolOrder?.map((entry: { name: string }) => entry.name))
+        .toEqual(['invoke_subagent']);
+    }, { timeout: 5000 });
     update({
       sessionUpdate: 'tool_call_update',
       toolCallId: 'f1-list-1',

@@ -702,7 +702,9 @@ describe('RemoteDesktopWorkspace', () => {
     await act(async () => { fullscreen.setElement(null); });
     expect(screen.getByRole('button', { name: 'remote_desktop.workspace_fullscreen' })
       .getAttribute('aria-pressed')).toBe('false');
-    expect(workspaceCss).toMatch(/\.remote-desktop-workspace:fullscreen[\s\S]*height:\s*100vh/);
+    const fullscreenRule = /\.remote-desktop-workspace:fullscreen\s*\{([^}]*)\}/.exec(workspaceCss)?.[1] ?? '';
+    expect(fullscreenRule).toMatch(/width:\s*var\(--imcodes-ui-vw,\s*100vw\)/);
+    expect(fullscreenRule).toMatch(/height:\s*var\(--imcodes-ui-(?:dvh|vh),\s*100(?:dvh|vh)\)/);
   });
 
   it('offers no fullscreen button in a browser that would refuse it', () => {
