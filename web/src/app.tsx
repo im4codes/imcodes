@@ -369,6 +369,7 @@ import {
   isSubSessionBarInputTarget,
 } from './mobile-keyboard.js';
 import { applyNativePlatformClasses, isNativeMacDesktop, shouldUseIosMacTextScale } from './native-platform.js';
+import { useMacInputInset } from './mac-input-inset.js';
 import { boundedVisualViewportHeight, createSettledViewportUpdater } from './visual-viewport.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
@@ -1519,6 +1520,7 @@ function InternalMainApp() {
   }, []);
 
   const isNativeMac = nativePlatformSnapshot.macDesktop;
+  useMacInputInset(isNativeMac);
 
   // Keep layout height within visual viewport on mobile (keyboard-aware)
   useEffect(() => {

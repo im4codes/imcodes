@@ -9,12 +9,24 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     var window: UIWindow?
     private var didRegisterLocalPlugins = false
     private var configuredWebViewId: ObjectIdentifier?
+    private var keyboardObserverTokens: [NSObjectProtocol] = []
+    private var windowBoundsObservation: NSKeyValueObservation?
+    private var observedWindowId: ObjectIdentifier?
+    private var lastKeyboardScreenFrame: CGRect?
+    private var lastMacBottomInsetPt: Double = 0
     // #080d16 (--chrome-bg) — prevents light/black host flashes during macOS Space transitions.
     private static let macHostBackgroundColor = UIColor(red: 8.0 / 255.0, green: 13.0 / 255.0, blue: 22.0 / 255.0, alpha: 1.0)
 
     override init() {
         super.init()
         Self.reconcileCachedOtaBundles()
+    }
+
+    deinit {
+        for token in keyboardObserverTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        windowBoundsObservation?.invalidate()
     }
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
@@ -90,8 +102,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     }
 
     func applicationWillResignActive(_ application: UIApplication) {
-        // Sent when the application is about to move from active to inactive state. This can occur for certain types of temporary interruptions (such as an incoming phone call or SMS message) or when the user quits the application and it begins the transition to the background state.
-        // Use this method to pause ongoing tasks, disable timers, and invalidate graphics rendering callbacks. Games should use this method to pause the game.
+        if Self.currentMacHostFlags().isMacDesktop {
+            lastKeyboardScreenFrame = nil
+            publishMacBottomInset(0)
+        }
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
@@ -305,11 +319,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             })();
             """)
         }
+        if hostFlags.isMacDesktop {
+            scripts.append(Self.buildMacBottomInsetScript(insetPoints: lastMacBottomInsetPt))
+        }
         return scripts.joined(separator: "\n")
     }
 
     private func refreshMacHostSignal(_ webView: WKWebView) {
         self.configureMacHostAppearance(webView: webView)
+        self.observeMacWindowBoundsIfNeeded()
+        Self.clearInputAssistantItems(for: webView)
         let signalScript = buildNativeHostSignalScript()
         if !signalScript.isEmpty {
             webView.evaluateJavaScript(signalScript, completionHandler: nil)
@@ -318,6 +337,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
     private func configureInputChrome(_ webView: WKWebView?) {
         self.configureMacHostAppearance(webView: webView)
+        self.installInputChromeObserversIfNeeded()
+        self.observeMacWindowBoundsIfNeeded()
         let signalScript = buildNativeHostSignalScript()
         if !signalScript.isEmpty {
             let userScript = WKUserScript(source: signalScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)
@@ -325,9 +346,220 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             webView?.evaluateJavaScript(signalScript, completionHandler: nil)
         }
         guard #available(iOS 14.0, *) else { return }
-        webView?.inputAssistantItem.leadingBarButtonGroups = []
-        webView?.inputAssistantItem.trailingBarButtonGroups = []
+        Self.clearInputAssistantItems(for: webView)
         webView?.scrollView.keyboardDismissMode = .interactive
+    }
+
+    /// Recursively clears `UITextInputAssistantItem` shortcut bar button groups across
+    /// `WKWebView`, its `scrollView`, and all descendant subviews (including `WKContentView`,
+    /// which becomes the actual first responder when HTML inputs focus) using public UIKit APIs only.
+    static func clearInputAssistantItems(for webView: WKWebView?) {
+        guard #available(iOS 14.0, *), let webView else { return }
+        var visited = Set<ObjectIdentifier>()
+        var stack: [UIView] = [webView, webView.scrollView]
+        while let current = stack.popLast() {
+            let viewId = ObjectIdentifier(current)
+            guard visited.insert(viewId).inserted else { continue }
+            let assistant = current.inputAssistantItem
+            assistant.leadingBarButtonGroups = []
+            assistant.trailingBarButtonGroups = []
+            assistant.allowsHidingShortcuts = true
+            stack.append(contentsOf: current.subviews)
+        }
+    }
+
+    /// Computes bottom-docked keyboard / input-assistant overlap in `rootVC.view` points on Mac.
+    /// Detached floating IME candidate popups (not touching the bottom edge or narrow width) return `0`.
+    static func computeMacBottomOverlapPoints(
+        viewBounds: CGRect,
+        convertedKeyboardFrame: CGRect,
+        bottomEdgeTolerance: CGFloat = 2.0
+    ) -> CGFloat {
+        guard !viewBounds.isNull, !viewBounds.isInfinite,
+              viewBounds.width > 0, viewBounds.height > 0,
+              !convertedKeyboardFrame.isNull, !convertedKeyboardFrame.isInfinite,
+              convertedKeyboardFrame.width > 0, convertedKeyboardFrame.height > 0 else {
+            return 0
+        }
+        let intersection = viewBounds.intersection(convertedKeyboardFrame)
+        guard !intersection.isNull, !intersection.isEmpty,
+              intersection.width > 0, intersection.height > 0 else {
+            return 0
+        }
+        guard intersection.maxY >= viewBounds.maxY - bottomEdgeTolerance else {
+            return 0
+        }
+        guard intersection.width >= viewBounds.width * 0.5 else {
+            return 0
+        }
+        let overlap = max(0, viewBounds.maxY - intersection.minY)
+        guard overlap >= 1.0, overlap < viewBounds.height * 0.8 else {
+            return 0
+        }
+        return (overlap * 100).rounded() / 100
+    }
+
+    static func buildMacBottomInsetScript(insetPoints: Double) -> String {
+        let sanitized = insetPoints.isFinite && insetPoints > 0
+            ? (insetPoints * 100).rounded() / 100
+            : 0
+        let formatted = String(format: "%.2f", sanitized)
+        return """
+        (function(){
+          var next = Number(\(formatted));
+          var prev = typeof window.__IMCODES_MAC_BOTTOM_INSET__ === 'number' ? window.__IMCODES_MAC_BOTTOM_INSET__ : -1;
+          window.__IMCODES_MAC_BOTTOM_INSET__ = next;
+          if (Math.abs(prev - next) > 0.01) {
+            window.dispatchEvent(new CustomEvent('imcodes:mac-bottom-inset', { detail: { inset: next } }));
+          }
+        })();
+        """
+    }
+
+    private func currentBridgeWebView() -> WKWebView? {
+        (window?.rootViewController as? CAPBridgeViewController)?.bridge?.webView
+    }
+
+    private func publishMacBottomInset(_ insetPoints: Double) {
+        let sanitized = insetPoints.isFinite && insetPoints > 0
+            ? (insetPoints * 100).rounded() / 100
+            : 0
+        lastMacBottomInsetPt = sanitized
+        guard Self.currentMacHostFlags().isMacDesktop,
+              let webView = currentBridgeWebView() else {
+            return
+        }
+        let script = Self.buildMacBottomInsetScript(insetPoints: sanitized)
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    private func observeMacWindowBoundsIfNeeded() {
+        guard Self.currentMacHostFlags().isMacDesktop,
+              let win = window else {
+            return
+        }
+        let winId = ObjectIdentifier(win)
+        guard observedWindowId != winId else { return }
+        observedWindowId = winId
+        windowBoundsObservation?.invalidate()
+        windowBoundsObservation = win.observe(\.bounds, options: [.old, .new]) { [weak self] _, change in
+            guard change.oldValue?.size != change.newValue?.size else { return }
+            DispatchQueue.main.async {
+                self?.recomputeAndPublishMacBottomInset()
+            }
+        }
+    }
+
+    private func recomputeAndPublishMacBottomInset() {
+        guard Self.currentMacHostFlags().isMacDesktop else { return }
+        guard let rootView = window?.rootViewController?.view,
+              let win = rootView.window ?? window,
+              let screenFrame = lastKeyboardScreenFrame else {
+            publishMacBottomInset(0)
+            return
+        }
+        let convertedFrame = rootView.convert(screenFrame, from: win.screen.coordinateSpace)
+        let overlapPt = Double(Self.computeMacBottomOverlapPoints(
+            viewBounds: rootView.bounds,
+            convertedKeyboardFrame: convertedFrame
+        ))
+        if overlapPt <= 0 {
+            lastKeyboardScreenFrame = nil
+        }
+        publishMacBottomInset(overlapPt)
+    }
+
+    private func handleMacKeyboardFrameNotification(_ notification: Notification) {
+        guard Self.currentMacHostFlags().isMacDesktop else { return }
+        guard let frameValue = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else {
+            return
+        }
+        lastKeyboardScreenFrame = frameValue.cgRectValue
+        recomputeAndPublishMacBottomInset()
+    }
+
+    private func installInputChromeObserversIfNeeded() {
+        guard keyboardObserverTokens.isEmpty else { return }
+        let center = NotificationCenter.default
+
+        let willShow = center.addObserver(
+            forName: UIResponder.keyboardWillShowNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            Self.clearInputAssistantItems(for: self.currentBridgeWebView())
+            DispatchQueue.main.async { [weak self] in
+                Self.clearInputAssistantItems(for: self?.currentBridgeWebView())
+            }
+            self.handleMacKeyboardFrameNotification(notification)
+        }
+
+        let willChange = center.addObserver(
+            forName: UIResponder.keyboardWillChangeFrameNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            Self.clearInputAssistantItems(for: self.currentBridgeWebView())
+            self.handleMacKeyboardFrameNotification(notification)
+        }
+
+        let didChange = center.addObserver(
+            forName: UIResponder.keyboardDidChangeFrameNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            Self.clearInputAssistantItems(for: self.currentBridgeWebView())
+            self.handleMacKeyboardFrameNotification(notification)
+        }
+
+        let willHide = center.addObserver(
+            forName: UIResponder.keyboardWillHideNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.lastKeyboardScreenFrame = nil
+            self.publishMacBottomInset(0)
+        }
+
+        let didHide = center.addObserver(
+            forName: UIResponder.keyboardDidHideNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.lastKeyboardScreenFrame = nil
+            self.publishMacBottomInset(0)
+        }
+
+        let textFieldBegin = center.addObserver(
+            forName: UITextField.textDidBeginEditingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Self.clearInputAssistantItems(for: self?.currentBridgeWebView())
+        }
+
+        let textViewBegin = center.addObserver(
+            forName: UITextView.textDidBeginEditingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Self.clearInputAssistantItems(for: self?.currentBridgeWebView())
+        }
+
+        keyboardObserverTokens = [
+            willShow,
+            willChange,
+            didChange,
+            willHide,
+            didHide,
+            textFieldBegin,
+            textViewBegin
+        ]
     }
 
     private static func nativeModifierName(for keyCode: UIKeyboardHIDUsage) -> String? {

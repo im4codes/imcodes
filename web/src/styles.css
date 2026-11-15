@@ -22095,6 +22095,58 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
   }
 }
 
+/* Mac native shell ("Designed for iPad" / Mac Catalyst): when macOS displays a
+   bottom input-assistant / IME bar while an input is focused, lift the entire
+   desktop shell and bottom-pinned fixed overlays above `--imcodes-mac-bottom-inset`
+   without activating mobile `.kb-open` / `.input-focused` chrome hiding. */
+html.native-mac-desktop .layout {
+  height: calc(var(--imcodes-ui-vh, 100vh) - env(safe-area-inset-top, 0px) - var(--imcodes-mac-bottom-inset, 0px));
+  height: calc(var(--imcodes-ui-dvh, 100dvh) - env(safe-area-inset-top, 0px) - var(--imcodes-mac-bottom-inset, 0px));
+}
+
+html.native-mac-desktop .login-page {
+  height: calc(var(--imcodes-ui-vh, 100vh) - var(--imcodes-mac-bottom-inset, 0px));
+  height: calc(var(--imcodes-ui-dvh, 100dvh) - var(--imcodes-mac-bottom-inset, 0px));
+}
+
+html.native-mac-desktop .toast-container {
+  bottom: calc(80px + var(--imcodes-mac-bottom-inset, 0px));
+}
+
+html.native-mac-desktop .feature-announcement {
+  bottom: calc(18px + var(--sab, 0px) + var(--imcodes-mac-bottom-inset, 0px));
+}
+
+html.native-mac-desktop .download-transfer-center {
+  bottom: calc(14px + var(--imcodes-mac-bottom-inset, 0px));
+}
+
+html.native-mac-desktop .capability-global-operation {
+  bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + var(--imcodes-mac-bottom-inset, 0px));
+}
+
+html.native-mac-desktop .remote-desktop-minimized-dock {
+  bottom: calc(14px + env(safe-area-inset-bottom, 0px) + var(--imcodes-mac-bottom-inset, 0px));
+}
+
+html.native-mac-desktop .remote-desktop-window-blocked {
+  bottom: calc(24px + var(--imcodes-mac-bottom-inset, 0px));
+}
+
+@media (max-width: 640px) {
+  html.native-mac-desktop .qp {
+    bottom: calc(var(--kbh, 0px) + var(--imcodes-mac-bottom-inset, 0px) + env(safe-area-inset-bottom, 0px) + 12px);
+  }
+
+  html.native-mac-desktop .menu-dropdown-p2p {
+    bottom: calc(env(safe-area-inset-bottom, 0px) + var(--imcodes-mac-bottom-inset, 0px) + 64px);
+  }
+
+  html.native-mac-desktop .capability-global-operation {
+    bottom: calc(max(72px, calc(env(safe-area-inset-bottom, 0px) + 64px)) + var(--imcodes-mac-bottom-inset, 0px));
+  }
+}
+
 /* Android WebView (with native setTextZoom(100)): compact mobile sizing on narrow phones (<= 420 CSS px)
    to match iOS density (~7 sub-session cards across ~360px, unclipped top-bar controls) without CSS zoom. */
 @media (max-width: 420px) {
