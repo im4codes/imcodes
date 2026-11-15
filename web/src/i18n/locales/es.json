@@ -1106,7 +1106,14 @@
     },
     "capacity_retrying": "Modelo al límite de capacidad: reintentando automáticamente (cada ≤15 s)",
     "state_error": "Error de sesión",
-    "state_error_detail": "Error: {{error}}"
+    "state_error_detail": "Error: {{error}}",
+    "compactHijack": {
+      "title": "Compact Hijack (/handoff)",
+      "hint": "Anula el valor global cuando se detecta compactación automática en esta sesión propia.",
+      "inherit": "Heredar valor global",
+      "on": "Activado (usar /handoff)",
+      "off": "Desactivado (compactación nativa)"
+    }
   },
   "server": {
     "devices": "Dispositivos",
@@ -2366,7 +2373,10 @@
         "disabled": "Desactivado",
         "reset_aria": "Restablecer tecla modificadora de doble pulsación para voz en Mac"
       }
-    }
+    },
+    "compact_hijack_title": "Compact Hijack (/handoff)",
+    "compact_hijack_toggle_label": "Tomar control automático de la compactación mediante /handoff",
+    "compact_hijack_desc": "Valor predeterminado global para sus daemons propios. Cuando se detecta compactación automática, abre una conversación nueva con el paquete de relevo y continúa. /compact manual no cambia."
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

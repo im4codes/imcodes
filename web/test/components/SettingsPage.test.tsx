@@ -42,6 +42,9 @@ const { MockApiError } = vi.hoisted(() => {
 vi.mock('../../src/api.js', () => ({
   ApiError: MockApiError,
   apiFetch: vi.fn().mockResolvedValue({ ok: false }),
+  getUserPref: vi.fn().mockResolvedValue(null),
+  saveUserPref: vi.fn().mockResolvedValue(undefined),
+  onUserPrefChanged: () => () => undefined,
   updateDisplayName: (...args: unknown[]) => updateDisplayNameMock(...args),
   passwordChange: (...args: unknown[]) => passwordChangeMock(...args),
   passkeyVerifyBegin: (...args: unknown[]) => passkeyVerifyBeginMock(...args),

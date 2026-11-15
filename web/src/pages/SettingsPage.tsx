@@ -44,6 +44,12 @@ import {
   UI_SCALE_STEP,
   useUiScale,
 } from '../ui-scale.js';
+import { usePref } from '../hooks/usePref.js';
+import {
+  COMPACT_HIJACK_GLOBAL_PREF_KEY,
+  normalizeCompactHijackGlobalConfig,
+  type CompactHijackGlobalConfig,
+} from '@shared/compact-hijack.js';
 
 interface PushServerItem {
   id: string;
@@ -112,6 +118,25 @@ export function SettingsPage({
   const [confirmPw, setConfirmPw] = useState('');
   const [pwSaving, setPwSaving] = useState(false);
   const [pwMsg, setPwMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const compactHijackPref = usePref<CompactHijackGlobalConfig>(COMPACT_HIJACK_GLOBAL_PREF_KEY, {
+    parse: (raw) => normalizeCompactHijackGlobalConfig(raw),
+    serialize: (val) => val,
+  });
+  const compactHijackEnabled = compactHijackPref.value?.enabled ?? false;
+  const [compactHijackSaving, setCompactHijackSaving] = useState(false);
+  const [compactHijackError, setCompactHijackError] = useState<string | null>(null);
+
+  const handleToggleCompactHijack = async () => {
+    setCompactHijackSaving(true);
+    setCompactHijackError(null);
+    try {
+      await compactHijackPref.save({ enabled: !compactHijackEnabled });
+    } catch (err) {
+      setCompactHijackError(err instanceof Error ? err.message : t('common.error'));
+    } finally {
+      if (mountedRef.current) setCompactHijackSaving(false);
+    }
+  };
 
   const [pushPreferences, setPushPreferences] = useState<PushNotificationType[]>(() =>
     getLocalPushNotificationPreferences(),
@@ -670,6 +695,31 @@ export function SettingsPage({
                     </div>
                   </div>
                 </div>
+              </div>
+
+              <div class="settings-card" data-testid="compact-hijack-global-settings-card">
+                <h2 class="settings-card-heading">
+                  {t('settings.compact_hijack_title')}
+                </h2>
+                <label class="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    aria-label={t('settings.compact_hijack_toggle_label')}
+                    checked={compactHijackEnabled}
+                    disabled={compactHijackSaving}
+                    onChange={() => { void handleToggleCompactHijack(); }}
+                    style={checkboxStyle}
+                  />
+                  <div style={checkboxTextWrapStyle}>
+                    <div style={checkboxTitleStyle}>{t('settings.compact_hijack_toggle_label')}</div>
+                    <div style={checkboxDescStyle}>{t('settings.compact_hijack_desc')}</div>
+                  </div>
+                </label>
+                {compactHijackError && (
+                  <div style={{ color: '#f87171', fontSize: '12px', marginTop: '8px' }}>
+                    {compactHijackError}
+                  </div>
+                )}
               </div>
 
               <div class="settings-card">

@@ -54,6 +54,13 @@ import {
   normalizeSharedContextRuntimeBackend,
 } from '../../../shared/shared-context-runtime-config.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import {
+  buildTransportConfigWithCompactHijack,
+  extractSessionCompactHijackMode,
+  hasCompactHijackField,
+  hasInvalidCompactHijackSetting,
+  stripCompactHijackFromTransportConfig,
+} from '../../../shared/compact-hijack.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
 import {
@@ -437,7 +444,12 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     return c.json({ error: 'relay_failed' }, 502);
   }
 
-  return c.json({ ok: true, transportConfig: nextTransportConfig });
+  return c.json({
+    ok: true,
+    transportConfig: access.actor.kind === 'share'
+      ? stripCompactHijackFromTransportConfig(nextTransportConfig)
+      : nextTransportConfig,
+  });
 });
 
 async function resolveSupervisorDefaultsOwner(
@@ -693,9 +705,10 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   // fields, but no transport config (including an apparent `off`) crosses this
   // generic gate. Whole-server participants intentionally follow the owner path.
   if (access.actor.kind === 'share'
-    && !isWholeServerShareAccess(access)
     && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
-    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+    if (!isWholeServerShareAccess(access) || hasCompactHijackField(body.transportConfig)) {
+      return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+    }
   }
 
   const fields: {
@@ -718,12 +731,29 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   if ('requestedModel' in body) fields.requested_model = body.requestedModel ?? null;
   if ('activeModel' in body) fields.active_model = body.activeModel ?? null;
   if ('effort' in body) fields.effort = body.effort ?? null;
-  if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
 
-  if (hasInvalidSessionSupervisionSnapshot(body.transportConfig ?? null)) {
+  let nextTransportConfig = body.transportConfig;
+  if ('transportConfig' in body) {
+    if (hasInvalidCompactHijackSetting(body.transportConfig ?? null)) {
+      return c.json({ error: 'invalid_compact_hijack_config' }, 400);
+    }
+    if (access.actor.kind === 'share') {
+      const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
+      const existingMode = extractSessionCompactHijackMode(parseStoredTransportConfig(current?.transport_config ?? null));
+      nextTransportConfig = buildTransportConfigWithCompactHijack(body.transportConfig ?? null, existingMode);
+    } else if (body.transportConfig != null) {
+      nextTransportConfig = buildTransportConfigWithCompactHijack(
+        body.transportConfig,
+        extractSessionCompactHijackMode(body.transportConfig),
+      );
+    }
+    fields.transport_config = nextTransportConfig ?? null;
+  }
+
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
     return c.json({ error: 'invalid_supervision_config' }, 400);
   }
-  const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
+  const requestedSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
   if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
     const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
     if (!current || !canSessionRoleOwnAutomaticSupervision(current.role)) {
@@ -756,7 +786,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         ...(body.requestedModel !== undefined ? { requestedModel: body.requestedModel } : {}),
         ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
         ...(body.effort !== undefined ? { effort: body.effort } : {}),
-        ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+        ...(body.transportConfig !== undefined ? { transportConfig: nextTransportConfig ?? null } : {}),
         ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
@@ -782,7 +812,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
         type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
         sessionName,
-        transportConfig: body.transportConfig ?? null,
+        transportConfig: nextTransportConfig ?? null,
         ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {

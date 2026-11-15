@@ -235,7 +235,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import { hasPinnedPanelServerProvenance, type PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import { canSharedActorControlSession, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import { canSharedActorControlSession, isShareScopedState, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
 import {
   clearSharedTabRestoreMarker,
   findRememberedSharedEntry,
@@ -2979,7 +2979,7 @@ function InternalMainApp() {
 
   const [showSubDialog, setShowSubDialog] = useState(false);
   const [poolAddTarget, setPoolAddTarget] = useState<SupervisionExecutionPoolKind | null>(null);
-  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; modelDisplay?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('@shared/supervision-config.js').SupervisionMode | null; openIntent?: SessionSettingsOpenIntent; canControlAutomaticSupervision: boolean } | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; modelDisplay?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('@shared/supervision-config.js').SupervisionMode | null; openIntent?: SessionSettingsOpenIntent; canControlAutomaticSupervision: boolean; canConfigureCompactHijack: boolean } | null>(null);
   const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
@@ -9093,6 +9093,7 @@ function InternalMainApp() {
                 supervisionMode: session.supervisionMode ?? null,
                 canControlAutomaticSupervision: canSharedActorControlSession(session.sharedState)
                   && canSessionRoleOwnAutomaticSupervision(session.role),
+                canConfigureCompactHijack: !selectedServerIsSharedIn && !selectedShareTarget && !isShareScopedState(session.sharedState),
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
@@ -9212,7 +9213,7 @@ function InternalMainApp() {
                 onStopProject={handleStopProject}
                 onRestart={() => handleRestartProject(s.project)}
                 onRenameSession={() => setRenameRequest(s.name)}
-                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, modelDisplay: s.modelDisplay, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, supervisionMode: s.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: canSharedActorControlSession(s.sharedState) && canSessionRoleOwnAutomaticSupervision(s.role) })}
+                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, modelDisplay: s.modelDisplay, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, supervisionMode: s.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: canSharedActorControlSession(s.sharedState) && canSessionRoleOwnAutomaticSupervision(s.role), canConfigureCompactHijack: !selectedServerIsSharedIn && !selectedShareTarget && !isShareScopedState(s.sharedState) })}
                 onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
@@ -10281,7 +10282,7 @@ function InternalMainApp() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
-              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, modelDisplay: sub.modelDisplay, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, supervisionMode: sub.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: false })}
+              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, modelDisplay: sub.modelDisplay, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, supervisionMode: sub.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: false, canConfigureCompactHijack: !selectedServerIsSharedIn && !selectedShareTarget })}
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
@@ -10507,6 +10508,7 @@ function InternalMainApp() {
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
           canControlAutomaticSupervision={settingsTarget.canControlAutomaticSupervision}
+          canConfigureCompactHijack={settingsTarget.canConfigureCompactHijack}
           transportConfig={settingsTarget.transportConfig}
           supervisionMode={settingsTarget.supervisionMode}
           sessionInstanceId={settingsTarget.sessionInstanceId}

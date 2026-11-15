@@ -305,6 +305,12 @@ import {
   type MemoryFeatureFlagResolutionLayers,
   type MemoryFeatureFlagValues,
 } from '../../../shared/feature-flags.js';
+import {
+  COMPACT_HIJACK_GLOBAL_PREF_KEY,
+  COMPACT_HIJACK_MSG,
+  parseCompactHijackGlobalConfigJson,
+  type CompactHijackGlobalConfig,
+} from '../../../shared/compact-hijack.js';
 import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 import {
   MSG_COMMAND_ACK,
@@ -5810,6 +5816,44 @@ export class WsBridge {
     }));
   }
 
+  private async readUserCompactHijackGlobalConfig(userId: string): Promise<CompactHijackGlobalConfig> {
+    if (!this.db) return { enabled: false };
+    return parseCompactHijackGlobalConfigJson(await getUserPref(this.db, userId, COMPACT_HIJACK_GLOBAL_PREF_KEY));
+  }
+
+  private sendCompactHijackConfigApply(config: CompactHijackGlobalConfig): void {
+    this.sendToDaemon(JSON.stringify({
+      type: COMPACT_HIJACK_MSG.APPLY,
+      enabled: config.enabled === true,
+    }));
+  }
+
+  static async pushUserCompactHijackConfigToOnlineDaemons(
+    userId: string,
+    config: CompactHijackGlobalConfig,
+  ): Promise<void> {
+    const normalized: CompactHijackGlobalConfig = { enabled: config.enabled === true };
+    const entries = [...WsBridge.instances.values()];
+    await Promise.all(entries.map(async (bridge) => {
+      if (!bridge.authenticated || !bridge.daemonWs) return;
+      if (bridge.daemonNodeRole === NODE_ROLE.CONTROLLED) return;
+      let ownerUserId = bridge.daemonOwnerUserId;
+      if (!ownerUserId && bridge.db) {
+        const row = await bridge.db.queryOne<{ user_id?: string }>(
+          'SELECT user_id FROM servers WHERE id = $1',
+          [bridge.serverId],
+        ).catch(() => null);
+        ownerUserId = row?.user_id ?? null;
+      }
+      if (ownerUserId !== userId) return;
+      try {
+        bridge.sendCompactHijackConfigApply(normalized);
+      } catch (error) {
+        logger.warn({ err: error, serverId: bridge.serverId }, 'failed to apply global compact hijack config to daemon');
+      }
+    }));
+  }
+
   /**
    * Identity-over-the-lease access, mirroring the HTTP identity routes
    * (server/src/routes/session-mgmt.ts: resolveSupervisorDefaultsOwner +
@@ -6507,6 +6551,15 @@ export class WsBridge {
               this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
             } catch (err) {
               logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
+            }
+          })());
+          postAuthTasks.push((async () => {
+            try {
+              const compactHijackConfig = await this.readUserCompactHijackGlobalConfig(authUserId);
+              if (!isCurrentAuthConnection()) return;
+              this.sendCompactHijackConfigApply(compactHijackConfig);
+            } catch (err) {
+              logger.warn({ err, serverId: this.serverId }, 'failed to push global compact hijack config on daemon auth');
             }
           })());
           // USER-scope identity content lives on the server; push it now

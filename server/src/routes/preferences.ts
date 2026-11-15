@@ -2,6 +2,13 @@ import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { getUserPref, setUserPref, deleteUserPref } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
+import { WsBridge } from '../ws/bridge.js';
+import logger from '../util/logger.js';
+import {
+  COMPACT_HIJACK_GLOBAL_PREF_KEY,
+  isValidCompactHijackGlobalPrefPayload,
+  normalizeCompactHijackGlobalConfig,
+} from '../../../shared/compact-hijack.js';
 
 export const preferencesRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
@@ -38,12 +45,28 @@ preferencesRoutes.put('/:key', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
-  const serialized = JSON.stringify(body.value ?? null);
+  let storedValue: unknown = body.value ?? null;
+  if (key === COMPACT_HIJACK_GLOBAL_PREF_KEY) {
+    if (!isValidCompactHijackGlobalPrefPayload(storedValue)) {
+      return c.json({ error: 'invalid_compact_hijack_config' }, 400);
+    }
+    storedValue = normalizeCompactHijackGlobalConfig(storedValue);
+  }
+
+  const serialized = JSON.stringify(storedValue);
   if (Buffer.byteLength(serialized, 'utf8') > MAX_VALUE_BYTES) {
     return c.json({ error: 'value_too_large' }, 400);
   }
 
   await setUserPref(c.env.DB, userId, key, serialized);
+  if (key === COMPACT_HIJACK_GLOBAL_PREF_KEY) {
+    await WsBridge.pushUserCompactHijackConfigToOnlineDaemons(
+      userId,
+      normalizeCompactHijackGlobalConfig(storedValue),
+    ).catch((err) => {
+      logger.warn({ err, userId }, 'failed to push compact hijack preference to online daemons');
+    });
+  }
   return c.json({ ok: true });
 });
 
@@ -54,5 +77,10 @@ preferencesRoutes.delete('/:key', async (c) => {
   if (!KEY_RE.test(key)) return c.json({ error: 'invalid_key' }, 400);
 
   await deleteUserPref(c.env.DB, userId, key);
+  if (key === COMPACT_HIJACK_GLOBAL_PREF_KEY) {
+    await WsBridge.pushUserCompactHijackConfigToOnlineDaemons(userId, { enabled: false }).catch((err) => {
+      logger.warn({ err, userId }, 'failed to reset compact hijack preference on online daemons');
+    });
+  }
   return c.json({ ok: true });
 });

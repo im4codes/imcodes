@@ -1106,7 +1106,14 @@
     },
     "capacity_retrying": "モデルが混雑しています。自動で再試行中（15 秒以内の間隔）",
     "state_error": "セッションエラー",
-    "state_error_detail": "エラー: {{error}}"
+    "state_error_detail": "エラー: {{error}}",
+    "compactHijack": {
+      "title": "Compact ハイジャック (/handoff)",
+      "hint": "この所有セッションで非手動の圧縮が検知された際の動作を上書きします。",
+      "inherit": "グローバル設定を継承",
+      "on": "オン（/handoff で引き継ぐ）",
+      "off": "オフ（通常の圧縮を使う）"
+    }
   },
   "server": {
     "devices": "デバイス",
@@ -2365,7 +2372,10 @@
         "disabled": "無効",
         "reset_aria": "Mac インライン音声入力の2回押し修飾キーをリセット"
       }
-    }
+    },
+    "compact_hijack_title": "Compact ハイジャック (/handoff)",
+    "compact_hijack_toggle_label": "自動コンテキスト圧縮を /handoff で自動引き継ぎする",
+    "compact_hijack_desc": "所有デーモンの全セッションのグローバル既定値です。非手動コンテキスト圧縮を検知すると、即座に /handoff で新しい会話を開始して作業を続行します。手動の /compact には影響しません。"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

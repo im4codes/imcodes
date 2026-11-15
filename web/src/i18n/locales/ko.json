@@ -1106,7 +1106,14 @@
     },
     "capacity_retrying": "모델 용량이 가득 찼습니다. 자동으로 재시도 중 (15초 이내 간격)",
     "state_error": "세션 오류",
-    "state_error_detail": "오류: {{error}}"
+    "state_error_detail": "오류: {{error}}",
+    "compactHijack": {
+      "title": "Compact 하이재킹 (/handoff)",
+      "hint": "이 소유 세션에서 비수동 압축이 감지될 때 전역 기본값을 재정의합니다.",
+      "inherit": "전역 기본값 상속",
+      "on": "켜짐 (/handoff로 인계)",
+      "off": "꺼짐 (기본 압축 사용)"
+    }
   },
   "server": {
     "devices": "기기",
@@ -2365,7 +2372,10 @@
         "disabled": "사용 안 함",
         "reset_aria": "Mac 인라인 음성 두 번 누르기 보조 키 초기화"
       }
-    }
+    },
+    "compact_hijack_title": "Compact 하이재킹 (/handoff)",
+    "compact_hijack_toggle_label": "자동 컨텍스트 압축 감지 시 /handoff로 자동 인계",
+    "compact_hijack_desc": "소유한 데몬의 모든 세션에 대한 전역 기본값입니다. 수동이 아닌 컨텍스트 압축이 감지되면 즉시 /handoff로 새 대화를 열고 실행을 이어갑니다. 수동 /compact는 영향을 받지 않습니다."
   },
   "capabilities": {
     "eyebrow": "이식 가능한 AI 기능",

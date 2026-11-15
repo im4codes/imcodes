@@ -796,6 +796,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _lastAutoCompactAt = 0;
   /** The provider reported compacting during the current turn. */
   private _compactionObservedInTurn = false;
+  /** Guards against triggering compact hijack more than once for the same runtime instance. */
+  private _compactHijackTriggered = false;
+  /** Suppresses one post-manual-`/compact` watermark check from triggering compact hijack. */
+  private _suppressNextWatermarkCompactHijack = false;
+  /** Synchronous gate checked before triggering compact hijack (resolved in session-manager). */
+  canTriggerCompactHijack: (() => boolean) | null = null;
+  /** Invoked when non-manual context compaction is detected and compact hijack should run. */
+  onCompactHijack: ((info: { reason: 'status' | 'completion' | 'watermark'; pendingPrompt?: string }) => void | Promise<void>) | null = null;
   // Pending backoff timer for the next auto-retry drain. While set, the session
   // counts as having active turn work (so new sends queue in order behind the
   // message being retried) and presents an in-progress status, not idle.
@@ -971,11 +979,27 @@ export class TransportSessionRuntime implements SessionRuntime {
         // completion; the turn answered a `/compact` the runtime dispatched
         // (Claude's slash command completes untagged); or the provider
         // reported compacting during the turn (its own auto-compaction).
+        const isManualCompact = this.activeDispatchIsCompactCommand();
+        const compactionObserved = this._compactionObservedInTurn;
+        const participantTurn = this.requiresSharedMachineAuthority();
         const compacted = isTransportCompactionCompletion(message)
-          || this.activeDispatchIsCompactCommand()
-          || this._compactionObservedInTurn;
+          || isManualCompact
+          || compactionObserved;
         this._compactionObservedInTurn = false;
-        if (compacted) this.reinjectAfterCompaction();
+        if (isManualCompact) {
+          this._suppressNextWatermarkCompactHijack = true;
+        }
+        const shouldCompactHijack = compacted
+          && !isManualCompact
+          && !this._compactHijackTriggered
+          && !participantTurn
+          && (isTransportCompactionCompletion(message) || compactionObserved)
+          && Boolean(this.canTriggerCompactHijack?.());
+        if (shouldCompactHijack) {
+          this._compactHijackTriggered = true;
+        } else if (compacted) {
+          this.reinjectAfterCompaction();
+        }
         this.clearStalePendingCancelFallbackTimer();
         // Some providers emit onComplete synchronously while sendProviderTurn is
         // still unwinding. In that ordering the acceptance continuation below
@@ -1021,7 +1045,14 @@ export class TransportSessionRuntime implements SessionRuntime {
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
           this.setStatus('idle');
-          if (!compacted) this.maybeAutoCompact(message);
+          if (!compacted && !this._compactHijackTriggered) this.maybeAutoCompact(message);
+        }
+        if (shouldCompactHijack) {
+          try {
+            void Promise.resolve(this.onCompactHijack?.({ reason: 'completion' })).catch(() => {});
+          } catch {
+            // handled in session-manager
+          }
         }
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
@@ -1238,7 +1269,24 @@ export class TransportSessionRuntime implements SessionRuntime {
         // Providers also compact on their own mid-turn (Claude's
         // compact_boundary, Codex's inline auto-compaction). Remember it so the
         // turn's completion re-injects what compaction may have summarized.
-        if (status?.status === 'compacting') this._compactionObservedInTurn = true;
+        if (status?.status === 'compacting') {
+          this._compactionObservedInTurn = true;
+          if (
+            !this.activeDispatchIsCompactCommand()
+            && !this._compactHijackTriggered
+            && !this.requiresSharedMachineAuthority()
+            && this.canTriggerCompactHijack?.()
+          ) {
+            this._compactHijackTriggered = true;
+            void this.cancel().catch(() => {});
+            try {
+              void Promise.resolve(this.onCompactHijack?.({ reason: 'status' })).catch(() => {});
+            } catch {
+              // handled in session-manager
+            }
+            return;
+          }
+        }
         const activity = this.getActivitySnapshot();
         const canKeepActive = this.hasActiveTurnWork() || activity.backgroundKeepsSessionRunning;
         if (!this._activeDispatchCancelled && status?.status && canKeepActive) {
@@ -5075,7 +5123,26 @@ export class TransportSessionRuntime implements SessionRuntime {
           this.cancelActiveDispatchLocally(dispatchId);
           return;
         }
-        if (changed) this.reinjectAfterCompaction();
+        if (changed) {
+          const suppressed = this._suppressNextWatermarkCompactHijack;
+          this._suppressNextWatermarkCompactHijack = false;
+          if (
+            !suppressed
+            && !this._compactHijackTriggered
+            && !this.requiresSharedMachineAuthority()
+            && this.canTriggerCompactHijack?.()
+          ) {
+            this._compactHijackTriggered = true;
+            this.cancelActiveDispatchLocally(dispatchId);
+            try {
+              void Promise.resolve(this.onCompactHijack?.({ reason: 'watermark', pendingPrompt: message })).catch(() => {});
+            } catch {
+              // handled in session-manager
+            }
+            return;
+          }
+          this.reinjectAfterCompaction();
+        }
       }
       await this.refreshContextBootstrap({ phase: 'dispatch' });
       if (this.isDispatchLocallyCancelled(dispatchId)) {
@@ -5787,7 +5854,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private _drainPending(selectedIds?: ReadonlySet<string>): boolean {
-    if (this._stopQueueBarrier || this._unconfirmedProviderStop) return false;
+    if (this._stopQueueBarrier || this._unconfirmedProviderStop || this._compactHijackTriggered) return false;
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
     // Durable rows can outlive the scheduler decision that created them. Re-run
     // the daemon authority predicate at the final delivery edge; rejected rows

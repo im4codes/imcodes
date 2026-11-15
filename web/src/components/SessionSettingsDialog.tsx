@@ -34,6 +34,13 @@ import {
 } from '@shared/supervision-config.js';
 import { TaskPairSettingsSection } from './TaskPairSettingsSection.js';
 import {
+  COMPACT_HIJACK_MODE,
+  COMPACT_HIJACK_MODES,
+  buildTransportConfigWithCompactHijack,
+  extractSessionCompactHijackMode,
+  type CompactHijackMode,
+} from '@shared/compact-hijack.js';
+import {
   buildSupervisionExecutionCapabilityId,
   isExcludedDevelopmentModel,
   normalizeSupervisionExecutionModel,
@@ -72,6 +79,8 @@ interface Props {
   parentSession?: string | null;
   /** UI hint only; Server/daemon remain the authority for automatic mode. */
   canControlAutomaticSupervision?: boolean;
+  /** True only for user-owned sessions; hidden on shared/participating sessions. */
+  canConfigureCompactHijack?: boolean;
   transportConfig?: Record<string, unknown> | null;
   /** Minimal owner-authoritative mode projected to shared read-only clients. */
   supervisionMode?: SupervisionMode | null;
@@ -515,6 +524,7 @@ export function SessionSettingsDialog({
   poolSessionDialogOpen = false,
   parentSession,
   canControlAutomaticSupervision = false,
+  canConfigureCompactHijack = true,
   openIntent,
   surface,
   ws,
@@ -547,6 +557,11 @@ export function SessionSettingsDialog({
   const [modelApplyState, setModelApplyState] = useState<'idle' | 'applying' | 'applied' | 'error'>('idle');
   const [modelApplyError, setModelApplyError] = useState('');
   const [pendingSessionModel, setPendingSessionModel] = useState<string | null>(null);
+  const initialCompactHijackMode = useMemo(
+    () => extractSessionCompactHijackMode(transportConfig ?? null),
+    [transportConfig],
+  );
+  const [compactHijackMode, setCompactHijackMode] = useState<CompactHijackMode>(initialCompactHijackMode);
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const agentTypeMountedRef = useRef(false);
   const providerModelManuallySelectedRef = useRef(false);
@@ -561,8 +576,9 @@ export function SessionSettingsDialog({
     setLabel(initLabel);
     setDescription(initDesc);
     setAgentType(type);
+    setCompactHijackMode(initialCompactHijackMode);
     setSupervision(initialSupervision);
-  }, [initLabel, initDesc, initCwd, type, initialSupervision, serverId, sessionName, subSessionId]);
+  }, [initLabel, initDesc, initCwd, type, initialCompactHijackMode, initialSupervision, serverId, sessionName, subSessionId]);
 
   useEffect(() => {
     const observedModel = activeModel?.trim() || modelDisplay?.trim() || requestedModel?.trim() || '';
@@ -857,14 +873,18 @@ export function SessionSettingsDialog({
       label !== initLabel
       || description !== initDesc
       || agentType !== type
+      || (canConfigureCompactHijack && compactHijackMode !== initialCompactHijackMode)
     ))
     || (surface !== 'session'
       && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null))
   ), [
     agentType,
+    canConfigureCompactHijack,
+    compactHijackMode,
     description,
     initDesc,
     initLabel,
+    initialCompactHijackMode,
     label,
     nextTransportConfig,
     surface,
@@ -953,8 +973,14 @@ export function SessionSettingsDialog({
           }
         }
       }
+      let savedTransportConfig: Record<string, unknown> | null | undefined;
       if (surface !== 'session' && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)) {
         fields.transportConfig = nextTransportConfig;
+        savedTransportConfig = nextTransportConfig;
+      } else if (surface === 'session' && canConfigureCompactHijack && compactHijackMode !== initialCompactHijackMode) {
+        const nextSessionConfig = buildTransportConfigWithCompactHijack(transportConfig, compactHijackMode) ?? null;
+        fields.transportConfig = nextSessionConfig;
+        savedTransportConfig = nextSessionConfig;
       }
 
       if (Object.keys(fields).length === 0) {
@@ -978,7 +1004,7 @@ export function SessionSettingsDialog({
             modelDisplay: null,
           } : {}),
         } : {}),
-        ...(surface !== 'session' ? { transportConfig: nextTransportConfig } : {}),
+        ...(savedTransportConfig !== undefined ? { transportConfig: savedTransportConfig } : {}),
       });
       onClose();
     } catch (err) {
@@ -1245,6 +1271,39 @@ export function SessionSettingsDialog({
               <div class="session-settings-notice">{t('session.modelSettings.unsupported')}</div>
             )}
           </div>
+
+          {canConfigureCompactHijack && (
+            <div class="session-settings-field" data-testid="session-compact-hijack-field">
+              <div class="session-settings-label">{t('session.compactHijack.title')}</div>
+              <select
+                class="input"
+                aria-label={t('session.compactHijack.title')}
+                value={compactHijackMode}
+                onInput={(e) => {
+                  const raw = (e.target as HTMLSelectElement).value;
+                  if (raw === COMPACT_HIJACK_MODE.INHERIT || raw === COMPACT_HIJACK_MODE.ON || raw === COMPACT_HIJACK_MODE.OFF) {
+                    setCompactHijackMode(raw);
+                  }
+                }}
+                onChange={(e) => {
+                  const raw = (e.target as HTMLSelectElement).value;
+                  if (raw === COMPACT_HIJACK_MODE.INHERIT || raw === COMPACT_HIJACK_MODE.ON || raw === COMPACT_HIJACK_MODE.OFF) {
+                    setCompactHijackMode(raw);
+                  }
+                }}
+                style={{ width: '100%' }}
+              >
+                {COMPACT_HIJACK_MODES.map((mode) => (
+                  <option key={mode} value={mode}>
+                    {t(`session.compactHijack.${mode}`)}
+                  </option>
+                ))}
+              </select>
+              <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>
+                {t('session.compactHijack.hint')}
+              </div>
+            </div>
+          )}
 
           {/* Working directory */}
           <div class="session-settings-field">

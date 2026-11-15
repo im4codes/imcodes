@@ -1,4 +1,5 @@
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { tryAcquireCompactHijackSlot, finishCompactHijackSlot } from '../agent/session-manager.js';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { taskPairService } from './task-pairs/service.js';
@@ -31,7 +32,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions, triggerCompactHijackForSession, consumeManualCompactProcessTurn } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -42,7 +43,7 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { releaseProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import { releaseProcessSharedMachineAuthority, readProcessSharedMachineParticipants } from './shared-machine-authority-context.js';
 import { isDuplicateTimelineForward } from './timeline-forward-dedup.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -1209,6 +1210,20 @@ export async function startup(): Promise<DaemonContext> {
     // the event; local listeners must ignore it.
     if (e.type === 'session.state' && isServerLinkResyncStatePayload(e.payload)) return;
     liveContextIngestion.handleTimelineEvent(e);
+    if (e.type === 'agent.status' && (e.payload as Record<string, unknown>).status === 'compacting') {
+      const rec = getSession(e.sessionId);
+      if (rec && rec.runtimeType !== 'transport' && !isTransportAgent(rec.agentType ?? '')) {
+        if (
+          readProcessSharedMachineParticipants(e.sessionId).length === 0
+          && !consumeManualCompactProcessTurn(e.sessionId)
+          && tryAcquireCompactHijackSlot(e.sessionId)
+        ) {
+          void triggerCompactHijackForSession(e.sessionId, serverLink ?? undefined, { reason: 'status' })
+            .then(() => finishCompactHijackSlot(e.sessionId, true))
+            .catch(() => finishCompactHijackSlot(e.sessionId, false));
+        }
+      }
+    }
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);
       // The turn is over: a participant's machine-authority window on a process session ends here.

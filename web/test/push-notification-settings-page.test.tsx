@@ -16,6 +16,9 @@ const apiFetchMock = vi.fn();
 
 vi.mock('../src/api.js', () => ({
   apiFetch: (...args: unknown[]) => apiFetchMock(...args),
+  getUserPref: vi.fn().mockResolvedValue(null),
+  saveUserPref: vi.fn().mockResolvedValue(undefined),
+  onUserPrefChanged: () => () => undefined,
   passwordChange: vi.fn(),
   passkeyVerifyBegin: vi.fn(),
   passwordSetupWithPasskey: vi.fn(),

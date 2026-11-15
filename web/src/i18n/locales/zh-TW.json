@@ -1106,7 +1106,14 @@
     },
     "capacity_retrying": "模型容量已滿，正在自動重試（間隔不超過 15 秒）",
     "state_error": "工作階段錯誤",
-    "state_error_detail": "錯誤：{{error}}"
+    "state_error_detail": "錯誤：{{error}}",
+    "compactHijack": {
+      "title": "Compact 劫持 (/handoff)",
+      "hint": "覆蓋此自有工作階段在偵測到非手動壓縮時的接管行為。",
+      "inherit": "繼承全域預設",
+      "on": "開啟（劫持壓縮並 /handoff）",
+      "off": "關閉（使用原生壓縮）"
+    }
   },
   "server": {
     "devices": "裝置",
@@ -2366,7 +2373,10 @@
         "disabled": "已停用",
         "reset_aria": "重設 Mac 內建語音雙擊修飾鍵"
       }
-    }
+    },
+    "compact_hijack_title": "Compact 劫持 (/handoff)",
+    "compact_hijack_toggle_label": "偵測到自動壓縮上下文時自動透過 /handoff 接管",
+    "compact_hijack_desc": "您名下 Daemon 所有工作階段的全域預設值。偵測到非手動上下文壓縮時，立即透過 /handoff 開啟新對話並攜帶精簡交接包繼續執行。手動 /compact 不受影響。"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

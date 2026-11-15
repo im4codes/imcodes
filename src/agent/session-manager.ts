@@ -93,6 +93,47 @@ import { getSessionRuntimeType, isClaudeCodeFamily, isClaudeCodeSdkAgentType, is
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '../../shared/cc-presets.js';
 import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
+import {
+  COMPACT_HIJACK_COOLDOWN_MS,
+  extractSessionCompactHijackMode,
+  resolveCompactHijackEnabled,
+} from '../../shared/compact-hijack.js';
+import { isGlobalCompactHijackEnabled } from '../store/compact-hijack-config-store.js';
+
+const compactHijackInFlight = new Set<string>();
+const compactHijackLastTriggeredAt = new Map<string, number>();
+
+export function canTriggerCompactHijackForSession(sessionName: string, now = Date.now()): boolean {
+  const rec = getSession(sessionName);
+  if (!rec || isIncognitoSession(rec)) return false;
+  const enabled = resolveCompactHijackEnabled(
+    extractSessionCompactHijackMode(rec.transportConfig),
+    isGlobalCompactHijackEnabled(),
+  );
+  if (!enabled) return false;
+  if (compactHijackInFlight.has(sessionName)) return false;
+  const lastAt = compactHijackLastTriggeredAt.get(sessionName);
+  if (typeof lastAt === 'number' && now - lastAt < COMPACT_HIJACK_COOLDOWN_MS) return false;
+  return true;
+}
+
+export function tryAcquireCompactHijackSlot(sessionName: string, now = Date.now()): boolean {
+  if (!canTriggerCompactHijackForSession(sessionName, now)) return false;
+  compactHijackInFlight.add(sessionName);
+  return true;
+}
+
+export function finishCompactHijackSlot(sessionName: string, succeeded: boolean, now = Date.now()): void {
+  compactHijackInFlight.delete(sessionName);
+  if (succeeded) {
+    compactHijackLastTriggeredAt.set(sessionName, now);
+  }
+}
+
+export function resetCompactHijackStateForTests(): void {
+  compactHijackInFlight.clear();
+  compactHijackLastTriggeredAt.clear();
+}
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import {
   resolveTransportContextBootstrap,
@@ -2336,6 +2377,20 @@ function wireTransportCallbacks(
   runtime.setSupervisionSnapshotResolver(
     () => extractSessionSupervisionSnapshot(getSession(sessionName)?.transportConfig ?? null),
   );
+  runtime.canTriggerCompactHijack = () => canTriggerCompactHijackForSession(sessionName);
+  runtime.onCompactHijack = async (info) => {
+    if (!tryAcquireCompactHijackSlot(sessionName)) return;
+    let succeeded = false;
+    try {
+      const { triggerCompactHijackForSession } = await import('../daemon/command-handler.js');
+      await triggerCompactHijackForSession(sessionName, undefined, info);
+      succeeded = true;
+    } catch (err) {
+      logger.warn({ err, sessionName, reason: info.reason }, 'compact hijack trigger failed');
+    } finally {
+      finishCompactHijackSlot(sessionName, succeeded);
+    }
+  };
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const persistTransportState = (state: unknown, error?: string): void => {
     if (state !== 'running' && state !== 'idle' && state !== 'error') return;

@@ -1106,7 +1106,14 @@
     },
     "capacity_retrying": "Model at capacity — retrying automatically (every ≤15 s)",
     "state_error": "Session error",
-    "state_error_detail": "Error: {{error}}"
+    "state_error_detail": "Error: {{error}}",
+    "compactHijack": {
+      "title": "Compact Hijack (/handoff)",
+      "hint": "Override your account default when non-manual compaction is detected in this owned session.",
+      "inherit": "Inherit global default",
+      "on": "On (hijack compaction)",
+      "off": "Off (native compaction)"
+    }
   },
   "server": {
     "devices": "Devices",
@@ -2366,7 +2373,10 @@
         "disabled": "Disabled",
         "reset_aria": "Reset Mac inline voice double-tap modifier"
       }
-    }
+    },
+    "compact_hijack_title": "Compact Hijack (/handoff)",
+    "compact_hijack_toggle_label": "Automatically hijack context compaction via /handoff",
+    "compact_hijack_desc": "Default for all sessions on your owned daemons. When automatic context compaction begins, opens a fresh conversation with a bounded handoff pack and continues execution. Manual /compact is unaffected."
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

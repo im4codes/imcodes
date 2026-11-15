@@ -451,6 +451,60 @@ import {
   shouldHideTimelineUserMessageForSessionControl,
   shouldResetProcessPreferenceContextForSessionControl,
 } from '../../shared/session-control-commands.js';
+import {
+  COMPACT_HIJACK_CONTINUATION_PROMPT,
+  COMPACT_HIJACK_MSG,
+  buildTransportConfigWithCompactHijack,
+  extractSessionCompactHijackMode,
+  hasCompactHijackField,
+  hasInvalidCompactHijackSetting,
+  resolveCompactHijackEnabled,
+} from '../../shared/compact-hijack.js';
+import {
+  isGlobalCompactHijackEnabled,
+  setPersistedCompactHijackGlobalConfig,
+} from '../store/compact-hijack-config-store.js';
+
+let lastObservedServerLink: ServerLink | undefined;
+const manualCompactProcessTurns = new Map<string, number>();
+
+export function noteManualCompactProcessTurn(sessionName: string, now = Date.now()): void {
+  manualCompactProcessTurns.set(sessionName, now + 120_000);
+}
+
+export function consumeManualCompactProcessTurn(sessionName: string, now = Date.now()): boolean {
+  const expiresAt = manualCompactProcessTurns.get(sessionName);
+  manualCompactProcessTurns.delete(sessionName);
+  return typeof expiresAt === 'number' && expiresAt >= now;
+}
+
+function resolveIncomingTransportConfigForCompactHijack(
+  cmd: Record<string, unknown>,
+  rawIncomingConfig: Record<string, unknown> | undefined,
+  existingConfig: Record<string, unknown> | undefined,
+): { ok: true; transportConfig: Record<string, unknown> | undefined } | { ok: false; reason: string } {
+  const isSharedCaller = Boolean(cmd.sharedActor && typeof cmd.sharedActor === 'object');
+  if (isSharedCaller) {
+    if (hasCompactHijackField(rawIncomingConfig)) {
+      return { ok: false, reason: 'shared_caller_cannot_modify_compact_hijack' };
+    }
+    const preservedMode = extractSessionCompactHijackMode(existingConfig);
+    return {
+      ok: true,
+      transportConfig: buildTransportConfigWithCompactHijack(rawIncomingConfig, preservedMode) ?? undefined,
+    };
+  }
+  if (hasInvalidCompactHijackSetting(rawIncomingConfig)) {
+    return { ok: false, reason: 'invalid_compact_hijack' };
+  }
+  return {
+    ok: true,
+    transportConfig: buildTransportConfigWithCompactHijack(
+      rawIncomingConfig,
+      extractSessionCompactHijackMode(rawIncomingConfig),
+    ) ?? undefined,
+  };
+}
 import type {
   ContextMemoryProjectView,
   ContextMemoryStatsView,
@@ -1239,11 +1293,21 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
     logger.warn({ sessionName }, 'session.update_transport_config: missing transportConfig field — ignoring');
     return;
   }
-  const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
-  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+  const rawIncomingConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(rawIncomingConfig ?? null)) {
     logger.warn({ sessionName }, 'session.update_transport_config: invalid supervision snapshot — ignoring');
     return;
   }
+  const resolvedCompactHijack = resolveIncomingTransportConfigForCompactHijack(
+    cmd,
+    rawIncomingConfig,
+    record.transportConfig,
+  );
+  if (!resolvedCompactHijack.ok) {
+    logger.warn({ sessionName, reason: resolvedCompactHijack.reason }, 'session.update_transport_config: compactHijack rejected — ignoring');
+    return;
+  }
+  const nextTransportConfig = resolvedCompactHijack.transportConfig;
   const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
   if (isAutomaticSupervisionEnabled(nextSupervision)
     && !canSessionRoleOwnAutomaticSupervision(record.role)) {
@@ -1280,11 +1344,21 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
     logger.warn({ sessionName }, 'subsession.update_transport_config: missing transportConfig field — ignoring');
     return;
   }
-  const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
-  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+  const rawIncomingConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(rawIncomingConfig ?? null)) {
     logger.warn({ sessionName }, 'subsession.update_transport_config: invalid supervision snapshot — ignoring');
     return;
   }
+  const resolvedCompactHijack = resolveIncomingTransportConfigForCompactHijack(
+    cmd,
+    rawIncomingConfig,
+    record.transportConfig,
+  );
+  if (!resolvedCompactHijack.ok) {
+    logger.warn({ sessionName, reason: resolvedCompactHijack.reason }, 'subsession.update_transport_config: compactHijack rejected — ignoring');
+    return;
+  }
+  const nextTransportConfig = resolvedCompactHijack.transportConfig;
   const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
   if (isAutomaticSupervisionEnabled(nextSupervision)) {
     logger.warn({ sessionName }, 'subsession.update_transport_config: automatic supervision requires Brain session — ignoring');
@@ -1533,6 +1607,67 @@ export async function handoffSessionConversation(
     await relaunchSessionWithSettings(currentRecord, { fresh: true, handoff: true });
   }, token);
   await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId, token);
+}
+
+/**
+ * Automatic Compact Hijack: reopen via `/handoff` and immediately send the
+ * concise continuation instruction onto the fresh conversation.
+ */
+export async function triggerCompactHijackForSession(
+  sessionName: string,
+  serverLink?: ServerLink,
+  info?: { reason?: 'status' | 'completion' | 'watermark'; pendingPrompt?: string },
+): Promise<void> {
+  const record = getSession(sessionName);
+  if (!record || isIncognitoSession(record)) return;
+  if (
+    !resolveCompactHijackEnabled(
+      extractSessionCompactHijackMode(record.transportConfig),
+      isGlobalCompactHijackEnabled(),
+    )
+  ) {
+    return;
+  }
+  const resolvedLink = serverLink ?? lastObservedServerLink;
+  await handoffSessionConversation(record, resolvedLink);
+  const latest = getSession(sessionName);
+  if (
+    !latest
+    || (record.sessionInstanceId && latest.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId)
+  ) {
+    return;
+  }
+  const pendingPrompt = typeof info?.pendingPrompt === 'string' ? info.pendingPrompt.trim() : '';
+  const continuationText = pendingPrompt && pendingPrompt !== COMPACT_HIJACK_CONTINUATION_PROMPT
+    ? `${COMPACT_HIJACK_CONTINUATION_PROMPT}\n\n${pendingPrompt}`
+    : COMPACT_HIJACK_CONTINUATION_PROMPT;
+  const messageId = `compact-hijack-${randomUUID()}`;
+  const isTransport = latest.runtimeType === 'transport'
+    || (typeof latest.agentType === 'string' && isTransportAgent(latest.agentType));
+  if (isTransport) {
+    const runtime = getTransportRuntime(sessionName);
+    if (runtime) {
+      timelineEmitter.emit(
+        sessionName,
+        'user.message',
+        { text: continuationText, clientMessageId: messageId },
+        { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
+      );
+      await runtime.send(continuationText, messageId);
+      return;
+    }
+    enqueueResend(sessionName, {
+      ...(recipientFromSessionRecord(latest) ? { recipient: recipientFromSessionRecord(latest) } : {}),
+      text: continuationText,
+      commandId: messageId,
+      clientMessageId: messageId,
+      queuedAt: Date.now(),
+    });
+    return;
+  }
+  await sendProcessSessionMessageForAutomation(sessionName, continuationText, {
+    verbatim: true,
+  });
 }
 
 async function clearProcessConversation(
@@ -2267,6 +2402,7 @@ export function setRouterContext(ctx: RouterContext): void {
 }
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
+  lastObservedServerLink = serverLink;
   const cmd = msg && typeof msg === 'object' ? msg as Record<string, unknown> : {};
   const name = resolveSessionCommandName(cmd)
     ?? (cmd.type === 'subsession.start' && typeof cmd.id === 'string' && cmd.id ? subSessionName(cmd.id) : undefined)
@@ -2695,6 +2831,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case MEMORY_FEATURE_CONFIG_MSG.APPLY:
       handleMemoryFeatureConfigApply(cmd);
+      break;
+    case COMPACT_HIJACK_MSG.APPLY:
+      handleCompactHijackConfigApply(cmd);
       break;
     case MEMORY_WS.PERSONAL_QUERY:
       void handlePersonalMemoryQuery(cmd, serverLink);
@@ -3284,14 +3423,26 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     try {
       await runExclusiveSessionRelaunch(sessionName, async () => {
         try {
-          await relaunchSessionWithSettings(record, {
+  let nextRestartTransportConfig: Record<string, unknown> | null | undefined = undefined;
+  if ('transportConfig' in cmd) {
+    const rawRestartConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+    const resolvedRestartConfig = resolveIncomingTransportConfigForCompactHijack(
+      cmd,
+      rawRestartConfig,
+      record.transportConfig,
+    );
+    nextRestartTransportConfig = resolvedRestartConfig.ok
+      ? (resolvedRestartConfig.transportConfig ?? null)
+      : (record.transportConfig ?? null);
+  }
+  await relaunchSessionWithSettings(record, {
             agentType: (cmd.agentType as any) ?? undefined,
             projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
             label: ('label' in cmd ? (cmd.label as string | null) : undefined),
             description: ('description' in cmd ? (cmd.description as string | null) : undefined),
             requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
             effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
-            transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+            transportConfig: nextRestartTransportConfig,
           });
           await handleGetSessions(serverLink);
           logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
@@ -6102,6 +6253,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   }
 
   try {
+    if (isSessionControlCommandText(displayText, 'compact')) {
+      noteManualCompactProcessTurn(sessionName);
+    }
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
       onTyped: () => authorityBinding.current?.typed(),
       originalText: displayText,
@@ -8398,7 +8552,11 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
           ...(label ? { label } : {}),
           description,
           requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
-          transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
+          transportConfig: (() => {
+            const rawStartConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+            const resolvedStartConfig = resolveIncomingTransportConfigForCompactHijack(cmd, rawStartConfig, undefined);
+            return resolvedStartConfig.ok ? resolvedStartConfig.transportConfig : undefined;
+          })(),
           bindExistingKey,
           ...(ccPreset ? { ccPreset } : {}),
           ...(isClaudeCodeSdkAgentType(type) ? { ccSessionId: randomUUID(), fresh: true } : {}),
@@ -8525,6 +8683,18 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     await runExclusiveSessionRelaunch(sName, async () => {
       try {
         const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
+        let nextSubRestartTransportConfig: Record<string, unknown> | null | undefined = undefined;
+        if ('transportConfig' in cmd) {
+          const rawSubRestartConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+          const resolvedSubRestartConfig = resolveIncomingTransportConfigForCompactHijack(
+            cmd,
+            rawSubRestartConfig,
+            effectiveRecord.transportConfig,
+          );
+          nextSubRestartTransportConfig = resolvedSubRestartConfig.ok
+            ? (resolvedSubRestartConfig.transportConfig ?? null)
+            : (effectiveRecord.transportConfig ?? null);
+        }
         await relaunchSessionWithSettings(effectiveRecord, {
           agentType: (cmd.agentType as any) ?? undefined,
           projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
@@ -8532,7 +8702,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           description: ('description' in cmd ? (cmd.description as string | null) : undefined),
           requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
           effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
-          transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+          transportConfig: nextSubRestartTransportConfig,
         });
         try {
           await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sName));
@@ -13077,6 +13247,18 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
     const { requeueAllForReplication } = await import('../context/processed-context-replication.js');
     await requeueAllForReplication();
   }
+}
+
+function handleCompactHijackConfigApply(cmd: Record<string, unknown>): void {
+  if (cmd.sharedActor && typeof cmd.sharedActor === 'object') {
+    logger.warn('compact_hijack.apply: ignoring command carrying sharedActor');
+    return;
+  }
+  if (typeof cmd.enabled !== 'boolean') {
+    logger.warn('compact_hijack.apply: ignoring non-boolean enabled payload');
+    return;
+  }
+  setPersistedCompactHijackGlobalConfig({ enabled: cmd.enabled });
 }
 
 function handleMemoryFeatureConfigApply(cmd: Record<string, unknown>): void {
