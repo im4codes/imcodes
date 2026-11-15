@@ -231,4 +231,68 @@ describe('background transfer keepalive and cross-lifecycle HTTP resume', () => 
     ac.abort();
     await expect(canceledPromise).rejects.toMatchObject({ name: 'AbortError' });
   });
+
+  it('resolves concurrent resume waiters once on notifyUploadAppStateChange without Set re-add infinite loop and cleans up waiters on resume/abort/timeout', async () => {
+    const {
+      notifyUploadAppStateChange,
+      waitForUploadResumeIfSuspended,
+      getUploadResumeWaiterCountForTests,
+    } = await import('../src/upload-suspend-wait.js');
+
+    // Counterexample for Set delete+re-add infinite iteration during markResumed():
+    // Wait while backgrounded via native appStateChange, then resume via notifyUploadAppStateChange(true).
+    notifyUploadAppStateChange(false);
+    let settled1 = 0;
+    let settled2 = 0;
+    const w1 = waitForUploadResumeIfSuspended(undefined, 60_000).then((res) => {
+      settled1 += 1;
+      return res;
+    });
+    const w2 = waitForUploadResumeIfSuspended(undefined, 60_000).then((res) => {
+      settled2 += 1;
+      return res;
+    });
+    expect(getUploadResumeWaiterCountForTests()).toBe(2);
+
+    notifyUploadAppStateChange(true);
+    await expect(w1).resolves.toBe(true);
+    await expect(w2).resolves.toBe(true);
+    expect(settled1).toBe(1);
+    expect(settled2).toBe(1);
+    expect(getUploadResumeWaiterCountForTests()).toBe(0);
+
+    // Subsequent lifecycle transitions must not leave or re-invoke cleared waiters
+    notifyUploadAppStateChange(false);
+    notifyUploadAppStateChange(true);
+    await Promise.resolve();
+    expect(settled1).toBe(1);
+    expect(settled2).toBe(1);
+    expect(getUploadResumeWaiterCountForTests()).toBe(0);
+
+    // Visibility-triggered foreground resume also removes waiter completely
+    setDocumentVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    const wVis = waitForUploadResumeIfSuspended(undefined, 60_000);
+    expect(getUploadResumeWaiterCountForTests()).toBe(1);
+    setDocumentVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await expect(wVis).resolves.toBe(true);
+    expect(getUploadResumeWaiterCountForTests()).toBe(0);
+
+    // AbortSignal removes waiter cleanly
+    const ac = new AbortController();
+    notifyUploadAppStateChange(false);
+    const wAbort = waitForUploadResumeIfSuspended(ac.signal, 60_000);
+    expect(getUploadResumeWaiterCountForTests()).toBe(1);
+    ac.abort();
+    await expect(wAbort).rejects.toMatchObject({ name: 'AbortError' });
+    expect(getUploadResumeWaiterCountForTests()).toBe(0);
+
+    // Timeout removes waiter cleanly
+    const wTimeout = waitForUploadResumeIfSuspended(undefined, 250);
+    expect(getUploadResumeWaiterCountForTests()).toBe(1);
+    await vi.advanceTimersByTimeAsync(260);
+    await expect(wTimeout).resolves.toBe(true);
+    expect(getUploadResumeWaiterCountForTests()).toBe(0);
+  });
 });

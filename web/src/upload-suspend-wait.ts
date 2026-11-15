@@ -36,7 +36,7 @@ function markResumed(): void {
     isSuspendedByLifecycle = false;
     backgroundEpoch += 1;
     lastForegroundResumeAt = Date.now();
-    for (const notify of resumeWaiters) {
+    for (const notify of [...resumeWaiters]) {
       notify();
     }
   }
@@ -107,8 +107,13 @@ export function resetUploadLifecycleForTests(): void {
   isSuspendedByLifecycle = false;
   lastSuspendStartedAt = 0;
   lastForegroundResumeAt = 0;
+  resumeWaiters.clear();
   listenersInstalled = false;
   ensureLifecycleListeners();
+}
+
+export function getUploadResumeWaiterCountForTests(): number {
+  return resumeWaiters.size;
 }
 
 export function createUploadLifecycleRecoveryState(): UploadLifecycleRecoveryState {
@@ -171,9 +176,8 @@ export function waitForUploadResumeIfSuspended(
         clearTimeout(timer);
         timer = null;
       }
-      resumeWaiters.delete(onEnvironmentChange);
-      resumeWaiters.add(onEnvironmentChange);
-    if (typeof document !== 'undefined') {
+      resumeWaiters.delete(settleIfForegroundReady);
+      if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onEnvironmentChange);
       }
       if (typeof window !== 'undefined') {
@@ -191,6 +195,12 @@ export function waitForUploadResumeIfSuspended(
       resolve(true);
     };
 
+    const settleIfForegroundReady = () => {
+      if (!isEnvironmentPhysicallySuspended() && !isSuspendedByLifecycle) {
+        finish();
+      }
+    };
+
     const onEnvironmentChange = () => {
       if (!isEnvironmentPhysicallySuspended()) {
         markResumed();
@@ -205,7 +215,7 @@ export function waitForUploadResumeIfSuspended(
       reject(createAbortError());
     };
 
-    resumeWaiters.add(onEnvironmentChange);
+    resumeWaiters.add(settleIfForegroundReady);
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', onEnvironmentChange);
     }
