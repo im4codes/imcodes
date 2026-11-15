@@ -13,6 +13,8 @@ import {
   validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
+import { bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
 import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
@@ -49,6 +51,7 @@ export interface CronSendDispatchInput {
   reply?: boolean;
   broadcast?: boolean;
   idempotencyKey?: string;
+  ownerMachineAuthority?: string;
 }
 
 export interface CronSendDispatchResult {
@@ -154,6 +157,10 @@ async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
 
 export async function executeCronJob(msg: CronDispatchMessage, serverLink: ServerLink): Promise<void> {
   const { jobId, executionId, jobName, projectName, targetRole, targetSessionName } = msg;
+  const rawOwnerMachineAuthority = msg[OWNER_MACHINE_AUTHORITY_FIELD];
+  const ownerMachineAuthority = typeof rawOwnerMachineAuthority === 'string' && rawOwnerMachineAuthority.trim()
+    ? rawOwnerMachineAuthority.trim()
+    : undefined;
   // The server outbox may resend after a crash between WS delivery and its
   // `dispatched` acknowledgement.  Claim the logical occurrence in the
   // daemon's durable SQLite ledger before resolving a target or invoking any
@@ -308,6 +315,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
             timelineCommitted: true,
             messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
             ...(managedAgent ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
+            ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
           });
           if (!timelineProjected && cronRun) {
             timelineEmitter.emit(name, 'user.message', {
@@ -352,6 +360,14 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       }
     } else {
       const collector = collectCommandResult(name, jobId, executionId, serverLink);
+      const ownerBinding = ownerMachineAuthority && session.sessionInstanceId && session.runtimeEpoch
+        ? bindProcessSharedMachineActivity(
+            name,
+            { sessionInstanceId: session.sessionInstanceId, runtimeEpoch: session.runtimeEpoch },
+            { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: ownerMachineAuthority },
+            { sessionRunning: session.state === 'running' },
+          )
+        : null;
       try {
         await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command, {
           userMessageMetadata: {
@@ -361,6 +377,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
             messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
             ...(cronRun ? { cronRun } : {}),
           },
+          ...(ownerBinding ? { onTyped: () => ownerBinding.typed() } : {}),
         });
       } catch (error) {
         collector.cancel();
@@ -373,6 +390,8 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           detail: `Cron process session send failed for ${name}: ${formatErr(error)}`,
         });
         return;
+      } finally {
+        ownerBinding?.settle();
       }
     }
     return;
@@ -403,6 +422,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         ...(action.reply !== undefined ? { reply: action.reply } : {}),
         ...(action.broadcast !== undefined ? { broadcast: action.broadcast } : {}),
         ...(action.idempotencyKey ? { idempotencyKey: action.idempotencyKey } : {}),
+        ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
       });
       logger.info({
         jobId,

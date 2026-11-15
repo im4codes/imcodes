@@ -84,6 +84,7 @@ import {
 import { normalizeDaemonLocalMemoryNamespace, LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import {
+  SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
@@ -1205,15 +1206,23 @@ export async function startHookServer(
           sessionInstanceId: session.sessionInstanceId,
           runtimeEpoch: session.runtimeEpoch,
         }, Date.now(), session.state === 'running');
-        const required = runtime?.requiresSharedMachineAuthority() ?? processContext.required;
-        const authority = runtime?.getActiveSharedMachineAuthority() ?? processContext.authority;
+        const required = runtime ? runtime.requiresSharedMachineAuthority() : processContext.required;
+        const authority = runtime
+          ? (required ? runtime.getActiveSharedMachineAuthority() : (runtime.getActiveOwnerMachineAuthority?.() ?? null))
+          : processContext.authority;
         if (required && !authority) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_unavailable' }));
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, required, authority }));
+        res.end(JSON.stringify(
+          required
+            ? { ok: true, required: true, authority }
+            : authority
+              ? { ok: true, required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority }
+              : { ok: true, required: false, authority: null },
+        ));
       } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'malformed' }));

@@ -7,7 +7,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMemoryMcpServer, mergeDefaultToolDeps, sharedMachineAuthorityFromHookResponse } from '../../src/daemon/memory-mcp-server.js';
 import { MEMORY_MCP_TOOL_NAMES as N } from '../../shared/memory-mcp-contracts.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
-import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
+import { SHARED_MACHINE_AUTHORITY_ACTOR_KIND, SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
 import { mcpToolPayload } from '../helpers/mcp-tool-result.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 
@@ -16,11 +16,19 @@ afterEach(() => vi.restoreAllMocks());
 it('node authority accepts only coherent explicit owner/participant replies', () => {
   for (const reply of [{}, { ok: true }, { required: false }, { ok: true, required: 'false' }, { ok: false, required: false },
     { ok: true, required: true, authority: null }, { ok: true, required: true, authority: '' },
-    { ok: true, required: false, authority: 'participant' }]) {
+    { ok: true, required: false, authority: 'participant' },
+    { ok: true, required: false, actorKind: 'participant', authority: 'signed' },
+    { ok: true, required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: '' }]) {
     expect(() => sharedMachineAuthorityFromHookResponse(reply)).toThrow('shared_machine_authority_invalid_response');
   }
   expect(sharedMachineAuthorityFromHookResponse({ ok: true, required: false, authority: null })).toBeNull();
   expect(sharedMachineAuthorityFromHookResponse({ ok: true, required: true, authority: 'signed' })).toBe('signed');
+  expect(sharedMachineAuthorityFromHookResponse({
+    ok: true,
+    required: false,
+    actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER,
+    authority: 'owner-signed',
+  })).toBe('owner-signed');
 });
 
 it.each([{}, { ok: true }, { ok: true, required: true, authority: null }, { ok: true, required: 'false' }])(

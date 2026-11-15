@@ -6,6 +6,7 @@ import { IMCODES_DAEMON_SESSION_NAME_ENV } from '../../shared/memory-mcp-env.js'
 import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 import {
+  SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
@@ -187,7 +188,16 @@ export function createResourceOwnerHookWithEpochRefresh(options: {
 /** Node access alone requires an explicit, coherent hook answer; an unknown reply must never borrow the daemon owner. */
 export function sharedMachineAuthorityFromHookResponse(answer: Record<string, unknown>): string | null {
   if (answer.ok !== true || typeof answer.required !== 'boolean') throw new Error('shared_machine_authority_invalid_response');
-  if (answer.required === false && answer.authority == null) return null;
+  if (answer.required === false) {
+    if (answer.authority == null) return null;
+    if (
+      answer.actorKind === SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER
+      && typeof answer.authority === 'string'
+      && answer.authority
+    ) {
+      return answer.authority;
+    }
+  }
   if (answer.required === true && typeof answer.authority === 'string' && answer.authority) return answer.authority;
   throw new Error('shared_machine_authority_invalid_response');
 }

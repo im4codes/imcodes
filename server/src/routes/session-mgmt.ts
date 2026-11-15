@@ -64,8 +64,8 @@ import {
 } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { shareCancelDispatchDenial, type SharedActorEnvelope } from '../../../shared/tab-sharing.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
-import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import { issueOwnerMachineAuthorityForSession, issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import {
   buildTransportConfigWithSupervision,
   canSessionRoleOwnAutomaticSupervision,
@@ -1177,11 +1177,13 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
       }
       await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'accepted', actionId, now });
       const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
-        [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...rest } = body;
+        [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority,
+        [OWNER_MACHINE_AUTHORITY_FIELD]: _ignoredOwnerAuthority, ...rest } = body;
       void _ignoredType;
       void _ignoredSharedActor;
       void _ignoredShareScope;
       void _ignoredMachineAuthority;
+      void _ignoredOwnerAuthority;
       const sharedActor = await buildHttpSharedActor(c.env.DB, {
         userId,
         coverage: access.actor.coverage,
@@ -1211,7 +1213,21 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
     const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
     if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   }
-  return relayToDaemon(c, 'session.send', stripBrowserShareFields(body));
+  const safeBody = stripBrowserShareFields(body);
+  const ownerMachineAuthority = targetSessionName
+    ? await issueOwnerMachineAuthorityForSession(c.env.DB, {
+        actorUserId: userId,
+        sourceServerId: serverId,
+        sessionName: targetSessionName,
+        actionId: actionIdFromBody(body),
+        signingKey: c.env.JWT_SIGNING_KEY,
+      })
+    : null;
+  return relayToDaemon(
+    c,
+    'session.send',
+    ownerMachineAuthority ? { ...safeBody, [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : safeBody,
+  );
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1248,11 +1264,13 @@ function actionIdFromBody(body: Record<string, unknown>): string {
 
 function stripBrowserShareFields(body: Record<string, unknown>): Record<string, unknown> {
   const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
-    [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...safeBody } = body;
+    [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority,
+    [OWNER_MACHINE_AUTHORITY_FIELD]: _ignoredOwnerAuthority, ...safeBody } = body;
   void _ignoredType;
   void _ignoredSharedActor;
   void _ignoredShareScope;
   void _ignoredMachineAuthority;
+  void _ignoredOwnerAuthority;
   return safeBody;
 }
 

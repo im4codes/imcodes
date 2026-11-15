@@ -36,6 +36,7 @@ export type DaemonCallerAuthority =
       actorUserId: string;
       sourceServerId: string;
       restrictedSharedHost: boolean;
+      hasTurnAuthority?: boolean;
     }
   | {
       ok: false;
@@ -87,6 +88,7 @@ export async function resolveDaemonCallerAuthority<
     token: rawHeader,
     signingKey: c.env.JWT_SIGNING_KEY,
     authenticatedSourceServerId: authServerId,
+    sourceOwnerUserId: userId,
     now,
   });
 
@@ -139,7 +141,7 @@ export async function resolveDaemonCallerAuthority<
   }
 
   const restrictedSharedHost = await isSharedOrContributedServer(c.env.DB, authServerId, now);
-  if (restrictedSharedHost && options.denySharedHostAbsentAuthority !== false) {
+  if (delegated.kind === 'absent' && restrictedSharedHost && options.denySharedHostAbsentAuthority !== false) {
     return {
       ok: false,
       status: 403,
@@ -151,7 +153,7 @@ export async function resolveDaemonCallerAuthority<
   if (
     options.targetServerId
     && options.targetServerId !== authServerId
-    && (restrictedSharedHost || !options.allowOwnerCrossServer)
+    && ((restrictedSharedHost && delegated.kind !== 'owner') || !options.allowOwnerCrossServer)
   ) {
     return {
       ok: false,
@@ -169,6 +171,7 @@ export async function resolveDaemonCallerAuthority<
     actorUserId: userId,
     sourceServerId: authServerId,
     restrictedSharedHost,
+    hasTurnAuthority: delegated.kind === 'owner',
   };
 }
 

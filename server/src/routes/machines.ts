@@ -287,7 +287,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
       now,
     });
     if (!operational) return c.json({ error: 'forbidden' }, 403);
-    if (!operational.delegatedActorUserId && await isSharedOrContributedServer(c.env.DB, sourceServerId, now)) {
+    if (operational.authorityKind === 'absent' && await isSharedOrContributedServer(c.env.DB, sourceServerId, now)) {
       return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
     }
     userId = operational.userId;

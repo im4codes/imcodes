@@ -1,7 +1,10 @@
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
+  OWNER_MACHINE_AUTHORITY_FIELD,
   SHARED_MACHINE_ACTIVITY_KIND,
+  SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
   type SharedMachineActivity,
+  type SharedMachineAuthorityActorKind,
 } from '../../shared/shared-machine-authority.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 
@@ -15,6 +18,8 @@ type Window = {
   participants: Set<string>;
   /** Latest server-minted token of the (single) participant; the server re-verifies it on every use. */
   authority: string | null;
+  /** Latest server-minted owner-turn authority token when only authenticated owner activity ran in this window. */
+  ownerAuthority: string | null;
   lastActivityAt: number;
   /**
    * Every turn that can still run on the session, counting the one already in
@@ -94,7 +99,7 @@ export function bindProcessSharedMachineActivity(
     // A session that is running when the window opens is running a turn the daemon never saw start
     // (typed in the local tmux, an automation write): it is ahead of this input and must be counted.
     window = {
-      identity, owner: false, participants: new Set(), authority: null, lastActivityAt: now,
+      identity, owner: false, participants: new Set(), authority: null, ownerAuthority: null, lastActivityAt: now,
       turns: opts.sessionRunning ? 1 : 0, undelivered: 0,
     };
     windows.set(sessionName, window);
@@ -108,8 +113,10 @@ export function bindProcessSharedMachineActivity(
   if (!identity) window.identity = null;
   if (activity.kind === SHARED_MACHINE_ACTIVITY_KIND.OWNER) {
     window.owner = true;
+    window.ownerAuthority = activity.authority ?? null;
   } else {
     window.participants.add(activity.actorUserId);
+    window.ownerAuthority = null;
     // Keep the participant marker even without a token: a participant turn must
     // never degrade into the ordinary source-owner path because propagation failed.
     if (activity.authority) window.authority = activity.authority;
@@ -156,13 +163,19 @@ export function bindProcessSharedMachineCommand(
   const authority = typeof cmd.sharedMachineAuthority === 'string' && cmd.sharedMachineAuthority.trim()
     ? cmd.sharedMachineAuthority.trim()
     : undefined;
+  const ownerAuthority = typeof cmd[OWNER_MACHINE_AUTHORITY_FIELD] === 'string' && String(cmd[OWNER_MACHINE_AUTHORITY_FIELD]).trim()
+    ? String(cmd[OWNER_MACHINE_AUTHORITY_FIELD]).trim()
+    : undefined;
   const activity: SharedMachineActivity = actor?.effectiveActorRole === 'participant'
     ? {
         kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
         actorUserId: typeof actor.actorUserId === 'string' ? actor.actorUserId : '',
         authority,
       }
-    : { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER };
+    : {
+        kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+        ...(ownerAuthority ? { authority: ownerAuthority } : {}),
+      };
   // Keystrokes only start a turn when they submit a line (Enter); a message always does.
   const startsTurn = cmd.type === DAEMON_COMMAND_TYPES.SESSION_INPUT
     ? typeof cmd.data === 'string' && /[\r\n]/.test(cmd.data)
@@ -203,6 +216,7 @@ export function releaseProcessSharedMachineAuthority(sessionName: string, now = 
   if (window.turns > 1) {
     window.turns -= 1;
     window.owner = false;
+    if (window.participants.size > 0) window.ownerAuthority = null;
     window.lastActivityAt = now;
     return;
   }
@@ -214,15 +228,20 @@ export function readProcessSharedMachineAuthority(
   identity: RuntimeIdentity,
   now = Date.now(),
   sessionRunning = false,
-): { required: boolean; authority: string | null } {
+): { required: boolean; actorKind?: SharedMachineAuthorityActorKind; authority: string | null } {
   const window = windows.get(sessionName);
   if (!window) return { required: false, authority: null };
   if (quietAndIdle(window, now, sessionRunning)) {
     windows.delete(sessionName);
     return { required: false, authority: null };
   }
-  // Owner-only activity is the ordinary unrestricted path.
-  if (window.participants.size === 0) return { required: false, authority: null };
+  // Owner-only activity is the ordinary unrestricted path; on shared hosts it carries its server-signed owner token.
+  if (window.participants.size === 0) {
+    const ownerAuthority = sameIdentity(window.identity, identity) ? window.ownerAuthority : null;
+    return ownerAuthority
+      ? { required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: ownerAuthority }
+      : { required: false, authority: null };
+  }
   if (!sameIdentity(window.identity, identity)) return { required: true, authority: null };
   if (window.owner || window.participants.size > 1) return { required: true, authority: null };
   return { required: true, authority: window.authority };

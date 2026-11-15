@@ -550,9 +550,12 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
     token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
     signingKey: c.env.JWT_SIGNING_KEY,
     authenticatedSourceServerId: serverRow.serverId,
+    sourceOwnerUserId: serverRow.userId,
     now: Date.now(),
   });
-  if (authority.kind !== 'absent') return c.json({ error: 'forbidden' }, 403);
+  if (authority.kind === 'participant' || authority.kind === 'invalid') {
+    return c.json({ error: 'forbidden' }, 403);
+  }
   const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
   const personalSyncEnabled = await getPersonalMemorySyncEnabled(c.env.DB, serverRow.userId);
   const config = normalizeSharedContextRuntimeConfig({
@@ -583,12 +586,16 @@ async function checkDaemonSelfAccess(
     token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
     signingKey: c.env.JWT_SIGNING_KEY,
     authenticatedSourceServerId: serverRow.serverId,
+    sourceOwnerUserId: serverRow.userId,
     now: Date.now(),
   });
-  if (authority.kind !== 'absent') {
+  if (authority.kind === 'participant') {
     return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
   }
-  if (options.blockSharedHost && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
+  if (authority.kind === 'invalid') {
+    return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
+  }
+  if (options.blockSharedHost && authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
     return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
   }
   return null;

@@ -89,6 +89,8 @@ export interface ResendEntry {
   sharedActor?: SharedActorEnvelope;
   /** Opaque server-signed device authority; private queue material only. */
   sharedMachineAuthority?: string;
+  /** Opaque server-signed owner-turn device authority; private queue material only. */
+  ownerMachineAuthority?: string;
   /** Preserve the trusted MCP delivery policy across runtime restore windows. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** @internal: this logical user event has already been written to the timeline. */
@@ -216,6 +218,7 @@ function enqueueResendInternal(
     ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
     ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
     ...(normalizedEntry.sharedMachineAuthority ? { sharedMachineAuthority: normalizedEntry.sharedMachineAuthority } : {}),
+    ...(normalizedEntry.ownerMachineAuthority ? { ownerMachineAuthority: normalizedEntry.ownerMachineAuthority } : {}),
     ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
     ...(normalizedEntry.activeTurnDeliveryKind
       ? { activeTurnDeliveryKind: normalizedEntry.activeTurnDeliveryKind }

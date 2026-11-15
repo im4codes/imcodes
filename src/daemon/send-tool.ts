@@ -413,6 +413,8 @@ export interface SendMessageInput {
    * the receiving/automation side.
    */
   internalStructuredPayload?: true;
+  /** Daemon-only owner-turn device authority propagated for non-shared cron structured sends. */
+  internalOwnerMachineAuthority?: string;
 }
 
 export interface SendMessageDelivery {
@@ -729,6 +731,7 @@ export interface CronSendDispatchInput {
   reply?: boolean;
   broadcast?: boolean;
   idempotencyKey?: string;
+  ownerMachineAuthority?: string;
 }
 
 export interface CronSendDispatchResult {
@@ -3007,6 +3010,7 @@ export async function dispatchSendMessage(
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
     });
     try {
+      const actorOption = buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now);
       const dispatchResult = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
@@ -3023,7 +3027,12 @@ export async function dispatchSendMessage(
         ...(supervisedTaskId && supervisedAssignmentId
           ? { supervision: { taskId: supervisedTaskId, assignmentId: supervisedAssignmentId } }
           : {}),
-        ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
+        ...actorOption,
+        ...(actorOption.sharedActor?.effectiveActorRole !== 'participant'
+          && !actorOption.ownerMachineAuthority
+          && input.internalOwnerMachineAuthority
+          ? { ownerMachineAuthority: input.internalOwnerMachineAuthority }
+          : {}),
       });
       const execution = resolveDeliveryExecution(target, supervisedAssignmentId);
       deliveries.push({
@@ -5736,6 +5745,7 @@ async function dispatchCommandSend(
   for (const target of gate.dispatchable) {
     const messageId = createSendMessageId();
     try {
+      const actorOption = buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now);
       const dispatchResult = await d.dispatchMessage(target, buildSessionDispatchMessage({ message: text, command: true }), {
         dispatchId,
         messageId,
@@ -5744,7 +5754,12 @@ async function dispatchCommandSend(
         command: true,
         ...(input.emergency ? { emergency: true } : {}),
         ...(deps?.cancelSession ? { cancelSession: deps.cancelSession } : {}),
-        ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
+        ...actorOption,
+        ...(actorOption.sharedActor?.effectiveActorRole !== 'participant'
+          && !actorOption.ownerMachineAuthority
+          && input.internalOwnerMachineAuthority
+          ? { ownerMachineAuthority: input.internalOwnerMachineAuthority }
+          : {}),
       });
       deliveries.push({
         target: target.name,
@@ -5996,6 +6011,7 @@ export async function dispatchCronSend(input: CronSendDispatchInput, deps?: Send
     ...(input.reply !== undefined ? { reply: input.reply } : {}),
     ...(input.broadcast !== undefined ? { broadcast: input.broadcast } : {}),
     ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+    ...(input.ownerMachineAuthority ? { internalOwnerMachineAuthority: input.ownerMachineAuthority } : {}),
     // A cron tick creates work on a schedule nobody is watching, so it gets the
     // wider refusal: firing every N minutes into a target that cannot run the
     // task builds a backlog and burns the retry budget for nothing.

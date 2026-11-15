@@ -175,6 +175,8 @@ export interface PendingTransportMessage {
   sharedActor?: SharedActorEnvelope;
   /** @internal: opaque server-signed device authority; never exposed in public projections/prompts. */
   sharedMachineAuthority?: string;
+  /** @internal: opaque server-signed owner-turn device authority; never exposed in public projections/prompts. */
+  ownerMachineAuthority?: string;
   /** @internal: this logical user event has already been written to the timeline. */
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
@@ -286,6 +288,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
   delete publicEntry.sharedMachineAuthority;
+  delete publicEntry.ownerMachineAuthority;
   // `aliasAudit` deliberately survives: it holds only referenced names and a
   // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
@@ -302,6 +305,8 @@ export interface TransportSendMetadata {
   sharedActor?: SharedActorEnvelope;
   /** @internal: opaque server-signed device authority for this exact shared turn. */
   sharedMachineAuthority?: string;
+  /** @internal: opaque server-signed owner-turn device authority for this exact owner turn. */
+  ownerMachineAuthority?: string;
   /**
    * Agent-bound text after alias expansion (A′). When present the provider (and
    * runtime history) receive this text while the timeline keeps the ORIGINAL
@@ -720,7 +725,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _appendedTurnOrigins: {
     dispatchId: number | null;
     turn: unknown;
-    entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority'>>;
+    entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>>;
   } | null = null;
   /** Last single-message turn that reached provider completion. Consumed by
    * the authoritative idle projection; never inferred from timeline order. */
@@ -1467,7 +1472,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * Every message that fed the CURRENT turn: the dispatched entries and whatever was appended into the running turn since. The turn's
    * origin class is the weakest of them (a participant anywhere makes it participant-origin).
    */
-  private turnOriginEntries(): Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority'>> {
+  private turnOriginEntries(): Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>> {
     const appended = this._appendedTurnOrigins;
     const stillSameTurn = appended !== null && (
       appended.dispatchId !== null
@@ -1483,6 +1488,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (origins.length === 0 || origins.some((entry) => !entry.sharedMachineAuthority)) return null;
     const tokens = new Set(origins.map((entry) => entry.sharedMachineAuthority!));
     return tokens.size === 1 ? [...tokens][0]! : null;
+  }
+
+  /** Opaque owner-turn authority for non-participant turns only; any participant or unstamped origin fails closed. */
+  getActiveOwnerMachineAuthority(): string | null {
+    if (this.requiresSharedMachineAuthority()) return null;
+    const origins = this.turnOriginEntries();
+    if (origins.length === 0 || origins.some((entry) => !entry.ownerMachineAuthority)) return null;
+    return origins[origins.length - 1]!.ownerMachineAuthority!;
   }
 
   requiresSharedMachineAuthority(): boolean {
@@ -1832,6 +1845,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             attachmentRefs?: unknown;
             sharedActorEnvelope?: unknown;
             sharedMachineAuthority?: unknown;
+            ownerMachineAuthority?: unknown;
             timelineCommitted?: unknown;
             historyCommitted?: unknown;
             deliveryMode?: unknown;
@@ -1856,6 +1870,9 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
               ...(typeof material.sharedMachineAuthority === 'string' && material.sharedMachineAuthority
                 ? { sharedMachineAuthority: material.sharedMachineAuthority }
+                : {}),
+              ...(typeof material.ownerMachineAuthority === 'string' && material.ownerMachineAuthority
+                ? { ownerMachineAuthority: material.ownerMachineAuthority }
                 : {}),
               ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
               ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
@@ -2928,6 +2945,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
       ...(metadata?.sharedMachineAuthority ? { sharedMachineAuthority: metadata.sharedMachineAuthority } : {}),
+      ...(metadata?.ownerMachineAuthority ? { ownerMachineAuthority: metadata.ownerMachineAuthority } : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
@@ -3508,6 +3526,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           ...selected.map((entry) => ({
             ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
+            ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
           })),
         ],
       };
@@ -4461,6 +4480,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
         ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
         ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
+        ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
         ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
         ...(entry.historyCommitted ? { historyCommitted: true } : {}),
         ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),

@@ -53,3 +53,26 @@ export function readSenderParticipantTurn(senderSessionName: string | null | und
     authority: process.authority,
   };
 }
+
+/**
+ * Returns the active owner-turn machine authority token when the sender session is running an
+ * authenticated owner turn (never participant or mixed). Synchronous: in-memory registries only.
+ */
+export function readSenderOwnerMachineAuthority(senderSessionName: string | null | undefined): string | null {
+  if (!senderSessionName) return null;
+  if (readSenderParticipantTurn(senderSessionName)) return null;
+  const record = getSession(senderSessionName);
+  if (!record) return null;
+  const runtime = getTransportRuntime(senderSessionName);
+  if (runtime) {
+    return runtime.getActiveOwnerMachineAuthority?.() ?? null;
+  }
+  if (!record.sessionInstanceId || !record.runtimeEpoch) return null;
+  const process = readProcessSharedMachineAuthority(
+    senderSessionName,
+    { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch },
+    Date.now(),
+    record.state === 'running',
+  );
+  return !process.required ? process.authority : null;
+}

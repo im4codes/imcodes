@@ -32,7 +32,7 @@ vi.mock('../../src/store/session-store.js', async (importOriginal) => ({
 
 // session-dispatch first: it and session-manager import each other, and the mocked session-manager must be what both bind to.
 const { buildServerMemberSharedActorOption, dispatchSessionMessage } = await import('../../src/daemon/session-dispatch.js');
-const { readSenderParticipantTurn, AMBIGUOUS_PARTICIPANT_ACTOR } = await import('../../src/daemon/sender-participant-turn.js');
+const { readSenderOwnerMachineAuthority, readSenderParticipantTurn, AMBIGUOUS_PARTICIPANT_ACTOR } = await import('../../src/daemon/sender-participant-turn.js');
 const { bindProcessSharedMachineActivity, clearProcessSharedMachineAuthoritiesForTests, readProcessSharedMachineAuthority } =
   await import('../../src/daemon/shared-machine-authority-context.js');
 const { SHARED_MACHINE_ACTIVITY_KIND } = await import('../../shared/shared-machine-authority.js');
@@ -46,10 +46,11 @@ function record(name: string, patch: Partial<SessionRecord> = {}): SessionRecord
 }
 
 /** A sender runtime whose active turn was started by `actors` (empty = an owner turn). */
-function senderRuntime(actors: string[], authority: string | null) {
+function senderRuntime(actors: string[], authority: string | null, ownerAuthority: string | null = null) {
   return {
     requiresSharedMachineAuthority: () => actors.length > 0,
     getActiveSharedMachineAuthority: () => (actors.length > 0 ? authority : null),
+    getActiveOwnerMachineAuthority: () => (actors.length === 0 ? ownerAuthority : null),
     activeDispatchEntries: actors.map((actorUserId) => ({ sharedActor: { actorUserId, effectiveActorRole: 'participant' } })),
   };
 }
@@ -199,5 +200,61 @@ describe('dispatch of a participant-stamped message', () => {
     } as never);
     expect(result).toBe('sent');
     expect(stopSessionNow).toHaveBeenCalledWith(target.name);
+  });
+
+  it('propagates ownerMachineAuthority across sibling transport and process dispatches on clean owner turns, never on participant turns', async () => {
+    const brain = record('deck_proj_brain', { runtimeType: 'transport' });
+    mocks.sessions.set(brain.name, brain);
+    mocks.runtimes.set(brain.name, senderRuntime([], null, 'owner-jwt-1'));
+    expect(readSenderOwnerMachineAuthority(brain.name)).toBe('owner-jwt-1');
+
+    // Main brain -> worker w1 (non-sub-session) still forwards ownerMachineAuthority without forcing sharedActor
+    const worker = record('deck_proj_w1', { runtimeType: 'transport' });
+    const stampBrainToWorker = buildServerMemberSharedActorOption(
+      { userId: 'owner', sessionName: brain.name, projectName: 'proj', projectRoot: '/repo' },
+      brain, worker, 'msg-ow-1', 1000,
+    );
+    expect(stampBrainToWorker.sharedActor).toBeUndefined();
+    expect(stampBrainToWorker.ownerMachineAuthority).toBe('owner-jwt-1');
+
+    // Transport target append receives ownerMachineAuthority
+    const appendExternalMessageToActiveTurn = vi.fn(async () => 'appended');
+    const send = vi.fn((): 'sent' => 'sent');
+    mocks.runtimes.set(worker.name, { providerSessionId: 'p-w1', send, appendExternalMessageToActiveTurn });
+    await dispatchSessionMessage(worker, 'check status', {
+      dispatchId: 'd-ow-1' as never, messageId: 'm-ow-1' as never, ...stampBrainToWorker,
+    } as never);
+    expect(appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+      'check status',
+      'm-ow-1',
+      undefined,
+      undefined,
+      expect.objectContaining({ ownerMachineAuthority: 'owner-jwt-1' }),
+    );
+
+    // Transport target queue sends ownerMachineAuthority
+    await dispatchSessionMessage(worker, 'queued check', {
+      dispatchId: 'd-ow-2' as never, messageId: 'm-ow-2' as never, deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE, ...stampBrainToWorker,
+    } as never);
+    expect((send.mock.calls[0] as unknown[])[4]).toMatchObject({ ownerMachineAuthority: 'owner-jwt-1' });
+
+    // Process target receives ownerMachineAuthority binding
+    const procTarget = record('deck_proj_w4', { runtimeType: 'process', agentType: 'claude-code' });
+    mocks.sessions.set(procTarget.name, procTarget);
+    await dispatchSessionMessage(procTarget, 'run proc task', {
+      dispatchId: 'd-ow-3' as never, messageId: 'm-ow-3' as never, ...stampBrainToWorker,
+    } as never);
+    expect(readProcessSharedMachineAuthority(procTarget.name, { sessionInstanceId: procTarget.sessionInstanceId!, runtimeEpoch: procTarget.runtimeEpoch! }))
+      .toEqual({ required: false, actorKind: 'owner', authority: 'owner-jwt-1' });
+
+    // Participant turn never leaks ownerMachineAuthority
+    mocks.runtimes.set(brain.name, senderRuntime(['participant-1'], 'part-jwt-1', 'owner-jwt-1'));
+    expect(readSenderOwnerMachineAuthority(brain.name)).toBeNull();
+    const partStamp = buildServerMemberSharedActorOption(
+      { userId: 'owner', sessionName: brain.name, projectName: 'proj', projectRoot: '/repo' },
+      brain, worker, 'msg-part', 1000,
+    );
+    expect(partStamp.sharedMachineAuthority).toBe('part-jwt-1');
+    expect(partStamp.ownerMachineAuthority).toBeUndefined();
   });
 });

@@ -1,4 +1,5 @@
 import type { MemoryMcpSourceProvenance } from './memory-mcp-provenance.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD } from './shared-machine-authority.js';
 
 // ── Cron Action types (discriminated union) ──────────────────────────────
 
@@ -428,6 +429,8 @@ export interface CronDispatchMessage {
   nextRunAt?: number | null;
   /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
   targetSessionName?: string;
+  /** Server-signed owner-turn authority for non-shared host-owner cron dispatches. */
+  [OWNER_MACHINE_AUTHORITY_FIELD]?: string;
   action: CronAction;
 }
 

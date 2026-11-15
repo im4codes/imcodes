@@ -9,7 +9,7 @@ import {
 } from '../../shared/session-control-commands.js';
 import { createHash } from 'node:crypto';
 import { sendCommandText } from '../../shared/send-command-mode.js';
-import { readSenderParticipantTurn } from './sender-participant-turn.js';
+import { readSenderOwnerMachineAuthority, readSenderParticipantTurn } from './sender-participant-turn.js';
 import { bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
 import { SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
@@ -76,6 +76,8 @@ export interface SessionDispatchMessageOptions {
    * the receiving turn is bound to that participant, so machine tools there follow the participant's own access, not the owner's.
    */
   sharedMachineAuthority?: string;
+  /** Server-minted owner-turn authority carried across sibling sends during an owner turn or owner cron send. */
+  ownerMachineAuthority?: string;
   /** Node MCP send_message: prefer provider-native append before FIFO. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /**
@@ -202,6 +204,7 @@ function formatServerMemberActorName(callerName: string, callerRecord?: SessionR
 export interface SessionDispatchActorOption {
   sharedActor?: SharedActorEnvelope;
   sharedMachineAuthority?: string;
+  ownerMachineAuthority?: string;
   /** A participant-stamped message waits for its own turn: it must never be appended into a turn that is already running. */
   deliveryMode?: typeof MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE;
 }
@@ -228,8 +231,13 @@ export function buildServerMemberSharedActorOption(
       ...(senderTurn.authority ? { sharedMachineAuthority: senderTurn.authority } : {}),
     };
   }
-  if (!shouldAttachServerMemberActor(caller.sessionName, callerRecord, target)) return {};
-  return { sharedActor: buildServerMemberActorEnvelope(caller, callerRecord, target, actionId, now, caller.userId || caller.sessionName, 'server-member') };
+  const ownerAuthority = readSenderOwnerMachineAuthority(caller.sessionName);
+  const attachActor = shouldAttachServerMemberActor(caller.sessionName, callerRecord, target);
+  if (!attachActor && !ownerAuthority) return {};
+  return {
+    ...(attachActor ? { sharedActor: buildServerMemberActorEnvelope(caller, callerRecord, target, actionId, now, caller.userId || caller.sessionName, 'server-member') } : {}),
+    ...(ownerAuthority ? { ownerMachineAuthority: ownerAuthority } : {}),
+  };
 }
 
 function buildServerMemberActorEnvelope(
@@ -369,6 +377,7 @@ export async function dispatchSessionMessage(
         ...(options.command ? { commandMode: true as const } : {}),
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
         ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
@@ -408,6 +417,7 @@ export async function dispatchSessionMessage(
         ...(options.command ? { commandMode: true as const } : {}),
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
         ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
@@ -434,6 +444,7 @@ export async function dispatchSessionMessage(
         ...originMetadata(options),
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
       };
       const commandPrivateMetadata = Object.keys(privateMetadata).length > 0 ? privateMetadata : undefined;
       const result = typeof appendExternal === 'function'
@@ -463,6 +474,7 @@ export async function dispatchSessionMessage(
           ...(shouldStop ? { queuePlacement: 'front' as const, emergency: true as const } : {}),
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
           ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+          ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
           ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
           ...(options.queueSupervisionReference
             ? { supervisionReference: options.queueSupervisionReference }
@@ -506,11 +518,17 @@ export async function dispatchSessionMessage(
       ? runtime.send(message, options.messageId, undefined, undefined, {
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+        ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
           timelineCommitted: true,
           ...originMetadata(options),
         })
-      : options.sharedActor
-      ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor, ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}), ...originMetadata(options) })
+      : options.sharedActor || options.ownerMachineAuthority
+      ? runtime.send(message, options.messageId, undefined, undefined, {
+          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+          ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+          ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...originMetadata(options),
+        })
       : options.messageOrigin || options.command
       ? runtime.send(message, options.messageId, undefined, undefined, originMetadata(options))
       : runtime.send(message, options.messageId);
@@ -544,15 +562,24 @@ export async function dispatchSessionMessage(
   if (shouldAutoStopProcess) {
     await cancelTargetSession(target, options);
   }
-  // A participant-stamped message makes this process session's next turn a participant turn (the window the machine tools consult).
-  const participantBinding = options.sharedActor?.effectiveActorRole === 'participant'
-    && target.sessionInstanceId && target.runtimeEpoch
-    ? bindProcessSharedMachineActivity(
-        target.name,
-        { sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch },
-        { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: options.sharedActor.actorUserId, authority: options.sharedMachineAuthority },
-        { sessionRunning: target.state === 'running' },
-      )
+  // A participant-stamped message makes this process session's next turn a participant turn;
+  // an authenticated owner-turn message carries ownerMachineAuthority when no participant is involved.
+  const processAuthorityBinding = target.sessionInstanceId && target.runtimeEpoch
+    ? options.sharedActor?.effectiveActorRole === 'participant'
+      ? bindProcessSharedMachineActivity(
+          target.name,
+          { sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch },
+          { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: options.sharedActor.actorUserId, authority: options.sharedMachineAuthority },
+          { sessionRunning: target.state === 'running' },
+        )
+      : options.ownerMachineAuthority
+        ? bindProcessSharedMachineActivity(
+            target.name,
+            { sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch },
+            { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: options.ownerMachineAuthority },
+            { sessionRunning: target.state === 'running' },
+          )
+        : null
     : null;
   const processDeliveryMode = deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE
     ? { deliveryMode }
@@ -569,7 +596,7 @@ export async function dispatchSessionMessage(
     ...processDeliveryMode,
     ...userMessageMetadata,
     ...processCommandMode,
-    ...(participantBinding ? { onTyped: () => participantBinding.typed() } : {}),
+    ...(processAuthorityBinding ? { onTyped: () => processAuthorityBinding.typed() } : {}),
   };
   try {
     const result = Object.keys(processOptions).length > 0
@@ -578,7 +605,7 @@ export async function dispatchSessionMessage(
     if (result === 'queued') return 'queued';
   } finally {
     // Delivery is over whatever happened: an input that never reached the terminal is not a turn that will run.
-    participantBinding?.settle();
+    processAuthorityBinding?.settle();
   }
 }
 

@@ -2,10 +2,14 @@ import { activeUserAnswer } from './helpers/user-status.js';
 import { describe, expect, it } from 'vitest';
 import type { Database } from '../src/db/client.js';
 import {
+  issueOwnerMachineAuthority,
   issueSharedMachineAuthority,
   resolveMachineOperationalUser,
 } from '../src/share/shared-machine-authority.js';
-import { SHARED_MACHINE_AUTHORITY_TYPE } from '../../shared/shared-machine-authority.js';
+import {
+  OWNER_MACHINE_AUTHORITY_TYPE,
+  SHARED_MACHINE_AUTHORITY_TYPE,
+} from '../../shared/shared-machine-authority.js';
 
 const KEY = 'shared-machine-authority-unit-key-at-least-32-bytes';
 
@@ -45,7 +49,7 @@ describe('shared-session machine authority', () => {
     await expect(resolveMachineOperationalUser(fakeDb(), {
       token: token(), signingKey: KEY, authenticatedSourceServerId: 'source-1',
       sourceOwnerUserId: 'owner-1', now: 10,
-    })).resolves.toEqual({ userId: 'owner-1', delegatedActorUserId: 'participant-1' });
+    })).resolves.toEqual({ userId: 'owner-1', delegatedActorUserId: 'participant-1', authorityKind: 'participant' });
   });
 
   it.each([
@@ -66,6 +70,58 @@ describe('shared-session machine authority', () => {
     await expect(resolveMachineOperationalUser(fakeDb(), {
       token: undefined, signingKey: KEY, authenticatedSourceServerId: 'source-1',
       sourceOwnerUserId: 'owner-1', now: 10,
-    })).resolves.toEqual({ userId: 'owner-1' });
+    })).resolves.toEqual({ userId: 'owner-1', authorityKind: 'absent' });
+  });
+
+  it('resolves verified server-signed owner-turn authority and rejects whole-server-share / foreign / forged claims', async () => {
+    const ownerDb = (opts: { wholeServerShare?: boolean; active?: boolean } = {}): Database => ({
+      queryOne: async (sql: string) => {
+        if (sql.includes('FROM users')) return { status: opts.active === false ? 'disabled' : 'active' };
+        if (sql.includes('FROM servers')) return { user_id: 'owner-1' };
+        if (sql.includes('FROM sessions')) return { project_name: 'project-a' };
+        return null;
+      },
+      query: async (sql: string) => {
+        if (sql.includes('FROM server_shares')) return [{ shared: opts.wholeServerShare === true }];
+        return [];
+      },
+    } as unknown as Database);
+
+    const ownerToken = (overrides: Record<string, unknown> = {}) => issueOwnerMachineAuthority({
+      type: OWNER_MACHINE_AUTHORITY_TYPE,
+      sub: 'owner-1',
+      sourceServerId: 'source-1',
+      sessionName: 'deck_a',
+      projectName: 'project-a',
+      actionId: 'owner-act-1',
+      ...overrides,
+    } as never, KEY);
+
+    await expect(resolveMachineOperationalUser(ownerDb(), {
+      token: ownerToken(), signingKey: KEY, authenticatedSourceServerId: 'source-1',
+      sourceOwnerUserId: 'owner-1', now: 10,
+    })).resolves.toEqual({ userId: 'owner-1', authorityKind: 'owner' });
+
+    await expect(resolveMachineOperationalUser(ownerDb({ wholeServerShare: true }), {
+      token: ownerToken(), signingKey: KEY, authenticatedSourceServerId: 'source-1',
+      sourceOwnerUserId: 'owner-1', now: 10,
+    })).resolves.toBeNull();
+
+    await expect(resolveMachineOperationalUser(ownerDb({ active: false }), {
+      token: ownerToken(), signingKey: KEY, authenticatedSourceServerId: 'source-1',
+      sourceOwnerUserId: 'owner-1', now: 10,
+    })).resolves.toBeNull();
+
+    for (const badToken of [
+      ownerToken({ sub: 'participant-1' }),
+      ownerToken({ sourceServerId: 'source-2' }),
+      ownerToken({ projectName: 'project-b' }),
+      `${ownerToken()}tamper`,
+    ]) {
+      await expect(resolveMachineOperationalUser(ownerDb(), {
+        token: badToken, signingKey: KEY, authenticatedSourceServerId: 'source-1',
+        sourceOwnerUserId: 'owner-1', now: 10,
+      })).resolves.toBeNull();
+    }
   });
 });

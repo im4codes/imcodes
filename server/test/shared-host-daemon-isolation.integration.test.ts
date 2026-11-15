@@ -11,10 +11,11 @@ import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser, upsertDbSession } from '../src/db/queries.js';
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
-import { issueSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
+import { issueOwnerMachineAuthority, issueOwnerMachineAuthorityForSession, issueSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
 import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 import { randomHex, signJwt } from '../src/security/crypto.js';
 import {
+  OWNER_MACHINE_AUTHORITY_TYPE,
   SHARED_MACHINE_AUTHORITY_HEADER,
   SHARED_MACHINE_AUTHORITY_TYPE,
 } from '../../shared/shared-machine-authority.js';
@@ -465,5 +466,145 @@ describe('Positive regression guarantees: Owner A on unshared M_priv1 -> M_priv2
     });
     expect(crossOwnExecRes.status).not.toBe(403);
     expect(crossOwnExecRes.status).not.toBe(401);
+  });
+});
+
+describe('Owner-Turn Authority: Owner A operating on shared/contributed hosts M_shared and M_team', () => {
+  it('allows verified Owner A turns on M_shared and M_team across machines, cross-device exec, account stores, and daemon-self endpoints', async () => {
+    for (const host of [
+      { id: M_SHARED, tok: TOK_SHARED, session: SHARED_MAIN_SESSION, project: SHARED_PROJ, label: 'M_shared' },
+      { id: M_TEAM, tok: TOK_TEAM, session: `deck_team_${tag}_brain`, project: `team_${tag}`, label: 'M_team' },
+    ]) {
+      const ownerToken = await issueOwnerMachineAuthorityForSession(db, {
+        actorUserId: OWNER_A,
+        sourceServerId: host.id,
+        sessionName: host.session,
+        actionId: `owner-act-${randomHex(4)}`,
+        signingKey: JWT_KEY,
+      });
+      expect(ownerToken, `${host.label} owner token minted`).toBeTruthy();
+      const hdrs = daemonHeaders(host.id, host.tok, {
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerToken!,
+      });
+
+      const machinesRes = await app.request('/api/machines?includeOffline=true', { headers: hdrs });
+      expect(machinesRes.status, `${host.label} GET /api/machines`).toBe(200);
+      const machinesBody = await machinesRes.json() as { machines: Array<{ serverId: string }> };
+      expect(machinesBody.machines.some((m) => m.serverId === M_PRIV2)).toBe(true);
+
+      const crossExecRes = await app.request(`/api/machine/exec?serverId=${M_PRIV2}`, {
+        method: 'POST',
+        headers: { ...hdrs, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'echo owner-ok' }),
+      });
+      expect(crossExecRes.status, `${host.label} cross-device exec not 403`).not.toBe(403);
+      expect(crossExecRes.status, `${host.label} cross-device exec not 401`).not.toBe(401);
+
+      const crossCuRes = await app.request(`/api/machine/computer-use?serverId=${M_PRIV2}`, {
+        method: 'POST',
+        headers: { ...hdrs, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool: 'list_apps' }),
+      });
+      expect(crossCuRes.status, `${host.label} computer-use not 403`).not.toBe(403);
+      expect(crossCuRes.status, `${host.label} computer-use not 401`).not.toBe(401);
+
+      const aliasesRes = await app.request('/api/aliases', { headers: hdrs });
+      expect(aliasesRes.status, `${host.label} GET /api/aliases`).toBe(200);
+
+      const vmRes = await app.request('/api/verification-machines', { headers: hdrs });
+      expect(vmRes.status, `${host.label} GET /api/verification-machines`).toBe(200);
+
+      const capGetRes = await app.request(`/api/capabilities/${CAP_ID}?serverId=${host.id}`, { headers: hdrs });
+      expect(capGetRes.status, `${host.label} GET /api/capabilities/:id`).toBe(200);
+
+      const docRes = await app.request('/api/cloud-docs', { headers: hdrs });
+      expect(docRes.status, `${host.label} GET /api/cloud-docs`).toBe(200);
+
+      const memOwnerRes = await app.request(
+        `/api/memory/projection-owner?projectionId=${MEM_PROJ_PRIV_ID}&projectId=${encodeURIComponent(`priv${tag}`)}`,
+        { headers: hdrs },
+      );
+      expect(memOwnerRes.status, `${host.label} GET /api/memory/projection-owner`).toBe(200);
+
+      const pinListRes = await app.request(`/api/message-pins?serverId=${host.id}`, { headers: hdrs });
+      expect(pinListRes.status, `${host.label} GET /api/message-pins`).toBe(200);
+      if (host.id === M_SHARED) {
+        const pinRes = await app.request(`/api/message-pins/${OWNER_PIN_SHARED}?serverId=${M_SHARED}`, { headers: hdrs });
+        expect(pinRes.status, `${host.label} GET /api/message-pins/:id`).toBe(200);
+      }
+
+      const ownSessRes = await app.request(`/api/server/${host.id}/sessions`, { headers: hdrs });
+      expect(ownSessRes.status, `${host.label} GET /api/server/:id/sessions`).toBe(200);
+
+      const subSessRes = await app.request(`/api/server/${host.id}/sub-sessions`, { headers: hdrs });
+      expect(subSessRes.status, `${host.label} GET /api/server/:id/sub-sessions`).toBe(200);
+
+      const cfgRes = await app.request(`/api/server/${host.id}/shared-context/runtime-config/daemon`, { headers: hdrs });
+      expect(cfgRes.status, `${host.label} GET /api/server/:id/shared-context/runtime-config/daemon`).toBe(200);
+
+      const supRes = await app.request(`/api/server/${host.id}/supervision/user-defaults/daemon`, { headers: hdrs });
+      expect(supRes.status, `${host.label} GET /api/server/:id/supervision/user-defaults/daemon`).toBe(200);
+
+      const outRes = await app.request('/api/outbound', {
+        method: 'POST',
+        headers: { ...hdrs, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ botId: 'b1', channelId: 'c1', text: 'owner outbound' }),
+      });
+      expect(outRes.status, `${host.label} POST /api/outbound not 403`).not.toBe(403);
+    }
+  });
+
+  it('refuses owner-turn minting and owner-turn claims for non-owners, whole-server share users, and mismatched source servers', async () => {
+    // Whole-server-share user USER_B on M_WHOLE must never receive an owner token
+    const wholeUserToken = await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: USER_B,
+      sourceServerId: M_WHOLE,
+      sessionName: `deck_w_${tag}_brain`,
+      actionId: `bad-whole-${randomHex(4)}`,
+      signingKey: JWT_KEY,
+    });
+    expect(wholeUserToken).toBeNull();
+
+    // Non-owner participant USER_B on M_SHARED must never receive an owner token
+    const participantUserToken = await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: USER_B,
+      sourceServerId: M_SHARED,
+      sessionName: SHARED_MAIN_SESSION,
+      actionId: `bad-part-${randomHex(4)}`,
+      signingKey: JWT_KEY,
+    });
+    expect(participantUserToken).toBeNull();
+
+    // Even if a forged JWT claims OWNER_MACHINE_AUTHORITY_TYPE for USER_B or wrong server, M_SHARED rejects it with 403
+    const forgedUserBOwner = issueOwnerMachineAuthority({
+      type: OWNER_MACHINE_AUTHORITY_TYPE,
+      sub: USER_B,
+      sourceServerId: M_SHARED,
+      sessionName: SHARED_MAIN_SESSION,
+      projectName: SHARED_PROJ,
+      actionId: `forge-b-${randomHex(4)}`,
+    }, JWT_KEY);
+    const wrongServerOwner = issueOwnerMachineAuthority({
+      type: OWNER_MACHINE_AUTHORITY_TYPE,
+      sub: OWNER_A,
+      sourceServerId: M_PRIV1,
+      sessionName: SHARED_MAIN_SESSION,
+      projectName: SHARED_PROJ,
+      actionId: `forge-srv-${randomHex(4)}`,
+    }, JWT_KEY);
+
+    for (const badToken of [forgedUserBOwner, wrongServerOwner]) {
+      const hdrs = daemonHeaders(M_SHARED, TOK_SHARED, {
+        [SHARED_MACHINE_AUTHORITY_HEADER]: badToken,
+      });
+      const res = await app.request('/api/machines?includeOffline=true', { headers: hdrs });
+      expect(res.status).toBe(403);
+      const execRes = await app.request(`/api/machine/exec?serverId=${M_PRIV2}`, {
+        method: 'POST',
+        headers: { ...hdrs, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'id' }),
+      });
+      expect(execRes.status).toBe(403);
+    }
   });
 });

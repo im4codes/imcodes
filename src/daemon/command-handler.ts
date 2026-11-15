@@ -41,6 +41,7 @@ import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { registerProcessQueueDrainer } from './hook-server.js';
 import { bindProcessSharedMachineCommand, type ProcessSharedMachineBinding } from './shared-machine-authority-context.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
 import {
   emitTransportUserMessage as emitTransportUserMessageEvent,
   persistTransportUserMessage,
@@ -4744,6 +4745,13 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const sharedMachineAuthority = typeof cmd.sharedMachineAuthority === 'string' && cmd.sharedMachineAuthority.trim()
     ? cmd.sharedMachineAuthority.trim()
     : undefined;
+  const rawOwnerMachineAuthority = (cmd as Record<string, unknown>)[OWNER_MACHINE_AUTHORITY_FIELD];
+  const ownerMachineAuthority = sharedActor?.effectiveActorRole !== 'participant'
+    && !sharedMachineAuthority
+    && typeof rawOwnerMachineAuthority === 'string'
+    && rawOwnerMachineAuthority.trim()
+    ? rawOwnerMachineAuthority.trim()
+    : undefined;
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
     : undefined;
@@ -5660,6 +5668,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+      ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -5757,6 +5766,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+      ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -5935,10 +5945,11 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       // `aliasAudit` must ride the metadata, not just the immediate emit: a
       // queued/resent message emits its user.message later from session-manager,
       // which can only anchor what the entry carries.
-      const sendMetadata = (sharedActor || sharedMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
+      const sendMetadata = (sharedActor || sharedMachineAuthority || ownerMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
             ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+            ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
             ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),

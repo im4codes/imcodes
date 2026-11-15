@@ -10,6 +10,7 @@ import { logAudit } from '../security/audit.js';
 import { randomHex } from '../security/crypto.js';
 import { listActiveSharesForUser, shareTargetFromSessionName } from '../db/tab-sharing.js';
 import { resolveServerMemberAccessOrShareDeny, resolveHttpShareAccessForCoveredSession } from '../routes/share-http-auth.js';
+import { issueOwnerMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import type { Database } from '../db/client.js';
 import {
   CRON_MSG,
@@ -19,6 +20,7 @@ import {
   type CronAction,
   type CronDispatchMessage,
 } from '../../../shared/cron-types.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import logger from '../util/logger.js';
 
 type PreparedCronAction =
@@ -93,6 +95,32 @@ async function verifySharedCronCreatorStillAuthorized(
   return shares.some((s) => s.serverId === job.server_id && s.role === 'participant');
 }
 
+async function issueCronOwnerAuthority(
+  env: Env,
+  job: DbCronJob,
+  executionId: string,
+): Promise<string | undefined> {
+  if (!env.JWT_SIGNING_KEY || typeof (env.DB as { queryOne?: unknown })?.queryOne !== 'function') {
+    return undefined;
+  }
+  const prov = await env.DB.queryOne<{ shared: boolean }>(
+    'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
+    [job.id],
+  ).catch(() => null);
+  if (prov?.shared) return undefined;
+  const targetSessionName = job.target_session_name?.trim()
+    || (job.project_name ? `deck_${job.project_name}_${job.target_role ?? 'brain'}` : '');
+  if (!targetSessionName) return undefined;
+  const token = await issueOwnerMachineAuthorityForSession(env.DB, {
+    actorUserId: job.user_id,
+    sourceServerId: job.server_id,
+    sessionName: targetSessionName,
+    actionId: `cron-${job.id}-${executionId}`,
+    signingKey: env.JWT_SIGNING_KEY,
+  });
+  return token ?? undefined;
+}
+
 /** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
 export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
   if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, Date.now())) {
@@ -117,6 +145,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     logger.warn({ jobId: job.id }, 'Cron manual trigger: target_role is NULL, defaulting to brain');
   }
   const executionId = randomHex(12);
+  const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId);
   const msg: CronDispatchMessage = {
     type: CRON_MSG.DISPATCH,
     jobId: job.id,
@@ -132,6 +161,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     previousRunAt: job.last_run_at,
     nextRunAt: job.next_run_at,
     ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
+    ...(ownerMachineAuthority ? { [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : {}),
     action,
   };
   bridge.sendToDaemon(JSON.stringify(msg));
@@ -347,10 +377,12 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       // Use the value written by the claim, rather than recalculating it after
       // the claim, so the payload always describes the durable occurrence.
       const nextRun = job.next_run_at ?? calculateNextRun(job.cron_expr, now, job.timezone);
+      const executionId = job.execution_id ?? randomHex(12);
+      const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId);
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,
-        executionId: job.execution_id ?? randomHex(12),
+        executionId,
         jobName: job.name,
         serverId: job.server_id,
         projectName: job.project_name ?? '',
@@ -364,6 +396,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
           : job.last_run_at,
         nextRunAt: nextRun,
         ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
+        ...(ownerMachineAuthority ? { [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : {}),
         action,
       };
       bridge.sendToDaemon(JSON.stringify(msg));

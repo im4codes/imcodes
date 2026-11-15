@@ -47,8 +47,8 @@ import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { SHARE_MESSAGE_LANE, SHARE_MESSAGE_LANE_MAX_PENDING, shareBrowserMessageLane, type ShareMessageLane } from './share-lanes.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
-import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
+import { issueOwnerMachineAuthorityForSession, issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { TERMINAL_CONTROL, TERMINAL_STREAM_RESET_REASON } from '../../../shared/terminal-protocol.js';
@@ -2698,6 +2698,9 @@ export class WsBridge {
   private shareCoverageRefreshes = new WeakMap<WebSocket, Promise<ShareScopedSocketState | null>>();
   private shareInputAuthorityTokens = new WeakMap<WebSocket, Map<string, { token: string | null; at: number }>>();
   private shareInputAuthorityMints = new WeakMap<WebSocket, Map<string, Promise<string | null>>>();
+  private ownerInputAuthorityTokens = new WeakMap<WebSocket, Map<string, { token: string | null; at: number }>>();
+  private ownerInputAuthorityMints = new WeakMap<WebSocket, Map<string, Promise<string | null>>>();
+  private ownerCommandChains = new WeakMap<WebSocket, Promise<void>>();
   private pendingShareAudits = 0;
   private browserDataReadRateLimiter = new MemoryRateLimiter();
 
@@ -7457,6 +7460,17 @@ export class WsBridge {
           this.rejectShareScopedBrowserCommand(ws, msg, SHARE_REASONS.DIRECT_SURFACE_DENIED);
           return;
         }
+      } else if (
+        Object.prototype.hasOwnProperty.call(msg, OWNER_MACHINE_AUTHORITY_FIELD)
+        || Object.prototype.hasOwnProperty.call(msg, SHARED_MACHINE_AUTHORITY_FIELD)
+        || Object.prototype.hasOwnProperty.call(msg, 'sharedActor')
+      ) {
+        const sanitized = { ...msg };
+        delete sanitized[OWNER_MACHINE_AUTHORITY_FIELD];
+        delete sanitized[SHARED_MACHINE_AUTHORITY_FIELD];
+        delete sanitized.sharedActor;
+        msg = sanitized;
+        raw = JSON.stringify(msg);
       }
       const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
       if (!browserMessageType) {
@@ -7793,6 +7807,41 @@ export class WsBridge {
 
       if (browserMessageType === SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT && this.browserShareStates.has(ws)) {
         await this.handleShareDiscussionCommentCommand(ws, msg);
+        return;
+      }
+
+      if (!shareState && (browserMessageType === 'session.send' || SHARE_PROCESS_INPUT_COMMANDS.has(browserMessageType))) {
+        const targetSession = typeof msg.sessionName === 'string'
+          ? msg.sessionName.trim()
+          : (typeof msg.session === 'string' ? msg.session.trim() : '');
+        const capturedMsg = msg;
+        const capturedRaw = raw;
+        await this.enqueueOwnerCommand(ws, async () => {
+          let stampedMsg = capturedMsg;
+          let stampedRaw = capturedRaw;
+          if (targetSession && this.db && this.directFileTransferTicketSigningKey && userId) {
+            const token = browserMessageType === 'session.send'
+              ? await issueOwnerMachineAuthorityForSession(this.db, {
+                  actorUserId: userId,
+                  sourceServerId: this.serverId,
+                  sessionName: targetSession,
+                  actionId: typeof capturedMsg.commandId === 'string' && capturedMsg.commandId
+                    ? capturedMsg.commandId
+                    : `owner-send-${randomHex(8)}`,
+                  signingKey: this.directFileTransferTicketSigningKey,
+                })
+              : await this.ownerInputMachineAuthority(ws, userId, targetSession);
+            if (token) {
+              stampedMsg = { ...capturedMsg, [OWNER_MACHINE_AUTHORITY_FIELD]: token };
+              stampedRaw = JSON.stringify(stampedMsg);
+            }
+          }
+          if (stampedMsg.type === 'session.send' && typeof stampedMsg.commandId === 'string' && targetSession) {
+            this.handleOutboundSessionSend(ws, stampedMsg.commandId, targetSession, stampedRaw);
+            return;
+          }
+          this.sendToDaemon(stampedRaw);
+        });
         return;
       }
 
@@ -8146,6 +8195,57 @@ export class WsBridge {
     if (!mints) {
       mints = new Map();
       this.shareInputAuthorityMints.set(ws, mints);
+    }
+    mints.set(sessionName, run);
+    return run;
+  }
+
+  private enqueueOwnerCommand(ws: WebSocket, task: () => Promise<void>): Promise<void> {
+    const prev = this.ownerCommandChains.get(ws) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(task);
+    this.ownerCommandChains.set(ws, next);
+    return next;
+  }
+
+  private async ownerInputMachineAuthority(
+    ws: WebSocket,
+    userId: string,
+    sessionName: string,
+  ): Promise<string | null> {
+    if (!this.db || !this.directFileTransferTicketSigningKey) return null;
+    let perSession = this.ownerInputAuthorityTokens.get(ws);
+    if (!perSession) {
+      perSession = new Map();
+      this.ownerInputAuthorityTokens.set(ws, perSession);
+    }
+    const cached = perSession.get(sessionName);
+    const now = shareClockNow();
+    if (cached && now >= cached.at && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS) return cached.token;
+    const inFlight = this.ownerInputAuthorityMints.get(ws)?.get(sessionName);
+    if (inFlight) return inFlight;
+    const db = this.db;
+    const signingKey = this.directFileTransferTicketSigningKey;
+    const run = issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: userId,
+      sourceServerId: this.serverId,
+      sessionName,
+      actionId: `owner-input-${randomHex(8)}`,
+      signingKey,
+      now,
+    })
+      .catch(() => null)
+      .then((token) => {
+        perSession.set(sessionName, { token, at: shareClockNow() });
+        return token;
+      })
+      .finally(() => {
+        const mints = this.ownerInputAuthorityMints.get(ws);
+        mints?.delete(sessionName);
+      });
+    let mints = this.ownerInputAuthorityMints.get(ws);
+    if (!mints) {
+      mints = new Map();
+      this.ownerInputAuthorityMints.set(ws, mints);
     }
     mints.set(sessionName, run);
     return run;

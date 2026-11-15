@@ -76,6 +76,8 @@ describe('transport queue privacy helpers', () => {
       historyCommitted: true,
       privateMaterialRef: 'private-ref',
       providerRouting: { model: 'secret-route' },
+      sharedMachineAuthority: 'jwt-participant',
+      ownerMachineAuthority: 'jwt-owner',
     })) {
       expect(containsProhibitedQueueProjectionField({ nested: { [key]: value } })).toBe(true);
     }
