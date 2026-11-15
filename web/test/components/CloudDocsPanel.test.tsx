@@ -2076,4 +2076,105 @@ describe('CloudDocsPanel', () => {
       expect(screen.getByTestId('mock-office-preview').getAttribute('data-cloud-doc-id')).toBe('cdoc-1');
     });
   });
+
+  it('switches from recent to my_docs root after upload button upload even if user previously visited a subfolder', async () => {
+    const folder = makeFolder({ id: 'fld-1', name: 'Archive' });
+    const folderDoc = makeDoc({ id: 'doc-in-folder', folderId: 'fld-1', name: 'nested.docx' });
+    const uploadedDoc = makeDoc({ id: 'doc-root-up', folderId: null, name: 'Report.pdf', mimeType: 'application/pdf' });
+
+    listCloudDocsApiMock
+      .mockResolvedValueOnce({ folders: [folder], docs: [folderDoc], sharedFolders: [], sharedDocs: [] })
+      .mockResolvedValue({ folders: [folder], docs: [folderDoc, uploadedDoc], sharedFolders: [], sharedDocs: [] });
+    uploadCloudDocApiMock.mockResolvedValueOnce({ doc: uploadedDoc });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    const folderRow = await screen.findByTestId('cloud-folder-row-fld-1');
+    fireEvent.click(folderRow.querySelector('button.cloud-docs-row-main')!);
+    await screen.findByTestId('cloud-doc-row-doc-in-folder');
+
+    // Switch to Recent tab (stale currentFolderId === 'fld-1' in state)
+    fireEvent.click(screen.getByTestId('cloud-docs-tab-recent'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-tab-recent').getAttribute('aria-selected')).toBe('true'));
+
+    const triggerUploadInput = (inputEl: HTMLInputElement, file: File) => {
+      Object.defineProperty(inputEl, 'files', { value: [file], configurable: true });
+      fireEvent(inputEl, new Event('change', { bubbles: true }));
+    };
+    const input = screen.getByTestId('cloud-docs-panel').querySelector('input[type="file"]') as HTMLInputElement;
+    const clickSpy = vi.spyOn(input, 'click');
+    fireEvent.click(screen.getByTestId('cloud-docs-upload-btn'));
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    const pdf = new File(['%PDF'], 'Report.pdf', { type: 'application/pdf' });
+    triggerUploadInput(input, pdf);
+
+    await waitFor(() => expect(uploadCloudDocApiMock).toHaveBeenCalledWith(pdf, { folderId: null }));
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-docs-tab-my-docs').getAttribute('aria-selected')).toBe('true');
+    });
+    expect(await screen.findByTestId('cloud-doc-row-doc-root-up')).toBeTruthy();
+    expect(screen.queryByTestId('cloud-doc-row-doc-in-folder')).toBeNull();
+  });
+
+  it('switches from recent to my_docs after drag-and-drop upload and renders the uploaded document', async () => {
+    const uploadedDoc = makeDoc({ id: 'doc-drop-up', folderId: null, name: 'Deck.pdf', mimeType: 'application/pdf' });
+    listCloudDocsApiMock
+      .mockResolvedValueOnce({ folders: [], docs: [], sharedFolders: [], sharedDocs: [] })
+      .mockResolvedValue({ folders: [], docs: [uploadedDoc], sharedFolders: [], sharedDocs: [] });
+    uploadCloudDocApiMock.mockResolvedValueOnce({ doc: uploadedDoc });
+
+    render(<CloudDocsPanel initialTab="recent" />);
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-recent-empty')).toBeTruthy());
+
+    const body = screen.getByTestId('cloud-docs-panel').querySelector('.cloud-docs-body')!;
+    const pdf = new File(['%PDF'], 'Deck.pdf', { type: 'application/pdf' });
+    fireEvent.drop(body, { dataTransfer: { files: [pdf] } });
+
+    await waitFor(() => expect(uploadCloudDocApiMock).toHaveBeenCalledWith(pdf, { folderId: null }));
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-docs-tab-my-docs').getAttribute('aria-selected')).toBe('true');
+    });
+    expect(await screen.findByTestId('cloud-doc-row-doc-drop-up')).toBeTruthy();
+  });
+
+  it('stays on recent when upload validation or API fails, and stays in subfolder when uploading inside my_docs subfolder', async () => {
+    const folder = makeFolder({ id: 'fld-1', name: 'Archive' });
+    const subDoc = makeDoc({ id: 'doc-sub-up', folderId: 'fld-1', name: 'SubSpec.pdf', mimeType: 'application/pdf' });
+
+    listCloudDocsApiMock
+      .mockResolvedValueOnce({ folders: [folder], docs: [], sharedFolders: [], sharedDocs: [] })
+      .mockResolvedValue({ folders: [folder], docs: [subDoc], sharedFolders: [], sharedDocs: [] });
+    uploadCloudDocApiMock
+      .mockRejectedValueOnce(new Error('Upload quota reached'))
+      .mockResolvedValueOnce({ doc: subDoc });
+
+    render(<CloudDocsPanel initialTab="recent" />);
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-recent-empty')).toBeTruthy());
+
+    const triggerUploadInput = (inputEl: HTMLInputElement, file: File) => {
+      Object.defineProperty(inputEl, 'files', { value: [file], configurable: true });
+      fireEvent(inputEl, new Event('change', { bubbles: true }));
+    };
+    const input = screen.getByTestId('cloud-docs-panel').querySelector('input[type="file"]') as HTMLInputElement;
+    const badFile = new File(['x'], 'bad.exe', { type: 'application/octet-stream' });
+    triggerUploadInput(input, badFile);
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-error')).toBeTruthy());
+    expect(screen.getByTestId('cloud-docs-tab-recent').getAttribute('aria-selected')).toBe('true');
+
+    const validFile = new File(['%PDF'], 'Fail.pdf', { type: 'application/pdf' });
+    triggerUploadInput(input, validFile);
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-error').textContent).toContain('Upload quota reached'));
+    expect(screen.getByTestId('cloud-docs-tab-recent').getAttribute('aria-selected')).toBe('true');
+
+    // Now navigate to my_docs subfolder and upload there -> remains in the same subfolder
+    fireEvent.click(screen.getByTestId('cloud-docs-tab-my-docs'));
+    const folderRow = await screen.findByTestId('cloud-folder-row-fld-1');
+    fireEvent.click(folderRow.querySelector('button.cloud-docs-row-main')!);
+
+    const subFile = new File(['%PDF'], 'SubSpec.pdf', { type: 'application/pdf' });
+    triggerUploadInput(input, subFile);
+
+    await waitFor(() => expect(uploadCloudDocApiMock).toHaveBeenLastCalledWith(subFile, { folderId: 'fld-1' }));
+    expect(screen.getByTestId('cloud-docs-tab-my-docs').getAttribute('aria-selected')).toBe('true');
+    expect(await screen.findByTestId('cloud-doc-row-doc-sub-up')).toBeTruthy();
+  });
 });
