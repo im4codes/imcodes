@@ -23,6 +23,7 @@ export function agyTranscriptFile(home: string, id: string): string | undefined 
  * this known owner's file; never poll or start a second native prompt. */
 export class AgyTranscriptBridge {
   private watcher?: FSWatcher;
+  private fileWatcher?: FSWatcher;
   private timer?: ReturnType<typeof setTimeout>;
   private closed = false;
   private reading?: Promise<void>;
@@ -36,6 +37,7 @@ export class AgyTranscriptBridge {
   private decoder = new StringDecoder('utf8');
   private lastStep = -1;
   private watched?: { dir: string; ino: number; dev: number };
+  private fileWatched?: { ino: number; dev: number };
 
   constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow, cursor?: AgyTranscriptCursor) => void) {}
   get isClosed(): boolean { return this.closed; }
@@ -61,6 +63,66 @@ export class AgyTranscriptBridge {
     await this.run(!replayExisting);
   }
 
+  private closeFileWatcher(): void {
+    this.fileWatcher?.close();
+    this.fileWatcher = undefined;
+    this.fileWatched = undefined;
+  }
+
+  private async armFile(): Promise<boolean> {
+    if (this.closed) return false;
+    let info: Awaited<ReturnType<typeof stat>>;
+    try {
+      info = await stat(this.file);
+      if (!info.isFile()) {
+        this.closeFileWatcher();
+        return false;
+      }
+    } catch {
+      this.closeFileWatcher();
+      return false;
+    }
+    if (this.closed) return false;
+    let ino = Number(info.ino);
+    let dev = Number(info.dev);
+    if (this.fileWatcher && this.fileWatched?.ino === ino && this.fileWatched.dev === dev) {
+      return false;
+    }
+    this.closeFileWatcher();
+    try {
+      // Non-recursive file watch binds the kernel vnode directly (kqueue EVFILT_VNODE
+      // on macOS), bypassing fseventsd coalescing latency under heavy CI load.
+      const watcher = watch(this.file, { persistent: false }, (eventType) => {
+        if (eventType === 'rename' && this.fileWatcher === watcher) {
+          this.closeFileWatcher();
+        }
+        this.schedule();
+      });
+      watcher.on('error', () => {
+        if (this.fileWatcher === watcher) {
+          this.closeFileWatcher();
+        }
+      });
+      try {
+        const after = statSync(this.file);
+        if (!after.isFile() || Number(after.ino) !== ino || Number(after.dev) !== dev) {
+          watcher.close();
+          this.schedule();
+          return false;
+        }
+      } catch {
+        watcher.close();
+        return false;
+      }
+      this.fileWatcher = watcher;
+      this.fileWatched = { ino, dev };
+      return true;
+    } catch {
+      this.closeFileWatcher();
+      return false;
+    }
+  }
+
   private async arm(): Promise<void> {
     const target = path.dirname(this.file);
     while (!this.closed) {
@@ -70,21 +132,35 @@ export class AgyTranscriptBridge {
       let identity: Awaited<ReturnType<typeof stat>> | undefined;
       while (true) {
         try { const info = await stat(dir); if (info.isDirectory()) { identity = info; break; } } catch { /* descend on the next creation event */ }
-        const parent = path.dirname(dir); if (parent === dir) return; dir = parent;
+        const parent = path.dirname(dir); if (parent === dir) { this.closeFileWatcher(); return; } dir = parent;
       }
       if (this.closed || !identity) return;
-      if (dir === this.watched?.dir && identity.ino === this.watched.ino && identity.dev === this.watched.dev) return;
+      if (dir !== target) this.closeFileWatcher();
+      if (dir === this.watched?.dir && Number(identity.ino) === this.watched.ino && Number(identity.dev) === this.watched.dev) {
+        if (dir === target) await this.armFile();
+        return;
+      }
       this.watcher?.close(); this.watched = { dir, ino: Number(identity.ino), dev: Number(identity.dev) };
       try {
-        this.watcher = watch(
+        const watcher = watch(
           dir,
           { persistent: false, recursive: process.platform === 'darwin' || process.platform === 'win32' },
           () => this.schedule(),
         );
-        this.watcher.on('error', () => { this.watcher?.close(); this.watched = undefined; });
+        this.watcher = watcher;
+        watcher.on('error', () => {
+          if (this.watcher === watcher) {
+            this.watcher.close();
+            this.watcher = undefined;
+            this.watched = undefined;
+          }
+        });
         this.schedule();
-      } catch { this.watched = undefined; return; }
-      if (dir === target) return;
+      } catch { this.watcher = undefined; this.watched = undefined; return; }
+      if (dir === target) {
+        await this.armFile();
+        return;
+      }
     }
   }
   private schedule(): void {
@@ -116,10 +192,23 @@ export class AgyTranscriptBridge {
   }
   private async read(baseline = false): Promise<void> {
     try {
-      const s = await stat(this.file);
+      let s: Awaited<ReturnType<typeof stat>>;
+      try {
+        s = await stat(this.file);
+        if (!s.isFile()) {
+          this.closeFileWatcher();
+          return;
+        }
+      } catch {
+        this.closeFileWatcher();
+        return;
+      }
       const dev = Number(s.dev);
       const ino = Number(s.ino);
       const size = Number(s.size);
+      if (!this.fileWatcher || this.fileWatched?.ino !== ino || this.fileWatched.dev !== dev) {
+        if (await this.armFile() && !this.closed) this.again = true;
+      }
       if (this.inode === undefined || this.dev !== dev || this.inode !== ino) {
         this.truncationEpoch = 0;
         this.offset = 0; this.parsedBytes = 0; this.partial = ''; this.decoder = new StringDecoder('utf8');
@@ -158,7 +247,9 @@ export class AgyTranscriptBridge {
     }
   }
   close(): void {
-    this.closed = true; this.watcher?.close(); this.watcher = undefined; this.watched = undefined;
+    this.closed = true;
+    this.watcher?.close(); this.watcher = undefined; this.watched = undefined;
+    this.closeFileWatcher();
     if (this.timer) clearTimeout(this.timer); this.timer = undefined;
   }
 }

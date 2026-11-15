@@ -1435,6 +1435,10 @@ rl.on('line', (line) => {
 
     await provider.send(id, 'launch');
     await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await vi.waitFor(
+      () => expect(events.some((e) => e.detail?.meta?.agentPath === 'native-child-fixture' && e.detail?.meta?.normalizedStatus === 'complete')).toBe(true),
+      { timeout: 5000 },
+    );
 
     const state = (provider as any).sessions.get(id);
     const nativeId = state.acpSessionId as string;
@@ -1558,6 +1562,10 @@ rl.on('line', (line) => {
 
     await provider.send(id, 'launch');
     await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await vi.waitFor(
+      () => expect(events.some((e) => e.detail?.meta?.agentPath === 'native-child-fixture' && e.detail?.meta?.normalizedStatus === 'complete')).toBe(true),
+      { timeout: 5000 },
+    );
 
     const state = (provider as any).sessions.get(id);
     const nativeId = state.acpSessionId as string;
