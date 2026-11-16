@@ -32,7 +32,7 @@ import { useQuickData } from './QuickInputPanel.js';
 import { useSharedGitChanges } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
-import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import { isShareScopedState, type SharedStateSummary } from '../tab-sharing-ui.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -167,6 +167,8 @@ interface Props {
   onOpenRemoteDesktop?: (machine: MachineListItem) => void;
   /** This user owns the daemon: its remote-desktop button may offer setup. */
   remoteDesktopCanSetUp?: boolean;
+  /** Allow opening DocShare controls from embedded FileBrowser instances (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -299,9 +301,10 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
+  const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(sharedState);
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken, visible);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -1205,6 +1208,7 @@ export function SubSessionWindow({
             serverId={serverId}
             scopeTaskPairs={showTaskPairPanel}
             taskPairPanelVisitKey={taskPairPanelVisitKey}
+            canManageFileShares={effectiveCanManageFileShares}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
             onResendFailed={handleResendFailed}
@@ -1305,6 +1309,7 @@ export function SubSessionWindow({
         onSettings={onSettings}
         onShareSession={onShareSession}
         subSessionId={sub.id}
+        canManageFileShares={effectiveCanManageFileShares}
         onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
@@ -1356,6 +1361,7 @@ export function SubSessionWindow({
               sessionName={sub.sessionName}
               scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
               readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
+              canShare={effectiveCanManageFileShares}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -1395,6 +1401,7 @@ export function SubSessionWindow({
               sessionName={sub.sessionName}
               scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
               readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
+              canShare={effectiveCanManageFileShares}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}

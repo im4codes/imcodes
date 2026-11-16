@@ -47,6 +47,8 @@ export interface PanelRenderContext {
   sharedAccessRole?: 'viewer' | 'participant' | null;
   /** Share target kind: 'server' for whole-server share, 'main' or 'subsession' for tab share */
   shareTargetKind?: 'main' | 'subsession' | 'server' | null;
+  /** Whether the current actor can open/manage server DocShare controls. */
+  canManageFileShares?: boolean;
   /** Canonical session name for shared scope authorization */
   sharedSessionName?: string;
   /** Quote callback — adds quoted text to the main session's input */

@@ -7442,6 +7442,7 @@ function InternalMainApp() {
   const isSharedServerParticipant = selectedShareTarget?.kind === 'server'
     && sharedAccessRole === 'participant';
   const isTabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
+  const canManageServerFileShares = !selectedServerIsSharedIn && !selectedShareTarget;
   const canCreateMainSession = !selectedShareTarget || isSharedServerParticipant;
   const canCreateSubSession = !selectedShareTarget
     || sharedAccessRole === 'participant';
@@ -8300,6 +8301,7 @@ function InternalMainApp() {
       sessionsLoading,
       sharedAccessRole,
       shareTargetKind: selectedShareTarget?.kind ?? null,
+      canManageFileShares: canManageServerFileShares,
       sharedSessionName: canonicalSharedSessionName,
       sessions,
       servers: orderedServers.map((s) => ({ id: s.id, name: s.name })),
@@ -9194,6 +9196,7 @@ function InternalMainApp() {
                 serverId={selectedServerId ?? ''}
                 onPendingQuestion={surfaceAskQuestionFromHistory}
                 session={s}
+                canManageFileShares={canManageServerFileShares && !isShareScopedState(s.sharedState)}
                 sessions={quickDelegationSessions}
                 subSessions={subSessionsSlim}
                 ws={wsRef.current}
@@ -9329,6 +9332,7 @@ function InternalMainApp() {
                   sessionName={activeSession ?? undefined}
                   scopeToSessionRoot={isTabShare}
                   readOnly={sharedAccessRole === 'viewer'}
+                  canShare={canManageServerFileShares}
                   mode="file-multi"
                   layout="panel"
                   initialPath={activeSessionInfo.projectDir ?? '~'}
@@ -9821,7 +9825,9 @@ function InternalMainApp() {
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
             sessionName={previewFileRequest.sessionName ?? activeSession ?? undefined}
-            scopeToSessionRoot={!!previewFileRequest.sessionName}
+            scopeToSessionRoot={isTabShare}
+            readOnly={sharedAccessRole === 'viewer'}
+            canShare={canManageServerFileShares}
             mode="file-single"
             layout="panel"
             initialPath={getFilePreviewInitialPath(previewFileRequest)}
@@ -10241,6 +10247,7 @@ function InternalMainApp() {
               daemonOnline={daemonOnline}
               onOpenRemoteDesktop={openRemoteDesktop}
               remoteDesktopCanSetUp={!selectedShareTarget}
+              canManageFileShares={canManageServerFileShares}
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
               showTaskPairPanel={pairRole !== 'executor'}
