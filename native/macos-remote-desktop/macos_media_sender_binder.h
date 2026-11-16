@@ -46,9 +46,37 @@ inline constexpr MediaSenderBindingId kInvalidMediaSenderBinding = 0;
 //
 // It is deliberately free of libwebrtc headers so this fail-closed behaviour is
 // compilable and testable without a pinned checkout.
+class MacosMediaSenderBinder;
+
+// Thread-safe lifetime handle to MacosMediaSenderBinder so objects owned by
+// libwebrtc (encoders/factories that can tear down after the session destroys
+// the binder) never dereference a dangling binder pointer.
+class MediaBinderHandle {
+ public:
+  explicit MediaBinderHandle(MacosMediaSenderBinder* binder) noexcept
+      : binder_(binder) {}
+
+  void Invalidate() noexcept {
+    std::lock_guard lock(mutex_);
+    binder_ = nullptr;
+  }
+
+  template <typename Fn>
+  auto WithBinder(Fn&& fn) const
+      -> decltype(fn(static_cast<MacosMediaSenderBinder*>(nullptr))) {
+    std::lock_guard lock(mutex_);
+    return fn(binder_);
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  MacosMediaSenderBinder* binder_ = nullptr;
+};
+
 class MacosMediaSenderBinder final : public H264SenderBackend {
  public:
   MacosMediaSenderBinder() = default;
+  ~MacosMediaSenderBinder() override;
 
   MacosMediaSenderBinder(const MacosMediaSenderBinder&) = delete;
   MacosMediaSenderBinder& operator=(const MacosMediaSenderBinder&) = delete;
@@ -91,6 +119,10 @@ class MacosMediaSenderBinder final : public H264SenderBackend {
   [[nodiscard]] const std::shared_ptr<RawVideoPath>& raw_video() const noexcept {
     return raw_video_;
   }
+  [[nodiscard]] const std::shared_ptr<MediaBinderHandle>& handle()
+      const noexcept {
+    return handle_;
+  }
   // The encode size the session configured, or {0,0} before it has.
   [[nodiscard]] common::PixelSize configured_pixels() const noexcept;
 
@@ -123,6 +155,8 @@ class MacosMediaSenderBinder final : public H264SenderBackend {
       std::make_shared<std::atomic<std::uint64_t>>(0);
   std::shared_ptr<RawVideoPath> raw_video_ =
       std::make_shared<RawVideoPath>(accepted_bytes_);
+  std::shared_ptr<MediaBinderHandle> handle_ =
+      std::make_shared<MediaBinderHandle>(this);
 };
 
 }  // namespace imcodes::remote_desktop::macos

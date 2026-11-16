@@ -190,6 +190,14 @@ class RawVideoPath {
   [[nodiscard]] std::uint64_t no_sink_frames() const noexcept {
     return no_sink_frames_.load(std::memory_order_relaxed);
   }
+  void SetConfiguredPixels(common::PixelSize pixels) noexcept {
+    std::lock_guard lock(mutex_);
+    configured_pixels_ = pixels;
+  }
+  [[nodiscard]] common::PixelSize configured_pixels() const noexcept {
+    std::lock_guard lock(mutex_);
+    return configured_pixels_;
+  }
 
  private:
   const std::shared_ptr<std::atomic<std::uint64_t>> accepted_bytes_;
@@ -202,6 +210,7 @@ class RawVideoPath {
   std::shared_ptr<const Nv12ToBgraConverter> nv12_to_bgra_;
   std::optional<RawEncoderFacts> encoder_facts_;
   RawCodecPolicyState policy_state_;
+  common::PixelSize configured_pixels_{};
 };
 
 }  // namespace imcodes::remote_desktop::macos

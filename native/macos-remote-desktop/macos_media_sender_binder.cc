@@ -4,6 +4,10 @@
 
 namespace imcodes::remote_desktop::macos {
 
+MacosMediaSenderBinder::~MacosMediaSenderBinder() {
+  if (handle_ != nullptr) handle_->Invalidate();
+}
+
 MediaSenderBindingId MacosMediaSenderBinder::Bind(
     std::unique_ptr<H264SenderBackend> sender) {
   if (sender == nullptr) return kInvalidMediaSenderBinding;
@@ -72,6 +76,9 @@ bool MacosMediaSenderBinder::Start(
   std::lock_guard lock(mutex_);
   configuration_ = configuration;
   configured_ = true;
+  if (raw_video_ != nullptr) {
+    raw_video_->SetConfiguredPixels(configuration.encoded_pixels);
+  }
   if (sender_ == nullptr) {
     // Not an error: the session legitimately configures before negotiation
     // produces an encoder. The configuration is retained for Bind() to replay.
@@ -137,6 +144,9 @@ void MacosMediaSenderBinder::Cancel(
   if (configured_ && configuration_.generation == generation) {
     configured_ = false;
     configuration_ = H264SenderConfiguration{};
+    if (raw_video_ != nullptr) {
+      raw_video_->SetConfiguredPixels(common::PixelSize{});
+    }
   }
   const std::shared_ptr<H264SenderBackend> sender = sender_;
   lock.unlock();
