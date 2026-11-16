@@ -646,4 +646,63 @@ describe('SessionControls mobile upload IDB persistence, auto-retry & cleanup', 
       expect(await listPendingUploadsForKey('composer:session:stale-session', 'srv-1')).toHaveLength(0);
     });
   });
+
+  it('resumes a waitingForConnection upload when switching back to its session while connected is already true', async () => {
+    directMocks.uploadFileWithDirectFallback.mockResolvedValueOnce({
+      ok: true,
+      attachment: {
+        id: 'att-switched-back',
+        source: 'upload',
+        serverId: 'srv-1',
+        daemonPath: '/tmp/switch.bin',
+        originalName: 'switch.bin',
+        size: 6,
+        createdAt: '2026-11-16T00:00:00.000Z',
+        downloadable: true,
+      },
+    });
+
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={{ ...ws, connected: false } as never}
+        connected={false}
+        activeSession={makeSession('sess-a')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        files: [new File(['switch'], 'switch.bin', { type: 'application/octet-stream' })],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(screen.getAllByTestId('composer-upload-row')).toHaveLength(1));
+    expect(directMocks.uploadFileWithDirectFallback).not.toHaveBeenCalled();
+
+    // Switch to sess-b while connected transitions true, then switch back to sess-a while connected stays true
+    rerender(
+      <SessionControls
+        ws={ws as never}
+        connected={true}
+        activeSession={makeSession('sess-b')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+    expect(directMocks.uploadFileWithDirectFallback).not.toHaveBeenCalled();
+
+    rerender(
+      <SessionControls
+        ws={ws as never}
+        connected={true}
+        activeSession={makeSession('sess-a')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(1));
+  });
 });

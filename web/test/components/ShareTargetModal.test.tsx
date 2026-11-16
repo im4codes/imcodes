@@ -143,7 +143,16 @@ vi.mock('../../src/ws-client.js', () => ({
   WsClient: class MockWsClient {
     connected = true;
     connectionAttemptInFlight = false;
-    connect = vi.fn(() => { this.connected = true; });
+    private messageHandlers = new Set<(msg: Record<string, unknown>) => void>();
+    connect = vi.fn(() => {
+      this.connected = true;
+      queueMicrotask(() => {
+        if (!this.connected) return;
+        for (const handler of [...this.messageHandlers]) {
+          handler({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+        }
+      });
+    });
     disconnect = vi.fn(() => { this.connected = false; });
     requestSessionList = vi.fn();
     setClaudeWeeklyQuotaOptIn = vi.fn();
@@ -166,7 +175,12 @@ vi.mock('../../src/ws-client.js', () => ({
     reconnectNow = vi.fn();
     getDaemonCapabilitySnapshot = () => null;
     onDaemonCapabilitySnapshot = () => () => {};
-    onMessage = () => () => {};
+    onMessage = (handler: (msg: Record<string, unknown>) => void) => {
+      this.messageHandlers.add(handler);
+      return () => {
+        this.messageHandlers.delete(handler);
+      };
+    };
     onLatency = () => {};
   },
 }));
