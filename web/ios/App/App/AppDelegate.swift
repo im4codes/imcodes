@@ -330,6 +330,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         self.configureMacHostAppearance(webView: webView)
         self.observeMacWindowBoundsIfNeeded()
         Self.clearInputAssistantItems(for: webView)
+        Self.installMacEmptyInputAccessoryIfNeeded(for: webView)
         let signalScript = buildNativeHostSignalScript()
         if !signalScript.isEmpty {
             webView.evaluateJavaScript(signalScript, completionHandler: nil)
@@ -348,7 +349,100 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         }
         guard #available(iOS 14.0, *) else { return }
         Self.clearInputAssistantItems(for: webView)
+        Self.installMacEmptyInputAccessoryIfNeeded(for: webView)
         webView?.scrollView.keyboardDismissMode = .interactive
+    }
+
+    private final class MacEmptyInputAccessoryView: UIView {
+        override var intrinsicContentSize: CGSize {
+            CGSize(width: UIView.noIntrinsicMetric, height: 0)
+        }
+    }
+
+    private static var macSuppressedInputClassIds = Set<ObjectIdentifier>()
+    private static var macInputAccessoryAssocKey: UInt8 = 0
+
+    /// Under `isiOSAppOnMac` ("Designed for iPad"), UIKit/WebKit still presents a bottom
+    /// `UIInputSetHostView` (`UIKBBackdropView` + `UIInputView`, 17–44pt) on input focus when
+    /// `WKContentView.inputAccessoryView` is `nil` or `WKContentView` repopulates
+    /// `inputAssistantItem` on focus. Providing a zero-height `MacEmptyInputAccessoryView` and
+    /// keeping `inputAssistantItem` empty on Mac desktop stops UIKit from raising the empty bar
+    /// while leaving real iPhone/iPad behavior untouched.
+    static func installMacEmptyInputAccessoryIfNeeded(for webView: WKWebView?) {
+        guard #available(iOS 14.0, *), ProcessInfo.processInfo.isiOSAppOnMac, let webView else { return }
+        let accSel = #selector(getter: UIResponder.inputAccessoryView)
+        let asstSel = #selector(getter: UIResponder.inputAssistantItem)
+        guard let baseAccMethod = class_getInstanceMethod(UIView.self, accSel) else { return }
+        let baseAccImp = method_getImplementation(baseAccMethod)
+
+        var firstResponderSubview: UIView?
+        var didPatchAnyClass = false
+        var visited = Set<ObjectIdentifier>()
+        var stack: [UIView] = webView.scrollView.subviews
+        while let current = stack.popLast() {
+            guard visited.insert(ObjectIdentifier(current)).inserted else { continue }
+            if current.isFirstResponder {
+                firstResponderSubview = current
+            }
+            let cls: AnyClass = type(of: current)
+            let clsId = ObjectIdentifier(cls)
+            if cls !== UIView.self,
+               !macSuppressedInputClassIds.contains(clsId),
+               let accMethod = class_getInstanceMethod(cls, accSel),
+               method_getImplementation(accMethod) != baseAccImp {
+                macSuppressedInputClassIds.insert(clsId)
+                didPatchAnyClass = true
+
+                let accBlock: @convention(block) (AnyObject) -> UIView? = { responder in
+                    if let existing = objc_getAssociatedObject(responder, &macInputAccessoryAssocKey) as? UIView {
+                        return existing
+                    }
+                    let view = MacEmptyInputAccessoryView(frame: .zero)
+                    view.isHidden = true
+                    view.isUserInteractionEnabled = false
+                    view.backgroundColor = .clear
+                    objc_setAssociatedObject(responder, &macInputAccessoryAssocKey, view, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+                    return view
+                }
+                class_replaceMethod(
+                    cls,
+                    accSel,
+                    imp_implementationWithBlock(accBlock),
+                    method_getTypeEncoding(accMethod)
+                )
+
+                if let asstMethod = class_getInstanceMethod(cls, asstSel) {
+                    let origImp = method_getImplementation(asstMethod)
+                    typealias AsstFn = @convention(c) (AnyObject, Selector) -> UITextInputAssistantItem
+                    let origFn = unsafeBitCast(origImp, to: AsstFn.self)
+                    let asstBlock: @convention(block) (AnyObject) -> UITextInputAssistantItem = { responder in
+                        let item = origFn(responder, asstSel)
+                        if !item.leadingBarButtonGroups.isEmpty {
+                            item.leadingBarButtonGroups = []
+                        }
+                        if !item.trailingBarButtonGroups.isEmpty {
+                            item.trailingBarButtonGroups = []
+                        }
+                        if !item.allowsHidingShortcuts {
+                            item.allowsHidingShortcuts = true
+                        }
+                        return item
+                    }
+                    class_replaceMethod(
+                        cls,
+                        asstSel,
+                        imp_implementationWithBlock(asstBlock),
+                        method_getTypeEncoding(asstMethod)
+                    )
+                }
+            }
+            stack.append(contentsOf: current.subviews)
+        }
+
+        if didPatchAnyClass {
+            clearInputAssistantItems(for: webView)
+            firstResponderSubview?.reloadInputViews()
+        }
     }
 
     /// Recursively clears `UITextInputAssistantItem` shortcut bar button groups across
@@ -489,9 +583,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             queue: .main
         ) { [weak self] notification in
             guard let self else { return }
-            Self.clearInputAssistantItems(for: self.currentBridgeWebView())
+            let webView = self.currentBridgeWebView()
+            Self.clearInputAssistantItems(for: webView)
+            Self.installMacEmptyInputAccessoryIfNeeded(for: webView)
             DispatchQueue.main.async { [weak self] in
-                Self.clearInputAssistantItems(for: self?.currentBridgeWebView())
+                let wv = self?.currentBridgeWebView()
+                Self.clearInputAssistantItems(for: wv)
+                Self.installMacEmptyInputAccessoryIfNeeded(for: wv)
             }
             self.handleMacKeyboardFrameNotification(notification)
         }

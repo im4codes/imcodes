@@ -185,6 +185,8 @@ describe('mac-input-inset unit & boundary behavior', () => {
     const source = readFileSync(appDelegatePath, 'utf8');
 
     expect(source).toContain('static func clearInputAssistantItems(for webView: WKWebView?)');
+    expect(source).toContain('static func installMacEmptyInputAccessoryIfNeeded(for webView: WKWebView?)');
+    expect(source).toContain('MacEmptyInputAccessoryView');
     expect(source).toContain('assistant.leadingBarButtonGroups = []');
     expect(source).toContain('assistant.trailingBarButtonGroups = []');
     expect(source).toContain('assistant.allowsHidingShortcuts = true');
@@ -239,6 +241,7 @@ class ShareReceiverPlugin: CAPBridgePlugin {
 }
 class AuthSessionPlugin: CAPBridgePlugin {}
 class WatchBridgePlugin: CAPBridgePlugin {}
+class FileTransferKeepAlivePlugin: CAPBridgePlugin {}
 `);
 
         const strippedDelegate = source
@@ -302,10 +305,14 @@ struct Runner {
         webView.scrollView.addSubview(simulatedContentView)
 
         AppDelegate.clearInputAssistantItems(for: webView)
+        AppDelegate.installMacEmptyInputAccessoryIfNeeded(for: webView)
         check(webView.inputAssistantItem.leadingBarButtonGroups.isEmpty, "webView leading groups should be cleared")
         check(simulatedContentView.inputAssistantItem.leadingBarButtonGroups.isEmpty, "subview leading groups should be cleared")
         check(simulatedContentView.inputAssistantItem.trailingBarButtonGroups.isEmpty, "subview trailing groups should be cleared")
         check(simulatedContentView.inputAssistantItem.allowsHidingShortcuts == true, "allowsHidingShortcuts should be true")
+        // Verify non-isiOSAppOnMac / plain UIView responders remain untouched by Mac suppression
+        let plainField = UITextField(frame: CGRect(x: 0, y: 0, width: 100, height: 30))
+        check(plainField.inputAccessoryView == nil, "plain UITextField inputAccessoryView must stay nil")
     }
 }
 `);
