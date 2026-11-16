@@ -333,6 +333,7 @@ const VoiceHoldHud = memo(
 
     if (!active || typeof document === 'undefined') return null;
 
+    const voiceHoldStarting = phase === 'starting';
     const voiceHoldRecording = phase === 'recording';
     const voiceHoldEnded = phase === 'ended';
     const voiceHoldDraining = phase === 'draining';
@@ -346,11 +347,11 @@ const VoiceHoldHud = memo(
           ? t('voice.buffering_hint')
           : voiceHoldRecording
             ? (voiceHoldActuallyRecognizing ? t('voice.buffering_hint') : t('voice.speak_now'))
-            : t('voice.starting');
+            : '';
     const voiceHoldStatusLabel = voiceHoldEnded
       ? (text.trim() ? t('voice.ended') : t('voice.no_speech'))
-      : phase === 'starting'
-        ? t('voice.starting')
+      : voiceHoldStarting
+        ? ''
         : voiceHoldActuallyRecognizing
           ? t('voice.recognizing')
           : t('voice.listening');
@@ -382,16 +383,20 @@ const VoiceHoldHud = memo(
         <div class="voice-hold-hud-card">
           <div class="voice-hold-hud-header">
             <span class={`voice-hold-hud-recognizing${voiceHoldActuallyRecognizing ? ' is-recognizing' : ''}${voiceHoldEnded ? ' is-ended' : ''}`}>
-              <span
-                class={`voice-status-dot${voiceHoldRecording || voiceHoldDraining ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
-                aria-hidden="true"
-              />
+              {voiceHoldStarting ? (
+                <span class="voice-hold-starting-spinner" aria-hidden="true" />
+              ) : (
+                <span
+                  class={`voice-status-dot${voiceHoldRecording || voiceHoldDraining ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
+                  aria-hidden="true"
+                />
+              )}
               {(voiceHoldRecording || voiceHoldDraining) && (
                 <span class="voice-recognizing-dots" aria-hidden="true">
                   <i /><i /><i />
                 </span>
               )}
-              <span>{voiceHoldStatusLabel}</span>
+              {voiceHoldStatusLabel && <span>{voiceHoldStatusLabel}</span>}
             </span>
           </div>
           <div class={`voice-hold-hud-active-hint is-${zone}`}>

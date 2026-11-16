@@ -3285,6 +3285,19 @@ html.native-ios-mac .chat-dl-btn {
   background: #f59e0b;
   box-shadow: 0 0 10px rgba(245, 158, 11, 0.4);
 }
+.voice-hold-starting-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 2px solid rgba(56, 189, 248, 0.25);
+  border-top-color: rgba(186, 230, 253, 0.96);
+  animation: voice-hold-starting-spin 0.75s linear infinite;
+}
+@keyframes voice-hold-starting-spin {
+  to { transform: rotate(360deg); }
+}
 @keyframes voice-dot-pulse { 0%,100% { box-shadow: 0 0 12px #22d3ee, 0 0 24px rgba(34,211,238,0.3); } 50% { box-shadow: 0 0 20px #22d3ee, 0 0 40px rgba(34,211,238,0.5); } }
 .voice-recognizing-dots {
   display: inline-flex; align-items: center; gap: 3px;
@@ -4052,6 +4065,7 @@ html.native-ios-mac .chat-dl-btn {
   .voice-overlay,
   .voice-overlay-grid,
   .voice-status-dot-active,
+  .voice-hold-starting-spinner,
   .voice-recognizing-dots i,
   .voice-editor-marquee::before,
   .voice-editor-marquee::after,

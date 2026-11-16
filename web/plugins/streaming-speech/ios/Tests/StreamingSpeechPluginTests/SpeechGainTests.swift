@@ -429,4 +429,10 @@ final class SpeechGainTests: XCTestCase {
         XCTAssertEqual(spoken, "嗯")
         XCTAssertEqual(decodedCounts, [3200 + SpeechWindow.finalSilencePadding])
     }
+
+    func testCheckPermissionsMapsRecordPermissionWithoutPrompting() {
+        XCTAssertEqual(StreamingSpeechPlugin.mapRecordPermissionStatus(.granted), "granted")
+        XCTAssertEqual(StreamingSpeechPlugin.mapRecordPermissionStatus(.denied), "denied")
+        XCTAssertEqual(StreamingSpeechPlugin.mapRecordPermissionStatus(.undetermined), "prompt")
+    }
 }

@@ -3227,13 +3227,14 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(input.getAttribute('contenteditable')).toBe('false');
     };
 
-    // 1. Before listening(true) arrives: starting phase shows voice.starting, NEVER fake recognizing / 0-dot active robot
+    // 1. Before listening(true) arrives: starting phase shows rotating spinner without voice.starting text, NEVER fake recognizing / 0-dot active robot
     dispatchPointer(input, 'pointerdown', 180, 500, 1);
     await vi.advanceTimersByTimeAsync(175);
     const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
     expect(hud).not.toBeNull();
     expect(hud.getAttribute('data-phase')).toBe('starting');
-    expect(hud.textContent).toContain('voice.starting');
+    expect(hud.textContent).not.toContain('voice.starting');
+    expect(hud.querySelector('.voice-hold-starting-spinner')).not.toBeNull();
     expect(hud.textContent).not.toContain('voice.recognizing');
     expect(hud.textContent).not.toContain('voice.buffering_hint');
     expect(hud.querySelector('.voice-streaming-robot-cursor.is-active')).toBeNull();
@@ -3243,6 +3244,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     voiceMock.listeningHandler?.(true);
     await vi.advanceTimersByTimeAsync(0);
     expect(hud.getAttribute('data-phase')).toBe('recording');
+    expect(hud.querySelector('.voice-hold-starting-spinner')).toBeNull();
     expect(hud.textContent).toContain('voice.listening');
     expect(hud.textContent).toContain('voice.speak_now');
     expect(hud.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).not.toBeNull();
