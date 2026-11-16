@@ -102,7 +102,10 @@ vi.mock('../src/api.js', () => ({
   onUserPrefChanged: vi.fn(() => () => {}),
 }));
 
-import { SessionControls } from '../src/components/SessionControls.js';
+import { SessionControls, resetPendingUploadRecoveryForTests } from '../src/components/SessionControls.js';
+import { DirectFileTransferFailure } from '../src/direct-file-transfer.js';
+import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
+import { resetUploadLifecycleForTests } from '../src/upload-suspend-wait.js';
 
 const makeQuickData = () => ({
   data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
@@ -171,6 +174,8 @@ describe('SessionControls mobile upload IDB persistence, auto-retry & cleanup', 
     localStorage.clear();
     sessionStorage.clear();
     resetPendingUploadStoreForTests();
+    resetPendingUploadRecoveryForTests();
+    resetUploadLifecycleForTests();
     vi.stubGlobal('indexedDB', new IDBFactory());
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     directMocks.uploadFileWithDirectFallback.mockReset();
@@ -185,6 +190,8 @@ describe('SessionControls mobile upload IDB persistence, auto-retry & cleanup', 
   afterEach(async () => {
     cleanup();
     resetPendingUploadStoreForTests();
+    resetPendingUploadRecoveryForTests();
+    resetUploadLifecycleForTests();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     localStorage.clear();
@@ -385,5 +392,258 @@ describe('SessionControls mobile upload IDB persistence, auto-retry & cleanup', 
       window.dispatchEvent(new Event('online'));
     });
     expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(2);
+  });
+
+  it('persists web (!isNative) uploads in IndexedDB and preserves row + recovers across app-switch and WS reconnect while CONNECTING', async () => {
+    (globalThis as { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => false,
+      getPlatform: () => 'web',
+    };
+
+    const seenClientIds: string[] = [];
+    let rejectFirstAttempt!: (err: unknown) => void;
+    directMocks.uploadFileWithDirectFallback
+      .mockImplementationOnce((opts: { clientUploadId?: string }) => {
+        seenClientIds.push(opts.clientUploadId ?? '');
+        return new Promise((_resolve, reject) => {
+          rejectFirstAttempt = reject;
+        });
+      })
+      .mockImplementationOnce(async (opts: { clientUploadId?: string; file: File }) => {
+        seenClientIds.push(opts.clientUploadId ?? '');
+        return {
+          ok: true,
+          attachment: {
+            id: 'att-web-1',
+            source: 'upload',
+            serverId: 'srv-1',
+            daemonPath: `/tmp/${opts.file.name}`,
+            originalName: opts.file.name,
+            size: opts.file.size,
+            createdAt: '2026-11-16T00:00:00.000Z',
+            downloadable: true,
+          },
+        };
+      });
+
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as never}
+        connected={true}
+        activeSession={makeSession('web-session')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const file = new File(['web-connecting-persist'], 'web-photo.jpg', { type: 'image/jpeg' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [file],
+        getData: () => '',
+      },
+    });
+
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(1));
+    // Web must await IndexedDB persistence before starting transport so IDB already holds it during CONNECTING
+    const storedOnConnecting = await listPendingUploadsForKey('composer:session:web-session', 'srv-1');
+    expect(storedOnConnecting).toHaveLength(1);
+    expect(storedOnConnecting[0].meta.clientUploadId).toBe(seenClientIds[0]);
+
+    // User switches out while still CONNECTING and WS drops (connected=false)
+    await act(async () => {
+      setVisibility('hidden');
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    rerender(
+      <SessionControls
+        ws={{ ...ws, connected: false } as never}
+        connected={false}
+        activeSession={makeSession('web-session')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+
+    // Non-user AbortError while disconnected must NOT delete IndexedDB or drop the row
+    await act(async () => {
+      const nonUserAbort = new Error('ws closed');
+      nonUserAbort.name = 'AbortError';
+      rejectFirstAttempt(nonUserAbort);
+    });
+    await waitFor(() => expect(screen.getAllByTestId('composer-upload-row')).toHaveLength(1));
+    expect(await listPendingUploadsForKey('composer:session:web-session', 'srv-1')).toHaveLength(1);
+
+    // User returns to foreground and WS reconnects -> auto-retries with exact same clientUploadId and succeeds
+    await act(async () => {
+      setVisibility('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    rerender(
+      <SessionControls
+        ws={ws as never}
+        connected={true}
+        activeSession={makeSession('web-session')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(2));
+    expect(seenClientIds[1]).toBe(seenClientIds[0]);
+    await waitFor(async () => {
+      expect(await listPendingUploadsForKey('composer:session:web-session', 'srv-1')).toHaveLength(0);
+    });
+  });
+
+  it('preserves non-user CANCELED error uploads, survives multiple reconnect/resume failures after cold mount, and keeps CONNECTING row visible before WS connects', async () => {
+    const file = new File(['cold-reconnect'], 'reconnect.bin', { type: 'application/octet-stream' });
+    await persistPendingUploadFile({
+      serverId: 'srv-1',
+      sessionName: '',
+      composerKey: 'composer:session:cold-reconnect',
+      clientUploadId: 'cid-cold-multi-retry',
+      file,
+    });
+
+    directMocks.uploadFileWithDirectFallback
+      .mockRejectedValueOnce(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false))
+      .mockRejectedValueOnce(new Error('transient reconnect failure'))
+      .mockResolvedValueOnce({
+        ok: true,
+        attachment: {
+          id: 'att-recovered',
+          source: 'upload',
+          serverId: 'srv-1',
+          daemonPath: '/tmp/reconnect.bin',
+          originalName: 'reconnect.bin',
+          size: file.size,
+          createdAt: '2026-11-16T00:00:00.000Z',
+          downloadable: true,
+        },
+      });
+
+    const ws = makeWs();
+    // Mount with connected=false (e.g. WebView reloaded right after returning from another app while WS reconnects)
+    const { rerender } = render(
+      <SessionControls
+        ws={{ ...ws, connected: false } as never}
+        connected={false}
+        activeSession={makeSession('cold-reconnect')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+
+    // CONNECTING row must appear immediately even before WS finishes reconnecting, without firing transport yet
+    await waitFor(() => expect(screen.getAllByTestId('composer-upload-row')).toHaveLength(1));
+    expect(directMocks.uploadFileWithDirectFallback).not.toHaveBeenCalled();
+
+    // Connect -> attempt 1 throws non-user CANCELED -> row & IDB MUST NOT be deleted
+    rerender(
+      <SessionControls
+        ws={ws as never}
+        connected={true}
+        activeSession={makeSession('cold-reconnect')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getAllByTestId('composer-upload-row')).toHaveLength(1));
+    expect(await listPendingUploadsForKey('composer:session:cold-reconnect', 'srv-1')).toHaveLength(1);
+
+    // Background -> foreground wake triggers attempt 2, which also fails transiently
+    await act(async () => {
+      setVisibility('hidden');
+      document.dispatchEvent(new Event('visibilitychange'));
+      setVisibility('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(2));
+    expect(await listPendingUploadsForKey('composer:session:cold-reconnect', 'srv-1')).toHaveLength(1);
+
+    // Subsequent WS disconnect -> reconnect still auto-retries (not blocked by autoRetried/recoveredPendingUploadIds) and succeeds!
+    rerender(
+      <SessionControls
+        ws={{ ...ws, connected: false } as never}
+        connected={false}
+        activeSession={makeSession('cold-reconnect')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+    rerender(
+      <SessionControls
+        ws={ws as never}
+        connected={true}
+        activeSession={makeSession('cold-reconnect')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(3));
+    await waitFor(async () => {
+      expect(await listPendingUploadsForKey('composer:session:cold-reconnect', 'srv-1')).toHaveLength(0);
+    });
+  });
+
+  it('auto-retries an upload whose pre-background attempt rejects shortly after returning to foreground', async () => {
+    let rejectStale!: (err: unknown) => void;
+    directMocks.uploadFileWithDirectFallback
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        rejectStale = reject;
+      }))
+      .mockResolvedValueOnce({
+        ok: true,
+        attachment: {
+          id: 'att-stale-retry',
+          source: 'upload',
+          serverId: 'srv-1',
+          daemonPath: '/tmp/stale.bin',
+          originalName: 'stale.bin',
+          size: 5,
+          createdAt: '2026-11-16T00:00:00.000Z',
+          downloadable: true,
+        },
+      });
+
+    render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected={true}
+        activeSession={makeSession('stale-session')}
+        quickData={makeQuickData() as never}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['stale'], 'stale.bin', { type: 'application/octet-stream' })],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(1));
+
+    // App goes background then returns BEFORE stale promise rejects
+    await act(async () => {
+      setVisibility('hidden');
+      document.dispatchEvent(new Event('visibilitychange'));
+      setVisibility('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+
+    // Now stale attempt rejects after app is already visible again -> must auto-retry without waiting for another wake
+    await act(async () => {
+      rejectStale(new Error('stale socket dropped'));
+    });
+    await waitFor(() => expect(directMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(2));
+    await waitFor(async () => {
+      expect(await listPendingUploadsForKey('composer:session:stale-session', 'srv-1')).toHaveLength(0);
+    });
   });
 });

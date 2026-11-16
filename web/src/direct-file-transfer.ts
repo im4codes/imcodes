@@ -2669,27 +2669,27 @@ export function uploadFileWithDirectFallback(options: {
       && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
       options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
       const directAbort = new AbortController();
-      let directConnectTimedOut = false;
       let directConnected = false;
       const abortDirect = () => directAbort.abort();
       if (options.signal?.aborted) abortDirect();
       else options.signal?.addEventListener('abort', abortDirect, { once: true });
+      let attemptBackgroundEpoch = getUploadBackgroundEpoch();
       let connectTimer: ReturnType<typeof setTimeout> | null = null;
       const armConnectTimer = () => {
         if (connectTimer !== null) clearTimeout(connectTimer);
+        attemptBackgroundEpoch = getUploadBackgroundEpoch();
         connectTimer = setTimeout(() => {
           if (directConnected || directAbort.signal.aborted) return;
-          if (isUploadEnvironmentSuspended()) {
+          if (isUploadEnvironmentSuspended() || getUploadBackgroundEpoch() !== attemptBackgroundEpoch) {
             void waitForUploadResumeIfSuspended(directAbort.signal)
-              .then((waited) => {
-                if (waited && !directConnected && !directAbort.signal.aborted) {
+              .then(() => {
+                if (!directConnected && !directAbort.signal.aborted) {
                   armConnectTimer();
                 }
               })
               .catch(() => {});
             return;
           }
-          directConnectTimedOut = true;
           directAbort.abort();
         }, uploadDirectConnectFallbackMs(options.file.size));
       };
@@ -2717,15 +2717,14 @@ export function uploadFileWithDirectFallback(options: {
         clearResumableUploadIdentity(storageKey, clientUploadId);
         return direct;
       } catch (error) {
-        // User cancellation is terminal. The internal 20-second deadline uses
-        // the same abort machinery, but intentionally continues through HTTP.
-        const forcedFallbackCancellation = directConnectTimedOut && isFileUploadCanceled(error);
-        if (options.signal?.aborted
-          || (!forcedFallbackCancellation
-            && (isFileUploadCanceled(error) || isTerminalDirectFailure(error)))) {
-          if (isFileUploadCanceled(error) || options.signal?.aborted) {
-            clearResumableUploadIdentity(storageKey, clientUploadId);
-          }
+        // Explicit user cancellation is terminal. The internal 20-second deadline
+        // or internal lease/channel reset without caller abort preserves
+        // resumable identity and continues through HTTP fallback.
+        if (options.signal?.aborted) {
+          clearResumableUploadIdentity(storageKey, clientUploadId);
+          throw error;
+        }
+        if (isTerminalDirectFailure(error) && !isFileUploadCanceled(error)) {
           throw error;
         }
         if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
