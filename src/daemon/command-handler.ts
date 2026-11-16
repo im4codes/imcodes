@@ -1523,7 +1523,7 @@ async function executeDaemonResetCommand(opts: {
   expectedInstanceId?: string;
   run: (resetToken: number) => Promise<void>;
   formatError: (err: unknown) => string;
-}): Promise<void> {
+}): Promise<boolean> {
   const { sessionName, serverLink, effectiveId, isLegacy, label, expectedInstanceId, run, formatError } = opts;
   let resetToken: number;
   try {
@@ -1533,7 +1533,7 @@ async function executeDaemonResetCommand(opts: {
     logger.warn({ sessionName, effectiveId, expectedInstanceId, errMsg }, `${label} rejected at admission without modifying current owner`);
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
     emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-    return;
+    return false;
   }
   // Emit receipt ack + starting progress immediately before teardown/relaunch
   // (and before any queued prior relaunch wait) so the UI never hangs silently.
@@ -1543,6 +1543,7 @@ async function executeDaemonResetCommand(opts: {
   timelineEmitter.emit(sessionName, 'session.state', { state: 'starting' }, { source: 'daemon', confidence: 'high' });
   try {
     await run(resetToken);
+    return true;
   } catch (err) {
     const errMsg = formatError(err);
     logger.error({ sessionName, err }, `${label} failed`);
@@ -1561,6 +1562,7 @@ async function executeDaemonResetCommand(opts: {
     }
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
     emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+    return false;
   }
 }
 
@@ -1611,6 +1613,56 @@ export async function handoffSessionConversation(
 }
 
 /**
+ * Send the bounded continuation turn onto the fresh conversation created by
+ * `/handoff` or Compact Hijack. Never throws reset errors after a fresh
+ * session has already succeeded.
+ */
+export async function dispatchHandoffContinuation(
+  sessionName: string,
+  continuationText = COMPACT_HIJACK_CONTINUATION_PROMPT,
+  expectedInstanceId?: string,
+  messageIdPrefix = 'handoff',
+): Promise<void> {
+  const latest = getSession(sessionName);
+  if (!latest || isIncognitoSession(latest)) return;
+  if (expectedInstanceId && latest.sessionInstanceId !== expectedInstanceId) {
+    return;
+  }
+  const text = continuationText.trim() || COMPACT_HIJACK_CONTINUATION_PROMPT;
+  const messageId = `${messageIdPrefix}-${randomUUID()}`;
+  const isTransport = latest.runtimeType === 'transport'
+    || (typeof latest.agentType === 'string' && isTransportAgent(latest.agentType));
+  try {
+    if (isTransport) {
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime) {
+        timelineEmitter.emit(
+          sessionName,
+          'user.message',
+          { text, clientMessageId: messageId },
+          { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
+        );
+        await runtime.send(text, messageId);
+        return;
+      }
+      enqueueResend(sessionName, {
+        ...(recipientFromSessionRecord(latest) ? { recipient: recipientFromSessionRecord(latest) } : {}),
+        text,
+        commandId: messageId,
+        clientMessageId: messageId,
+        queuedAt: Date.now(),
+      });
+      return;
+    }
+    await sendProcessSessionMessageForAutomation(sessionName, text, {
+      verbatim: true,
+    });
+  } catch (err) {
+    logger.warn({ sessionName, err }, 'Failed to dispatch handoff continuation');
+  }
+}
+
+/**
  * Automatic Compact Hijack: reopen via `/handoff` and immediately send the
  * concise continuation instruction onto the fresh conversation.
  */
@@ -1631,44 +1683,16 @@ export async function triggerCompactHijackForSession(
   }
   const resolvedLink = serverLink ?? lastObservedServerLink;
   await handoffSessionConversation(record, resolvedLink);
-  const latest = getSession(sessionName);
-  if (
-    !latest
-    || (record.sessionInstanceId && latest.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId)
-  ) {
-    return;
-  }
   const pendingPrompt = typeof info?.pendingPrompt === 'string' ? info.pendingPrompt.trim() : '';
   const continuationText = pendingPrompt && pendingPrompt !== COMPACT_HIJACK_CONTINUATION_PROMPT
     ? `${COMPACT_HIJACK_CONTINUATION_PROMPT}\n\n${pendingPrompt}`
     : COMPACT_HIJACK_CONTINUATION_PROMPT;
-  const messageId = `compact-hijack-${randomUUID()}`;
-  const isTransport = latest.runtimeType === 'transport'
-    || (typeof latest.agentType === 'string' && isTransportAgent(latest.agentType));
-  if (isTransport) {
-    const runtime = getTransportRuntime(sessionName);
-    if (runtime) {
-      timelineEmitter.emit(
-        sessionName,
-        'user.message',
-        { text: continuationText, clientMessageId: messageId },
-        { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
-      );
-      await runtime.send(continuationText, messageId);
-      return;
-    }
-    enqueueResend(sessionName, {
-      ...(recipientFromSessionRecord(latest) ? { recipient: recipientFromSessionRecord(latest) } : {}),
-      text: continuationText,
-      commandId: messageId,
-      clientMessageId: messageId,
-      queuedAt: Date.now(),
-    });
-    return;
-  }
-  await sendProcessSessionMessageForAutomation(sessionName, continuationText, {
-    verbatim: true,
-  });
+  await dispatchHandoffContinuation(
+    sessionName,
+    continuationText,
+    record.sessionInstanceId,
+    'compact-hijack',
+  );
 }
 
 async function clearProcessConversation(
@@ -5549,7 +5573,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       authorityBinding.current = bindProcessSharedMachineCommand(sessionName, fastRecord, cmd);
       emitTransportUserMessage(text);
       receiptAcked = true;
-      await executeDaemonResetCommand({
+      const resetOk = await executeDaemonResetCommand({
         sessionName,
         serverLink,
         effectiveId,
@@ -5567,6 +5591,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
           ? describeTransportSendError
           : (err) => (err instanceof Error ? err.message : String(err)),
       });
+      if (resetOk && isResetHandoffFast) {
+        await dispatchHandoffContinuation(sessionName, undefined, fastRecord.sessionInstanceId);
+      }
       return;
     }
   }
@@ -5777,7 +5804,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   if (isTransportSession && (isSessionControlCommandText(trimmedText, 'clear') || isTransportHandoff) && supportsTransportClear(record?.agentType)) {
     emitTransportUserMessage(text);
     receiptAcked = true;
-    await executeDaemonResetCommand({
+    const resetOk = await executeDaemonResetCommand({
       sessionName,
       serverLink,
       effectiveId,
@@ -5789,6 +5816,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         : clearTransportConversation(record!, serverLink, resetToken),
       formatError: describeTransportSendError,
     });
+    if (resetOk && isTransportHandoff) {
+      await dispatchHandoffContinuation(sessionName, undefined, record!.sessionInstanceId);
+    }
     return;
   }
   if (!transportRuntime && isTransportSession) {
@@ -6219,7 +6249,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   if ((isSessionControlCommandText(text, 'clear') || isProcessHandoff) && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
     receiptAcked = true;
-    await executeDaemonResetCommand({
+    const resetOk = await executeDaemonResetCommand({
       sessionName,
       serverLink,
       effectiveId,
@@ -6231,6 +6261,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         : clearProcessConversation(record, serverLink, resetToken),
       formatError: (err) => (err instanceof Error ? err.message : String(err)),
     });
+    if (resetOk && isProcessHandoff) {
+      await dispatchHandoffContinuation(sessionName, undefined, record.sessionInstanceId);
+    }
     return;
   }
 

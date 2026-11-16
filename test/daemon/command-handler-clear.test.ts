@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { COMPACT_HIJACK_CONTINUATION_PROMPT } from '../../shared/compact-hijack.js';
 import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 
 const {
@@ -63,7 +64,13 @@ vi.mock('../../src/util/imc-dir.js', () => ({ ensureImcDir: vi.fn().mockResolved
 vi.mock('../../src/daemon/supervision-broker.js', () => ({ supervisionBroker: { decide: vi.fn() } }));
 vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutomation: { init: vi.fn(), setServerLink: vi.fn(), cancelSession: vi.fn(), queueTaskIntent: vi.fn(), updateQueuedTaskIntent: vi.fn(), removeQueuedTaskIntent: vi.fn(), registerTaskIntent: vi.fn(), applySnapshotUpdate: vi.fn() } }));
 
-import { handleWebCommand, handoffSessionConversation, clearTransportConversation } from '../../src/daemon/command-handler.js';
+import {
+  clearTransportConversation,
+  dispatchHandoffContinuation,
+  handleWebCommand,
+  handoffSessionConversation,
+} from '../../src/daemon/command-handler.js';
+import { sendKeysDelayedEnter } from '../../src/agent/tmux.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -543,5 +550,71 @@ describe('process session /clear handling', () => {
       { state: 'idle' },
       expect.objectContaining({ source: 'daemon' }),
     );
+  });
+
+  it('dispatches continuation after process /handoff, isolates send failures from Clear failed, and skips failed resets or stale/incognito sessions', async () => {
+    vi.mocked(sendKeysDelayedEnter).mockClear();
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_proc_handoff',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-proc-1',
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_proc_handoff', text: '/handoff', commandId: 'cmd-proc-cont-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_proc_handoff',
+      COMPACT_HIJACK_CONTINUATION_PROMPT,
+      expect.objectContaining({ verbatim: true }),
+    );
+
+    // Failed reset must NOT dispatch continuation
+    vi.mocked(sendKeysDelayedEnter).mockClear();
+    relaunchSessionWithSettingsMock.mockRejectedValueOnce(new Error('relaunch failed'));
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_proc_handoff', text: '/handoff', commandId: 'cmd-proc-fail-reset' }, serverLink as any);
+    await flushAsync();
+    expect(sendKeysDelayedEnter).not.toHaveBeenCalled();
+
+    // Failed continuation dispatch must NOT emit Clear failed or error command.ack
+    emitMock.mockClear();
+    vi.mocked(sendKeysDelayedEnter).mockRejectedValueOnce(new Error('tmux send failed'));
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_proc_handoff', text: '/handoff', commandId: 'cmd-proc-fail-cont' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_proc_handoff', 'command.ack', { commandId: 'cmd-proc-fail-cont', status: 'accepted' });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_proj_proc_handoff',
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED }),
+      expect.anything(),
+    );
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_proj_proc_handoff',
+      'command.ack',
+      expect.objectContaining({ commandId: 'cmd-proc-fail-cont', status: 'error' }),
+    );
+
+    // Stale instance / deleted / incognito sessions never receive continuation
+    vi.mocked(sendKeysDelayedEnter).mockClear();
+    await dispatchHandoffContinuation('deck_proj_proc_handoff', undefined, 'inst-stale');
+    getSessionMock.mockReturnValue(undefined);
+    await dispatchHandoffContinuation('deck_proj_proc_handoff');
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_incog',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      incognito: true,
+    });
+    await dispatchHandoffContinuation('deck_proj_incog');
+    expect(sendKeysDelayedEnter).not.toHaveBeenCalled();
   });
 });

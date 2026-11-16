@@ -288,6 +288,37 @@ function sanitizeCodexSdkStartupModel(value: string | null | undefined): string 
   return isClaudeModel ? DEFAULT_CODEX_SESSION_MODEL : trimmed;
 }
 
+async function resolveCodexPresetSessionOverrides(
+  ccPreset: string,
+  requestedModel: string | undefined,
+  existingSettings: string | Record<string, unknown> | undefined,
+): Promise<{
+  env: Record<string, string>;
+  model?: string;
+  contextWindow?: number;
+  systemPrompt?: string;
+  availableModels?: string[];
+  settings?: string | Record<string, unknown>;
+}> {
+  const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
+  const presetConfig = await getCodexPresetTransportConfig(ccPreset, requestedModel);
+  return {
+    env: presetConfig.env,
+    ...(presetConfig.model ? { model: presetConfig.model } : {}),
+    ...(presetConfig.contextWindow !== undefined ? { contextWindow: presetConfig.contextWindow } : {}),
+    ...(presetConfig.systemPrompt ? { systemPrompt: presetConfig.systemPrompt } : {}),
+    ...(presetConfig.availableModels?.length ? { availableModels: presetConfig.availableModels } : {}),
+    ...(presetConfig.codexModelProvider
+      ? {
+          settings: {
+            ...(typeof existingSettings === 'object' && existingSettings ? existingSettings : {}),
+            codexModelProvider: presetConfig.codexModelProvider,
+          },
+        }
+      : {}),
+  };
+}
+
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
   if (ccSessionId) {
@@ -3381,7 +3412,7 @@ export async function restoreTransportSessions(
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
-      if (s.providerId === 'codex-sdk') {
+      if (s.providerId === 'codex-sdk' && !s.ccPreset) {
         requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
       } else if (isClaudeCodeSdkAgentType(s.providerId) && requestedTransportModel) {
         // Resolve the picker alias (e.g. "fable") to the documented API id before the
@@ -3448,6 +3479,7 @@ export async function restoreTransportSessions(
       let effectiveRequestedModel = requestedTransportModel;
       let restoredPresetContextWindow = s.presetContextWindow;
       let qwenPresetUsesApiKey = false;
+      let availableCodexModels: string[] | undefined;
       let dshLlmConfig: DshLlmConfig | undefined;
       let piLlmConfig: PiLlmConfig | undefined;
       const boundServerId = await loadBoundServerIdForManagedMcp();
@@ -3513,6 +3545,14 @@ export async function restoreTransportSessions(
         if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
         restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'codex-sdk' && s.ccPreset) {
+        const presetOverrides = await resolveCodexPresetSessionOverrides(s.ccPreset, effectiveRequestedModel, transportSettings);
+        extraEnv = { ...(extraEnv ?? {}), ...presetOverrides.env };
+        if (presetOverrides.model) effectiveRequestedModel = presetOverrides.model;
+        restoredPresetContextWindow = presetOverrides.contextWindow ?? restoredPresetContextWindow;
+        if (presetOverrides.systemPrompt) systemPrompt = presetOverrides.systemPrompt;
+        if (presetOverrides.availableModels?.length) availableCodexModels = presetOverrides.availableModels;
+        if (presetOverrides.settings) transportSettings = presetOverrides.settings;
       }
       if (s.providerId === 'qwen'
         && !s.ccPreset
@@ -3650,6 +3690,7 @@ export async function restoreTransportSessions(
           ? undefined
           : (qwenRuntime?.authLimit ?? currentForFinalize.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
         ...(restoredPresetContextWindow ? { presetContextWindow: restoredPresetContextWindow } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
@@ -4091,21 +4132,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
     let availableCodexModels: string[] | undefined;
     if (effectiveCcPreset) {
-      const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
-      const presetConfig = await getCodexPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
-      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
-      if (presetConfig.model) requestedTransportModel = presetConfig.model;
-      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
-      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
-      if (presetConfig.availableModels?.length) {
-        availableCodexModels = presetConfig.availableModels;
-      }
-      if (presetConfig.codexModelProvider) {
-        transportSettings = {
-          ...(typeof transportSettings === 'object' && transportSettings ? transportSettings : {}),
-          codexModelProvider: presetConfig.codexModelProvider,
-        };
-      }
+      const presetOverrides = await resolveCodexPresetSessionOverrides(effectiveCcPreset, requestedTransportModel, transportSettings);
+      transportEnv = { ...(transportEnv ?? {}), ...presetOverrides.env };
+      if (presetOverrides.model) requestedTransportModel = presetOverrides.model;
+      presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
+      if (presetOverrides.systemPrompt) transportSystemPrompt = presetOverrides.systemPrompt;
+      if (presetOverrides.availableModels?.length) availableCodexModels = presetOverrides.availableModels;
+      if (presetOverrides.settings) transportSettings = presetOverrides.settings;
     }
     const rawSdkDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),

@@ -352,13 +352,14 @@ export async function dispatchSessionMessage(
     const isTransportClear = isSessionControlCommandText(message.trim(), 'clear');
     const isTransportHandoff = isSessionControlCommandText(message.trim(), 'handoff');
     if (isTransportClear || isTransportHandoff) {
-      const { clearTransportConversation, handoffSessionConversation, supportsTransportClear } = await import('./command-handler.js');
+      const { clearTransportConversation, dispatchHandoffContinuation, handoffSessionConversation, supportsTransportClear } = await import('./command-handler.js');
       if (supportsTransportClear(target.agentType)) {
         if (!options.suppressTimeline) {
           emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
         }
         if (isTransportHandoff) {
           await handoffSessionConversation(target);
+          await dispatchHandoffContinuation?.(target.name, undefined, target.sessionInstanceId);
         } else {
           await clearTransportConversation(target);
         }
@@ -543,12 +544,13 @@ export async function dispatchSessionMessage(
   }
 
   if (isSessionControlCommandText(message.trim(), 'handoff')) {
-    const { handoffSessionConversation, supportsProcessClear } = await import('./command-handler.js');
+    const { dispatchHandoffContinuation, handoffSessionConversation, supportsProcessClear } = await import('./command-handler.js');
     if (supportsProcessClear(target.agentType)) {
       if (!options.suppressTimeline) {
         emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
       }
       await handoffSessionConversation(target);
+      await dispatchHandoffContinuation?.(target.name, undefined, target.sessionInstanceId);
       return 'sent';
     }
   }

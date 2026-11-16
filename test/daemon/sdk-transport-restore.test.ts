@@ -253,6 +253,7 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
+import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
 import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
 import {
@@ -3872,6 +3873,75 @@ describe('sdk transport session restore', () => {
       expect(mocks.store.get(name)?.agentType).toBe('codex-sdk');
       expect(mocks.store.get(name)?.ccPreset).toBeUndefined();
     } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('resolves codex-sdk ccPreset overrides during restoreTransportSessions without stripping custom model ids', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({
+      env: { CUSTOM_API_KEY: 'preset-secret', OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      model: 'sc117-qwen3.8-flash-opus-custom',
+      availableModels: ['sc117-qwen3.8-flash-opus-custom', 'sc117-mini'],
+      contextWindow: 131_072,
+      systemPrompt: 'Runtime facts: custom codex preset.',
+      codexModelProvider: {
+        id: 'qwen3_8_27b',
+        name: 'qwen3.8-27b',
+        baseUrl: 'https://custom-codex.example/v1',
+        envKey: 'CUSTOM_API_KEY',
+      },
+    });
+    const createSessionSpy = vi.spyOn(CodexSdkProvider.prototype, 'createSession');
+    try {
+      const name = 'deck_sub_restore_codex_preset';
+      mocks.store.set(name, {
+        name,
+        projectName: 'restorecodexpreset',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-cx-restore-preset',
+        codexSessionId: 'codex-thread-restore-preset',
+        projectDir: '/tmp/restore-codex-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccPreset: 'qwen3.8-27b',
+        requestedModel: 'sc117-qwen3.8-flash-opus-custom',
+      });
+
+      await connectProvider('codex-sdk', {});
+      await restoreTransportSessions('codex-sdk', { sessionName: name });
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('qwen3.8-27b', 'sc117-qwen3.8-flash-opus-custom');
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'sc117-qwen3.8-flash-opus-custom',
+        systemPrompt: 'Runtime facts: custom codex preset.',
+        env: expect.objectContaining({
+          CUSTOM_API_KEY: 'preset-secret',
+          OPENAI_BASE_URL: 'https://custom-codex.example/v1',
+        }),
+        settings: expect.objectContaining({
+          codexModelProvider: {
+            id: 'qwen3_8_27b',
+            name: 'qwen3.8-27b',
+            baseUrl: 'https://custom-codex.example/v1',
+            envKey: 'CUSTOM_API_KEY',
+          },
+        }),
+      }));
+      expect(mocks.store.get(name)).toMatchObject({
+        ccPreset: 'qwen3.8-27b',
+        requestedModel: 'sc117-qwen3.8-flash-opus-custom',
+        presetContextWindow: 131_072,
+        codexAvailableModels: ['sc117-qwen3.8-flash-opus-custom', 'sc117-mini'],
+      });
+    } finally {
+      createSessionSpy.mockRestore();
       codexPresetSpy.mockRestore();
     }
   });

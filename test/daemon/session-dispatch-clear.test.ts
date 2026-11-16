@@ -10,6 +10,7 @@ import type { SessionRecord } from '../../src/store/session-store.js';
 
 const mocks = vi.hoisted(() => ({
   clearTransportConversation: vi.fn(async () => undefined),
+  dispatchHandoffContinuation: vi.fn(async () => undefined),
   handoffSessionConversation: vi.fn(async () => undefined),
   supportsTransportClear: vi.fn((agentType: string | undefined) => agentType === 'codex-sdk'),
   supportsProcessClear: vi.fn((agentType: string | undefined) => agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode'),
@@ -20,6 +21,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../src/daemon/command-handler.js', () => ({
   clearTransportConversation: mocks.clearTransportConversation,
+  dispatchHandoffContinuation: mocks.dispatchHandoffContinuation,
   handoffSessionConversation: mocks.handoffSessionConversation,
   supportsTransportClear: mocks.supportsTransportClear,
   supportsProcessClear: mocks.supportsProcessClear,
@@ -52,6 +54,7 @@ function transportSession(patch: Partial<SessionRecord> = {}): SessionRecord {
 describe('daemon-side delivery of /clear', () => {
   beforeEach(() => {
     mocks.clearTransportConversation.mockClear();
+    mocks.dispatchHandoffContinuation.mockClear();
     mocks.handoffSessionConversation.mockClear();
     mocks.sendProcessSessionMessageForAutomation.mockClear();
     mocks.runtimeSend.mockClear();
@@ -63,6 +66,7 @@ describe('daemon-side delivery of /clear', () => {
     const result = await dispatchSessionMessage(target, ' /clear ', { messageId: 'send_message_1', suppressTimeline: true } as never);
     expect(result).toBe('sent');
     expect(mocks.clearTransportConversation).toHaveBeenCalledWith(target);
+    expect(mocks.dispatchHandoffContinuation).not.toHaveBeenCalled();
     expect(mocks.runtimeSend).not.toHaveBeenCalled();
   });
 
@@ -94,25 +98,30 @@ describe('daemon-side delivery of /clear', () => {
     expect(buildSessionDispatchMessage('/stop', wrap)).not.toBe('/stop');
   });
 
-  it('handles /handoff via handoffSessionConversation for transport and process sessions', async () => {
+  it('handles /handoff via handoffSessionConversation and dispatches continuation for transport and process sessions', async () => {
     const { dispatchSessionMessage } = await import('../../src/daemon/session-dispatch.js');
-    const transportTarget = transportSession();
+    const transportTarget = transportSession({ sessionInstanceId: 'inst-tr-1' });
     const processTarget = {
-      ...transportSession({ name: 'deck_sub_cc1', agentType: 'claude-code', runtimeType: 'process' }),
+      ...transportSession({ name: 'deck_sub_cc1', agentType: 'claude-code', runtimeType: 'process', sessionInstanceId: 'inst-pr-1' }),
     };
 
     expect(await dispatchSessionMessage(transportTarget, ' /handoff ', { messageId: 'send_message_5', suppressTimeline: true } as never)).toBe('sent');
     expect(mocks.handoffSessionConversation).toHaveBeenCalledWith(transportTarget);
+    expect(mocks.dispatchHandoffContinuation).toHaveBeenCalledWith('deck_sub_cx8', undefined, 'inst-tr-1');
     expect(mocks.runtimeSend).not.toHaveBeenCalled();
 
     mocks.handoffSessionConversation.mockClear();
+    mocks.dispatchHandoffContinuation.mockClear();
     expect(await dispatchSessionMessage(processTarget, '/handoff', { messageId: 'send_message_6', suppressTimeline: true } as never)).toBe('sent');
     expect(mocks.handoffSessionConversation).toHaveBeenCalledWith(processTarget);
+    expect(mocks.dispatchHandoffContinuation).toHaveBeenCalledWith('deck_sub_cc1', undefined, 'inst-pr-1');
     expect(mocks.sendProcessSessionMessageForAutomation).not.toHaveBeenCalled();
 
     mocks.handoffSessionConversation.mockClear();
+    mocks.dispatchHandoffContinuation.mockClear();
     await dispatchSessionMessage(transportSession({ agentType: 'some-other-sdk' as never }), '/handoff', { messageId: 'send_message_7', suppressTimeline: true } as never);
     expect(mocks.handoffSessionConversation).not.toHaveBeenCalled();
+    expect(mocks.dispatchHandoffContinuation).not.toHaveBeenCalled();
     expect(mocks.runtimeSend).toHaveBeenCalledTimes(1);
   });
 });

@@ -223,4 +223,46 @@ describe('daemon command-handler compact hijack integration', () => {
     await triggerCompactHijackForSession('deck_proj_incog', serverLink as never);
     expect(relaunchSessionWithSettingsMock).not.toHaveBeenCalled();
   });
+
+  it('auto-dispatches continuation once after user /handoff on a transport session', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_handoff',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      projectDir: '/tmp/proj',
+      state: 'idle',
+      sessionInstanceId: 'inst-handoff-1',
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_proj_handoff',
+      text: '/handoff',
+      commandId: 'cmd-user-handoff-1',
+    }, serverLink as never);
+    await flush();
+    await flush();
+
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_proj_handoff' }),
+      { fresh: true, handoff: true },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_handoff',
+      'user.message',
+      expect.objectContaining({
+        text: COMPACT_HIJACK_CONTINUATION_PROMPT,
+        clientMessageId: expect.stringMatching(/^handoff-/),
+      }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(runtimeSendMock).toHaveBeenCalledTimes(1);
+    expect(runtimeSendMock).toHaveBeenCalledWith(
+      COMPACT_HIJACK_CONTINUATION_PROMPT,
+      expect.stringMatching(/^handoff-/),
+    );
+  });
 });
