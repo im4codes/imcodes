@@ -430,6 +430,8 @@ final class SpeechCoordinator {
                                 tail.samples,
                                 speech: tail.speech,
                                 trailingSilence: tail.trailingSilence,
+                                activeSamples: tail.activeSamples,
+                                noiseFloorRMS: tail.noiseFloorRMS,
                                 final: true,
                                 shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
                                 rollbackPrefix: decoder.rollbackPrefix,
@@ -515,6 +517,8 @@ final class SpeechCoordinator {
                     batch.samples,
                     speech: batch.speech,
                     trailingSilence: batch.trailingSilence,
+                    activeSamples: batch.activeSamples,
+                    noiseFloorRMS: batch.noiseFloorRMS,
                     shouldEmitNonFinal: { [weak self] in self?.isCurrent(owner) ?? false },
                     shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
                     rollbackPrefix: decoder.rollbackPrefix,
@@ -738,20 +742,17 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func configureAudioSessionCategoryIfNeeded(session: AVAudioSession) throws {
         dispatchPrecondition(condition: .onQueue(audioQueue))
-        let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker]
+        let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
         if audioSessionCategoryConfigured,
            session.category == .playAndRecord,
            (session.mode == .spokenAudio || session.mode == .default),
-           session.categoryOptions.contains(desiredOptions),
-           !session.categoryOptions.contains(.allowBluetooth) {
+           session.categoryOptions.contains(desiredOptions) {
             return
         }
         do {
-            // Keep built-in 48kHz mic + A2DP output cleanly separated without triggering
-            // 660-2450ms Bluetooth HFP SCO teardown/renegotiation on every hold press.
-            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker])
+            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
         } catch {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
         }
         audioSessionCategoryConfigured = true
     }
@@ -1257,6 +1258,7 @@ struct SpeechWindow {
     static let onsetClearSilenceSamples = sampleRate / 10 // 100ms unvoiced gap discards unconfirmed noise onset
     static let onsetBypassRMS: Float = 0.05 // Normal handheld speech (>= -26 dBFS) opens window immediately without onset buffering
     static let minDecodeWindowRMS: Float = 0.0024 // Skip decoder call if no 200ms window reaches soft-speech energy (-52.4 dBFS)
+    static let minDecodeNoiseMultiplier: Float = 1.75 // Require ~4.9 dB above adapted ambient noise floor
     static let decodeEnergyWindowSamples = sampleRate * 2 / 10 // 200ms @ 16 kHz
     static let decodeEnergyHopSamples = sampleRate / 10 // 100ms hop @ 16 kHz
     enum Failure: Error { case decode, cancelled }
@@ -1273,12 +1275,20 @@ struct SpeechWindow {
     private var pendingOnsetSamples: [Float] = []
     private var pendingOnsetActiveSamples = 0
     private var pendingOnsetSilenceSamples = 0
+    private var latestNoiseFloorRMS: Float = SpeechGain.initialNoiseFloorRMS
+    private var voicedSinceSilenceSamples = 0
+    static let silenceResetMinVoicedSamples = sampleRate / 20 // 50ms voiced continuity required to reset active pause clock
     var text: String { Self.join(committed, partial) }
 
-    static func hasDecodableEnergy(in audio: [Float], count: Int? = nil) -> Bool {
+    static func hasDecodableEnergy(
+        in audio: [Float],
+        count: Int? = nil,
+        noiseFloorRMS: Float = SpeechGain.initialNoiseFloorRMS
+    ) -> Bool {
         let n = min(audio.count, count ?? audio.count)
         guard n > 0 else { return false }
-        let threshSq = Double(minDecodeWindowRMS) * Double(minDecodeWindowRMS)
+        let effectiveMinRMS = max(minDecodeWindowRMS, noiseFloorRMS * minDecodeNoiseMultiplier)
+        let threshSq = Double(effectiveMinRMS) * Double(effectiveMinRMS)
         let win = decodeEnergyWindowSamples
         if n <= win {
             var sumSq: Double = 0
@@ -1379,8 +1389,22 @@ struct SpeechWindow {
         return bestStart + frameSize / 2
     }
 
-    private mutating func advanceSilence(sliceCount: Int, speech: Bool, trailingSilence: Int, tailRemaining: Int) {
+    private mutating func advanceSilence(
+        sliceCount: Int,
+        speech: Bool,
+        trailingSilence: Int,
+        activeInSlice: Int,
+        sliceRMS: Float,
+        tailRemaining: Int
+    ) {
         guard speech else {
+            voicedSinceSilenceSamples = 0
+            silentSamples += sliceCount
+            return
+        }
+        voicedSinceSilenceSamples += activeInSlice
+        guard sliceRMS >= Self.onsetBypassRMS || voicedSinceSilenceSamples >= Self.silenceResetMinVoicedSamples else {
+            // Isolated single-subframe (25ms) ambient blip must not reset an active pause clock.
             silentSamples += sliceCount
             return
         }
@@ -1394,6 +1418,8 @@ struct SpeechWindow {
         _ input: [Float],
         speech: Bool,
         trailingSilence: Int = 0,
+        activeSamples: Int? = nil,
+        noiseFloorRMS: Float = SpeechGain.initialNoiseFloorRMS,
         final: Bool = false,
         shouldEmitNonFinal: () -> Bool = { true },
         shouldContinue: () -> Bool = { true },
@@ -1401,6 +1427,7 @@ struct SpeechWindow {
         decode: DecodeFn,
         emit: (String) -> Void
     ) throws {
+        latestNoiseFloorRMS = noiseFloorRMS
         guard !input.isEmpty else { return }
         var remaining: ArraySlice<Float>
         if samples.isEmpty {
@@ -1415,7 +1442,7 @@ struct SpeechWindow {
                 return
             }
             let silentEnd = min(input.count, max(0, trailingSilence))
-            let activeInChunk = max(0, input.count - silentEnd)
+            let activeInChunk = activeSamples.map { min(input.count, max(0, $0)) } ?? max(0, input.count - silentEnd)
             let bypassOnset = SpeechGain.rms(input) >= Self.onsetBypassRMS
             if pendingOnsetSamples.isEmpty && (bypassOnset || activeInChunk >= Self.onsetConfirmSamples) {
                 remaining = input[...]
@@ -1441,6 +1468,8 @@ struct SpeechWindow {
         } else {
             remaining = input[...]
         }
+        let activeForSilence = activeSamples ?? input.count
+        let inputRMS = SpeechGain.rms(input)
         while samples.count + remaining.count > Self.segmentCapacity {
             guard shouldContinue() else { throw Failure.cancelled }
             let takeCount = max(0, Self.segmentCapacity - samples.count)
@@ -1448,7 +1477,14 @@ struct SpeechWindow {
             remaining = remaining.dropFirst(takeCount)
             samples.append(contentsOf: chunk)
             newSamples += chunk.count
-            advanceSilence(sliceCount: chunk.count, speech: speech, trailingSilence: trailingSilence, tailRemaining: remaining.count)
+            advanceSilence(
+                sliceCount: chunk.count,
+                speech: speech,
+                trailingSilence: trailingSilence,
+                activeInSlice: min(chunk.count, activeForSilence),
+                sliceRMS: inputRMS,
+                tailRemaining: remaining.count
+            )
             let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
             if silentSamples >= pause {
                 try evaluate(samples, allowPrefix: true, rollbackPrefix: rollbackPrefix, shouldContinue: shouldContinue, decode: decode)
@@ -1462,7 +1498,14 @@ struct SpeechWindow {
         guard shouldContinue() else { throw Failure.cancelled }
         samples.append(contentsOf: remaining)
         newSamples += remaining.count
-        advanceSilence(sliceCount: remaining.count, speech: speech, trailingSilence: trailingSilence, tailRemaining: 0)
+        advanceSilence(
+            sliceCount: remaining.count,
+            speech: speech,
+            trailingSilence: trailingSilence,
+            activeInSlice: min(remaining.count, activeForSilence),
+            sliceRMS: inputRMS,
+            tailRemaining: 0
+        )
         if final || !shouldEmitNonFinal() {
             // Stop flushes the final bounded segment once in finish() with 200ms silence padding;
             // skip redundant non-final decodes once stop has already been requested.
@@ -1545,7 +1588,7 @@ struct SpeechWindow {
         decodedSampleCount: Int? = nil
     ) throws {
         guard shouldContinue() else { throw Failure.cancelled }
-        guard Self.hasDecodableEnergy(in: audio) else {
+        guard Self.hasDecodableEnergy(in: audio, noiseFloorRMS: latestNoiseFloorRMS) else {
             partial = ""
             newSamples = 0
             return
@@ -1575,6 +1618,7 @@ struct SpeechWindow {
         samples.removeAll(keepingCapacity: true)
         newSamples = 0
         silentSamples = 0
+        voicedSinceSilenceSamples = 0
         clearPendingOnset()
     }
 
@@ -1603,12 +1647,12 @@ struct SpeechGain {
     static let maxGain: Float = 1.0
     static let minNoiseFloorRMS: Float = 0.0006
     static let initialNoiseFloorRMS: Float = 0.00075
-    static let maxNoiseFloorRMS: Float = 0.0038
-    static let maxNoiseCeilingRMS: Float = 0.0040
+    static let maxNoiseFloorRMS: Float = 0.015
+    static let maxNoiseCeilingRMS: Float = 0.018
     static let noiseFloorLowRMS: Float = 0.0006
     static let noiseFloorHighRMS: Float = 0.0014
     static let voicedRawRMSFloor: Float = 0.0012
-    static let voicedNoiseMultiplier: Float = 1.65
+    static let voicedNoiseMultiplier: Float = 1.75
     static let voicedBoostedRMSFloor: Float = 0.0012
     static let unpitchedSpeechRMSFloor: Float = 0.05
     static let stationaryHoldSeconds: Float = 0.22
@@ -1620,7 +1664,8 @@ struct SpeechGain {
     static let hpfCutoffHz: Float = 125.0
     private static let hpfAlpha: Float = 1.0 / (1.0 + 2.0 * Float.pi * hpfCutoffHz / Float(sampleRate))
     static let minSpeechBandRatio: Float = 0.50
-    static let minPitchPeriodicity: Float = 0.42
+    static let minPitchPeriodicity: Float = 0.55
+    static let noiseAdaptMaxPitchPeriodicity: Float = 0.72
     static let pitchLagMin = 40   // 400 Hz @ 16 kHz
     static let pitchLagMax = 200  // 80 Hz @ 16 kHz
     static let pitchLagStep = 2
@@ -1636,6 +1681,8 @@ struct SpeechGain {
         let anyVoiced: Bool
         let lastVoiced: Bool
         let trailingUnvoicedSamples: Int
+        let voicedSamples: Int
+        let noiseFloorRMS: Float
     }
 
     private(set) var currentGain: Float = 1.0
@@ -1800,9 +1847,9 @@ struct SpeechGain {
         }
         guard isEnvelopeCandidate else { return }
 
-        // Require independent non-speech acoustic evidence before treating stationary low-level audio as noise:
-        // either energy is mostly sub-bass hum (<125 Hz), or >125 Hz content lacks speech pitch periodicity.
-        if hpRatio >= Self.minSpeechBandRatio && pitch >= Self.minPitchPeriodicity {
+        // Require sustained vocal harmonic clarity before exempting stationary low-level audio from
+        // ambient noise adaptation; room/fan hum with moderate 25ms autocorrelation still adapts.
+        if hpRatio >= Self.minSpeechBandRatio && pitch >= Self.noiseAdaptMaxPitchPeriodicity {
             stationaryDuration = 0
             stationaryAnchorRMS = rawRMS
             return
@@ -1850,7 +1897,16 @@ struct SpeechGain {
 
     mutating func process(_ samples: [Float]) -> Result {
         guard !samples.isEmpty else {
-            return Result(samples: [], rawRMS: 0, boostedRMS: 0, anyVoiced: false, lastVoiced: false, trailingUnvoicedSamples: 0)
+            return Result(
+                samples: [],
+                rawRMS: 0,
+                boostedRMS: 0,
+                anyVoiced: false,
+                lastVoiced: false,
+                trailingUnvoicedSamples: 0,
+                voicedSamples: 0,
+                noiseFloorRMS: noiseFloorRMS
+            )
         }
         let overallRawRMS = Self.rms(samples)
         var out = [Float](repeating: 0, count: samples.count)
@@ -1858,6 +1914,7 @@ struct SpeechGain {
         var anyVoiced = false
         var lastVoiced = false
         var trailingUnvoiced = 0
+        var voicedSamples = 0
 
         var pos = 0
         while pos < samples.count {
@@ -1867,6 +1924,7 @@ struct SpeechGain {
             let subCount = end - pos
             anyVoiced = anyVoiced || voiced
             lastVoiced = voiced
+            if voiced { voicedSamples += subCount }
             trailingUnvoiced = voiced ? 0 : (trailingUnvoiced + subCount)
             pos = end
         }
@@ -1877,7 +1935,9 @@ struct SpeechGain {
             boostedRMS: overallBoostedRMS,
             anyVoiced: anyVoiced,
             lastVoiced: lastVoiced,
-            trailingUnvoicedSamples: trailingUnvoiced
+            trailingUnvoicedSamples: trailingUnvoiced,
+            voicedSamples: voicedSamples,
+            noiseFloorRMS: noiseFloorRMS
         )
     }
 }
@@ -1892,11 +1952,13 @@ struct SpeechInbox {
     private var scheduled = false
     private var speech = false
     private var trailingSilence = 0
+    private var activeSamples = 0
     private var gain = SpeechGain()
     private(set) var warmupRemaining = SpeechInbox.warmupSamples
     private var pendingAudioLevel: Float?
     private var lastAudioLevelAt: TimeInterval = -.infinity
     private(set) var lastVoiced = false
+    var currentNoiseFloorRMS: Float { gain.noiseFloorRMS }
     enum Failure: Error { case overload }
     mutating func offer(_ input: [Float]) throws -> Bool {
         let skip = min(warmupRemaining, input.count)
@@ -1909,6 +1971,7 @@ struct SpeechInbox {
         pendingAudioLevel = level
         lastVoiced = result.lastVoiced
         speech = speech || result.anyVoiced
+        activeSamples += result.voicedSamples
         if result.anyVoiced {
             trailingSilence = result.trailingUnvoicedSamples
         } else {
@@ -1925,11 +1988,23 @@ struct SpeechInbox {
         lastAudioLevelAt = now
         return level
     }
-    struct Batch { let samples: [Float]; let speech: Bool; let trailingSilence: Int }
+    struct Batch {
+        let samples: [Float]
+        let speech: Bool
+        let trailingSilence: Int
+        let activeSamples: Int
+        let noiseFloorRMS: Float
+    }
     mutating func take() -> Batch? {
         guard !pending.isEmpty else { scheduled = false; return nil }
-        let batch = Batch(samples: pending, speech: speech, trailingSilence: trailingSilence)
-        pending = []; speech = false; trailingSilence = 0
+        let batch = Batch(
+            samples: pending,
+            speech: speech,
+            trailingSilence: trailingSilence,
+            activeSamples: activeSamples,
+            noiseFloorRMS: gain.noiseFloorRMS
+        )
+        pending = []; speech = false; trailingSilence = 0; activeSamples = 0
         return batch
     }
 }

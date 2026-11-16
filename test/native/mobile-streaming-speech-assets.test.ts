@@ -253,13 +253,13 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('func checkPermissions(_ call: CAPPluginCall)');
     expect(ios).toContain('mapRecordPermissionStatus(');
     expect(ios).toContain('static let warmHoldIdleTimeout: TimeInterval = 20.0');
-    expect(ios).toContain('mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker]');
+    expect(ios).toContain('mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
     expect(ios).not.toContain('mode: .measurement');
     expect(ios).toContain('session.isInputGainSettable');
     expect(ios).toContain('try? session.setInputGain(1.0)');
     expect(ios).toContain('struct SpeechGain');
-    expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker]');
-    expect(ios).not.toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
+    expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
+    expect(ios).toContain('options: [.defaultToSpeaker, .allowBluetooth]');
     expect(ios).not.toContain('.duckOthers');
     expect(ios).toContain('self.coordinator.markStarted(owner: owner)');
     expect(ios).toContain('guard warmupRemaining == 0');
@@ -1750,6 +1750,41 @@ do {
         }
         require(!mixInbox.lastVoiced && mixWin.samples.isEmpty && mixWin.committed == "mixspeech",
                 "L: mixed hum+fan noise blocked VAD commit: left=\\(mixWin.samples.count) committed=\\(mixWin.committed)")
+    }
+    // Real KOCA's iPhone 16 34s silence profile (measured p50=0.0022..0.0030 RMS, 117/148/531Hz ambient hum+fan
+    // producing hpRatio ~0.76 and 25ms autocorrelation 0.45..0.67) must adapt noiseFloorRMS and decode 0 times
+    // well past 2x segmentCapacity (13.5s), while soft speech above the room floor still opens and decodes.
+    do {
+        var ip16Inbox = SpeechInbox()
+        var ip16Win = SpeechWindow()
+        var ip16Decodes = 0
+        let ip16Decode: SpeechWindow.DecodeFn = { _, _ in ip16Decodes += 1; return ("嗯", [1]) }
+        _ = try! ip16Inbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for step in 0..<340 {
+            let off = step * 1600
+            let h1 = tonePCM(1600, rms: 0.0016, freqHz: 117, phaseOffset: off)
+            let h2 = tonePCM(1600, rms: 0.0014, freqHz: 148, phaseOffset: off)
+            let h3 = tonePCM(1600, rms: 0.0012, freqHz: 531, phaseOffset: off)
+            let n = fanPCM(1600, rms: 0.0016, seed: UInt64(0x16_0000 + step))
+            let chunk = (0..<1600).map { h1[$0] + h2[$0] + h3[$0] + n[$0] }
+            _ = try! ip16Inbox.offer(chunk)
+            if let batch = ip16Inbox.take() {
+                try! ip16Win.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, activeSamples: batch.activeSamples, noiseFloorRMS: batch.noiseFloorRMS, decode: ip16Decode) { _ in }
+            }
+        }
+        let silOut = try! ip16Win.finish(decode: ip16Decode)
+        require(ip16Inbox.currentNoiseFloorRMS >= 0.0020, "L: iPhone 16 noiseFloorRMS froze at \\(ip16Inbox.currentNoiseFloorRMS)")
+        require(ip16Win.samples.isEmpty && ip16Decodes == 0 && silOut.isEmpty,
+                "L: 34s iPhone 16 room silence hallucinated (decodes=\\(ip16Decodes) out=\\(silOut))")
+        // Verify soft speech (0.0055 RMS) over that adapted 0.0028+ floor still opens and decodes cleanly.
+        for s in 0..<4 {
+            _ = try! ip16Inbox.offer(tonePCM(1600, rms: 0.0055, freqHz: 220, phaseOffset: s * 1600))
+            if let batch = ip16Inbox.take() {
+                try! ip16Win.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, activeSamples: batch.activeSamples, noiseFloorRMS: batch.noiseFloorRMS, decode: ip16Decode) { _ in }
+            }
+        }
+        let softOut = try! ip16Win.finish(decode: ip16Decode)
+        require(softOut == "嗯" && ip16Decodes == 1, "L: soft speech over iPhone 16 noise floor failed (decodes=\\(ip16Decodes) out=\\(softOut))")
     }
     print("SPEECH_GAIN_AND_INBOX_VAD:PASS")
 }
