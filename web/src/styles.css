@@ -8597,7 +8597,12 @@ html.mobile-nav-gesture-active .chat-view {
    enough for the bottom — the top strip stays the dominant 5px indicator. */
 .subsession-window-active::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--subsession-accent-color, #38bdf8); opacity: 1; box-shadow: 0 0 12px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 60%, transparent); pointer-events: none; z-index: 3; }
 .subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6), 0 0 24px rgba(34,211,238,0.12); box-sizing: border-box; }
-.subsession-header { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(10,16,27,0.98)); border-bottom: 1px solid rgba(125,211,252,0.16); cursor: move; user-select: none; flex-shrink: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+.subsession-header { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(10,16,27,0.98)); border-bottom: 1px solid rgba(125,211,252,0.16); cursor: move; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; flex-shrink: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+.subsession-header *,
+.floating-panel-titlebar,
+.floating-panel-titlebar * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+html.imcodes-window-dragging,
+html.imcodes-window-dragging * { -webkit-user-select: none !important; user-select: none !important; -webkit-touch-callout: none !important; }
 .subsession-drag-icon { color: rgba(34,211,238,0.48); font-size: 16px; cursor: grab; text-shadow: 0 0 8px rgba(34,211,238,0.16); }
 .subsession-title-group { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 6px; overflow: hidden; }
 .subsession-title-group.is-pair { display: flex; flex-direction: column; align-items: flex-start; gap: 0; line-height: 1.15; }
@@ -8901,6 +8906,9 @@ html.mobile-nav-gesture-active .chat-view {
   background: rgb(0 0 0 / 1%);
   pointer-events: auto;
   touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 /* The layer is a final direct child of each floating window.  It covers the

@@ -44,6 +44,7 @@ import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { shouldSuppressSubSessionBarForKeyboard } from '../mobile-keyboard.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import { focusComposerElement } from '../util/composer-focus.js';
+import { startFloatingWindowDrag, startFloatingWindowResize } from './window-drag.js';
 import {
   clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
@@ -731,7 +732,12 @@ export function SubSessionWindow({
   }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, launchExecutionClones, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
-  const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
+  const activeInteractionCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => () => {
+    activeInteractionCleanupRef.current?.();
+    activeInteractionCleanupRef.current = null;
+  }, []);
 
   const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
     const clamped = clampDesktopGeom({ x, y, w, h });
@@ -744,26 +750,22 @@ export function SubSessionWindow({
       return;
     }
     if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable]')) return;
-    dragStart.current = { mx: e.clientX, my: e.clientY, ox: geomRef.current.x, oy: geomRef.current.y };
-    onFocus();
-    const onMove = (me: MouseEvent) => {
-      if (!dragStart.current) return;
-      const dx = me.clientX - dragStart.current.mx;
-      const dy = me.clientY - dragStart.current.my;
-      setGeom((g) => {
-        const { x, y } = clampPos(dragStart.current!.ox + dx, dragStart.current!.oy + dy, g.w);
-        return { ...g, x, y };
-      });
-    };
-    const onUp = () => {
-      dragStart.current = null;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
     e.preventDefault();
-  }, [isDesktopMaximized, onFocus, clampPos]);
+    activeInteractionCleanupRef.current?.();
+    onFocus();
+    const cancel = startFloatingWindowDrag({
+      element: swipeBackRef.current,
+      startX: e.clientX,
+      startY: e.clientY,
+      origin: geomRef.current,
+      clampPos: (x, y, w, h) => clampPos(x, y, w, h),
+      onCommit: (x, y) => {
+        activeInteractionCleanupRef.current = null;
+        setGeom((g) => (g.x === x && g.y === y ? g : { ...g, x, y }));
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
+  }, [isDesktopMaximized, onFocus, clampPos, swipeBackRef]);
 
   const onHeaderMouseDown = startDrag;
 
@@ -777,14 +779,14 @@ export function SubSessionWindow({
     e.stopPropagation();
     e.preventDefault();
     if (isDesktopMaximized) return;
+    activeInteractionCleanupRef.current?.();
     onFocus();
     setResizingDir(dir);
     const startG = { ...geomRef.current };
-    const sx = e.clientX, sy = e.clientY;
-    const onMove = (me: MouseEvent) => {
-      const dx = me.clientX - sx;
-      const dy = me.clientY - sy;
-      setGeom((_g) => {
+    const cancel = startFloatingWindowResize({
+      startX: e.clientX,
+      startY: e.clientY,
+      computeGeometry: (dx, dy) => {
         let { x, y, w, h } = { ...startG };
         if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
@@ -796,15 +798,14 @@ export function SubSessionWindow({
           h = startBottom - y;
         }
         return clampDesktopGeom({ x, y, w, h });
-      });
-    };
-    const onUp = () => {
-      setResizingDir(null);
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+      },
+      onUpdate: (next) => setGeom(next),
+      onEnd: () => {
+        activeInteractionCleanupRef.current = null;
+        setResizingDir(null);
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
   }, [isDesktopMaximized, onFocus]);
 
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
