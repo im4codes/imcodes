@@ -1850,4 +1850,22 @@ describe('styles.css regression contracts', () => {
       expect(mobileWrap).toMatch(/overflow:\s*hidden/);
     }
   });
+
+  it('keeps .voice-hold-hud-card bottom clearance dynamic above .controls-composer with bounded @container fallbacks', () => {
+    const hudRule = cssWithoutComments.match(/\.voice-hold-hud\s*\{[^}]*\}/)?.[0];
+    const cardRule = cssWithoutComments.match(/\.voice-hold-hud-card\s*\{[^}]*\}/)?.[0];
+    expect(hudRule, '.voice-hold-hud rule missing').toBeTruthy();
+    expect(cardRule, '.voice-hold-hud-card rule missing').toBeTruthy();
+    expect(hudRule).toMatch(/pointer-events:\s*none/);
+    expect(hudRule).toContain('--voice-hud-safe-bottom');
+    expect(cardRule).toContain('var(--voice-hud-bottom-clearance');
+    expect(cardRule).toContain('clamp(');
+
+    const container420 = extractBalancedAtRuleBlocks(cssWithoutComments, /@container\s*\(max-height:\s*420px\)/).join('\n');
+    const container300 = extractBalancedAtRuleBlocks(cssWithoutComments, /@container\s*\(max-height:\s*300px\)/).join('\n');
+    expect(container420).toContain('--voice-hud-bottom-clearance');
+    expect(container420).toContain('100cqh');
+    expect(container300).toContain('--voice-hud-bottom-clearance');
+    expect(container300).toContain('100cqh');
+  });
 });

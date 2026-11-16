@@ -208,6 +208,7 @@ const VOICE_HOLD_SLIDE_MAX_PX = 84;
 const VOICE_HOLD_START_TIMEOUT_MS = 10_000;
 const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
 const VOICE_HOLD_DROP_ANIMATION_MS = 300;
+export const VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX = 16;
 const VOICE_HOLD_BAR_COUNT = 28;
 const VOICE_HOLD_BAR_MIN_PX = 5;
 const VOICE_HOLD_BAR_MAX_PX = 27;
@@ -283,6 +284,7 @@ interface VoiceHoldHudHandle {
   setDragX: (dragX: number) => void;
   pushLevel: (level: number) => void;
   resetBars: () => void;
+  getBottomPx: () => number | null;
 }
 
 interface VoiceHoldHudProps {
@@ -291,6 +293,7 @@ interface VoiceHoldHudProps {
   zone: 'send' | 'cancel' | 'edit';
   dragXRef: RefObject<number>;
   dropY: number | null;
+  bottomClearance: number | null;
   text: string;
   recognizing: boolean;
   liveAudio: boolean;
@@ -303,7 +306,7 @@ interface VoiceHoldHudProps {
  */
 const VoiceHoldHud = memo(
   forwardRef<VoiceHoldHudHandle, VoiceHoldHudProps>(function VoiceHoldHud(
-    { active, phase, zone, dragXRef, dropY, text, recognizing, liveAudio, transcriptRef },
+    { active, phase, zone, dragXRef, dropY, bottomClearance, text, recognizing, liveAudio, transcriptRef },
     ref,
   ) {
     const { t } = useTranslation();
@@ -321,6 +324,10 @@ const VoiceHoldHud = memo(
       },
       resetBars() {
         waveformRef.current?.reset();
+      },
+      getBottomPx() {
+        const rect = hudElRef.current?.getBoundingClientRect();
+        return rect && Number.isFinite(rect.bottom) && rect.height > 0 ? rect.bottom : null;
       },
     }), []);
 
@@ -357,6 +364,7 @@ const VoiceHoldHud = memo(
         style={{
           '--voice-slide-x': `${dragXRef.current ?? 0}px`,
           ...(dropY !== null ? { '--voice-drop-y': `${dropY}px` } : {}),
+          ...(bottomClearance !== null ? { '--voice-hud-bottom-clearance': `${bottomClearance}px` } : {}),
         } as JSX.CSSProperties}
         role="status"
         aria-live="polite"
@@ -525,6 +533,37 @@ function prefersVoiceHoldReducedMotion(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Compute CSS pixel bottom padding needed so `.voice-hold-hud-card` and `.voice-hold-hud-zones`
+ * sit cleanly above `.controls-composer` rather than under the holding finger.
+ */
+export function computeVoiceHoldBottomClearancePx(
+  composerEl: HTMLElement | null,
+  viewportHeightPx: number,
+  cssZoom = 1,
+): number | null {
+  if (!composerEl) return null;
+  if (!Number.isFinite(viewportHeightPx) || viewportHeightPx <= 0) return null;
+  const rect = composerEl.getBoundingClientRect();
+  if (
+    !rect
+    || !Number.isFinite(rect.top)
+    || !Number.isFinite(rect.bottom)
+    || !Number.isFinite(rect.width)
+    || !Number.isFinite(rect.height)
+    || (rect.width <= 0 && rect.height <= 0)
+  ) {
+    return null;
+  }
+  const safeZoom = Number.isFinite(cssZoom) && cssZoom > 0 ? cssZoom : 1;
+  const distanceFromBottomPx = (viewportHeightPx - rect.top) / safeZoom;
+  if (!Number.isFinite(distanceFromBottomPx) || distanceFromBottomPx <= 0) {
+    return null;
+  }
+  const clearance = Math.round(distanceFromBottomPx + VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX);
+  return Number.isFinite(clearance) && clearance > 0 ? clearance : null;
 }
 
 function computeVoiceHoldDropOffsetPx(
@@ -2201,6 +2240,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const voiceHoldDragXRef = useRef(0);
   const voiceHoldHudRef = useRef<VoiceHoldHudHandle | null>(null);
   const [voiceHoldDropY, setVoiceHoldDropY] = useState<number | null>(null);
+  const [voiceHoldBottomClearance, setVoiceHoldBottomClearance] = useState<number | null>(null);
   const [voiceHoldText, setVoiceHoldText] = useState('');
   const [voiceHoldPhase, setVoiceHoldPhase] = useState<'starting' | 'recording' | 'ended' | 'draining' | 'dropping'>('starting');
   const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
@@ -2467,6 +2507,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const [fileDragActive, setFileDragActive] = useState(false);
   const controlsWrapperRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
   const aliasPickerRef = useRef<HTMLDivElement>(null);
   const machinePickerRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -6561,6 +6602,43 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
   }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers]);
 
+  const measureVoiceHoldBottomClearance = useCallback((): number | null => {
+    const composerEl = composerRef.current
+      ?? (divRef.current?.closest('.controls-composer') as HTMLElement | null)
+      ?? divRef.current;
+    const viewportHeightPx = voiceHoldHudRef.current?.getBottomPx()
+      ?? (typeof window !== 'undefined'
+        ? (window.visualViewport?.height || window.innerHeight || document.documentElement?.clientHeight || 0)
+        : 0);
+    return computeVoiceHoldBottomClearancePx(composerEl, viewportHeightPx, getActiveCssZoom());
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!voiceHoldHudActive) return;
+    const update = () => {
+      const next = measureVoiceHoldBottomClearance();
+      setVoiceHoldBottomClearance((prev) => (prev === next ? prev : next));
+    };
+    update();
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', update);
+    }
+    vv?.addEventListener('resize', update);
+    const composerEl = composerRef.current ?? divRef.current;
+    const observer = typeof ResizeObserver === 'function' && composerEl
+      ? new ResizeObserver(update)
+      : null;
+    if (observer && composerEl) observer.observe(composerEl);
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', update);
+      }
+      vv?.removeEventListener('resize', update);
+      observer?.disconnect();
+    };
+  }, [measureVoiceHoldBottomClearance, voiceHoldHudActive, mobileComposerExpanded]);
+
   const closeVoiceHoldHud = useCallback(() => {
     clearVoiceHoldDropTimer();
     voiceHoldDragXRef.current = 0;
@@ -6571,6 +6649,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldPhase('starting');
       setVoiceHoldZone('send');
       setVoiceHoldDropY(null);
+      setVoiceHoldBottomClearance(null);
     }
   }, [clearVoiceHoldDropTimer]);
 
@@ -7017,6 +7096,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setVoiceHoldText('');
     setVoiceHoldZone('send');
     setVoiceHoldDropY(null);
+    setVoiceHoldBottomClearance(measureVoiceHoldBottomClearance());
     setVoiceHoldPhase('starting');
     setVoiceHoldLiveAudio(false);
     setVoiceHoldRecognizing(false);
@@ -10548,12 +10628,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           zone={voiceHoldZone}
           dragXRef={voiceHoldDragXRef}
           dropY={voiceHoldDropY}
+          bottomClearance={voiceHoldBottomClearance}
           text={voiceHoldText}
           recognizing={voiceHoldRecognizing}
           liveAudio={voiceHoldLiveAudio}
           transcriptRef={voiceHoldTranscriptRef}
         />
-        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}${voiceHoldHudActive && voiceHoldPhase === 'dropping' ? ' controls-composer-voice-dropping' : ''}`}>
+        <div ref={composerRef} class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}${voiceHoldHudActive && voiceHoldPhase === 'dropping' ? ' controls-composer-voice-dropping' : ''}`}>
           {!isMobileLayout && !compact && (
             <>
               <div
