@@ -1,6 +1,6 @@
 import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
-import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
+import { readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel, collectTaskPairTitlesFromSnapshot, formatTaskPairDependencyTasks } from '@shared/task-pair-display.js';
 import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { applyTaskPairPanelFit, bindTaskPairPanelFit, TASK_PAIR_PANEL_MAX_HEIGHT_VAR } from '../task-pair-panel-fit.js';
@@ -9,10 +9,29 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preac
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
-import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, type TaskPairStatus } from '@shared/task-pair.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
+import {
+  DEFAULT_TASK_PAIR_SPLIT_MODIFIERS,
+  KEYBOARD_SHORTCUTS_PREF_KEY,
+  formatShortcutModifierKeycaps,
+  isMacPlatform,
+  resolveTaskPairSplitModifiers,
+  type KeyboardShortcutOverrides,
+  type ShortcutModifierKey,
+} from '../keyboard-shortcuts.js';
+import {
+  getTaskPairWaitKind,
+  groupAndOrderTaskPairRows,
+  isAcceptedPanelSnapshot,
+  isTaskPairSplittable,
+  mergeSnapshotRows,
+  normalizeTaskPairSnapshot,
+  type TaskPairConsoleSnapshotDetail,
+  type TaskPairPanelRow,
+} from '../task-pair-panel-order.js';
 import {
   cleanLegacyTaskPairPanelKeysOnce,
   isPhoneScreen,
@@ -23,28 +42,8 @@ import {
   writeServerWideChoice,
 } from '../task-pair-panel-state.js';
 
-const MAX_ROWS = 6;
-
 /** Kept for callers and tests: the server-wide flag's key (see task-pair-panel-state.ts). */
 export const collapsedStorageKey = serverWideStorageKey;
-
-function status(value: unknown): value is TaskPairStatus {
-  return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
-}
-
-type TaskPairConsoleSnapshotDetail = {
-  authoritative?: unknown;
-  serverId?: string;
-  scopeKey?: string;
-  authorityScopeKey?: string;
-  tasks?: readonly Record<string, unknown>[];
-  taskTitles?: Record<string, string>;
-  assignments?: readonly Record<string, unknown>[];
-  scopeReset?: boolean;
-  authorityUnavailable?: boolean;
-  op?: string;
-  task?: unknown;
-};
 
 type SnapshotScopeMeta = {
   authorityScopeKey?: string;
@@ -52,16 +51,26 @@ type SnapshotScopeMeta = {
   serverId?: string;
 };
 
-function matchesSnapshotServer(snapshot: { serverId?: unknown } | null | undefined, serverId?: string | null): boolean {
-  return !(typeof snapshot?.serverId === 'string' && snapshot.serverId && serverId && snapshot.serverId !== serverId);
+function readTaskPairSplitModifiers(): ShortcutModifierKey[] {
+  const win = window as Window & { __imcodesTaskPairSplitModifiers?: ShortcutModifierKey[] };
+  if (Array.isArray(win.__imcodesTaskPairSplitModifiers) && win.__imcodesTaskPairSplitModifiers.length > 0) {
+    return win.__imcodesTaskPairSplitModifiers;
+  }
+  try {
+    const raw = localStorage.getItem(`rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`);
+    if (raw) {
+      const parsed = JSON.parse(raw) as { v?: KeyboardShortcutOverrides } | KeyboardShortcutOverrides;
+      const overrides = (parsed && typeof parsed === 'object' && 'v' in parsed ? parsed.v : parsed) as KeyboardShortcutOverrides | undefined;
+      return resolveTaskPairSplitModifiers(overrides);
+    }
+  } catch {}
+  return [...DEFAULT_TASK_PAIR_SPLIT_MODIFIERS];
 }
 
-function isAcceptedPanelSnapshot(
-  snapshot: { authoritative?: unknown; serverId?: unknown } | null | undefined,
-  serverId?: string | null,
-): boolean {
-  if (!snapshot || snapshot.authoritative === false) return false;
-  return matchesSnapshotServer(snapshot, serverId);
+function formatTaskPairSplitHint(modifiers: readonly ShortcutModifierKey[], sequenceNumber: number): string {
+  const isMac = isMacPlatform();
+  const caps = formatShortcutModifierKeycaps(modifiers, isMac, DEFAULT_TASK_PAIR_SPLIT_MODIFIERS);
+  return isMac ? `${caps.join('')}${sequenceNumber}` : `${caps.join('+')}+${sequenceNumber}`;
 }
 
 function readSnapshotScope(detail: unknown): SnapshotScopeMeta {
@@ -86,85 +95,6 @@ function isCrossScopeSnapshot(prev: SnapshotScopeMeta | undefined, next: Snapsho
     return true;
   }
   return Boolean(prev.serverId && next.serverId && prev.serverId !== next.serverId);
-}
-
-function finiteTimestamp(value: unknown, fallback?: number): number | undefined {
-  const numeric = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
-}
-
-function snapshotTimestamp(row: Record<string, unknown>): number {
-  const value = Number(row.updatedAt);
-  return Number.isFinite(value) && value >= 0 ? value : 0;
-}
-
-function isTerminalRow(row: Record<string, unknown> | undefined): boolean {
-  return Boolean(row && TASK_PAIR_TERMINAL_STATUSES.includes(row.toStatus as TaskPairStatus));
-}
-
-/**
- * Pair snapshots can cross.  Once a terminal row has been observed, an older
- * (or even newer but non-terminal) update must not resurrect it or restart its
- * elapsed timer.  An accepted incoming row REPLACES the previous one: it is the
- * daemon's whole row, so a field it no longer carries (a cleared
- * `waitingReason`, a `queuePosition` after the pair left the queue, a
- * participant state) must disappear - merging kept the old value forever.
- */
-function mergeSnapshotRow(
-  previous: Record<string, unknown> | undefined,
-  incoming: Record<string, unknown>,
-): Record<string, unknown> {
-  if (!previous) return incoming;
-  if (isTerminalRow(previous) && !isTerminalRow(incoming)) return previous;
-  if (snapshotTimestamp(incoming) < snapshotTimestamp(previous)) return previous;
-  return incoming;
-}
-
-function mergeSnapshotRows(
-  previous: readonly Record<string, unknown>[] | null,
-  incoming: readonly Record<string, unknown>[],
-): readonly Record<string, unknown>[] {
-  if (!previous) return incoming;
-  const previousByTask = new Map(previous.map((row) => [String(row.taskId), row]));
-  return incoming.map((row) => mergeSnapshotRow(previousByTask.get(String(row.taskId)), row));
-}
-
-function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Record<string, unknown>[] | null {
-  if (!Array.isArray(detail.tasks)) return null;
-  const byTask = new Map<string, Record<string, unknown>[]>();
-  for (const assignment of detail.assignments ?? []) { const id = typeof assignment.taskId === 'string' ? assignment.taskId : ''; if (id) byTask.set(id, [...(byTask.get(id) ?? []), assignment]); }
-  return detail.tasks.map((task) => {
-    const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
-    const executor = roles.find((role) => role.role === 'implementer'); const auditor = roles.find((role) => role.role === 'auditor');
-    const toStatus = pair.status ?? task.status;
-    const startedAt = finiteTimestamp(pair.startedAt ?? pair.createdAt);
-    const updatedAt = finiteTimestamp(pair.updatedAt ?? task.updatedAt, startedAt);
-    const endedAt = TASK_PAIR_TERMINAL_STATUSES.includes(toStatus as TaskPairStatus)
-      ? finiteTimestamp(pair.endedAt ?? task.updatedAt, updatedAt)
-      : undefined;
-    return {
-      ...pair,
-      scheduling: readPairScheduling(pair.scheduling as TaskPairScheduling | undefined),
-      taskId: task.taskId,
-      title: task.title,
-      brief: typeof task.brief === 'string' && task.brief.trim() ? task.brief : pair.brief,
-      toStatus,
-      ...(startedAt !== undefined ? { startedAt } : {}),
-      updatedAt,
-      ...(endedAt !== undefined ? { endedAt } : {}),
-      queuePosition: pair.queuePosition,
-      executor: pair.executor,
-      auditor: pair.auditor,
-      executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel,
-      auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel,
-      executorModel: executor?.observedModel ?? pair.executorModel,
-      executorThinking: executor?.observedThinking ?? pair.executorThinking,
-      auditorModel: auditor?.observedModel ?? pair.auditorModel,
-      auditorThinking: auditor?.observedThinking ?? pair.auditorThinking,
-      executorState: executor?.sessionState ?? pair.executorState,
-      auditorState: auditor?.sessionState ?? pair.auditorState,
-    };
-  });
 }
 
 type SessionLabelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
@@ -256,7 +186,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   })());
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
-    return detail && isAcceptedPanelSnapshot(detail, serverId) ? normalizeSnapshot(detail) : null;
+    return detail && isAcceptedPanelSnapshot(detail, serverId) ? normalizeTaskPairSnapshot(detail) : null;
   });
   const [snapshotTitles, setSnapshotTitles] = useState<Map<string, string>>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
@@ -265,13 +195,19 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   const [activeSplitTaskId, setActiveSplitTaskId] = useState<string | null>(() => {
     return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
   });
+  const [splitShortcutModifiers, setSplitShortcutModifiers] = useState<ShortcutModifierKey[]>(readTaskPairSplitModifiers);
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       setActiveSplitTaskId(detail?.activeTaskId ?? null);
     };
+    const onModifiersChange = () => setSplitShortcutModifiers(readTaskPairSplitModifiers());
     window.addEventListener('deck:pair-split-state', handler);
-    return () => window.removeEventListener('deck:pair-split-state', handler);
+    window.addEventListener('deck:task-pair-split-modifiers', onModifiersChange);
+    return () => {
+      window.removeEventListener('deck:pair-split-state', handler);
+      window.removeEventListener('deck:task-pair-split-modifiers', onModifiersChange);
+    };
   }, []);
   useEffect(() => {
     const applyPanelSnapshot = (detail: TaskPairConsoleSnapshotDetail | undefined) => {
@@ -289,7 +225,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
         setSnapshotTitles(collectTaskPairTitlesFromSnapshot(detail));
       }
       if (Array.isArray(detail.tasks)) {
-        const normalized = normalizeSnapshot(detail);
+        const normalized = normalizeTaskPairSnapshot(detail);
         if (normalized) {
           const nextScope = readSnapshotScope(detail);
           const crossScope = isCrossScopeSnapshot(lastSnapshotScopeRef.current, nextScope);
@@ -314,7 +250,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
   }, [serverId]);
-  const latest = new Map<string, { payload: Record<string, unknown>; startedAt: number; updatedAt: number }>();
+  const latest = new Map<string, TaskPairPanelRow>();
   const reworkCounts = new Map<string, number>();
   const taskTitles = new Map<string, string>();
   for (const event of events) {
@@ -345,23 +281,12 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   }
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
-  const allRows = [...latest.values()].filter((row) => {
-    if (!status(row.payload.toStatus)) return false;
-    if (!scopeSessionId) return true;
-    return String(row.payload.executor ?? '') === scopeSessionId || String(row.payload.auditor ?? '') === scopeSessionId;
-  });
-  const waitKind = (payload: Record<string, unknown>) => taskPairWaitKind({ scheduling: payload.scheduling as TaskPairScheduling | undefined, status: payload.toStatus as TaskPairStatus });
-  const groupFor = (value: TaskPairStatus, payload: Record<string, unknown>) => waitKind(payload) ?? ( value === 'queued' ? 'queued' : value === 'awaiting_brain_decision' ? 'awaiting_brain_decision' : value === 'rework' ? 'rework' : value === 'in_audit' || value === 'awaiting_audit' ? 'audit' : value === 'done' || value === 'cancelled' || value === 'passed' ? 'recent' : 'working');
-  const groups = (['working', 'audit', 'rework', 'queued', 'awaiting_brain_decision', ...TASK_PAIR_WAIT_KINDS, 'recent'] as const).map((key) => {
-    const rows = allRows.filter((row) => groupFor(row.payload.toStatus as TaskPairStatus, row.payload) === key);
-    if (key === 'queued') rows.sort((a, b) => Number(a.payload.queuePosition ?? Number.MAX_SAFE_INTEGER) - Number(b.payload.queuePosition ?? Number.MAX_SAFE_INTEGER));
-    return { key, rows: key === 'recent' ? rows.slice(-MAX_ROWS) : rows };
-  }).filter((group) => group.rows.length > 0);
+  const { allRows, groups } = groupAndOrderTaskPairRows(latest.values(), scopeSessionId);
   const scopedDefaultTaskId = scopeSessionId
     ? (allRows.find((row) => ['working', 'in_audit', 'awaiting_audit', 'rework'].includes(String(row.payload.toStatus)))?.payload.taskId ?? allRows[0]?.payload.taskId)
     : undefined;
   const counts = allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number; waiting: number }>((result, row) => {
-    if (waitKind(row.payload)) { result.waiting += 1; return result; }
+    if (getTaskPairWaitKind(row.payload)) { result.waiting += 1; return result; }
     const value = row.payload.toStatus;
     if (value === 'working' || value === 'rework') result.working += 1;
     else if (value === 'in_audit' || value === 'awaiting_audit') result.audit += 1;
@@ -464,7 +389,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
               <span class="task-pair-status-badge-dot" aria-hidden="true" />
-              {waitKind(payload) ? t(`taskPair.status.${waitKind(payload)}`) : taskStatus === 'rework' ? t('taskPair.panel_rework_count', { count: reworkCount }) : taskStatus === 'working' && deliveryRound > 1 ? t('taskPair.panel_round_in_progress', { round: deliveryRound }) : t(`taskPair.status.${taskStatus}`)}
+              {getTaskPairWaitKind(payload) ? t(`taskPair.status.${getTaskPairWaitKind(payload)}`) : taskStatus === 'rework' ? t('taskPair.panel_rework_count', { count: reworkCount }) : taskStatus === 'working' && deliveryRound > 1 ? t('taskPair.panel_round_in_progress', { round: deliveryRound }) : t(`taskPair.status.${taskStatus}`)}
             </span>
             {!queued && auditRound > 0 && <span class="task-pair-status-round-badge">{deliveryRound > 1 ? t('taskPair.panel_round_of', { delivery: deliveryRound, audit: auditRound }) : t('taskPair.panel_round', { round: auditRound })}</span>}
             {!queued && <span class="task-pair-status-round-badge task-pair-status-blocking-badge">{t('taskPair.blocking', { levels: Array.isArray(payload.blocking) ? payload.blocking.join(',') : 'P0' })}</span>}
@@ -472,7 +397,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           {(() => {
-            const rowWaitKind = waitKind(payload);
+            const rowWaitKind = getTaskPairWaitKind(payload);
             if (!rowWaitKind) return null;
             const rowScheduling = readPairScheduling(payload.scheduling as TaskPairScheduling | undefined);
             const deps = rowScheduling?.dependsOn ?? [];
@@ -488,16 +413,18 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
             {payload.auditor === 'none'
               ? <span class="task-pair-role-chip task-pair-role-chip--muted">{t('taskPair.panel_no_audit')}</span>
               : <span class="task-pair-role-chip" role="group" aria-label={t('taskPair.panel_auditor')}><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, payload.auditorThinking, 'auditor') ?? unassigned(payload.auditorModel, payload.auditorThinking)}</span>}
-            {!isMobile && typeof payload.executor === 'string' && payload.executor && payload.executor !== 'none' && typeof payload.auditor === 'string' && payload.auditor && payload.auditor !== 'none' && (() => {
+            {!isMobile && isTaskPairSplittable(payload) && (() => {
               const taskIdStr = String(payload.taskId);
               // The active pair exits from either window's titlebar.
               if (activeSplitTaskId === taskIdStr) return null;
+              const splitLabel = t('taskPair.panel_open_split');
+              const splitHint = sequenceNumber <= 9 ? `${splitLabel} (${formatTaskPairSplitHint(splitShortcutModifiers, sequenceNumber)})` : splitLabel;
               return (
                 <button
                   type="button"
                   class="task-pair-split-btn"
-                  title={t('taskPair.panel_open_split')}
-                  aria-label={t('taskPair.panel_open_split')}
+                  title={splitHint}
+                  aria-label={splitLabel}
                   onClick={(e) => {
                     e.stopPropagation();
                     window.dispatchEvent(new CustomEvent('deck:pair-split', {

@@ -9,20 +9,27 @@ import {
   applyMacVoiceInlineModifier,
   applyShortcutSlotOverride,
   applySubSessionQuickModifiers,
+  applyTaskPairSplitModifiers,
+  areShortcutModifiersEqual,
   areSubSessionQuickModifiersEqual,
   chordFromKeyboardEvent,
+  extractDigitFromKeyboardEvent,
   findShortcutSlotConflicts,
   formatShortcutKeycaps,
+  formatShortcutModifierKeycaps,
   formatSubSessionQuickModifierKeycaps,
   getDefaultSecondaryShortcuts,
   getDefaultShortcutForSlot,
   getDefaultShortcuts,
   getDefaultSubSessionQuickModifiers,
+  getDefaultTaskPairSplitModifiers,
   isMacPlatform,
+  normalizeModifierToken,
   normalizeShortcutChordString,
   resolveKeyboardShortcutSlots,
   resolveMacVoiceInlineModifier,
   resolveSubSessionQuickModifiers,
+  resolveTaskPairSplitModifiers,
   sanitizeShortcutOverrides,
   type KeyboardShortcutOverrides,
   type MacVoiceInlineModifier,
@@ -65,6 +72,30 @@ const ACTION_LABELS: Record<ShortcutActionId, { titleKey: string; descKey: strin
   },
 };
 
+type ModifierGroupId = 'subsession' | 'taskPairSplit';
+
+const collectModifiersFromEvent = (e: KeyboardEvent): ShortcutModifierKey[] => {
+  const active = new Set<ShortcutModifierKey>();
+  if (e.ctrlKey) active.add('ctrl');
+  if (e.altKey) active.add('alt');
+  if (e.shiftKey) active.add('shift');
+  if (e.metaKey) active.add('meta');
+  const keyMod = normalizeModifierToken(e.key);
+  if (keyMod) active.add(keyMod);
+  return SHORTCUT_MODIFIER_KEYS.filter((m) => active.has(m));
+};
+
+const remainingModifiersAfterKeyUp = (e: KeyboardEvent): ShortcutModifierKey[] => {
+  const active = new Set<ShortcutModifierKey>();
+  if (e.ctrlKey) active.add('ctrl');
+  if (e.altKey) active.add('alt');
+  if (e.shiftKey) active.add('shift');
+  if (e.metaKey) active.add('meta');
+  const releasedMod = normalizeModifierToken(e.key);
+  if (releasedMod) active.delete(releasedMod);
+  return SHORTCUT_MODIFIER_KEYS.filter((m) => active.has(m));
+};
+
 function KeyboardShortcutsSectionInner({
   overrides,
   onChangeOverrides,
@@ -88,8 +119,12 @@ function KeyboardShortcutsSectionInner({
   const conflicts = useMemo(() => findShortcutSlotConflicts(resolvedSlots), [resolvedSlots]);
 
   const [recordingTarget, setRecordingTarget] = useState<ShortcutSlotTarget | null>(null);
+  const [recordingModifierGroup, setRecordingModifierGroup] = useState<ModifierGroupId | null>(null);
+  const [recordingHeldModifiers, setRecordingHeldModifiers] = useState<ShortcutModifierKey[]>([]);
   const [statusNotice, setStatusNotice] = useState<{ type: 'info' | 'err'; text: string } | null>(null);
   const recorderContainerRef = useRef<HTMLDivElement | null>(null);
+  const modifierRecorderContainerRef = useRef<HTMLDivElement | null>(null);
+  const peakModifiersRef = useRef<Set<ShortcutModifierKey>>(new Set());
 
   const subSessionModifiers = useMemo(
     () => resolveSubSessionQuickModifiers(cleanOverrides),
@@ -105,6 +140,27 @@ function KeyboardShortcutsSectionInner({
     [subSessionModifiers, isMac],
   );
 
+  const taskPairSplitModifiers = useMemo(
+    () => resolveTaskPairSplitModifiers(cleanOverrides),
+    [cleanOverrides],
+  );
+  const defaultTaskPairSplitModifiers = useMemo(() => getDefaultTaskPairSplitModifiers(), []);
+  const isCustomTaskPairSplitModifiers = !areShortcutModifiersEqual(
+    taskPairSplitModifiers,
+    defaultTaskPairSplitModifiers,
+    defaultTaskPairSplitModifiers,
+  );
+  const taskPairSplitModifierCaps = useMemo(
+    () => formatShortcutModifierKeycaps(taskPairSplitModifiers, isMac, defaultTaskPairSplitModifiers),
+    [taskPairSplitModifiers, isMac, defaultTaskPairSplitModifiers],
+  );
+
+  const hasModifierGroupConflict = areShortcutModifiersEqual(
+    subSessionModifiers,
+    taskPairSplitModifiers,
+    defaultSubSessionModifiers,
+  );
+
   const macVoiceModifier = useMemo(
     () => resolveMacVoiceInlineModifier(cleanOverrides),
     [cleanOverrides],
@@ -116,11 +172,21 @@ function KeyboardShortcutsSectionInner({
   );
 
   const hasAnyOverride = useMemo(
-    () => isCustomSubSessionModifiers || isCustomMacVoiceModifier || SHORTCUT_ACTION_IDS.some(
-      (id) => resolvedSlots[id].primary !== primaryDefaults[id]
-        || resolvedSlots[id].secondary !== secondaryDefaults[id],
-    ),
-    [isCustomSubSessionModifiers, isCustomMacVoiceModifier, resolvedSlots, primaryDefaults, secondaryDefaults],
+    () => isCustomSubSessionModifiers
+      || isCustomTaskPairSplitModifiers
+      || isCustomMacVoiceModifier
+      || SHORTCUT_ACTION_IDS.some(
+        (id) => resolvedSlots[id].primary !== primaryDefaults[id]
+          || resolvedSlots[id].secondary !== secondaryDefaults[id],
+      ),
+    [
+      isCustomSubSessionModifiers,
+      isCustomTaskPairSplitModifiers,
+      isCustomMacVoiceModifier,
+      resolvedSlots,
+      primaryDefaults,
+      secondaryDefaults,
+    ],
   );
 
   const formatModifierName = (mod: ShortcutModifierKey) => (
@@ -133,10 +199,31 @@ function KeyboardShortcutsSectionInner({
           : 'Ctrl'
   );
 
-  const handleToggleSubSessionModifier = (mod: ShortcutModifierKey) => {
+  const cancelModifierRecording = () => {
+    peakModifiersRef.current.clear();
+    setRecordingHeldModifiers([]);
+    setRecordingModifierGroup(null);
+  };
+
+  const applyModifierGroupChange = (
+    group: ModifierGroupId,
+    nextModifiers: readonly ShortcutModifierKey[],
+  ) => {
+    onChangeOverrides((prev) => (
+      group === 'subsession'
+        ? applySubSessionQuickModifiers(prev, nextModifiers)
+        : applyTaskPairSplitModifiers(prev, nextModifiers)
+    ));
+  };
+
+  const handleToggleModifierInGroup = (group: ModifierGroupId, mod: ShortcutModifierKey) => {
     setStatusNotice(null);
+    cancelModifierRecording();
+    setRecordingTarget(null);
     onChangeOverrides((prev) => {
-      const current = resolveSubSessionQuickModifiers(prev);
+      const current = group === 'subsession'
+        ? resolveSubSessionQuickModifiers(prev)
+        : resolveTaskPairSplitModifiers(prev);
       const exists = current.includes(mod);
       if (exists && current.length <= 1) {
         return prev;
@@ -144,13 +231,20 @@ function KeyboardShortcutsSectionInner({
       const next = exists
         ? current.filter((item) => item !== mod)
         : [...current, mod];
-      return applySubSessionQuickModifiers(prev, next);
+      return group === 'subsession'
+        ? applySubSessionQuickModifiers(prev, next)
+        : applyTaskPairSplitModifiers(prev, next);
     });
   };
 
-  const handleResetSubSessionModifiers = () => {
+  const handleResetModifierGroup = (group: ModifierGroupId) => {
     setStatusNotice(null);
-    onChangeOverrides((prev) => applySubSessionQuickModifiers(prev, defaultSubSessionModifiers));
+    cancelModifierRecording();
+    setRecordingTarget(null);
+    applyModifierGroupChange(
+      group,
+      group === 'subsession' ? defaultSubSessionModifiers : defaultTaskPairSplitModifiers,
+    );
   };
 
   const handleSelectMacVoiceModifier = (mod: MacVoiceInlineModifier) => {
@@ -281,8 +375,259 @@ function KeyboardShortcutsSectionInner({
 
   const handleResetAll = () => {
     setRecordingTarget(null);
+    cancelModifierRecording();
     setStatusNotice(null);
     onChangeOverrides({});
+  };
+
+  useEffect(() => {
+    if (!recordingModifierGroup) return;
+
+    const commitPeak = (mods: readonly ShortcutModifierKey[]) => {
+      const canonical = SHORTCUT_MODIFIER_KEYS.filter((m) => mods.includes(m));
+      if (canonical.length === 0) return;
+      const targetGroup = recordingModifierGroup;
+      cancelModifierRecording();
+      setStatusNotice(null);
+      applyModifierGroupChange(targetGroup, canonical);
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') {
+        e.stopImmediatePropagation();
+      }
+
+      if (e.key === 'Escape' && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+        cancelModifierRecording();
+        setStatusNotice(null);
+        return;
+      }
+
+      const activeMods = collectModifiersFromEvent(e);
+      for (const m of activeMods) {
+        peakModifiersRef.current.add(m);
+      }
+      const peakList = SHORTCUT_MODIFIER_KEYS.filter((m) => peakModifiersRef.current.has(m));
+      setRecordingHeldModifiers(peakList);
+
+      const isModKey = normalizeModifierToken(e.key) !== null;
+      if (!isModKey) {
+        const digit = extractDigitFromKeyboardEvent(e);
+        if (digit !== null && digit >= 1 && digit <= 9 && peakList.length > 0) {
+          commitPeak(peakList);
+          return;
+        }
+        if (peakList.length === 0) {
+          setStatusNotice({
+            type: 'err',
+            text: t('settings.shortcuts.modifier_required'),
+          });
+        }
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (peakModifiersRef.current.size === 0) return;
+      const remaining = remainingModifiersAfterKeyUp(e);
+      if (remaining.length === 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const peakList = SHORTCUT_MODIFIER_KEYS.filter((m) => peakModifiersRef.current.has(m));
+        commitPeak(peakList);
+      }
+    };
+
+    const handlePointerDown = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (modifierRecorderContainerRef.current && target && modifierRecorderContainerRef.current.contains(target)) {
+        return;
+      }
+      cancelModifierRecording();
+    };
+
+    document.addEventListener('keydown', handleKeyDown, true);
+    document.addEventListener('keyup', handleKeyUp, true);
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown, true);
+      document.removeEventListener('keyup', handleKeyUp, true);
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+    };
+  }, [recordingModifierGroup, onChangeOverrides, t]);
+
+  const renderModifierDigitSection = ({
+    group,
+    sectionTestId,
+    previewTestId,
+    modTestIdPrefix,
+    recordTestId,
+    cancelTestId,
+    resetTestId,
+    conflictTestId,
+    titleKey,
+    descKey,
+    openLabelKey,
+    modifiersAriaKey,
+    resetAriaKey,
+    recordAriaKey,
+    conflictText,
+    modifiers,
+    caps,
+    isCustom,
+  }: {
+    group: ModifierGroupId;
+    sectionTestId: string;
+    previewTestId: string;
+    modTestIdPrefix: string;
+    recordTestId: string;
+    cancelTestId: string;
+    resetTestId: string;
+    conflictTestId: string;
+    titleKey: string;
+    descKey: string;
+    openLabelKey: string;
+    modifiersAriaKey: string;
+    resetAriaKey: string;
+    recordAriaKey: string;
+    conflictText: string | null;
+    modifiers: readonly ShortcutModifierKey[];
+    caps: readonly string[];
+    isCustom: boolean;
+  }) => {
+    const isRecording = recordingModifierGroup === group;
+    const heldCaps = recordingHeldModifiers.length > 0
+      ? formatShortcutModifierKeycaps(recordingHeldModifiers, isMac)
+      : [];
+    return (
+      <div
+        class="settings-shortcuts-subsession"
+        data-testid={sectionTestId}
+        ref={isRecording ? modifierRecorderContainerRef : undefined}
+        data-shortcut-recording={isRecording ? 'true' : undefined}
+      >
+        <div
+          class={`settings-shortcut-row settings-shortcut-row-subsession${isRecording ? ' is-recording' : ''}${conflictText ? ' has-conflict' : ''}`}
+        >
+          <div class="settings-shortcut-info">
+            <div class="settings-shortcut-title">
+              {t(titleKey)}
+            </div>
+            <div class="settings-shortcut-desc">
+              {t(descKey)}
+            </div>
+            {conflictText && (
+              <div class="settings-shortcut-conflict" data-testid={conflictTestId}>
+                {conflictText}
+              </div>
+            )}
+            <div class="settings-shortcut-subsession-previews">
+              <div class="settings-shortcut-preview-item" data-testid={previewTestId}>
+                <span class="settings-shortcut-preview-label">
+                  {t(openLabelKey)}
+                </span>
+                <span class="settings-shortcut-keycaps">
+                  {caps.map((cap) => (
+                    <kbd key={`open-${cap}`} class="settings-kbd">{cap}</kbd>
+                  ))}
+                  <kbd class="settings-kbd">1–9</kbd>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-shortcut-subsession-controls">
+            <div
+              class="settings-shortcut-modifier-group"
+              role="group"
+              aria-label={t(modifiersAriaKey)}
+            >
+              {SHORTCUT_MODIFIER_KEYS.map((mod) => {
+                const active = modifiers.includes(mod);
+                const lockedLast = active && modifiers.length <= 1;
+                const keycap = formatSubSessionQuickModifierKeycaps([mod], isMac)[0];
+                const name = formatModifierName(mod);
+                return (
+                  <button
+                    key={mod}
+                    type="button"
+                    data-testid={`${modTestIdPrefix}-${mod}`}
+                    aria-pressed={active}
+                    disabled={lockedLast}
+                    title={lockedLast ? t('settings.shortcuts.subsession_quick.min_one_hint') : undefined}
+                    class={`settings-shortcut-mod-btn${active ? ' is-active' : ''}`}
+                    onClick={() => handleToggleModifierInGroup(group, mod)}
+                  >
+                    <kbd class="settings-kbd">{keycap}</kbd>
+                    <span>{name}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              type="button"
+              data-testid={recordTestId}
+              data-shortcut-recording={isRecording ? 'true' : undefined}
+              aria-pressed={isRecording}
+              aria-label={t(recordAriaKey)}
+              class={`settings-shortcut-capture-btn${isRecording ? ' is-recording' : ''}`}
+              onClick={() => {
+                setStatusNotice(null);
+                setRecordingTarget(null);
+                if (isRecording) {
+                  cancelModifierRecording();
+                } else {
+                  peakModifiersRef.current.clear();
+                  setRecordingHeldModifiers([]);
+                  setRecordingModifierGroup(group);
+                }
+              }}
+            >
+              {isRecording ? (
+                heldCaps.length > 0 ? (
+                  <span class="settings-shortcut-keycaps">
+                    {heldCaps.map((cap, idx) => (
+                      <kbd key={`held-${cap}-${idx}`} class="settings-kbd">{cap}</kbd>
+                    ))}
+                  </span>
+                ) : (
+                  <span class="settings-shortcut-recording-label">
+                    {t('settings.shortcuts.recording_modifiers_prompt')}
+                  </span>
+                )
+              ) : (
+                <span>{t('settings.shortcuts.record_modifiers')}</span>
+              )}
+            </button>
+            {isRecording && (
+              <button
+                type="button"
+                class="settings-btn-secondary settings-shortcut-mini-btn"
+                data-testid={cancelTestId}
+                onClick={() => {
+                  cancelModifierRecording();
+                  setStatusNotice(null);
+                }}
+              >
+                {t('common.cancel')}
+              </button>
+            )}
+            {isCustom && !isRecording && (
+              <button
+                type="button"
+                data-testid={resetTestId}
+                class="settings-btn-secondary settings-shortcut-mini-btn"
+                aria-label={t(resetAriaKey)}
+                onClick={() => handleResetModifierGroup(group)}
+              >
+                {t('settings.shortcuts.reset')}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
   };
 
   return (
@@ -397,6 +742,7 @@ function KeyboardShortcutsSectionInner({
                           class={`settings-shortcut-capture-btn${isSlotRecording ? ' is-recording' : ''}${chord === null ? ' is-empty' : ''}`}
                           onClick={() => {
                             setStatusNotice(null);
+                            cancelModifierRecording();
                             setRecordingTarget((prev) => (
                               prev?.action === action && prev?.slot === slot
                                 ? null
@@ -475,72 +821,51 @@ function KeyboardShortcutsSectionInner({
         })}
       </div>
 
-      <div class="settings-shortcuts-subsession" data-testid="subsession-quick-shortcuts-section">
-        <div class="settings-shortcut-row settings-shortcut-row-subsession">
-          <div class="settings-shortcut-info">
-            <div class="settings-shortcut-title">
-              {t('settings.shortcuts.subsession_quick.title')}
-            </div>
-            <div class="settings-shortcut-desc">
-              {t('settings.shortcuts.subsession_quick.desc')}
-            </div>
-            <div class="settings-shortcut-subsession-previews">
-              <div class="settings-shortcut-preview-item" data-testid="subsession-quick-preview-open">
-                <span class="settings-shortcut-preview-label">
-                  {t('settings.shortcuts.subsession_quick.open_label')}
-                </span>
-                <span class="settings-shortcut-keycaps">
-                  {subSessionModifierCaps.map((cap) => (
-                    <kbd key={`open-${cap}`} class="settings-kbd">{cap}</kbd>
-                  ))}
-                  <kbd class="settings-kbd">1–9</kbd>
-                </span>
-              </div>
-            </div>
-          </div>
+      {renderModifierDigitSection({
+        group: 'subsession',
+        sectionTestId: 'subsession-quick-shortcuts-section',
+        previewTestId: 'subsession-quick-preview-open',
+        modTestIdPrefix: 'subsession-mod',
+        recordTestId: 'subsession-mod-record',
+        cancelTestId: 'subsession-mod-cancel',
+        resetTestId: 'subsession-mod-reset',
+        conflictTestId: 'subsession-quick-conflict',
+        titleKey: 'settings.shortcuts.subsession_quick.title',
+        descKey: 'settings.shortcuts.subsession_quick.desc',
+        openLabelKey: 'settings.shortcuts.subsession_quick.open_label',
+        modifiersAriaKey: 'settings.shortcuts.subsession_quick.modifiers_aria',
+        resetAriaKey: 'settings.shortcuts.subsession_quick.reset_aria',
+        recordAriaKey: 'settings.shortcuts.subsession_quick.record_aria',
+        conflictText: hasModifierGroupConflict
+          ? t('settings.shortcuts.conflict_warning', { actions: t('settings.shortcuts.task_pair_split.title') })
+          : null,
+        modifiers: subSessionModifiers,
+        caps: subSessionModifierCaps,
+        isCustom: isCustomSubSessionModifiers,
+      })}
 
-          <div class="settings-shortcut-subsession-controls">
-            <div
-              class="settings-shortcut-modifier-group"
-              role="group"
-              aria-label={t('settings.shortcuts.subsession_quick.modifiers_aria')}
-            >
-              {SHORTCUT_MODIFIER_KEYS.map((mod) => {
-                const active = subSessionModifiers.includes(mod);
-                const lockedLast = active && subSessionModifiers.length <= 1;
-                const keycap = formatSubSessionQuickModifierKeycaps([mod], isMac)[0];
-                const name = formatModifierName(mod);
-                return (
-                  <button
-                    key={mod}
-                    type="button"
-                    data-testid={`subsession-mod-${mod}`}
-                    aria-pressed={active}
-                    disabled={lockedLast}
-                    title={lockedLast ? t('settings.shortcuts.subsession_quick.min_one_hint') : undefined}
-                    class={`settings-shortcut-mod-btn${active ? ' is-active' : ''}`}
-                    onClick={() => handleToggleSubSessionModifier(mod)}
-                  >
-                    <kbd class="settings-kbd">{keycap}</kbd>
-                    <span>{name}</span>
-                  </button>
-                );
-              })}
-            </div>
-            {isCustomSubSessionModifiers && (
-              <button
-                type="button"
-                data-testid="subsession-mod-reset"
-                class="settings-btn-secondary settings-shortcut-mini-btn"
-                aria-label={t('settings.shortcuts.subsession_quick.reset_aria')}
-                onClick={handleResetSubSessionModifiers}
-              >
-                {t('settings.shortcuts.reset')}
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
+      {renderModifierDigitSection({
+        group: 'taskPairSplit',
+        sectionTestId: 'taskpair-split-shortcuts-section',
+        previewTestId: 'taskpair-split-preview',
+        modTestIdPrefix: 'taskpair-split-mod',
+        recordTestId: 'taskpair-split-mod-record',
+        cancelTestId: 'taskpair-split-mod-cancel',
+        resetTestId: 'taskpair-split-mod-reset',
+        conflictTestId: 'taskpair-split-conflict',
+        titleKey: 'settings.shortcuts.task_pair_split.title',
+        descKey: 'settings.shortcuts.task_pair_split.desc',
+        openLabelKey: 'settings.shortcuts.task_pair_split.open_label',
+        modifiersAriaKey: 'settings.shortcuts.task_pair_split.modifiers_aria',
+        resetAriaKey: 'settings.shortcuts.task_pair_split.reset_aria',
+        recordAriaKey: 'settings.shortcuts.task_pair_split.record_aria',
+        conflictText: hasModifierGroupConflict
+          ? t('settings.shortcuts.conflict_warning', { actions: t('settings.shortcuts.subsession_quick.title') })
+          : null,
+        modifiers: taskPairSplitModifiers,
+        caps: taskPairSplitModifierCaps,
+        isCustom: isCustomTaskPairSplitModifiers,
+      })}
 
       <div class="settings-shortcuts-subsession" data-testid="mac-voice-inline-shortcut-section">
         <div class="settings-shortcut-row settings-shortcut-row-subsession">

@@ -53,12 +53,14 @@ export type ResolvedShortcutSlotConflicts = Partial<
 export type ShortcutModifierKey = 'ctrl' | 'alt' | 'shift' | 'meta';
 export const SHORTCUT_MODIFIER_KEYS: readonly ShortcutModifierKey[] = ['ctrl', 'alt', 'shift', 'meta'];
 export const DEFAULT_SUBSESSION_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl'];
+export const DEFAULT_TASK_PAIR_SPLIT_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl', 'shift'];
 export type MacVoiceInlineModifier = ShortcutModifierKey | null;
 export const DEFAULT_MAC_VOICE_INLINE_MODIFIER: ShortcutModifierKey = 'ctrl';
 
 export type KeyboardShortcutOverrides = Partial<Record<ShortcutActionId, string | null>> & {
   secondary?: Partial<Record<ShortcutActionId, string | null>>;
   subSessionQuickModifiers?: ShortcutModifierKey[];
+  taskPairSplitModifiers?: ShortcutModifierKey[];
   macVoiceInlineModifier?: MacVoiceInlineModifier;
 };
 
@@ -430,6 +432,12 @@ export function sanitizeShortcutOverrides(raw: unknown): KeyboardShortcutOverrid
     const cleanModifiers = sanitizeSubSessionQuickModifiers(input.subSessionQuickModifiers);
     if (cleanModifiers) {
       out.subSessionQuickModifiers = cleanModifiers;
+    }
+  }
+  if ('taskPairSplitModifiers' in input) {
+    const cleanSplitModifiers = sanitizeSubSessionQuickModifiers(input.taskPairSplitModifiers);
+    if (cleanSplitModifiers) {
+      out.taskPairSplitModifiers = cleanSplitModifiers;
     }
   }
   if ('macVoiceInlineModifier' in input) {
@@ -881,7 +889,7 @@ export function resolveFocusedKeyboardViewMode(options: {
 /** Focus a contentEditable composer `.controls-input` without scrolling the viewport. */
 export { focusComposerElement } from './util/composer-focus.js';
 
-function normalizeModifierToken(raw: unknown): ShortcutModifierKey | null {
+export function normalizeModifierToken(raw: unknown): ShortcutModifierKey | null {
   if (typeof raw !== 'string') return null;
   switch (raw.trim().toLowerCase()) {
     case 'ctrl':
@@ -904,9 +912,40 @@ function normalizeModifierToken(raw: unknown): ShortcutModifierKey | null {
   }
 }
 
+function areModifierCombinationsEqual(
+  a: readonly ShortcutModifierKey[],
+  b: readonly ShortcutModifierKey[],
+  fallback: readonly ShortcutModifierKey[],
+): boolean {
+  const normA = sanitizeSubSessionQuickModifiers([...a]) ?? fallback;
+  const normB = sanitizeSubSessionQuickModifiers([...b]) ?? fallback;
+  return normA.length === normB.length && normA.every((mod, idx) => mod === normB[idx]);
+}
+
+function applyModifierCombinationOverride(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+  key: 'subSessionQuickModifiers' | 'taskPairSplitModifiers',
+  modifiers: readonly ShortcutModifierKey[],
+  defaultModifiers: readonly ShortcutModifierKey[],
+): KeyboardShortcutOverrides {
+  const next = sanitizeShortcutOverrides(overrides);
+  const clean = sanitizeSubSessionQuickModifiers([...modifiers]) ?? [...defaultModifiers];
+  if (areModifierCombinationsEqual(clean, defaultModifiers, defaultModifiers)) {
+    delete next[key];
+  } else {
+    next[key] = clean;
+  }
+  return next;
+}
+
 /** Return the default modifier combination (`Ctrl`) for sub-session digit shortcuts. */
 export function getDefaultSubSessionQuickModifiers(): ShortcutModifierKey[] {
   return [...DEFAULT_SUBSESSION_QUICK_MODIFIERS];
+}
+
+/** Return the default modifier combination (`Ctrl+Shift`) for task-pair split-view digit shortcuts. */
+export function getDefaultTaskPairSplitModifiers(): ShortcutModifierKey[] {
+  return [...DEFAULT_TASK_PAIR_SPLIT_MODIFIERS];
 }
 
 /** Sanitize a candidate modifier list into canonical non-empty `ShortcutModifierKey[]` order, or `undefined`. */
@@ -922,13 +961,20 @@ export function sanitizeSubSessionQuickModifiers(raw: unknown): ShortcutModifier
 }
 
 /** Check whether two modifier combinations represent the exact same modifier set. */
+export function areShortcutModifiersEqual(
+  a: readonly ShortcutModifierKey[],
+  b: readonly ShortcutModifierKey[],
+  fallback: readonly ShortcutModifierKey[] = DEFAULT_SUBSESSION_QUICK_MODIFIERS,
+): boolean {
+  return areModifierCombinationsEqual(a, b, fallback);
+}
+
+/** Check whether two sub-session modifier combinations represent the exact same modifier set. */
 export function areSubSessionQuickModifiersEqual(
   a: readonly ShortcutModifierKey[],
   b: readonly ShortcutModifierKey[],
 ): boolean {
-  const normA = sanitizeSubSessionQuickModifiers([...a]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
-  const normB = sanitizeSubSessionQuickModifiers([...b]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
-  return normA.length === normB.length && normA.every((mod, idx) => mod === normB[idx]);
+  return areModifierCombinationsEqual(a, b, DEFAULT_SUBSESSION_QUICK_MODIFIERS);
 }
 
 /** Resolve active sub-session quick-shortcut modifiers from stored overrides (defaults to `['ctrl']`). */
@@ -938,27 +984,46 @@ export function resolveSubSessionQuickModifiers(
   return sanitizeSubSessionQuickModifiers(overrides?.subSessionQuickModifiers) ?? getDefaultSubSessionQuickModifiers();
 }
 
+/** Resolve active task-pair split-view digit modifiers from stored overrides (defaults to `['ctrl', 'shift']`). */
+export function resolveTaskPairSplitModifiers(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+): ShortcutModifierKey[] {
+  return sanitizeSubSessionQuickModifiers(overrides?.taskPairSplitModifiers) ?? getDefaultTaskPairSplitModifiers();
+}
+
 /** Update `subSessionQuickModifiers` on an override object, omitting it when back to default `['ctrl']`. */
 export function applySubSessionQuickModifiers(
   overrides: KeyboardShortcutOverrides | null | undefined,
   modifiers: readonly ShortcutModifierKey[],
 ): KeyboardShortcutOverrides {
-  const next = sanitizeShortcutOverrides(overrides);
-  const clean = sanitizeSubSessionQuickModifiers([...modifiers]) ?? getDefaultSubSessionQuickModifiers();
-  if (areSubSessionQuickModifiersEqual(clean, DEFAULT_SUBSESSION_QUICK_MODIFIERS)) {
-    delete next.subSessionQuickModifiers;
-  } else {
-    next.subSessionQuickModifiers = clean;
-  }
-  return next;
+  return applyModifierCombinationOverride(
+    overrides,
+    'subSessionQuickModifiers',
+    modifiers,
+    DEFAULT_SUBSESSION_QUICK_MODIFIERS,
+  );
 }
 
-/** Format sub-session quick-shortcut modifiers into platform keycaps. */
-export function formatSubSessionQuickModifierKeycaps(
+/** Update `taskPairSplitModifiers` on an override object, omitting it when back to default `['ctrl', 'shift']`. */
+export function applyTaskPairSplitModifiers(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+  modifiers: readonly ShortcutModifierKey[],
+): KeyboardShortcutOverrides {
+  return applyModifierCombinationOverride(
+    overrides,
+    'taskPairSplitModifiers',
+    modifiers,
+    DEFAULT_TASK_PAIR_SPLIT_MODIFIERS,
+  );
+}
+
+/** Format a modifier combination into platform keycaps. */
+export function formatShortcutModifierKeycaps(
   modifiers: readonly ShortcutModifierKey[],
   isMac = isMacPlatform(),
+  fallback: readonly ShortcutModifierKey[] = DEFAULT_SUBSESSION_QUICK_MODIFIERS,
 ): string[] {
-  const resolved = sanitizeSubSessionQuickModifiers([...modifiers]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
+  const resolved = sanitizeSubSessionQuickModifiers([...modifiers]) ?? fallback;
   const caps: string[] = [];
   for (const mod of resolved) {
     if (mod === 'ctrl') caps.push(isMac ? '⌃' : 'Ctrl');
@@ -969,9 +1034,18 @@ export function formatSubSessionQuickModifierKeycaps(
   return caps;
 }
 
-export type SubSessionQuickShortcutMatch = { kind: 'open'; index: number };
+/** Format sub-session quick-shortcut modifiers into platform keycaps. */
+export function formatSubSessionQuickModifierKeycaps(
+  modifiers: readonly ShortcutModifierKey[],
+  isMac = isMacPlatform(),
+): string[] {
+  return formatShortcutModifierKeycaps(modifiers, isMac, DEFAULT_SUBSESSION_QUICK_MODIFIERS);
+}
 
-function extractDigitFromKeyboardEvent(
+export type SubSessionQuickShortcutMatch = { kind: 'open'; index: number };
+export type TaskPairSplitQuickShortcutMatch = { kind: 'toggleSplit'; index: number };
+
+export function extractDigitFromKeyboardEvent(
   e: Pick<KeyboardEvent, 'key' | 'code'>,
 ): number | null {
   if (typeof e.code === 'string' && e.code.length > 0) {
@@ -982,6 +1056,33 @@ function extractDigitFromKeyboardEvent(
     return Number(e.key);
   }
   return null;
+}
+
+function matchModifierDigitIndex(
+  e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'> & {
+    isComposing?: boolean;
+    keyCode?: number;
+  },
+  modifiers: readonly ShortcutModifierKey[],
+  fallback: readonly ShortcutModifierKey[],
+): number | null {
+  if (e.isComposing || e.keyCode === 229) return null;
+  const resolved = sanitizeSubSessionQuickModifiers([...modifiers]) ?? fallback;
+  const needCtrl = resolved.includes('ctrl');
+  const needAlt = resolved.includes('alt');
+  const needShift = resolved.includes('shift');
+  const needMeta = resolved.includes('meta');
+  if (
+    Boolean(e.ctrlKey) !== needCtrl
+    || Boolean(e.altKey) !== needAlt
+    || Boolean(e.shiftKey) !== needShift
+    || Boolean(e.metaKey) !== needMeta
+  ) {
+    return null;
+  }
+  const digit = extractDigitFromKeyboardEvent(e);
+  if (digit === null || digit < 1 || digit > 9) return null;
+  return digit - 1;
 }
 
 /**
@@ -997,21 +1098,21 @@ export function matchSubSessionQuickShortcut(
   },
   modifiers: readonly ShortcutModifierKey[],
 ): SubSessionQuickShortcutMatch | null {
-  if (e.isComposing || e.keyCode === 229) return null;
-  const resolved = sanitizeSubSessionQuickModifiers([...modifiers]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
-  const needCtrl = resolved.includes('ctrl');
-  const needAlt = resolved.includes('alt');
-  const needShift = resolved.includes('shift');
-  const needMeta = resolved.includes('meta');
-  if (
-    Boolean(e.ctrlKey) !== needCtrl
-    || Boolean(e.altKey) !== needAlt
-    || Boolean(e.shiftKey) !== needShift
-    || Boolean(e.metaKey) !== needMeta
-  ) {
-    return null;
-  }
-  const digit = extractDigitFromKeyboardEvent(e);
-  if (digit === null || digit < 1 || digit > 9) return null;
-  return { kind: 'open', index: digit - 1 };
+  const index = matchModifierDigitIndex(e, modifiers, DEFAULT_SUBSESSION_QUICK_MODIFIERS);
+  return index === null ? null : { kind: 'open', index };
+}
+
+/**
+ * Match `<Modifier> + 1..9` (toggle side-by-side split view for the N-th numbered task
+ * in the task bar) against the user's configured modifier combination (`['ctrl', 'shift']` by default).
+ */
+export function matchTaskPairSplitQuickShortcut(
+  e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'> & {
+    isComposing?: boolean;
+    keyCode?: number;
+  },
+  modifiers: readonly ShortcutModifierKey[],
+): TaskPairSplitQuickShortcutMatch | null {
+  const index = matchModifierDigitIndex(e, modifiers, DEFAULT_TASK_PAIR_SPLIT_MODIFIERS);
+  return index === null ? null : { kind: 'toggleSplit', index };
 }

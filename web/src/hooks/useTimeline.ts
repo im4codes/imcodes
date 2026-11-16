@@ -2133,6 +2133,14 @@ export function __getTimelineCacheForTests(cacheKey: string): TimelineEvent[] | 
   return eventsCache.get(cacheKey);
 }
 
+export function getCachedTimelineEvents(
+  serverId: string | null | undefined,
+  sessionId: string | null | undefined,
+): TimelineEvent[] {
+  if (!sessionId) return [];
+  return getCachedEvents(scopeCacheKey(serverId, sessionId)) ?? [];
+}
+
 export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEvent[]): void {
   setCachedEvents(cacheKey, events);
 }
