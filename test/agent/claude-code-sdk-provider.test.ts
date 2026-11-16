@@ -422,6 +422,45 @@ describe('ClaudeCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('reuses host/preset Claude authentication env in incognito mode identically to normal sessions', async () => {
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'private-auth-native' },
+      { type: 'assistant', session_id: 'private-auth-native', message: { content: [{ type: 'text', text: 'auth-ok' }], stop_reason: 'end_turn' } },
+      { type: 'result', subtype: 'success', session_id: 'private-auth-native', result: 'auth-ok', usage: { input_tokens: 1, output_tokens: 1 } },
+    ]);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'private-auth-route',
+      sessionName: 'deck_private_auth_brain',
+      cwd: '/tmp/project',
+      incognito: true,
+      env: {
+        ANTHROPIC_API_KEY: 'sk-ant-fixture',
+        ANTHROPIC_AUTH_TOKEN: 'ant-token-fixture',
+        ANTHROPIC_BASE_URL: 'https://example.invalid/anthropic',
+        CLAUDE_CODE_OAUTH_TOKEN: 'oauth-token-fixture',
+        CLAUDE_CONFIG_DIR: '/tmp/custom-claude-config',
+      },
+    });
+    const completed: string[] = [];
+    provider.onComplete((_sid, message) => completed.push(message.content));
+    await provider.send('private-auth-route', 'check auth reuse');
+    await waitFor(() => completed.length === 1);
+    expect(sdkMock.runs[0].options).toMatchObject({ persistSession: false, strictMcpConfig: true, mcpServers: {} });
+    expect((sdkMock.runs[0].options as { env: Record<string, string> }).env).toMatchObject({
+      HOME: process.env.HOME,
+      ANTHROPIC_API_KEY: 'sk-ant-fixture',
+      ANTHROPIC_AUTH_TOKEN: 'ant-token-fixture',
+      ANTHROPIC_BASE_URL: 'https://example.invalid/anthropic',
+      CLAUDE_CODE_OAUTH_TOKEN: 'oauth-token-fixture',
+      CLAUDE_CONFIG_DIR: '/tmp/custom-claude-config',
+    });
+    await provider.endSession('private-auth-route');
+    await provider.disconnect();
+  });
+
   it('uses stable resume id, emits cumulative text deltas, and completes from result', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-1', model: 'claude-sonnet-4-6' },

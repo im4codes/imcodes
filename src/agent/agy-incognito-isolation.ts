@@ -34,8 +34,15 @@ export interface CreateAgyIncognitoEnvOptions {
   skipReclaim?: boolean;
 }
 
+const AGY_CLI_OAUTH_TOKEN_REL_PATH = path.join('.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+const AGY_STANDALONE_OAUTH_TOKEN_REL_PATHS = [
+  path.join('.gemini', 'jetski-standalone-oauth-token'),
+  path.join('.gemini', 'antigravity', 'antigravity-oauth-token'),
+] as const;
+
 const AUTH_RELATIVE_PATHS = [
-  path.join('.gemini', 'antigravity-cli', 'antigravity-oauth-token'),
+  AGY_CLI_OAUTH_TOKEN_REL_PATH,
+  ...AGY_STANDALONE_OAUTH_TOKEN_REL_PATHS,
   path.join('.gemini', 'oauth_creds.json'),
   path.join('.gemini', 'google_accounts.json'),
 ] as const;
@@ -636,14 +643,22 @@ export function reclaimOrphanedAgyIncognitoHomesSync(baseTempDir = tmpdir()): nu
  */
 export function resolveAgySourceHome(...envs: Array<Record<string, string | undefined> | undefined>): string {
   for (const env of envs) {
-    for (const key of ['HOME', 'USERPROFILE'] as const) {
+    for (const key of ['GEMINI_CLI_HOME', 'HOME', 'USERPROFILE'] as const) {
       const candidate = env?.[key]?.trim();
       if (candidate && !activeIncognitoHomes.has(path.resolve(candidate))) {
         return candidate;
       }
     }
   }
-  return process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+  return process.env.GEMINI_CLI_HOME?.trim() || process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+}
+
+function copyStrictAuthFile(src: string, dst: string): boolean {
+  if (!existsSync(src)) return false;
+  mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
+  copyFileSync(src, dst);
+  try { chmodSync(dst, 0o600); } catch { /* non-POSIX */ }
+  return true;
 }
 
 /**
@@ -779,12 +794,16 @@ export function createAgyIncognitoEnvSync(
     const resolvedSource = sourceHome?.trim() ? path.resolve(sourceHome.trim()) : undefined;
     if (resolvedSource && resolvedSource !== resolvedHomeDir) {
       for (const rel of AUTH_RELATIVE_PATHS) {
-        const src = path.join(resolvedSource, rel);
-        if (!existsSync(src)) continue;
-        const dst = path.join(homeDir, rel);
-        mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
-        copyFileSync(src, dst);
-        try { chmodSync(dst, 0o600); } catch { /* non-POSIX */ }
+        copyStrictAuthFile(path.join(resolvedSource, rel), path.join(homeDir, rel));
+      }
+      // Antigravity 2.0 / Jetski stores standalone OAuth tokens at `.gemini/jetski-standalone-oauth-token`
+      // (while `agy acp` under isolated HOME falls back to `.gemini/antigravity-cli/antigravity-oauth-token`
+      // when macOS Keychain is unreachable). Seed the CLI fallback path if missing in sourceHome.
+      const cliTokenDst = path.join(homeDir, AGY_CLI_OAUTH_TOKEN_REL_PATH);
+      if (!existsSync(cliTokenDst)) {
+        for (const fallbackRel of AGY_STANDALONE_OAUTH_TOKEN_REL_PATHS) {
+          if (copyStrictAuthFile(path.join(resolvedSource, fallbackRel), cliTokenDst)) break;
+        }
       }
     }
   } catch (err) {

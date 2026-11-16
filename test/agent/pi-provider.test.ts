@@ -26,6 +26,7 @@ import { buildPiRpcArgs, piSessionDir, resolvePiBinary, resolvePiExtensionEntry 
 import {
   PI_MCP_CONFIG_ENV,
   PI_PROVIDER_API_KEY_ENV,
+  PI_PROVIDER_CONFIG_ENV,
   PI_RPC_COMMAND,
   PI_RPC_FRAME,
 } from '../../shared/pi-agent.js';
@@ -282,6 +283,9 @@ describe('PiProvider', () => {
       expect(args).not.toContain('--session-dir');
       expect(args).not.toContain('--name');
       expect(options.env[PI_MCP_CONFIG_ENV]).toBeUndefined();
+      expect(options.env.HOME).toBe(tempHome);
+      expect(options.env[PI_PROVIDER_API_KEY_ENV]).toBe('sk-priv-only');
+      expect(options.env[PI_PROVIDER_CONFIG_ENV]).toContain('"provider":"minimax"');
       expect(infoUpdates.some((u) => 'resumeId' in u && u.resumeId !== undefined)).toBe(false);
 
       // Multi-turn keeps same in-memory child alive

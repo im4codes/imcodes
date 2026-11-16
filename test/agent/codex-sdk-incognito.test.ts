@@ -838,4 +838,43 @@ args = ["--stdio"]
 
     await provider.disconnect();
   });
+
+  it('inherits CODEX_HOME, OPENAI_API_KEY, and customModelProvider auth into incognitoChannel identically to normalChannel', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-incog-auth-'));
+    createdCodexHomes.push(codexHome);
+    await writeFile(join(codexHome, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'sk-codex-fixture' }), 'utf8');
+
+    const provider = new CodexSdkProvider();
+    await provider.connect({
+      binaryPath: 'codex',
+      env: { CODEX_HOME: codexHome, OPENAI_API_KEY: 'sk-env-fixture' },
+    });
+    await provider.createSession({
+      sessionKey: 'incog-auth-route',
+      sessionName: 'deck_incog_auth_brain',
+      cwd: '/tmp/project',
+      agentType: 'codex-sdk',
+      incognito: true,
+      env: {
+        OPENAI_BASE_URL: 'https://example.invalid/v1',
+        OPENAI_API_KEY: 'sk-preset-fixture',
+      },
+    });
+    await provider.send('incog-auth-route', 'check codex auth');
+
+    expect(appServer.children).toHaveLength(2);
+    const spawnCalls = (appServer.spawn.mock.calls as Array<[string, string[], { env?: Record<string, string> }]>).slice(-2);
+    expect(spawnCalls[1]?.[2]?.env?.CODEX_HOME).toBe(codexHome);
+    expect(spawnCalls[1]?.[2]?.env?.OPENAI_API_KEY).toBe('sk-env-fixture');
+    const incogProc = appServer.children[1]!;
+    const startReq = incogProc.requests.find((r) => r.method === 'thread/start');
+    expect(startReq?.params?.ephemeral).toBe(true);
+    expect(startReq?.params?.env).toMatchObject({
+      OPENAI_BASE_URL: 'https://example.invalid/v1',
+      OPENAI_API_KEY: 'sk-preset-fixture',
+    });
+    expect(startReq?.params?.config?.model_providers?.custom?.experimental_bearer_token).toBe('sk-preset-fixture');
+
+    await provider.disconnect();
+  });
 });

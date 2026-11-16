@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -11,6 +11,7 @@ import {
   createAgyIncognitoEnvSync,
   reclaimOrphanedAgyIncognitoHomes,
   reclaimOrphanedAgyIncognitoHomesSync,
+  resolveAgySourceHome,
 } from '../../src/agent/agy-incognito-isolation.js';
 import { AgyAcpProvider, createAgyProvider } from '../../src/agent/providers/agy-acp.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
@@ -118,6 +119,121 @@ describe('AGY Incognito Isolation', () => {
     await isolated.cleanup();
     isolated.cleanupSync();
     expect(existsSync(path.join(agyDir, 'antigravity-oauth-token'))).toBe(true);
+  });
+
+  it('reuses Antigravity 2.0 jetski-standalone-oauth-token (seeding CLI fallback path) and google_accounts.json without leaking state/db/history', async () => {
+    const fakeRealHome = makeTempDir('imcodes-fake-agy2-home-');
+    const geminiDir = path.join(fakeRealHome, '.gemini');
+    const agyDir = path.join(geminiDir, 'antigravity');
+    const agyCliDir = path.join(geminiDir, 'antigravity-cli');
+    mkdirSync(path.join(agyDir, 'brain', 'old-conv'), { recursive: true });
+    mkdirSync(path.join(agyCliDir, 'conversations'), { recursive: true });
+
+    // Host has ONLY Antigravity 2.0 standalone token + google_accounts.json (no legacy antigravity-oauth-token or oauth_creds.json)
+    writeFileSync(path.join(geminiDir, 'jetski-standalone-oauth-token'), 'jetski-fixture-token');
+    writeFileSync(path.join(geminiDir, 'google_accounts.json'), '{"active":"user@example.invalid"}');
+    writeFileSync(path.join(geminiDir, 'settings.json'), '{"security":{"auth":{"selectedType":"oauth-personal"}}}');
+    writeFileSync(path.join(agyDir, 'antigravity_state.pbtxt'), 'state-secret');
+    writeFileSync(path.join(agyDir, 'conversation_summaries.db'), 'sqlite-bytes');
+    writeFileSync(path.join(agyCliDir, 'jetski_state.pbtxt'), 'cli-state-secret');
+    writeFileSync(path.join(agyCliDir, 'conversation_summaries.db'), 'cli-sqlite-bytes');
+    writeFileSync(path.join(agyCliDir, 'history.jsonl'), '{"secret":true}\n');
+    writeFileSync(path.join(agyCliDir, 'settings.json'), '{"model":"secret"}');
+
+    const isolated = createAgyIncognitoEnvSync(fakeRealHome);
+    tempDirs.push(isolated.homeDir);
+
+    const copiedJetski = path.join(isolated.homeDir, '.gemini', 'jetski-standalone-oauth-token');
+    const seededCliToken = path.join(isolated.homeDir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+    const copiedAccounts = path.join(isolated.homeDir, '.gemini', 'google_accounts.json');
+
+    expect(lstatSync(copiedJetski).isSymbolicLink()).toBe(false);
+    expect(lstatSync(seededCliToken).isSymbolicLink()).toBe(false);
+    expect(readFileSync(copiedJetski, 'utf8')).toBe('jetski-fixture-token');
+    expect(readFileSync(seededCliToken, 'utf8')).toBe('jetski-fixture-token');
+    expect(readFileSync(copiedAccounts, 'utf8')).toBe('{"active":"user@example.invalid"}');
+    if (process.platform !== 'win32') {
+      expect(statSync(copiedJetski).mode & 0o777).toBe(0o600);
+      expect(statSync(seededCliToken).mode & 0o777).toBe(0o600);
+    }
+
+    // Strict isolation: state/db/history/settings must never be copied
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'settings.json'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity', 'antigravity_state.pbtxt'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity', 'conversation_summaries.db'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity', 'brain'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity-cli', 'jetski_state.pbtxt'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity-cli', 'conversation_summaries.db'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity-cli', 'history.jsonl'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity-cli', 'settings.json'))).toBe(false);
+    expect(existsSync(path.join(isolated.homeDir, '.gemini', 'antigravity-cli', 'conversations'))).toBe(false);
+    await isolated.cleanup();
+
+    // When explicit antigravity-cli/antigravity-oauth-token already exists, keep it untouched (do not overwrite with jetski fallback)
+    writeFileSync(path.join(agyCliDir, 'antigravity-oauth-token'), 'explicit-cli-token');
+    const isolatedBoth = createAgyIncognitoEnvSync(fakeRealHome);
+    tempDirs.push(isolatedBoth.homeDir);
+    expect(readFileSync(path.join(isolatedBoth.homeDir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'utf8')).toBe('explicit-cli-token');
+    expect(readFileSync(path.join(isolatedBoth.homeDir, '.gemini', 'jetski-standalone-oauth-token'), 'utf8')).toBe('jetski-fixture-token');
+    await isolatedBoth.cleanup();
+
+    // resolveAgySourceHome respects GEMINI_CLI_HOME when non-incognito and skips active incognito homes
+    const customGeminiHome = makeTempDir('imcodes-custom-gemini-home-');
+    const liveIso = createAgyIncognitoEnvSync(fakeRealHome);
+    tempDirs.push(liveIso.homeDir);
+    expect(resolveAgySourceHome({ GEMINI_CLI_HOME: liveIso.homeDir }, { GEMINI_CLI_HOME: customGeminiHome, HOME: fakeRealHome })).toBe(customGeminiHome);
+    await liveIso.cleanup();
+  });
+
+  it('authenticates AgyAcpProvider incognito sessions when host has only jetski-standalone-oauth-token', async () => {
+    const work = makeTempDir('imcodes-agy-incog-jetski-acp-');
+    const fakeRealHome = path.join(work, 'real-home');
+    mkdirSync(path.join(fakeRealHome, '.gemini'), { recursive: true });
+    writeFileSync(path.join(fakeRealHome, '.gemini', 'jetski-standalone-oauth-token'), 'jetski-acp-fixture');
+
+    const script = path.join(work, 'auth-check-acp.mjs');
+    const binary = path.join(work, 'agy');
+    writeFileSync(script, `
+import readline from 'node:readline';
+import fs from 'node:fs';
+import path from 'node:path';
+const cliToken = path.join(process.env.HOME, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+const send = (obj) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...obj }) + '\\n');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    send({ id: msg.id, result: {
+      protocolVersion: 1,
+      agentInfo: { name: ${JSON.stringify(AGY_ACP_AGENT_NAME)}, version: '1.5.9' },
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, list: {} } },
+    } });
+  } else if (msg.method === 'session/new') {
+    if (!fs.existsSync(cliToken) || fs.readFileSync(cliToken, 'utf8') !== 'jetski-acp-fixture') {
+      send({ id: msg.id, error: { code: -32000, message: 'Authentication required' } });
+      return;
+    }
+    send({ id: msg.id, result: { sessionId: 'acp-jetski-1', models: { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }] } } });
+  } else if (msg.method === 'session/prompt') {
+    send({ method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'AUTH-OK' } } } });
+    send({ id: msg.id, result: { stopReason: 'end_turn' } });
+  }
+});
+`);
+    writeFileSync(binary, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 });
+
+    const provider = new AgyAcpProvider();
+    providers.push(provider);
+    await withSessionPrivacy('deck_incog_jetski_brain', true, () =>
+      provider.connect({ binaryPath: binary, env: { HOME: fakeRealHome } }),
+    );
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    const sid = await provider.createSession({ sessionKey: 'deck_incog_jetski_brain', cwd: work, incognito: true });
+    await provider.send(sid, 'ping');
+    await vi.waitFor(() => expect(completed).toEqual(['AUTH-OK']), { timeout: 5000 });
+    await provider.endSession(sid);
   });
 
   it('runs AgyAcpProvider incognito sessions in isolated per-session ACP processes with zero writes to real HOME and removes ephemeral dirs on endSession', async () => {
