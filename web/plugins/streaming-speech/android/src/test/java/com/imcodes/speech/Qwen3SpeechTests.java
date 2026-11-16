@@ -336,7 +336,7 @@ public final class Qwen3SpeechTests {
         Arrays.fill(speech, 0.1f);
         check(inbox.offer(speech, speech.length), "post-warmup chunk admitted");
         Double lvl1 = inbox.pollAudioLevel(1_000_000_000L);
-        check(lvl1 != null && lvl1 > 0.2, "first audioLevel emitted immediately post-warmup");
+        check(lvl1 != null && Math.abs(lvl1 - 0.1) < 1e-3, "first audioLevel emitted immediately post-warmup");
 
         // Burst within 50ms must be throttled
         check(inbox.offer(speech, speech.length), "second chunk admitted");

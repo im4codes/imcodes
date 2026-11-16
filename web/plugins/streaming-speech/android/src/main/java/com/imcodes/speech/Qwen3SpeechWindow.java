@@ -324,7 +324,7 @@ public final class Qwen3SpeechWindow {
         public static final int LIMIT = SAMPLE_RATE * 320 / 10; // 512,000 samples (~32s)
         public static final int WARMUP_SAMPLES = 320; // 20ms at 16kHz
         public static final long AUDIO_LEVEL_INTERVAL_NS = 50_000_000L; // 50ms
-        public static final double VOICED_THRESHOLD = 0.01;
+        public static final double VOICED_THRESHOLD = 0.0018;
 
         public static final class Batch {
             public final float[] samples;
@@ -390,7 +390,7 @@ public final class Qwen3SpeechWindow {
                 for (float s : chunk) {
                     power += s * s;
                 }
-                level = Math.min(1.0, Math.sqrt(power / usable) * 3.0);
+                level = Math.min(1.0, Math.sqrt(power / usable));
             }
             pendingAudioLevel = level;
             boolean voiced = level >= VOICED_THRESHOLD;

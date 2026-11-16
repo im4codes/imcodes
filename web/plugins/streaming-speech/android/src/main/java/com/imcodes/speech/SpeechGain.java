@@ -6,9 +6,9 @@ package com.imcodes.speech;
  */
 public final class SpeechGain {
     public static final float TARGET_RMS = 0.16f;
-    public static final float BASELINE_GAIN = 4.0f;
-    public static final float MIN_GAIN = 0.25f;
-    public static final float MAX_GAIN = 8.0f;
+    public static final float BASELINE_GAIN = 1.0f;
+    public static final float MIN_GAIN = 1.0f;
+    public static final float MAX_GAIN = 1.0f;
     public static final float SOFT_KNEE = 0.75f;
     public static final float MIN_SPEECH_GATE_RMS = 0.0014f;
     public static final float MAX_SPEECH_GATE_RMS = 0.0018f;
@@ -19,8 +19,8 @@ public final class SpeechGain {
     public static final float ATTACK_UP_ALPHA = 0.85f;
     public static final float RELEASE_DOWN_ALPHA = 0.90f;
     public static final float IDLE_DECAY_ALPHA = 0.25f;
-    public static final double VAD_LEVEL_THRESHOLD = 0.01;
-    public static final double LEVEL_SCALE = 3.0;
+    public static final double VAD_LEVEL_THRESHOLD = 0.0018;
+    public static final double LEVEL_SCALE = 1.0;
 
     private float currentGain = BASELINE_GAIN;
     private float noiseFloor = INITIAL_NOISE_FLOOR;
@@ -65,9 +65,8 @@ public final class SpeechGain {
         }
 
         float gateThreshold = clamp(noiseFloor * 2.0f, MIN_SPEECH_GATE_RMS, MAX_SPEECH_GATE_RMS);
-        float appliedGain;
         if (inputRms < gateThreshold) {
-            // Keep ambient silence/room floor at unity gain so idle hiss does not become false speech
+            // Keep ambient silence/room floor tracked so idle hiss does not trigger false speech
             // or block trailing-silence segment commits.
             if (inputRms > 0.0 && inputRms <= NOISE_FLOOR_TRACK_CEILING) {
                 noiseFloor = clamp(
@@ -76,25 +75,11 @@ public final class SpeechGain {
                     MAX_NOISE_FLOOR
                 );
             }
-            currentGain = clamp(
-                currentGain + IDLE_DECAY_ALPHA * (BASELINE_GAIN - currentGain),
-                MIN_GAIN,
-                MAX_GAIN
-            );
-            appliedGain = 1.0f;
-        } else {
-            float desiredGain = clamp(TARGET_RMS / (float) Math.max(inputRms, 1e-6), MIN_GAIN, MAX_GAIN);
-            float alpha = desiredGain > currentGain ? ATTACK_UP_ALPHA : RELEASE_DOWN_ALPHA;
-            currentGain = clamp(
-                currentGain + alpha * (desiredGain - currentGain),
-                MIN_GAIN,
-                MAX_GAIN
-            );
-            appliedGain = currentGain;
         }
-
+        // Preserve clean native PCM at unity gain (1.0f) with finite sanitize + soft-knee limiting only.
+        currentGain = BASELINE_GAIN;
         for (int i = 0; i < n; i++) {
-            samples[i] = softLimit(samples[i] * appliedGain);
+            samples[i] = softLimit(samples[i]);
         }
         return computeLevel(samples, n);
     }

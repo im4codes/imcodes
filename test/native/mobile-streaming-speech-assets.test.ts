@@ -1497,20 +1497,22 @@ do {
         return (0..<count).map { i in peak * sin(2.0 * .pi * 220.0 * Float(i) / 16000.0) }
     }
 
-    // Quiet speech (RMS 0.0025 < old 0.00333 floor) amplifies without clipping and opens VAD.
+    // Quiet speech (RMS 0.0025) stays clean unboosted (unity gain 1.0x) and opens VAD without clipping.
     var gain = SpeechGain()
     let quiet = sinePCM(1600, rms: 0.0025)
     let g1 = gain.process(quiet)
-    require(g1.boostedRMS >= g1.rawRMS * 4.0, "L: quiet speech chunk1 not boosted: \\(g1.boostedRMS) vs \\(g1.rawRMS)")
+    require(abs(g1.boostedRMS - g1.rawRMS) <= 1e-5, "L: quiet speech chunk1 was unexpectedly boosted: \\(g1.boostedRMS) vs \\(g1.rawRMS)")
+    require(abs(gain.currentGain - 1.0) <= 1e-6, "L: gain must stay unity 1.0: \\(gain.currentGain)")
+    require(g1.anyVoiced, "L: quiet speech chunk1 failed VAD")
     require(g1.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 }, "L: quiet speech chunk1 clipped")
     let g2 = gain.process(quiet)
-    require(g2.boostedRMS >= 0.015 && gain.currentGain <= SpeechGain.maxGain, "L: quiet speech chunk2 gain unexpected: rms=\\(g2.boostedRMS) gain=\\(gain.currentGain)")
+    require(abs(g2.boostedRMS - g2.rawRMS) <= 1e-5 && gain.currentGain <= SpeechGain.maxGain, "L: quiet speech chunk2 gain unexpected: rms=\\(g2.boostedRMS) gain=\\(gain.currentGain)")
 
-    // Loud burst immediately after high gain stays strictly inside (-1.0, 1.0) without hard clipping.
+    // Loud burst stays strictly inside (-1.0, 1.0) via softLimit without hard clipping.
     let loud = sinePCM(1600, rms: 0.85)
     let gLoud = gain.process(loud)
     require(gLoud.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 }, "L: loud burst hard clipped")
-    require(gain.currentGain <= 1.5, "L: gain failed fast downward attack: \\(gain.currentGain)")
+    require(abs(gain.currentGain - 1.0) <= 1e-6, "L: gain failed unity invariant: \\(gain.currentGain)")
 
     // Cold-start pure silence and ultra-low noise floor stay unboosted and unvoiced.
     var inbox = SpeechInbox()
@@ -1522,11 +1524,11 @@ do {
     require(!noiseBatch.speech && noiseBatch.trailingSilence == noise.count, "L: noise marked as speech")
     require(SpeechGain.rms(noiseBatch.samples) <= 0.0004, "L: noise floor was wildly amplified")
 
-    // Quiet speech in inbox opens VAD, emits visible audioLevel, and trailing ambient floor releases VAD.
+    // Quiet speech in inbox opens VAD, emits clean unscaled rawRMS audioLevel (no *4), and trailing ambient floor releases VAD.
     _ = try! inbox.offer(quiet)
     require(inbox.lastVoiced, "L: quiet speech failed VAD onset")
     let quietLevel = inbox.pollAudioLevel(now: 0.1)
-    require((quietLevel ?? 0) > 0.015, "L: quiet audioLevel too weak for equalizer: \\(String(describing: quietLevel))")
+    require(abs((quietLevel ?? 0) - 0.0025) <= 2e-4, "L: quiet audioLevel must match unscaled rawRMS ~0.0025: \\(String(describing: quietLevel))")
     let quietBatch = inbox.take()!
     require(quietBatch.speech && quietBatch.trailingSilence == 0, "L: quiet speech batch not marked voiced")
 
@@ -1545,7 +1547,7 @@ do {
     require(ack.wait(timeout: .now() + 2) == .success && err == nil, "L: coordinator quiet capture failed")
     let evs = events()
     require(evs.contains(.final("q:6400")), "L: quiet speech dropped before final: \\(evs)")
-    require(evs.contains { if case .audioLevel(let lvl) = $0 { return lvl > 0.015 }; return false }, "L: missing responsive audioLevel event: \\(evs)")
+    require(evs.contains { if case .audioLevel(let lvl) = $0 { return abs(lvl - 0.0025) <= 2e-4 }; return false }, "L: missing clean rawRMS audioLevel event: \\(evs)")
 
     // F1 class test: steady 60Hz hum and broadband fan noise (0.0012..0.003) after 0.2s speech must adapt & allow SpeechWindow VAD pause commit.
     func tonePCM(_ count: Int, rms: Float, freqHz: Float, phaseOffset: Int = 0) -> [Float] {
@@ -1610,8 +1612,8 @@ do {
         _ = try! ambientInbox.offer(tonePCM(400, rms: rms, freqHz: 240, phaseOffset: idx * 400))
         require(ambientInbox.lastVoiced, "L: modulated quiet speech blocked over noise at rms=\\(rms)")
         let batch = ambientInbox.take()!
-        require(batch.speech && SpeechGain.rms(batch.samples) >= rms * 3.0 && batch.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 },
-                "L: modulated quiet speech gain/bounds invalid at rms=\\(rms)")
+        require(batch.speech && abs(SpeechGain.rms(batch.samples) - rms) <= 2e-4 && batch.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 },
+                "L: modulated quiet speech clean PCM/bounds invalid at rms=\\(rms)")
     }
 
     // F1-R2 class test: sustained quiet speech (2.0s @ RMS 0.0025 / 220Hz) and slowly varying harmonic quiet speech (<0.004)
@@ -2275,15 +2277,15 @@ func run() throws {
     check(levelInbox.pollAudioLevel(now: 0.01) == nil, "audioLevel emitted on exact warmup completion without post-warmup samples")
     _ = try levelInbox.offer(Array(repeating: 0.0025, count: 320))
     let firstLevel = levelInbox.pollAudioLevel(now: 0.05)
-    check(firstLevel != nil && firstLevel! > 0.015 && firstLevel! < 0.2, "first quiet post-warmup audioLevel out of range: \\(String(describing: firstLevel))")
+    check(firstLevel != nil && abs(firstLevel! - 0.0025) < 2e-4, "first quiet post-warmup audioLevel out of range: \\(String(describing: firstLevel))")
     _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
     check(levelInbox.pollAudioLevel(now: 0.07) == nil, "audioLevel not throttled at +20ms")
     _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
     check(levelInbox.pollAudioLevel(now: 0.099) == nil, "audioLevel not throttled at +49ms")
     let secondLevel = levelInbox.pollAudioLevel(now: 0.10)
-    check(secondLevel != nil && abs(secondLevel! - 0.8) < 0.05, "throttled audioLevel did not emit at +50ms: \\(String(describing: secondLevel))")
+    check(secondLevel != nil && abs(secondLevel! - 0.2) < 0.01, "throttled audioLevel did not emit unscaled 0.2 at +50ms: \\(String(describing: secondLevel))")
     check(levelInbox.pollAudioLevel(now: 0.20) == nil, "duplicate audioLevel emitted without new samples")
-    _ = try levelInbox.offer(Array(repeating: 0.8, count: 320))
+    _ = try levelInbox.offer(Array(repeating: 1.5, count: 320))
     let clampedLevel = levelInbox.pollAudioLevel(now: 0.20)
     check(clampedLevel == 1.0, "loud audioLevel did not clamp to 1.0: \\(String(describing: clampedLevel))")
     print("AUDIO_LEVEL_THROTTLE:PASS")

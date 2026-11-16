@@ -28,12 +28,13 @@ final class SpeechGainTests: XCTestCase {
         var gain = SpeechGain()
         let quiet = sineWave(count: 1600, rms: 0.0025)
         let first = gain.process(quiet)
-        XCTAssertGreaterThanOrEqual(first.boostedRMS, first.rawRMS * 4.0)
-        XCTAssertLessThanOrEqual(gain.currentGain, SpeechGain.maxGain)
+        XCTAssertEqual(first.boostedRMS, first.rawRMS, accuracy: 1e-5)
+        XCTAssertEqual(gain.currentGain, 1.0, accuracy: 1e-6)
+        XCTAssertTrue(first.anyVoiced)
         XCTAssertTrue(first.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 })
 
         let second = gain.process(quiet)
-        XCTAssertGreaterThanOrEqual(second.boostedRMS, 0.015)
+        XCTAssertEqual(second.boostedRMS, second.rawRMS, accuracy: 1e-5)
         XCTAssertTrue(second.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 })
 
         var inbox = SpeechInbox()
@@ -43,7 +44,7 @@ final class SpeechGainTests: XCTestCase {
         XCTAssertTrue(inbox.lastVoiced)
         let level = inbox.pollAudioLevel(now: 0.1)
         XCTAssertNotNil(level)
-        XCTAssertGreaterThan(level ?? 0, 0.015)
+        XCTAssertEqual(level ?? 0, 0.0025, accuracy: 2e-4)
 
         let batch = inbox.take()
         XCTAssertNotNil(batch)
@@ -54,13 +55,12 @@ final class SpeechGainTests: XCTestCase {
 
     func testLoudInputAndPlosivesStayBoundedWithoutHardClipping() {
         var gain = SpeechGain()
-        // First prime gain high on quiet speech, then hit a sudden loud transient.
         _ = gain.process(sineWave(count: 1600, rms: 0.002))
         let loud = sineWave(count: 1600, rms: 0.85)
         let result = gain.process(loud)
 
         XCTAssertTrue(result.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 })
-        XCTAssertLessThanOrEqual(gain.currentGain, 1.5)
+        XCTAssertEqual(gain.currentGain, 1.0, accuracy: 1e-6)
     }
 
     func testSilenceAndUltraLowNoiseFloorStayUnboostedAndUnvoiced() throws {
@@ -146,14 +146,14 @@ final class SpeechGainTests: XCTestCase {
         }
         XCTAssertFalse(coldInbox.lastVoiced)
 
-        // Modulated quiet speech (RMS 0.003..0.0055) over the learned 0.0015 floor opens VAD & amplifies safely.
+        // Modulated quiet speech (RMS 0.003..0.0055) over the learned 0.0015 floor opens VAD cleanly without gain boost.
         for (idx, rms) in [Float(0.0040), 0.0055, 0.0032, 0.0050, 0.0035].enumerated() {
             let speechChunk = sineWave(count: 400, rms: rms, freqHz: 240, phaseOffset: idx * 400)
             _ = try coldInbox.offer(speechChunk)
             XCTAssertTrue(coldInbox.lastVoiced)
             let batch = coldInbox.take()
             XCTAssertTrue(batch?.speech == true)
-            XCTAssertGreaterThanOrEqual(SpeechGain.rms(batch?.samples ?? []), rms * 3.0)
+            XCTAssertEqual(SpeechGain.rms(batch?.samples ?? []), rms, accuracy: 2e-4)
             XCTAssertTrue(batch?.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 } == true)
         }
     }

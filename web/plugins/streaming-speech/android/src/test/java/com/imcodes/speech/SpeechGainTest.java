@@ -24,9 +24,11 @@ public final class SpeechGainTest {
         double level = gain.processChunk(chunk, chunk.length);
         double outRms = rms(chunk);
 
-        assertTrue(outRms >= 0.012, "quiet speech should be boosted from 0.0025 into clear range, got " + outRms);
+        assertTrue(Math.abs(outRms - 0.0025) < 1e-4, "quiet speech must stay clean unboosted near 0.0025, got " + outRms);
+        assertTrue(Math.abs(level - 0.0025) < 1e-4, "level must report unscaled clean RMS near 0.0025, got " + level);
         assertTrue(level >= SpeechGain.VAD_LEVEL_THRESHOLD, "quiet speech first chunk should exceed VAD threshold, got " + level);
         assertTrue(SpeechGain.isVoiced(chunk), "quiet speech (RMS 0.0025) must trigger voiced == true");
+        assertTrue(gain.getCurrentGain() == 1.0f, "gain must remain unity 1.0f");
         assertAllSamplesBounded(chunk);
     }
 
@@ -39,13 +41,12 @@ public final class SpeechGainTest {
             assertTrue(SpeechGain.isVoiced(chunk), "0.005 RMS speech chunk " + i + " must be voiced");
             assertAllSamplesBounded(chunk);
         }
-        assertTrue(lastLevel >= 0.10, "HUD audioLevel should be responsive for quiet-normal speech, got " + lastLevel);
-        assertTrue(gain.getCurrentGain() <= SpeechGain.MAX_GAIN + 1e-6f, "gain must stay capped at MAX_GAIN");
+        assertTrue(Math.abs(lastLevel - 0.005) < 1e-4, "HUD audioLevel should reflect unscaled RMS 0.005, got " + lastLevel);
+        assertTrue(gain.getCurrentGain() == 1.0f, "gain must remain unity 1.0f");
     }
 
     private static void testLoudSpeechAttenuatedAndSoftKneeLimitedWithoutHardClipping() {
         SpeechGain gain = new SpeechGain();
-        // Prime to max gain with quiet speech first, then slam with sudden loud speech (RMS 0.85, peak ~1.20)
         gain.processChunk(sineWithRms(CHUNK_SAMPLES, 0.0025f));
 
         float[] firstLoud = sineWithRms(CHUNK_SAMPLES, 0.85f);
@@ -59,7 +60,7 @@ public final class SpeechGainTest {
             gain.processChunk(steadyLoud, steadyLoud.length);
             assertAllSamplesBounded(steadyLoud);
         }
-        assertTrue(rms(steadyLoud) < 0.35, "sustained loud speech should attenuate cleanly toward target RMS, got " + rms(steadyLoud));
+        assertTrue(Math.abs(rms(steadyLoud) - 0.70) < 0.05, "steady loud speech below soft knee should stay clean, got " + rms(steadyLoud));
         assertTrue(SpeechGain.isVoiced(steadyLoud), "loud speech must remain voiced");
 
         // Verify softLimit itself compresses > 1.0 smoothly without flat-top hard clipping
@@ -93,19 +94,19 @@ public final class SpeechGainTest {
 
     private static void testSilenceAfterSpeechDropsVoicedImmediately() {
         SpeechGain gain = new SpeechGain();
-        // Sustain quiet speech so gain approaches MAX_GAIN (8x)
         for (int i = 0; i < 6; i++) {
             float[] speech = sineWithRms(CHUNK_SAMPLES, 0.0025f);
             gain.processChunk(speech, speech.length);
             assertTrue(SpeechGain.isVoiced(speech), "speech chunk should be voiced");
         }
-        assertTrue(gain.getCurrentGain() > 7.5f, "gain should have ramped near MAX_GAIN");
+        assertTrue(gain.getCurrentGain() == 1.0f, "gain must remain unity 1.0f");
 
-        // Next chunk drops to room floor (0.0007f): must NOT multiply by 8x into false voiced (0.0056*3 = 0.0168)!
+        // Next chunk drops to room floor (0.0007f): remains unboosted and immediately drops voiced == false.
         float[] trailingSilence = sineWithRms(CHUNK_SAMPLES, 0.0007f);
         double level = gain.processChunk(trailingSilence, trailingSilence.length);
+        assertTrue(level < 0.001, "room floor level must stay raw (< 0.001), got " + level);
         assertTrue(!SpeechGain.isVoiced(trailingSilence),
-            "trailing room silence after 8x speech gain must drop voiced == false immediately, got level=" + level);
+            "trailing room silence after speech must drop voiced == false immediately, got level=" + level);
     }
 
     private static void testNonFiniteAndEdgeInputsRemainBounded() {

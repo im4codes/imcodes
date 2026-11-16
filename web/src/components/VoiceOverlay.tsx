@@ -452,7 +452,7 @@ export function VoiceOverlay({
 
     VoiceInput.onAudioLevel((rawLevel) => {
       const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
-      if (level > 0.015 && listeningRef.current) {
+      if (level > 0.025 && listeningRef.current) {
         pulseRecognizing(1800);
       }
       waveformRef.current?.pushLevel(level);
