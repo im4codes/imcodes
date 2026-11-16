@@ -106,7 +106,11 @@ vi.mock('../../src/api.js', () => ({
 }));
 
 import { getUserPref, uploadFile } from '../../src/api.js';
-import { SessionControls } from '../../src/components/SessionControls.js';
+import {
+  SessionControls,
+  VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX,
+  computeVoiceHoldBottomClearancePx,
+} from '../../src/components/SessionControls.js';
 import { focusComposerElement } from '../../src/util/composer-focus.js';
 import type { SessionInfo } from '../../src/types.js';
 
@@ -3936,5 +3940,197 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await Promise.resolve();
     await Promise.resolve();
     getUserPrefMock.mockResolvedValue(null);
+  });
+
+  it('computes --voice-hud-bottom-clearance from .controls-composer top edge, handles jsdom zero rects cleanly, and updates dynamically during hold', async () => {
+    // 1. Direct helper boundary checks: null element, invalid viewport, jsdom zero rect, below-viewport rect, and cssZoom scaling
+    expect(computeVoiceHoldBottomClearancePx(null, 844)).toBeNull();
+    const dummy = document.createElement('div');
+    expect(computeVoiceHoldBottomClearancePx(dummy, 844)).toBeNull();
+    dummy.getBoundingClientRect = () => ({ top: 750, bottom: 800, left: 0, right: 390, width: 390, height: 50, x: 0, y: 750, toJSON: () => ({}) });
+    expect(computeVoiceHoldBottomClearancePx(dummy, 0)).toBeNull();
+    expect(computeVoiceHoldBottomClearancePx(dummy, Number.NaN)).toBeNull();
+    expect(computeVoiceHoldBottomClearancePx(dummy, 700)).toBeNull();
+    expect(computeVoiceHoldBottomClearancePx(dummy, 844)).toBe(94 + VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX);
+    expect(computeVoiceHoldBottomClearancePx(dummy, 844, 1.25)).toBe(Math.round(94 / 1.25 + VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX));
+
+    const origInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    try {
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+
+      const input = document.querySelector('.controls-input') as HTMLElement;
+      const composer = document.querySelector('.controls-composer') as HTMLElement;
+
+      // jsdom default all-zero rect -> relies on CSS fallback, no NaN/negative inline clearance
+      dispatchPointer(input, 'pointerdown', 180, 760, 1);
+      await vi.advanceTimersByTimeAsync(115);
+      const hudZero = document.querySelector('.voice-hold-hud') as HTMLElement;
+      expect(hudZero).not.toBeNull();
+      expect(hudZero.style.getPropertyValue('--voice-hud-bottom-clearance')).toBe('');
+
+      dispatchPointer(input, 'pointermove', 60, 760, 1);
+      await vi.advanceTimersByTimeAsync(0);
+      dispatchPointer(input, 'pointerup', 60, 760, 1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('.voice-hold-hud')).toBeNull();
+
+      // Single-line composer geometry -> clearance sets HUD strictly above composer.top
+      let composerTop = 754;
+      composer.getBoundingClientRect = () => ({
+        top: composerTop,
+        bottom: 810,
+        left: 8,
+        right: 382,
+        width: 374,
+        height: 56,
+        x: 8,
+        y: composerTop,
+        toJSON: () => ({}),
+      });
+
+      dispatchPointer(input, 'pointerdown', 180, 770, 2);
+      await vi.advanceTimersByTimeAsync(115);
+      const hudSingle = document.querySelector('.voice-hold-hud') as HTMLElement;
+      expect(hudSingle.style.getPropertyValue('--voice-hud-bottom-clearance')).toBe(
+        `${844 - 754 + VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX}px`,
+      );
+
+      // Simulate multiline composer resize during active hold -> clearance increases dynamically
+      composerTop = 640;
+      window.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hudSingle.style.getPropertyValue('--voice-hud-bottom-clearance')).toBe(
+        `${844 - 640 + VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX}px`,
+      );
+
+      dispatchPointer(input, 'pointermove', 60, 770, 2);
+      await vi.advanceTimersByTimeAsync(0);
+      dispatchPointer(input, 'pointerup', 60, 770, 2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    } finally {
+      if (origInnerHeight) Object.defineProperty(window, 'innerHeight', origInnerHeight);
+      else delete (window as { innerHeight?: number }).innerHeight;
+    }
+  });
+
+  it('positions .voice-hold-hud-card and .voice-hold-hud-zones strictly above single-line & multiline .controls-composer with non-zero safe-area and compressed @container heights in chromium', { timeout: 60_000 }, async () => {
+    vi.useRealTimers();
+    const require = createRequire(import.meta.url);
+    const browserType = (require('playwright') as typeof import('playwright')).chromium;
+    if (!existsSync(browserType.executablePath())) {
+      return;
+    }
+    const stylesPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/styles.css');
+    const css = readFileSync(stylesPath, 'utf8');
+    const barsHtml = Array.from({ length: 28 }, () => '<span class="voice-hold-hud-bar" style="height: 16px; opacity: 0.8"></span>').join('');
+    const browser = await browserType.launch({ headless: true });
+    try {
+      const scenarios = [
+        { name: 'iphone-single-line', width: 390, height: 844, sat: 47, sab: 34, composerHeight: 46, bottomOffset: 44 },
+        { name: 'iphone-multiline', width: 390, height: 844, sat: 47, sab: 34, composerHeight: 148, bottomOffset: 44 },
+        { name: 'landscape-420-container', width: 844, height: 390, sat: 0, sab: 21, composerHeight: 44, bottomOffset: 24 },
+        { name: 'compressed-300-container', width: 390, height: 280, sat: 0, sab: 0, composerHeight: 42, bottomOffset: 8 },
+      ];
+
+      for (const sc of scenarios) {
+        const context = await browser.newContext({ viewport: { width: sc.width, height: sc.height }, hasTouch: true });
+        const page = await context.newPage();
+        try {
+          await page.setContent(`<!doctype html><html style="--sat:${sc.sat}px;--sab:${sc.sab}px;--vvh:${sc.height}px;"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>
+            <div class="controls-wrapper" style="position:fixed;bottom:0;left:0;right:0;z-index:13;padding-bottom:${sc.bottomOffset}px;">
+              <div class="controls">
+                <div class="controls-composer controls-composer-voice-ready controls-composer-voice-holding" style="height:${sc.composerHeight}px;">
+                  <div class="controls-input" contenteditable="false" style="min-height:${sc.composerHeight}px;height:${sc.composerHeight}px;"></div>
+                </div>
+              </div>
+            </div>
+            <div class="voice-hold-hud voice-hold-hud-zone-send">
+              <div class="voice-hold-hud-atmosphere">
+                <div class="voice-hold-hud-aurora"></div>
+                <div class="voice-hold-hud-aurora-core"></div>
+              </div>
+              <div class="voice-hold-hud-transcript-stage">
+                <div class="voice-hold-hud-transcript">实时语音转写内容测试</div>
+              </div>
+              <div class="voice-hold-hud-card">
+                <div class="voice-hold-hud-header">
+                  <span class="voice-hold-hud-recognizing is-recognizing">
+                    <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
+                    <span>Listening</span>
+                  </span>
+                </div>
+                <div class="voice-hold-hud-active-hint is-send">松开发送</div>
+                <div class="voice-hold-hud-waveform">${barsHtml}</div>
+                <div class="voice-hold-hud-zones">
+                  <div class="voice-hold-zone voice-hold-zone-cancel" data-zone-target="cancel"><span class="voice-hold-zone-label">左滑取消</span></div>
+                  <div class="voice-hold-zone voice-hold-zone-send is-active" data-zone-target="send"><span class="voice-hold-zone-label">松开发送</span></div>
+                  <div class="voice-hold-zone voice-hold-zone-edit" data-zone-target="edit"><span class="voice-hold-zone-label">右滑编辑</span></div>
+                </div>
+              </div>
+            </div>
+          </body></html>`);
+
+          const metrics = await page.evaluate((gapPx) => {
+            const composer = document.querySelector('.controls-composer') as HTMLElement;
+            const input = document.querySelector('.controls-input') as HTMLElement;
+            const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
+            const composerRect = composer.getBoundingClientRect();
+            const hudRect = hud.getBoundingClientRect();
+            const clearance = Math.round(hudRect.bottom - composerRect.top + gapPx);
+            hud.style.setProperty('--voice-hud-bottom-clearance', `${clearance}px`);
+
+            const card = document.querySelector('.voice-hold-hud-card')!.getBoundingClientRect();
+            const zones = document.querySelector('.voice-hold-hud-zones')!.getBoundingClientRect();
+            const stageEl = document.querySelector('.voice-hold-hud-transcript-stage')!;
+            const stage = stageEl.getBoundingClientRect();
+            const transcriptEl = document.querySelector('.voice-hold-hud-transcript')!;
+            const transcript = transcriptEl.getBoundingClientRect();
+            const inputRect = input.getBoundingClientRect();
+            const dropDelta = Math.round((inputRect.top + inputRect.height / 2) - (transcript.top + transcript.height / 2));
+            return {
+              clearance,
+              composerTop: composerRect.top,
+              zonesBottom: zones.bottom,
+              cardTop: card.top,
+              cardBottom: card.bottom,
+              stageHeight: stage.height,
+              transcriptTop: transcript.top,
+              transcriptBottom: transcript.bottom,
+              transcriptHeight: transcript.height,
+              transcriptScrollHeight: transcriptEl.scrollHeight,
+              transcriptClientHeight: transcriptEl.clientHeight,
+              dropDelta,
+              hudPointerEvents: getComputedStyle(hud).pointerEvents,
+            };
+          }, VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX);
+
+          expect(metrics.clearance, `${sc.name} clearance`).toBeGreaterThan(0);
+          expect(metrics.zonesBottom, `${sc.name} zones above composer`).toBeLessThanOrEqual(metrics.composerTop - 8);
+          expect(metrics.cardBottom, `${sc.name} card bottom >= zonesBottom`).toBeGreaterThanOrEqual(metrics.zonesBottom);
+          expect(metrics.stageHeight, `${sc.name} stage height`).toBeGreaterThanOrEqual(40);
+          expect(metrics.transcriptBottom, `${sc.name} transcript above card`).toBeLessThanOrEqual(metrics.cardTop + 1);
+          expect(metrics.transcriptHeight, `${sc.name} transcript visible`).toBeGreaterThanOrEqual(24);
+          expect(metrics.transcriptClientHeight, `${sc.name} transcript unclipped`).toBeGreaterThanOrEqual(metrics.transcriptScrollHeight);
+          expect(metrics.dropDelta, `${sc.name} drop-y delta positive`).toBeGreaterThan(24);
+          expect(metrics.hudPointerEvents).toBe('none');
+        } finally {
+          await context.close();
+        }
+      }
+    } finally {
+      await browser.close();
+    }
   });
 });

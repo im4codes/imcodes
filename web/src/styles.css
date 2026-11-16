@@ -3456,6 +3456,8 @@ html.native-ios-mac .chat-dl-btn {
   animation: voice-composer-energy-pulse 1.6s ease-in-out infinite;
 }
 .voice-hold-hud {
+  --voice-hud-safe-top: max(var(--sat, 0px), env(safe-area-inset-top, 0px));
+  --voice-hud-safe-bottom: max(var(--sab, 0px), env(safe-area-inset-bottom, 0px));
   position: fixed;
   left: 0;
   right: 0;
@@ -3464,7 +3466,7 @@ html.native-ios-mac .chat-dl-btn {
   width: var(--imcodes-ui-vw, 100%);
   height: var(--vvh, var(--imcodes-ui-dvh));
   max-height: var(--vvh, var(--imcodes-ui-dvh));
-  padding-top: calc(12px + max(var(--sat, 0px), env(safe-area-inset-top, 0px)));
+  padding-top: calc(12px + var(--voice-hud-safe-top));
   box-sizing: border-box;
   z-index: 2147483022;
   container-type: size;
@@ -3494,7 +3496,10 @@ html.native-ios-mac .chat-dl-btn {
   left: 0;
   right: 0;
   bottom: 0;
-  height: min(390px, calc(var(--imcodes-ui-dvh) * 0.68));
+  height: min(
+    max(390px, calc(var(--voice-hud-bottom-clearance, 72px) + 200px)),
+    calc(var(--imcodes-ui-dvh) * 0.72)
+  );
   max-height: 100%;
   pointer-events: none;
   overflow: hidden;
@@ -3591,7 +3596,13 @@ html.native-ios-mac .chat-dl-btn {
   max-height: calc(100cqh - 48px);
   min-height: 0;
   box-sizing: border-box;
-  padding: 12px 20px calc(22px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+  /* Lift the action card and cancel/send/edit cues cleanly above .controls-composer
+     so the user's holding finger never occludes them, with clamped short-viewport bounds. */
+  padding: 12px 20px clamp(
+    calc(22px + var(--voice-hud-safe-bottom)),
+    var(--voice-hud-bottom-clearance, calc(72px + var(--voice-hud-safe-bottom))),
+    max(calc(22px + var(--voice-hud-safe-bottom)), calc(100cqh - 240px - var(--voice-hud-safe-top)))
+  );
   border: none;
   border-radius: 0;
   background: transparent;
@@ -3922,7 +3933,11 @@ html.native-ios-mac .chat-dl-btn {
     line-height: 1.45;
   }
   .voice-hold-hud-card {
-    padding: 6px 18px calc(10px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+    padding: 6px 18px clamp(
+      calc(10px + var(--voice-hud-safe-bottom)),
+      var(--voice-hud-bottom-clearance, calc(64px + var(--voice-hud-safe-bottom))),
+      max(calc(10px + var(--voice-hud-safe-bottom)), calc(100cqh - 185px - var(--voice-hud-safe-top)))
+    );
     gap: 5px;
   }
   .voice-hold-hud-waveform {
@@ -3946,7 +3961,11 @@ html.native-ios-mac .chat-dl-btn {
     line-height: 1.35;
   }
   .voice-hold-hud-card {
-    padding: 4px 16px calc(6px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+    padding: 4px 16px clamp(
+      calc(6px + var(--voice-hud-safe-bottom)),
+      var(--voice-hud-bottom-clearance, calc(24px + var(--voice-hud-safe-bottom))),
+      max(calc(6px + var(--voice-hud-safe-bottom)), calc(100cqh - 148px - var(--voice-hud-safe-top)))
+    );
     gap: 3px;
     overflow-y: auto;
   }
