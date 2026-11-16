@@ -36,6 +36,7 @@ export interface PendingUploadEntry {
 
 let cachedDbPromise: Promise<IDBDatabase> | null = null;
 const inFlightPersistCounts = new Map<string, number>();
+const inFlightPersistQueues = new Map<string, Promise<void>>();
 
 function addInFlightPersist(clientUploadId: string): void {
   inFlightPersistCounts.set(clientUploadId, (inFlightPersistCounts.get(clientUploadId) ?? 0) + 1);
@@ -72,6 +73,7 @@ function readBlobArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
 export function resetPendingUploadStoreForTests(): void {
   cachedDbPromise = null;
   inFlightPersistCounts.clear();
+  inFlightPersistQueues.clear();
 }
 
 function hasIndexedDb(): boolean {
@@ -189,123 +191,149 @@ export async function persistPendingUploadFile(options: {
   file: File;
   signal?: AbortSignal;
 }): Promise<{ persisted: boolean; snapshotFile: File | null }> {
-  const { clientUploadId, serverId, sessionName, composerKey, file, signal } = options;
+  const { clientUploadId, signal } = options;
   if (signal?.aborted) throw createAbortError();
   if (!hasIndexedDb()) return { persisted: false, snapshotFile: null };
-  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > PENDING_UPLOAD_MAX_FILE_BYTES) {
+  if (!Number.isSafeInteger(options.file.size) || options.file.size < 0 || options.file.size > PENDING_UPLOAD_MAX_FILE_BYTES) {
     return { persisted: false, snapshotFile: null };
   }
-  if (typeof file.slice !== 'function') {
+  if (typeof options.file.slice !== 'function') {
     return { persisted: false, snapshotFile: null };
   }
 
+  // Serialize persists sharing one clientUploadId so a concurrent retry/re-pick
+  // never sweeps the active writer's incomplete metadata/chunks mid-stream.
+  const prior = inFlightPersistQueues.get(clientUploadId) ?? Promise.resolve();
+  let releaseQueue!: () => void;
+  const queueTail = new Promise<void>((resolve) => {
+    releaseQueue = resolve;
+  });
+  inFlightPersistQueues.set(clientUploadId, queueTail);
   addInFlightPersist(clientUploadId);
   try {
-    let db: IDBDatabase;
-    try {
-      db = await openPendingDb();
-    } catch {
-      return { persisted: false, snapshotFile: null };
+    await prior;
+    if (signal?.aborted) throw createAbortError();
+    return await persistPendingUploadFileSerial(options);
+  } finally {
+    removeInFlightPersist(clientUploadId);
+    if (inFlightPersistQueues.get(clientUploadId) === queueTail) {
+      inFlightPersistQueues.delete(clientUploadId);
+    }
+    releaseQueue();
+  }
+}
+
+async function persistPendingUploadFileSerial(options: {
+  clientUploadId: string;
+  serverId: string;
+  sessionName: string;
+  composerKey: string;
+  file: File;
+  signal?: AbortSignal;
+}): Promise<{ persisted: boolean; snapshotFile: File | null }> {
+  const { clientUploadId, serverId, sessionName, composerKey, file, signal } = options;
+  let db: IDBDatabase;
+  try {
+    db = await openPendingDb();
+  } catch {
+    return { persisted: false, snapshotFile: null };
+  }
+
+  const mimeType = file.type || 'application/octet-stream';
+  const chunkCount = file.size === 0 ? 0 : Math.ceil(file.size / PENDING_UPLOAD_CHUNK_BYTES);
+  const createdAt = Date.now();
+  const meta: PendingUploadMeta = {
+    clientUploadId,
+    serverId,
+    sessionName,
+    composerKey,
+    name: file.name,
+    mimeType,
+    size: file.size,
+    lastModified: file.lastModified,
+    chunkCount,
+    chunkSize: PENDING_UPLOAD_CHUNK_BYTES,
+    complete: false,
+    createdAt,
+  };
+
+  try {
+    const prepTx = db.transaction([META_STORE_NAME, CHUNK_STORE_NAME], 'readwrite');
+    const metaStore = prepTx.objectStore(META_STORE_NAME);
+    const chunkStore = prepTx.objectStore(CHUNK_STORE_NAME);
+    const existing = await runGetAll<PendingUploadMeta>(metaStore);
+    const now = Date.now();
+
+    const retained: PendingUploadMeta[] = [];
+    for (const item of existing) {
+      if (item.clientUploadId === clientUploadId) {
+        metaStore.delete(item.clientUploadId);
+        deleteUploadChunks(chunkStore, item.clientUploadId);
+        continue;
+      }
+      if (!item.complete && isPersistInFlight(item.clientUploadId)) {
+        // Another persist in this runtime is actively writing chunks; do not sweep it.
+        continue;
+      }
+      if (isExpired(item, now) || !item.complete) {
+        metaStore.delete(item.clientUploadId);
+        deleteUploadChunks(chunkStore, item.clientUploadId);
+        continue;
+      }
+      retained.push(item);
     }
 
-    const mimeType = file.type || 'application/octet-stream';
-    const chunkCount = file.size === 0 ? 0 : Math.ceil(file.size / PENDING_UPLOAD_CHUNK_BYTES);
-    const createdAt = Date.now();
-    const meta: PendingUploadMeta = {
-      clientUploadId,
-      serverId,
-      sessionName,
-      composerKey,
-      name: file.name,
-      mimeType,
-      size: file.size,
-      lastModified: file.lastModified,
-      chunkCount,
-      chunkSize: PENDING_UPLOAD_CHUNK_BYTES,
-      complete: false,
-      createdAt,
-    };
+    retained.sort((a, b) => a.createdAt - b.createdAt);
+    let totalBytes = retained.reduce((sum, item) => sum + (Number.isFinite(item.size) ? item.size : 0), 0);
+    while (retained.length > 0 && totalBytes + file.size > PENDING_UPLOAD_MAX_TOTAL_BYTES) {
+      const oldest = retained.shift()!;
+      totalBytes -= Number.isFinite(oldest.size) ? oldest.size : 0;
+      metaStore.delete(oldest.clientUploadId);
+      deleteUploadChunks(chunkStore, oldest.clientUploadId);
+    }
 
-    try {
-      const prepTx = db.transaction([META_STORE_NAME, CHUNK_STORE_NAME], 'readwrite');
-      const metaStore = prepTx.objectStore(META_STORE_NAME);
-      const chunkStore = prepTx.objectStore(CHUNK_STORE_NAME);
-      const existing = await runGetAll<PendingUploadMeta>(metaStore);
-      const now = Date.now();
+    metaStore.put(meta);
+    await awaitTx(prepTx);
 
-      const retained: PendingUploadMeta[] = [];
-      for (const item of existing) {
-        if (item.clientUploadId === clientUploadId) {
-          metaStore.delete(item.clientUploadId);
-          deleteUploadChunks(chunkStore, item.clientUploadId);
-          continue;
-        }
-        if (!item.complete && isPersistInFlight(item.clientUploadId)) {
-          // Another persist in this runtime is actively writing chunks; do not sweep it.
-          continue;
-        }
-        if (isExpired(item, now) || !item.complete) {
-          metaStore.delete(item.clientUploadId);
-          deleteUploadChunks(chunkStore, item.clientUploadId);
-          continue;
-        }
-        retained.push(item);
-      }
-
-      retained.sort((a, b) => a.createdAt - b.createdAt);
-      let totalBytes = retained.reduce((sum, item) => sum + (Number.isFinite(item.size) ? item.size : 0), 0);
-      while (retained.length > 0 && totalBytes + file.size > PENDING_UPLOAD_MAX_TOTAL_BYTES) {
-        const oldest = retained.shift()!;
-        totalBytes -= Number.isFinite(oldest.size) ? oldest.size : 0;
-        metaStore.delete(oldest.clientUploadId);
-        deleteUploadChunks(chunkStore, oldest.clientUploadId);
-      }
-
-      metaStore.put(meta);
-      await awaitTx(prepTx);
-
-      for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
-        if (signal?.aborted) {
-          await deletePendingUpload(clientUploadId);
-          throw createAbortError();
-        }
-        const start = chunkIndex * PENDING_UPLOAD_CHUNK_BYTES;
-        const end = Math.min(file.size, start + PENDING_UPLOAD_CHUNK_BYTES);
-        const buf = await readBlobArrayBuffer(file.slice(start, end, mimeType));
-        if (signal?.aborted) {
-          await deletePendingUpload(clientUploadId);
-          throw createAbortError();
-        }
-        const chunkTx = db.transaction(CHUNK_STORE_NAME, 'readwrite');
-        chunkTx.objectStore(CHUNK_STORE_NAME).put({
-          clientUploadId,
-          chunkIndex,
-          data: buf,
-        } satisfies PendingUploadChunkRecord);
-        await awaitTx(chunkTx);
-      }
-
+    for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
       if (signal?.aborted) {
         await deletePendingUpload(clientUploadId);
         throw createAbortError();
       }
-
-      const completeMeta: PendingUploadMeta = { ...meta, complete: true };
-      const finalizeTx = db.transaction(META_STORE_NAME, 'readwrite');
-      finalizeTx.objectStore(META_STORE_NAME).put(completeMeta);
-      await awaitTx(finalizeTx);
-
-      const snapshotFile = await readChunkedFileFromDb(db, completeMeta);
-      return { persisted: true, snapshotFile };
-    } catch (error) {
-      await deletePendingUpload(clientUploadId);
-      if ((error instanceof Error && (error.name === 'AbortError' || error.name === 'NotReadableError'))) {
-        throw error;
+      const start = chunkIndex * PENDING_UPLOAD_CHUNK_BYTES;
+      const end = Math.min(file.size, start + PENDING_UPLOAD_CHUNK_BYTES);
+      const buf = await readBlobArrayBuffer(file.slice(start, end, mimeType));
+      if (signal?.aborted) {
+        await deletePendingUpload(clientUploadId);
+        throw createAbortError();
       }
-      return { persisted: false, snapshotFile: null };
+      const chunkTx = db.transaction(CHUNK_STORE_NAME, 'readwrite');
+      chunkTx.objectStore(CHUNK_STORE_NAME).put({
+        clientUploadId,
+        chunkIndex,
+        data: buf,
+      } satisfies PendingUploadChunkRecord);
+      await awaitTx(chunkTx);
     }
-  } finally {
-    removeInFlightPersist(clientUploadId);
+
+    if (signal?.aborted) {
+      await deletePendingUpload(clientUploadId);
+      throw createAbortError();
+    }
+
+    const completeMeta: PendingUploadMeta = { ...meta, complete: true };
+    const finalizeTx = db.transaction(META_STORE_NAME, 'readwrite');
+    finalizeTx.objectStore(META_STORE_NAME).put(completeMeta);
+    await awaitTx(finalizeTx);
+
+    const snapshotFile = await readChunkedFileFromDb(db, completeMeta);
+    return { persisted: true, snapshotFile };
+  } catch (error) {
+    await deletePendingUpload(clientUploadId);
+    if ((error instanceof Error && (error.name === 'AbortError' || error.name === 'NotReadableError'))) {
+      throw error;
+    }
+    return { persisted: false, snapshotFile: null };
   }
 }
 
@@ -344,7 +372,9 @@ export async function listPendingUploadsForKey(
     for (const meta of candidates) {
       const file = await readChunkedFileFromDb(db, meta);
       if (!file) {
-        await deletePendingUpload(meta.clientUploadId);
+        if (!isPersistInFlight(meta.clientUploadId)) {
+          await deletePendingUpload(meta.clientUploadId);
+        }
         continue;
       }
       entries.push({ meta, file });

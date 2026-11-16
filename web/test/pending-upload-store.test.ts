@@ -245,4 +245,120 @@ describe('pending-upload-store', () => {
       'upl-slow-inflight',
     ]);
   });
+
+  it('serializes two concurrent persistPendingUploadFile calls sharing the same clientUploadId without clobbering active chunks', async () => {
+    let resolveFirstRead!: (buf: ArrayBuffer) => void;
+    let markFirstEntered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => { markFirstEntered = resolve; });
+    const firstBytes = new Uint8Array([10, 20, 30, 40]);
+    const firstFile = {
+      name: 'same-id.bin',
+      type: 'application/octet-stream',
+      size: firstBytes.byteLength,
+      lastModified: 100,
+      slice: () => ({
+        arrayBuffer: () => {
+          markFirstEntered();
+          return new Promise<ArrayBuffer>((resolve) => {
+            resolveFirstRead = resolve;
+          });
+        },
+      }),
+    } as unknown as File;
+
+    let secondSliceCalled = false;
+    const secondBytes = new Uint8Array([55, 66, 77, 88]);
+    const secondFile = {
+      name: 'same-id.bin',
+      type: 'application/octet-stream',
+      size: secondBytes.byteLength,
+      lastModified: 100,
+      slice: () => {
+        secondSliceCalled = true;
+        return {
+          arrayBuffer: async () => secondBytes.buffer,
+        };
+      },
+    } as unknown as File;
+
+    const firstPersist = persistPendingUploadFile({
+      clientUploadId: 'upl-shared-id',
+      serverId: 'srv-1',
+      sessionName: '',
+      composerKey: 'composer:main',
+      file: firstFile,
+    });
+    await firstEntered;
+
+    // Launch a second concurrent persist with the SAME clientUploadId while writer 1 is mid-chunk.
+    const secondPersist = persistPendingUploadFile({
+      clientUploadId: 'upl-shared-id',
+      serverId: 'srv-1',
+      sessionName: '',
+      composerKey: 'composer:main',
+      file: secondFile,
+    });
+
+    // Give microtasks a chance to run; writer 2 must wait behind writer 1 rather than touching IDB.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(secondSliceCalled).toBe(false);
+    expect(await listPendingUploadsForKey('composer:main', 'srv-1')).toHaveLength(0);
+
+    resolveFirstRead(firstBytes.buffer);
+    const [res1, res2] = await Promise.all([firstPersist, secondPersist]);
+
+    expect(secondSliceCalled).toBe(true);
+    expect(res1.persisted).toBe(true);
+    expect(Array.from(await readBlobBytes(res1.snapshotFile!))).toEqual([10, 20, 30, 40]);
+    expect(res2.persisted).toBe(true);
+    expect(Array.from(await readBlobBytes(res2.snapshotFile!))).toEqual([55, 66, 77, 88]);
+
+    const listed = await listPendingUploadsForKey('composer:main', 'srv-1');
+    expect(listed).toHaveLength(1);
+    expect(Array.from(await readBlobBytes(listed[0].file))).toEqual([55, 66, 77, 88]);
+
+    // A queued second persist canceled before starting must not wipe an already-committed first persist.
+    let resolveBlockedRead!: (buf: ArrayBuffer) => void;
+    let markBlockedEntered!: () => void;
+    const blockedEntered = new Promise<void>((resolve) => { markBlockedEntered = resolve; });
+    const blockedPersist = persistPendingUploadFile({
+      clientUploadId: 'upl-shared-abort',
+      serverId: 'srv-1',
+      sessionName: '',
+      composerKey: 'composer:main',
+      file: {
+        name: 'keep.bin',
+        type: 'application/octet-stream',
+        size: firstBytes.byteLength,
+        lastModified: 100,
+        slice: () => ({
+          arrayBuffer: () => {
+            markBlockedEntered();
+            return new Promise<ArrayBuffer>((resolve) => {
+              resolveBlockedRead = resolve;
+            });
+          },
+        }),
+      } as unknown as File,
+    });
+    await blockedEntered;
+
+    const ac = new AbortController();
+    const abortedQueued = persistPendingUploadFile({
+      clientUploadId: 'upl-shared-abort',
+      serverId: 'srv-1',
+      sessionName: '',
+      composerKey: 'composer:main',
+      file: secondFile,
+      signal: ac.signal,
+    });
+    ac.abort();
+    resolveBlockedRead(firstBytes.buffer);
+
+    await expect(blockedPersist).resolves.toMatchObject({ persisted: true });
+    await expect(abortedQueued).rejects.toMatchObject({ name: 'AbortError' });
+    const finalList = await listPendingUploadsForKey('composer:main', 'srv-1');
+    expect(finalList.map((e) => e.meta.clientUploadId).sort()).toEqual(['upl-shared-abort', 'upl-shared-id']);
+  });
 });
