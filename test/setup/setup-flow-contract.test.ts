@@ -242,6 +242,7 @@ describe('setupFlow contracts', () => {
     expect(turnConfig).not.toContain('denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff');
     expect(turnConfig).toContain('denied-peer-ip=203.0.113.10-203.0.113.10');
     expect(turnConfig).toContain('allowed-peer-ip=203.0.113.10-203.0.113.10');
+    expect(turnEntrypoint).toContain('ip -o -4 addr show scope global');
     expect(turnEntrypoint).toContain('hostname -i');
     expect(turnEntrypoint).toContain('--allowed-peer-ip="${turn_container_ipv4}-${turn_container_ipv4}"');
     expect(turnEntrypoint).toContain('exec docker-entrypoint.sh "$@"');
@@ -258,6 +259,66 @@ describe('setupFlow contracts', () => {
     expect(statSync(join(projectDir, 'turn-entrypoint.sh')).mode & 0o777).toBe(0o700);
     const commands = execSyncMock.mock.calls.map(([cmd]) => String(cmd));
     expect(commands.some((cmd) => cmd.includes('up -d --force-recreate turn'))).toBe(true);
+  });
+
+  it('resolves coturn container IPv4 via ip first, falls back to hostname -i under set -eu, and fails closed', async () => {
+    const { turnEntrypointTemplate } = await import('../../src/setup/templates.js');
+    const awkPath = spawnSync('/bin/sh', ['-c', 'command -v awk'], { encoding: 'utf8' }).stdout.trim();
+    expect(awkPath.length).toBeGreaterThan(0);
+
+    const runEntrypoint = (opts: { ipScript?: string; hostnameScript: string }) => {
+      const workDir = mkdtempSync(join(testRoot, 'turn-ep-'));
+      const binDir = join(workDir, 'bin');
+      mkdirSync(binDir, { recursive: true });
+      const scriptPath = join(workDir, 'turn-entrypoint.sh');
+      writeFileSync(scriptPath, turnEntrypointTemplate(), { mode: 0o700 });
+      writeFileSync(join(binDir, 'awk'), `#!/bin/sh\nexec "${awkPath}" "$@"\n`, { mode: 0o755 });
+      writeFileSync(join(binDir, 'docker-entrypoint.sh'), '#!/bin/sh\nprintf "%s\\n" "$*"\n', { mode: 0o755 });
+      writeFileSync(join(binDir, 'hostname'), opts.hostnameScript, { mode: 0o755 });
+      if (opts.ipScript !== undefined) {
+        writeFileSync(join(binDir, 'ip'), opts.ipScript, { mode: 0o755 });
+      }
+      return spawnSync('/bin/sh', [scriptPath, '--no-cli'], {
+        encoding: 'utf8',
+        env: { PATH: binDir },
+      });
+    };
+
+    // 1. Primary ip lookup strips CIDR and selects first global IPv4 even if hostname -i fails
+    const primaryRes = runEntrypoint({
+      ipScript: [
+        '#!/bin/sh',
+        'if [ "$*" != "-o -4 addr show scope global" ]; then exit 2; fi',
+        'printf "2: eth0    inet 172.21.0.7/16 brd 172.21.255.255 scope global eth0\\n"',
+        'printf "3: eth1    inet 10.10.0.5/24 scope global eth1\\n"',
+      ].join('\n') + '\n',
+      hostnameScript: '#!/bin/sh\necho "hostname: 5ca800958181: Try again" >&2\nexit 1\n',
+    });
+    expect(primaryRes.status, primaryRes.stderr).toBe(0);
+    expect(primaryRes.stdout.trim()).toBe('--no-cli --allowed-peer-ip=172.21.0.7-172.21.0.7');
+
+    // 2. Fallback to hostname -i when ip binary is absent
+    const missingIpRes = runEntrypoint({
+      hostnameScript: '#!/bin/sh\nprintf "::1 172.22.0.9\\n"\n',
+    });
+    expect(missingIpRes.status, missingIpRes.stderr).toBe(0);
+    expect(missingIpRes.stdout.trim()).toBe('--no-cli --allowed-peer-ip=172.22.0.9-172.22.0.9');
+
+    // 3. Fallback to hostname -i when ip returns empty
+    const emptyIpRes = runEntrypoint({
+      ipScript: '#!/bin/sh\nexit 0\n',
+      hostnameScript: '#!/bin/sh\nprintf "192.0.2.44\\n"\n',
+    });
+    expect(emptyIpRes.status, emptyIpRes.stderr).toBe(0);
+    expect(emptyIpRes.stdout.trim()).toBe('--no-cli --allowed-peer-ip=192.0.2.44-192.0.2.44');
+
+    // 4. Fails closed when neither ip nor hostname -i provides a valid IPv4
+    const failClosedRes = runEntrypoint({
+      ipScript: '#!/bin/sh\nexit 1\n',
+      hostnameScript: '#!/bin/sh\necho "hostname: 5ca800958181: Try again" >&2\nexit 1\n',
+    });
+    expect(failClosedRes.status).toBe(1);
+    expect(failClosedRes.stderr).toContain('Unable to determine coturn container IPv4');
   });
 
   it('uses the same reachable registry proxy for coturn in mirror mode', async () => {

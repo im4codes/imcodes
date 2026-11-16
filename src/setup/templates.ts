@@ -384,28 +384,36 @@ export function turnEntrypointTemplate(): string {
   return `#!/bin/sh
 set -eu
 
-turn_container_ipv4="$(hostname -i | awk '
-  {
-    for (i = 1; i <= NF; i++) {
-      count = split($i, octets, ".")
-      valid = count == 4
-      for (j = 1; valid && j <= 4; j++) {
-        valid = octets[j] ~ /^[0-9]+$/ && octets[j] >= 0 && octets[j] <= 255
-      }
-      if (valid) {
-        print $i
-        exit
+extract_ipv4() {
+  awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        count = split($i, octets, ".")
+        valid = count == 4
+        for (j = 1; valid && j <= 4; j++) {
+          valid = octets[j] ~ /^[0-9]+$/ && octets[j] >= 0 && octets[j] <= 255
+        }
+        if (valid) {
+          print $i
+          exit
+        }
       }
     }
-  }
-')"
+  '
+}
+
+turn_container_ipv4="$({ ip -o -4 addr show scope global 2>/dev/null || true; } | awk '{sub(/\\/.*/, "", $4); print $4}' | extract_ipv4 || true)"
+
+if [ -z "$turn_container_ipv4" ]; then
+  turn_container_ipv4="$({ hostname -i 2>/dev/null || true; } | extract_ipv4 || true)"
+fi
 
 if [ -z "$turn_container_ipv4" ]; then
   echo "Unable to determine coturn container IPv4" >&2
   exit 1
 fi
 
-exec docker-entrypoint.sh "$@" \
+exec docker-entrypoint.sh "$@" \\
   --allowed-peer-ip="\${turn_container_ipv4}-\${turn_container_ipv4}"
 `;
 }
