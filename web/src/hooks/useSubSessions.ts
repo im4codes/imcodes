@@ -117,7 +117,7 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
 export function buildSubSessionRebuildInputs(
   subSessions: readonly SubSession[],
 ): Parameters<WsClient['subSessionRebuildAll']>[0] {
-  return subSessions.map((s) => ({
+  return subSessions.filter((s) => !s.incognito).map((s) => ({
     id: s.id,
     type: s.type,
     runtimeType: s.runtimeType,
@@ -137,6 +137,20 @@ export function buildSubSessionRebuildInputs(
   }));
 }
 
+function mergeIncognitoSubSessions(
+  primary: readonly SubSession[],
+  fallback: readonly SubSession[],
+): SubSession[] {
+  const byId = new Map<string, SubSession>();
+  for (const s of fallback) {
+    if (s.incognito) byId.set(s.id, s);
+  }
+  for (const s of primary) {
+    if (s.incognito) byId.set(s.id, s);
+  }
+  return [...byId.values()];
+}
+
 export function useSubSessions(
   serverId: string | null,
   ws: WsClient | null,
@@ -144,20 +158,59 @@ export function useSubSessions(
   activeSession?: string | null,
   disableHttpLoad = false,
 ) {
-  const [subSessions, setSubSessions] = useState<SubSession[]>([]);
+  const [subSessions, setSubSessionsRaw] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
   const rebuiltRef = useRef(false);
-  const pendingIncognitoCreateIdsRef = useRef<Set<string>>(new Set());
+  const serverIdRef = useRef<string | null>(serverId);
+  serverIdRef.current = serverId;
+  const incognitoByServerRef = useRef<Map<string, SubSession[]>>(new Map());
+  const pendingIncognitoCreateIdsByServerRef = useRef<Map<string, Set<string>>>(new Map());
+  const prevServerIdForEffectRef = useRef<string | null>(serverId);
+  const getPendingIncognitoSet = useCallback((targetServerId: string | null | undefined): Set<string> | null => {
+    if (!targetServerId) return null;
+    let set = pendingIncognitoCreateIdsByServerRef.current.get(targetServerId);
+    if (!set) {
+      set = new Set<string>();
+      pendingIncognitoCreateIdsByServerRef.current.set(targetServerId, set);
+    }
+    return set;
+  }, []);
+  const syncIncognitoStore = useCallback((targetServerId: string | null | undefined, list: readonly SubSession[]) => {
+    if (!targetServerId) return;
+    const incognitoOnly = list.filter((s) => s.incognito === true);
+    if (incognitoOnly.length > 0) incognitoByServerRef.current.set(targetServerId, incognitoOnly);
+    else incognitoByServerRef.current.delete(targetServerId);
+  }, []);
+  const setSubSessions = useCallback((
+    updater: SubSession[] | ((prev: SubSession[]) => SubSession[]),
+    explicitServerId?: string | null,
+  ) => {
+    const targetServerId = explicitServerId === undefined ? serverIdRef.current : explicitServerId;
+    setSubSessionsRaw((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      if (targetServerId && serverIdRef.current === targetServerId) {
+        syncIncognitoStore(targetServerId, next);
+      }
+      return next;
+    });
+  }, [syncIncognitoStore]);
   // Load from PG — retries indefinitely with backoff until successful.
   // Re-triggers when serverId changes or the WS performs a real reconnect.
   const loadGenRef = useRef(0);
   const loadedGenRef = useRef(0);
   useEffect(() => {
+    const serverChanged = prevServerIdForEffectRef.current !== serverId;
+    prevServerIdForEffectRef.current = serverId;
     if (!serverId) {
-      pendingIncognitoCreateIdsRef.current.clear();
-      setSubSessions([]);
+      setSubSessionsRaw([]);
       setLoadedServerId(null);
       return;
+    }
+    const savedIncognito = incognitoByServerRef.current.get(serverId) ?? [];
+    if (serverChanged) {
+      // Seed preserved in-memory incognito sub-sessions for this server immediately
+      // without clearing or touching other servers' incognito entries.
+      setSubSessionsRaw(savedIncognito);
     }
     if (disableHttpLoad) {
       const gen = ++loadGenRef.current;
@@ -168,14 +221,6 @@ export function useSubSessions(
     }
     if (!connected) {
       rebuiltRef.current = false;
-      pendingIncognitoCreateIdsRef.current.clear();
-      setSubSessions((prev) => {
-        if (!prev.some((s) => s.incognito)) return prev;
-        for (const s of prev) {
-          if (s.incognito) forgetIncognitoTimelineSessions(serverId, s.sessionName);
-        }
-        return prev.filter((s) => !s.incognito);
-      });
       return;
     }
     rebuiltRef.current = false;
@@ -192,8 +237,14 @@ export function useSubSessions(
           loadedGenRef.current = gen;
           setSubSessions((prev) => {
             const previousById = new Map(prev.map((existing) => [existing.id, existing] as const));
-            return list.map((s) => mergeLoadedSubSession(s, previousById.get(s.id)));
-          });
+            const loaded = list.map((s) => mergeLoadedSubSession(s, previousById.get(s.id)));
+            const loadedIds = new Set(loaded.map((s) => s.id));
+            const preservedIncognito = mergeIncognitoSubSessions(
+              prev,
+              incognitoByServerRef.current.get(serverId!) ?? [],
+            ).filter((s) => !loadedIds.has(s.id));
+            return preservedIncognito.length > 0 ? [...loaded, ...preservedIncognito] : loaded;
+          }, serverId);
           setLoadedServerId(serverId);
         })
         .catch((err) => {
@@ -343,6 +394,16 @@ export function useSubSessions(
               }
             };
             for (const m of validItems) {
+              const currentServerId = serverIdRef.current;
+              const sessionNameForCreate = m.sessionName || `deck_sub_${m.id}`;
+              const isIncog = m.incognito === true;
+              if (isIncog) {
+                getPendingIncognitoSet(currentServerId)?.delete(m.id);
+                registerIncognitoTimelineSession(currentServerId, sessionNameForCreate, {
+                  ...(m.sessionInstanceId ? { sessionInstanceId: m.sessionInstanceId } : {}),
+                  ...(m.runtimeEpoch !== undefined ? { runtimeEpoch: m.runtimeEpoch } : {}),
+                });
+              }
               const foundIdx = indexById ? indexById.get(m.id) : next.findIndex((s) => s.id === m.id);
               const existingIdx = foundIdx !== undefined && foundIdx !== -1 ? foundIdx : undefined;
               if (existingIdx !== undefined) {
@@ -357,6 +418,7 @@ export function useSubSessions(
                 ensureClone();
                 next[existingIdx] = {
                   ...existing,
+                  ...(isIncog || existing.incognito ? { incognito: true, serverId: currentServerId ?? existing.serverId } : {}),
                   ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
                   ...(m.state != null && { state: m.state as SubSession['state'] }),
                   ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
@@ -394,7 +456,6 @@ export function useSubSessions(
                   updatedAt: now,
                 };
               } else {
-                const sessionNameForCreate = m.sessionName || `deck_sub_${m.id}`;
                 const transportPendingPatch = buildTransportPendingSyncPatch({}, m, sessionNameForCreate);
                 ensureClone();
                 indexById?.set(m.id, next.length);
@@ -402,7 +463,7 @@ export function useSubSessions(
                   id: m.id,
                   sessionInstanceId: m.sessionInstanceId ?? null,
                   runtimeEpoch: m.runtimeEpoch ?? null,
-                  serverId: '',
+                  serverId: (isIncog ? currentServerId : '') ?? '',
                   type: m.sessionType || 'shell',
                   sessionName: sessionNameForCreate,
                   runtimeType: m.runtimeType ?? getSessionRuntimeType(m.sessionType || 'shell'),
@@ -415,6 +476,7 @@ export function useSubSessions(
                   createdAt: now,
                   updatedAt: now,
                   state: (m.state || 'idle') as SubSession['state'],
+                  ...(isIncog ? { incognito: true } : {}),
                   ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
                   qwenModel: m.qwenModel ?? null,
                   requestedModel: m.requestedModel ?? null,
@@ -453,8 +515,9 @@ export function useSubSessions(
           ? m.id
           : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
         if (removedId) {
-          pendingIncognitoCreateIdsRef.current.delete(removedId);
-          forgetIncognitoTimelineSessions(serverId, rawSession || toSessionName(removedId));
+          const activeServer = serverIdRef.current;
+          getPendingIncognitoSet(activeServer)?.delete(removedId);
+          forgetIncognitoTimelineSessions(activeServer, rawSession || toSessionName(removedId));
           setSubSessions((prev) => prev.filter((s) => s.id !== removedId));
         }
         return;
@@ -469,16 +532,19 @@ export function useSubSessions(
           ? m.id
           : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
         const messageText = typeof m.message === 'string' ? m.message : '';
-        const isIncognitoError = messageText === SESSION_INCOGNITO_UNSUPPORTED || /incognito/i.test(messageText);
-        if (errId && (pendingIncognitoCreateIdsRef.current.has(errId) || isIncognitoError)) {
-          pendingIncognitoCreateIdsRef.current.delete(errId);
-          forgetIncognitoTimelineSessions(serverId, rawSession || toSessionName(errId));
+        const activeServer = serverIdRef.current;
+        const pendingSet = getPendingIncognitoSet(activeServer);
+        const isIncognitoUnsupported = messageText === SESSION_INCOGNITO_UNSUPPORTED;
+        const isPendingIncognitoError = messageText === SESSION_INCOGNITO_UNSUPPORTED || /incognito/i.test(messageText);
+        if (errId && (pendingSet?.has(errId) || isIncognitoUnsupported)) {
+          pendingSet?.delete(errId);
+          forgetIncognitoTimelineSessions(activeServer, rawSession || toSessionName(errId));
           setSubSessions((prev) => prev.filter((s) => s.id !== errId));
-        } else if (!errId && isIncognitoError && pendingIncognitoCreateIdsRef.current.size > 0) {
-          const rollbackIds = new Set(pendingIncognitoCreateIdsRef.current);
-          pendingIncognitoCreateIdsRef.current.clear();
+        } else if (!errId && isPendingIncognitoError && pendingSet && pendingSet.size > 0) {
+          const rollbackIds = new Set(pendingSet);
+          pendingSet.clear();
           for (const id of rollbackIds) {
-            forgetIncognitoTimelineSessions(serverId, toSessionName(id));
+            forgetIncognitoTimelineSessions(activeServer, toSessionName(id));
           }
           setSubSessions((prev) => prev.filter((s) => !rollbackIds.has(s.id)));
         }
@@ -489,12 +555,14 @@ export function useSubSessions(
       if (msg.type === 'subsession.sync') {
         const m = msg as any;
         if (m.id) {
+          getPendingIncognitoSet(serverIdRef.current)?.delete(m.id);
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
             if (isOlderActivityGeneration(m.activityGeneration, s.activityGeneration)) return s;
             const preserveQuota = isQuotaPreservingSubSessionType(s.type);
             const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
+              ...(m.incognito === true || s.incognito ? { incognito: true } : {}),
               ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
               ...(m.sessionInstanceId !== undefined ? { sessionInstanceId: m.sessionInstanceId } : {}),
@@ -685,7 +753,7 @@ export function useSubSessions(
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
       if (state && state !== 'starting' && state !== 'error') {
-        pendingIncognitoCreateIdsRef.current.delete(sessionName.slice('deck_sub_'.length));
+        getPendingIncognitoSet(serverIdRef.current)?.delete(sessionName.slice('deck_sub_'.length));
       }
       if (state === 'queued' || state === 'running' || state === 'idle') {
         // Streaming text, tool calls and repeated session.state frames say
@@ -795,7 +863,7 @@ export function useSubSessions(
       }
       if (isPrivate) {
         registerIncognitoTimelineSession(serverId, res.sessionName);
-        pendingIncognitoCreateIdsRef.current.add(res.id);
+        getPendingIncognitoSet(serverId)?.add(res.id);
       }
       const sub: SubSession = {
         ...res.subSession,
@@ -857,18 +925,18 @@ export function useSubSessions(
     const sub = subSessions.find((s) => s.id === id);
     if (!sub) return;
     // Stop the session
-    ws?.subSessionStop(sub.sessionName);
+    ws?.subSessionStop?.(sub.sessionName);
     if (sub.incognito && (!ws || !connected)) {
-      pendingIncognitoCreateIdsRef.current.delete(id);
+      getPendingIncognitoSet(serverId)?.delete(id);
       forgetIncognitoTimelineSessions(serverId, sub.sessionName);
-      setSubSessions((prev) => prev.filter((s) => s.id !== id));
+      setSubSessions((prev) => prev.filter((s) => s.id !== id), serverId);
       return;
     }
     // Keep the sub-session visible until daemon/server confirm successful close.
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, state: 'stopping' } : s,
-    ));
-  }, [serverId, ws, connected, subSessions]);
+    ), serverId);
+  }, [serverId, ws, connected, subSessions, getPendingIncognitoSet, setSubSessions]);
 
   const restart = useCallback(async (id: string) => {
     if (!serverId || !ws) return;

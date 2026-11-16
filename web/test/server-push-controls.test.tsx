@@ -340,6 +340,7 @@ vi.mock('../src/watch-projection.js', () => ({
 vi.mock('../src/hooks/useTimeline.js', () => ({
   syncIncognitoTimelineSessions: vi.fn(),
   forgetIncognitoTimelineSessions: vi.fn(),
+  isIncognitoTimelineSession: vi.fn(() => false),
   ingestTimelineEventForCache: vi.fn(),
   requestActiveTimelineRefresh: vi.fn(),
   dispatchActiveTimelineRefresh: vi.fn(),

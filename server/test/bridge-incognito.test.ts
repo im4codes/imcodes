@@ -472,4 +472,86 @@ describe('server WsBridge incognito privacy isolation (F3)', () => {
       errorReason: TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED,
     }));
   });
+
+  it('re-registers live incognito sub-sessions strictly in memory on daemon subsession.sync and replays them to reconnecting browsers with zero DB writes', async () => {
+    const { bridge, daemonWs, browserWs, executedSql } = await setupBridge();
+
+    daemonWs.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'restore01',
+      sessionType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      cwd: '/tmp/secret-restore',
+      label: 'Restored Secret Sub',
+      parentSession: 'deck_priv_brain',
+      state: 'running',
+      incognito: true,
+    }));
+    await flushAsync();
+
+    // Must not touch sub_sessions DB at all
+    expect(executedSql.filter((q) => q.sql.includes('sub_sessions'))).toEqual([]);
+    expect((bridge as unknown as { incognitoSessions: Set<string> }).incognitoSessions.has('deck_sub_restore01')).toBe(true);
+    expect((bridge as unknown as { activeSubSessions: Map<string, unknown> }).activeSubSessions.has('deck_sub_restore01')).toBe(true);
+
+    // Connected browsers receive in-memory subsession.created with incognito: true
+    const firstBrowserMsgs = browserWs.sent.map((item) => JSON.parse(String(item)) as Record<string, unknown>);
+    expect(firstBrowserMsgs).toContainEqual(expect.objectContaining({
+      type: 'subsession.created',
+      id: 'restore01',
+      sessionName: 'deck_sub_restore01',
+      sessionType: 'claude-code-sdk',
+      label: 'Restored Secret Sub',
+      parentSession: 'deck_priv_brain',
+      state: 'running',
+      incognito: true,
+    }));
+
+    // Simulate switching away and back (browser reconnects while daemon stayed connected)
+    const browserWs2 = new MockWs();
+    bridge.handleBrowserConnection(browserWs2 as never, 'u1', {
+      queryOne: async () => null,
+      query: async () => [],
+      execute: async (sql: string, params: unknown[] = []) => {
+        executedSql.push({ sql, params });
+        return { changes: 1 };
+      },
+    } as never);
+    await flushAsync();
+
+    const replayedMsgs = browserWs2.sent.map((item) => JSON.parse(String(item)) as Record<string, unknown>);
+    expect(replayedMsgs).toContainEqual(expect.objectContaining({
+      type: 'subsession.created',
+      id: 'restore01',
+      sessionName: 'deck_sub_restore01',
+      label: 'Restored Secret Sub',
+      state: 'running',
+      incognito: true,
+    }));
+    expect(executedSql.filter((q) => q.sql.includes('sub_sessions'))).toEqual([]);
+
+    // Reconnecting browser can also subscribe/request history for the incognito sub-session
+    daemonWs.sent.length = 0;
+    browserWs2.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_sub_restore01',
+      requestId: 'hist-restore-ok',
+      limit: 50,
+    }));
+    await flushAsync();
+    expect(daemonWs.sent.some((raw) => JSON.parse(String(raw)).requestId === 'hist-restore-ok')).toBe(true);
+
+    // Manual close via subsession.closed removes it from in-memory metadata so later browsers won't see it
+    daemonWs.emit('message', JSON.stringify({
+      type: 'subsession.closed',
+      id: 'restore01',
+      sessionName: 'deck_sub_restore01',
+      incognito: true,
+    }));
+    await flushAsync();
+    const browserWs3 = new MockWs();
+    bridge.handleBrowserConnection(browserWs3 as never, 'u1', {} as never);
+    await flushAsync();
+    expect(browserWs3.sent.map((item) => String(item)).join('\n')).not.toContain('restore01');
+  });
 });

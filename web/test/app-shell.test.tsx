@@ -383,6 +383,7 @@ vi.mock('../src/hooks/useTimeline.js', () => ({
   registerIncognitoTimelineSession: vi.fn(),
   registerNormalTimelineSession: vi.fn(),
   forgetIncognitoTimelineSessions: vi.fn(),
+  isIncognitoTimelineSession: vi.fn(() => false),
   ingestTimelineEventForCache: vi.fn(),
   requestActiveTimelineRefresh: vi.fn(),
   requestActiveTimelineRefreshAfterUserAction: vi.fn(),

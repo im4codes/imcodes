@@ -2240,6 +2240,7 @@ export class WsBridge {
   // Session names are only unique within a daemon, never across owners.
   private readonly incognitoSessions = new Set<string>();
   private readonly pendingIncognitoSubSessionStarts = new Map<string, { id: string; sessionName: string }>();
+  private readonly incognitoSubSessionMetadata = new Map<string, Record<string, unknown>>();
   private readonly rejectedIncognitoSubSessions = new Set<string>();
   private static instances = new Map<string, WsBridge>();
   private static remoteDesktopReconnectRevalidator: ((serverId: string) => Promise<void>) | null = null;
@@ -6425,6 +6426,7 @@ export class WsBridge {
         this.recentTextBySession.clear();
         this.incognitoSessions.clear();
         this.pendingIncognitoSubSessionStarts.clear();
+        this.incognitoSubSessionMetadata.clear();
         this.rejectedIncognitoSubSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
@@ -7055,6 +7057,7 @@ export class WsBridge {
         this.recentTextBySession.clear();
         this.incognitoSessions.clear();
         this.pendingIncognitoSubSessionStarts.clear();
+        this.incognitoSubSessionMetadata.clear();
         this.rejectedIncognitoSubSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
@@ -7391,6 +7394,10 @@ export class WsBridge {
       // Push cached remote sessions for each connected provider
       for (const [providerId, sessions] of this.providerRemoteSessions) {
         sendInitial(JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
+      }
+      for (const [subName, meta] of this.incognitoSubSessionMetadata) {
+        const liveState = this.activeSubSessions.get(subName)?.state;
+        sendInitial(JSON.stringify(liveState ? { ...meta, state: liveState } : meta));
       }
     }
     // Worker refresh status is durable per controlled node. Replay the latest
@@ -8034,16 +8041,41 @@ export class WsBridge {
           }));
           return;
         }
+        const subLabel = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
+        const subRuntimeType = agentType ? getSessionRuntimeType(agentType) : undefined;
         this.rejectedIncognitoSubSessions.delete(subSessionName);
         this.incognitoSessions.add(subSessionName);
         this.pendingIncognitoSubSessionStarts.set(subSessionName, { id: msg.id, sessionName: subSessionName });
         this.activeSubSessions.set(subSessionName, {
           name: subSessionName,
           state: 'starting',
-          label: typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined,
+          label: subLabel,
           parentSession,
           agentType,
-          runtimeType: agentType ? getSessionRuntimeType(agentType) : undefined,
+          runtimeType: subRuntimeType,
+        });
+        this.incognitoSubSessionMetadata.set(subSessionName, {
+          type: 'subsession.created',
+          id: msg.id,
+          sessionName: subSessionName,
+          sessionType: agentType ?? null,
+          runtimeType: subRuntimeType ?? null,
+          providerId: subRuntimeType === 'transport' ? (agentType ?? null) : null,
+          cwd: typeof msg.cwd === 'string' ? msg.cwd : null,
+          label: subLabel ?? null,
+          parentSession: parentSession ?? null,
+          state: 'starting',
+          requestedModel: typeof msg.requestedModel === 'string'
+            ? msg.requestedModel
+            : (typeof msg.model === 'string' ? msg.model : null),
+          activeModel: typeof msg.requestedModel === 'string'
+            ? msg.requestedModel
+            : (typeof msg.model === 'string' ? msg.model : null),
+          effort: typeof msg.thinking === 'string'
+            ? msg.thinking
+            : (typeof msg.effort === 'string' ? msg.effort : null),
+          transportConfig: msg.transportConfig && typeof msg.transportConfig === 'object' ? msg.transportConfig : null,
+          incognito: true,
         });
       }
       if (browserMessageType === 'subsession.stop' && typeof msg.sessionName === 'string' && msg.sessionName) {
@@ -9855,6 +9887,7 @@ export class WsBridge {
       const acceptedItems: Record<string, unknown>[] = [];
       for (const item of rawItems) {
         if (isIncognitoSession(item) || (typeof item.id === 'string' && this.incognitoSessions.has(`deck_sub_${item.id}`))) {
+          this.registerInMemoryIncognitoSubSession(item);
           continue;
         }
         if (this.registerActiveSubSessionFromSync(item)) acceptedItems.push(item);
@@ -10318,6 +10351,53 @@ export class WsBridge {
     this.pendingIncognitoSubSessionStarts.delete(sessionName);
   }
 
+  private registerInMemoryIncognitoSubSession(item: Record<string, unknown>): void {
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    if (!id) return;
+    const subSessionName = `deck_sub_${id}`;
+    if (isKnownTestSessionLike({
+      name: subSessionName,
+      cwd: typeof item.cwd === 'string' ? item.cwd : undefined,
+      parentSession: typeof item.parentSession === 'string' ? item.parentSession : undefined,
+    })) {
+      return;
+    }
+    this.rejectedIncognitoSubSessions.delete(subSessionName);
+    this.incognitoSessions.add(subSessionName);
+    this.pendingIncognitoSubSessionStarts.delete(subSessionName);
+    this.registerActiveSubSessionFromSync(item);
+    const agentType = typeof item.sessionType === 'string' && item.sessionType ? item.sessionType : undefined;
+    const runtimeType = typeof item.runtimeType === 'string'
+      ? item.runtimeType
+      : (agentType ? getSessionRuntimeType(agentType) : undefined);
+    const payload: Record<string, unknown> = {
+      type: 'subsession.created',
+      id,
+      sessionName: subSessionName,
+      sessionType: agentType ?? null,
+      runtimeType: runtimeType ?? null,
+      providerId: typeof item.providerId === 'string' ? item.providerId : (runtimeType === 'transport' ? (agentType ?? null) : null),
+      cwd: typeof item.cwd === 'string' ? item.cwd : null,
+      label: typeof item.label === 'string' ? item.label : null,
+      parentSession: typeof item.parentSession === 'string' ? item.parentSession : null,
+      state: typeof item.state === 'string' ? item.state : null,
+      ...(item.sessionInstanceId !== undefined ? { sessionInstanceId: item.sessionInstanceId } : {}),
+      ...(item.runtimeEpoch !== undefined ? { runtimeEpoch: item.runtimeEpoch } : {}),
+      ...(item.requestedModel !== undefined ? { requestedModel: item.requestedModel } : {}),
+      ...(item.activeModel !== undefined ? { activeModel: item.activeModel } : {}),
+      ...(item.modelDisplay !== undefined ? { modelDisplay: item.modelDisplay } : {}),
+      ...(item.planLabel !== undefined ? { planLabel: item.planLabel } : {}),
+      ...(item.quotaLabel !== undefined ? { quotaLabel: item.quotaLabel } : {}),
+      ...(item.quotaUsageLabel !== undefined ? { quotaUsageLabel: item.quotaUsageLabel } : {}),
+      ...(item.quotaMeta !== undefined ? { quotaMeta: item.quotaMeta } : {}),
+      ...(item.effort !== undefined ? { effort: item.effort } : {}),
+      ...(item.transportConfig !== undefined ? { transportConfig: item.transportConfig } : {}),
+      incognito: true,
+    };
+    this.incognitoSubSessionMetadata.set(subSessionName, payload);
+    this.broadcastToBrowsers(JSON.stringify(payload));
+  }
+
   private cleanupIncognitoSubSession(sessionName: string, explicitId?: string): void {
     const id = explicitId || rawSubSessionIdFromDisplayName(sessionName) || '';
     const canonicalName = sessionName || (id ? `deck_sub_${id}` : '');
@@ -10325,6 +10405,7 @@ export class WsBridge {
     const wasTracked = this.incognitoSessions.delete(canonicalName);
     const hadActive = this.activeSubSessions.delete(canonicalName);
     const wasPending = this.pendingIncognitoSubSessionStarts.delete(canonicalName);
+    this.incognitoSubSessionMetadata.delete(canonicalName);
     if (this.rejectedIncognitoSubSessions.size >= 256) {
       this.rejectedIncognitoSubSessions.clear();
     }

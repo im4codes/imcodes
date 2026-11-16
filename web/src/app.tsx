@@ -1042,6 +1042,13 @@ function InternalMainApp() {
     };
   }, []);
   const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
+  // In-memory-only incognito preservation across server switches & reconnects.
+  // Never written to localStorage / sessionStorage / IndexedDB.
+  const incognitoOpenSubWindowsRef = useRef<Map<string, Set<string>>>(new Map());
+  const incognitoMaximizedSubWindowsRef = useRef<Map<string, Set<string>>>(new Map());
+  const incognitoActiveSessionByServerRef = useRef<Map<string, string>>(new Map());
+  const incognitoMainSessionsByServerRef = useRef<Map<string, SessionInfo[]>>(new Map());
+  const manualStoppedMainSessionsRef = useRef<Set<string>>(new Set());
   const clearAuthState = useCallback(async (
     reason?: string,
     options?: {
@@ -1116,6 +1123,11 @@ function InternalMainApp() {
     setShowSharedReturnGuide(false);
     setOpenSubIds(new Set());
     setMaximizedSubIds(new Set());
+    incognitoOpenSubWindowsRef.current.clear();
+    incognitoMaximizedSubWindowsRef.current.clear();
+    incognitoActiveSessionByServerRef.current.clear();
+    incognitoMainSessionsByServerRef.current.clear();
+    manualStoppedMainSessionsRef.current.clear();
     setDiscussions([]);
     setRepoContexts(new Map());
     if (preserveSharedRoute) {
@@ -2292,7 +2304,7 @@ function InternalMainApp() {
     ).then((data) => {
       clearTimeout(timer);
       if (cancelled || ctrl.signal.aborted || selectedServerIdRef.current !== targetServerId) return;
-      const mapped = data.sessions.map((s) => ({
+      const mapped: SessionInfo[] = data.sessions.map((s) => ({
         name: s.name,
         project: s.project_name,
         role: s.role as SessionInfo['role'],
@@ -2316,14 +2328,31 @@ function InternalMainApp() {
         quotaUsageLabel: undefined,
         quotaMeta: undefined,
       }));
-      setSessions((prev) => mapped.map((s) => {
-        const existing = prev.find((p) => p.name === s.name);
-        return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
-      }));
-      const navigableMapped = mapped.filter(isNavigableMainSession);
+      const preservedIncognito = incognitoMainSessionsByServerRef.current.get(targetServerId) ?? [];
+      setSessions((prev) => {
+        const mergedLoaded = mapped.map((s) => {
+          const existing = prev.find((p) => p.name === s.name);
+          return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
+        });
+        const loadedNames = new Set(mergedLoaded.map((s) => s.name));
+        const incogByName = new Map<string, SessionInfo>();
+        for (const s of preservedIncognito) {
+          if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
+        }
+        for (const s of prev) {
+          if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
+        }
+        return incogByName.size > 0 ? [...mergedLoaded, ...incogByName.values()] : mergedLoaded;
+      });
+      const loadedNamesSet = new Set(mapped.map((s) => s.name));
+      const allForNav = [
+        ...mapped,
+        ...preservedIncognito.filter((s) => !loadedNamesSet.has(s.name)),
+      ];
+      const navigableMapped = allForNav.filter(isNavigableMainSession);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
       // so wait for WS session_list to avoid flashing "No active sessions"
-      if (mapped.length > 0) {
+      if (allForNav.length > 0) {
         setSessionsLoaded(true);
       }
       // Restore the last tab for this server, never the global session value
@@ -2612,17 +2641,48 @@ function InternalMainApp() {
   const [activeSplitPairTaskId, setActiveSplitPairTaskId] = useState<string | null>(null);
   const persistOpenSubIds = useCallback((next: Set<string>) => {
     const mainSession = openSubPersistenceSessionRef.current;
+    const srvId = openSubPersistenceServerRef.current;
     if (!mainSession) return;
-    const ids = Array.from(next);
+    const isIncogSub = (id: string) => (
+      rawSubSessionsRef.current.some((s) => s.id === id && s.incognito === true)
+      || isIncognitoTimelineSession(srvId, `deck_sub_${id}`)
+    );
+    const normalIds: string[] = [];
+    const incogIds = new Set<string>();
+    for (const id of next) {
+      if (isIncogSub(id)) incogIds.add(id);
+      else normalIds.push(id);
+    }
+    if (srvId) {
+      const memKey = `${srvId}:${mainSession}`;
+      if (incogIds.size > 0) incognitoOpenSubWindowsRef.current.set(memKey, incogIds);
+      else incognitoOpenSubWindowsRef.current.delete(memKey);
+    }
     const storageKey = `rcc_open_subs_${mainSession}`;
-    if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
+    if (normalIds.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(normalIds));
     else safeLocalStorageRemoveItem(storageKey);
   }, []);
   const persistMaximizedSubIds = useCallback((next: Set<string>) => {
     const mainSession = openSubPersistenceSessionRef.current;
+    const srvId = openSubPersistenceServerRef.current;
     if (!mainSession) return;
-    const ids = Array.from(next).slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS);
-    const storageKey = maximizedSubSessionStorageKey(openSubPersistenceServerRef.current, mainSession);
+    const isIncogSub = (id: string) => (
+      rawSubSessionsRef.current.some((s) => s.id === id && s.incognito === true)
+      || isIncognitoTimelineSession(srvId, `deck_sub_${id}`)
+    );
+    const normalIds: string[] = [];
+    const incogIds = new Set<string>();
+    for (const id of next) {
+      if (isIncogSub(id)) incogIds.add(id);
+      else normalIds.push(id);
+    }
+    if (srvId) {
+      const memKey = `${srvId}:${mainSession}`;
+      if (incogIds.size > 0) incognitoMaximizedSubWindowsRef.current.set(memKey, incogIds);
+      else incognitoMaximizedSubWindowsRef.current.delete(memKey);
+    }
+    const ids = normalIds.slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS);
+    const storageKey = maximizedSubSessionStorageKey(srvId, mainSession);
     if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
     else safeLocalStorageRemoveItem(storageKey);
   }, []);
@@ -3680,23 +3740,49 @@ function InternalMainApp() {
     const deliberate = Boolean(name) && opts?.remember !== false;
     rememberIntentRef.current = deliberate ? name : null;
     if (deliberate) explicitSelectionServerRef.current = selectedServerId;
+    const isIncogActive = Boolean(
+      name
+      && selectedServerId
+      && (isIncognitoTimelineSession(selectedServerId, name)
+        || sessionsRef.current.some((s) => s.name === name && s.incognito === true)
+        || incognitoMainSessionsByServerRef.current.get(selectedServerId)?.some((s) => s.name === name)),
+    );
+    if (deliberate && selectedServerId) {
+      if (isIncogActive && name) {
+        incognitoActiveSessionByServerRef.current.set(selectedServerId, name);
+      } else {
+        incognitoActiveSessionByServerRef.current.delete(selectedServerId);
+      }
+    }
     // Update this before setOpenSubIds: state setters below run in the same
     // turn, before the hash-sync effect can publish the new tab-local scope.
     openSubPersistenceSessionRef.current = name;
     openSubPersistenceServerRef.current = selectedServerId;
-    if (name) safeLocalStorageSetItem('rcc_session', name);
+    if (name && !isIncogActive) safeLocalStorageSetItem('rcc_session', name);
     else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
     if (!opts?.keepSubWindows) {
-      setMaximizedSubIds(loadPersistedMaximizedSubSessionIds(selectedServerId, name));
+      const persistedMax = loadPersistedMaximizedSubSessionIds(selectedServerId, name);
+      const incogMax = name && selectedServerId ? incognitoMaximizedSubWindowsRef.current.get(`${selectedServerId}:${name}`) : undefined;
+      if (incogMax && incogMax.size > 0) {
+        for (const id of incogMax) persistedMax.add(id);
+      }
+      setMaximizedSubIds(persistedMax);
       setDesktopFileBrowserMaximized(false);
       // Restore saved open sub-sessions for the target main session
       if (name) {
+        const nextOpen = new Set<string>();
         try {
           const raw = localStorage.getItem(`rcc_open_subs_${name}`);
-          if (raw) { setOpenSubIds(new Set(JSON.parse(raw) as string[]), { retainPrevious: true }); }
-          else { setOpenSubIds(new Set(), { retainPrevious: true }); }
-        } catch { setOpenSubIds(new Set(), { retainPrevious: true }); }
+          if (raw) {
+            for (const id of JSON.parse(raw) as string[]) nextOpen.add(id);
+          }
+        } catch { /* ignore */ }
+        const incogOpen = selectedServerId ? incognitoOpenSubWindowsRef.current.get(`${selectedServerId}:${name}`) : undefined;
+        if (incogOpen) {
+          for (const id of incogOpen) nextOpen.add(id);
+        }
+        setOpenSubIds(nextOpen, { retainPrevious: true });
       } else {
         setOpenSubIds(new Set(), { retainPrevious: true });
       }
@@ -3721,6 +3807,12 @@ function InternalMainApp() {
     }
     if (!selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
     if (!activeSession || rememberIntentRef.current !== activeSession) return;
+    const isIncogActive = isIncognitoTimelineSession(selectedServerId, activeSession)
+      || sessionsRef.current.some((s) => s.name === activeSession && s.incognito === true);
+    if (isIncogActive) {
+      incognitoActiveSessionByServerRef.current.set(selectedServerId, activeSession);
+      return;
+    }
     writeServerSession(selectedServerId, activeSession);
   }, [activeSession, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
 
@@ -3735,19 +3827,25 @@ function InternalMainApp() {
   const restoreLastTabRef = useRef<(serverId: string, navigableNames: readonly string[]) => string | null>(() => null);
   restoreLastTabRef.current = (serverId, navigableNames) => {
     if (explicitSelectionServerRef.current === serverId || navigableNames.length === 0) return null;
+    const incogPreferred = incognitoActiveSessionByServerRef.current.get(serverId);
+    const incogHit = incogPreferred && navigableNames.includes(incogPreferred) ? incogPreferred : null;
     const remembered = readServerSession(serverId);
-    const preferred = resolveServerSessionSnapshot(
-      serverId,
-      initialHashStateRef.current.sessionName ?? remembered,
-      navigableNames.map((sessionName) => ({ serverId, sessionName })),
-      remembered,
-    ) ?? navigableNames[0]!;
+    const preferred = incogHit
+      ?? resolveServerSessionSnapshot(
+        serverId,
+        initialHashStateRef.current.sessionName ?? remembered,
+        navigableNames.map((sessionName) => ({ serverId, sessionName })),
+        remembered,
+      )
+      ?? navigableNames[0]!;
     setActiveSession(preferred, { remember: false });
     // Migration: a tab that came from the hash or from an older build's single
     // global value (not from a fallback) is where the user really was, so it
     // becomes this server's memory when none exists yet. Otherwise a user who
     // upgrades and never clicks a tab would lose it on the next server switch.
-    if (!remembered && preferred === initialHashStateRef.current.sessionName) {
+    const isIncogPreferred = isIncognitoTimelineSession(serverId, preferred)
+      || (incognitoMainSessionsByServerRef.current.get(serverId)?.some((s) => s.name === preferred) ?? false);
+    if (!isIncogPreferred && !remembered && preferred === initialHashStateRef.current.sessionName) {
       writeServerSession(serverId, preferred);
     }
     if (preferred !== initialHashStateRef.current.sessionName) {
@@ -4484,6 +4582,27 @@ function InternalMainApp() {
 
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
+    // Manual user close: remove this sub-session from any in-memory open/maximized incognito window state.
+    if (selectedServerId) {
+      for (const [key, ids] of incognitoOpenSubWindowsRef.current) {
+        if (key.startsWith(`${selectedServerId}:`)) {
+          ids.delete(id);
+          if (ids.size === 0) incognitoOpenSubWindowsRef.current.delete(key);
+        }
+      }
+      for (const [key, ids] of incognitoMaximizedSubWindowsRef.current) {
+        if (key.startsWith(`${selectedServerId}:`)) {
+          ids.delete(id);
+          if (ids.size === 0) incognitoMaximizedSubWindowsRef.current.delete(key);
+        }
+      }
+    }
+    setOpenSubIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
     if (activeSplitPairRef.current && (activeSplitPairRef.current.executorSubId === id || activeSplitPairRef.current.auditorSubId === id)) {
       activeSplitPairRef.current = null;
@@ -4492,7 +4611,7 @@ function InternalMainApp() {
       window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
     }
     closeSubSession(id);
-  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
+  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow, selectedServerId, setOpenSubIds]);
 
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
   // Weekly (7d) quota opt-in (per-user pref → all servers). Tell the daemon
@@ -5044,8 +5163,61 @@ function InternalMainApp() {
           detail: { serverId: selectedServerId, ...msg },
         }));
       }
+      if (msg.type === 'subsession.removed') {
+        const m = msg as { id?: unknown; sessionName?: unknown };
+        const rawSession = typeof m.sessionName === 'string' ? m.sessionName : '';
+        const removedId = typeof m.id === 'string' && m.id
+          ? m.id
+          : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
+        if (removedId) {
+          if (selectedServerId) {
+            for (const [key, ids] of incognitoOpenSubWindowsRef.current) {
+              if (key.startsWith(`${selectedServerId}:`)) {
+                ids.delete(removedId);
+                if (ids.size === 0) incognitoOpenSubWindowsRef.current.delete(key);
+              }
+            }
+            for (const [key, ids] of incognitoMaximizedSubWindowsRef.current) {
+              if (key.startsWith(`${selectedServerId}:`)) {
+                ids.delete(removedId);
+                if (ids.size === 0) incognitoMaximizedSubWindowsRef.current.delete(key);
+              }
+            }
+          }
+          setOpenSubIds((prev) => {
+            if (!prev.has(removedId)) return prev;
+            const next = new Set(prev);
+            next.delete(removedId);
+            return next;
+          });
+          removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(removedId));
+        }
+      }
       if (msg.type === 'session.event') {
-        if (msg.event === 'disconnected' || msg.event === 'stopped') forgetIncognitoTimelineSessions(selectedServerId, msg.event === 'stopped' ? msg.session : undefined);
+        const stoppedSession = msg.event === 'stopped' ? msg.session : undefined;
+        const targetSession = stoppedSession ?? msg.session;
+        const isIncognitoEventSession = Boolean(
+          targetSession
+          && selectedServerId
+          && (isIncognitoTimelineSession(selectedServerId, targetSession)
+            || sessionsRef.current.some((s) => s.name === targetSession && s.incognito === true)
+            || incognitoMainSessionsByServerRef.current.get(selectedServerId)?.some((s) => s.name === targetSession)),
+        );
+        const manualStopKey = selectedServerId && stoppedSession ? `${selectedServerId}:${stoppedSession}` : '';
+        const wasManualStop = Boolean(manualStopKey && manualStoppedMainSessionsRef.current.has(manualStopKey));
+        const shouldCloseStoppedSession = msg.event === 'stopped' && (!isIncognitoEventSession || wasManualStop);
+        if (stoppedSession && shouldCloseStoppedSession) {
+          if (manualStopKey) manualStoppedMainSessionsRef.current.delete(manualStopKey);
+          forgetIncognitoTimelineSessions(selectedServerId, stoppedSession);
+          if (selectedServerId) {
+            if (incognitoActiveSessionByServerRef.current.get(selectedServerId) === stoppedSession) {
+              incognitoActiveSessionByServerRef.current.delete(selectedServerId);
+            }
+            const remaining = (incognitoMainSessionsByServerRef.current.get(selectedServerId) ?? []).filter((s) => s.name !== stoppedSession);
+            if (remaining.length > 0) incognitoMainSessionsByServerRef.current.set(selectedServerId, remaining);
+            else incognitoMainSessionsByServerRef.current.delete(selectedServerId);
+          }
+        }
         if (msg.session) {
           watchProjectionStore.updateSessionState(msg.session, msg.state);
         }
@@ -5105,8 +5277,8 @@ function InternalMainApp() {
         }
         if (msg.session && !isSubSessionName(msg.session)) {
           setSessions((prev) => {
-            // Stopped → remove the tab immediately
-            if (msg.event === 'stopped') {
+            // Stopped → remove the tab immediately ONLY for normal sessions or explicitly user-stopped incognito sessions
+            if (shouldCloseStoppedSession) {
               return prev.filter((s) => s.name !== msg.session);
             }
             const existing = prev.find((s) => s.name === msg.session);
@@ -5119,13 +5291,14 @@ function InternalMainApp() {
                 role: parsed?.role ?? 'brain',
                 agentType: 'unknown',
                 state: msg.state as SessionInfo['state'],
+                ...(isIncognitoEventSession ? { incognito: true } : {}),
               }];
             }
             return prev.map((s) => s.name === msg.session ? { ...s, state: msg.state as SessionInfo['state'] } : s);
           });
           // Active session stopped → navigate back after a grace period
           // (allows restart to re-create the session before navigating away)
-          if (msg.event === 'stopped' && msg.session === activeSessionRef.current) {
+          if (shouldCloseStoppedSession && msg.session === activeSessionRef.current) {
             if (stoppedNavTimerRef.current) clearTimeout(stoppedNavTimerRef.current);
             stoppedNavTimerRef.current = setTimeout(() => {
               stoppedNavTimerRef.current = null;
@@ -5222,6 +5395,19 @@ function InternalMainApp() {
         ));
         const newSessions = msg.sessions.filter((s) => !isSubSessionName(s.name));
         const navigableNewSessions = newSessions.filter(isNavigableMainSession);
+        const mergedSessionList = newSessions.map((s) => {
+          const existing = sessionsRef.current.find((p) => p.name === s.name);
+          return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
+        });
+        const liveIncogMain = mergedSessionList.filter((s) => s.incognito === true);
+        if (liveIncogMain.length > 0) incognitoMainSessionsByServerRef.current.set(selectedServerId, liveIncogMain);
+        else incognitoMainSessionsByServerRef.current.delete(selectedServerId);
+        const presentNames = new Set(newSessions.map((s) => s.name));
+        for (const key of [...manualStoppedMainSessionsRef.current]) {
+          if (key.startsWith(`${selectedServerId}:`) && !presentNames.has(key.slice(selectedServerId.length + 1))) {
+            manualStoppedMainSessionsRef.current.delete(key);
+          }
+        }
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
@@ -5833,7 +6019,6 @@ function InternalMainApp() {
         }
       }
       if (msg.type === DAEMON_MSG.DISCONNECTED) {
-        forgetIncognitoTimelineSessions(selectedServerId);
         // Mark projection stale immediately — that's just a data-freshness
         // hint, not the user-facing status badge. But do NOT flip the
         // "Daemon Offline" badge yet: the server side still has a
@@ -6566,7 +6751,7 @@ function InternalMainApp() {
     }
   }, [auth?.baseUrl, clearAuthState, holdAuthCredentialCleanupGate, nativeServerUrl]);
 
-  const resetServerScopedStateForSwitch = useCallback(() => {
+  const resetServerScopedStateForSwitch = useCallback((nextServerId?: string | null) => {
     staleSubSessionsSnapshotRef.current = rawSubSessionsRef.current;
     managedSharesGenerationRef.current += 1;
     explicitSelectionServerRef.current = null;
@@ -6579,12 +6764,19 @@ function InternalMainApp() {
       daemonOfflineGraceTimerRef.current = null;
     }
     resetServerScopedOverlaysAndTargets();
-    setSessions([]);
+    const restoredIncogMain = nextServerId
+      ? (incognitoMainSessionsByServerRef.current.get(nextServerId) ?? [])
+      : [];
+    setSessions(restoredIncogMain);
     setSessionsLoaded(false);
-    setActiveSession(null, { remember: false });
-    setOpenSubIds(new Set());
+    // Clear only active view state without erasing per-server incognito caches/open windows.
+    openSubPersistenceSessionRef.current = null;
+    openSubPersistenceServerRef.current = null;
+    openSubIdsRef.current = new Set();
+    setOpenSubIdsRaw(new Set());
     setRetainedOpenSubIds(new Set());
     setMaximizedSubIds(new Set());
+    setActiveSession(null, { remember: false, keepSubWindows: true });
     setSharedActiveDispatchIds(new Map());
     setDaemonStats(null);
     setDaemonOnline(false);
@@ -6594,7 +6786,7 @@ function InternalMainApp() {
     setDiscussions([]);
     setRepoContexts(new Map());
     setManagedShares([]);
-  }, [resetServerScopedOverlaysAndTargets, setActiveSession, setOpenSubIds]);
+  }, [resetServerScopedOverlaysAndTargets, setActiveSession]);
 
   const switchToOwnedServerInApp = useCallback((serverId: string, serverName?: string | null) => {
     setManualDashboard(false);
@@ -6611,8 +6803,15 @@ function InternalMainApp() {
     // what was remembered before, never erase or replace it.
     const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
     const currentSession = activeSessionRef.current;
-    if (prevServer && prevServer !== serverId && !selectedShareTarget && currentSession && rememberIntentRef.current === currentSession) {
-      writeServerSession(prevServer, currentSession);
+    if (prevServer && prevServer !== serverId && !selectedShareTarget && currentSession) {
+      const isCurrentIncog = isIncognitoTimelineSession(prevServer, currentSession)
+        || sessionsRef.current.some((s) => s.name === currentSession && s.incognito === true)
+        || (incognitoMainSessionsByServerRef.current.get(prevServer)?.some((s) => s.name === currentSession) ?? false);
+      if (isCurrentIncog) {
+        incognitoActiveSessionByServerRef.current.set(prevServer, currentSession);
+      } else if (rememberIntentRef.current === currentSession) {
+        writeServerSession(prevServer, currentSession);
+      }
     }
 
     localStorage.setItem('rcc_server', serverId);
@@ -6633,7 +6832,7 @@ function InternalMainApp() {
     selectedServerIdRef.current = serverId;
     setSelectedServerId(serverId);
     setSelectedServerName(serverName ?? null);
-    resetServerScopedStateForSwitch();
+    resetServerScopedStateForSwitch(serverId);
     writeHashState(serverId, null, null);
   }, [resetServerScopedStateForSwitch, selectedShareTarget]);
 
@@ -7265,8 +7464,22 @@ function InternalMainApp() {
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
+    const prevServer = selectedServerIdRef.current;
+    const currentSession = activeSessionRef.current;
+    if (prevServer && currentSession) {
+      const isCurrentIncog = isIncognitoTimelineSession(prevServer, currentSession)
+        || sessionsRef.current.some((s) => s.name === currentSession && s.incognito === true);
+      if (isCurrentIncog) {
+        incognitoActiveSessionByServerRef.current.set(prevServer, currentSession);
+      } else if (rememberIntentRef.current === currentSession) {
+        writeServerSession(prevServer, currentSession);
+      }
+    }
     resetServerScopedOverlaysAndTargets();
-    setOpenSubIds(new Set());
+    openSubPersistenceSessionRef.current = null;
+    openSubPersistenceServerRef.current = null;
+    openSubIdsRef.current = new Set();
+    setOpenSubIdsRaw(new Set());
     setRetainedOpenSubIds(new Set());
     setMaximizedSubIds(new Set());
     setManualDashboard(true);
@@ -7279,9 +7492,9 @@ function InternalMainApp() {
     setSelectedServerName(null);
     setSelectedShareTarget(null);
     setSelectedSharedEntryId(null);
-    setActiveSession(null);
+    setActiveSession(null, { remember: false, keepSubWindows: true });
     setShowMobileServerMenu(false);
-  }, [resetServerScopedOverlaysAndTargets, setActiveSession, setOpenSubIds]);
+  }, [resetServerScopedOverlaysAndTargets, setActiveSession]);
 
   const canStopProjectForCurrentShare = !selectedShareTarget || (
     selectedShareTarget.kind === 'server'
@@ -7300,12 +7513,19 @@ function InternalMainApp() {
       try { window.alert(trans('session.unpin_to_stop')); } catch { /* ignore */ }
       return;
     }
+    if (selectedServerId) {
+      for (const s of sessions) {
+        if (s.project === project) {
+          manualStoppedMainSessionsRef.current.add(`${selectedServerId}:${s.name}`);
+        }
+      }
+    }
     setSessions((prev) => prev.map((s) =>
       s.project === project ? { ...s, state: 'stopping' as SessionInfo['state'] } : s,
     ));
     wsRef.current.sendSessionCommand('stop', { project });
     requestActiveTimelineRefreshAfterUserAction();
-  }, [canStopProjectForCurrentShare, pinnedTabs, sessions, trans]);
+  }, [canStopProjectForCurrentShare, pinnedTabs, selectedServerId, sessions, trans]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
