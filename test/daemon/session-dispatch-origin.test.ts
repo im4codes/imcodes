@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../src/daemon/command-handler.js', () => ({
   clearTransportConversation: mocks.clearTransportConversation,
+  dispatchHandoffContinuation: vi.fn(async () => undefined),
   handoffSessionConversation: vi.fn(async () => undefined),
   supportsTransportClear: () => true,
   supportsProcessClear: () => false,

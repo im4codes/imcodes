@@ -124,4 +124,22 @@ describe('daemon-side delivery of /clear', () => {
     expect(mocks.dispatchHandoffContinuation).not.toHaveBeenCalled();
     expect(mocks.runtimeSend).toHaveBeenCalledTimes(1);
   });
+
+  it('handles /clear cleanly even when a partial command-handler mock omits /handoff exports', async () => {
+    vi.resetModules();
+    const clearTransportConversation = vi.fn(async () => undefined);
+    vi.doMock('../../src/daemon/command-handler.js', () => ({
+      clearTransportConversation,
+      supportsTransportClear: () => true,
+    }));
+    try {
+      const { dispatchSessionMessage } = await import('../../src/daemon/session-dispatch.js');
+      const target = transportSession();
+      await expect(dispatchSessionMessage(target, '/clear', { messageId: 'send_message_partial', suppressTimeline: true } as never)).resolves.toBe('sent');
+      expect(clearTransportConversation).toHaveBeenCalledWith(target);
+    } finally {
+      vi.doUnmock('../../src/daemon/command-handler.js');
+      vi.resetModules();
+    }
+  });
 });
