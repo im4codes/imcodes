@@ -249,12 +249,17 @@ describe('Qwen3-ASR mobile assets', () => {
     }
     expect(ios).toContain('static let limit = 16000 * 320 / 10');
     expect(ios).toContain('static let warmupSamples = 320');
-    expect(ios).toContain('mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
+    expect(ios).toContain('CAPPluginMethod(name: "checkPermissions", returnType: CAPPluginReturnPromise)');
+    expect(ios).toContain('func checkPermissions(_ call: CAPPluginCall)');
+    expect(ios).toContain('mapRecordPermissionStatus(');
+    expect(ios).toContain('static let warmHoldIdleTimeout: TimeInterval = 20.0');
+    expect(ios).toContain('mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker]');
     expect(ios).not.toContain('mode: .measurement');
     expect(ios).toContain('session.isInputGainSettable');
     expect(ios).toContain('try? session.setInputGain(1.0)');
     expect(ios).toContain('struct SpeechGain');
-    expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
+    expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker]');
+    expect(ios).not.toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
     expect(ios).not.toContain('.duckOthers');
     expect(ios).toContain('self.coordinator.markStarted(owner: owner)');
     expect(ios).toContain('guard warmupRemaining == 0');

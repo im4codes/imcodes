@@ -562,6 +562,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     public let jsName = "StreamingSpeech"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "available", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "checkPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "requestPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "prewarm", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "start", returnType: CAPPluginReturnPromise),
@@ -601,6 +602,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var cachedConverter: AVAudioConverter?
     private var audioSessionCategoryConfigured = false
     private var audioSessionActive = false
+    private static let warmHoldIdleTimeout: TimeInterval = 20.0
+    private var warmHoldIdleWorkItem: DispatchWorkItem? // audioQueue only
+    private var warmHoldGeneration: UInt64 = 0 // audioQueue only
     // Call & lifecycle tracking on main thread.
     private var activeMainOwner: UInt64 = 0
     private var startingCall: CAPPluginCall? // main-thread only
@@ -634,6 +638,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         NotificationCenter.default.removeObserver(self)
         warmupWatchdog?.cancel()
         warmupWatchdog = nil
+        warmHoldIdleWorkItem?.cancel()
+        warmHoldIdleWorkItem = nil
         let retainedRecognizer = recognizer
         if retainedRecognizer != nil {
             coordinator.worker.async {
@@ -688,6 +694,23 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    static func mapRecordPermissionStatus(_ permission: AVAudioSession.RecordPermission) -> String {
+        switch permission {
+        case .granted:
+            return "granted"
+        case .denied:
+            return "denied"
+        case .undetermined:
+            return "prompt"
+        @unknown default:
+            return "prompt"
+        }
+    }
+
+    @objc public override func checkPermissions(_ call: CAPPluginCall) {
+        call.resolve(["speechRecognition": Self.mapRecordPermissionStatus(AVAudioSession.sharedInstance().recordPermission)])
+    }
+
     @objc public override func requestPermissions(_ call: CAPPluginCall) {
         requestRecordPermission { allowed in
             call.resolve(["speechRecognition": allowed ? "granted" : "denied"])
@@ -715,19 +738,48 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func configureAudioSessionCategoryIfNeeded(session: AVAudioSession) throws {
         dispatchPrecondition(condition: .onQueue(audioQueue))
-        let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
+        let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker]
         if audioSessionCategoryConfigured,
            session.category == .playAndRecord,
            (session.mode == .spokenAudio || session.mode == .default),
-           session.categoryOptions.contains(desiredOptions) {
+           session.categoryOptions.contains(desiredOptions),
+           !session.categoryOptions.contains(.allowBluetooth) {
             return
         }
         do {
-            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
+            // Keep built-in 48kHz mic + A2DP output cleanly separated without triggering
+            // 660-2450ms Bluetooth HFP SCO teardown/renegotiation on every hold press.
+            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker])
         } catch {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
         }
         audioSessionCategoryConfigured = true
+    }
+
+    private func cancelWarmHoldDeactivationOnAudioQueue() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        warmHoldGeneration &+= 1
+        warmHoldIdleWorkItem?.cancel()
+        warmHoldIdleWorkItem = nil
+    }
+
+    private func scheduleWarmHoldDeactivationOnAudioQueue() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        cancelWarmHoldDeactivationOnAudioQueue()
+        let token = warmHoldGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            dispatchPrecondition(condition: .onQueue(self.audioQueue))
+            guard self.warmHoldGeneration == token,
+                  !self.tapInstalled,
+                  self.audioSessionActive else { return }
+            self.warmHoldIdleWorkItem = nil
+            self.invalidateEngineOnAudioQueue()
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            self.audioSessionActive = false
+        }
+        warmHoldIdleWorkItem = work
+        audioQueue.asyncAfter(deadline: .now() + Self.warmHoldIdleTimeout, execute: work)
     }
 
     private func invalidateEngineOnAudioQueue() {
@@ -838,6 +890,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func stopCaptureAudioOnAudioQueue(deactivateSession: Bool, forceTeardown: Bool) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
+        cancelWarmHoldDeactivationOnAudioQueue()
         if tapInstalled {
             engine?.inputNode.removeTap(onBus: 0)
             tapInstalled = false
@@ -846,15 +899,22 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             if forceTeardown {
                 invalidateEngineOnAudioQueue()
             } else if engine.isRunning {
-                engine.pause()
+                engine.stop()
+                if !deactivateSession {
+                    engine.prepare()
+                }
             }
         }
         if forceTeardown {
             audioSessionCategoryConfigured = false
         }
-        if deactivateSession && audioSessionActive {
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            audioSessionActive = false
+        if deactivateSession {
+            if audioSessionActive {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                audioSessionActive = false
+            }
+        } else if audioSessionActive {
+            scheduleWarmHoldDeactivationOnAudioQueue()
         }
     }
 
@@ -934,6 +994,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     return
                 }
                 do {
+                    self.cancelWarmHoldDeactivationOnAudioQueue()
                     try self.configureAudioSessionCategoryIfNeeded(session: session)
                     if !self.audioSessionActive {
                         try session.setActive(true)
@@ -1033,6 +1094,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 return
             }
             let wasCapturing = self.tapInstalled
+            self.cancelWarmHoldDeactivationOnAudioQueue()
             self.invalidateEngineOnAudioQueue()
             self.audioSessionCategoryConfigured = false
             if self.audioSessionActive {
@@ -1040,10 +1102,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.audioSessionActive = false
             }
             DispatchQueue.main.async {
+                guard wasCapturing else { return }
                 if self.startingCall != nil {
                     self.settleStartingCall(errorMessage: "Offline speech interrupted by audio configuration change")
                 }
-                if wasCapturing || self.activeMainOwner != 0 {
+                if self.activeMainOwner != 0 {
                     self.endCapture(nil, deactivateSession: true, forceTeardown: true)
                 }
             }
@@ -1052,7 +1115,13 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc private func didBecomeActive(_ notification: Notification) {
         coordinator.setBackgrounded(false)
     }
-    @objc public func stop(_ call: CAPPluginCall) { DispatchQueue.main.async { self.endCapture(call) } }
+    @objc public func stop(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            // Keep AVAudioSession warm briefly in foreground so consecutive presses start immediately;
+            // backgrounding, audio interruptions, and the idle timer deactivate the session cleanly.
+            self.endCapture(call, deactivateSession: self.coordinator.isBackgrounded)
+        }
+    }
     // Capture teardown dispatches CoreAudio/AVAudioSession work off main onto audioQueue;
     // serial decoder flush still precedes .stopped emission and stop() resolution.
     private func endCapture(_ call: CAPPluginCall?, deactivateSession: Bool = true, forceTeardown: Bool = false) {

@@ -1873,5 +1873,8 @@ describe('styles.css regression contracts', () => {
     expect(sideZoneRule, 'side zone vertical offset rule missing').toBeTruthy();
     expect(sideZoneRule).toMatch(/position:\s*relative/);
     expect(sideZoneRule).toContain('--voice-hold-side-zone-offset-y');
+    expect(cssWithoutComments).toContain('.voice-hold-starting-spinner');
+    const reducedMotion = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(prefers-reduced-motion:\s*reduce\)/).join('\n');
+    expect(reducedMotion).toContain('.voice-hold-starting-spinner');
   });
 });
