@@ -3842,6 +3842,11 @@ html.native-ios-mac .chat-dl-btn {
 .voice-hold-zone-edit {
   color: rgba(167, 243, 208, 0.74);
 }
+.voice-hold-zone-cancel,
+.voice-hold-zone-edit {
+  position: relative;
+  top: var(--voice-hold-side-zone-offset-y, 26px);
+}
 .voice-hold-zone-cancel.is-active {
   color: #ffffff;
   background: radial-gradient(ellipse at center, rgba(239, 68, 68, 0.34) 0%, transparent 74%);
@@ -3949,6 +3954,10 @@ html.native-ios-mac .chat-dl-btn {
   .voice-hold-zone {
     padding: 4px 6px;
   }
+  .voice-hold-zone-cancel,
+  .voice-hold-zone-edit {
+    --voice-hold-side-zone-offset-y: 14px;
+  }
 }
 @container (max-height: 300px) {
   .voice-hold-hud-transcript-stage {
@@ -3984,6 +3993,10 @@ html.native-ios-mac .chat-dl-btn {
   }
   .voice-hold-zone {
     padding: 2px 6px;
+  }
+  .voice-hold-zone-cancel,
+  .voice-hold-zone-edit {
+    --voice-hold-side-zone-offset-y: 6px;
   }
   .voice-hold-zone-label {
     font-size: 11px;

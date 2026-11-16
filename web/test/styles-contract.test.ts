@@ -1864,8 +1864,14 @@ describe('styles.css regression contracts', () => {
     const container420 = extractBalancedAtRuleBlocks(cssWithoutComments, /@container\s*\(max-height:\s*420px\)/).join('\n');
     const container300 = extractBalancedAtRuleBlocks(cssWithoutComments, /@container\s*\(max-height:\s*300px\)/).join('\n');
     expect(container420).toContain('--voice-hud-bottom-clearance');
+    expect(container420).toContain('--voice-hold-side-zone-offset-y');
     expect(container420).toContain('100cqh');
     expect(container300).toContain('--voice-hud-bottom-clearance');
+    expect(container300).toContain('--voice-hold-side-zone-offset-y');
     expect(container300).toContain('100cqh');
+    const sideZoneRule = cssWithoutComments.match(/\.voice-hold-zone-cancel,\s*\.voice-hold-zone-edit\s*\{[^}]*\}/)?.[0];
+    expect(sideZoneRule, 'side zone vertical offset rule missing').toBeTruthy();
+    expect(sideZoneRule).toMatch(/position:\s*relative/);
+    expect(sideZoneRule).toContain('--voice-hold-side-zone-offset-y');
   });
 });
