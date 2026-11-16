@@ -7751,13 +7751,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     removeComposerUploadItems(composerUploadKey, [item.id]);
   }, [composerUploadKey]);
 
-  const autoRetryFailedUploads = useCallback(() => {
+  const autoRetryFailedUploads = useCallback((waitingOnly = false) => {
     if (!connected || isUploadEnvironmentSuspended()) return;
     const wakeEpoch = getComposerUploadWakeEpoch();
     const snapshot = getComposerUploadSnapshot(composerUploadKey);
     const candidates = snapshot.uploads.filter((item) => {
       if (!composerUploadRetryFiles.has(item.id)) return false;
       if (item.status === 'uploading' && item.waitingForConnection) return true;
+      if (waitingOnly) return false;
       return item.status === 'error'
         && item.retryable !== false
         && item.lastAutoRetryEpoch !== wakeEpoch
@@ -7807,13 +7808,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       composerUploadConnectEpoch += 1;
     }
     if (!connected) return;
-    if (!wasConnected) {
-      autoRetryFailedUploadsRef.current();
-    }
-    const onWake = () => autoRetryFailedUploadsRef.current();
+    autoRetryFailedUploadsRef.current(wasConnected);
+    const onWake = () => autoRetryFailedUploadsRef.current(false);
     const onOnline = () => {
       composerUploadOnlineEpoch += 1;
-      autoRetryFailedUploadsRef.current();
+      autoRetryFailedUploadsRef.current(false);
     };
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', onWake);
@@ -7833,7 +7832,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         window.removeEventListener('online', onOnline);
       }
     };
-  }, [connected]);
+  }, [composerUploadKey, connected]);
 
   useEffect(() => {
     if (!serverId || !composerUploadKey || activeSessionIncognito) return;
