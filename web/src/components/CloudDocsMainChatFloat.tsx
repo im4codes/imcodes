@@ -12,6 +12,7 @@ import { hasActiveTimelineTurn, hasPendingUserSend } from '../timeline-running.j
 import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { formatLabel } from '../format-label.js';
+import { isShareScopedState } from '../tab-sharing-ui.js';
 import {
   formatCloudDocQuoteBadge,
   getCloudDocQuoteKey,
@@ -283,6 +284,7 @@ export function CloudDocsMainChatFloat({
               serverId={mainChat.serverId}
               scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}
               readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
+              canManageFileShares={!isShareScopedState(session.sharedState)}
               onQuote={(text) => setExtraQuotes((prev) => [...prev, text])}
               onCloudDocClick={onOpenDoc}
               agentType={session.agentType}
@@ -324,6 +326,7 @@ export function CloudDocsMainChatFloat({
               sessions={mainChat.sessions}
               subSessions={mainChat.subSessions}
               serverId={mainChat.serverId}
+              canManageFileShares={!isShareScopedState(session.sharedState)}
               quotes={quotes}
               onRemoveQuote={handleRemoveQuote}
               onSend={(_name, text, meta) => {

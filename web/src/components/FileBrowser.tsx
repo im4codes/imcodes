@@ -191,6 +191,8 @@ export interface FileBrowserProps {
   scopeToSessionRoot?: boolean;
   /** Hide mutation controls while preserving browse, preview, and download. */
   readOnly?: boolean;
+  /** Allow opening DocShare controls for files/folders on this server (false for shared-in callers). */
+  canShare?: boolean;
   /** Report the current single-selection to an embedded host control. */
   onSelectedPathChange?: (path: string | null, isDirectory: boolean) => void;
   /** Report directory navigation so an embedded uploader can target it. */
@@ -261,6 +263,8 @@ type FsNode = {
   size?: number;
   mtimeMs?: number;
   birthtimeMs?: number;
+  /** Controlled download handle ID when supplied by ls metadata. */
+  downloadId?: string;
   /**
    * How the children of this directory were obtained. `complete`: every entry
    * of the directory is here (an unfiltered listing that was not cut), so the
@@ -525,6 +529,17 @@ function findNodePath(nodes: FsNode[], targetId: string): string[] | null {
   return null;
 }
 
+function findNodeById(nodes: readonly FsNode[], targetId: string): FsNode | undefined {
+  for (const node of nodes) {
+    if (node.id === targetId) return node;
+    if (node.children?.length) {
+      const found = findNodeById(node.children, targetId);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
 type PendingPreviewReason = 'interactive' | 'refresh';
 type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
@@ -610,6 +625,7 @@ export function FileBrowser({
   sessionName,
   scopeToSessionRoot = false,
   readOnly = false,
+  canShare = true,
   onSelectedPathChange,
   onCurrentPathChange,
   hideBreadcrumbConfirm = false,
@@ -1110,6 +1126,7 @@ export function FileBrowser({
             ...(typeof e.size === 'number' ? { size: e.size } : {}),
             ...(typeof e.mtimeMs === 'number' ? { mtimeMs: e.mtimeMs } : {}),
             ...(typeof e.birthtimeMs === 'number' ? { birthtimeMs: e.birthtimeMs } : {}),
+            ...(typeof e.downloadId === 'string' && e.downloadId ? { downloadId: e.downloadId } : {}),
           }));
         const truncated = msg.truncated === true && typeof msg.total === 'number' ? { total: msg.total } : undefined;
         const partial = msg.partial === true;
@@ -1171,7 +1188,7 @@ export function FileBrowser({
 
         if (!mountedRef.current) return;
 
-        const dlId = msg.downloadId;
+        const fallbackNodeDownloadId = findNodeById(dataRef.current, filePath)?.downloadId;
 
         if (msg.status === 'error') {
           if (msg.error === FS_READ_ERROR_CODES.IS_DIRECTORY) {
@@ -1197,35 +1214,38 @@ export function FileBrowser({
           const errorCodeOrMessage = String(msg.error ?? '');
           const isMissingFileError = msg.error === FS_READ_ERROR_CODES.PARENT_NOT_FOUND
             || /not[_ -]?found|enoent|no such file/i.test(errorCodeOrMessage);
+          const errDlId = msg.downloadId
+            || (!isMissingFileError && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH ? fallbackNodeDownloadId : undefined);
           if (
             officeErrorFallbackType
             && serverId
-            && dlId
+            && errDlId
             && !isMissingFileError
             && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH
             && msg.error !== FS_READ_ERROR_CODES.FILE_TOO_LARGE
           ) {
-            void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            void buildAttachmentDownloadUrl(serverId, errDlId, sessionName)
               .then((streamUrl) => {
                 if (!mountedRef.current) return;
                 const stillActive = getActivePreviewCycle(filePath);
                 if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-                setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType: officeErrorFallbackType, downloadId: dlId, verified: false });
+                setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType: officeErrorFallbackType, downloadId: errDlId, verified: false });
               })
               .catch(() => {
                 if (!mountedRef.current) return;
                 const stillActive = getActivePreviewCycle(filePath);
                 if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-                finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
+                finishPreviewError(filePath, t('file_browser.preview_error'), errDlId);
               });
             return;
           }
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
             : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
-          finishPreviewError(filePath, t(errKey), dlId);
+          finishPreviewError(filePath, t(errKey), errDlId);
           return;
         }
+        const dlId = msg.downloadId || fallbackNodeDownloadId;
         previewRefreshBackoffUntilRef.current = 0;
 
         // Media preview — daemon signals stream-mode (no inline content) and
@@ -1591,7 +1611,12 @@ export function FileBrowser({
       preview: loadingPreview,
     });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
-      const requestId = scopedSessionName ? ws.fsReadFile(filePath, scopedSessionName) : ws.fsReadFile(filePath);
+      const isAutoPreview = filePath === autoPreviewPath;
+      const requestId = scopedSessionName
+        ? (isAutoPreview
+            ? ws.fsReadFile(filePath, scopedSessionName, { chatFileReference: true })
+            : ws.fsReadFile(filePath, scopedSessionName))
+        : ws.fsReadFile(filePath);
       trackPendingPreviewRequest('read', requestId, { path: filePath, cycleId, reason: 'interactive' });
     }
     if (shouldFetchDiff && !hasPendingPreviewWork('diff', filePath, cycleId)) {
@@ -2154,7 +2179,7 @@ export function FileBrowser({
         event.stopPropagation();
       }}
     >
-      {serverId && (
+      {serverId && canShare && (
         <button
           type="button"
           onClick={() => {
@@ -2565,7 +2590,7 @@ export function FileBrowser({
             {t('office_preview.open_in_onlyoffice', 'ONLYOFFICE')}
           </button>
         )}
-        {serverId && !readOnly && 'path' in preview && (
+        {serverId && !readOnly && canShare && 'path' in preview && (
           <button
             class="fb-diff-toggle"
             data-testid="fb-preview-share-btn"
@@ -3066,7 +3091,7 @@ export function FileBrowser({
           <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
           <span class="fb-create-plus" aria-hidden="true">+</span>
         </button>}
-        {serverId && !readOnly && (
+        {serverId && !readOnly && canShare && (
           <button
             type="button"
             class="fb-nav-btn"
@@ -3422,7 +3447,7 @@ export function FileBrowser({
     </div>
   ) : null;
 
-  const shareDialogOverlay = shareDialogTarget && serverId ? (
+  const shareDialogOverlay = shareDialogTarget && serverId && canShare ? (
     <DocShareDialog
       serverId={serverId}
       targetPath={shareDialogTarget.path}

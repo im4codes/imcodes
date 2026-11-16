@@ -3913,4 +3913,134 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('hides all Share controls when canShare=false and readOnly=false while keeping Download, Edit, Create, Rename, and Delete', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser
+        ws={ws}
+        serverId="srv-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/home/user"
+        canShare={false}
+        readOnly={false}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'notes.txt', isDir: false, downloadId: 'dl-notes' }], '/home/user');
+    });
+
+    // Toolbar create & upload remain available, toolbar share button hidden
+    expect(screen.queryByTestId('fb-toolbar-share-btn')).toBeNull();
+    expect(container.querySelector('.fb-create-file-btn')).toBeTruthy();
+    expect(container.querySelector('.fb-create-folder-btn')).toBeTruthy();
+
+    // Context menu shows Rename & Delete, omits Share
+    const fileItem = screen.getByText('notes.txt').closest('.fb-node') as HTMLElement;
+    fireEvent.contextMenu(fileItem);
+    expect(screen.getByText('Rename')).toBeTruthy();
+    expect(screen.getByText('Delete')).toBeTruthy();
+    expect(screen.queryByText('Share')).toBeNull();
+    expect(screen.queryByText('doc_share.share_btn')).toBeNull();
+
+    // Open preview -> Download, Edit, Copy path shown, fb-preview-share-btn hidden
+    fireEvent.click(fileItem);
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/notes.txt',
+        status: 'ok',
+        content: 'hello participant',
+        downloadId: 'dl-notes',
+      } as unknown as ServerMessage);
+    });
+    expect(screen.queryByTestId('fb-preview-share-btn')).toBeNull();
+    expect(screen.getByText('fileBrowser.edit')).toBeTruthy();
+    expect(screen.getByText('upload.download_file')).toBeTruthy();
+    expect(screen.getByTitle('/home/user/notes.txt')).toBeTruthy();
+  });
+
+  it('shows Download button on .zip/binary and ls-downloadId fallback previews, and scopes chatFileReference only when scopeToSessionRoot=true', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+
+    // 1. Server participant / owner (scopeToSessionRoot=false): does NOT pass sessionName; binary .zip with downloadId renders Download
+    const firstView = render(
+      <FileBrowser
+        ws={ws}
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        scopeToSessionRoot={false}
+        canShare={false}
+        mode="file-single"
+        layout="panel"
+        initialPath="/outside"
+        autoPreviewPath="/outside/archive.zip"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect((ws.fsReadFile as any)).toHaveBeenCalledWith('/outside/archive.zip');
+    await act(async () => {
+      respond([{ name: 'archive.zip', isDir: false, downloadId: 'dl-zip-1' }], '/outside');
+    });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/outside/archive.zip',
+        status: 'error',
+        error: FS_READ_ERROR_CODES.BINARY_FILE,
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('upload.download_file')).toBeTruthy();
+    firstView.unmount();
+
+    // 2. FORBIDDEN_PATH does NOT use ls downloadId fallback
+    const { ws: wsForbidden, respond: respondForbidden, sendMsg: sendForbidden } = makeWsFactory();
+    const forbiddenView = render(
+      <FileBrowser
+        ws={wsForbidden}
+        serverId="srv-1"
+        mode="file-single"
+        layout="panel"
+        initialPath="/outside"
+        autoPreviewPath="/outside/secret.zip"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      respondForbidden([{ name: 'secret.zip', isDir: false, downloadId: 'dl-secret' }], '/outside');
+    });
+    await act(async () => {
+      sendForbidden({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/outside/secret.zip',
+        status: 'error',
+        error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+      } as unknown as ServerMessage);
+    });
+    expect(screen.queryByText('upload.download_file')).toBeNull();
+    forbiddenView.unmount();
+
+    // 3. Tab-share autoPreviewPath (scopeToSessionRoot=true) passes { chatFileReference: true }
+    const { ws: wsScoped } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={wsScoped}
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        scopeToSessionRoot={true}
+        mode="file-single"
+        layout="panel"
+        initialPath=":session-root:"
+        autoPreviewPath="/tmp/shared-chat.zip"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect((wsScoped.fsReadFile as any)).toHaveBeenCalledWith('/tmp/shared-chat.zip', 'deck_proj_brain', { chatFileReference: true });
+  });
 });

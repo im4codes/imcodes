@@ -338,4 +338,71 @@ describe('FileBrowser + DocShareDialog Manage Node Groups entrypoints (F2)', () 
     expect(openNodeGroups).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.queryByTestId('doc-share-dialog')).toBeNull());
   });
+
+  it('hides Share button across SessionControls, SubSessionWindow, and pinned filebrowser panel when shared-in (canManageFileShares=false)', async () => {
+    const ws = makeWs();
+
+    // 1. Mobile SessionControls with canManageFileShares=false (whole-server participant)
+    const scView = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+        mobileFileBrowserOpen={true}
+        canManageFileShares={false}
+        onMobileFileBrowserClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(document.body.querySelector('.mobile-fb-overlay')).toBeTruthy());
+    expect(screen.queryByTestId('fb-toolbar-share-btn')).toBeNull();
+    scView.unmount();
+
+    // 2. Desktop SubSessionWindow with canManageFileShares=false
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 (X11; Linux x86_64)' });
+    const subView = render(
+      <SubSessionWindow
+        sub={makeSubSession()}
+        ws={ws as any}
+        connected={true}
+        active={true}
+        serverId="srv-1"
+        canManageFileShares={false}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+    fireEvent.click(subView.container.querySelector('button[title="picker.files"]') as HTMLButtonElement);
+    await waitFor(() => expect(screen.getByText('📁 picker.files')).toBeTruthy());
+    expect(screen.queryByTestId('fb-toolbar-share-btn')).toBeNull();
+    subView.unmount();
+
+    // 3. Pinned filebrowser panel with canManageFileShares=false and shareTargetKind='server'
+    const reg = getPanelType('filebrowser');
+    render(
+      h('div', null, reg!.render(
+        { id: 'pin-fb-shared', type: 'filebrowser', props: { serverId: 'srv-1', projectDir: '/home/user/proj' } } as any,
+        {
+          ws: ws as any,
+          serverId: 'srv-1',
+          connected: true,
+          sessionsLoading: false,
+          activeSession: 'deck_alpha_brain',
+          activeProjectDir: '/home/user/proj',
+          shareTargetKind: 'server',
+          sharedAccessRole: 'participant',
+          canManageFileShares: false,
+          t: (k: string) => k,
+        } as any,
+      )),
+    );
+    await waitFor(() => expect(document.querySelector('.fb-create-file-btn')).toBeTruthy());
+    expect(screen.queryByTestId('fb-toolbar-share-btn')).toBeNull();
+  });
 });

@@ -1140,10 +1140,12 @@ vi.mock('../src/components/LocalWebPreviewPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/file-browser-lazy.js', () => ({
-  FileBrowser: ({ autoPreviewPath, onClose, onConfirm, onOpenNodeGroups, onPreviewStateChange, scopeToSessionRoot }: any) => (
+  FileBrowser: ({ autoPreviewPath, onClose, onConfirm, onOpenNodeGroups, onPreviewStateChange, scopeToSessionRoot, readOnly, canShare }: any) => (
     <div
       data-testid={autoPreviewPath ? 'file-browser-preview' : 'file-browser'}
       data-scope-to-session-root={String(!!scopeToSessionRoot)}
+      data-read-only={String(!!readOnly)}
+      data-can-share={String(canShare ?? true)}
     >
       file-browser
       <button onClick={() => onConfirm?.(['/work/alpha/src/index.ts'])}>file-confirm</button>
@@ -6096,7 +6098,10 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('file-close'));
 
     fireEvent.click(screen.getByText('pane-preview-upload'));
-    expect((await screen.findByTestId('file-browser-preview')).getAttribute('data-scope-to-session-root')).toBe('true');
+    const previewFb = await screen.findByTestId('file-browser-preview');
+    expect(previewFb.getAttribute('data-scope-to-session-root')).toBe('false');
+    expect(previewFb.getAttribute('data-can-share')).toBe('true');
+    expect(previewFb.getAttribute('data-read-only')).toBe('false');
     fireEvent.click(screen.getByText('file-close'));
 
     fireEvent.click(screen.getByText('subbar-repo'));
@@ -11234,5 +11239,99 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
     }
+  }, 20_000);
+
+  it('grants whole-server participant full unscoped FileBrowser/file-preview without Share', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    history.replaceState(null, '', '/#/srv-shared?shared=share-srv-part');
+    const serverGrant = {
+      id: 'share-srv-part',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([serverGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: serverGrant.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-srv-part'],
+        primaryShareId: 'share-srv-part',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'idle',
+        agentType: 'codex-sdk',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    fireEvent.click(screen.getByTitle('picker.files'));
+    const desktopFb = await screen.findByTestId('file-browser');
+    expect(desktopFb.getAttribute('data-scope-to-session-root')).toBe('false');
+    expect(desktopFb.getAttribute('data-read-only')).toBe('false');
+    expect(desktopFb.getAttribute('data-can-share')).toBe('false');
+    fireEvent.click(screen.getByText('file-close'));
+
+    fireEvent.click(screen.getByText('pane-preview-upload'));
+    const previewFb = await screen.findByTestId('file-browser-preview');
+    expect(previewFb.getAttribute('data-scope-to-session-root')).toBe('false');
+    expect(previewFb.getAttribute('data-read-only')).toBe('false');
+    expect(previewFb.getAttribute('data-can-share')).toBe('false');
+  }, 20_000);
+
+  it('keeps tab-share viewer file-preview scoped, readOnly, and without Share', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-tab-view');
+    const tabGrant = {
+      id: 'share-tab-view',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Tab Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([tabGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: tabGrant.target,
+      coverage: {
+        effectiveRole: 'viewer',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-tab-view'],
+        primaryShareId: 'share-tab-view',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Tab Beta',
+        state: 'idle',
+        agentType: 'codex-sdk',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    fireEvent.click(screen.getByText('pane-preview-upload'));
+    const tabPreviewFb = await screen.findByTestId('file-browser-preview');
+    expect(tabPreviewFb.getAttribute('data-scope-to-session-root')).toBe('true');
+    expect(tabPreviewFb.getAttribute('data-read-only')).toBe('true');
+    expect(tabPreviewFb.getAttribute('data-can-share')).toBe('false');
   }, 20_000);
 });

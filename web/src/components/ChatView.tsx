@@ -228,6 +228,8 @@ interface Props {
   readOnlyFiles?: boolean;
   /** Constrain file operations to this session's canonical project root. */
   scopeFilesToSession?: boolean;
+  /** Allow opening DocShare controls from the embedded file panel (false for shared-in callers). */
+  canManageFileShares?: boolean;
   /** Retry a failed optimistic send — called with the original commandId and text. */
   onResendFailed?: (commandId: string, text: string) => void;
   /** Load the bounded timeline window around an old PostgreSQL-backed pin. */
@@ -2825,7 +2827,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
-function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false }: Props) {
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, canManageFileShares = true, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -5289,6 +5291,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               sessionName={sessionId ?? undefined}
               scopeToSessionRoot={scopeFilesToSession}
               readOnly={readOnlyFiles}
+              canShare={canManageFileShares}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}

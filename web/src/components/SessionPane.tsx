@@ -33,6 +33,7 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import { isShareScopedState } from '../tab-sharing-ui.js';
 import { focusComposerElement } from '../keyboard-shortcuts.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
@@ -138,6 +139,8 @@ export interface SessionPaneProps {
   onPendingSharedUploadConsumed?: (id: string) => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
+  /** Allow opening DocShare controls from embedded FileBrowser instances (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 export function SessionPane({
@@ -182,8 +185,10 @@ export function SessionPane({
   pendingSharedUpload,
   onPendingSharedUploadConsumed,
   onVersionSensitiveAction,
+  canManageFileShares = true,
 }: SessionPaneProps) {
   recordPerfRender(isActive ? 'SessionPane:active' : 'SessionPane:hidden');
+  const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(session.sharedState);
   const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
@@ -508,6 +513,7 @@ export function SessionPane({
           serverId={serverId}
           scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}
           readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
+          canManageFileShares={effectiveCanManageFileShares}
           onQuote={addQuote}
           agentType={session.agentType}
           onResendFailed={handleResendFailed}
@@ -627,6 +633,7 @@ export function SessionPane({
           onPendingSharedUploadConsumed={onPendingSharedUploadConsumed}
           onVersionSensitiveAction={onVersionSensitiveAction}
           onComposerTextChange={setComposerText}
+          canManageFileShares={effectiveCanManageFileShares}
         />
       )}
     </div>

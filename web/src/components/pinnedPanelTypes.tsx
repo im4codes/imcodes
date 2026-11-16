@@ -220,6 +220,7 @@ registerPanelType('filebrowser', {
         sessionName={activeSession}
         scopeToSessionRoot={isTabShare}
         readOnly={ctx.sharedAccessRole === 'viewer'}
+        canShare={ctx.canManageFileShares ?? !ctx.shareTargetKind}
         mode="file-multi"
         layout="panel"
         initialPath={projectDir}

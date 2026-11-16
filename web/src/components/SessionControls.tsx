@@ -543,6 +543,8 @@ interface Props {
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
   /** Reports the current composer text to parent surfaces (e.g. footer actions). */
   onComposerTextChange?: (text: string) => void;
+  /** Allow opening DocShare controls from embedded FileBrowser overlays (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
@@ -1863,7 +1865,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
   const baseOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
   const handleOpenNodeGroupsFromBrowser = useCallback(() => {
     onMobileFileBrowserClose?.();
@@ -8533,6 +8535,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             sessionName={activeSession.name}
             scopeToSessionRoot={isShareScopedSession && sharedState?.targetKind !== 'server'}
             readOnly={isShareScopedSession && !canSharedSessionSend}
+            canShare={canManageFileShares && !isShareScopedSession}
             mode="file-multi"
           layout="panel"
           initialPath={activeSession.projectDir ?? '~'}
@@ -8566,6 +8569,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             sessionName={activeSession.name}
             scopeToSessionRoot={isShareScopedSession && sharedState?.targetKind !== 'server'}
             readOnly={isShareScopedSession && !canSharedSessionSend}
+            canShare={canManageFileShares && !isShareScopedSession}
             mode="file-multi"
             layout="panel"
             initialPath={openSpecFolderPath}
