@@ -4038,10 +4038,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const browser = await browserType.launch({ headless: true });
     try {
       const scenarios = [
-        { name: 'iphone-single-line', width: 390, height: 844, sat: 47, sab: 34, composerHeight: 46, bottomOffset: 44 },
-        { name: 'iphone-multiline', width: 390, height: 844, sat: 47, sab: 34, composerHeight: 148, bottomOffset: 44 },
-        { name: 'landscape-420-container', width: 844, height: 390, sat: 0, sab: 21, composerHeight: 44, bottomOffset: 24 },
-        { name: 'compressed-300-container', width: 390, height: 280, sat: 0, sab: 0, composerHeight: 42, bottomOffset: 8 },
+        { name: 'iphone-single-line', width: 390, height: 844, sat: 47, sab: 34, composerHeight: 46, bottomOffset: 44, minSideOffsetY: 20 },
+        { name: 'iphone-multiline', width: 390, height: 844, sat: 47, sab: 34, composerHeight: 148, bottomOffset: 44, minSideOffsetY: 20 },
+        { name: 'landscape-420-container', width: 844, height: 390, sat: 0, sab: 21, composerHeight: 44, bottomOffset: 24, minSideOffsetY: 10 },
+        { name: 'compressed-300-container', width: 390, height: 280, sat: 0, sab: 0, composerHeight: 42, bottomOffset: 8, minSideOffsetY: 4 },
       ];
 
       for (const sc of scenarios) {
@@ -4091,20 +4091,61 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             const clearance = Math.round(hudRect.bottom - composerRect.top + gapPx);
             hud.style.setProperty('--voice-hud-bottom-clearance', `${clearance}px`);
 
-            const card = document.querySelector('.voice-hold-hud-card')!.getBoundingClientRect();
+            const cardEl = document.querySelector('.voice-hold-hud-card') as HTMLElement;
+            const card = cardEl.getBoundingClientRect();
             const zones = document.querySelector('.voice-hold-hud-zones')!.getBoundingClientRect();
+            const activeHint = document.querySelector('.voice-hold-hud-active-hint')!.getBoundingClientRect();
+            const waveform = document.querySelector('.voice-hold-hud-waveform')!.getBoundingClientRect();
+            const cancelEl = document.querySelector('.voice-hold-zone-cancel') as HTMLElement;
+            const sendEl = document.querySelector('.voice-hold-zone-send') as HTMLElement;
+            const editEl = document.querySelector('.voice-hold-zone-edit') as HTMLElement;
+            const cancel = cancelEl.getBoundingClientRect();
+            const send = sendEl.getBoundingClientRect();
+            const edit = editEl.getBoundingClientRect();
+            const cancelLabel = cancelEl.querySelector('.voice-hold-zone-label') as HTMLElement;
+            const editLabel = editEl.querySelector('.voice-hold-zone-label') as HTMLElement;
             const stageEl = document.querySelector('.voice-hold-hud-transcript-stage')!;
             const stage = stageEl.getBoundingClientRect();
             const transcriptEl = document.querySelector('.voice-hold-hud-transcript')!;
             const transcript = transcriptEl.getBoundingClientRect();
             const inputRect = input.getBoundingClientRect();
             const dropDelta = Math.round((inputRect.top + inputRect.height / 2) - (transcript.top + transcript.height / 2));
+
+            cancelEl.classList.add('is-active');
+            editEl.classList.add('is-active');
+            const cancelActiveTransform = getComputedStyle(cancelEl).transform;
+            const editActiveTransform = getComputedStyle(editEl).transform;
+            const cancelActiveTop = cancelEl.getBoundingClientRect().top;
+            cancelEl.classList.remove('is-active');
+            editEl.classList.remove('is-active');
+
             return {
               clearance,
+              innerHeight: window.innerHeight,
               composerTop: composerRect.top,
               zonesBottom: zones.bottom,
+              activeHintBottom: activeHint.bottom,
+              waveformTop: waveform.top,
+              waveformBottom: waveform.bottom,
               cardTop: card.top,
               cardBottom: card.bottom,
+              cardScrollHeight: cardEl.scrollHeight,
+              cardClientHeight: cardEl.clientHeight,
+              cancelTop: cancel.top,
+              cancelBottom: cancel.bottom,
+              cancelRight: cancel.right,
+              sendTop: send.top,
+              sendBottom: send.bottom,
+              sendLeft: send.left,
+              sendRight: send.right,
+              editTop: edit.top,
+              editBottom: edit.bottom,
+              editLeft: edit.left,
+              cancelActiveTransform,
+              editActiveTransform,
+              cancelActiveTop,
+              cancelLabelPointerEvents: getComputedStyle(cancelLabel).pointerEvents,
+              editLabelPointerEvents: getComputedStyle(editLabel).pointerEvents,
               stageHeight: stage.height,
               transcriptTop: transcript.top,
               transcriptBottom: transcript.bottom,
@@ -4118,6 +4159,22 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
           expect(metrics.clearance, `${sc.name} clearance`).toBeGreaterThan(0);
           expect(metrics.zonesBottom, `${sc.name} zones above composer`).toBeLessThanOrEqual(metrics.composerTop - 8);
+          expect(metrics.sendBottom, `${sc.name} send zone above composer`).toBeLessThanOrEqual(metrics.composerTop - 8);
+          expect(metrics.activeHintBottom, `${sc.name} active hint above waveform`).toBeLessThanOrEqual(metrics.waveformTop + 1);
+          expect(metrics.waveformBottom, `${sc.name} waveform above send zone`).toBeLessThanOrEqual(metrics.sendTop + 1);
+          expect(metrics.cancelTop - metrics.sendTop, `${sc.name} cancel shifted downward`).toBeGreaterThanOrEqual(sc.minSideOffsetY);
+          expect(metrics.editTop - metrics.sendTop, `${sc.name} edit shifted downward`).toBeGreaterThanOrEqual(sc.minSideOffsetY);
+          expect(Math.abs(metrics.cancelTop - metrics.editTop), `${sc.name} side zones horizontally aligned`).toBeLessThanOrEqual(1);
+          expect(metrics.cancelRight, `${sc.name} cancel stays left of send`).toBeLessThanOrEqual(metrics.sendLeft + 1);
+          expect(metrics.editLeft, `${sc.name} edit stays right of send`).toBeGreaterThanOrEqual(metrics.sendRight - 1);
+          expect(metrics.cancelBottom, `${sc.name} cancel inside safe viewport`).toBeLessThanOrEqual(metrics.innerHeight - sc.sab);
+          expect(metrics.editBottom, `${sc.name} edit inside safe viewport`).toBeLessThanOrEqual(metrics.innerHeight - sc.sab);
+          expect(metrics.cardScrollHeight, `${sc.name} card unclipped`).toBeLessThanOrEqual(metrics.cardClientHeight + 1);
+          expect(metrics.cancelActiveTransform, `${sc.name} cancel active scale preserved`).not.toBe('none');
+          expect(metrics.editActiveTransform, `${sc.name} edit active scale preserved`).not.toBe('none');
+          expect(metrics.cancelActiveTop - metrics.sendTop, `${sc.name} cancel stays shifted when active`).toBeGreaterThanOrEqual(sc.minSideOffsetY - 2);
+          expect(metrics.cancelLabelPointerEvents).toBe('none');
+          expect(metrics.editLabelPointerEvents).toBe('none');
           expect(metrics.cardBottom, `${sc.name} card bottom >= zonesBottom`).toBeGreaterThanOrEqual(metrics.zonesBottom);
           expect(metrics.stageHeight, `${sc.name} stage height`).toBeGreaterThanOrEqual(40);
           expect(metrics.transcriptBottom, `${sc.name} transcript above card`).toBeLessThanOrEqual(metrics.cardTop + 1);
