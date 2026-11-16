@@ -841,6 +841,7 @@ export interface CapabilityListRequest {
   state?: CapabilityLifecycleState;
   scope?: CapabilityScope;
   query?: string;
+  searchRegistry?: boolean;
   limit?: number;
 }
 
@@ -932,7 +933,9 @@ export const CAPABILITY_MCP_TOOL_NAMES = Object.values(CAPABILITY_MCP_TOOL) as r
 
 export const CAPABILITY_CANONICAL_INSTALL_POLICY = [
   'Manage MCP services through IM.codes capability tools.',
-  'For MCP services, compose the requested non-secret stdio or Streamable HTTP definition directly as source.kind=mcp_config; do not require an installer URL, package download, Settings form, or separate model. A source.kind=url value is the MCP Streamable HTTP endpoint itself, not an installation package.',
+  'Use capability_list to inspect installed MCP servers, or capability_list(searchRegistry=true, query="<name>") to look up official MCP Registry entries.',
+  'For MCP services, compose the requested non-secret stdio or Streamable HTTP/SSE definition directly as source.kind=mcp_config (or source.kind=url for a remote endpoint); scope defaults to local, idempotencyKey is optional, and MCP configs do not require an installer URL, package download, Settings form, or separate model. A source.kind=url value is the MCP Streamable HTTP endpoint itself, not an installation package.',
+  'Use capability_manage(action="uninstall", kind="mcp", name="<server>", userIntent="...") when the user asks to uninstall an MCP server.',
   'For Agent Skills, use the upstream open-source skills CLI directly: npx skills add <source>. Do not use IM.codes capability tools, its managed-package registry or its audit/confirmation workflow to install Skills.',
   'Follow the upstream project-local default in the requested project; add --global only when the user requests installation across projects. Preserve the requested machine, skill and agent selections; do not silently install on other machines or for other agents.',
   'Use npx skills find, npx skills list, npx skills check, npx skills update and npx skills remove for Skill discovery, inventory, update checks, updates and removal. Agents load the CLI-installed files themselves; do not maintain a second IM.codes copy or installation lifecycle.',
@@ -953,7 +956,7 @@ export const CAPABILITY_AI_SYSTEM_INSTRUCTIONS = [
 ].join(' ');
 
 export interface CapabilityJsonSchema {
-  type: string;
+  type?: string;
   description?: string;
   enum?: readonly string[];
   minimum?: number;
@@ -964,6 +967,7 @@ export interface CapabilityJsonSchema {
   required?: readonly string[];
   properties?: Readonly<Record<string, CapabilityJsonSchema>>;
   items?: CapabilityJsonSchema;
+  anyOf?: readonly CapabilityJsonSchema[];
   maxItems?: number;
 }
 
@@ -1003,12 +1007,13 @@ const machineSchema = arraySchema(
 export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolName, CapabilityMcpToolContract>> = {
   [CAPABILITY_MCP_TOOL.LIST]: {
     name: CAPABILITY_MCP_TOOL.LIST,
-    description: 'List visible IM.codes MCP services and legacy managed records with state, scope, version, readiness, findings, and management hints. Read-only. For Agent Skills, use npx skills list instead.',
-    inputSchema: objectSchema('Bounded inventory filter.', {
+    description: 'List installed MCP servers and visible legacy records, or set searchRegistry=true with query to search the official MCP Registry. Read-only. For Agent Skills, use npx skills list instead.',
+    inputSchema: objectSchema('Bounded inventory filter or official MCP Registry search.', {
       kind: kindSchema,
       state: { type: 'string', enum: CAPABILITY_LIFECYCLE_STATES, description: 'Optional lifecycle-state filter.' },
       scope: scopeSchema,
-      query: stringSchema('Optional case-insensitive name/source search text.', { maxLength: CAPABILITY_LIMITS.DISPLAY_NAME_CHARS }),
+      query: stringSchema('Optional case-insensitive name/source search text (required when searchRegistry=true).', { maxLength: CAPABILITY_LIMITS.DISPLAY_NAME_CHARS }),
+      searchRegistry: { type: 'boolean', description: 'When true, search the official MCP Registry (registry.modelcontextprotocol.io) by query instead of listing installed services.' },
       limit: { type: 'number', description: `Optional result cap; defaults to ${CAPABILITY_LIMITS.LIST_DEFAULT}, maximum ${CAPABILITY_LIMITS.LIST_MAX}.`, minimum: 1, maximum: CAPABILITY_LIMITS.LIST_MAX },
     }),
   },
@@ -1024,16 +1029,32 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
         value: stringSchema(`Direct MCP Streamable HTTP endpoint, Skill URL/repository locator, or daemon-local Skill path, at most ${CAPABILITY_LIMITS.SOURCE_CHARS} characters.`, { maxLength: CAPABILITY_LIMITS.SOURCE_CHARS }),
         repositorySubdir: stringSchema('Optional repository-relative Skill directory; traversal and absolute paths are forbidden.', { maxLength: CAPABILITY_LIMITS.PATH_BYTES }),
         inlineFiles: { type: 'object', description: `Optional bounded portable package file map including SKILL.md; total UTF-8 bytes at most ${CAPABILITY_LIMITS.INLINE_PACKAGE_BYTES}.`, additionalProperties: stringSchema('UTF-8 file content.') },
-        mcpConfig: { type: 'object', description: 'AI-composed normalized credential-free stdio or Streamable HTTP MCP definition; this is the normal MCP install input and does not require a package URL. The Registry credential store is not ready in this release: authenticated definitions and all credentialRef fields are rejected with typed runtime_pending; never include token values.', additionalProperties: true },
+        mcpConfig: {
+          type: 'object',
+          description: 'AI-composed normalized credential-free stdio or Streamable HTTP MCP definition; this is the normal MCP install input and does not require a package URL. The Registry credential store is not ready in this release: authenticated definitions and all credentialRef fields are rejected with typed runtime_pending; never include token values.',
+          properties: {
+            name: stringSchema('Optional server name; inferred from URL host or stdio package when omitted.'),
+            transport: stringSchema('Transport type: stdio, http (or streamable-http / streamable_http), or sse.'),
+            type: stringSchema('Alias of transport: stdio, http, streamable-http, or sse.'),
+            command: { description: 'Executable name (e.g. npx) or OpenCode command array (["npx", "-y", "@pkg"]). Pass arguments in args when using a string command.', anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
+            args: arraySchema('Optional stdio command arguments (e.g. ["-y", "@upstash/context7-mcp"]).', stringSchema('Argument.'), 32),
+            env: { type: 'object', description: 'Optional stdio environment variables (only values explicitly provided by the user).', additionalProperties: stringSchema('Environment value.') },
+            url: stringSchema('Remote Streamable HTTP or SSE endpoint URL (https:// or http://localhost).'),
+            headers: { type: 'object', description: 'Optional HTTP headers (only values explicitly provided by the user).', additionalProperties: stringSchema('Header value.') },
+            mcpServers: { type: 'object', description: 'Optional standard mcp.json single-server wrapper: { "<name>": { ... } }.', additionalProperties: true },
+            servers: { type: 'object', description: 'Optional standard VS Code mcp.json single-server wrapper: { "<name>": { ... } }.', additionalProperties: true },
+          },
+          additionalProperties: true,
+        },
       }, ['kind']),
       displayName: stringSchema('Optional user-facing name; source metadata is used when omitted.', { maxLength: CAPABILITY_LIMITS.DISPLAY_NAME_CHARS }),
-      scope: scopeSchema,
+      scope: { type: 'string', enum: Object.values(CAPABILITY_SCOPE), description: 'Optional install scope (defaults to local). local stays on this daemon; account synchronizes; project/session require scopeId.' },
       scopeId: stringSchema('Required canonical project/session id for project or session scope; never a local path.'),
       providers: providerSchema,
       machines: machineSchema,
-      idempotencyKey: stringSchema('Required caller-stable retry key for one logical install request.', { maxLength: 128 }),
+      idempotencyKey: stringSchema('Optional caller-stable retry key for one logical install request (auto-generated when omitted for MCP installs).', { maxLength: 128 }),
       userIntent: stringSchema('Optional bounded original user instruction for provenance; never treated as confirmation.', { maxLength: CAPABILITY_LIMITS.USER_INTENT_BYTES }),
-    }, ['kind', 'source', 'scope', 'idempotencyKey']),
+    }, ['kind', 'source']),
   },
   [CAPABILITY_MCP_TOOL.STATUS]: {
     name: CAPABILITY_MCP_TOOL.STATUS,
