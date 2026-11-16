@@ -50,6 +50,8 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.reset': 'Reset',
         'settings.shortcuts.unassigned': 'Not set',
         'settings.shortcuts.recording_prompt': 'Press shortcut…',
+        'settings.shortcuts.record_modifiers': 'Record',
+        'settings.shortcuts.recording_modifiers_prompt': 'Press modifiers…',
         'settings.shortcuts.record_aria': 'Record shortcut for {{action}}',
         'settings.shortcuts.record_slot_aria': 'Record {{slot}} shortcut for {{action}}',
         'settings.shortcuts.clear_slot_aria': 'Clear {{slot}} shortcut for {{action}}',
@@ -74,6 +76,13 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.subsession_quick.modifiers_aria': 'Sub-session quick shortcut modifier keys',
         'settings.shortcuts.subsession_quick.min_one_hint': 'Keep at least one modifier key selected.',
         'settings.shortcuts.subsession_quick.reset_aria': 'Reset sub-session quick shortcut modifiers',
+        'settings.shortcuts.subsession_quick.record_aria': 'Record sub-session quick shortcut modifier combination',
+        'settings.shortcuts.task_pair_split.title': 'Task Pair Split View Shortcuts',
+        'settings.shortcuts.task_pair_split.desc': 'Choose modifiers for 1–9 split view toggle.',
+        'settings.shortcuts.task_pair_split.open_label': 'Toggle split view for task #',
+        'settings.shortcuts.task_pair_split.modifiers_aria': 'Task pair split view shortcut modifier keys',
+        'settings.shortcuts.task_pair_split.reset_aria': 'Reset task pair split view shortcut modifiers',
+        'settings.shortcuts.task_pair_split.record_aria': 'Record task pair split view shortcut modifier combination',
         'settings.shortcuts.mac_voice.title': 'Mac App Inline Voice Input',
         'settings.shortcuts.mac_voice.desc': 'Double-tap modifier key to dictate directly inside composer.',
         'settings.shortcuts.mac_voice.trigger_label': 'Double-tap shortcut',
@@ -494,5 +503,77 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     fireEvent.click(screen.getByTestId('mac-voice-mod-reset'));
     expect(screen.getByTestId('mac-voice-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
     expect(screen.queryByTestId('mac-voice-mod-reset')).toBeNull();
+  });
+
+  it('configures task-pair split shortcut (default Ctrl+Shift), supports keyboard modifier recording (Ctrl+Shift keydown/keyup & digit chord), conflict notice, and reset', () => {
+    render(<KeyboardShortcutsSection isMacOverride={false} />);
+
+    const splitSection = screen.getByTestId('taskpair-split-shortcuts-section');
+    expect(splitSection).not.toBeNull();
+    expect(screen.getByTestId('taskpair-split-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('taskpair-split-mod-shift').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('taskpair-split-mod-alt').getAttribute('aria-pressed')).toBe('false');
+    expect(screen.getByTestId('taskpair-split-preview').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('taskpair-split-preview').textContent).toContain('Shift');
+    expect(screen.queryByTestId('taskpair-split-mod-reset')).toBeNull();
+    expect(screen.queryByTestId('taskpair-split-conflict')).toBeNull();
+
+    // Start keyboard recording on task-pair split modifiers: record Alt+Shift via keydown + staggered keyup
+    const recordBtn = screen.getByTestId('taskpair-split-mod-record');
+    fireEvent.click(recordBtn);
+    expect(recordBtn.getAttribute('data-shortcut-recording')).toBe('true');
+    expect(splitSection.getAttribute('data-shortcut-recording')).toBe('true');
+
+    // Escape alone cancels without altering modifiers
+    fireEvent.keyDown(document, { key: 'Escape', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false });
+    expect(recordBtn.getAttribute('data-shortcut-recording')).toBeNull();
+    expect(screen.getByTestId('taskpair-split-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+
+    // Now record Alt + Shift, releasing Alt slightly before Shift -> peak Alt+Shift commits cleanly on last keyup
+    fireEvent.click(recordBtn);
+    fireEvent.keyDown(document, { key: 'Alt', altKey: true });
+    fireEvent.keyDown(document, { key: 'Shift', altKey: true, shiftKey: true });
+    fireEvent.keyUp(document, { key: 'Alt', altKey: false, shiftKey: true });
+    // Still recording while Shift remains held
+    expect(recordBtn.getAttribute('data-shortcut-recording')).toBe('true');
+    fireEvent.keyUp(document, { key: 'Shift', altKey: false, shiftKey: false });
+    expect(recordBtn.getAttribute('data-shortcut-recording')).toBeNull();
+    expect(screen.getByTestId('taskpair-split-mod-alt').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('taskpair-split-mod-shift').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('taskpair-split-mod-ctrl').getAttribute('aria-pressed')).toBe('false');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"taskPairSplitModifiers":["alt","shift"]'),
+      expect.anything(),
+    );
+
+    // Setting task-pair split to ['ctrl'] collides with sub-session quick modifiers -> conflict warning on both sections
+    fireEvent.click(screen.getByTestId('taskpair-split-mod-record'));
+    fireEvent.keyDown(document, { key: 'Control', ctrlKey: true });
+    fireEvent.keyUp(document, { key: 'Control', ctrlKey: false });
+    expect(screen.getByTestId('taskpair-split-conflict').textContent).toContain('Sub-session Quick Shortcuts');
+    expect(screen.getByTestId('subsession-quick-conflict').textContent).toContain('Task Pair Split View Shortcuts');
+
+    // Record Ctrl+Shift+Digit1 chord -> commits ['ctrl', 'shift'] immediately & restores default (reset button disappears, conflict clears)
+    fireEvent.click(screen.getByTestId('taskpair-split-mod-record'));
+    fireEvent.keyDown(document, { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true });
+    expect(screen.getByTestId('taskpair-split-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('taskpair-split-mod-shift').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByTestId('taskpair-split-conflict')).toBeNull();
+    expect(screen.queryByTestId('taskpair-split-mod-reset')).toBeNull();
+
+    // Sub-session quick modifier recorder also supports keyboard recording Ctrl+Shift
+    fireEvent.click(screen.getByTestId('subsession-mod-record'));
+    fireEvent.keyDown(document, { key: 'Control', ctrlKey: true });
+    fireEvent.keyDown(document, { key: 'Shift', ctrlKey: true, shiftKey: true });
+    fireEvent.keyUp(document, { key: 'Control', ctrlKey: false, shiftKey: true });
+    fireEvent.keyUp(document, { key: 'Shift', ctrlKey: false, shiftKey: false });
+    expect(screen.getByTestId('subsession-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('subsession-mod-shift').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('subsession-quick-conflict')).toBeTruthy();
+
+    // Reset sub-session modifiers clears conflict
+    fireEvent.click(screen.getByTestId('subsession-mod-reset'));
+    expect(screen.queryByTestId('subsession-quick-conflict')).toBeNull();
   });
 });

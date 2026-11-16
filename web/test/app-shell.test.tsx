@@ -384,6 +384,7 @@ vi.mock('../src/hooks/useTimeline.js', () => ({
   registerNormalTimelineSession: vi.fn(),
   forgetIncognitoTimelineSessions: vi.fn(),
   isIncognitoTimelineSession: vi.fn(() => false),
+  getCachedTimelineEvents: vi.fn(() => []),
   ingestTimelineEventForCache: vi.fn(),
   requestActiveTimelineRefresh: vi.fn(),
   dispatchActiveTimelineRefresh: vi.fn(),
@@ -9116,6 +9117,97 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
   }, 15000);
+
+  it('toggles task-pair split view with Ctrl+Shift+1..9 by numbered task order, ignores non-splittable/recording/inputs, and keeps Ctrl+1 independent', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      { id: 'sub-1', sessionName: 'deck_sub_alpha_a', parentSession: 'deck_alpha_brain', label: 'A', description: '', cwd: '/work/alpha', type: 'codex-sdk', runtimeType: 'transport', state: 'idle', serverId: 'srv-1' },
+      { id: 'sub-2', sessionName: 'deck_sub_alpha_b', parentSession: 'deck_alpha_brain', label: 'B', description: '', cwd: '/work/alpha', type: 'codex-sdk', runtimeType: 'transport', state: 'idle', serverId: 'srv-1' },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      const snapshot = {
+        authoritative: true,
+        serverId: 'srv-1',
+        tasks: [
+          { taskId: 'task-1', title: 'Primary Splittable', status: 'working', updatedAt: 10, pair: { status: 'working', executor: 'deck_sub_alpha_a', auditor: 'deck_sub_alpha_b' } },
+          { taskId: 'task-2', title: 'No Auditor Task', status: 'working', updatedAt: 20, pair: { status: 'working', executor: 'deck_sub_alpha_a', auditor: 'none' } },
+        ],
+      };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = snapshot;
+      act(() => {
+        window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: snapshot }));
+      });
+
+      // Ctrl+Shift+Digit1 (key '!') inside active composer opens split view for #1 task
+      const openEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(openEvt);
+      expect(openEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('true');
+        expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('true');
+      });
+
+      // Ctrl+Shift+2 on auditor='none' task safely no-ops without closing active split or preventing default
+      const nonSplittableEvt = new KeyboardEvent('keydown', { key: '@', code: 'Digit2', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(nonSplittableEvt);
+      expect(nonSplittableEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+
+      // Blocked when arbitrary non-composer input is focused
+      const otherInput = document.createElement('input');
+      document.body.appendChild(otherInput);
+      otherInput.focus();
+      const inInputEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      otherInput.dispatchEvent(inInputEvt);
+      expect(inInputEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+      otherInput.remove();
+
+      // Blocked during active shortcut recording (data-shortcut-recording="true")
+      alphaComposer.focus();
+      const recorderEl = document.createElement('div');
+      recorderEl.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorderEl);
+      const whileRecordingEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(whileRecordingEvt);
+      expect(whileRecordingEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('task-1');
+      recorderEl.remove();
+
+      // Second Ctrl+Shift+Digit1 toggles split view closed
+      const closeEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(closeEvt);
+      expect(closeEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('');
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
+      });
+
+      // Plain Ctrl+1 still opens sub-session 1 cleanly without triggering split view
+      alphaComposer.focus();
+      const plainSub1 = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, shiftKey: false, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(plainSub1);
+      expect(plainSub1.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('true');
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-task-pair-visit')).toBe('');
+        expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
+      });
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+    }
+  });
 
   it('blocks tab-switching shortcuts when terminal subwindow header chrome has focus, while preserving chat subwindow navigation', async () => {
     useSubSessionsState.subSessions = [

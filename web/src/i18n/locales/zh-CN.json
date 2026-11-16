@@ -2332,6 +2332,8 @@
       "reset": "恢复默认",
       "unassigned": "未设置",
       "recording_prompt": "请按下快捷键…",
+      "record_modifiers": "录制",
+      "recording_modifiers_prompt": "请按下修饰键组合…",
       "record_aria": "录制「{{action}}」快捷键",
       "record_slot_aria": "录制「{{action}}」的{{slot}}",
       "clear_slot_aria": "清除「{{action}}」的{{slot}}",
@@ -2368,7 +2370,16 @@
         "open_label": "打开/关闭对应子会话并聚焦输入框",
         "modifiers_aria": "子会话数字快捷键修饰键组合",
         "min_one_hint": "至少保留一个修饰键。",
-        "reset_aria": "重置子会话快捷键修饰键"
+        "reset_aria": "重置子会话快捷键修饰键",
+        "record_aria": "录制子会话快捷键修饰键组合"
+      },
+      "task_pair_split": {
+        "title": "任务并列查看快捷键",
+        "desc": "设置与数字键 1–9 配合使用的修饰键组合，按序号打开或关闭任务栏对应任务的并列查看（默认 Ctrl + Shift）。",
+        "open_label": "切换对应序号任务的并列查看",
+        "modifiers_aria": "任务并列查看数字快捷键修饰键组合",
+        "reset_aria": "重置任务并列查看快捷键修饰键",
+        "record_aria": "录制任务并列查看快捷键修饰键组合"
       },
       "mac_voice": {
         "title": "Mac 应用内置语音输入",

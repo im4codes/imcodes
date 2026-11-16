@@ -2332,6 +2332,8 @@
       "reset": "Restablecer",
       "unassigned": "Sin asignar",
       "recording_prompt": "Pulsa un atajo…",
+      "record_modifiers": "Grabar",
+      "recording_modifiers_prompt": "Pulsa modificadores…",
       "record_aria": "Grabar atajo para {{action}}",
       "record_slot_aria": "Grabar atajo {{slot}} para {{action}}",
       "clear_slot_aria": "Borrar atajo {{slot}} para {{action}}",
@@ -2368,7 +2370,16 @@
         "open_label": "Abrir / minimizar y enfocar subsesión #",
         "modifiers_aria": "Teclas modificadoras de atajos rápidos de subsesión",
         "min_one_hint": "Mantén seleccionada al menos una tecla modificadora.",
-        "reset_aria": "Restablecer modificadores de atajos rápidos de subsesión"
+        "reset_aria": "Restablecer modificadores de atajos rápidos de subsesión",
+        "record_aria": "Grabar combinación de modificadores para subsesión"
+      },
+      "task_pair_split": {
+        "title": "Atajos de vista dividida de tareas",
+        "desc": "Elige las teclas modificadoras que se combinan con 1–9 para abrir o cerrar la vista dividida de la tarea numerada en la barra de tareas (por defecto Ctrl + Shift).",
+        "open_label": "Alternar vista dividida de tarea #",
+        "modifiers_aria": "Teclas modificadoras para vista dividida de tareas",
+        "reset_aria": "Restablecer modificadores de vista dividida de tareas",
+        "record_aria": "Grabar combinación de modificadores para vista dividida de tareas"
       },
       "mac_voice": {
         "title": "Entrada de voz integrada en Mac",

@@ -4,9 +4,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_MAC_VOICE_INLINE_MODIFIER,
+  DEFAULT_TASK_PAIR_SPLIT_MODIFIERS,
   applyMacVoiceInlineModifier,
   applyShortcutSlotOverride,
   applySubSessionQuickModifiers,
+  applyTaskPairSplitModifiers,
   areSubSessionQuickModifiersEqual,
   canHandleGlobalNavigationShortcut,
   chordFromKeyboardEvent,
@@ -15,15 +17,18 @@ import {
   findShortcutSlotConflicts,
   focusComposerElement,
   formatShortcutKeycaps,
+  formatShortcutModifierKeycaps,
   formatSubSessionQuickModifierKeycaps,
   getDefaultSecondaryShortcuts,
   getDefaultShortcuts,
   getDefaultSubSessionQuickModifiers,
+  getDefaultTaskPairSplitModifiers,
   isMacPlatform,
   matchesShortcutChord,
   matchNavigationShortcutAction,
   matchNavigationShortcutBinding,
   matchSubSessionQuickShortcut,
+  matchTaskPairSplitQuickShortcut,
   normalizeShortcutChordString,
   parseShortcutChord,
   resolveFocusedKeyboardViewMode,
@@ -31,6 +36,7 @@ import {
   resolveKeyboardShortcutSlots,
   resolveMacVoiceInlineModifier,
   resolveSubSessionQuickModifiers,
+  resolveTaskPairSplitModifiers,
   sanitizeMacVoiceInlineModifier,
   sanitizeShortcutOverrides,
   sanitizeSubSessionQuickModifiers,
@@ -814,5 +820,68 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(withDisabled).toEqual({ macVoiceInlineModifier: null });
     const resetDefault = applyMacVoiceInlineModifier(withDisabled, 'ctrl');
     expect(resetDefault).toEqual({});
+  });
+
+  it('defaults taskPairSplitModifiers to Ctrl+Shift, sanitizes overrides, and matches Shift-shifted Digit1..9', () => {
+    expect(DEFAULT_TASK_PAIR_SPLIT_MODIFIERS).toEqual(['ctrl', 'shift']);
+    expect(getDefaultTaskPairSplitModifiers()).toEqual(['ctrl', 'shift']);
+    expect(resolveTaskPairSplitModifiers(undefined)).toEqual(['ctrl', 'shift']);
+    expect(resolveTaskPairSplitModifiers({ taskPairSplitModifiers: [] })).toEqual(['ctrl', 'shift']);
+
+    expect(sanitizeShortcutOverrides({ taskPairSplitModifiers: ['shift', 'ctrl'] })).toEqual({
+      taskPairSplitModifiers: ['ctrl', 'shift'],
+    });
+    expect(applyTaskPairSplitModifiers({}, ['alt', 'shift'])).toEqual({
+      taskPairSplitModifiers: ['alt', 'shift'],
+    });
+    expect(applyTaskPairSplitModifiers({ taskPairSplitModifiers: ['alt', 'shift'] }, ['shift', 'ctrl'])).toEqual({});
+
+    expect(formatShortcutModifierKeycaps(['ctrl', 'shift'], true, DEFAULT_TASK_PAIR_SPLIT_MODIFIERS)).toEqual(['⌃', '⇧']);
+    expect(formatShortcutModifierKeycaps(['ctrl', 'shift'], false, DEFAULT_TASK_PAIR_SPLIT_MODIFIERS)).toEqual(['Ctrl', 'Shift']);
+
+    // Shift + Digit1 emits e.key === '!' while e.code === 'Digit1'
+    expect(matchTaskPairSplitQuickShortcut({
+      key: '!',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: true,
+      metaKey: false,
+    }, ['ctrl', 'shift'])).toEqual({ kind: 'toggleSplit', index: 0 });
+    expect(matchTaskPairSplitQuickShortcut({
+      key: '9',
+      code: 'Numpad9',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: true,
+      metaKey: false,
+    }, ['ctrl', 'shift'])).toEqual({ kind: 'toggleSplit', index: 8 });
+    // Plain Ctrl+1 does NOT match default task-pair split shortcut
+    expect(matchTaskPairSplitQuickShortcut({
+      key: '1',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: false,
+      metaKey: false,
+    }, ['ctrl', 'shift'])).toBeNull();
+    // Ctrl+Shift+0 and IME composing are ignored
+    expect(matchTaskPairSplitQuickShortcut({
+      key: ')',
+      code: 'Digit0',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: true,
+      metaKey: false,
+    }, ['ctrl', 'shift'])).toBeNull();
+    expect(matchTaskPairSplitQuickShortcut({
+      key: '!',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: true,
+      metaKey: false,
+      isComposing: true,
+    }, ['ctrl', 'shift'])).toBeNull();
   });
 });

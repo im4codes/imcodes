@@ -2331,6 +2331,8 @@
       "reset": "초기화",
       "unassigned": "설정 안 됨",
       "recording_prompt": "단축키를 누르세요…",
+      "record_modifiers": "기록",
+      "recording_modifiers_prompt": "보조 키 조합을 누르세요…",
       "record_aria": "{{action}} 단축키 기록",
       "record_slot_aria": "{{action}}의 {{slot}} 단축키 기록",
       "clear_slot_aria": "{{action}}의 {{slot}} 단축키 지우기",
@@ -2367,7 +2369,16 @@
         "open_label": "하위 세션 # 열기/닫기 및 포커스",
         "modifiers_aria": "하위 세션 빠른 단축키 보조 키",
         "min_one_hint": "최소 하나의 보조 키를 유지해야 합니다.",
-        "reset_aria": "하위 세션 단축키 보조 키 초기화"
+        "reset_aria": "하위 세션 단축키 보조 키 초기화",
+        "record_aria": "하위 세션 단축키 보조 키 조합 기록"
+      },
+      "task_pair_split": {
+        "title": "작업 나란히 보기 단축키",
+        "desc": "숫자 키 1–9와 조합해 작업 표시줄의 해당 번호 작업에 대한 나란히 보기를 켜거나 끄는 보조 키 조합을 선택합니다(기본 Ctrl + Shift).",
+        "open_label": "작업 # 나란히 보기 전환",
+        "modifiers_aria": "작업 나란히 보기 단축키 보조 키",
+        "reset_aria": "작업 나란히 보기 단축키 보조 키 초기화",
+        "record_aria": "작업 나란히 보기 단축키 보조 키 조합 기록"
       },
       "mac_voice": {
         "title": "Mac 앱 인라인 음성 입력",

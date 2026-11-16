@@ -2332,6 +2332,8 @@
       "reset": "Reset",
       "unassigned": "Not set",
       "recording_prompt": "Press shortcut…",
+      "record_modifiers": "Record",
+      "recording_modifiers_prompt": "Press modifiers…",
       "record_aria": "Record shortcut for {{action}}",
       "record_slot_aria": "Record {{slot}} shortcut for {{action}}",
       "clear_slot_aria": "Clear {{slot}} shortcut for {{action}}",
@@ -2368,7 +2370,16 @@
         "open_label": "Open / minimize & focus sub-session #",
         "modifiers_aria": "Sub-session quick shortcut modifier keys",
         "min_one_hint": "Keep at least one modifier key selected.",
-        "reset_aria": "Reset sub-session quick shortcut modifiers"
+        "reset_aria": "Reset sub-session quick shortcut modifiers",
+        "record_aria": "Record sub-session quick shortcut modifier combination"
+      },
+      "task_pair_split": {
+        "title": "Task Pair Split View Shortcuts",
+        "desc": "Choose which modifier keys combine with number keys 1–9 to toggle side-by-side split view for the corresponding numbered task in the task bar.",
+        "open_label": "Toggle split view for task #",
+        "modifiers_aria": "Task pair split view shortcut modifier keys",
+        "reset_aria": "Reset task pair split view shortcut modifiers",
+        "record_aria": "Record task pair split view shortcut modifier combination"
       },
       "mac_voice": {
         "title": "Mac App Inline Voice Input",

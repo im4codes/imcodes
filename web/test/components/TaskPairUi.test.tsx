@@ -15,6 +15,7 @@ vi.mock('react-i18next', () => ({
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
 import { TaskPairStatusPanel, TaskPairStatusPanelHost, collapsedStorageKey } from '../../src/components/TaskPairStatusPanel.js';
+import { resolveOrderedTaskPairRows } from '../../src/task-pair-panel-order.js';
 import { SubSessionTaskTitle } from '../../src/components/SubSessionTaskTitle.js';
 import { SupervisionTaskPairSnapshotBridge, taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
@@ -1368,6 +1369,43 @@ describe('TaskPairStatusPanel', () => {
     expect(container.querySelector('.task-pair-split-btn')).toBeNull();
     act(() => window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } })));
     expect(container.querySelector('.task-pair-split-btn')).toBeTruthy();
+  });
+
+  it('orders visible sequence badges consistently with resolveOrderedTaskPairRows, keeps auditor=none numbered, and puts shortcut hint on split buttons', () => {
+    localStorage.setItem(collapsedStorageKey('s1', false), 'false');
+    try {
+      const snapshot = {
+        authoritative: true,
+        serverId: 's1',
+        tasks: [
+          { taskId: 't-queued-2', title: 'Queued second', status: 'queued', updatedAt: 10, pair: { status: 'queued', queuePosition: 2, executor: 'exec-1', auditor: 'audit-1' } },
+          { taskId: 't-no-audit', title: 'No auditor task', status: 'working', updatedAt: 20, pair: { status: 'working', executor: 'exec-2', auditor: 'none' } },
+          { taskId: 't-working-1', title: 'Working task', status: 'working', updatedAt: 30, pair: { status: 'working', executor: 'exec-3', auditor: 'audit-3' } },
+          { taskId: 't-queued-1', title: 'Queued first', status: 'queued', updatedAt: 40, pair: { status: 'queued', queuePosition: 1, executor: 'exec-4', auditor: 'audit-4' } },
+        ],
+      };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = snapshot;
+      const ordered = resolveOrderedTaskPairRows({ snapshot, events: [], serverId: 's1' });
+      expect(ordered.map((r) => r.payload.taskId)).toEqual(['t-no-audit', 't-working-1', 't-queued-1', 't-queued-2']);
+
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="s1" />);
+      const rows = [...container.querySelectorAll('.task-pair-status-row')];
+      expect(rows.map((row) => row.querySelector('.task-pair-status-sequence')?.textContent)).toEqual(['1', '2', '3', '4']);
+      expect(rows.map((row) => row.querySelector('.task-pair-status-row-title')?.textContent)).toEqual([
+        'No auditor task',
+        'Working task',
+        '#1 Queued first',
+        '#2 Queued second',
+      ]);
+      // Row 1 has auditor='none' so no split button, while rows 2..4 show shortcut hints with their sequence numbers
+      expect(rows[0].querySelector('.task-pair-split-btn')).toBeNull();
+      expect(rows[1].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('2');
+      expect(rows[2].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('3');
+      expect(rows[3].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('4');
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      localStorage.clear();
+    }
   });
 
   it('has panel_open_split and panel_close_split i18n keys across all seven locales', () => {

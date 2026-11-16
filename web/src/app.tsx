@@ -110,14 +110,23 @@ import {
   isMacPlatform,
   matchNavigationShortcutBinding,
   matchSubSessionQuickShortcut,
+  matchTaskPairSplitQuickShortcut,
   readLegacyTabOrder,
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcutSlots,
   resolveMacVoiceInlineModifier,
   resolveSubSessionQuickModifiers,
+  resolveTaskPairSplitModifiers,
   sortSessionsByTabOrder,
   type KeyboardShortcutOverrides,
+  type ShortcutModifierKey,
 } from './keyboard-shortcuts.js';
+import {
+  isTaskPairSplittable,
+  resolveOrderedTaskPairRows,
+  type TaskPairConsoleSnapshotDetail,
+} from './task-pair-panel-order.js';
+import { taskPairDisplayTitle } from '@shared/task-pair-display.js';
 import {
   installMacVoiceShortcutListener,
   setFallbackMacVoiceModifier,
@@ -362,7 +371,7 @@ import {
   nextTransportQueueVersion,
   removeTransportPendingEntryForUserMessage,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh, requestActiveTimelineRefreshAfterUserAction } from './hooks/useTimeline.js';
+import { getCachedTimelineEvents, ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh, requestActiveTimelineRefreshAfterUserAction } from './hooks/useTimeline.js';
 import {
   getMobileKeyboardState,
   isMobileKeyboardInputTarget,
@@ -2748,6 +2757,10 @@ function InternalMainApp() {
   );
   const resolvedSubSessionQuickModifiers = useMemo(
     () => resolveSubSessionQuickModifiers(shortcutOverrides),
+    [shortcutOverrides],
+  );
+  const resolvedTaskPairSplitModifiers = useMemo(
+    () => resolveTaskPairSplitModifiers(shortcutOverrides),
     [shortcutOverrides],
   );
   const resolvedMacVoiceModifier = useMemo(
@@ -7868,6 +7881,14 @@ function InternalMainApp() {
   resolvedShortcutSlotsRef.current = resolvedShortcutSlots;
   const resolvedSubSessionQuickModifiersRef = useRef(resolvedSubSessionQuickModifiers);
   resolvedSubSessionQuickModifiersRef.current = resolvedSubSessionQuickModifiers;
+  const resolvedTaskPairSplitModifiersRef = useRef(resolvedTaskPairSplitModifiers);
+  resolvedTaskPairSplitModifiersRef.current = resolvedTaskPairSplitModifiers;
+  useEffect(() => {
+    (window as Window & { __imcodesTaskPairSplitModifiers?: ShortcutModifierKey[] }).__imcodesTaskPairSplitModifiers = resolvedTaskPairSplitModifiers;
+    window.dispatchEvent(new CustomEvent('deck:task-pair-split-modifiers'));
+  }, [resolvedTaskPairSplitModifiers]);
+  const handlePairSplitRef = useRef(handlePairSplit);
+  handlePairSplitRef.current = handlePairSplit;
   const resolvedMacVoiceModifierRef = useRef(resolvedMacVoiceModifier);
   resolvedMacVoiceModifierRef.current = resolvedMacVoiceModifier;
   setFallbackMacVoiceModifier(resolvedMacVoiceModifier);
@@ -7993,7 +8014,10 @@ function InternalMainApp() {
       const quickSubMatch = matched
         ? null
         : matchSubSessionQuickShortcut(e, resolvedSubSessionQuickModifiersRef.current);
-      if (!matched && !quickSubMatch) return;
+      const pairSplitMatch = matched || quickSubMatch
+        ? null
+        : matchTaskPairSplitQuickShortcut(e, resolvedTaskPairSplitModifiersRef.current);
+      if (!matched && !quickSubMatch && !pairSplitMatch) return;
 
       const subId = focusedSubIdRef.current;
       const subRecord = subId ? subSessionsRef.current.find((item) => item.id === subId) : undefined;
@@ -8040,6 +8064,30 @@ function InternalMainApp() {
             });
           }
         }
+        return;
+      }
+
+      if (pairSplitMatch) {
+        if (!selectedServerIdRef.current || manualDashboardRef.current) return;
+        const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+        const orderedRows = resolveOrderedTaskPairRows({
+          snapshot,
+          events: getCachedTimelineEvents(selectedServerIdRef.current, activeSessionRef.current),
+          serverId: selectedServerIdRef.current,
+        });
+        const targetRow = orderedRows[pairSplitMatch.index];
+        if (!targetRow || !isTaskPairSplittable(targetRow.payload)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const taskId = String(targetRow.payload.taskId);
+        const title = taskPairDisplayTitle(targetRow.payload.title, taskId, targetRow.payload.brief) ?? taskId;
+        handlePairSplitRef.current({
+          taskId,
+          title,
+          executor: String(targetRow.payload.executor),
+          auditor: String(targetRow.payload.auditor),
+          action: 'toggle',
+        });
         return;
       }
 
