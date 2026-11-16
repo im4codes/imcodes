@@ -484,4 +484,98 @@ describe('direct-file-transfer zombie peer recovery & iOS delayed errors', () =>
     expect(mockFallbackUploadFile).toHaveBeenCalledTimes(1);
     expect(res.attachment.daemonPath).toBe('/tmp/http-fallback.bin');
   });
+
+  it('re-arms direct connectTimer instead of falling back immediately when timer fires after background resume crossed epoch', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createMockWs({ stallAllOffers: true });
+    const file = createTestUploadFile('resume-crossed-epoch.bin', 16);
+
+    mockFallbackUploadFile.mockResolvedValue({
+      ok: true,
+      attachment: {
+        id: opaque('f'),
+        source: 'upload',
+        serverId: 'srv-1',
+        daemonPath: '/tmp/http-after-rearm.bin',
+        originalName: 'resume-crossed-epoch.bin',
+        size: 16,
+        createdAt: '2026-11-15T00:00:00.000Z',
+        downloadable: true,
+      },
+    });
+
+    const promise = uploadFileWithDirectFallback({
+      ws,
+      file,
+      serverId: 'srv-1',
+      sessionName: 'deck_sub_1',
+    });
+
+    await vi.advanceTimersByTimeAsync(500);
+    // Simulate quick app switch before connectTimer expires: hidden -> visible before timer fires
+    setDocumentVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(2_000);
+    setDocumentVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    // Advance past the original 8s deadline (500 + 2000 + 6000 = 8500): timer fires while already visible,
+    // detects crossed backgroundEpoch, and re-arms a fresh 8s connect window instead of immediate HTTP fallback.
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(mockFallbackUploadFile).not.toHaveBeenCalled();
+
+    // After the re-armed 8s window elapses with Direct still stalled, HTTP fallback proceeds cleanly.
+    await vi.advanceTimersByTimeAsync(8_500);
+    const res = await promise;
+    expect(res.ok).toBe(true);
+    expect(mockFallbackUploadFile).toHaveBeenCalledTimes(1);
+    expect(res.attachment.daemonPath).toBe('/tmp/http-after-rearm.bin');
+  });
+
+  it('falls back to HTTP without clearing resumable identity on non-user CANCELED from lease control invalidation', async () => {
+    const { uploadFileWithDirectFallback, resumeDirectFileTransfers } = await import('../src/direct-file-transfer.js');
+    const { ws } = createMockWs({ stallAllOffers: true });
+    const file = createTestUploadFile('non-user-cancel.bin', 16);
+
+    mockFallbackUploadFile.mockImplementation(async (_srv: string, _f: File, _onProg?: unknown, clientUploadId?: string) => ({
+      ok: true,
+      attachment: {
+        id: opaque('c'),
+        source: 'upload',
+        serverId: 'srv-1',
+        daemonPath: `/tmp/http-${String(clientUploadId ?? 'missing')}.bin`,
+        originalName: 'non-user-cancel.bin',
+        size: 16,
+        createdAt: '2026-11-15T00:00:00.000Z',
+        downloadable: true,
+      },
+    }));
+
+    const controller = new AbortController();
+    const promise = uploadFileWithDirectFallback({
+      ws,
+      file,
+      serverId: 'srv-1',
+      sessionName: 'deck_sub_1',
+      clientUploadId: 'cid-keep-me',
+      signal: controller.signal,
+    });
+
+    await vi.advanceTimersByTimeAsync(100);
+    // Simulate WS reconnect / resume closing peer while user signal was NOT aborted
+    resumeDirectFileTransfers(ws, 'srv-1');
+    await vi.advanceTimersByTimeAsync(17_000);
+
+    const res = await promise;
+    expect(res.ok).toBe(true);
+    expect(res.attachment.daemonPath).toBe('/tmp/http-cid-keep-me.bin');
+    expect(mockFallbackUploadFile).toHaveBeenCalledWith(
+      'srv-1',
+      file,
+      undefined,
+      'cid-keep-me',
+      controller.signal,
+      'deck_sub_1',
+    );
+  });
 });

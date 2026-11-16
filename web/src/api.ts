@@ -3600,36 +3600,81 @@ export function buildDocAuthRelayUrl(
 export function isR2RelaySelected(): boolean {
   return isServerR2RelayEnabled() && readFileRelayMode(getExpectedUserId()) === FILE_RELAY_MODE.R2;
 }
+function isRetryableR2NetworkError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  if (error instanceof ApiError) {
+    return error.status === 0 || error.status === 408 || error.status === 425 || error.status === 429
+      || error.status === 502 || error.status === 503 || error.status === 504;
+  }
+  return error instanceof Error && error.name !== 'NotReadableError';
+}
+
+async function runR2StepWithLifecycleRecovery<T>(
+  lifecycleState: ReturnType<typeof createUploadLifecycleRecoveryState>,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  for (;;) {
+    if (signal?.aborted) throw new DOMException('upload_canceled', 'AbortError');
+    const attemptEpoch = getUploadBackgroundEpoch();
+    try {
+      return await run();
+    } catch (error) {
+      if (signal?.aborted) {
+        if (error instanceof Error && error.name === 'AbortError') throw error;
+        throw new DOMException('upload_canceled', 'AbortError');
+      }
+      if (!isRetryableR2NetworkError(error, signal)) throw error;
+      const recovery = await recoverUploadFromLifecycleIfNeeded(attemptEpoch, lifecycleState, signal);
+      if (recovery === 'none') throw error;
+    }
+  }
+}
+
 export async function tryUploadR2File(serverId: string, file: File, onProgress?: (pct: number) => void,
   clientUploadId?: string, signal?: AbortSignal, sessionName?: string, destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse } | null> {
   if (!isR2RelaySelected() || destinationDirectory) return null;
   if (signal?.aborted) throw new DOMException('upload_canceled', 'AbortError');
+  const lifecycleState = createUploadLifecycleRecoveryState();
   const root = withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, sessionName);
-  const response = await rawFetch(root, { method: 'POST', signal, body: JSON.stringify({
-    filename: file.name, size: file.size, clientUploadId, destinationDirectory,
-  }) });
-  if (response.status === 204 || response.status === 404) return null;
-  if (!response.ok) throw new ApiError(response.status, await response.text());
-  const stage = await response.json() as { id: string; url: string };
-  await new Promise<void>((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    const abort = () => { xhr.abort(); reject(new DOMException('upload_canceled', 'AbortError')); };
-    const cleanup = () => signal?.removeEventListener('abort', abort);
-    xhr.open('PUT', stage.url); // no app credentials or authorization headers on the R2 request
-    xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress?.(event.loaded * 50 / event.total); };
-    xhr.onload = () => { cleanup(); if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new ApiError(xhr.status, R2_RELAY_ERROR.FAILED)); };
-    xhr.onerror = () => { cleanup(); reject(new ApiError(0, R2_RELAY_ERROR.FAILED)); };
-    xhr.onabort = () => { cleanup(); reject(new DOMException('upload_canceled', 'AbortError')); };
-    signal?.addEventListener('abort', abort, { once: true });
-    if (signal?.aborted) { abort(); return; }
-    xhr.send(file);
+  const stage = await runR2StepWithLifecycleRecovery(lifecycleState, signal, async () => {
+    const response = await rawFetch(root, { method: 'POST', signal, body: JSON.stringify({
+      filename: file.name, size: file.size, clientUploadId, destinationDirectory,
+    }) });
+    if (response.status === 204 || response.status === 404) return null;
+    if (!response.ok) throw new ApiError(response.status, await response.text());
+    return await response.json() as { id: string; url: string };
+  });
+  if (!stage) return null;
+  await runR2StepWithLifecycleRecovery(lifecycleState, signal, async () => {
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const abort = () => { xhr.abort(); reject(new DOMException('upload_canceled', 'AbortError')); };
+      const cleanup = () => signal?.removeEventListener('abort', abort);
+      xhr.open('PUT', stage.url); // no app credentials or authorization headers on the R2 request
+      xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress?.(event.loaded * 50 / event.total); };
+      xhr.onload = () => { cleanup(); if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new ApiError(xhr.status, R2_RELAY_ERROR.FAILED)); };
+      xhr.onerror = () => { cleanup(); reject(new ApiError(0, R2_RELAY_ERROR.FAILED)); };
+      xhr.onabort = () => {
+        cleanup();
+        if (signal?.aborted) reject(new DOMException('upload_canceled', 'AbortError'));
+        else reject(new ApiError(0, R2_RELAY_ERROR.FAILED));
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) { abort(); return; }
+      xhr.send(file);
+    });
   });
   onProgress?.(50);
-  const commit = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/${encodeURIComponent(stage.id)}/commit`, sessionName), { method: 'POST', signal });
-  if (!commit.ok) throw new ApiError(commit.status, await commit.text());
-  const result = await commit.json() as { ok: boolean; attachment: AttachmentRefResponse };
-  onProgress?.(100); return result;
+  const commitUrl = withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/${encodeURIComponent(stage.id)}/commit`, sessionName);
+  const result = await runR2StepWithLifecycleRecovery(lifecycleState, signal, async () => {
+    const commit = await rawFetch(commitUrl, { method: 'POST', signal });
+    if (!commit.ok) throw new ApiError(commit.status, await commit.text());
+    return await commit.json() as { ok: boolean; attachment: AttachmentRefResponse };
+  });
+  onProgress?.(100);
+  return result;
 }
 export async function prepareR2AttachmentDownload(serverId: string, attachmentId: string, sessionName?: string,
   signal?: AbortSignal, onProgress?: (progress: R2RelayProgress) => void): Promise<string | null> {

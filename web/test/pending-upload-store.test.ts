@@ -187,4 +187,62 @@ describe('pending-upload-store', () => {
     })).rejects.toMatchObject({ name: 'AbortError' });
     expect(await listPendingUploadsForKey('composer:main', 'srv-1')).toHaveLength(0);
   });
+
+  it('never deletes an in-flight persist when listPendingUploadsForKey or another persist runs concurrently', async () => {
+    let resolveSlowRead!: (buf: ArrayBuffer) => void;
+    let markSliceEntered!: () => void;
+    const sliceEntered = new Promise<void>((resolve) => { markSliceEntered = resolve; });
+    const slowBytes = new Uint8Array([1, 2, 3, 4]);
+    const slowFile = {
+      name: 'slow.bin',
+      type: 'application/octet-stream',
+      size: slowBytes.byteLength,
+      lastModified: 100,
+      slice: () => ({
+        arrayBuffer: () => {
+          markSliceEntered();
+          return new Promise<ArrayBuffer>((resolve) => {
+            resolveSlowRead = resolve;
+          });
+        },
+      }),
+    } as unknown as File;
+
+    const slowPersist = persistPendingUploadFile({
+      clientUploadId: 'upl-slow-inflight',
+      serverId: 'srv-1',
+      sessionName: '',
+      composerKey: 'composer:main',
+      file: slowFile,
+    });
+
+    await sliceEntered;
+
+    // While upl-slow-inflight is still writing chunks (complete: false), both
+    // listPendingUploadsForKey and a second persistPendingUploadFile run concurrently.
+    const listedDuringWrite = await listPendingUploadsForKey('composer:main', 'srv-1');
+    expect(listedDuringWrite).toHaveLength(0);
+
+    const fastPersist = await persistPendingUploadFile({
+      clientUploadId: 'upl-fast-sibling',
+      serverId: 'srv-1',
+      sessionName: '',
+      composerKey: 'composer:main',
+      file: makePatternFile(64, 'fast.bin'),
+    });
+    expect(fastPersist.persisted).toBe(true);
+
+    // Finish the slow in-flight persist -> its record must still be intact and restorable!
+    resolveSlowRead(slowBytes.buffer);
+    const slowResult = await slowPersist;
+    expect(slowResult.persisted).toBe(true);
+    expect(slowResult.snapshotFile).not.toBeNull();
+
+    const listedAfterBoth = await listPendingUploadsForKey('composer:main', 'srv-1');
+    expect(listedAfterBoth).toHaveLength(2);
+    expect(listedAfterBoth.map((entry) => entry.meta.clientUploadId).sort()).toEqual([
+      'upl-fast-sibling',
+      'upl-slow-inflight',
+    ]);
+  });
 });

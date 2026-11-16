@@ -210,4 +210,82 @@ describe('R2 user routing and progress', () => {
     setServerR2RelayEnabled(true);
     expect(isR2RelaySelected()).toBe(true);
   });
+
+  it('recovers R2 PUT and commit across background suspend without breaking abort or R2 commit errors', async () => {
+    const lifecycle = await import('../src/upload-suspend-wait.js');
+    lifecycle.resetUploadLifecycleForTests();
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+
+    const setVisibility = (state: 'visible' | 'hidden') => {
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => state,
+      });
+    };
+
+    try {
+      // 1) Transient XHR error during background -> waits for foreground resume and retries PUT + commit
+      fetchMock
+        .mockResolvedValueOnce(Response.json({ id: 'ticket-bg', url: 'https://r2.example/signed-put-bg' }))
+        .mockResolvedValueOnce(Response.json({ ok: true, attachment: { id: 'att-r2-bg' } }));
+
+      let putAttempt = 0;
+      class BackgroundRetryXhr {
+        upload = {};
+        status = 0;
+        onload?: () => void;
+        onerror?: () => void;
+        onabort?: () => void;
+        open = vi.fn();
+        setRequestHeader = vi.fn();
+        abort = vi.fn();
+        send() {
+          putAttempt += 1;
+          if (putAttempt === 1) {
+            setVisibility('hidden');
+            document.dispatchEvent(new Event('visibilitychange'));
+            this.status = 0;
+            queueMicrotask(() => this.onerror?.());
+            return;
+          }
+          this.status = 200;
+          queueMicrotask(() => this.onload?.());
+        }
+      }
+      vi.stubGlobal('XMLHttpRequest', BackgroundRetryXhr);
+
+      const pending = tryUploadR2File('srv', new File(['r2-bg'], 'r2-bg.bin'), undefined, 'cid-r2-bg');
+      await vi.waitFor(() => expect(putAttempt).toBe(1));
+      setVisibility('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      await expect(pending).resolves.toMatchObject({ ok: true, attachment: { id: 'att-r2-bg' } });
+      expect(putAttempt).toBe(2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // 2) R2 commit HTTP 500 error in foreground throws ApiError immediately without spurious retry
+      fetchMock.mockReset();
+      fetchMock
+        .mockResolvedValueOnce(Response.json({ id: 'ticket-err', url: 'https://r2.example/signed-put-err' }))
+        .mockResolvedValueOnce(new Response('commit_failed', { status: 500 }));
+      class OkXhr {
+        upload = {};
+        status = 200;
+        onload?: () => void;
+        open = vi.fn();
+        abort = vi.fn();
+        send() { queueMicrotask(() => this.onload?.()); }
+      }
+      vi.stubGlobal('XMLHttpRequest', OkXhr);
+
+      await expect(tryUploadR2File('srv', new File(['err'], 'r2-err.bin'))).rejects.toMatchObject({
+        status: 500,
+        body: 'commit_failed',
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      setVisibility('visible');
+      lifecycle.resetUploadLifecycleForTests();
+    }
+  });
 });

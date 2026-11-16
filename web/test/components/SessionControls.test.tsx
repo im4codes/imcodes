@@ -10501,7 +10501,9 @@ afterEach(() => {
       clipboardData: { files: [new File(['x'], 'missing-path.txt', { type: 'text/plain' })], getData: () => '' },
     });
 
-    const failedRow = await screen.findByTestId('composer-upload-row');
+    const retryButton = await screen.findByRole('button', { name: 'retry: missing-path.txt' });
+    const failedRow = retryButton.closest('[data-testid="composer-upload-row"]') as HTMLElement;
+    expect(failedRow).toBeTruthy();
     expect(within(failedRow).getByRole('button', { name: 'retry: missing-path.txt' })).toBeTruthy();
     expect(input.textContent).toBe('keep this text');
     expect(screen.getAllByText('upload_failed').length).toBeGreaterThan(0);
