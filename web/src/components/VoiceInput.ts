@@ -176,7 +176,7 @@ interface PrewarmCacheEntry {
 
 const PREWARM_CACHE_TTL_MS = 15_000;
 /** Longer window used only by synchronous `pointerdown` gesture priming once mic permission was confirmed. */
-const NATIVE_PRIME_CACHE_TTL_MS = 120_000;
+const NATIVE_PRIME_CACHE_TTL_MS = 300_000;
 /** Upper bound for quick native capability/permission checks during prewarm and start setup. */
 export const NATIVE_PREWARM_CALL_TIMEOUT_MS = 3_500;
 /** Upper bound for interactive native OS permission requests. */

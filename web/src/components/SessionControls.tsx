@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
-import { createPortal } from 'preact/compat';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useImperativeHandle } from 'preact/hooks';
+import { createPortal, forwardRef, memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren, JSX, RefObject } from 'preact';
 import type { WsClient, ServerMessage, TimelineEvent } from '../ws-client.js';
@@ -209,6 +209,272 @@ const VOICE_HOLD_START_TIMEOUT_MS = 10_000;
 const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
 const VOICE_HOLD_DROP_ANIMATION_MS = 300;
 const VOICE_HOLD_BAR_COUNT = 28;
+const VOICE_HOLD_BAR_MIN_PX = 5;
+const VOICE_HOLD_BAR_MAX_PX = 27;
+const VOICE_HOLD_BAR_MIN_SCALE = VOICE_HOLD_BAR_MIN_PX / VOICE_HOLD_BAR_MAX_PX;
+
+interface VoiceHoldWaveformHandle {
+  pushLevel: (level: number) => void;
+  reset: () => void;
+}
+
+/**
+ * Isolated 28-bar GPU-composited waveform (`scaleY` + `opacity` via DOM refs) so live audio
+ * level ticks never re-render `SessionControls` or trigger layout reflow.
+ */
+const VoiceHoldWaveform = memo(
+  forwardRef<VoiceHoldWaveformHandle, { recording: boolean; liveAudio: boolean; ended: boolean }>(
+    function VoiceHoldWaveform({ recording, liveAudio, ended }, ref) {
+      const barElsRef = useRef<Array<HTMLSpanElement | null>>(Array(VOICE_HOLD_BAR_COUNT).fill(null));
+      const levelsRef = useRef<number[]>(Array(VOICE_HOLD_BAR_COUNT).fill(0));
+
+      const applyLevels = useCallback((levels: number[]) => {
+        const els = barElsRef.current;
+        for (let i = 0; i < VOICE_HOLD_BAR_COUNT; i++) {
+          const el = els[i];
+          if (!el) continue;
+          const level = levels[i] ?? 0;
+          const centerNorm = 1 - Math.abs((i / Math.max(1, VOICE_HOLD_BAR_COUNT - 1)) * 2 - 1);
+          const envelope = 0.38 + 0.62 * Math.sin((centerNorm * Math.PI) / 2);
+          const scale = (VOICE_HOLD_BAR_MIN_PX + level * 22 * envelope) / VOICE_HOLD_BAR_MAX_PX;
+          el.style.transform = `scaleY(${scale.toFixed(6)})`;
+          el.style.opacity = String(0.45 + level * 0.55);
+        }
+      }, []);
+
+      useImperativeHandle(ref, () => ({
+        pushLevel(level: number) {
+          const prev = levelsRef.current;
+          prev.copyWithin(0, 1);
+          prev[prev.length - 1] = level;
+          applyLevels(prev);
+        },
+        reset() {
+          levelsRef.current.fill(0);
+          applyLevels(levelsRef.current);
+        },
+      }), [applyLevels]);
+
+      return (
+        <div
+          class={`voice-hold-hud-waveform${recording && !liveAudio ? ' is-ambient-wave' : ''}${ended ? ' is-ended' : ''}`}
+          aria-hidden="true"
+        >
+          {Array.from({ length: VOICE_HOLD_BAR_COUNT }, (_, idx) => (
+            <span
+              key={idx}
+              ref={(el) => {
+                barElsRef.current[idx] = el;
+              }}
+              class="voice-hold-hud-bar"
+              style={{
+                transform: `scaleY(${VOICE_HOLD_BAR_MIN_SCALE.toFixed(6)})`,
+                opacity: 0.45,
+              }}
+            />
+          ))}
+        </div>
+      );
+    },
+  ),
+);
+
+interface VoiceHoldHudHandle {
+  setDragX: (dragX: number) => void;
+  pushLevel: (level: number) => void;
+  resetBars: () => void;
+}
+
+interface VoiceHoldHudProps {
+  active: boolean;
+  phase: 'starting' | 'recording' | 'ended' | 'draining' | 'dropping';
+  zone: 'send' | 'cancel' | 'edit';
+  dragXRef: RefObject<number>;
+  dropY: number | null;
+  text: string;
+  recognizing: boolean;
+  liveAudio: boolean;
+  transcriptRef: RefObject<HTMLDivElement>;
+}
+
+/**
+ * Isolated hold-to-talk HUD portal: high-frequency horizontal drag offset (`--voice-slide-x`)
+ * and audio level bars mutate DOM refs directly without reconciling `SessionControls`.
+ */
+const VoiceHoldHud = memo(
+  forwardRef<VoiceHoldHudHandle, VoiceHoldHudProps>(function VoiceHoldHud(
+    { active, phase, zone, dragXRef, dropY, text, recognizing, liveAudio, transcriptRef },
+    ref,
+  ) {
+    const { t } = useTranslation();
+    const hudElRef = useRef<HTMLDivElement | null>(null);
+    const waveformRef = useRef<VoiceHoldWaveformHandle | null>(null);
+
+    useImperativeHandle(ref, () => ({
+      setDragX(dragX: number) {
+        if (hudElRef.current) {
+          hudElRef.current.style.setProperty('--voice-slide-x', `${dragX}px`);
+        }
+      },
+      pushLevel(level: number) {
+        waveformRef.current?.pushLevel(level);
+      },
+      resetBars() {
+        waveformRef.current?.reset();
+      },
+    }), []);
+
+    if (!active || typeof document === 'undefined') return null;
+
+    const voiceHoldRecording = phase === 'recording';
+    const voiceHoldEnded = phase === 'ended';
+    const voiceHoldDraining = phase === 'draining';
+    const voiceHoldDropping = phase === 'dropping';
+    const voiceHoldActuallyRecognizing = (voiceHoldRecording && recognizing) || voiceHoldDraining;
+    const voiceHoldTranscriptDisplay = text.trim()
+      ? text
+      : voiceHoldEnded
+        ? t('voice.no_speech')
+        : voiceHoldDraining
+          ? t('voice.buffering_hint')
+          : voiceHoldRecording
+            ? (voiceHoldActuallyRecognizing ? t('voice.buffering_hint') : t('voice.speak_now'))
+            : t('voice.starting');
+    const voiceHoldStatusLabel = voiceHoldEnded
+      ? (text.trim() ? t('voice.ended') : t('voice.no_speech'))
+      : phase === 'starting'
+        ? t('voice.starting')
+        : voiceHoldActuallyRecognizing
+          ? t('voice.recognizing')
+          : t('voice.listening');
+
+    return createPortal(
+      <div
+        ref={hudElRef}
+        class={`voice-hold-hud voice-hold-hud-zone-${zone}${voiceHoldDropping ? ' is-dropping' : ''}`}
+        data-zone={zone}
+        data-phase={phase}
+        style={{
+          '--voice-slide-x': `${dragXRef.current ?? 0}px`,
+          ...(dropY !== null ? { '--voice-drop-y': `${dropY}px` } : {}),
+        } as JSX.CSSProperties}
+        role="status"
+        aria-live="polite"
+      >
+        <div class="voice-hold-hud-atmosphere" aria-hidden="true">
+          <div class="voice-hold-hud-aurora" />
+          <div class="voice-hold-hud-aurora-core" />
+        </div>
+        <div class="voice-hold-hud-transcript-stage">
+          <div ref={transcriptRef} class="voice-hold-hud-transcript">
+            {voiceHoldTranscriptDisplay}
+            <VoiceStreamingRobot active={voiceHoldActuallyRecognizing} />
+          </div>
+        </div>
+        <div class="voice-hold-hud-card">
+          <div class="voice-hold-hud-header">
+            <span class={`voice-hold-hud-recognizing${voiceHoldActuallyRecognizing ? ' is-recognizing' : ''}${voiceHoldEnded ? ' is-ended' : ''}`}>
+              <span
+                class={`voice-status-dot${voiceHoldRecording || voiceHoldDraining ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
+                aria-hidden="true"
+              />
+              {(voiceHoldRecording || voiceHoldDraining) && (
+                <span class="voice-recognizing-dots" aria-hidden="true">
+                  <i /><i /><i />
+                </span>
+              )}
+              <span>{voiceHoldStatusLabel}</span>
+            </span>
+          </div>
+          <div class={`voice-hold-hud-active-hint is-${zone}`}>
+            {zone === 'cancel'
+              ? t('voice.release_to_cancel')
+              : zone === 'edit'
+                ? t('voice.release_to_edit')
+                : t('voice.release_to_send')}
+          </div>
+          <VoiceHoldWaveform
+            ref={waveformRef}
+            recording={voiceHoldRecording}
+            liveAudio={liveAudio}
+            ended={voiceHoldEnded}
+          />
+          <div class="voice-hold-hud-zones">
+            {(['cancel', 'send', 'edit'] as const).map((z) => {
+              const isActive = zone === z;
+              const label = z === 'cancel'
+                ? t('voice.slide_left_cancel')
+                : z === 'edit'
+                  ? t('voice.slide_right_edit')
+                  : t('voice.release_to_send');
+              return (
+                <div
+                  key={z}
+                  class={`voice-hold-zone voice-hold-zone-${z}${isActive ? ' is-active' : ''}`}
+                  data-zone-target={z}
+                >
+                  {z === 'cancel' && (
+                    <svg
+                      class="voice-hold-zone-arrow"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M19 12H5" />
+                      <path d="M12 19l-7-7 7-7" />
+                    </svg>
+                  )}
+                  {z === 'send' && (
+                    <svg
+                      class="voice-hold-zone-arrow voice-hold-zone-send-icon"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.1"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M12 19V5" />
+                      <path d="M5 12l7-7 7 7" />
+                    </svg>
+                  )}
+                  <span class="voice-hold-zone-label">{label}</span>
+                  {z === 'edit' && (
+                    <svg
+                      class="voice-hold-zone-arrow"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M5 12h14" />
+                      <path d="M12 5l7 7-7 7" />
+                    </svg>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>,
+      document.body,
+    );
+  }),
+);
 
 function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEditable: boolean): void {
   if (!el) return;
@@ -1932,14 +2198,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldActive, setVoiceHoldActive] = useState(false);
   const [voiceHoldHudActive, setVoiceHoldHudActive] = useState(false);
   const [voiceHoldZone, setVoiceHoldZone] = useState<'send' | 'cancel' | 'edit'>('send');
-  const [voiceHoldDragX, setVoiceHoldDragX] = useState(0);
+  const voiceHoldDragXRef = useRef(0);
+  const voiceHoldHudRef = useRef<VoiceHoldHudHandle | null>(null);
   const [voiceHoldDropY, setVoiceHoldDropY] = useState<number | null>(null);
   const [voiceHoldText, setVoiceHoldText] = useState('');
   const [voiceHoldPhase, setVoiceHoldPhase] = useState<'starting' | 'recording' | 'ended' | 'draining' | 'dropping'>('starting');
   const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
   const [voiceHoldLiveAudio, setVoiceHoldLiveAudio] = useState(false);
   const [voiceHoldError, setVoiceHoldError] = useState<string | null>(null);
-  const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldSlideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1983,7 +2249,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     drainPromise: Promise<void> | null;
   } | null>(null);
   const voiceHoldLiveAudioRef = useRef(false);
-  const voiceHoldBarsRef = useRef<number[]>(Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTranscriptRef = useRef<HTMLDivElement | null>(null);
   const inputDisabledRef = useRef(false);
   const voiceHoldReadyRef = useRef(false);
@@ -6298,15 +6563,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const closeVoiceHoldHud = useCallback(() => {
     clearVoiceHoldDropTimer();
-    const zeroBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
-    voiceHoldBarsRef.current = zeroBars;
+    voiceHoldDragXRef.current = 0;
+    voiceHoldHudRef.current?.setDragX(0);
+    voiceHoldHudRef.current?.resetBars();
     if (mountedRef.current) {
       setVoiceHoldHudActive(false);
       setVoiceHoldPhase('starting');
       setVoiceHoldZone('send');
-      setVoiceHoldDragX(0);
       setVoiceHoldDropY(null);
-      setVoiceHoldBars(zeroBars);
     }
   }, [clearVoiceHoldDropTimer]);
 
@@ -6399,7 +6663,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     hapticOnChange = true,
   ) => {
     const clampedDragX = Math.round(Math.max(-VOICE_HOLD_SLIDE_MAX_PX, Math.min(VOICE_HOLD_SLIDE_MAX_PX, dx)));
-    setVoiceHoldDragX(clampedDragX);
+    voiceHoldDragXRef.current = clampedDragX;
+    voiceHoldHudRef.current?.setDragX(clampedDragX);
     let nextZone: 'send' | 'cancel' | 'edit' = 'send';
     if (dx <= -VOICE_HOLD_CANCEL_THRESHOLD_PX) nextZone = 'cancel';
     else if (dx >= VOICE_HOLD_EDIT_THRESHOLD_PX) nextZone = 'edit';
@@ -6475,12 +6740,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const shouldKeepHudForDrain = outcome === 'send' || outcome === 'edit';
     if (shouldKeepHudForDrain) {
       releaseVoiceHoldInteraction();
-      const zeroBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
-      voiceHoldBarsRef.current = zeroBars;
+      voiceHoldHudRef.current?.resetBars();
       if (mountedRef.current) {
         setVoiceHoldPhase('draining');
         setVoiceHoldHudActive(true);
-        setVoiceHoldBars(zeroBars);
       }
     } else {
       resetVoiceHoldInteractionState();
@@ -6748,12 +7011,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldActiveRef.current = true;
     voiceHoldZoneRef.current = 'send';
     voiceHoldLiveAudioRef.current = false;
-    const emptyBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
-    voiceHoldBarsRef.current = emptyBars;
-    setVoiceHoldBars(emptyBars);
+    voiceHoldDragXRef.current = 0;
+    voiceHoldHudRef.current?.resetBars();
+    voiceHoldHudRef.current?.setDragX(0);
     setVoiceHoldText('');
     setVoiceHoldZone('send');
-    setVoiceHoldDragX(0);
     setVoiceHoldDropY(null);
     setVoiceHoldPhase('starting');
     setVoiceHoldLiveAudio(false);
@@ -6808,11 +7070,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setVoiceHoldLiveAudio(true);
       }
       const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
-      if (level > 0.015) pulseVoiceHoldRecognizing(1800);
-      const prev = voiceHoldBarsRef.current;
-      const next = [...prev.slice(1), level];
-      voiceHoldBarsRef.current = next;
-      setVoiceHoldBars(next);
+      if (level > 0.025) pulseVoiceHoldRecognizing(1800);
+      voiceHoldHudRef.current?.pushLevel(level);
     });
 
     tx.startPromise = VoiceInput.startListening(
@@ -6861,13 +7120,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           voiceHoldRecognizingTimerRef.current = null;
         }
         voiceHoldLiveAudioRef.current = false;
-        const zeroBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
-        voiceHoldBarsRef.current = zeroBars;
+        voiceHoldHudRef.current?.resetBars();
         if (mountedRef.current) {
           setVoiceHoldPhase('ended');
           setVoiceHoldRecognizing(false);
           setVoiceHoldLiveAudio(false);
-          setVoiceHoldBars(zeroBars);
         }
       },
       (err) => {
@@ -10284,163 +10541,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        {voiceHoldHudActive && typeof document !== 'undefined' && (() => {
-          const voiceHoldRecording = voiceHoldPhase === 'recording';
-          const voiceHoldEnded = voiceHoldPhase === 'ended';
-          const voiceHoldDraining = voiceHoldPhase === 'draining';
-          const voiceHoldDropping = voiceHoldPhase === 'dropping';
-          const voiceHoldActuallyRecognizing = (voiceHoldRecording && voiceHoldRecognizing) || voiceHoldDraining;
-          const voiceHoldTranscriptDisplay = voiceHoldText.trim()
-            ? voiceHoldText
-            : voiceHoldEnded
-              ? t('voice.no_speech')
-              : voiceHoldDraining
-                ? t('voice.buffering_hint')
-                : voiceHoldRecording
-                  ? (voiceHoldActuallyRecognizing ? t('voice.buffering_hint') : t('voice.speak_now'))
-                  : t('voice.starting');
-          const voiceHoldStatusLabel = voiceHoldEnded
-            ? (voiceHoldText.trim() ? t('voice.ended') : t('voice.no_speech'))
-            : voiceHoldPhase === 'starting'
-              ? t('voice.starting')
-              : voiceHoldActuallyRecognizing
-                ? t('voice.recognizing')
-                : t('voice.listening');
-          return createPortal(
-          <div
-            class={`voice-hold-hud voice-hold-hud-zone-${voiceHoldZone}${voiceHoldDropping ? ' is-dropping' : ''}`}
-            data-zone={voiceHoldZone}
-            data-phase={voiceHoldPhase}
-            style={{
-              '--voice-slide-x': `${voiceHoldDragX}px`,
-              ...(voiceHoldDropY !== null ? { '--voice-drop-y': `${voiceHoldDropY}px` } : {}),
-            } as JSX.CSSProperties}
-            role="status"
-            aria-live="polite"
-          >
-            <div class="voice-hold-hud-atmosphere" aria-hidden="true">
-              <div class="voice-hold-hud-aurora" />
-              <div class="voice-hold-hud-aurora-core" />
-            </div>
-            <div class="voice-hold-hud-transcript-stage">
-              <div ref={voiceHoldTranscriptRef} class="voice-hold-hud-transcript">
-                {voiceHoldTranscriptDisplay}
-                <VoiceStreamingRobot active={voiceHoldActuallyRecognizing} />
-              </div>
-            </div>
-            <div class="voice-hold-hud-card">
-              <div class="voice-hold-hud-header">
-                <span class={`voice-hold-hud-recognizing${voiceHoldActuallyRecognizing ? ' is-recognizing' : ''}${voiceHoldEnded ? ' is-ended' : ''}`}>
-                  <span
-                    class={`voice-status-dot${voiceHoldRecording || voiceHoldDraining ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
-                    aria-hidden="true"
-                  />
-                  {(voiceHoldRecording || voiceHoldDraining) && (
-                    <span class="voice-recognizing-dots" aria-hidden="true">
-                      <i /><i /><i />
-                    </span>
-                  )}
-                  <span>{voiceHoldStatusLabel}</span>
-                </span>
-              </div>
-              <div class={`voice-hold-hud-active-hint is-${voiceHoldZone}`}>
-                {voiceHoldZone === 'cancel'
-                  ? t('voice.release_to_cancel')
-                  : voiceHoldZone === 'edit'
-                    ? t('voice.release_to_edit')
-                    : t('voice.release_to_send')}
-              </div>
-              <div class={`voice-hold-hud-waveform${voiceHoldRecording && !voiceHoldLiveAudio ? ' is-ambient-wave' : ''}${voiceHoldEnded ? ' is-ended' : ''}`} aria-hidden="true">
-                {voiceHoldBars.map((level, idx) => {
-                  const centerNorm = 1 - Math.abs((idx / Math.max(1, voiceHoldBars.length - 1)) * 2 - 1);
-                  const envelope = 0.38 + 0.62 * Math.sin((centerNorm * Math.PI) / 2);
-                  return (
-                    <span
-                      key={idx}
-                      class="voice-hold-hud-bar"
-                      style={{
-                        height: `${Math.round(5 + level * 22 * envelope)}px`,
-                        opacity: 0.45 + level * 0.55,
-                      }}
-                    />
-                  );
-                })}
-              </div>
-              <div class="voice-hold-hud-zones">
-                {(['cancel', 'send', 'edit'] as const).map((zone) => {
-                  const isActive = voiceHoldZone === zone;
-                  const label = zone === 'cancel'
-                    ? t('voice.slide_left_cancel')
-                    : zone === 'edit'
-                      ? t('voice.slide_right_edit')
-                      : t('voice.release_to_send');
-                  return (
-                    <div
-                      key={zone}
-                      class={`voice-hold-zone voice-hold-zone-${zone}${isActive ? ' is-active' : ''}`}
-                      data-zone-target={zone}
-                    >
-                      {zone === 'cancel' && (
-                        <svg
-                          class="voice-hold-zone-arrow"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2.2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M19 12H5" />
-                          <path d="M12 19l-7-7 7-7" />
-                        </svg>
-                      )}
-                      {zone === 'send' && (
-                        <svg
-                          class="voice-hold-zone-arrow voice-hold-zone-send-icon"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2.1"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M12 19V5" />
-                          <path d="M5 12l7-7 7 7" />
-                        </svg>
-                      )}
-                      <span class="voice-hold-zone-label">{label}</span>
-                      {zone === 'edit' && (
-                        <svg
-                          class="voice-hold-zone-arrow"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2.2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M5 12h14" />
-                          <path d="M12 5l7 7-7 7" />
-                        </svg>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>,
-          document.body,
-        );
-        })()}
+        <VoiceHoldHud
+          ref={voiceHoldHudRef}
+          active={voiceHoldHudActive}
+          phase={voiceHoldPhase}
+          zone={voiceHoldZone}
+          dragXRef={voiceHoldDragXRef}
+          dropY={voiceHoldDropY}
+          text={voiceHoldText}
+          recognizing={voiceHoldRecognizing}
+          liveAudio={voiceHoldLiveAudio}
+          transcriptRef={voiceHoldTranscriptRef}
+        />
         <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}${voiceHoldHudActive && voiceHoldPhase === 'dropping' ? ' controls-composer-voice-dropping' : ''}`}>
           {!isMobileLayout && !compact && (
             <>

@@ -1202,9 +1202,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             expect(computed.idleUserSelect).toBe('none');
             expect(computed.overlayBorderRadius).toBe('0px');
             expect(computed.overlayZIndex).toBe('2147483021');
-            expect(computed.atmosphereBlur).toContain('blur(');
-            expect(computed.atmosphereMask).toContain('linear-gradient');
-            expect(computed.auroraFilter).toContain('blur(');
+            expect(computed.atmosphereBlur).toBe('none');
+            expect(computed.atmosphereMask).toBe('none');
+            expect(computed.auroraFilter).toBe('none');
             expect(computed.cardBorderTopStyle).toBe('none');
             expect(computed.cardBorderTopWidth).toBe('0px');
             expect(computed.transcriptBorderTopStyle).toBe('solid');
@@ -1212,7 +1212,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             expect(computed.transcriptBorderRadius).toBe('20px');
             expect(computed.transcriptBackgroundImage).toContain('linear-gradient');
             expect(computed.transcriptBoxShadow).not.toBe('none');
-            expect(computed.transcriptBackdropFilter).toContain('blur(');
+            expect(computed.transcriptBackdropFilter).toBe('none');
             expect(computed.transcriptPointerEvents).toBe('none');
             expect(computed.hudPointerEvents).toBe('none');
             if (zone === 'send') expect(computed.transcriptBorderTopColor).toContain('56, 189, 248');
@@ -3261,7 +3261,8 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(hud.querySelector('.voice-hold-hud-waveform.is-ended')).not.toBeNull();
     expect(hud.querySelector('.voice-hold-hud-waveform.is-ambient-wave')).toBeNull();
     Array.from(hud.querySelectorAll('.voice-hold-hud-bar')).forEach((bar) => {
-      expect((bar as HTMLElement).style.height).toBe('5px');
+      const match = /scaleY\(([^)]+)\)/.exec((bar as HTMLElement).style.transform);
+      expect(match ? parseFloat(match[1]!) * 27 : NaN).toBeCloseTo(5, 2);
     });
 
     // Slide to cancel after ended still updates zone and closes cleanly without sending

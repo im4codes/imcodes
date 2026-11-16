@@ -3502,15 +3502,11 @@ html.native-ios-mac .chat-dl-btn {
   border-radius: 0;
   background: linear-gradient(
     to top,
-    rgba(6, 16, 40, 0.92) 0%,
-    rgba(11, 32, 78, 0.72) 40%,
-    rgba(16, 48, 114, 0.28) 74%,
+    rgba(6, 16, 40, 0.94) 0%,
+    rgba(11, 32, 78, 0.78) 40%,
+    rgba(16, 48, 114, 0.34) 74%,
     transparent 100%
   );
-  backdrop-filter: blur(22px) saturate(145%);
-  -webkit-backdrop-filter: blur(22px) saturate(145%);
-  -webkit-mask-image: linear-gradient(to top, #000 0%, #000 36%, rgba(0, 0, 0, 0.72) 68%, transparent 100%);
-  mask-image: linear-gradient(to top, #000 0%, #000 36%, rgba(0, 0, 0, 0.72) 68%, transparent 100%);
   transition: background 0.12s ease;
 }
 .voice-hold-hud-zone-cancel .voice-hold-hud-atmosphere {
@@ -3539,10 +3535,9 @@ html.native-ios-mac .chat-dl-btn {
   height: 100%;
   pointer-events: none;
   background:
-    radial-gradient(ellipse 56% 62% at 50% 88%, rgba(37, 99, 235, 0.78) 0%, rgba(14, 165, 233, 0.34) 44%, transparent 74%),
-    radial-gradient(ellipse 40% 52% at 32% 94%, rgba(56, 189, 248, 0.42) 0%, transparent 70%),
-    radial-gradient(ellipse 40% 52% at 68% 94%, rgba(99, 102, 241, 0.38) 0%, transparent 70%);
-  filter: blur(34px);
+    radial-gradient(ellipse 56% 62% at 50% 88%, rgba(37, 99, 235, 0.52) 0%, rgba(14, 165, 233, 0.24) 48%, transparent 78%),
+    radial-gradient(ellipse 40% 52% at 32% 94%, rgba(56, 189, 248, 0.28) 0%, transparent 74%),
+    radial-gradient(ellipse 40% 52% at 68% 94%, rgba(99, 102, 241, 0.26) 0%, transparent 74%);
   transform: translateX(calc(var(--voice-slide-x, 0px) * 0.75)) translateZ(0);
   transition: transform 0.16s ease, opacity 0.2s ease;
   animation: voice-aurora-drift 4.2s ease-in-out infinite alternate;
@@ -3555,8 +3550,7 @@ html.native-ios-mac .chat-dl-btn {
   height: 62%;
   pointer-events: none;
   background:
-    radial-gradient(ellipse 46% 58% at 50% 92%, rgba(56, 189, 248, 0.56) 0%, rgba(37, 99, 235, 0.26) 48%, transparent 78%);
-  filter: blur(22px);
+    radial-gradient(ellipse 46% 58% at 50% 92%, rgba(56, 189, 248, 0.40) 0%, rgba(37, 99, 235, 0.18) 52%, transparent 82%);
   transform: translateX(calc(var(--voice-slide-x, 0px) * 0.95)) translateZ(0);
   transition: transform 0.14s ease, opacity 0.18s ease;
   animation: voice-aurora-pulse 2.6s ease-in-out infinite alternate;
@@ -3647,12 +3641,13 @@ html.native-ios-mac .chat-dl-btn {
 }
 .voice-hold-hud-bar {
   width: 3px;
-  min-height: 5px;
-  max-height: 100%;
+  height: 27px;
+  transform-origin: center center;
+  transform: scaleY(0.185185);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.94);
   box-shadow: 0 0 10px rgba(103, 232, 249, 0.45);
-  transition: height 0.08s ease, opacity 0.08s ease;
+  transition: none;
 }
 .voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar {
   transform-origin: center center;
@@ -3663,8 +3658,8 @@ html.native-ios-mac .chat-dl-btn {
 .voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar:nth-child(4n + 3) { animation-delay: 0.32s; }
 .voice-hold-hud-waveform.is-ambient-wave .voice-hold-hud-bar:nth-child(4n + 4) { animation-delay: 0.48s; }
 @keyframes voice-hold-ambient-wave {
-  0%, 100% { transform: scaleY(1); opacity: 0.48; }
-  50% { transform: scaleY(2.2); opacity: 0.9; }
+  0%, 100% { transform: scaleY(0.185185); opacity: 0.48; }
+  50% { transform: scaleY(0.407407); opacity: 0.9; }
 }
 .voice-hold-hud-waveform.is-ended .voice-hold-hud-bar {
   opacity: 0.32;
@@ -3727,15 +3722,13 @@ html.native-ios-mac .chat-dl-btn {
   border-radius: 20px;
   background: linear-gradient(
     180deg,
-    rgba(12, 24, 48, 0.84) 0%,
-    rgba(8, 17, 36, 0.90) 100%
+    rgba(12, 24, 48, 0.92) 0%,
+    rgba(8, 17, 36, 0.96) 100%
   );
   box-shadow:
     0 14px 36px rgba(2, 6, 23, 0.56),
     0 0 28px rgba(34, 211, 238, 0.16),
     inset 0 1px 0 rgba(186, 230, 253, 0.18);
-  backdrop-filter: blur(20px) saturate(150%);
-  -webkit-backdrop-filter: blur(20px) saturate(150%);
   transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease, color 0.18s ease;
   pointer-events: none;
 }
@@ -7728,9 +7721,9 @@ html.native-ios-mac .chat-dl-btn {
 }
 /* Lock chat surface interactions while an active 2-finger or 1-finger long-press-drag
    mobile navigation gesture is tracking/completing so it never scrolls, selects text,
-   or opens browser/app long-press callouts. */
-html.mobile-nav-gesture-active .chat-view,
-html.mobile-nav-gesture-active .chat-view * {
+   or opens browser/app long-press callouts. Inherit via `.chat-view` without `*`
+   descendant invalidation across hundreds of chat items. */
+html.mobile-nav-gesture-active .chat-view {
   touch-action: none !important;
   overscroll-behavior: none;
   -webkit-user-select: none !important;
@@ -20971,13 +20964,11 @@ button.quick-agent-delegation-preset.active {
   max-width: min(calc(var(--imcodes-ui-vw, 100vw) * 0.56), 200px);
   padding: 8px 12px;
   border-radius: 999px;
-  background: rgba(8, 13, 26, 0.88);
+  background: rgba(8, 13, 26, 0.94);
   border: 1.5px solid rgba(52, 211, 153, 0.44);
   box-shadow:
     0 12px 32px rgba(2, 6, 23, 0.56),
     inset 0 1px 0 rgba(167, 243, 208, 0.14);
-  backdrop-filter: blur(14px) saturate(150%);
-  -webkit-backdrop-filter: blur(14px) saturate(150%);
   color: rgba(236, 253, 245, 0.94);
   opacity: calc(0.76 + 0.24 * var(--mobile-swipe-progress, 0));
   pointer-events: none;
@@ -21066,7 +21057,7 @@ button.quick-agent-delegation-preset.active {
     radial-gradient(circle at 50% 48%, rgba(56, 189, 248, 0.14), transparent 60%),
     linear-gradient(rgba(56, 189, 248, 0.05) 1px, transparent 1px),
     linear-gradient(90deg, rgba(56, 189, 248, 0.05) 1px, transparent 1px),
-    rgba(8, 13, 26, 0.90);
+    rgba(8, 13, 26, 0.95);
   background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
   border: 1.5px solid rgba(56, 189, 248, 0.34);
   box-shadow:
@@ -21074,8 +21065,6 @@ button.quick-agent-delegation-preset.active {
     0 0 24px rgba(14, 165, 233, 0.12),
     inset 0 1px 0 rgba(186, 230, 253, 0.16),
     inset 0 0 24px rgba(14, 165, 233, 0.06);
-  backdrop-filter: blur(18px) saturate(160%);
-  -webkit-backdrop-filter: blur(18px) saturate(160%);
   color: rgba(248, 250, 252, 0.96);
   animation: server-switch-hud-in 120ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
   transition: border-color 140ms ease, box-shadow 140ms ease;

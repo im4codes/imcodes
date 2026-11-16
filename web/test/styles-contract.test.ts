@@ -1675,7 +1675,7 @@ describe('styles.css regression contracts', () => {
         if (trimmed) blurredSelectors.push(trimmed);
       }
     }
-    expect(blurredSelectors.length).toBeGreaterThanOrEqual(27);
+    expect(blurredSelectors.length).toBeGreaterThanOrEqual(25);
 
     const disableBlockMatch = cssWithoutComments.match(
       /(:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)[^\{]+)\{([^}]*backdrop-filter:\s*none[^}]*)\}/,

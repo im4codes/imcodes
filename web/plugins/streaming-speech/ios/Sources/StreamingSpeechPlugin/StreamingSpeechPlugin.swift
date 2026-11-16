@@ -1413,7 +1413,7 @@ struct SpeechGain {
     static let sampleRate = 16000
     static let targetRMS: Float = 0.14
     static let minGain: Float = 1.0
-    static let maxGain: Float = 8.0
+    static let maxGain: Float = 1.0
     static let minNoiseFloorRMS: Float = 0.0004
     static let initialNoiseFloorRMS: Float = 0.0005
     static let maxNoiseFloorRMS: Float = 0.0038
@@ -1422,7 +1422,7 @@ struct SpeechGain {
     static let noiseFloorHighRMS: Float = 0.0014
     static let voicedRawRMSFloor: Float = 0.0010
     static let voicedNoiseMultiplier: Float = 1.45
-    static let voicedBoostedRMSFloor: Float = 0.0050
+    static let voicedBoostedRMSFloor: Float = 0.0010
     static let stationaryHoldSeconds: Float = 0.22
     static let noiseFloorAttackTau: Float = 0.12
     static let noiseFloorReleaseTau: Float = 0.06
@@ -1637,43 +1637,22 @@ struct SpeechGain {
         let (rawRMS, hpRatio) = analyzeSubframe(subframe)
         updateNoiseFloor(rawRMS: rawRMS, hpRatio: hpRatio, dt: dt)
 
-        let confidence = Self.speechConfidence(rawRMS: rawRMS, noiseFloor: noiseFloorRMS)
-        let speechDesired = min(Self.maxGain, max(Self.minGain, Self.targetRMS / max(rawRMS, 1e-4)))
-        let desiredGain = Self.minGain + confidence * (speechDesired - Self.minGain)
-
-        let startGain = currentGain
-        let alpha: Float
-        if desiredGain < currentGain {
-            alpha = confidence < 0.5 ? (1.0 - expf(-dt / Self.gainReleaseTau)) : 1.0
-        } else {
-            alpha = 1.0 - expf(-dt / Self.gainAttackUpTau)
-        }
-        let nextGain = min(Self.maxGain, max(Self.minGain, currentGain + (desiredGain - currentGain) * alpha))
-        currentGain = nextGain
-
-        let rampLimit = nextGain < startGain ? Self.maxDownRampSamples : Self.maxUpRampSamples
-        let rampCount = min(count, rampLimit)
-        let delta = nextGain - startGain
+        // Preserve clean native microphone PCM at unity gain (1.0x) with finite sanitize + soft-knee
+        // peak protection only; software normalization boost amplifies room noise and degrades audio.
+        currentGain = 1.0
         var sumSqOut: Double = 0
         var idx = subframe.startIndex
         for i in 0..<count {
             let sample = subframe[idx]
             idx += 1
-            let g: Float
-            if i < rampCount && rampCount > 0 {
-                let t = Float(i + 1) / Float(rampCount)
-                g = startGain + delta * t
-            } else {
-                g = nextGain
-            }
-            let y = Self.softLimit((sample.isFinite ? sample : 0) * g)
+            let y = Self.softLimit(sample.isFinite ? sample : 0)
             out[outOffset + i] = y
             let dy = Double(y)
             sumSqOut += dy * dy
         }
-        let boostedRMS = Float(sqrt(sumSqOut / Double(count)))
+        let outputRMS = Float(sqrt(sumSqOut / Double(count)))
         let minSpeechFloor = max(Self.voicedRawRMSFloor, noiseFloorRMS * Self.voicedNoiseMultiplier)
-        let voiced = rawRMS >= minSpeechFloor && boostedRMS >= Self.voicedBoostedRMSFloor
+        let voiced = rawRMS >= minSpeechFloor && outputRMS >= Self.voicedBoostedRMSFloor
         return (voiced, sumSqOut)
     }
 
@@ -1734,7 +1713,7 @@ struct SpeechInbox {
         guard !audio.isEmpty else { return false }
         guard audio.count <= Self.limit - pending.count else { throw Failure.overload }
         let result = gain.process(Array(audio))
-        let level = min(1, result.boostedRMS * 4)
+        let level = min(1, max(0, result.rawRMS))
         pendingAudioLevel = level
         lastVoiced = result.lastVoiced
         speech = speech || result.anyVoiced

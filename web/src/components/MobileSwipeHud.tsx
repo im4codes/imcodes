@@ -2,6 +2,9 @@
  * Interactive 4-direction tactical HUD shown while long-press dragging on mobile
  * to preview multi-level target server/session switching, hysteresis lock, and threshold arming.
  */
+import { forwardRef, memo } from 'preact/compat';
+import type { RefObject } from 'preact';
+import { useCallback, useImperativeHandle, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { cycleOrderedId } from '../keyboard-shortcuts.js';
 import {
@@ -398,3 +401,157 @@ export function MobileSwipeHud({ progress, targets }: MobileSwipeHudProps) {
     </div>
   );
 }
+
+export interface MobileSwipeHudOverlayHandle {
+  setProgress: (next: MobileNavigationGestureProgress | null) => void;
+}
+
+export interface MobileSwipeHudOverlayProps {
+  navInputRef: RefObject<Omit<MobileSwipeTargetResolutionInput, 'verticalMaxSteps' | 'horizontalMaxSteps'>>;
+}
+
+function resolveDirectEdge(progress: MobileNavigationGestureProgress) {
+  const directAction = progress.swipeAction
+    ?? (progress.action === 'tabNext' || progress.action === 'tabPrev'
+      ? progress.action
+      : (progress.dx < 0 ? 'tabNext' : (progress.dx > 0 ? 'tabPrev' : null)));
+  if (!directAction) return null;
+  const isNext = directAction === 'tabNext';
+  return {
+    directAction,
+    edge: isNext ? ('right' as const) : ('left' as const),
+    targetDir: isNext ? ('right' as const) : ('left' as const),
+  };
+}
+
+/**
+ * Isolated swipe HUD wrapper owning gesture progress state so 120Hz `touchmove` updates
+ * never re-render `App()`, and `direct_horizontal` updates DOM style/attributes via refs.
+ */
+export const MobileSwipeHudOverlay = memo(
+  forwardRef<MobileSwipeHudOverlayHandle, MobileSwipeHudOverlayProps>(function MobileSwipeHudOverlay({ navInputRef }, ref) {
+    const { t } = useTranslation();
+    const [progress, setProgressState] = useState<MobileNavigationGestureProgress | null>(null);
+    const activeDirectRef = useRef<{ edge: 'left' | 'right'; action: 'tabNext' | 'tabPrev' } | null>(null);
+    const directRootRef = useRef<HTMLDivElement | null>(null);
+    const directIndicatorRef = useRef<HTMLDivElement | null>(null);
+
+    const setProgress = useCallback((next: MobileNavigationGestureProgress | null) => {
+      if (
+        next?.mode === 'direct_horizontal'
+        && activeDirectRef.current
+        && directRootRef.current
+        && directIndicatorRef.current
+      ) {
+        const direct = resolveDirectEdge(next);
+        if (direct && direct.edge === activeDirectRef.current.edge && direct.directAction === activeDirectRef.current.action) {
+          const clampedProgress = Math.max(0, Math.min(1, next.progress));
+          const pct = Math.round(clampedProgress * 100);
+          const pullOffsetPx = (clampedProgress * 20).toFixed(1);
+          const armedStr = next.armed ? 'true' : 'false';
+          const stepStr = String(next.step);
+          const pctStr = String(pct);
+
+          const root = directRootRef.current;
+          root.classList.toggle('is-armed', Boolean(next.armed));
+          root.setAttribute('data-direction', next.direction ?? direct.edge);
+          root.setAttribute('data-armed', armedStr);
+          root.setAttribute('data-step', stepStr);
+          root.setAttribute('data-progress', pctStr);
+
+          const ind = directIndicatorRef.current;
+          ind.classList.toggle('is-armed', Boolean(next.armed));
+          ind.setAttribute('data-armed', armedStr);
+          ind.setAttribute('data-progress', pctStr);
+          ind.style.setProperty('--mobile-swipe-pull', `${pullOffsetPx}px`);
+          ind.style.setProperty('--mobile-swipe-progress', String(clampedProgress));
+          return;
+        }
+      }
+      setProgressState(next);
+    }, []);
+
+    useImperativeHandle(ref, () => ({ setProgress }), [setProgress]);
+
+    if (!progress) {
+      activeDirectRef.current = null;
+      return null;
+    }
+
+    const navInput = navInputRef.current;
+    const targets = navInput
+      ? resolveMobileSwipeTargets({
+        ...navInput,
+        verticalMaxSteps: progress.verticalMaxSteps,
+        horizontalMaxSteps: progress.horizontalMaxSteps,
+      })
+      : null;
+
+    if (progress.mode === 'direct_horizontal') {
+      const direct = resolveDirectEdge(progress);
+      if (!direct) {
+        activeDirectRef.current = null;
+        return null;
+      }
+      const hasTargetSlot = Boolean(targets && Object.prototype.hasOwnProperty.call(targets, direct.targetDir));
+      const targetEntries = hasTargetSlot ? normalizeDirectionTargets(targets?.[direct.targetDir]) : [];
+      if (hasTargetSlot && targetEntries.length === 0) {
+        activeDirectRef.current = null;
+        return null;
+      }
+
+      const isNext = direct.directAction === 'tabNext';
+      const targetLabel = targetEntries[0]?.label
+        ?? t(isNext ? 'mobile_gesture.hud.right' : 'mobile_gesture.hud.left', {
+          defaultValue: isNext ? 'Next Session' : 'Previous Session',
+        });
+      const clampedProgress = Math.max(0, Math.min(1, progress.progress));
+      const pct = Math.round(clampedProgress * 100);
+      const pullOffsetPx = (clampedProgress * 20).toFixed(1);
+      activeDirectRef.current = { edge: direct.edge, action: direct.directAction };
+
+      return (
+        <div
+          ref={directRootRef}
+          class={`mobile-swipe-hud is-direct is-${direct.edge}${progress.armed ? ' is-armed' : ''}`}
+          data-testid="mobile-swipe-hud"
+          data-mode="direct_horizontal"
+          data-direction={progress.direction ?? direct.edge}
+          data-edge={direct.edge}
+          data-action={direct.directAction}
+          data-armed={progress.armed ? 'true' : 'false'}
+          data-step={String(progress.step)}
+          data-progress={String(pct)}
+          aria-hidden="true"
+        >
+          <div
+            ref={directIndicatorRef}
+            class={`mobile-swipe-edge-indicator is-${direct.edge}${progress.armed ? ' is-armed' : ''}`}
+            data-testid="mobile-swipe-edge-indicator"
+            data-edge={direct.edge}
+            data-action={direct.directAction}
+            data-armed={progress.armed ? 'true' : 'false'}
+            data-progress={String(pct)}
+            style={{
+              '--mobile-swipe-pull': `${pullOffsetPx}px`,
+              '--mobile-swipe-progress': String(clampedProgress),
+            } as Record<string, string>}
+          >
+            {direct.edge === 'left' && (
+              <span class="mobile-swipe-edge-arrow" data-testid="mobile-swipe-edge-arrow" aria-hidden="true">←</span>
+            )}
+            <span class="mobile-swipe-edge-label" data-testid="mobile-swipe-edge-label">
+              {targetLabel}
+            </span>
+            {direct.edge === 'right' && (
+              <span class="mobile-swipe-edge-arrow" data-testid="mobile-swipe-edge-arrow" aria-hidden="true">→</span>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    activeDirectRef.current = null;
+    return <MobileSwipeHud progress={progress} targets={targets} />;
+  }),
+);

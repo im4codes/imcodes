@@ -219,7 +219,7 @@ import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
 import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
 import { ServerSwitchWatermark } from './components/ServerSwitchWatermark.js';
-import { MobileSwipeHud, resolveMobileSwipeTargets } from './components/MobileSwipeHud.js';
+import { MobileSwipeHudOverlay, resolveMobileSwipeTargets, type MobileSwipeHudOverlayHandle } from './components/MobileSwipeHud.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { PushStatusBadge } from './components/PushStatusBadge.js';
@@ -7624,7 +7624,10 @@ function InternalMainApp() {
     || (remoteDesktopWallOpen && !remoteDesktopWallMinimized);
 
   // Global keyboard shortcuts & mobile 2-finger navigation gestures: switch servers & session tabs.
-  const [mobileGestureProgress, setMobileGestureProgress] = useState<MobileNavigationGestureProgress | null>(null);
+  const mobileSwipeHudRef = useRef<MobileSwipeHudOverlayHandle | null>(null);
+  const handleMobileGestureProgress = useCallback((progress: MobileNavigationGestureProgress | null) => {
+    mobileSwipeHudRef.current?.setProgress(progress);
+  }, []);
   const [serverSwitchWatermark, setServerSwitchWatermark] = useState<{
     serverId: string;
     serverName: string;
@@ -7853,7 +7856,7 @@ function InternalMainApp() {
   }), []);
 
   useEffect(() => {
-    setMobileGestureProgress(null);
+    mobileSwipeHudRef.current?.setProgress(null);
     return attachMobileNavigationGestures({
       isMobile,
       isBlocked: () => hasBlockingMobileGestureOverlayRef.current,
@@ -7868,7 +7871,7 @@ function InternalMainApp() {
         verticalMaxSteps: 5,
         horizontalMaxSteps: 3,
       })[direction].length,
-      onProgress: setMobileGestureProgress,
+      onProgress: handleMobileGestureProgress,
       onAction: (action, step) => {
         const keycaps = getMobileNavigationGestureKeycaps(action, step);
         if (action === 'serverPrev' || action === 'serverNext') {
@@ -7878,11 +7881,11 @@ function InternalMainApp() {
         navigateTabByStep(action === 'tabNext' ? step : -step, keycaps, 2);
       },
     });
-  }, [isMobile, navigateServerByStep, navigateTabByStep]);
+  }, [isMobile, handleMobileGestureProgress, navigateServerByStep, navigateTabByStep]);
 
   useEffect(() => {
     if (!isMobile || hasBlockingComposerOverlay || mobileSidebarOpen || mobileRemoteSurfaceActive) {
-      setMobileGestureProgress(null);
+      mobileSwipeHudRef.current?.setProgress(null);
     }
   }, [isMobile, hasBlockingComposerOverlay, mobileSidebarOpen, mobileRemoteSurfaceActive]);
 
@@ -10745,24 +10748,23 @@ function InternalMainApp() {
           : isPendingSharedWatermark
             ? trans('common.loading', { defaultValue: 'Loading…' })
             : null;
+        const mobileSwipeTargetInputRef = {
+          current: {
+            servers: unifiedServers,
+            currentServerId: sharedOpenIntentRef.current?.serverId ?? selectedServerId,
+            hasActiveShareTarget: selectedShareTarget !== null,
+            tabs: orderedVisibleMainSessions,
+            activeSession,
+            selectedServerId,
+            manualDashboard,
+          },
+        };
         return (
           <>
             {isMobile && (
-              <MobileSwipeHud
-                progress={mobileGestureProgress}
-                targets={mobileGestureProgress
-                  ? resolveMobileSwipeTargets({
-                    servers: unifiedServers,
-                    currentServerId: sharedOpenIntentRef.current?.serverId ?? selectedServerId,
-                    hasActiveShareTarget: selectedShareTarget !== null,
-                    tabs: orderedVisibleMainSessions,
-                    activeSession,
-                    selectedServerId,
-                    manualDashboard,
-                    verticalMaxSteps: mobileGestureProgress.verticalMaxSteps,
-                    horizontalMaxSteps: mobileGestureProgress.horizontalMaxSteps,
-                  })
-                  : null}
+              <MobileSwipeHudOverlay
+                ref={mobileSwipeHudRef}
+                navInputRef={mobileSwipeTargetInputRef}
               />
             )}
             <ServerSwitchWatermark
