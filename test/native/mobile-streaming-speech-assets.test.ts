@@ -1616,6 +1616,57 @@ do {
                 "L: modulated quiet speech clean PCM/bounds invalid at rms=\\(rms)")
     }
 
+    // Regression: iPhone 16 .spokenAudio 10s silence profile (digital zeros + 50ms settle pulse + unpitched noise bursts)
+    // must keep noiseFloor intact, never open SpeechWindow, and invoke 0 decodes; genuine 200ms soft speech still decodes completely.
+    do {
+        var zeroGain = SpeechGain()
+        for _ in 0..<4 { _ = zeroGain.process([Float](repeating: 0, count: 400)) }
+        require(abs(zeroGain.noiseFloorRMS - SpeechGain.initialNoiseFloorRMS) <= 1e-6,
+                "L: digital zeros dragged noiseFloorRMS down: \\(zeroGain.noiseFloorRMS)")
+
+        var silInbox = SpeechInbox()
+        var silWin = SpeechWindow()
+        var silDecodes = 0
+        let silDecode: SpeechWindow.DecodeFn = { _, _ in silDecodes += 1; return ("嗯", [1]) }
+        _ = try! silInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for frame in 0..<400 {
+            let chunk: [Float]
+            if frame < 3 {
+                chunk = [Float](repeating: 0, count: 400)
+            } else if frame == 11 || frame == 12 {
+                chunk = tonePCM(400, rms: 0.0014, freqHz: 240, phaseOffset: frame * 400)
+            } else if frame == 184 || (frame >= 190 && frame <= 195) {
+                chunk = fanPCM(400, rms: frame == 184 ? 0.0042 : 0.0021, seed: UInt64(0xCAFE_0000 + frame))
+            } else {
+                chunk = fanPCM(400, rms: 0.00048, seed: UInt64(0xFACE_0000 + frame))
+            }
+            _ = try! silInbox.offer(chunk)
+            if let batch = silInbox.take() {
+                try! silWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: silDecode) { _ in }
+            }
+        }
+        let silText = try! silWin.finish(decode: silDecode)
+        require(silWin.samples.isEmpty && silDecodes == 0 && silText.isEmpty,
+                "L: 10s silence profile leaked to decoder (decodes=\\(silDecodes) text=\\(silText))")
+
+        require(!SpeechWindow.hasDecodableEnergy(in: fanPCM(32000, rms: 0.0008, seed: 0xBEEF)),
+                "L: pre-decode energy guard accepted 0.0008 noise")
+        var qInbox = SpeechInbox()
+        var qWin = SpeechWindow()
+        var qDecodedLen = 0
+        let qDecode: SpeechWindow.DecodeFn = { s, _ in qDecodedLen = s.count; return ("嗯", [42]) }
+        _ = try! qInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for step in 0..<8 {
+            _ = try! qInbox.offer(tonePCM(400, rms: 0.0025, freqHz: 220, phaseOffset: step * 400))
+            if let batch = qInbox.take() {
+                try! qWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: qDecode) { _ in }
+            }
+        }
+        let qOut = try! qWin.finish(decode: qDecode)
+        require(qOut == "嗯" && qDecodedLen == 3200 + SpeechWindow.finalSilencePadding,
+                "L: genuine 200ms soft word dropped or truncated (len=\\(qDecodedLen) out=\\(qOut))")
+    }
+
     // F1-R2 class test: sustained quiet speech (2.0s @ RMS 0.0025 / 220Hz) and slowly varying harmonic quiet speech (<0.004)
     // must NOT be learned as stationary noise; all 80 frames remain voiced and SpeechWindow keeps full 32,000 samples.
     do {
