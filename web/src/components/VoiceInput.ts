@@ -11,9 +11,27 @@
 import {
   getNativeSpeechRecognition,
   getPlatformFallbackSpeechRecognition,
+  getVoiceRecognitionEngine,
+  isIosNativePlatform,
+  isStreamingSpeechAvailable,
+  setVoiceRecognitionEngine as persistVoiceRecognitionEngine,
+  VOICE_ENGINE_STORAGE_KEY,
   type NativeSpeechRecognition,
+  type VoiceRecognitionEngine,
 } from '../voice-recognition-backend.js';
 import type { PluginListenerHandle } from '@capacitor/core';
+
+export {
+  getVoiceRecognitionEngine,
+  isIosNativePlatform,
+  isStreamingSpeechAvailable,
+  VOICE_ENGINE_STORAGE_KEY,
+  type VoiceRecognitionEngine,
+};
+
+export function canSwitchVoiceEngine(): boolean {
+  return isNative() && isStreamingSpeechAvailable();
+}
 
 export type VoiceLanguageMode = 'follow' | 'auto';
 export const VOICE_LANG_STORAGE_KEY = 'imcodes_voice_lang';
@@ -236,7 +254,13 @@ let _nativeSession: NativeSession | null = null;
 let _activeOwner: CaptureOwner | null = null;
 let _prewarmCache: PrewarmCacheEntry | null = null;
 let _lastAuthorizedPrewarm: PrewarmCacheEntry | null = null;
-let _prewarmInFlight: { promise: Promise<void>; requestPermission: boolean } | null = null;
+let _prewarmEpoch = 0;
+let _prewarmInFlight: {
+  promise: Promise<void>;
+  requestPermission: boolean;
+  recognition: NativeSpeechRecognition;
+  epoch: number;
+} | null = null;
 let _onLevel: ((level: number) => void) | null = null;
 let _onError: ((error: string) => void) | null = null;
 let _lastError: string | null = null;
@@ -244,6 +268,13 @@ let _lastError: string | null = null;
 function clearPrewarmCaches(): void {
   _prewarmCache = null;
   _lastAuthorizedPrewarm = null;
+}
+
+/** Persist the native speech engine preference and invalidate cached recognizer prewarm state. */
+export function setVoiceRecognitionEngine(engine: VoiceRecognitionEngine): void {
+  persistVoiceRecognitionEngine(engine);
+  clearPrewarmCaches();
+  _prewarmEpoch++;
 }
 
 function setAuthorizedPrewarmEntry(entry: PrewarmCacheEntry): void {
@@ -537,6 +568,7 @@ async function resolveUsableFallbackRecognizer(
   primary: NativeSpeechRecognition,
   requestPermission = true,
 ): Promise<NativeSpeechRecognition | null> {
+  if (getVoiceRecognitionEngine() === 'system') return null;
   const fallback = getPlatformFallbackSpeechRecognition();
   if (!fallback || fallback === primary || typeof fallback.available !== 'function') return null;
   try {
@@ -623,13 +655,18 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
   }
 
   if (_prewarmInFlight) {
-    const shouldAwaitOnly = _prewarmInFlight.requestPermission || !requestPermission;
-    await _prewarmInFlight.promise;
+    const inflight = _prewarmInFlight;
+    const sameEngine = inflight.epoch === _prewarmEpoch && inflight.recognition === recognition;
+    const shouldAwaitOnly = sameEngine && (inflight.requestPermission || !requestPermission);
+    await inflight.promise;
     if (shouldAwaitOnly) return;
-    const afterWait = getFreshPrewarmCache(recognition);
-    if (afterWait && afterWait.permissionGranted) return;
+    if (sameEngine) {
+      const afterWait = getFreshPrewarmCache(recognition);
+      if (afterWait && afterWait.permissionGranted) return;
+    }
   }
 
+  const startEpoch = _prewarmEpoch;
   const runPromise = (async () => {
     try {
       // Warm native audio graph / MLX Metal shaders / ONNX decoder in parallel with
@@ -682,9 +719,11 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
       }
 
       if (!effective) {
-        clearPrewarmCaches();
+        if (startEpoch === _prewarmEpoch) clearPrewarmCaches();
         return;
       }
+
+      if (startEpoch !== _prewarmEpoch) return;
 
       const entry: PrewarmCacheEntry = {
         primary: recognition,
@@ -696,11 +735,11 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
       _prewarmCache = entry;
       setAuthorizedPrewarmEntry(entry);
     } catch {
-      clearPrewarmCaches();
+      if (startEpoch === _prewarmEpoch) clearPrewarmCaches();
     }
   })();
 
-  const entry = { promise: runPromise, requestPermission };
+  const entry = { promise: runPromise, requestPermission, recognition, epoch: startEpoch };
   _prewarmInFlight = entry;
   try {
     await runPromise;

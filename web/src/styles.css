@@ -3234,7 +3234,7 @@ html.native-ios-mac .chat-dl-btn {
 @keyframes voice-grid-scroll { to { background-position: 40px 40px; } }
 .voice-overlay-header {
   display: flex; align-items: center; justify-content: space-between;
-  width: 100%; padding: 16px 0 0; z-index: 1;
+  gap: 8px; width: 100%; padding: 16px 0 0; z-index: 1;
 }
 .voice-overlay-close {
   background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
@@ -3244,7 +3244,16 @@ html.native-ios-mac .chat-dl-btn {
   transition: all 0.2s;
 }
 .voice-overlay-close:hover { background: rgba(255,255,255,0.12); color: #e2e8f0; }
-.voice-overlay-actions { display: flex; align-items: center; gap: 10px; }
+.voice-overlay-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; min-width: 0; }
+.voice-engine-select {
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+  color: #94a3b8; font-size: 13px; font-family: inherit; cursor: pointer;
+  height: 36px; padding: 0 10px; border-radius: 18px;
+  max-width: 112px; min-width: 0; flex-shrink: 1;
+  text-overflow: ellipsis; transition: all 0.2s;
+}
+.voice-engine-select:hover { background: rgba(255,255,255,0.12); color: #e2e8f0; }
+.voice-engine-select:focus { outline: none; border-color: rgba(56,189,248,0.45); color: #e2e8f0; }
 .voice-notepad-toggle {
   background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
   color: #94a3b8; font-size: 13px; font-family: inherit; cursor: pointer;
@@ -3257,8 +3266,11 @@ html.native-ios-mac .chat-dl-btn {
 .voice-overlay-status {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: #a5b4cc;
-  letter-spacing: 0.3px; min-width: 0;
-  padding-right: 12px;
+  letter-spacing: 0.3px; min-width: 0; flex: 1 1 auto;
+  padding-right: 4px;
+}
+.voice-overlay-status > span[role="status"] {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .voice-status-dot {
   width: 8px; height: 8px; border-radius: 50%;

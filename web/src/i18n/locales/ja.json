@@ -1605,7 +1605,11 @@
     "release_to_cancel": "離して録音をキャンセル",
     "release_to_edit": "離してテキストを編集",
     "ended": "録音を終了しました",
-    "no_speech": "音声が検出されませんでした"
+    "no_speech": "音声が検出されませんでした",
+    "engine_label": "音声認識エンジン",
+    "engine_builtin": "内蔵モデル",
+    "engine_apple": "Apple 標準",
+    "engine_system": "システム標準"
   },
   "p2p": {
     "final_original_request_reminder": "議論の要約だけで終わらせず、議論を統合した後は必ず元のユーザー依頼に直接対応してください。\n元のユーザー依頼: \"{{request}}\"",
