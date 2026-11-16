@@ -245,7 +245,7 @@ describe('window-drag interaction guard and GPU transform lifecycle', () => {
   });
 
   it('keeps WebKit selection-lock CSS rules in styles.css', () => {
-    const css = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    const css = readFileSync(resolve(import.meta.dirname, '../src/styles.css'), 'utf8');
     expect(css).toContain('html.imcodes-window-dragging');
     expect(css).toContain('-webkit-user-select: none !important;');
     expect(css).toContain('-webkit-touch-callout: none !important;');
