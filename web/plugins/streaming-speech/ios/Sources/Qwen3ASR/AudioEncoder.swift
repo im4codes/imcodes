@@ -205,6 +205,54 @@ public class Qwen3AudioEncoder: Module {
 
     // Cache for sinusoidal position embeddings keyed by sequence length
     private var cachedPosEmbeddings: [Int: MLXArray] = [:]
+    private var cachedConv2WeightT: MLXArray?
+    private var cachedConv3WeightT: MLXArray?
+    private var cachedLeadingBlockMel: MLXArray?
+    private var cachedLeadingBlockHidden: MLXArray?
+    private var leadingBlockSeq: UInt64 = 0
+    public private(set) var lastLeadingBlockCacheId: UInt64?
+
+    public func clearWindowCache() {
+        cachedLeadingBlockMel = nil
+        cachedLeadingBlockHidden = nil
+        lastLeadingBlockCacheId = nil
+    }
+
+    /// 3x3 stride-2 padding-1 convolution via explicit im2col + matmul so Apple A14 GPUs
+    /// avoid the Metal conv2d GPU page fault on 480-channel inputs.
+    private func conv3x3Stride2Pad1(_ x: MLXArray, conv: Conv2d, cachedWT: inout MLXArray?) -> MLXArray {
+        let h = x.dim(1)
+        let w = x.dim(2)
+        let outH = (h + 1) / 2
+        let outW = (w + 1) / 2
+        let pad = padded(x, widths: [.init((0, 0)), .init((1, 1)), .init((1, 1)), .init((0, 0))])
+        var cols: [MLXArray] = []
+        cols.reserveCapacity(9)
+        for kh in 0..<3 {
+            let hEnd = kh + outH * 2
+            for kw in 0..<3 {
+                let wEnd = kw + outW * 2
+                cols.append(pad[0..., .stride(from: kh, to: hEnd, by: 2), .stride(from: kw, to: wEnd, by: 2), 0...])
+            }
+        }
+        let patches = concatenated(cols, axis: -1)
+        let wT: MLXArray
+        if let existing = cachedWT, existing.dtype == x.dtype {
+            wT = existing
+        } else {
+            let outC = conv.weight.dim(0)
+            let inC = conv.weight.dim(3)
+            let wt = conv.weight.reshaped(outC, 9 * inC).transposed(1, 0)
+            let typed = wt.dtype == x.dtype ? wt : wt.asType(x.dtype)
+            cachedWT = typed
+            wT = typed
+        }
+        var out = matmul(patches, wT)
+        if let bias = conv.bias {
+            out = out + (bias.dtype == out.dtype ? bias : bias.asType(out.dtype))
+        }
+        return out
+    }
 
     // Conv frontend - using 2D convolutions
     // Input: [batch, 1, mel=128, time] (single channel mel spectrogram image)
@@ -312,9 +360,9 @@ public class Qwen3AudioEncoder: Module {
         // Time dimension also downsampled 8x
         x = conv2d1(x)
         x = gelu(x)
-        x = conv2d2(x)
+        x = conv3x3Stride2Pad1(x, conv: conv2d2, cachedWT: &cachedConv2WeightT)
         x = gelu(x)
-        x = conv2d3(x)
+        x = conv3x3Stride2Pad1(x, conv: conv2d3, cachedWT: &cachedConv3WeightT)
         x = gelu(x)
 
         // Shape after conv: [batch, mel/8=16, time/8, 480]
@@ -360,10 +408,42 @@ public class Qwen3AudioEncoder: Module {
     /// Input: [batch, mel_bins, time]
     /// Output: [time', output_dim] (no batch dim, matching Python)
     public func callAsFunction(_ melFeatures: MLXArray) -> MLXArray {
-        // Keep activations in the loaded weight precision (typically BF16) so
-        // Float32 mel inputs do not promote all 18 transformer layers to Float32.
         let targetDtype = conv2d1.weight.dtype
         let melTyped = melFeatures.dtype == targetDtype ? melFeatures : melFeatures.asType(targetDtype)
+        let timeFrames = melTyped.dim(2)
+        let inferWindowFrames = config.nWindowInfer
+
+        if timeFrames >= inferWindowFrames {
+            let leadingMel = melTyped[0..<1, 0..., 0..<inferWindowFrames]
+            let leadingHidden: MLXArray
+            if let prevMel = cachedLeadingBlockMel,
+               let prevOut = cachedLeadingBlockHidden,
+               prevMel.dtype == targetDtype,
+               prevOut.dtype == targetDtype,
+               (leadingMel - prevMel).abs().max().item(Float.self) < 0.02 {
+                leadingHidden = prevOut
+            } else {
+                let computed = encodeContiguous(leadingMel, targetDtype: targetDtype)
+                MLX.eval(computed)
+                leadingBlockSeq &+= 1
+                cachedLeadingBlockMel = leadingMel
+                cachedLeadingBlockHidden = computed
+                leadingHidden = computed
+            }
+            lastLeadingBlockCacheId = leadingBlockSeq
+            if timeFrames == inferWindowFrames {
+                return leadingHidden
+            }
+            let tailMel = melTyped[0..<1, 0..., inferWindowFrames..<timeFrames]
+            let tailHidden = encodeContiguous(tailMel, targetDtype: targetDtype)
+            return concatenated([leadingHidden, tailHidden], axis: 0)
+        }
+
+        lastLeadingBlockCacheId = nil
+        return encodeContiguous(melTyped, targetDtype: targetDtype)
+    }
+
+    private func encodeContiguous(_ melTyped: MLXArray, targetDtype: DType) -> MLXArray {
         let timeFrames = melTyped.dim(2)
         let chunkSize = config.nWindow * 2  // 100
 
@@ -412,9 +492,9 @@ public class Qwen3AudioEncoder: Module {
         // Process through conv layers
         x = conv2d1(x)
         x = gelu(x)
-        x = conv2d2(x)
+        x = conv3x3Stride2Pad1(x, conv: conv2d2, cachedWT: &cachedConv2WeightT)
         x = gelu(x)
-        x = conv2d3(x)
+        x = conv3x3Stride2Pad1(x, conv: conv2d3, cachedWT: &cachedConv3WeightT)
         x = gelu(x)
 
         // Shape after conv: [numChunks, freq=16, time', channels=480]

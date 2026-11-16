@@ -12,6 +12,21 @@ public final class TextLayerKVCache {
         self.step = max(16, step)
     }
 
+    public init(preloadedKeys: MLXArray, preloadedValues: MLXArray, step: Int = 256) {
+        self.step = max(16, step)
+        let len = preloadedKeys.dim(2)
+        guard len > 0 else { return }
+        let cap = max(len, ((len + self.step - 1) / self.step) * self.step)
+        let kShape = [preloadedKeys.dim(0), preloadedKeys.dim(1), cap, preloadedKeys.dim(3)]
+        let newK = MLXArray.zeros(kShape, dtype: preloadedKeys.dtype)
+        let newV = MLXArray.zeros(kShape, dtype: preloadedValues.dtype)
+        newK[0..., 0..., 0..<len, 0...] = preloadedKeys
+        newV[0..., 0..., 0..<len, 0...] = preloadedValues
+        self.keys = newK
+        self.values = newV
+        self.offset = len
+    }
+
     /// Append `[batch, numKVHeads, seqLen, headDim]` keys/values and return active views `[0..<offset]`.
     public func updateAndFetch(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let prev = offset

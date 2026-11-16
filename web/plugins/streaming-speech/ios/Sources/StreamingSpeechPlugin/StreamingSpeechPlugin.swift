@@ -625,7 +625,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
     @objc private func didReceiveMemoryWarning(_ notification: Notification) {
-        coordinator.worker.async {
+        coordinator.worker.async { [weak self] in
+            self?.recognizer?.model.clearInferenceCaches()
             Qwen3ASRModel.clearMetalCache()
         }
     }
@@ -1070,7 +1071,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
             }
         )
-        coordinator.worker.async {
+        coordinator.worker.async { [weak self] in
+            self?.recognizer?.model.clearInferenceCaches()
             Qwen3ASRModel.clearMetalCache()
         }
     }
@@ -1174,7 +1176,7 @@ struct SpeechWindow {
     typealias RollbackFn = ([Int32], Int) -> [Int32]
 
     static let sampleRate = 16000
-    static let stride = sampleRate * 3 / 2 // 1.5s of NEW audio per partial decode
+    static let stride = sampleRate * 2 // 2.0s of NEW audio per partial decode (Qwen3-ASR chunk_size_sec=2.0)
     static let segmentCapacity = sampleRate * 27 / 2 // 13.5s bounded active segment capacity (216,000 samples, below 15s threshold)
     static let splitSearchWindow = sampleRate * 5 / 2 // Search trailing 2.5s band for a sustained quiet interval boundary
     static let finalSilencePadding = sampleRate * 2 / 10 // 200ms (3200 zero samples) flushed once at final boundary

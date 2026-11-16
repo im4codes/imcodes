@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
-import { createPortal } from 'preact/compat';
+import { useState, useRef, useEffect, useCallback, useImperativeHandle } from 'preact/hooks';
+import { createPortal, memo, forwardRef } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceStreamingRobot } from './VoiceStreamingRobot.js';
@@ -82,6 +82,79 @@ function readIsIosPlatform(): boolean {
 }
 
 const BAR_COUNT = 48;
+const BAR_MAX_HEIGHT_PX = 46;
+const BAR_MIN_HEIGHT_PX = 2;
+const BAR_MIN_SCALE = BAR_MIN_HEIGHT_PX / BAR_MAX_HEIGHT_PX;
+
+interface VoiceWaveformHandle {
+  pushLevel: (level: number) => void;
+  reset: () => void;
+}
+
+/**
+ * Isolated 48-bar GPU-composited waveform display (`scaleY` + `opacity` via DOM refs).
+ * Updating bar levels never triggers React reconciliation on `VoiceOverlay`.
+ */
+const VoiceWaveform = memo(
+  forwardRef<VoiceWaveformHandle>(function VoiceWaveform(_props, ref) {
+    const barElsRef = useRef<Array<HTMLDivElement | null>>(Array(BAR_COUNT).fill(null));
+    const levelsRef = useRef<number[]>(Array(BAR_COUNT).fill(0));
+
+    const applyLevels = useCallback((levels: number[]) => {
+      const els = barElsRef.current;
+      for (let i = 0; i < BAR_COUNT; i++) {
+        const el = els[i];
+        if (!el) continue;
+        const lvl = levels[i] ?? 0;
+        const scale = (BAR_MIN_HEIGHT_PX + lvl * (BAR_MAX_HEIGHT_PX - BAR_MIN_HEIGHT_PX)) / BAR_MAX_HEIGHT_PX;
+        el.style.transform = `scaleY(${scale.toFixed(6)})`;
+        el.style.opacity = String(0.15 + lvl * 0.35);
+      }
+    }, []);
+
+    useImperativeHandle(ref, () => ({
+      pushLevel(level: number) {
+        const prev = levelsRef.current;
+        let isEmpty = true;
+        for (let i = 0; i < prev.length; i++) {
+          if (prev[i]! >= 0.01) {
+            isEmpty = false;
+            break;
+          }
+        }
+        if (isEmpty && level > 0.01) {
+          for (let i = 0; i < prev.length; i++) {
+            prev[i] = level * (0.5 + Math.random() * 0.5);
+          }
+          applyLevels(prev);
+          return;
+        }
+        prev.copyWithin(0, 1);
+        prev[prev.length - 1] = level;
+        applyLevels(prev);
+      },
+      reset() {
+        levelsRef.current.fill(0);
+        applyLevels(levelsRef.current);
+      },
+    }), [applyLevels]);
+
+    return (
+      <div class="voice-waveform-bg">
+        {Array.from({ length: BAR_COUNT }, (_, i) => (
+          <div
+            key={i}
+            ref={(el) => {
+              barElsRef.current[i] = el;
+            }}
+            class="voice-waveform-bar"
+            style={{ transform: `scaleY(${BAR_MIN_SCALE.toFixed(6)})`, opacity: 0.15 }}
+          />
+        ))}
+      </div>
+    );
+  }),
+);
 export const VOICE_HOLD_MS = 350;
 export const VOICE_DOUBLE_TAP_MS = 375;
 /** Delay before re-arming the recognizer after it ends a segment by itself. */
@@ -117,18 +190,17 @@ export function VoiceOverlay({
   const startingTokenRef = useRef<number | null>(null);
   const [recognizing, setRecognizing] = useState(false);
   const [hasText, setHasText] = useState(false);
-  const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
   const [maxH, setMaxH] = useState('var(--vvh, var(--imcodes-ui-dvh))');
   const [streamMirror, setStreamMirror] = useState<{ before: string; after: string }>({ before: '', after: '' });
   const taRef = useRef<HTMLTextAreaElement>(null);
   const mirrorRef = useRef<HTMLDivElement>(null);
+  const waveformRef = useRef<VoiceWaveformHandle>(null);
   const recognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heldRef = useRef(false);
   const suppressMicClickRef = useRef(false);
   const lastMicTapRef = useRef<number | null>(null);
   const micPointerRef = useRef<number | null>(null);
-  const barsRef = useRef<number[]>(Array(BAR_COUNT).fill(0));
   // Voice zone: [insertPos, insertPos+voiceLen) is the active voice segment
   const insertPosRef = useRef(0);
   const voiceLenRef = useRef(0);
@@ -376,25 +448,14 @@ export function VoiceOverlay({
     voiceLenRef.current = 0;
     syncStreamMirror(init.length, 0);
     sessionTokenRef.current++;
-    setBars(Array(BAR_COUNT).fill(0));
-    barsRef.current = Array(BAR_COUNT).fill(0);
+    waveformRef.current?.reset();
 
     VoiceInput.onAudioLevel((rawLevel) => {
       const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
       if (level > 0.015 && listeningRef.current) {
         pulseRecognizing(1800);
       }
-      const prev = barsRef.current;
-      const isEmpty = prev.every((v) => v < 0.01);
-      if (isEmpty && level > 0.01) {
-        const filled = prev.map(() => level * (0.5 + Math.random() * 0.5));
-        barsRef.current = filled;
-        setBars(filled);
-        return;
-      }
-      const next = [...prev.slice(1), level];
-      barsRef.current = next;
-      setBars(next);
+      waveformRef.current?.pushLevel(level);
     });
 
     const vv = window.visualViewport;
@@ -691,8 +752,7 @@ export function VoiceOverlay({
     pendingResumeAfterStopRef.current = false;
     clearRestartTimer();
     if (!await commitAndStop(true) || !openRef.current) return;
-    setBars(Array(BAR_COUNT).fill(0));
-    barsRef.current = Array(BAR_COUNT).fill(0);
+    waveformRef.current?.reset();
     setNotepadSendFailed(false);
     setReview({
       instruction: draftInstructionRef.current ?? t('voice.notepad_summary_instruction'),
@@ -737,8 +797,7 @@ export function VoiceOverlay({
       pendingResumeAfterStopRef.current = false;
       clearRestartTimer();
       const committed = await commitAndStop(true);
-      setBars(Array(BAR_COUNT).fill(0));
-      barsRef.current = Array(BAR_COUNT).fill(0);
+      waveformRef.current?.reset();
       if (!committed) return;
     } else {
       if (voiceRetryPendingRef.current) return;
@@ -1260,18 +1319,7 @@ export function VoiceOverlay({
       </div>
 
       <div class="voice-overlay-controls" style={review ? { display: 'none' } : undefined}>
-        <div class="voice-waveform-bg">
-          {bars.map((level, i) => {
-            const h = 2 + level * 44;
-            return (
-              <div
-                key={i}
-                class="voice-waveform-bar"
-                style={{ height: `${h}px`, opacity: 0.15 + level * 0.35 }}
-              />
-            );
-          })}
-        </div>
+        <VoiceWaveform ref={waveformRef} />
 
         <button
           class={`voice-overlay-mic${listening ? ' voice-overlay-mic-active' : ''}`}
