@@ -934,4 +934,46 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     expect(canHandleMobileNavigationGesture(host, { isMobile: true, document })).toBe(true);
     host.remove();
   });
+
+  it('updates 48 waveform bars via GPU scaleY transforms in place and resets on pause without mutating bar height', async () => {
+    let audioLevelCb: ((level: number) => void) | null = null;
+    voiceApi.onAudioLevel.mockImplementation((cb: ((level: number) => void) | null) => {
+      audioLevelCb = cb;
+    });
+
+    render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const bars = Array.from(document.querySelectorAll('.voice-waveform-bar')) as HTMLDivElement[];
+    expect(bars).toHaveLength(48);
+    expect(bars[0]!.style.transform).toContain('scaleY(');
+    expect(bars[0]!.style.height).toBe('');
+
+    const taBefore = textarea();
+    const initialNodes = [...bars];
+
+    // Rapid low-level ticks (below recognizing threshold) mutate transform/opacity in place with identical DOM nodes.
+    for (let i = 0; i < 10; i++) {
+      audioLevelCb?.(0.01);
+    }
+    const barsAfterLow = Array.from(document.querySelectorAll('.voice-waveform-bar')) as HTMLDivElement[];
+    expect(barsAfterLow).toHaveLength(48);
+    expect(textarea()).toBe(taBefore);
+    barsAfterLow.forEach((bar, i) => {
+      expect(bar).toBe(initialNodes[i]);
+      expect(bar.style.height).toBe('');
+    });
+
+    // Active speech level scales bars up with scaleY and increases opacity.
+    audioLevelCb?.(0.8);
+    const tailBar = barsAfterLow[47]!;
+    expect(tailBar.style.transform).toMatch(/scaleY\(0\.[4-9]/);
+    expect(Number(tailBar.style.opacity)).toBeGreaterThan(0.25);
+
+    // Pausing resets waveform bars back to minimum idle scale.
+    fireEvent.click(mic());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tailBar.style.transform).toBe(`scaleY(${(2 / 46).toFixed(6)})`);
+    expect(tailBar.style.opacity).toBe('0.15');
+  });
 });

@@ -226,6 +226,11 @@ public class QuantizedTextModel: Module {
         (0..<layers.count).map { _ in TextLayerKVCache(step: step) }
     }
 
+    public func makeKVCache(prefix: [(MLXArray, MLXArray)], step: Int = 256) -> [TextLayerKVCache] {
+        guard prefix.count == layers.count else { return makeKVCache(step: step) }
+        return prefix.map { TextLayerKVCache(preloadedKeys: $0.0, preloadedValues: $0.1, step: step) }
+    }
+
     private func resolveEmbeddings(inputIds: MLXArray?, inputsEmbeds: MLXArray?) -> MLXArray {
         if let embeds = inputsEmbeds { return embeds }
         if let ids = inputIds { return embedTokens(ids) }

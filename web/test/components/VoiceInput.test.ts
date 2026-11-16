@@ -274,18 +274,19 @@ describe('VoiceInput', () => {
         onClose: () => {},
       }));
 
-      // 1. Initial idle bars are fill(0) -> height 2px (2 + 0 * 44), opacity 0.15 (never 90px overflow from fill(2))
+      // 1. Initial idle bars are fill(0) -> GPU scaleY equivalent to 2px (2 + 0 * 44 of 46px), opacity 0.15
       const getBarHeights = () =>
-        Array.from(document.querySelectorAll('.voice-waveform-bar')).map(
-          (el) => parseFloat((el as HTMLElement).style.height),
-        );
+        Array.from(document.querySelectorAll('.voice-waveform-bar')).map((el) => {
+          const match = /scaleY\(([^)]+)\)/.exec((el as HTMLElement).style.transform);
+          return match ? parseFloat(match[1]!) * 46 : NaN;
+        });
       expect(getBarHeights()).toHaveLength(48);
-      expect(getBarHeights().every((h) => h === 2)).toBe(true);
+      getBarHeights().forEach((h) => expect(h).toBeCloseTo(2, 2));
 
       await vi.advanceTimersByTimeAsync(150);
       expect(speechApi.start).toHaveBeenCalledTimes(1);
 
-      // 2. First active audioLevel > 0.01 triggers isEmpty initial burst across all 24 bars (within 2px..46px)
+      // 2. First active audioLevel > 0.01 triggers isEmpty initial burst across all 48 bars (within 2px..46px)
       listeners.audioLevel?.({ level: 0.5 });
       await vi.advanceTimersByTimeAsync(0);
       const burstHeights = getBarHeights();
@@ -313,7 +314,7 @@ describe('VoiceInput', () => {
 
       stopDrain.resolve();
       await vi.advanceTimersByTimeAsync(0);
-      expect(getBarHeights().every((h) => h === 2)).toBe(true);
+      getBarHeights().forEach((h) => expect(h).toBeCloseTo(2, 2));
     } finally {
       cleanup();
       await VoiceInput.stopListening();

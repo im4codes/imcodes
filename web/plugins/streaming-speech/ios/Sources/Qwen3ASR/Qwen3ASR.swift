@@ -140,6 +140,14 @@ public class Qwen3ASRModel {
     /// Whether the model weights are loaded and ready for inference.
     var _isLoaded = true
 
+    /// Cached KV states for identical leading system/user prompt tokens and
+    /// unchanged 8s leading audio blocks across streaming strides.
+    private var cachedPromptPrefixIds: [Int32]?
+    private var cachedPromptKV: [(MLXArray, MLXArray)]?
+    private var cachedAudioPrefixIds: [Int32]?
+    private var cachedAudioBlockId: UInt64?
+    private var cachedAudioKV: [(MLXArray, MLXArray)]?
+
     /// Registration in the shared cache-budget coordinator. Released by
     /// `unload()` or automatically when this model is destroyed.
     var mlxCacheLimitLease: Qwen3ASRCacheLimitCoordinator.Lease? = MLXCacheLimitCoordinator.shared.acquireDefault()
@@ -423,6 +431,7 @@ public class Qwen3ASRModel {
         try checkCancellation()
         let batchedFeatures = melFeatures.expandedDimensions(axis: 0)
         var audioEmbeds = audioEncoder(batchedFeatures)
+        let audioCacheId = audioEncoder.lastLeadingBlockCacheId
         audioEmbeds = audioEmbeds.expandedDimensions(axis: 0)
         guard let textDecoder = textDecoder else {
             let shape = audioEmbeds.shape
@@ -436,6 +445,7 @@ public class Qwen3ASRModel {
             context: effective.context,
             decodingOptions: effective,
             prefixTokens: prefixTokens,
+            audioBlockCacheId: audioCacheId,
             checkCancellation: checkCancellation
         )
     }
@@ -513,6 +523,17 @@ public class Qwen3ASRModel {
         Memory.clearCache()
     }
 
+    /// Drop cached prefix KV states and leading encoder block buffers on session teardown
+    /// or memory pressure so transient ~18 MB prefix state does not outlive a capture.
+    public func clearInferenceCaches() {
+        cachedPromptPrefixIds = nil
+        cachedPromptKV = nil
+        cachedAudioPrefixIds = nil
+        cachedAudioBlockId = nil
+        cachedAudioKV = nil
+        audioEncoder.clearWindowCache()
+    }
+
     /// Generate text from audio embeddings.
     ///
     /// When `decodingOptions` is supplied, the decoder loop applies an
@@ -553,6 +574,7 @@ public class Qwen3ASRModel {
         context: String? = nil,
         decodingOptions: Qwen3DecodingOptions = Qwen3DecodingOptions(),
         prefixTokens: [Int32] = [],
+        audioBlockCacheId: UInt64? = nil,
         checkCancellation: () throws -> Void
     ) rethrows -> (text: String, tokens: [Int32]) {
         defer {
@@ -566,6 +588,7 @@ public class Qwen3ASRModel {
             audioEmbeds: audioEmbeds, textDecoder: textDecoder,
             language: language, maxTokens: maxTokens, context: context,
             decodingOptions: decodingOptions, prefixTokens: prefixTokens,
+            audioBlockCacheId: audioBlockCacheId,
             checkCancellation: checkCancellation)
     }
 
@@ -577,25 +600,71 @@ public class Qwen3ASRModel {
         context: String?,
         decodingOptions: Qwen3DecodingOptions,
         prefixTokens: [Int32],
+        audioBlockCacheId: UInt64? = nil,
         checkCancellation: () throws -> Void
     ) rethrows -> (text: String, tokens: [Int32]) {
         let (prefixTokenIds, suffixTokenIds) = Self.buildPromptTokenIds(
             language: language, context: context, tokenizer: tokenizer, prefixTokens: prefixTokens)
-        let inputEmbeds = Self.buildInputEmbeds(
-            audioEmbeds: audioEmbeds,
-            audioTokenCount: audioEmbeds.dim(1),
-            prefixTokenIds: prefixTokenIds,
-            suffixTokenIds: suffixTokenIds,
-            audioStartIndex: prefixTokenIds.count,
-            textDecoder: textDecoder
-        )
 
-        // First pass: process the full input embeddings.
+        // First pass: process input embeddings, reusing frozen prefix/leading-block KV state
+        // on the greedy fast path when unchanged across streaming strides.
         try checkCancellation()
         let generatedTokens: [Int32]
         if Self.isGreedyFastPath(decodingOptions) {
-            let kvCache = textDecoder.makeKVCache(step: 256)
-            let hiddenStates = textDecoder.callWithKVCache(inputsEmbeds: inputEmbeds, cache: kvCache)
+            let audioCount = audioEmbeds.dim(1)
+            let leadingAudioTokens = (audioEncoder.config.nWindowInfer / (audioEncoder.config.nWindow * 2)) * 13
+            let suffixEmbeds = textDecoder.embedTokens(MLXArray(suffixTokenIds).expandedDimensions(axis: 0))
+
+            let kvCache: [TextLayerKVCache]
+            let tailEmbeds: MLXArray
+
+            if let blockId = audioBlockCacheId,
+               audioCount >= leadingAudioTokens,
+               cachedAudioBlockId == blockId,
+               cachedAudioPrefixIds == prefixTokenIds,
+               let audioKV = cachedAudioKV {
+                kvCache = textDecoder.makeKVCache(prefix: audioKV, step: 256)
+                tailEmbeds = audioCount > leadingAudioTokens
+                    ? concatenated([audioEmbeds[0..., leadingAudioTokens..<audioCount, 0...], suffixEmbeds], axis: 1)
+                    : suffixEmbeds
+            } else {
+                if cachedPromptPrefixIds == prefixTokenIds, let promptKV = cachedPromptKV {
+                    kvCache = textDecoder.makeKVCache(prefix: promptKV, step: 256)
+                    tailEmbeds = concatenated([audioEmbeds, suffixEmbeds], axis: 1)
+                } else {
+                    kvCache = textDecoder.makeKVCache(step: 256)
+                    let prefixEmbeds = textDecoder.embedTokens(MLXArray(prefixTokenIds).expandedDimensions(axis: 0))
+                    _ = textDecoder.callWithKVCache(inputsEmbeds: prefixEmbeds, cache: kvCache)
+                    let snap: [(MLXArray, MLXArray)] = kvCache.compactMap { layerCache in
+                        guard let (k, v) = layerCache.activeSlices else { return nil }
+                        return (contiguous(k), contiguous(v))
+                    }
+                    if snap.count == kvCache.count {
+                        MLX.eval(snap.flatMap { [$0.0, $0.1] })
+                        cachedPromptPrefixIds = prefixTokenIds
+                        cachedPromptKV = snap
+                    }
+                    tailEmbeds = concatenated([audioEmbeds, suffixEmbeds], axis: 1)
+                }
+            }
+
+            let hiddenStates = textDecoder.callWithKVCache(inputsEmbeds: tailEmbeds, cache: kvCache)
+            var pendingAudioSnap: (prefixIds: [Int32], blockId: UInt64, snap: [(MLXArray, MLXArray)])?
+            if let blockId = audioBlockCacheId,
+               audioCount >= leadingAudioTokens,
+               (cachedAudioBlockId != blockId || cachedAudioPrefixIds != prefixTokenIds) {
+                let targetLen = prefixTokenIds.count + leadingAudioTokens
+                let snap: [(MLXArray, MLXArray)] = kvCache.compactMap { layerCache in
+                    guard layerCache.offset >= targetLen,
+                          let k = layerCache.keys,
+                          let v = layerCache.values else { return nil }
+                    return (contiguous(k[0..., 0..., 0..<targetLen, 0...]),
+                            contiguous(v[0..., 0..., 0..<targetLen, 0...]))
+                }
+                if snap.count == kvCache.count {
+                    pendingAudioSnap = (prefixTokenIds, blockId, snap)
+                }
+            }
             let seqLen = hiddenStates.dim(1)
             let logits = textDecoder.embedTokens.asLinear(hiddenStates[0..., (seqLen - 1)..<seqLen, 0...])
             generatedTokens = try Self.generateGreedyAsyncEvalKVCache(
@@ -605,7 +674,21 @@ public class Qwen3ASRModel {
                 maxTokens: maxTokens,
                 checkCancellation: checkCancellation
             )
+            if let pending = pendingAudioSnap {
+                MLX.eval(pending.snap.flatMap { [$0.0, $0.1] })
+                cachedAudioPrefixIds = pending.prefixIds
+                cachedAudioBlockId = pending.blockId
+                cachedAudioKV = pending.snap
+            }
         } else {
+            let inputEmbeds = Self.buildInputEmbeds(
+                audioEmbeds: audioEmbeds,
+                audioTokenCount: audioEmbeds.dim(1),
+                prefixTokenIds: prefixTokenIds,
+                suffixTokenIds: suffixTokenIds,
+                audioStartIndex: prefixTokenIds.count,
+                textDecoder: textDecoder
+            )
             let (hiddenStates, cache) = textDecoder(inputsEmbeds: inputEmbeds, cache: nil)
             let seqLen = hiddenStates.dim(1)
             let logits = textDecoder.embedTokens.asLinear(hiddenStates[0..., (seqLen - 1)..<seqLen, 0...])
@@ -1506,6 +1589,19 @@ public extension Qwen3ASRModel {
         model.initializeTextDecoder()
         if let textDecoder = model.textDecoder {
             try WeightLoader.loadTextDecoderWeights(into: textDecoder, from: directory)
+        }
+
+        // Apple A-series GPUs run IEEE float16 natively while bfloat16 incurs software
+        // conversion and mixed-dtype Float32 promotion overhead.
+        model.audioEncoder.update(parameters: model.audioEncoder.parameters().mapValues {
+            $0.dtype == .bfloat16 ? $0.asType(.float16) : $0
+        })
+        MLX.eval(model.audioEncoder.parameters())
+        if let textDecoder = model.textDecoder {
+            textDecoder.update(parameters: textDecoder.parameters().mapValues {
+                $0.dtype == .bfloat16 ? $0.asType(.float16) : $0
+            })
+            MLX.eval(textDecoder.parameters())
         }
 
         MetalBudget.pinMemory()

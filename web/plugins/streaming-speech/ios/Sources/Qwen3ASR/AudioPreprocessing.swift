@@ -28,6 +28,7 @@ public class WhisperFeatureExtractor {
     public let chunkLength: Int = 30        // Max audio chunk in seconds
 
     private var melFilterbank: [Float]?
+    private var melFilterbankT: [Float]?
 
     // Windowed 400-point DFT as two [nFFT, nBins] matrices (Hann window folded in), so each
     // frame's spectrum is exactly HuggingFace's `np.fft.rfft(frame * window, n=400)`.
@@ -158,6 +159,9 @@ public class WhisperFeatureExtractor {
         }
 
         self.melFilterbank = filterbankTransposed
+        var fbT = [Float](repeating: 0, count: nBins * nMels)
+        vDSP_mtrans(filterbankTransposed, 1, &fbT, 1, vDSP_Length(nBins), vDSP_Length(nMels))
+        self.melFilterbankT = fbT
     }
 
     /// Power spectrum of every frame, [nFrames, nFFT / 2 + 1] row-major: |rfft(frame * window)|^2.
@@ -228,18 +232,11 @@ public class WhisperFeatureExtractor {
         let magnitude = powerSpectrum(paddedAudio, nFrames: nFrames)
 
         // --- BLAS sgemm for mel filterbank ---
-        guard let filterbank = melFilterbank else {
+        guard let filterbankT = melFilterbankT else {
             fatalError("Mel filterbank not initialized")
         }
 
         var melSpec = [Float](repeating: 0, count: nFrames * nMels)
-
-        // melSpec[nFrames, nMels] = magnitude[nFrames, nBins] * filterbankT[nBins, nMels]
-        // filterbank is [nMels, nBins]. We need A * B^T.
-        // vDSP_mmul computes C = A * B, so we need to pre-transpose filterbank.
-        // Transpose filterbank [nMels, nBins] -> filterbankT [nBins, nMels]
-        var filterbankT = [Float](repeating: 0, count: nBins * nMels)
-        vDSP_mtrans(filterbank, 1, &filterbankT, 1, vDSP_Length(nBins), vDSP_Length(nMels))
 
         // C[nFrames, nMels] = A[nFrames, nBins] * B[nBins, nMels]
         vDSP_mmul(magnitude, 1, filterbankT, 1, &melSpec, 1,
