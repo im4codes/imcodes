@@ -1112,7 +1112,8 @@
       "hint": "この所有セッションで非手動の圧縮が検知された際の動作を上書きします。",
       "inherit": "グローバル設定を継承",
       "on": "オン（/handoff で引き継ぐ）",
-      "off": "オフ（通常の圧縮を使う）"
+      "off": "オフ（通常の圧縮を使う）",
+      "handoffLimitsToggle": "Handoff コンテキスト上限（空欄＝全体設定）"
     }
   },
   "server": {
@@ -2375,7 +2376,12 @@
     },
     "compact_hijack_title": "Compact ハイジャック (/handoff)",
     "compact_hijack_toggle_label": "自動コンテキスト圧縮を /handoff で自動引き継ぎする",
-    "compact_hijack_desc": "所有デーモンの全セッションのグローバル既定値です。非手動コンテキスト圧縮を検知すると、即座に /handoff で新しい会話を開始して作業を続行します。手動の /compact には影響しません。"
+    "compact_hijack_desc": "所有デーモンの全セッションのグローバル既定値です。非手動コンテキスト圧縮を検知すると、即座に /handoff で新しい会話を開始して作業を続行します。手動の /compact には影響しません。",
+    "compact_hijack_handoff_text_limit": "Handoff テキスト件数",
+    "compact_hijack_handoff_summary_limit": "Handoff 要約件数",
+    "compact_hijack_handoff_max_chars": "Handoff 最大文字数",
+    "compact_hijack_handoff_reset": "既定に戻す",
+    "compact_hijack_handoff_invalid": "テキスト件数: 0–200、要約件数: 0–200、最大文字数: 500–500000。"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

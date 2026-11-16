@@ -1112,7 +1112,8 @@
       "hint": "Anula el valor global cuando se detecta compactación automática en esta sesión propia.",
       "inherit": "Heredar valor global",
       "on": "Activado (usar /handoff)",
-      "off": "Desactivado (compactación nativa)"
+      "off": "Desactivado (compactación nativa)",
+      "handoffLimitsToggle": "Límites de contexto Handoff (vacío = global)"
     }
   },
   "server": {
@@ -2376,7 +2377,12 @@
     },
     "compact_hijack_title": "Compact Hijack (/handoff)",
     "compact_hijack_toggle_label": "Tomar control automático de la compactación mediante /handoff",
-    "compact_hijack_desc": "Valor predeterminado global para sus daemons propios. Cuando se detecta compactación automática, abre una conversación nueva con el paquete de relevo y continúa. /compact manual no cambia."
+    "compact_hijack_desc": "Valor predeterminado global para sus daemons propios. Cuando se detecta compactación automática, abre una conversación nueva con el paquete de relevo y continúa. /compact manual no cambia.",
+    "compact_hijack_handoff_text_limit": "Turnos de texto Handoff",
+    "compact_hijack_handoff_summary_limit": "Resúmenes Handoff",
+    "compact_hijack_handoff_max_chars": "Límite máx. caracteres",
+    "compact_hijack_handoff_reset": "Restablecer",
+    "compact_hijack_handoff_invalid": "Texto: 0–200, resúmenes: 0–200, caracteres máx.: 500–500000."
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

@@ -1112,7 +1112,8 @@
       "hint": "Переопределяет глобальную настройку для автоматического сжатия в этой вашей сессии.",
       "inherit": "Как глобально",
       "on": "Вкл (перехват через /handoff)",
-      "off": "Выкл (штатное сжатие)"
+      "off": "Выкл (штатное сжатие)",
+      "handoffLimitsToggle": "Лимиты контекста Handoff (пусто = глобальные)"
     }
   },
   "server": {
@@ -2375,7 +2376,12 @@
     },
     "compact_hijack_title": "Перехват Compact (/handoff)",
     "compact_hijack_toggle_label": "Автоматически перехватывать сжатие контекста через /handoff",
-    "compact_hijack_desc": "Глобальная настройка для ваших собственных демонов. При автоматическом сжатии открывает новый диалог с кратким handoff-пакетом и продолжает работу. Ручной /compact не затрагивается."
+    "compact_hijack_desc": "Глобальная настройка для ваших собственных демонов. При автоматическом сжатии открывает новый диалог с кратким handoff-пакетом и продолжает работу. Ручной /compact не затрагивается.",
+    "compact_hijack_handoff_text_limit": "Сообщений Handoff",
+    "compact_hijack_handoff_summary_limit": "Сводок Handoff",
+    "compact_hijack_handoff_max_chars": "Макс. символов Handoff",
+    "compact_hijack_handoff_reset": "Сбросить",
+    "compact_hijack_handoff_invalid": "Тексты: 0–200, сводки: 0–200, макс. символов: 500–500000."
   },
   "capabilities": {
     "eyebrow": "Переносимые возможности ИИ",

@@ -456,8 +456,10 @@ import {
   COMPACT_HIJACK_MSG,
   buildTransportConfigWithCompactHijack,
   extractSessionCompactHijackMode,
+  extractSessionHandoffLimits,
   hasCompactHijackField,
   hasInvalidCompactHijackSetting,
+  normalizeCompactHijackGlobalConfig,
   resolveCompactHijackEnabled,
 } from '../../shared/compact-hijack.js';
 import {
@@ -781,9 +783,14 @@ function resolveIncomingTransportConfigForCompactHijack(
       return { ok: false, reason: 'shared_caller_cannot_modify_compact_hijack' };
     }
     const preservedMode = extractSessionCompactHijackMode(existingConfig);
+    const preservedLimits = extractSessionHandoffLimits(existingConfig);
     return {
       ok: true,
-      transportConfig: buildTransportConfigWithCompactHijack(rawIncomingConfig, preservedMode) ?? undefined,
+      transportConfig: buildTransportConfigWithCompactHijack(
+        rawIncomingConfig,
+        preservedMode,
+        preservedLimits,
+      ) ?? undefined,
     };
   }
   if (hasInvalidCompactHijackSetting(rawIncomingConfig)) {
@@ -13292,7 +13299,7 @@ function handleCompactHijackConfigApply(cmd: Record<string, unknown>): void {
     logger.warn('compact_hijack.apply: ignoring non-boolean enabled payload');
     return;
   }
-  setPersistedCompactHijackGlobalConfig({ enabled: cmd.enabled });
+  setPersistedCompactHijackGlobalConfig(normalizeCompactHijackGlobalConfig(cmd));
 }
 
 function handleMemoryFeatureConfigApply(cmd: Record<string, unknown>): void {

@@ -1112,7 +1112,8 @@
       "hint": "이 소유 세션에서 비수동 압축이 감지될 때 전역 기본값을 재정의합니다.",
       "inherit": "전역 기본값 상속",
       "on": "켜짐 (/handoff로 인계)",
-      "off": "꺼짐 (기본 압축 사용)"
+      "off": "꺼짐 (기본 압축 사용)",
+      "handoffLimitsToggle": "Handoff 컨텍스트 한도 (비움 = 전역 상속)"
     }
   },
   "server": {
@@ -2375,7 +2376,12 @@
     },
     "compact_hijack_title": "Compact 하이재킹 (/handoff)",
     "compact_hijack_toggle_label": "자동 컨텍스트 압축 감지 시 /handoff로 자동 인계",
-    "compact_hijack_desc": "소유한 데몬의 모든 세션에 대한 전역 기본값입니다. 수동이 아닌 컨텍스트 압축이 감지되면 즉시 /handoff로 새 대화를 열고 실행을 이어갑니다. 수동 /compact는 영향을 받지 않습니다."
+    "compact_hijack_desc": "소유한 데몬의 모든 세션에 대한 전역 기본값입니다. 수동이 아닌 컨텍스트 압축이 감지되면 즉시 /handoff로 새 대화를 열고 실행을 이어갑니다. 수동 /compact는 영향을 받지 않습니다.",
+    "compact_hijack_handoff_text_limit": "Handoff 텍스트 수",
+    "compact_hijack_handoff_summary_limit": "Handoff 요약 수",
+    "compact_hijack_handoff_max_chars": "Handoff 최대 글자 수",
+    "compact_hijack_handoff_reset": "기본값 복원",
+    "compact_hijack_handoff_invalid": "텍스트 수: 0–200, 요약 수: 0–200, 최대 글자 수: 500–500000."
   },
   "capabilities": {
     "eyebrow": "이식 가능한 AI 기능",

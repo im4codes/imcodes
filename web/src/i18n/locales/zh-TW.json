@@ -1112,7 +1112,8 @@
       "hint": "覆蓋此自有工作階段在偵測到非手動壓縮時的接管行為。",
       "inherit": "繼承全域預設",
       "on": "開啟（劫持壓縮並 /handoff）",
-      "off": "關閉（使用原生壓縮）"
+      "off": "關閉（使用原生壓縮）",
+      "handoffLimitsToggle": "Handoff 上下文上限（留空繼承全域）"
     }
   },
   "server": {
@@ -2376,7 +2377,12 @@
     },
     "compact_hijack_title": "Compact 劫持 (/handoff)",
     "compact_hijack_toggle_label": "偵測到自動壓縮上下文時自動透過 /handoff 接管",
-    "compact_hijack_desc": "您名下 Daemon 所有工作階段的全域預設值。偵測到非手動上下文壓縮時，立即透過 /handoff 開啟新對話並攜帶精簡交接包繼續執行。手動 /compact 不受影響。"
+    "compact_hijack_desc": "您名下 Daemon 所有工作階段的全域預設值。偵測到非手動上下文壓縮時，立即透過 /handoff 開啟新對話並攜帶精簡交接包繼續執行。手動 /compact 不受影響。",
+    "compact_hijack_handoff_text_limit": "Handoff Text 筆數",
+    "compact_hijack_handoff_summary_limit": "Handoff Summary 筆數",
+    "compact_hijack_handoff_max_chars": "Handoff 總上限字數",
+    "compact_hijack_handoff_reset": "恢復預設",
+    "compact_hijack_handoff_invalid": "Text 筆數需為 0–200，Summary 筆數需為 0–200，總上限字數需為 500–500000。"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

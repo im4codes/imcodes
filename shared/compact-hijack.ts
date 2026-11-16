@@ -8,6 +8,11 @@
  * Pure module — safe to import in daemon, server, and web.
  */
 
+import {
+  CROSS_VENDOR_HANDOFF_DEFAULTS,
+  CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS,
+} from './cross-vendor-handoff.js';
+
 export const COMPACT_HIJACK_GLOBAL_PREF_KEY = 'compact_hijack.global.v1';
 
 export const COMPACT_HIJACK_MSG = {
@@ -28,7 +33,43 @@ export const COMPACT_HIJACK_MODES: readonly CompactHijackMode[] = [
   COMPACT_HIJACK_MODE.OFF,
 ] as const;
 
-export interface CompactHijackGlobalConfig {
+export const COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS = [
+  'handoffTextLimit',
+  'handoffSummaryLimit',
+  'handoffMaxChars',
+] as const;
+
+export type CompactHijackHandoffLimitField = (typeof COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS)[number];
+
+export const COMPACT_HIJACK_HANDOFF_LIMIT_BOUNDS: Record<
+  CompactHijackHandoffLimitField,
+  { min: number; max: number; defaultValue: number }
+> = {
+  handoffTextLimit: {
+    ...CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.recentTurns,
+    defaultValue: CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns,
+  },
+  handoffSummaryLimit: {
+    ...CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.summaryLimit,
+    defaultValue: CROSS_VENDOR_HANDOFF_DEFAULTS.summaryLimit,
+  },
+  handoffMaxChars: {
+    ...CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.maxChars,
+    defaultValue: CROSS_VENDOR_HANDOFF_DEFAULTS.maxChars,
+  },
+} as const;
+
+export interface SessionHandoffLimits {
+  handoffTextLimit?: number;
+  handoffSummaryLimit?: number;
+  handoffMaxChars?: number;
+}
+
+export type CompactHijackHandoffLimitPatch = {
+  [K in CompactHijackHandoffLimitField]?: number | null;
+};
+
+export interface CompactHijackGlobalConfig extends SessionHandoffLimits {
   enabled: boolean;
 }
 
@@ -52,11 +93,32 @@ export function normalizeCompactHijackMode(value: unknown): CompactHijackMode {
   return isCompactHijackMode(value) ? value : COMPACT_HIJACK_MODE.INHERIT;
 }
 
+export function isValidHandoffLimitValue(field: CompactHijackHandoffLimitField, value: unknown): value is number {
+  const bounds = COMPACT_HIJACK_HANDOFF_LIMIT_BOUNDS[field];
+  return typeof value === 'number' && Number.isInteger(value) && value >= bounds.min && value <= bounds.max;
+}
+
+export function normalizeHandoffLimits(raw: unknown): SessionHandoffLimits {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const obj = raw as Record<string, unknown>;
+  const result: SessionHandoffLimits = {};
+  for (const field of COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS) {
+    const val = obj[field];
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      const bounds = COMPACT_HIJACK_HANDOFF_LIMIT_BOUNDS[field];
+      result[field] = Math.max(bounds.min, Math.min(bounds.max, Math.trunc(val)));
+    }
+  }
+  return result;
+}
+
 export function normalizeCompactHijackGlobalConfig(raw: unknown): CompactHijackGlobalConfig {
   if (typeof raw === 'boolean') return { enabled: raw };
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     const enabled = (raw as { enabled?: unknown }).enabled;
-    if (typeof enabled === 'boolean') return { enabled };
+    if (typeof enabled === 'boolean') {
+      return { enabled, ...normalizeHandoffLimits(raw) };
+    }
   }
   return { enabled: false };
 }
@@ -65,8 +127,16 @@ export function isValidCompactHijackGlobalPrefPayload(raw: unknown): boolean {
   if (raw === null || raw === undefined) return true;
   if (typeof raw === 'boolean') return true;
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    const enabled = (raw as { enabled?: unknown }).enabled;
-    return typeof enabled === 'boolean';
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.enabled !== 'boolean') return false;
+    for (const field of COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(obj, field)) continue;
+      const val = obj[field];
+      if (val !== undefined && val !== null && !isValidHandoffLimitValue(field, val)) {
+        return false;
+      }
+    }
+    return true;
   }
   return false;
 }
@@ -81,7 +151,7 @@ export function parseCompactHijackGlobalConfigJson(raw: string | null | undefine
 }
 
 export function encodeCompactHijackGlobalConfigJson(config: CompactHijackGlobalConfig): string {
-  return JSON.stringify({ enabled: config.enabled === true });
+  return JSON.stringify(normalizeCompactHijackGlobalConfig(config));
 }
 
 export function extractSessionCompactHijackMode(transportConfig: unknown): CompactHijackMode {
@@ -92,24 +162,58 @@ export function extractSessionCompactHijackMode(transportConfig: unknown): Compa
   return normalizeCompactHijackMode(value);
 }
 
+export function extractSessionHandoffLimits(transportConfig: unknown): SessionHandoffLimits {
+  return normalizeHandoffLimits(transportConfig);
+}
+
+export function resolveEffectiveHandoffLimits(
+  transportConfig: unknown,
+  globalConfig?: CompactHijackGlobalConfig | null,
+): { recentTurns: number; summaryLimit: number; maxChars: number } {
+  const session = extractSessionHandoffLimits(transportConfig);
+  const global = normalizeHandoffLimits(globalConfig);
+  return {
+    recentTurns: session.handoffTextLimit ?? global.handoffTextLimit ?? CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns,
+    summaryLimit: session.handoffSummaryLimit ?? global.handoffSummaryLimit ?? CROSS_VENDOR_HANDOFF_DEFAULTS.summaryLimit,
+    maxChars: session.handoffMaxChars ?? global.handoffMaxChars ?? CROSS_VENDOR_HANDOFF_DEFAULTS.maxChars,
+  };
+}
+
 export function hasCompactHijackField(transportConfig: unknown): boolean {
-  return Boolean(
-    transportConfig
-    && typeof transportConfig === 'object'
-    && !Array.isArray(transportConfig)
-    && Object.prototype.hasOwnProperty.call(transportConfig, 'compactHijack'),
+  if (!transportConfig || typeof transportConfig !== 'object' || Array.isArray(transportConfig)) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(transportConfig, 'compactHijack')) return true;
+  return COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS.some((field) =>
+    Object.prototype.hasOwnProperty.call(transportConfig, field),
   );
 }
 
 export function hasInvalidCompactHijackSetting(transportConfig: unknown): boolean {
-  if (!hasCompactHijackField(transportConfig)) return false;
-  const value = (transportConfig as Record<string, unknown>).compactHijack;
-  return value !== undefined && value !== null && !isCompactHijackMode(value);
+  if (!transportConfig || typeof transportConfig !== 'object' || Array.isArray(transportConfig)) {
+    return false;
+  }
+  const obj = transportConfig as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(obj, 'compactHijack')) {
+    const value = obj.compactHijack;
+    if (value !== undefined && value !== null && !isCompactHijackMode(value)) {
+      return true;
+    }
+  }
+  for (const field of COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(obj, field)) continue;
+    const value = obj[field];
+    if (value !== undefined && value !== null && !isValidHandoffLimitValue(field, value)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function buildTransportConfigWithCompactHijack(
   existing: Record<string, unknown> | null | undefined,
   mode: CompactHijackMode,
+  handoffLimits?: CompactHijackHandoffLimitPatch,
 ): Record<string, unknown> | null {
   const base: Record<string, unknown> = existing && typeof existing === 'object' && !Array.isArray(existing)
     ? { ...existing }
@@ -118,6 +222,17 @@ export function buildTransportConfigWithCompactHijack(
     delete base.compactHijack;
   } else {
     base.compactHijack = mode;
+  }
+  const sourceLimits: Record<string, unknown> = handoffLimits ?? base;
+  for (const field of COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(sourceLimits, field)) continue;
+    const raw = sourceLimits[field];
+    if (raw === undefined || raw === null) {
+      delete base[field];
+    } else if (typeof raw === 'number' && Number.isFinite(raw)) {
+      const bounds = COMPACT_HIJACK_HANDOFF_LIMIT_BOUNDS[field];
+      base[field] = Math.max(bounds.min, Math.min(bounds.max, Math.trunc(raw)));
+    }
   }
   return Object.keys(base).length > 0 ? base : null;
 }
@@ -128,6 +243,9 @@ export function stripCompactHijackFromTransportConfig(transportConfig: unknown):
   }
   const copy = { ...(transportConfig as Record<string, unknown>) };
   delete copy.compactHijack;
+  for (const field of COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS) {
+    delete copy[field];
+  }
   return Object.keys(copy).length > 0 ? copy : null;
 }
 

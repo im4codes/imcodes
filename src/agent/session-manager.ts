@@ -97,8 +97,12 @@ import {
   COMPACT_HIJACK_COOLDOWN_MS,
   extractSessionCompactHijackMode,
   resolveCompactHijackEnabled,
+  resolveEffectiveHandoffLimits,
 } from '../../shared/compact-hijack.js';
-import { isGlobalCompactHijackEnabled } from '../store/compact-hijack-config-store.js';
+import {
+  getPersistedCompactHijackGlobalConfig,
+  isGlobalCompactHijackEnabled,
+} from '../store/compact-hijack-config-store.js';
 
 const compactHijackInFlight = new Set<string>();
 const compactHijackLastTriggeredAt = new Map<string, number>();
@@ -1517,7 +1521,14 @@ export async function relaunchSessionWithSettings(
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
   const targetRuntimeType = getSessionRuntimeType(targetAgentType);
   const forceHandoff = overrides.handoff === true;
-  const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
+  const effectiveLimits = resolveEffectiveHandoffLimits(
+    targetTransportConfig,
+    getPersistedCompactHijackGlobalConfig(),
+  );
+  const handoffConfig = normalizeCrossVendorHandoffConfig({
+    ...(record.crossVendorHandoff?.config ?? {}),
+    ...effectiveLimits,
+  });
   const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
   const wantsHandoff = !isPrivate && shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
   const [resolvedIdentityPrompt, cutoffEvents] = await Promise.all([
@@ -1544,7 +1555,16 @@ export async function relaunchSessionWithSettings(
     );
     upsertSession({ ...record, crossVendorHandoff: persistedState, updatedAt: Date.now() });
     const build = buildCrossVendorHandoffPack(record, cutoff, targetAgentType, targetRuntimeType, {
-      ...effectiveHandoffConfig,
+      enabled: effectiveHandoffConfig.enabled,
+      recentTurns: effectiveHandoffConfig.recentTurns,
+      summaryLimit: effectiveHandoffConfig.summaryLimit,
+      maxChars: effectiveHandoffConfig.maxChars,
+      timeoutMs: effectiveHandoffConfig.timeoutMs,
+      providerWaitMs: effectiveHandoffConfig.providerWaitMs,
+      includeToolPreviews: effectiveHandoffConfig.includeToolPreviews,
+      ...(record.crossVendorHandoff?.config?.maxTokens !== undefined
+        ? { maxTokens: record.crossVendorHandoff.config.maxTokens }
+        : {}),
       // A previous cutoff means this is a switch-back; the pack builder still
       // uses the authoritative timeline and the target runtime receives it once.
       ...(priorCutoff ? { recentTurns: effectiveHandoffConfig.recentTurns } : {}),

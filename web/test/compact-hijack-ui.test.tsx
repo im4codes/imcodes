@@ -58,10 +58,12 @@ vi.mock('../src/components/file-browser-lazy.js', () => ({ FileBrowser: () => <d
 
 import { SettingsPage } from '../src/pages/SettingsPage.js';
 import { SessionSettingsDialog } from '../src/components/SessionSettingsDialog.js';
+import { __resetPrefCacheForTests } from '../src/hooks/usePref.js';
 
 describe('Compact Hijack Web UI', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetPrefCacheForTests();
     getUserPrefMock.mockResolvedValue(null);
   });
 
@@ -146,5 +148,130 @@ describe('Compact Hijack Web UI', () => {
     );
 
     expect(screen.queryByTestId('session-compact-hijack-field')).toBeNull();
+  });
+
+  it('configures global Handoff limits in SettingsPage with validation and reset-to-defaults', async () => {
+    getUserPrefMock.mockResolvedValue({
+      enabled: true,
+      handoffTextLimit: 60,
+      handoffSummaryLimit: 8,
+      handoffMaxChars: 64_000,
+    });
+    render(
+      <SettingsPage
+        userId="u1"
+        username="owner"
+        displayName="Owner"
+        onDisplayNameUpdated={vi.fn()}
+        onBack={vi.fn()}
+      />,
+    );
+
+    const textInput = (await screen.findByLabelText('settings.compact_hijack_handoff_text_limit')) as HTMLInputElement;
+    const summaryInput = screen.getByLabelText('settings.compact_hijack_handoff_summary_limit') as HTMLInputElement;
+    const maxCharsInput = screen.getByLabelText('settings.compact_hijack_handoff_max_chars') as HTMLInputElement;
+    await waitFor(() => {
+      expect(textInput.value).toBe('60');
+      expect(summaryInput.value).toBe('8');
+      expect(maxCharsInput.value).toBe('64000');
+    });
+
+    // Invalid value displays error and prevents save
+    fireEvent.input(textInput, { target: { value: '201' } });
+    expect(screen.getByText('settings.compact_hijack_handoff_invalid')).toBeTruthy();
+
+    // Valid edit & save persists custom limits
+    fireEvent.input(textInput, { target: { value: '0' } });
+    fireEvent.input(maxCharsInput, { target: { value: '200000' } });
+    fireEvent.click(screen.getByText('common.save'));
+    await waitFor(() => {
+      expect(saveUserPrefMock).toHaveBeenCalledWith(COMPACT_HIJACK_GLOBAL_PREF_KEY, {
+        enabled: true,
+        handoffTextLimit: 0,
+        handoffSummaryLimit: 8,
+        handoffMaxChars: 200_000,
+      });
+    });
+
+    // Reset defaults restores 100 / 20 / 128000 and omits optional limits
+    fireEvent.click(screen.getByText('settings.compact_hijack_handoff_reset'));
+    await waitFor(() => {
+      expect(saveUserPrefMock).toHaveBeenCalledWith(COMPACT_HIJACK_GLOBAL_PREF_KEY, { enabled: true });
+    });
+    expect(textInput.value).toBe('100');
+    expect(summaryInput.value).toBe('20');
+    expect(maxCharsInput.value).toBe('128000');
+  });
+
+  it('keeps session Handoff limits collapsed by default in SessionSettingsDialog and handles 0 vs blank', async () => {
+    getUserPrefMock.mockResolvedValue({
+      enabled: false,
+      handoffTextLimit: 75,
+      handoffSummaryLimit: 12,
+      handoffMaxChars: 96_000,
+    });
+    const { rerender } = render(
+      <SessionSettingsDialog
+        surface="session"
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description=""
+        cwd="/tmp/proj"
+        type="claude-code-sdk"
+        canConfigureCompactHijack={true}
+        transportConfig={{ uiLocale: 'en', handoffTextLimit: 30 }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const toggle = screen.getByTestId('session-handoff-limits-toggle');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByLabelText('settings.compact_hijack_handoff_text_limit')).toBeNull();
+
+    // Expand -> lazy loads global defaults as placeholders
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    const textInput = (await screen.findByLabelText('settings.compact_hijack_handoff_text_limit')) as HTMLInputElement;
+    const summaryInput = screen.getByLabelText('settings.compact_hijack_handoff_summary_limit') as HTMLInputElement;
+    const maxCharsInput = screen.getByLabelText('settings.compact_hijack_handoff_max_chars') as HTMLInputElement;
+    expect(textInput.value).toBe('30');
+    expect(summaryInput.value).toBe('');
+    await waitFor(() => {
+      expect(summaryInput.getAttribute('placeholder')).toBe('12');
+      expect(maxCharsInput.getAttribute('placeholder')).toBe('96000');
+    });
+
+    // Clear text override to blank (inherit) and set summary to explicit 0
+    fireEvent.input(textInput, { target: { value: '' } });
+    fireEvent.input(summaryInput, { target: { value: '0' } });
+    fireEvent.click(screen.getByText('common.save'));
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+        transportConfig: { uiLocale: 'en', handoffSummaryLimit: 0 },
+      });
+    });
+
+    // Switching to another session resets the advanced section back to collapsed
+    rerender(
+      <SessionSettingsDialog
+        surface="session"
+        serverId="srv-1"
+        sessionName="deck_proj_other"
+        label="Other"
+        description=""
+        cwd="/tmp/proj"
+        type="claude-code-sdk"
+        canConfigureCompactHijack={true}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('session-handoff-limits-toggle').getAttribute('aria-expanded')).toBe('false');
+    });
+    expect(screen.queryByLabelText('settings.compact_hijack_handoff_text_limit')).toBeNull();
   });
 });

@@ -308,6 +308,7 @@ import {
 import {
   COMPACT_HIJACK_GLOBAL_PREF_KEY,
   COMPACT_HIJACK_MSG,
+  normalizeCompactHijackGlobalConfig,
   parseCompactHijackGlobalConfigJson,
   type CompactHijackGlobalConfig,
 } from '../../../shared/compact-hijack.js';
@@ -5822,9 +5823,10 @@ export class WsBridge {
   }
 
   private sendCompactHijackConfigApply(config: CompactHijackGlobalConfig): void {
+    const normalized = normalizeCompactHijackGlobalConfig(config);
     this.sendToDaemon(JSON.stringify({
       type: COMPACT_HIJACK_MSG.APPLY,
-      enabled: config.enabled === true,
+      ...normalized,
     }));
   }
 
@@ -5832,7 +5834,7 @@ export class WsBridge {
     userId: string,
     config: CompactHijackGlobalConfig,
   ): Promise<void> {
-    const normalized: CompactHijackGlobalConfig = { enabled: config.enabled === true };
+    const normalized = normalizeCompactHijackGlobalConfig(config);
     const entries = [...WsBridge.instances.values()];
     await Promise.all(entries.map(async (bridge) => {
       if (!bridge.authenticated || !bridge.daemonWs) return;

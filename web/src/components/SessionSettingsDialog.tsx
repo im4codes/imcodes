@@ -6,7 +6,7 @@ import { AUDIT_SEVERITY_LEVELS, normalizeAuditBlockingSeverities, type AuditSeve
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import { patchSession, patchSubSession } from '../api.js';
+import { getUserPref, patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { readCachedTransportModels, supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
@@ -34,12 +34,24 @@ import {
 } from '@shared/supervision-config.js';
 import { TaskPairSettingsSection } from './TaskPairSettingsSection.js';
 import {
+  COMPACT_HIJACK_GLOBAL_PREF_KEY,
+  COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS,
   COMPACT_HIJACK_MODE,
   COMPACT_HIJACK_MODES,
   buildTransportConfigWithCompactHijack,
   extractSessionCompactHijackMode,
+  extractSessionHandoffLimits,
+  normalizeCompactHijackGlobalConfig,
+  resolveEffectiveHandoffLimits,
+  type CompactHijackGlobalConfig,
   type CompactHijackMode,
 } from '@shared/compact-hijack.js';
+import {
+  HandoffLimitsFields,
+  formatHandoffLimitDrafts,
+  parseHandoffLimitDrafts,
+  type HandoffLimitDrafts,
+} from './HandoffLimitsFields.js';
 import {
   buildSupervisionExecutionCapabilityId,
   isExcludedDevelopmentModel,
@@ -561,7 +573,19 @@ export function SessionSettingsDialog({
     () => extractSessionCompactHijackMode(transportConfig ?? null),
     [transportConfig],
   );
+  const initialHandoffLimits = useMemo(
+    () => extractSessionHandoffLimits(transportConfig ?? null),
+    [transportConfig],
+  );
+  const initialHandoffDrafts = useMemo(
+    () => formatHandoffLimitDrafts(initialHandoffLimits, false),
+    [initialHandoffLimits],
+  );
   const [compactHijackMode, setCompactHijackMode] = useState<CompactHijackMode>(initialCompactHijackMode);
+  const [handoffLimitDrafts, setHandoffLimitDrafts] = useState<HandoffLimitDrafts>(initialHandoffDrafts);
+  const [handoffLimitsExpanded, setHandoffLimitsExpanded] = useState(false);
+  const [globalCompactHijackConfig, setGlobalCompactHijackConfig] = useState<CompactHijackGlobalConfig | null>(null);
+  const globalCompactHijackLoadedRef = useRef(false);
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const agentTypeMountedRef = useRef(false);
   const providerModelManuallySelectedRef = useRef(false);
@@ -577,8 +601,22 @@ export function SessionSettingsDialog({
     setDescription(initDesc);
     setAgentType(type);
     setCompactHijackMode(initialCompactHijackMode);
+    setHandoffLimitDrafts(initialHandoffDrafts);
+    setHandoffLimitsExpanded(false);
     setSupervision(initialSupervision);
-  }, [initLabel, initDesc, initCwd, type, initialCompactHijackMode, initialSupervision, serverId, sessionName, subSessionId]);
+  }, [initLabel, initDesc, initCwd, type, initialCompactHijackMode, initialHandoffDrafts, initialSupervision, serverId, sessionName, subSessionId]);
+
+  useEffect(() => {
+    if (!canConfigureCompactHijack || !handoffLimitsExpanded || globalCompactHijackLoadedRef.current) return;
+    globalCompactHijackLoadedRef.current = true;
+    if (typeof getUserPref !== 'function') return;
+    let cancelled = false;
+    void getUserPref(COMPACT_HIJACK_GLOBAL_PREF_KEY).then((res) => {
+      if (cancelled || res == null) return;
+      setGlobalCompactHijackConfig(normalizeCompactHijackGlobalConfig(res));
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [canConfigureCompactHijack, handoffLimitsExpanded]);
 
   useEffect(() => {
     const observedModel = activeModel?.trim() || modelDisplay?.trim() || requestedModel?.trim() || '';
@@ -831,40 +869,73 @@ export function SessionSettingsDialog({
     };
   }, [authoritativeSupervisorDefaults, supervisorDefaultsExecutionPools]);
 
+  const parsedHandoffLimits = useMemo(
+    () => parseHandoffLimitDrafts(handoffLimitDrafts, { allowBlank: true }),
+    [handoffLimitDrafts],
+  );
+  const handoffLimitsChanged = useMemo(
+    () => canConfigureCompactHijack && COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS.some(
+      (field) => (parsedHandoffLimits.values[field] ?? undefined) !== initialHandoffLimits[field],
+    ),
+    [canConfigureCompactHijack, initialHandoffLimits, parsedHandoffLimits],
+  );
+  const globalHandoffPlaceholders = useMemo(() => {
+    const resolved = resolveEffectiveHandoffLimits(null, globalCompactHijackConfig);
+    return {
+      handoffTextLimit: resolved.recentTurns,
+      handoffSummaryLimit: resolved.summaryLimit,
+      handoffMaxChars: resolved.maxChars,
+    };
+  }, [globalCompactHijackConfig]);
+
   const nextTransportConfig = useMemo(() => {
-    if (!canControlAutomaticSupervision) return transportConfig ?? null;
-    // Strip legacy manual-auditor target fields while transparently preserving
-    // hidden legacy snapshot fields (mode, pairEngine, runtime, limits, etc.).
-    const {
-      auditTargetSessionName: _legacyTarget,
-      auditTargetFingerprint: _legacyFingerprint,
-      peerAuditPromptVersion: _legacyPeerPrompt,
-      auditMode: _legacyAuditMode,
-      ...preservedSupervision
-    } = supervision;
-    // Never replace persisted session pools with an unhydrated fallback while
-    // account defaults are still pending or failed and the user hasn't edited pools.
-    const resolvedSessionExecutionPools = (activeEditedExecutionPools !== null || authoritativeSupervisorDefaults !== null)
-      ? supervisorDefaultsExecutionPools
-      : preservedSupervision.executionPools;
-    return buildTransportConfigWithSupervision(transportConfig, {
-      ...preservedSupervision,
-      ...(resolvedSessionExecutionPools ? { executionPools: resolvedSessionExecutionPools } : {}),
-      ...(supervision.auditBlockingSeverities !== undefined
-        ? { auditBlockingSeverities: supervision.auditBlockingSeverities }
-        : {}),
-      // Marker-driven task-pair settings live on the project Brain only.
-      ...(isMainSession
-        ? pairSettingsOf(supervision)
-        : { pairEngine: undefined, pairMaxConcurrency: undefined }),
-    });
+    let base: Record<string, unknown> | null = transportConfig ?? null;
+    if (canControlAutomaticSupervision) {
+      // Strip legacy manual-auditor target fields while transparently preserving
+      // hidden legacy snapshot fields (mode, pairEngine, runtime, limits, etc.).
+      const {
+        auditTargetSessionName: _legacyTarget,
+        auditTargetFingerprint: _legacyFingerprint,
+        peerAuditPromptVersion: _legacyPeerPrompt,
+        auditMode: _legacyAuditMode,
+        ...preservedSupervision
+      } = supervision;
+      // Never replace persisted session pools with an unhydrated fallback while
+      // account defaults are still pending or failed and the user hasn't edited pools.
+      const resolvedSessionExecutionPools = (activeEditedExecutionPools !== null || authoritativeSupervisorDefaults !== null)
+        ? supervisorDefaultsExecutionPools
+        : preservedSupervision.executionPools;
+      base = buildTransportConfigWithSupervision(transportConfig, {
+        ...preservedSupervision,
+        ...(resolvedSessionExecutionPools ? { executionPools: resolvedSessionExecutionPools } : {}),
+        ...(supervision.auditBlockingSeverities !== undefined
+          ? { auditBlockingSeverities: supervision.auditBlockingSeverities }
+          : {}),
+        // Marker-driven task-pair settings live on the project Brain only.
+        ...(isMainSession
+          ? pairSettingsOf(supervision)
+          : { pairEngine: undefined, pairMaxConcurrency: undefined }),
+      });
+    }
+    if (surface !== 'supervision' && canConfigureCompactHijack) {
+      return buildTransportConfigWithCompactHijack(
+        base,
+        compactHijackMode,
+        parsedHandoffLimits.valid ? parsedHandoffLimits.values : undefined,
+      ) ?? null;
+    }
+    return base;
   }, [
     activeEditedExecutionPools,
     authoritativeSupervisorDefaults,
+    canConfigureCompactHijack,
     canControlAutomaticSupervision,
+    compactHijackMode,
     isMainSession,
+    parsedHandoffLimits,
     supervision,
     supervisorDefaultsExecutionPools,
+    surface,
     transportConfig,
   ]);
 
@@ -873,7 +944,7 @@ export function SessionSettingsDialog({
       label !== initLabel
       || description !== initDesc
       || agentType !== type
-      || (canConfigureCompactHijack && compactHijackMode !== initialCompactHijackMode)
+      || (canConfigureCompactHijack && (compactHijackMode !== initialCompactHijackMode || handoffLimitsChanged))
     ))
     || (surface !== 'session'
       && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null))
@@ -882,6 +953,7 @@ export function SessionSettingsDialog({
     canConfigureCompactHijack,
     compactHijackMode,
     description,
+    handoffLimitsChanged,
     initDesc,
     initLabel,
     initialCompactHijackMode,
@@ -977,8 +1049,21 @@ export function SessionSettingsDialog({
       if (surface !== 'session' && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)) {
         fields.transportConfig = nextTransportConfig;
         savedTransportConfig = nextTransportConfig;
-      } else if (surface === 'session' && canConfigureCompactHijack && compactHijackMode !== initialCompactHijackMode) {
-        const nextSessionConfig = buildTransportConfigWithCompactHijack(transportConfig, compactHijackMode) ?? null;
+      } else if (
+        surface === 'session'
+        && canConfigureCompactHijack
+        && (compactHijackMode !== initialCompactHijackMode || handoffLimitsChanged)
+      ) {
+        if (!parsedHandoffLimits.valid) {
+          setError(t('settings.compact_hijack_handoff_invalid'));
+          setSaving(false);
+          return;
+        }
+        const nextSessionConfig = buildTransportConfigWithCompactHijack(
+          transportConfig,
+          compactHijackMode,
+          parsedHandoffLimits.values,
+        ) ?? null;
         fields.transportConfig = nextSessionConfig;
         savedTransportConfig = nextSessionConfig;
       }
@@ -1302,6 +1387,44 @@ export function SessionSettingsDialog({
               <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>
                 {t('session.compactHijack.hint')}
               </div>
+              <button
+                type="button"
+                aria-expanded={handoffLimitsExpanded}
+                data-testid="session-handoff-limits-toggle"
+                onClick={() => setHandoffLimitsExpanded((prev) => !prev)}
+                style={{
+                  marginTop: '6px',
+                  padding: '2px 0',
+                  background: 'transparent',
+                  border: 'none',
+                  color: '#cbd5e1',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                }}
+              >
+                <span>{handoffLimitsExpanded ? '▾' : '▸'} {t('session.compactHijack.handoffLimitsToggle')}</span>
+              </button>
+              {handoffLimitsExpanded && (
+                <>
+                  <HandoffLimitsFields
+                    idPrefix="session-handoff"
+                    compact
+                    drafts={handoffLimitDrafts}
+                    placeholders={globalHandoffPlaceholders}
+                    onChange={(field, value) => {
+                      setHandoffLimitDrafts((prev) => ({ ...prev, [field]: value }));
+                    }}
+                  />
+                  {!parsedHandoffLimits.valid && (
+                    <div class="session-settings-error" role="alert" style={{ marginTop: '6px' }}>
+                      {t('settings.compact_hijack_handoff_invalid')}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           )}
 
@@ -1329,7 +1452,7 @@ export function SessionSettingsDialog({
 
         <div class="dialog-footer session-settings-footer">
           <button type="button" class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
-          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || (surface !== 'session' && (!supervisionValid || !globalDefaultsValid || globalDefaultsSaveBlocked))}>
+          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || (canConfigureCompactHijack && !parsedHandoffLimits.valid) || (surface !== 'session' && (!supervisionValid || !globalDefaultsValid || globalDefaultsSaveBlocked))}>
             {saving ? t('common.loading') : t('common.save')}
           </button>
         </div>

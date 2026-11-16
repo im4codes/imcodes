@@ -47,9 +47,17 @@ import {
 import { usePref } from '../hooks/usePref.js';
 import {
   COMPACT_HIJACK_GLOBAL_PREF_KEY,
+  COMPACT_HIJACK_HANDOFF_LIMIT_BOUNDS,
+  COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS,
   normalizeCompactHijackGlobalConfig,
   type CompactHijackGlobalConfig,
 } from '@shared/compact-hijack.js';
+import {
+  HandoffLimitsFields,
+  formatHandoffLimitDrafts,
+  parseHandoffLimitDrafts,
+  type HandoffLimitDrafts,
+} from '../components/HandoffLimitsFields.js';
 
 interface PushServerItem {
   id: string;
@@ -123,14 +131,80 @@ export function SettingsPage({
     serialize: (val) => val,
   });
   const compactHijackEnabled = compactHijackPref.value?.enabled ?? false;
+  const persistedHandoffLimitsKey = [
+    compactHijackPref.value?.handoffTextLimit ?? '',
+    compactHijackPref.value?.handoffSummaryLimit ?? '',
+    compactHijackPref.value?.handoffMaxChars ?? '',
+  ].join(':');
+  const [handoffLimitDrafts, setHandoffLimitDrafts] = useState<HandoffLimitDrafts>(() =>
+    formatHandoffLimitDrafts(compactHijackPref.value, true),
+  );
+  useEffect(() => {
+    setHandoffLimitDrafts(formatHandoffLimitDrafts(compactHijackPref.value, true));
+  }, [persistedHandoffLimitsKey]);
   const [compactHijackSaving, setCompactHijackSaving] = useState(false);
   const [compactHijackError, setCompactHijackError] = useState<string | null>(null);
+
+  const hasCustomGlobalHandoffLimits = COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS.some(
+    (field) => compactHijackPref.value?.[field] !== undefined,
+  );
+  const parsedGlobalHandoffLimits = parseHandoffLimitDrafts(handoffLimitDrafts, { allowBlank: false });
+  const persistedGlobalDrafts = formatHandoffLimitDrafts(compactHijackPref.value, true);
+  const handoffLimitsDirty = COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS.some(
+    (field) => handoffLimitDrafts[field].trim() !== persistedGlobalDrafts[field],
+  );
+  const handoffLimitsDifferFromDefaults = COMPACT_HIJACK_HANDOFF_LIMIT_FIELDS.some(
+    (field) => handoffLimitDrafts[field].trim() !== String(COMPACT_HIJACK_HANDOFF_LIMIT_BOUNDS[field].defaultValue),
+  );
+
+  const buildGlobalCompactHijackPayload = (enabled: boolean, includeCurrentLimits: boolean): CompactHijackGlobalConfig => {
+    if (!includeCurrentLimits) return { enabled };
+    return normalizeCompactHijackGlobalConfig({
+      ...(compactHijackPref.value ?? {}),
+      enabled,
+    });
+  };
 
   const handleToggleCompactHijack = async () => {
     setCompactHijackSaving(true);
     setCompactHijackError(null);
     try {
-      await compactHijackPref.save({ enabled: !compactHijackEnabled });
+      await compactHijackPref.save(buildGlobalCompactHijackPayload(!compactHijackEnabled, hasCustomGlobalHandoffLimits));
+    } catch (err) {
+      setCompactHijackError(err instanceof Error ? err.message : t('common.error'));
+    } finally {
+      if (mountedRef.current) setCompactHijackSaving(false);
+    }
+  };
+
+  const handleSaveGlobalHandoffLimits = async () => {
+    if (!parsedGlobalHandoffLimits.valid) {
+      setCompactHijackError(t('settings.compact_hijack_handoff_invalid'));
+      return;
+    }
+    setCompactHijackSaving(true);
+    setCompactHijackError(null);
+    try {
+      await compactHijackPref.save(
+        normalizeCompactHijackGlobalConfig({
+          enabled: compactHijackEnabled,
+          ...parsedGlobalHandoffLimits.values,
+        }),
+      );
+    } catch (err) {
+      setCompactHijackError(err instanceof Error ? err.message : t('common.error'));
+    } finally {
+      if (mountedRef.current) setCompactHijackSaving(false);
+    }
+  };
+
+  const handleResetGlobalHandoffLimits = async () => {
+    setHandoffLimitDrafts(formatHandoffLimitDrafts(null, true));
+    setCompactHijackError(null);
+    if (!hasCustomGlobalHandoffLimits) return;
+    setCompactHijackSaving(true);
+    try {
+      await compactHijackPref.save({ enabled: compactHijackEnabled });
     } catch (err) {
       setCompactHijackError(err instanceof Error ? err.message : t('common.error'));
     } finally {
@@ -715,9 +789,44 @@ export function SettingsPage({
                     <div style={checkboxDescStyle}>{t('settings.compact_hijack_desc')}</div>
                   </div>
                 </label>
-                {compactHijackError && (
+                <HandoffLimitsFields
+                  idPrefix="global-handoff"
+                  drafts={handoffLimitDrafts}
+                  disabled={compactHijackSaving}
+                  onChange={(field, value) => {
+                    setHandoffLimitDrafts((prev) => ({ ...prev, [field]: value }));
+                    if (compactHijackError) setCompactHijackError(null);
+                  }}
+                />
+                {(handoffLimitsDirty || hasCustomGlobalHandoffLimits || handoffLimitsDifferFromDefaults) && (
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '8px' }}>
+                    {handoffLimitsDirty && (
+                      <button
+                        type="button"
+                        class="btn btn-primary"
+                        disabled={compactHijackSaving || !parsedGlobalHandoffLimits.valid}
+                        onClick={() => { void handleSaveGlobalHandoffLimits(); }}
+                        style={{ padding: '4px 10px', fontSize: '12px' }}
+                      >
+                        {t('common.save')}
+                      </button>
+                    )}
+                    {(hasCustomGlobalHandoffLimits || handoffLimitsDifferFromDefaults) && (
+                      <button
+                        type="button"
+                        class="btn btn-secondary"
+                        disabled={compactHijackSaving}
+                        onClick={() => { void handleResetGlobalHandoffLimits(); }}
+                        style={{ padding: '4px 10px', fontSize: '12px' }}
+                      >
+                        {t('settings.compact_hijack_handoff_reset')}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {(!parsedGlobalHandoffLimits.valid || compactHijackError) && (
                   <div style={{ color: '#f87171', fontSize: '12px', marginTop: '8px' }}>
-                    {compactHijackError}
+                    {!parsedGlobalHandoffLimits.valid ? t('settings.compact_hijack_handoff_invalid') : compactHijackError}
                   </div>
                 )}
               </div>

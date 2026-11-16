@@ -1112,7 +1112,8 @@
       "hint": "Override your account default when non-manual compaction is detected in this owned session.",
       "inherit": "Inherit global default",
       "on": "On (hijack compaction)",
-      "off": "Off (native compaction)"
+      "off": "Off (native compaction)",
+      "handoffLimitsToggle": "Handoff context limits (blank = inherit global)"
     }
   },
   "server": {
@@ -2376,7 +2377,12 @@
     },
     "compact_hijack_title": "Compact Hijack (/handoff)",
     "compact_hijack_toggle_label": "Automatically hijack context compaction via /handoff",
-    "compact_hijack_desc": "Default for all sessions on your owned daemons. When automatic context compaction begins, opens a fresh conversation with a bounded handoff pack and continues execution. Manual /compact is unaffected."
+    "compact_hijack_desc": "Default for all sessions on your owned daemons. When automatic context compaction begins, opens a fresh conversation with a bounded handoff pack and continues execution. Manual /compact is unaffected.",
+    "compact_hijack_handoff_text_limit": "Handoff text turns",
+    "compact_hijack_handoff_summary_limit": "Handoff summaries",
+    "compact_hijack_handoff_max_chars": "Handoff max chars",
+    "compact_hijack_handoff_reset": "Reset defaults",
+    "compact_hijack_handoff_invalid": "Text turns: 0–200, summaries: 0–200, max chars: 500–500000."
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

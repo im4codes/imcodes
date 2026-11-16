@@ -404,4 +404,86 @@ describe('Compact Hijack server routes & owner-only WS daemon push', () => {
     expect(ownerSnapBody.sessions[0].transport_config).toEqual({ compactHijack: 'on', uiLocale: 'zh-CN' });
     expect(ownerSnapBody.subSessions[0].transport_config).toEqual({ compactHijack: 'off', uiLocale: 'en' });
   });
+
+  it('validates, pushes, and share-sanitizes global & session Handoff limit overrides', async () => {
+    const ownedFullBridge = WsBridge.get('srv-handoff-full');
+    const ownedFullWs = new MockWs();
+    const db = {
+      ...mockDb,
+      queryOne: async (sql: string) => {
+        if (sql.includes('FROM servers')) {
+          return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'owner-user', node_role: NODE_ROLE.FULL };
+        }
+        if (sql.includes('FROM user_preferences')) {
+          return { value: JSON.stringify({ enabled: true, handoffTextLimit: 60, handoffSummaryLimit: 8, handoffMaxChars: 90_000 }) };
+        }
+        return null;
+      },
+    } as unknown as import('../src/db/client.js').Database;
+
+    ownedFullBridge.handleDaemonConnection(ownedFullWs as never, db, {} as never);
+    ownedFullWs.emit('message', JSON.stringify({ type: 'auth', serverId: 'srv-handoff-full', token: 'tok', nodeRole: NODE_ROLE.FULL }));
+    await flush();
+    expect(ownedFullWs.sentJson().some((m) =>
+      m.type === COMPACT_HIJACK_MSG.APPLY
+      && m.enabled === true
+      && m.handoffTextLimit === 60
+      && m.handoffSummaryLimit === 8
+      && m.handoffMaxChars === 90_000,
+    )).toBe(true);
+
+    ownedFullWs.sent.length = 0;
+    const app = buildApp();
+    const putOk = await app.request(`/api/preferences/${COMPACT_HIJACK_GLOBAL_PREF_KEY}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: { enabled: true, handoffTextLimit: 0, handoffSummaryLimit: 12, handoffMaxChars: 200_000 } }),
+    });
+    expect(putOk.status).toBe(200);
+    expect(ownedFullWs.sentJson().some((m) =>
+      m.type === COMPACT_HIJACK_MSG.APPLY
+      && m.handoffTextLimit === 0
+      && m.handoffSummaryLimit === 12
+      && m.handoffMaxChars === 200_000,
+    )).toBe(true);
+
+    const putBad = await app.request(`/api/preferences/${COMPACT_HIJACK_GLOBAL_PREF_KEY}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: { enabled: true, handoffMaxChars: 100 } }),
+    });
+    expect(putBad.status).toBe(400);
+
+    // Session PATCH rejects invalid Handoff limits
+    const badPatch = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transportConfig: { handoffTextLimit: 201 } }),
+    });
+    expect(badPatch.status).toBe(400);
+
+    // Share responses strip handoff limit fields while owner keeps them
+    mockGetDbSessionsByServer.mockResolvedValue([{
+      id: 'sess-1',
+      name: 'deck_proj_brain',
+      role: 'brain',
+      transport_config: JSON.stringify({
+        compactHijack: 'on',
+        handoffTextLimit: 50,
+        handoffSummaryLimit: 5,
+        handoffMaxChars: 40_000,
+        uiLocale: 'en',
+      }),
+    }] as never);
+    mockResolveHttpShareAccess.mockResolvedValue({
+      ok: true,
+      allowed: true,
+      shareProvenance: 'server',
+      actor: { kind: 'share', role: 'participant', shareId: 'sh-1', grantKind: 'server', userId: 'guest-user' },
+    });
+    const shareRes = await app.request('/api/server/srv-1/sessions');
+    expect(shareRes.status).toBe(200);
+    const shareBody = await shareRes.json() as { sessions: Array<{ transport_config?: string | null }> };
+    expect(JSON.parse(shareBody.sessions[0].transport_config ?? '{}')).toEqual({ uiLocale: 'en' });
+  });
 });

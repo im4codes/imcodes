@@ -79,6 +79,7 @@ import {
   triggerCompactHijackForSession,
 } from '../../src/daemon/command-handler.js';
 import {
+  getPersistedCompactHijackGlobalConfig,
   isGlobalCompactHijackEnabled,
   resetCompactHijackConfigStoreForTests,
 } from '../../src/store/compact-hijack-config-store.js';
@@ -134,6 +135,21 @@ describe('daemon command-handler compact hijack integration', () => {
       enabled: true,
     }, serverLink as never);
     expect(isGlobalCompactHijackEnabled()).toBe(true);
+    expect(getPersistedCompactHijackGlobalConfig()).toEqual({ enabled: true });
+
+    handleWebCommand({
+      type: COMPACT_HIJACK_MSG.APPLY,
+      enabled: true,
+      handoffTextLimit: 45,
+      handoffSummaryLimit: 8,
+      handoffMaxChars: 64_000,
+    }, serverLink as never);
+    expect(getPersistedCompactHijackGlobalConfig()).toEqual({
+      enabled: true,
+      handoffTextLimit: 45,
+      handoffSummaryLimit: 8,
+      handoffMaxChars: 64_000,
+    });
   });
 
   it('blocks sharedActor transportConfig changes to compactHijack while preserving owner setting', async () => {
@@ -143,20 +159,32 @@ describe('daemon command-handler compact hijack integration', () => {
       role: 'brain',
       agentType: 'claude-code-sdk',
       runtimeType: 'transport',
-      transportConfig: { compactHijack: 'on', uiLocale: 'zh-CN' },
+      transportConfig: {
+        compactHijack: 'on',
+        handoffTextLimit: 55,
+        handoffSummaryLimit: 5,
+        handoffMaxChars: 50_000,
+        uiLocale: 'zh-CN',
+      },
     });
 
-    // Shared caller attempting to change compactHijack directly is ignored
+    // Shared caller attempting to change compactHijack or Handoff limits directly is ignored
     handleWebCommand({
       type: 'session.update_transport_config',
       sessionName: 'deck_proj_brain',
       transportConfig: { compactHijack: 'off' },
       sharedActor: { shareId: 'sh-1' },
     }, serverLink as never);
+    handleWebCommand({
+      type: 'session.update_transport_config',
+      sessionName: 'deck_proj_brain',
+      transportConfig: { handoffTextLimit: 10 },
+      sharedActor: { shareId: 'sh-1' },
+    }, serverLink as never);
     await flush();
     expect(upsertSessionMock).not.toHaveBeenCalled();
 
-    // Shared caller changing uiLocale preserves owner compactHijack: 'on'
+    // Shared caller changing uiLocale preserves owner compactHijack & Handoff limits
     handleWebCommand({
       type: 'session.update_transport_config',
       sessionName: 'deck_proj_brain',
@@ -166,7 +194,13 @@ describe('daemon command-handler compact hijack integration', () => {
     await flush();
     expect(upsertSessionMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        transportConfig: { uiLocale: 'en', compactHijack: 'on' },
+        transportConfig: {
+          uiLocale: 'en',
+          compactHijack: 'on',
+          handoffTextLimit: 55,
+          handoffSummaryLimit: 5,
+          handoffMaxChars: 50_000,
+        },
       }),
     );
   });

@@ -10,6 +10,7 @@ import {
 } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff, sourceConversationKey } from '../../src/daemon/cross-vendor-handoff.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import * as sessionHistory from '../../src/daemon/session-history.js';
 import * as tokenizer from '../../src/context/tokenizer.js';
 
 vi.mock('../../src/context/tokenizer.js', async (importOriginal) => {
@@ -49,18 +50,40 @@ describe('cross-vendor handoff contract', () => {
       enabled: true,
       maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens,
       recentTurns: CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns,
+      summaryLimit: CROSS_VENDOR_HANDOFF_DEFAULTS.summaryLimit,
+      maxChars: CROSS_VENDOR_HANDOFF_DEFAULTS.maxChars,
       timeoutMs: CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs,
       providerWaitMs: CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs,
       includeToolPreviews: false,
     });
-    expect(normalizeCrossVendorHandoffConfig({ maxTokens: 99_999, recentTurns: 0, timeoutMs: 1 })).toMatchObject({
+    expect(normalizeCrossVendorHandoffConfig({
+      maxTokens: 99_999,
+      recentTurns: 0,
+      summaryLimit: -5,
+      maxChars: 10,
+      timeoutMs: 1,
+    })).toMatchObject({
       maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens,
-      recentTurns: 1,
+      recentTurns: 0,
+      summaryLimit: 0,
+      maxChars: 500,
       timeoutMs: 250,
     });
     expect(normalizeCrossVendorHandoffConfig().maxTokens).toBe(50_000);
     expect(normalizeCrossVendorHandoffConfig().recentTurns).toBe(100);
-    expect(normalizeCrossVendorHandoffConfig({ maxTokens: 50_001, recentTurns: 999 })).toMatchObject({ maxTokens: 50_000, recentTurns: 100 });
+    expect(normalizeCrossVendorHandoffConfig().summaryLimit).toBe(20);
+    expect(normalizeCrossVendorHandoffConfig().maxChars).toBe(128_000);
+    expect(normalizeCrossVendorHandoffConfig({
+      maxTokens: 50_001,
+      recentTurns: 999,
+      summaryLimit: 999,
+      maxChars: 999_999,
+    })).toMatchObject({
+      maxTokens: 50_000,
+      recentTurns: 200,
+      summaryLimit: 200,
+      maxChars: 500_000,
+    });
   });
 
   it('triggers only for a non-fresh family or runtime-kind switch unless forced for /handoff', () => {
@@ -294,5 +317,79 @@ describe('reported lost provider-switch context counterexamples', () => {
       vi.unstubAllEnvs();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('reads session summaries, supports recentTurns=0, degrades gracefully on summary error, and enforces maxChars accurately', async () => {
+    const nsRecord = {
+      ...record('claude-code-sdk'),
+      contextNamespace: { scope: 'project', projectId: 'proj-1', userId: 'u1' },
+    } as never;
+
+    // 1. Includes summaries + text messages, newest preserved under maxChars trim
+    const readTextSpy = vi.spyOn(sessionHistory, 'readSessionTextMessages').mockResolvedValue([
+      { eventId: 'e1', role: 'user', text: `OLD_TURN_1 ${'历史第一轮文本内容。'.repeat(45)}`, ts: 1, truncated: false },
+      { eventId: 'e2', role: 'assistant', text: `NEW_TURN_2 ${'最新第二轮文本内容。'.repeat(45)}`, ts: 2, truncated: false },
+    ]);
+    const readSumSpy = vi.spyOn(sessionHistory, 'readSessionSummaries').mockResolvedValue([
+      { id: 'sum-new', summary: 'NEWEST_SUMMARY_B', updatedAt: 20, truncated: false, sourceLookup: { kind: 'projection', projectionId: 'sum-new' } },
+      { id: 'sum-old', summary: `OLDEST_SUMMARY_A ${'旧摘要补充内容。'.repeat(45)}`, updatedAt: 10, truncated: false, sourceLookup: { kind: 'projection', projectionId: 'sum-old' } },
+    ]);
+
+    const pack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 2, ts: 2 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 50, summaryLimit: 10, maxChars: 900 },
+    );
+    expect(pack).toBeDefined();
+    expect(readTextSpy).toHaveBeenCalledWith('handoff-test', 50, { epoch: 1, seq: 2, ts: 2 }, true, { excludeDaemonNotices: true, maxChars: 900 });
+    expect(readSumSpy).toHaveBeenCalledWith('handoff-test', { scope: 'project', projectId: 'proj-1', userId: 'u1' }, 10, true, 900);
+    expect(pack!.text.length).toBeLessThanOrEqual(900);
+    expect(pack!.text).toContain('NEW_TURN_2');
+    expect(pack!.text).toContain('NEWEST_SUMMARY_B');
+    expect(pack!.text).not.toContain('OLD_TURN_1');
+
+    // 2. recentTurns=0 skips readSessionTextMessages and builds pack from summaries alone
+    readTextSpy.mockClear();
+    const sumOnlyPack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 2, ts: 2 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 0, summaryLimit: 5, maxChars: 5000 },
+    );
+    expect(readTextSpy).not.toHaveBeenCalled();
+    expect(sumOnlyPack).toBeDefined();
+    expect(sumOnlyPack!.text).toContain('NEWEST_SUMMARY_B');
+
+    // 3. Summary store failure degrades gracefully to text-only pack
+    readSumSpy.mockRejectedValueOnce(new Error('summary worker offline'));
+    const fallbackPack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 2, ts: 2 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 10, summaryLimit: 5, maxChars: 5000 },
+    );
+    expect(fallbackPack).toBeDefined();
+    expect(fallbackPack!.text).toContain('NEW_TURN_2');
+
+    // 4. Large CJK payload under maxChars=80000 is not prematurely truncated by legacy 50k token constant when maxTokens omitted
+    const bigCjkText = `重要中文上下文${'汉字内容测试。'.repeat(9000)}`; // ~63,006 chars (~63k+ tokens > 50k!)
+    readTextSpy.mockResolvedValueOnce([
+      { eventId: 'e-cjk', role: 'user', text: bigCjkText, ts: 3, truncated: false },
+    ]);
+    readSumSpy.mockResolvedValueOnce([]);
+    const cjkPack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 3, ts: 3 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 100, summaryLimit: 0, maxChars: 80_000 },
+    );
+    expect(cjkPack).toBeDefined();
+    expect(cjkPack!.text.length).toBeGreaterThan(55_000);
+    expect(cjkPack!.text.length).toBeLessThanOrEqual(80_000);
   });
 });

@@ -10,6 +10,7 @@ import {
   buildTransportConfigWithCompactHijack,
   encodeCompactHijackGlobalConfigJson,
   extractSessionCompactHijackMode,
+  extractSessionHandoffLimits,
   hasCompactHijackField,
   hasInvalidCompactHijackSetting,
   isValidCompactHijackGlobalPrefPayload,
@@ -17,6 +18,8 @@ import {
   normalizeCompactHijackMode,
   parseCompactHijackGlobalConfigJson,
   resolveCompactHijackEnabled,
+  resolveEffectiveHandoffLimits,
+  sanitizeShareTransportConfigRow,
   stripCompactHijackFromTransportConfig,
 } from '../shared/compact-hijack.js';
 import {
@@ -78,6 +81,75 @@ describe('shared compact hijack contract', () => {
     expect(stripCompactHijackFromTransportConfig({ compactHijack: 'off', a: 1 })).toEqual({ a: 1 });
     expect(stripCompactHijackFromTransportConfig({ compactHijack: 'off' })).toBeNull();
   });
+
+  it('validates, normalizes, resolves precedence, and sanitizes Handoff limits', () => {
+    expect(isValidCompactHijackGlobalPrefPayload({
+      enabled: true,
+      handoffTextLimit: 0,
+      handoffSummaryLimit: 200,
+      handoffMaxChars: 500_000,
+    })).toBe(true);
+    expect(isValidCompactHijackGlobalPrefPayload({ enabled: true, handoffTextLimit: -1 })).toBe(false);
+    expect(isValidCompactHijackGlobalPrefPayload({ enabled: true, handoffTextLimit: 201 })).toBe(false);
+    expect(isValidCompactHijackGlobalPrefPayload({ enabled: true, handoffSummaryLimit: 1.5 })).toBe(false);
+    expect(isValidCompactHijackGlobalPrefPayload({ enabled: true, handoffMaxChars: 499 })).toBe(false);
+    expect(isValidCompactHijackGlobalPrefPayload({ enabled: true, handoffMaxChars: 500_001 })).toBe(false);
+
+    expect(resolveEffectiveHandoffLimits(null, null)).toEqual({
+      recentTurns: 100,
+      summaryLimit: 20,
+      maxChars: 128_000,
+    });
+    expect(resolveEffectiveHandoffLimits(
+      { handoffTextLimit: 0, handoffMaxChars: 64_000 },
+      { enabled: true, handoffTextLimit: 80, handoffSummaryLimit: 15, handoffMaxChars: 200_000 },
+    )).toEqual({
+      recentTurns: 0,
+      summaryLimit: 15,
+      maxChars: 64_000,
+    });
+
+    expect(hasCompactHijackField({ handoffTextLimit: 10 })).toBe(true);
+    expect(hasCompactHijackField({ handoffSummaryLimit: 0 })).toBe(true);
+    expect(hasCompactHijackField({ handoffMaxChars: 500 })).toBe(true);
+    expect(hasInvalidCompactHijackSetting({ handoffTextLimit: 201 })).toBe(true);
+    expect(hasInvalidCompactHijackSetting({ handoffMaxChars: '5000' })).toBe(true);
+    expect(hasInvalidCompactHijackSetting({ handoffSummaryLimit: 0, handoffMaxChars: 500 })).toBe(false);
+
+    const built = buildTransportConfigWithCompactHijack({ uiLocale: 'en' }, 'on', {
+      handoffTextLimit: 0,
+      handoffSummaryLimit: 12,
+      handoffMaxChars: 40_000,
+    });
+    expect(built).toEqual({
+      uiLocale: 'en',
+      compactHijack: 'on',
+      handoffTextLimit: 0,
+      handoffSummaryLimit: 12,
+      handoffMaxChars: 40_000,
+    });
+    expect(extractSessionHandoffLimits(built)).toEqual({
+      handoffTextLimit: 0,
+      handoffSummaryLimit: 12,
+      handoffMaxChars: 40_000,
+    });
+
+    const clearedText = buildTransportConfigWithCompactHijack(built, 'on', { handoffTextLimit: null });
+    expect(clearedText).toEqual({
+      uiLocale: 'en',
+      compactHijack: 'on',
+      handoffSummaryLimit: 12,
+      handoffMaxChars: 40_000,
+    });
+    expect(stripCompactHijackFromTransportConfig(clearedText)).toEqual({ uiLocale: 'en' });
+    expect(sanitizeShareTransportConfigRow({
+      id: 's1',
+      transport_config: JSON.stringify(built),
+    })).toEqual({
+      id: 's1',
+      transport_config: JSON.stringify({ uiLocale: 'en' }),
+    });
+  });
 });
 
 describe('compact-hijack-config-store', () => {
@@ -103,15 +175,32 @@ describe('compact-hijack-config-store', () => {
     expect(isGlobalCompactHijackEnabled()).toBe(false);
     expect(getPersistedCompactHijackGlobalConfig()).toEqual({ enabled: false });
 
-    setPersistedCompactHijackGlobalConfig({ enabled: true });
+    setPersistedCompactHijackGlobalConfig({
+      enabled: true,
+      handoffTextLimit: 50,
+      handoffSummaryLimit: 10,
+      handoffMaxChars: 90_000,
+    });
     expect(isGlobalCompactHijackEnabled()).toBe(true);
+    expect(getPersistedCompactHijackGlobalConfig()).toEqual({
+      enabled: true,
+      handoffTextLimit: 50,
+      handoffSummaryLimit: 10,
+      handoffMaxChars: 90_000,
+    });
 
     resetCompactHijackConfigStoreForTests();
-    expect(isGlobalCompactHijackEnabled()).toBe(true);
+    expect(getPersistedCompactHijackGlobalConfig()).toEqual({
+      enabled: true,
+      handoffTextLimit: 50,
+      handoffSummaryLimit: 10,
+      handoffMaxChars: 90_000,
+    });
 
     setPersistedCompactHijackGlobalConfig({ enabled: false });
     resetCompactHijackConfigStoreForTests();
     expect(isGlobalCompactHijackEnabled()).toBe(false);
+    expect(getPersistedCompactHijackGlobalConfig()).toEqual({ enabled: false });
   });
 
   it('falls back to disabled when persisted file is corrupt JSON', () => {

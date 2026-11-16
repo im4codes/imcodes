@@ -57,6 +57,7 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
   buildTransportConfigWithCompactHijack,
   extractSessionCompactHijackMode,
+  extractSessionHandoffLimits,
   hasCompactHijackField,
   hasInvalidCompactHijackSetting,
   sanitizeShareTransportConfigRow,
@@ -759,8 +760,14 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     }
     if (access.actor.kind === 'share') {
       const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
-      const existingMode = extractSessionCompactHijackMode(parseStoredTransportConfig(current?.transport_config ?? null));
-      nextTransportConfig = buildTransportConfigWithCompactHijack(body.transportConfig ?? null, existingMode);
+      const currentConfig = parseStoredTransportConfig(current?.transport_config ?? null);
+      const existingMode = extractSessionCompactHijackMode(currentConfig);
+      const existingLimits = extractSessionHandoffLimits(currentConfig);
+      nextTransportConfig = buildTransportConfigWithCompactHijack(
+        body.transportConfig ?? null,
+        existingMode,
+        existingLimits,
+      );
     } else if (body.transportConfig != null) {
       nextTransportConfig = buildTransportConfigWithCompactHijack(
         body.transportConfig,
