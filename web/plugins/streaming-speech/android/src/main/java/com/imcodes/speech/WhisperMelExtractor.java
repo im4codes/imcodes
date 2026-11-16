@@ -261,12 +261,11 @@ public final class WhisperMelExtractor {
      */
     public final class IncrementalExtractor {
         private static final int CHUNK_SAMPLES = CHUNK_FRAMES * HOP_LENGTH; // 16,000 samples (1.0s)
-        private static final int FP_PER_CHUNK = 8;
 
         private float[] rawLogs = new float[1400 * N_MELS];
         private float[] chunkMinRaw = new float[16];
         private float[] chunkMaxRaw = new float[16];
-        private float[] chunkFp = new float[16 * FP_PER_CHUNK];
+        private long[] chunkHash = new long[16];
         private float[] paddedScratch = new float[0];
         private final float[] windowed = new float[N_FFT];
         private final float[] even = new float[HALF_FFT - 1];
@@ -323,11 +322,13 @@ public final class WhisperMelExtractor {
                 rawLogs = Arrays.copyOf(rawLogs, Math.max(neededRaw, rawLogs.length * 2));
             }
             int numChunks = (numFrames + CHUNK_FRAMES - 1) / CHUNK_FRAMES;
-            if (chunkMinRaw.length < numChunks) {
-                int newCap = Math.max(numChunks, chunkMinRaw.length * 2);
+            int completeSampleChunks = safeLen / CHUNK_SAMPLES;
+            int neededMeta = Math.max(numChunks, completeSampleChunks);
+            if (chunkMinRaw.length < neededMeta) {
+                int newCap = Math.max(neededMeta, chunkMinRaw.length * 2);
                 chunkMinRaw = Arrays.copyOf(chunkMinRaw, newCap);
                 chunkMaxRaw = Arrays.copyOf(chunkMaxRaw, newCap);
-                chunkFp = Arrays.copyOf(chunkFp, newCap * FP_PER_CHUNK);
+                chunkHash = Arrays.copyOf(chunkHash, newCap);
             }
 
             // Fill padded audio window covering frames [reuseFrames .. numFrames - 1]
@@ -392,9 +393,8 @@ public final class WhisperMelExtractor {
                 features[i] = (clamped + 4.0f) * 0.25f;
             }
 
-            int completeSampleChunks = safeLen / CHUNK_SAMPLES;
-            for (int c = 0; c < completeSampleChunks; c++) {
-                recordChunkFingerprint(audio, c);
+            for (int c = matchedPrefixChunks; c < completeSampleChunks; c++) {
+                chunkHash[c] = computeChunkHash(audio, c);
             }
             cachedSampleLen = safeLen;
             cachedStableFrames = Math.min(numFrames, Math.max(0, (safeLen - PAD_LENGTH) / HOP_LENGTH + 1));
@@ -410,31 +410,23 @@ public final class WhisperMelExtractor {
             int maxChunks = Math.min(sharedCompleteChunks, cachedCompleteChunks);
             int matched = 0;
             for (int c = 0; c < maxChunks; c++) {
-                if (!matchesChunkFingerprint(audio, c)) break;
+                if (chunkHash[c] != computeChunkHash(audio, c)) break;
                 matched++;
             }
             return matched;
         }
 
-        private void recordChunkFingerprint(float[] audio, int chunkIdx) {
-            int baseSample = chunkIdx * CHUNK_SAMPLES;
-            int fpBase = chunkIdx * FP_PER_CHUNK;
-            int step = CHUNK_SAMPLES / FP_PER_CHUNK;
-            for (int i = 0; i < FP_PER_CHUNK; i++) {
-                chunkFp[fpBase + i] = audio[baseSample + i * step + (step / 2)];
+        private long computeChunkHash(float[] audio, int chunkIdx) {
+            long h = 0xcbf29ce484222325L;
+            int start = chunkIdx * CHUNK_SAMPLES;
+            int end = start + CHUNK_SAMPLES;
+            for (int i = start; i < end; i++) {
+                float v = audio[i];
+                int bits = (v == 0.0f) ? 0 : Float.floatToRawIntBits(v);
+                h ^= (bits & 0xffffffffL);
+                h *= 0x100000001b3L;
             }
-        }
-
-        private boolean matchesChunkFingerprint(float[] audio, int chunkIdx) {
-            int baseSample = chunkIdx * CHUNK_SAMPLES;
-            int fpBase = chunkIdx * FP_PER_CHUNK;
-            int step = CHUNK_SAMPLES / FP_PER_CHUNK;
-            for (int i = 0; i < FP_PER_CHUNK; i++) {
-                if (chunkFp[fpBase + i] != audio[baseSample + i * step + (step / 2)]) {
-                    return false;
-                }
-            }
-            return true;
+            return h;
         }
     }
 }

@@ -511,23 +511,23 @@ public class OnnxTensor implements OnnxValue {
   private final ByteBuffer raw;
   private boolean closed = false;
   private OnnxTensor(TensorInfo info, ByteBuffer raw){ this.info=info; this.raw=raw; created.incrementAndGet(); }
-  public static OnnxTensor createTensor(OrtEnvironment env, FloatBuffer data, long[] shape){
+  public static OnnxTensor createTensor(OrtEnvironment env, FloatBuffer data, long[] shape) throws OrtException {
     FloatBuffer dup = data.duplicate();
     ByteBuffer bb = ByteBuffer.allocateDirect(dup.remaining()*4).order(ByteOrder.nativeOrder());
     bb.asFloatBuffer().put(dup);
     return new OnnxTensor(new TensorInfo(OnnxJavaType.FLOAT, shape), bb);
   }
-  public static OnnxTensor createTensor(OrtEnvironment env, LongBuffer data, long[] shape){
+  public static OnnxTensor createTensor(OrtEnvironment env, LongBuffer data, long[] shape) throws OrtException {
     LongBuffer dup = data.duplicate();
     ByteBuffer bb = ByteBuffer.allocateDirect(dup.remaining()*8).order(ByteOrder.nativeOrder());
     bb.asLongBuffer().put(dup);
     return new OnnxTensor(new TensorInfo(OnnxJavaType.INT64, shape), bb);
   }
-  public static OnnxTensor createTensor(OrtEnvironment env, ByteBuffer data, long[] shape, OnnxJavaType type){
+  public static OnnxTensor createTensor(OrtEnvironment env, ByteBuffer data, long[] shape, OnnxJavaType type) throws OrtException {
     ByteBuffer dup = data.duplicate().order(ByteOrder.nativeOrder());
     return new OnnxTensor(new TensorInfo(type, shape), dup);
   }
-  public static OnnxTensor createTensor(OrtEnvironment env, boolean[][] data){
+  public static OnnxTensor createTensor(OrtEnvironment env, boolean[][] data) throws OrtException {
     int rows = data.length, cols = rows > 0 ? data[0].length : 0;
     ByteBuffer bb = ByteBuffer.allocateDirect(rows * cols).order(ByteOrder.nativeOrder());
     for (boolean[] row : data) for (boolean v : row) bb.put((byte)(v ? 1 : 0));
@@ -556,6 +556,7 @@ public class OrtSession implements AutoCloseable {
   public static volatile CountDownLatch decodeRelease = new CountDownLatch(1);
   public static volatile int lastConvMelFrames = 0;
   public static volatile int maxConvMelFrames = 0;
+  public static volatile int maxDecoderAudioTokens = 0;
   public static final List<Integer> convMelFrames = Collections.synchronizedList(new ArrayList<>());
   public static final AtomicInteger closes = new AtomicInteger(0);
   public static final AtomicInteger observedNonEmptyPrefixes = new AtomicInteger(0);
@@ -564,8 +565,10 @@ public class OrtSession implements AutoCloseable {
     public enum OptLevel { ALL_OPT }
     public OptLevel optLevel;
     public int intraThreads;
+    public final Map<String, String> configEntries = new LinkedHashMap<>();
     public void setOptimizationLevel(OptLevel lvl){ this.optLevel = lvl; }
     public void setIntraOpNumThreads(int n){ int expected = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2)); if (n != expected) throw new AssertionError("expected " + expected + " threads, got "+n); this.intraThreads = n; }
+    public void addConfigEntry(String key, String value){ configEntries.put(key, value); }
     @Override public void close(){}
   }
 
@@ -620,12 +623,15 @@ public class OrtSession implements AutoCloseable {
   }
 
   private static double hzToMel(double hz){ return hz < 1000.0 ? 3.0*hz/200.0 : 15.0 + Math.log(hz/1000.0)*(27.0/Math.log(6.4)); }
-  private static int[] extractWordIdsFromMel(float[] mel, int frames){
+  private static final double[] EXPECTED_WORD_BINS = new double[14];
+  static {
     double melMax = hzToMel(8000.0);
-    double[] expectedBin = new double[14];
-    for (int id = 0; id < 14; id++) expectedBin[id] = (hzToMel(400.0 + id * 400.0) / melMax) * 129.0 - 1.0;
-    List<Integer> rawIds = new ArrayList<>();
-    for (int f = 0; f < frames; f++) {
+    for (int id = 0; id < 14; id++) EXPECTED_WORD_BINS[id] = (hzToMel(400.0 + id * 400.0) / melMax) * 129.0 - 1.0;
+  }
+  private static float extractChunkTokenTag(float[] mel, int fStart, int fEnd){
+    int[] votes = new int[14];
+    int activeFrames = 0;
+    for (int f = fStart; f < fEnd; f++) {
       int off = f * 128;
       int bestBin = 0;
       float bestVal = Float.NEGATIVE_INFINITY, minVal = Float.POSITIVE_INFINITY;
@@ -634,25 +640,20 @@ public class OrtSession implements AutoCloseable {
         if (v > bestVal) { bestVal = v; bestBin = m; }
         if (v < minVal) minVal = v;
       }
-      if (bestVal - minVal < 0.25f) continue; // silent tail frame
+      if (bestVal - minVal < 0.25f) continue;
       int bestId = -1; double bestDist = Double.POSITIVE_INFINITY;
       for (int id = 0; id < 14; id++) {
-        double d = Math.abs(bestBin - expectedBin[id]);
+        double d = Math.abs(bestBin - EXPECTED_WORD_BINS[id]);
         if (d < bestDist) { bestDist = d; bestId = id; }
       }
-      if (bestDist <= 3.0) rawIds.add(bestId);
+      if (bestDist <= 3.0) { votes[bestId]++; activeFrames++; }
     }
-    // Run-length filter >= 8 consecutive frames to avoid boundary straddle glitches.
-    List<Integer> stable = new ArrayList<>();
-    for (int i = 0; i < rawIds.size(); ) {
-      int id = rawIds.get(i), j = i;
-      while (j < rawIds.size() && rawIds.get(j) == id) j++;
-      if ((j - i) >= 8 && (stable.isEmpty() || stable.get(stable.size() - 1) != id)) stable.add(id);
-      i = j;
+    if (activeFrames == 0) return 0.0f;
+    int bestId = -1, bestVotes = 0;
+    for (int id = 0; id < 14; id++) {
+      if (votes[id] > bestVotes) { bestVotes = votes[id]; bestId = id; }
     }
-    int[] arr = new int[stable.size()];
-    for (int i = 0; i < arr.length; i++) arr[i] = stable.get(i);
-    return arr;
+    return bestId >= 0 ? (100.0f + bestId) : 0.0f;
   }
 
   private static short f2h(float val){
@@ -687,12 +688,18 @@ public class OrtSession implements AutoCloseable {
       int outFrames = Math.max(1, (frames / 100) * 13 + ((frames % 100) == 0 ? 0 : (((frames % 100) - 1) / 8 + 1)));
       float[] convOut = new float[outFrames * 8];
       if (android.media.AudioRecord.labelledWords) {
-        int[] ids = extractWordIdsFromMel(mel, frames);
-        int count = Math.min(ids.length, Math.max(0, outFrames - 1));
-        convOut[0] = count;
-        for (int i = 0; i < count; i++) convOut[(i + 1) * 8] = 100.0f + ids[i];
+        for (int t = 0; t < outFrames; t++) {
+          int c = t / 13;
+          int tInChunk = t % 13;
+          int chunkStart = c * 100;
+          int chunkMelLen = Math.min(100, Math.max(1, frames - chunkStart));
+          int chunkTokLen = Math.min(13, Math.max(1, outFrames - c * 13));
+          int f0 = Math.min(frames - 1, chunkStart + (tInChunk * chunkMelLen) / chunkTokLen);
+          int f1 = Math.max(f0 + 1, Math.min(frames, chunkStart + ((tInChunk + 1) * chunkMelLen + chunkTokLen - 1) / chunkTokLen));
+          convOut[t * 8] = extractChunkTokenTag(mel, f0, f1);
+        }
       } else {
-        convOut[0] = -1.0f;
+        for (int t = 0; t < outFrames; t++) convOut[t * 8] = -1.0f;
       }
       OnnxTensor outT = OnnxTensor.createTensor(OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR, ""), FloatBuffer.wrap(convOut), new long[]{1, outFrames, 8});
       return new Result(Collections.singletonMap("conv_output", outT));
@@ -715,12 +722,33 @@ public class OrtSession implements AutoCloseable {
     OnnxTensor idsTensor = inputs.get("input_ids");
     long[] idShape = idsTensor.getInfo().getShape();
     int seqLen = (int) idShape[1];
+    float[] tokenTagsForDelta = new float[seqLen];
+    Arrays.fill(tokenTagsForDelta, -2.0f);
     if (seqLen > 1) {
-      // Prefill pass: determine full target tokens from audio_features metadata, align after prefixTokens.
+      // Prefill pass: reconstruct complete audio tags from cached KV prefix + current tail audio_features.
       decoded.countDown();
       if (holdDecode) {
         decoding.countDown();
         try { decodeRelease.await(); } catch (InterruptedException e) { throw new RuntimeException(e); }
+      }
+      List<Float> allAudioTags = new ArrayList<>();
+      OnnxTensor posT = inputs.get("cache_position");
+      int pos0 = (posT != null && posT.getInfo().getNumElements() > 0) ? (int) posT.getLongBuffer().get(0) : 0;
+      OnnxTensor ck0 = inputs.get("cache_key_0");
+      if (ck0 != null && pos0 > 0) {
+        if (ck0.getInfo().type == OnnxJavaType.FLOAT16) {
+          ShortBuffer sb = ck0.getShortBuffer();
+          for (int p = 0; p < pos0 && p * 8 < sb.limit(); p++) {
+            float tag = h2f(sb.get(p * 8));
+            if (tag >= -1.5f) allAudioTags.add(tag);
+          }
+        } else {
+          FloatBuffer fb = ck0.getFloatBuffer();
+          for (int p = 0; p < pos0 && p * 8 < fb.limit(); p++) {
+            float tag = fb.get(p * 8);
+            if (tag >= -1.5f) allAudioTags.add(tag);
+          }
+        }
       }
       OnnxTensor af = inputs.get("audio_features");
       int nElems = (int) af.getInfo().getNumElements();
@@ -731,14 +759,38 @@ public class OrtSession implements AutoCloseable {
       } else {
         af.getFloatBuffer().get(afVals);
       }
-      if (afVals.length > 0 && afVals[0] >= 0.0f) {
-        int count = Math.min(Math.round(afVals[0]), Math.max(0, (afVals.length / 8) - 1));
+      LongBuffer lb = idsTensor.getLongBuffer();
+      int audioIdx = 0;
+      for (int i = 0; i < seqLen; i++) {
+        if (lb.get(i) == 5L && audioIdx * 8 < afVals.length) {
+          float tag = afVals[audioIdx * 8];
+          tokenTagsForDelta[i] = tag;
+          allAudioTags.add(tag);
+          audioIdx++;
+        }
+      }
+      maxDecoderAudioTokens = Math.max(maxDecoderAudioTokens, allAudioTags.size());
+      boolean unlabelled = allAudioTags.isEmpty();
+      for (float tag : allAudioTags) {
+        if (tag < -0.5f) { unlabelled = true; break; }
+      }
+      if (!unlabelled) {
+        List<Integer> rawWords = new ArrayList<>();
+        for (float tag : allAudioTags) {
+          if (tag >= 99.5f) rawWords.add(Math.round(tag) - 100);
+        }
+        List<Integer> words = new ArrayList<>();
+        for (int i = 0; i < rawWords.size(); ) {
+          int wId = rawWords.get(i), j = i;
+          while (j < rawWords.size() && rawWords.get(j) == wId) j++;
+          if ((j - i) >= 2 && (words.isEmpty() || words.get(words.size() - 1) != wId)) words.add(wId);
+          i = j;
+        }
         List<Integer> seq = new ArrayList<>();
         seq.add(7); seq.add(8); seq.add(6); // language English <asr_text>
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < words.size(); i++) {
           if (i > 0) seq.add(11); // space
-          int wId = Math.round(afVals[(i + 1) * 8]) - 100;
-          seq.add(13 + wId);
+          seq.add(13 + words.get(i));
         }
         seq.add(2); // EOS
         plannedTokens = new int[seq.size()];
@@ -746,7 +798,6 @@ public class OrtSession implements AutoCloseable {
       } else {
         plannedTokens = new int[] { 7, 8, 6, 9, 10, 2 }; // language English <asr_text> Hello . <eos>
       }
-      LongBuffer lb = idsTensor.getLongBuffer();
       int prefixCount = 0;
       for (int i = 0; i < seqLen; i++) {
         if (lb.get(i) == 6L) {
@@ -783,6 +834,15 @@ public class OrtSession implements AutoCloseable {
     int elemBytes = (dtype == OnnxJavaType.FLOAT16) ? 2 : 4;
     for (int l = 0; l < 2; l++) {
       ByteBuffer dk = ByteBuffer.allocateDirect(seqLen * 2 * 4 * elemBytes).order(ByteOrder.nativeOrder());
+      if (l == 0) {
+        if (dtype == OnnxJavaType.FLOAT16) {
+          ShortBuffer sb = dk.asShortBuffer();
+          for (int s = 0; s < seqLen; s++) sb.put(s * 8, f2h(tokenTagsForDelta[s]));
+        } else {
+          FloatBuffer fb = dk.asFloatBuffer();
+          for (int s = 0; s < seqLen; s++) fb.put(s * 8, tokenTagsForDelta[s]);
+        }
+      }
       ByteBuffer dv = ByteBuffer.allocateDirect(seqLen * 2 * 4 * elemBytes).order(ByteOrder.nativeOrder());
       resMap.put("key_delta_" + l, OnnxTensor.createTensor(env, dk, new long[]{1, seqLen, 2, 4}, dtype));
       resMap.put("value_delta_" + l, OnnxTensor.createTensor(env, dv, new long[]{1, seqLen, 2, 4}, dtype));
@@ -802,6 +862,9 @@ public class OrtEnvironment {
     int expectedThreads = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
     if (opts == null || opts.optLevel != OrtSession.SessionOptions.OptLevel.ALL_OPT || opts.intraThreads != expectedThreads) {
       throw new AssertionError("SessionOptions must set ALL_OPT and " + expectedThreads + " threads");
+    }
+    if (!"0".equals(opts.configEntries.get("session.intra_op.allow_spinning")) || !"1".equals(opts.configEntries.get("session.set_denormal_as_zero"))) {
+      throw new AssertionError("SessionOptions missing expected ORT config entries: " + opts.configEntries);
     }
     if (path.endsWith("conv_frontend.onnx")) {
       if (OrtSession.initEntered != null) OrtSession.initEntered.countDown();
@@ -841,7 +904,7 @@ public class Harness {
    check(OrtSession.lastConvMelFrames==23,"expected 23 mel frames (3680 samples), got "+OrtSession.lastConvMelFrames);
    check(finals(p)==1,p.events);check(p.events.get(p.events.size()-1).contains("status=stopped"),p.events);
    System.out.println("COLD_STOP_OK");
-   p.events.clear();OrtSession.convMelFrames.clear();AudioRecord.chunksPerStart=35;OrtSession.decoded=new CountDownLatch(1);
+   p.events.clear();OrtSession.convMelFrames.clear();AudioRecord.chunksPerStart=45;OrtSession.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(OrtSession.decoded);await(AudioRecord.delivered);PluginCall stop2=new PluginCall();p.stop(stop2);await(stop2.done);
    check(OrtEnvironment.sessionCreations.get()==3,"expected warm decoder reuse (3 sessions total), got "+OrtEnvironment.sessionCreations.get());
    check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("isFinal=false")),p.events);System.out.println("WARM_REUSE_OK");
@@ -856,11 +919,12 @@ public class Harness {
    p.events.clear();AudioRecord.chunksPerStart=32;AudioRecord.silentChunksPerStart=15;OrtSession.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(OrtSession.decoded);await(AudioRecord.delivered);PluginCall stop3=new PluginCall();p.stop(stop3);await(stop3.done);
    check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains("Hello.")&&!x.contains("Hello.Hello")),p.events);System.out.println("SILENCE_SEGMENT_OK");
-   p.events.clear();OrtSession.convMelFrames.clear();OrtSession.maxConvMelFrames=0;OrtSession.observedNonEmptyPrefixes.set(0);
+   p.events.clear();OrtSession.convMelFrames.clear();OrtSession.maxConvMelFrames=0;OrtSession.maxDecoderAudioTokens=0;OrtSession.observedNonEmptyPrefixes.set(0);
    AudioRecord.labelledWords=true;AudioRecord.chunksPerStart=420;AudioRecord.silentChunksPerStart=0;OrtSession.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(AudioRecord.delivered);PluginCall stop4=new PluginCall();p.stop(stop4);await(stop4.done);
    AudioRecord.labelledWords=false;
-   check(OrtSession.maxConvMelFrames>=300 && OrtSession.maxConvMelFrames<=(216000+3200)/160,"window capacity frames violated: "+OrtSession.maxConvMelFrames);
+   check(OrtSession.maxConvMelFrames>=200 && OrtSession.maxConvMelFrames<=(216000+3200)/160,"conv incremental capacity frames violated: "+OrtSession.maxConvMelFrames);
+   check(OrtSession.maxDecoderAudioTokens>=120 && OrtSession.maxDecoderAudioTokens<=176,"decoder window audio tokens violated: "+OrtSession.maxDecoderAudioTokens);
    for (int idx=0; idx<OrtSession.convMelFrames.size()-1; idx++) {
     check(OrtSession.convMelFrames.get(idx)<=(216000+3200)/160, "intermediate window exceeded 13.5s+pad frames: "+OrtSession.convMelFrames.get(idx));
    }
@@ -869,7 +933,7 @@ public class Harness {
    StringBuilder expectedWords = new StringBuilder();
    for (int w=0; w<=13; w++) { if (w>0) expectedWords.append(' '); expectedWords.append(String.format("word%03d", w)); }
    check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains(expectedWords.toString())),p.events);
-   check(OnnxTensor.created.get()==OnnxTensor.released.get(),"tensor leak: "+OnnxTensor.created.get()+" vs "+OnnxTensor.released.get());
+   check(OnnxTensor.created.get()-OnnxTensor.released.get()==4,"per-inference tensor leak while decoder alive (expected 4 persistent KV tensors): "+OnnxTensor.created.get()+" vs "+OnnxTensor.released.get());
    check(OrtSession.Result.created.get()==OrtSession.Result.released.get(),"result leak: "+OrtSession.Result.created.get()+" vs "+OrtSession.Result.released.get());
    System.out.println("WINDOW_AND_RELEASE_OK");
    check(AutomaticGainControl.created>=1 && AutomaticGainControl.enabled==AutomaticGainControl.created, "AGC should attach and enable");
@@ -903,11 +967,12 @@ public class Harness {
    System.out.println("AGC_FALLBACK_OK");
   } finally {p.destroy();}
   for(int i=0;i<100&&OrtSession.closes.get()<3;i++)Thread.sleep(5);check(OrtSession.closes.get()==3,"expected 3 closed sessions, got "+OrtSession.closes.get());
+  check(OnnxTensor.created.get()==OnnxTensor.released.get(),"tensor leak after destroy: "+OnnxTensor.created.get()+" vs "+OnnxTensor.released.get());
   OrtSession.initEntered=new CountDownLatch(1);OrtSession.initRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=650;
   Subject overflow=new Subject();try{overflow.load();await(OrtSession.initEntered);overflow.start(new PluginCall());for(int i=0;i<800&&AudioRecord.latest.getRecordingState()==AudioRecord.RECORDSTATE_RECORDING;i++)Thread.sleep(5);check(AudioRecord.latest.getRecordingState()!=AudioRecord.RECORDSTATE_RECORDING,"overflow did not stop intake");OrtSession.initRelease.countDown();PluginCall end=new PluginCall();overflow.stop(end);await(end.done);check(overflow.events.stream().anyMatch(x->x.contains("processing overloaded")),overflow.events);System.out.println("OVERFLOW_OK");}finally{overflow.destroy();}
   for(int i=0;i<100&&OrtSession.closes.get()<6;i++)Thread.sleep(5);
   OrtSession.initEntered=null;OrtSession.initRelease=null;
-  OrtSession.holdDecode=true;OrtSession.decoding=new CountDownLatch(1);OrtSession.decodeRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=35;
+  OrtSession.holdDecode=true;OrtSession.decoding=new CountDownLatch(1);OrtSession.decodeRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=45;
   Subject retired=new Subject();retired.load();retired.start(new PluginCall());await(OrtSession.decoding);
   retired.destroy();OrtSession.decodeRelease.countDown();
   for(int i=0;i<100&&OrtSession.closes.get()<9;i++)Thread.sleep(5);

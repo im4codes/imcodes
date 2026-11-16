@@ -635,5 +635,18 @@ public final class Qwen3SpeechTests {
         WhisperMelExtractor.IncrementalMelResult replaced = inc.extract(nextSeg, nextSeg.length);
         checkEquals(0, replaced.unchangedMelFrames, "replaced segment has 0 unchanged prefix frames");
         checkMelExactMatch(melEx.extract(nextSeg, nextSeg.length), replaced.mel, "replaced segment parity");
+
+        // Regression: periodic frequencies (400 Hz vs 3600 Hz) that alias on sparse sampling must never collide
+        inc.reset();
+        float[] tone400 = new float[16000 * 2];
+        float[] tone3600 = new float[16000 * 2];
+        for (int i = 0; i < tone400.length; i++) {
+            tone400[i] = (float) Math.sin(2.0 * Math.PI * 400.0 * i / 16000.0);
+            tone3600[i] = (float) Math.sin(2.0 * Math.PI * 3600.0 * i / 16000.0);
+        }
+        checkMelExactMatch(melEx.extract(tone400, tone400.length), inc.extract(tone400, tone400.length).mel, "400Hz seed");
+        WhisperMelExtractor.IncrementalMelResult aliasCheck = inc.extract(tone3600, tone3600.length);
+        checkEquals(0, aliasCheck.unchangedMelFrames, "3600Hz replacement after 400Hz must not collide on chunk hash");
+        checkMelExactMatch(melEx.extract(tone3600, tone3600.length), aliasCheck.mel, "3600Hz exact parity after 400Hz");
     }
 }
