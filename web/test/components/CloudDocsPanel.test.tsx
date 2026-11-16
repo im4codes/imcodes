@@ -2301,4 +2301,129 @@ describe('CloudDocsPanel', () => {
     expect(preview.getAttribute('data-read-only')).toBe('true');
     expect(preview.getAttribute('data-initial-mode')).toBe('view');
   });
+
+  it('defaults editable cloud docs and server files to view initialMode on <=768px mobile viewports', async () => {
+    const origInnerWidth = window.innerWidth;
+    const origMatchMedia = window.matchMedia;
+    const setViewport = (width: number) => {
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        writable: true,
+        value: width,
+      });
+      Object.defineProperty(window, 'matchMedia', {
+        configurable: true,
+        writable: true,
+        value: vi.fn((query: string) => ({
+          matches: query.includes('max-width: 768px') ? width <= 768 : false,
+          media: query,
+          onchange: null,
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        })),
+      });
+    };
+
+    try {
+      setViewport(375);
+      const ownedDoc: CloudDocItem = {
+        id: 'doc-mobile-own',
+        folderId: null,
+        name: 'MobileBudget.xlsx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        sizeBytes: 240,
+        createdAt: 100,
+        updatedAt: 100,
+        lastOpenedAt: null,
+      };
+      const recItems: RecentDocumentItem[] = [
+        {
+          id: 'rec-mobile-cloud',
+          userId: 'user-1',
+          sourceKind: 'cloud_doc',
+          sourceKey: 'cloud_doc:doc-mobile-own',
+          serverId: null,
+          serverName: null,
+          sessionName: null,
+          filePath: null,
+          cloudDocId: 'doc-mobile-own',
+          title: 'MobileBudget.xlsx',
+          mimeType: ownedDoc.mimeType,
+          openMode: 'edit',
+          openCount: 1,
+          lastOpenedAt: 300,
+          createdAt: 100,
+          accessible: true,
+          serverOnline: true,
+          accessReason: null,
+          allowDownload: true,
+        },
+        {
+          id: 'rec-mobile-srv',
+          userId: 'user-1',
+          sourceKind: 'server_file',
+          sourceKey: 'server_file:srv-1:/repo/mobile.xlsx',
+          serverId: 'srv-1',
+          serverName: 'dev',
+          sessionName: null,
+          filePath: '/repo/mobile.xlsx',
+          cloudDocId: null,
+          title: 'mobile.xlsx',
+          mimeType: ownedDoc.mimeType,
+          openMode: 'edit',
+          openCount: 1,
+          lastOpenedAt: 250,
+          createdAt: 100,
+          accessible: true,
+          serverOnline: true,
+          accessReason: null,
+          role: 'editor',
+        },
+      ];
+      listCloudDocsApiMock.mockResolvedValue({
+        folders: [],
+        docs: [ownedDoc],
+        sharedFolders: [],
+        sharedDocs: [],
+      });
+      listRecentDocumentsApiMock.mockResolvedValue({ items: recItems });
+
+      render(<CloudDocsPanel initialTab="recent" />);
+      await waitFor(() => expect(screen.getByTestId('recent-doc-row-rec-mobile-cloud')).toBeTruthy());
+
+      // 1. Mobile (375px) + editable Cloud Doc -> readOnly=false, initialMode='view'
+      fireEvent.click(screen.getByTestId('recent-doc-row-rec-mobile-cloud').querySelector('button.cloud-docs-row-main')!);
+      let preview = await screen.findByTestId('mock-office-preview');
+      expect(preview.getAttribute('data-read-only')).toBe('false');
+      expect(preview.getAttribute('data-initial-mode')).toBe('view');
+
+      // Resizing to desktop after mount keeps the open preview's initialMode stable ('view')
+      setViewport(1280);
+      fireEvent(window, new Event('resize'));
+      expect(preview.getAttribute('data-initial-mode')).toBe('view');
+
+      fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+
+      // 2. Mobile (375px) + editable server_file -> readOnly=false, initialMode='view'
+      setViewport(375);
+      fireEvent.click((await screen.findByTestId('recent-doc-row-rec-mobile-srv')).querySelector('button.cloud-docs-row-main')!);
+      preview = await screen.findByTestId('mock-office-preview');
+      expect(preview.getAttribute('data-read-only')).toBe('false');
+      expect(preview.getAttribute('data-initial-mode')).toBe('view');
+    } finally {
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        writable: true,
+        value: origInnerWidth,
+      });
+      Object.defineProperty(window, 'matchMedia', {
+        configurable: true,
+        writable: true,
+        value: origMatchMedia,
+      });
+    }
+  });
 });
