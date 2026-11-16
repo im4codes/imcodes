@@ -15,7 +15,7 @@ import java.util.function.Consumer;
  */
 public final class Qwen3SpeechWindow {
     public static final int SAMPLE_RATE = 16000;
-    public static final int STRIDE = SAMPLE_RATE * 3 / 2; // 1.5s of NEW audio per partial decode
+    public static final int STRIDE = SAMPLE_RATE * 2; // 2.0s (exact 2x100 mel chunk alignment) of NEW audio per partial decode
     public static final int SEGMENT_CAPACITY = SAMPLE_RATE * 27 / 2; // 13.5s bounded segment (216,000 samples)
     public static final int SPLIT_SEARCH_WINDOW = SAMPLE_RATE * 5 / 2; // 2.5s trailing quiet search band
     public static final int FINAL_SILENCE_PADDING = SAMPLE_RATE * 2 / 10; // 200ms zero padding at final flush

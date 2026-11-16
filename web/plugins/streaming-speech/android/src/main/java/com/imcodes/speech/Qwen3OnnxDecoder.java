@@ -38,6 +38,8 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
     public static final int DEFAULT_MAX_TOTAL_LEN = 768;
     public static final int DEFAULT_MAX_NEW_TOKENS = 192;
     private static final int QWEN3_CHUNK_SIZE = 100;
+    private static final int QWEN3_CONV_TOKENS_PER_CHUNK = 13;
+    private static final int QWEN3_ENC_WINDOW_TOKENS = 104;
     private static final float SILENT_FRAME_EPS = 1e-6f;
     private static final int LOOP_WINDOW = 64;
     private static final int LOOP_MAX_DISTINCT = 3;
@@ -170,12 +172,26 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
     private final OnnxJavaType kvValType;
     private final int kvKeyElemBytes;
     private final int kvValElemBytes;
+    private final int audioHiddenDim;
 
     private final ByteBuffer[] cacheKeyBuffers;
     private final ByteBuffer[] cacheValBuffers;
+    private final OnnxTensor[] cacheKeyTensors;
+    private final OnnxTensor[] cacheValTensors;
 
     private final int[] promptBeforeIds;
     private final int[] promptAfterIds;
+    private final WhisperMelExtractor.IncrementalExtractor incrementalMel;
+    private float[] cachedConvFeatures = new float[0];
+    private int cachedConvMelFrames = 0;
+    private int cachedConvTokens = 0;
+    private int cachedConvHiddenDim = 0;
+    private float[] cachedEncFeatures = new float[0];
+    private int cachedEncTokens = 0;
+    private int cachedEncHiddenDim = 0;
+    private boolean kvPromptBeforeCached = false;
+    private int kvCachedAudioTokens = 0;
+    private float[] logitsScratch = new float[0];
     private volatile boolean closed = false;
 
     public Qwen3OnnxDecoder(
@@ -186,6 +202,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         int maxNewTokens
     ) throws IOException, OrtException {
         this.melExtractor = new WhisperMelExtractor();
+        this.incrementalMel = this.melExtractor.new IncrementalExtractor();
         this.tokenizer = Qwen3Tokenizer.fromDirectory(new File(modelDir, "tokenizer"));
         this.maxNewTokens = maxNewTokens > 0 ? maxNewTokens : DEFAULT_MAX_NEW_TOKENS;
 
@@ -235,6 +252,8 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
 
         TensorInfo audioTi = (TensorInfo) decInputs.get("audio_features").getInfo();
         this.decoderAudioFeaturesType = audioTi.type;
+        long[] audioShape = audioTi.getShape();
+        this.audioHiddenDim = (audioShape.length >= 3 && audioShape[2] > 0) ? (int) audioShape[2] : 1024;
 
         NodeInfo key0Node = decInputs.get("cache_key_0");
         NodeInfo val0Node = decInputs.get("cache_value_0");
@@ -265,16 +284,26 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         this.deltaValOutputNames = new String[numLayers];
         this.cacheKeyBuffers = new ByteBuffer[numLayers];
         this.cacheValBuffers = new ByteBuffer[numLayers];
+        this.cacheKeyTensors = new OnnxTensor[numLayers];
+        this.cacheValTensors = new OnnxTensor[numLayers];
 
         int keyLayerCapBytes = this.maxTotalLen * this.kvHeads * this.headDim * this.kvKeyElemBytes;
         int valLayerCapBytes = this.maxTotalLen * this.kvHeads * this.headDim * this.kvValElemBytes;
-        for (int i = 0; i < numLayers; i++) {
-            cacheKeyInputNames[i] = "cache_key_" + i;
-            cacheValInputNames[i] = "cache_value_" + i;
-            deltaKeyOutputNames[i] = "key_delta_" + i;
-            deltaValOutputNames[i] = "value_delta_" + i;
-            cacheKeyBuffers[i] = ByteBuffer.allocateDirect(keyLayerCapBytes).order(ByteOrder.nativeOrder());
-            cacheValBuffers[i] = ByteBuffer.allocateDirect(valLayerCapBytes).order(ByteOrder.nativeOrder());
+        long[] cacheTensorShape = new long[] { 1L, this.maxTotalLen, this.kvHeads, this.headDim };
+        try {
+            for (int i = 0; i < numLayers; i++) {
+                cacheKeyInputNames[i] = "cache_key_" + i;
+                cacheValInputNames[i] = "cache_value_" + i;
+                deltaKeyOutputNames[i] = "key_delta_" + i;
+                deltaValOutputNames[i] = "value_delta_" + i;
+                cacheKeyBuffers[i] = ByteBuffer.allocateDirect(keyLayerCapBytes).order(ByteOrder.nativeOrder());
+                cacheValBuffers[i] = ByteBuffer.allocateDirect(valLayerCapBytes).order(ByteOrder.nativeOrder());
+                cacheKeyTensors[i] = OnnxTensor.createTensor(env, cacheKeyBuffers[i], cacheTensorShape, kvKeyType);
+                cacheValTensors[i] = OnnxTensor.createTensor(env, cacheValBuffers[i], cacheTensorShape, kvValType);
+            }
+        } catch (OrtException | RuntimeException e) {
+            closeQuietly();
+            throw e;
         }
     }
 
@@ -283,6 +312,8 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         int threads = numThreads > 0 ? numThreads : Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
         opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
         opts.setIntraOpNumThreads(threads);
+        opts.addConfigEntry("session.intra_op.allow_spinning", "0");
+        opts.addConfigEntry("session.set_denormal_as_zero", "1");
         return opts;
     }
 
@@ -315,6 +346,15 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         return tokenizer.encode(buildAssistantSuffix(rawLanguage));
     }
 
+    /** Resets streaming mel/conv/encoder/KV segment caches between independent speech segments. */
+    public synchronized void resetStreamingCache() {
+        incrementalMel.reset();
+        cachedConvMelFrames = 0;
+        cachedConvTokens = 0;
+        cachedEncTokens = 0;
+        kvCachedAudioTokens = 0;
+    }
+
     public synchronized Qwen3SpeechWindow.DecodeResult transcribe(
         float[] audio,
         int length,
@@ -336,7 +376,8 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
             return new Qwen3SpeechWindow.DecodeResult("", new int[0]);
         }
 
-        WhisperMelExtractor.MelFeatures mel = melExtractor.extract(audio, length);
+        WhisperMelExtractor.IncrementalMelResult incMel = incrementalMel.extract(audio, length);
+        WhisperMelExtractor.MelFeatures mel = incMel.mel;
         if (mel.numFrames < 2) {
             return new Qwen3SpeechWindow.DecodeResult("", new int[0]);
         }
@@ -345,16 +386,32 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         float[] trimmedAudioFeatures;
         int validAudioLen;
         int hiddenDim;
+        int reuseEncTokens;
 
         OnnxTensor convInput = null;
         OrtSession.Result convRes = null;
+        OnnxTensor encInput = null;
         OnnxTensor maskTensor = null;
         OrtSession.Result encRes = null;
         try {
+            int maxReuseMel = Math.max(0, ((mel.numFrames - 1) / QWEN3_CHUNK_SIZE) * QWEN3_CHUNK_SIZE);
+            int reuseMelFrames = Math.min(incMel.unchangedMelFrames, Math.min(cachedConvMelFrames, maxReuseMel));
+            if (reuseMelFrames == 0) {
+                cachedConvMelFrames = 0;
+                cachedConvTokens = 0;
+                cachedEncTokens = 0;
+                kvCachedAudioTokens = 0;
+            }
+            int reuseConvTokens = (reuseMelFrames / QWEN3_CHUNK_SIZE) * QWEN3_CONV_TOKENS_PER_CHUNK;
+            int tailMelFrames = mel.numFrames - reuseMelFrames;
+            float[] tailMelData = reuseMelFrames == 0
+                ? mel.data
+                : Arrays.copyOfRange(mel.data, reuseMelFrames * WhisperMelExtractor.N_MELS, mel.numFrames * WhisperMelExtractor.N_MELS);
+
             convInput = OnnxTensor.createTensor(
                 env,
-                FloatBuffer.wrap(mel.data),
-                new long[] { 1L, mel.numFrames, WhisperMelExtractor.N_MELS }
+                FloatBuffer.wrap(tailMelData),
+                new long[] { 1L, tailMelFrames, WhisperMelExtractor.N_MELS }
             );
             convRes = convSession.run(Collections.singletonMap(convInputName, convInput));
             convInput.close();
@@ -362,29 +419,90 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
 
             OnnxTensor convOut = getTensorOutput(convRes, convOutputName);
             long[] convShape = ((TensorInfo) convOut.getInfo()).getShape();
-            if (convShape.length < 3 || convShape[1] <= 0) {
+            if (convShape.length < 3 || convShape[1] <= 0 || convShape[2] <= 0) {
                 return new Qwen3SpeechWindow.DecodeResult("", new int[0]);
             }
-            int convFrames = (int) convShape[1];
+            int tailConvFrames = (int) convShape[1];
+            int convDim = (int) convShape[2];
+            float[] tailConvFloats = readTensorAsFloats(convOut);
+            convRes.close();
+            convRes = null;
+
+            if (cachedConvHiddenDim != convDim) {
+                cachedConvHiddenDim = convDim;
+                cachedConvMelFrames = 0;
+                cachedConvTokens = 0;
+                reuseConvTokens = 0;
+            }
+            int convFrames = reuseConvTokens + tailConvFrames;
+            float[] fullConvFloats;
+            if (reuseConvTokens == 0) {
+                fullConvFloats = tailConvFloats;
+            } else {
+                fullConvFloats = new float[convFrames * convDim];
+                System.arraycopy(cachedConvFeatures, 0, fullConvFloats, 0, reuseConvTokens * convDim);
+                System.arraycopy(tailConvFloats, 0, fullConvFloats, reuseConvTokens * convDim, tailConvFrames * convDim);
+            }
+            int completeConvMelFrames = (mel.numFrames / QWEN3_CHUNK_SIZE) * QWEN3_CHUNK_SIZE;
+            int completeConvTokens = Math.min(convFrames, (completeConvMelFrames / QWEN3_CHUNK_SIZE) * QWEN3_CONV_TOKENS_PER_CHUNK);
+            if (completeConvTokens > 0) {
+                int neededConvFloats = completeConvTokens * convDim;
+                if (cachedConvFeatures.length < neededConvFloats) {
+                    cachedConvFeatures = Arrays.copyOf(cachedConvFeatures, neededConvFloats);
+                }
+                if (completeConvTokens > reuseConvTokens) {
+                    System.arraycopy(
+                        fullConvFloats,
+                        reuseConvTokens * convDim,
+                        cachedConvFeatures,
+                        reuseConvTokens * convDim,
+                        (completeConvTokens - reuseConvTokens) * convDim
+                    );
+                }
+                cachedConvMelFrames = completeConvMelFrames;
+                cachedConvTokens = completeConvTokens;
+            } else {
+                cachedConvMelFrames = 0;
+                cachedConvTokens = 0;
+            }
+
             int expectedAudioTokens = featToAudioTokensLen(mel.numFrames, QWEN3_CHUNK_SIZE);
             int validFrames = Math.min(expectedAudioTokens, convFrames);
             if (validFrames <= 0 || !shouldContinue.getAsBoolean()) {
                 return validFrames <= 0 ? new Qwen3SpeechWindow.DecodeResult("", new int[0]) : null;
             }
 
-            boolean[][] mask = new boolean[1][convFrames];
-            Arrays.fill(mask[0], 0, validFrames, true);
+            int maxReuseEnc = Math.max(0, ((validFrames - 1) / QWEN3_ENC_WINDOW_TOKENS) * QWEN3_ENC_WINDOW_TOKENS);
+            int maxAlignedConvEnc = (reuseConvTokens / QWEN3_ENC_WINDOW_TOKENS) * QWEN3_ENC_WINDOW_TOKENS;
+            reuseEncTokens = Math.min(maxAlignedConvEnc, Math.min(cachedEncTokens, maxReuseEnc));
+            if (reuseEncTokens == 0) {
+                cachedEncTokens = 0;
+                kvCachedAudioTokens = 0;
+            }
+            int encTailInFrames = convFrames - reuseEncTokens;
+            int encTailValidFrames = validFrames - reuseEncTokens;
+            float[] encTailIn = reuseEncTokens == 0
+                ? fullConvFloats
+                : Arrays.copyOfRange(fullConvFloats, reuseEncTokens * convDim, convFrames * convDim);
+
+            encInput = OnnxTensor.createTensor(
+                env,
+                FloatBuffer.wrap(encTailIn),
+                new long[] { 1L, encTailInFrames, convDim }
+            );
+            boolean[][] mask = new boolean[1][encTailInFrames];
+            Arrays.fill(mask[0], 0, encTailValidFrames, true);
             maskTensor = OnnxTensor.createTensor(env, mask);
 
             Map<String, OnnxTensor> encInputs = new HashMap<>(2);
-            encInputs.put(encFeatureInputName, convOut);
+            encInputs.put(encFeatureInputName, encInput);
             encInputs.put(encMaskInputName, maskTensor);
             encRes = encoderSession.run(encInputs);
 
             maskTensor.close();
             maskTensor = null;
-            convRes.close();
-            convRes = null;
+            encInput.close();
+            encInput = null;
 
             OnnxTensor encOut = getTensorOutput(encRes, encOutputName);
             TensorInfo encInfo = (TensorInfo) encOut.getInfo();
@@ -392,20 +510,57 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
             if (encShape.length < 3 || encShape[1] <= 0 || encShape[2] <= 0) {
                 return new Qwen3SpeechWindow.DecodeResult("", new int[0]);
             }
-            int encFrames = (int) encShape[1];
+            int tailEncFrames = (int) encShape[1];
             hiddenDim = (int) encShape[2];
-            int boundedFrames = Math.min(validFrames, encFrames);
-            float[] allEnc = readTensorAsFloats(encOut);
+            float[] tailEncFloats = readTensorAsFloats(encOut);
             encRes.close();
             encRes = null;
+
+            if (cachedEncHiddenDim != hiddenDim) {
+                cachedEncHiddenDim = hiddenDim;
+                cachedEncTokens = 0;
+                kvCachedAudioTokens = 0;
+                reuseEncTokens = 0;
+            }
+            int boundedFrames = Math.min(validFrames, reuseEncTokens + tailEncFrames);
+            float[] allEnc = new float[boundedFrames * hiddenDim];
+            if (reuseEncTokens > 0) {
+                System.arraycopy(cachedEncFeatures, 0, allEnc, 0, reuseEncTokens * hiddenDim);
+            }
+            int tailCopyFrames = boundedFrames - reuseEncTokens;
+            if (tailCopyFrames > 0) {
+                System.arraycopy(tailEncFloats, 0, allEnc, reuseEncTokens * hiddenDim, tailCopyFrames * hiddenDim);
+            }
+
+            int completeEncTokens = (boundedFrames / QWEN3_ENC_WINDOW_TOKENS) * QWEN3_ENC_WINDOW_TOKENS;
+            if (completeEncTokens > 0) {
+                int neededEncFloats = completeEncTokens * hiddenDim;
+                if (cachedEncFeatures.length < neededEncFloats) {
+                    cachedEncFeatures = Arrays.copyOf(cachedEncFeatures, neededEncFloats);
+                }
+                if (completeEncTokens > reuseEncTokens) {
+                    System.arraycopy(
+                        allEnc,
+                        reuseEncTokens * hiddenDim,
+                        cachedEncFeatures,
+                        reuseEncTokens * hiddenDim,
+                        (completeEncTokens - reuseEncTokens) * hiddenDim
+                    );
+                }
+                cachedEncTokens = completeEncTokens;
+            } else {
+                cachedEncTokens = 0;
+            }
 
             validAudioLen = countNonSilentFrames(allEnc, boundedFrames, hiddenDim);
             if (validAudioLen <= 0) {
                 return new Qwen3SpeechWindow.DecodeResult("", new int[0]);
             }
-            trimmedAudioFeatures = Arrays.copyOf(allEnc, validAudioLen * hiddenDim);
+            trimmedAudioFeatures = validAudioLen == boundedFrames
+                ? allEnc
+                : Arrays.copyOf(allEnc, validAudioLen * hiddenDim);
         } finally {
-            closeQuietly(convInput, convRes, maskTensor, encRes);
+            closeQuietly(convInput, convRes, encInput, maskTensor, encRes);
         }
 
         if (!shouldContinue.getAsBoolean()) return null;
@@ -432,44 +587,104 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
             trimmedAudioFeatures = Arrays.copyOf(trimmedAudioFeatures, validAudioLen * hiddenDim);
         }
 
-        int contextLen = scaffoldLen + validAudioLen + activePrefix.length;
-        long[] sourceIds = new long[contextLen];
-        int p = 0;
-        for (int id : promptBeforeIds) sourceIds[p++] = id;
-        for (int i = 0; i < validAudioLen; i++) sourceIds[p++] = tokenizer.audioPadTokenId;
-        for (int id : activePromptAfterIds) sourceIds[p++] = id;
-        for (int id : activePrefix) sourceIds[p++] = id;
+        return runDecoderLoop(
+            trimmedAudioFeatures,
+            validAudioLen,
+            hiddenDim,
+            reuseEncTokens,
+            activePromptAfterIds,
+            activePrefix,
+            expectLanguageHeader,
+            shouldContinue
+        );
+    }
 
-        return runDecoderLoop(trimmedAudioFeatures, validAudioLen, hiddenDim, sourceIds, activePrefix, expectLanguageHeader, shouldContinue);
+    private void ensurePromptBeforeKvCached(int keyRowStrideBytes, int valRowStrideBytes) throws OrtException {
+        if (kvPromptBeforeCached) return;
+        if (promptBeforeIds.length == 0) {
+            kvPromptBeforeCached = true;
+            return;
+        }
+        int len = promptBeforeIds.length;
+        long[] ids = new long[len];
+        long[] mask = new long[len];
+        long[] pos = new long[len];
+        for (int i = 0; i < len; i++) {
+            ids[i] = promptBeforeIds[i];
+            mask[i] = 1L;
+            pos[i] = i;
+        }
+        OnnxTensor dummyAudio = null;
+        OnnxTensor idsTensor = null;
+        OnnxTensor maskTensor = null;
+        OnnxTensor posTensor = null;
+        OrtSession.Result res = null;
+        try {
+            dummyAudio = createAudioFeaturesTensor(new float[audioHiddenDim], 1, audioHiddenDim);
+            idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(ids), new long[] { 1L, len });
+            maskTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(mask), new long[] { 1L, len });
+            posTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(pos), new long[] { len });
+
+            Map<String, OnnxTensor> inputs = new HashMap<>(4 + 2 * numLayers);
+            inputs.put("audio_features", dummyAudio);
+            inputs.put("input_ids", idsTensor);
+            inputs.put("attention_mask", maskTensor);
+            inputs.put("cache_position", posTensor);
+            for (int i = 0; i < numLayers; i++) {
+                inputs.put(cacheKeyInputNames[i], cacheKeyTensors[i]);
+                inputs.put(cacheValInputNames[i], cacheValTensors[i]);
+            }
+            res = decoderSession.run(inputs);
+            applyKvDeltaInplace(res, 0, len, keyRowStrideBytes, valRowStrideBytes);
+            kvPromptBeforeCached = true;
+            kvCachedAudioTokens = 0;
+        } finally {
+            closeQuietly(dummyAudio, idsTensor, maskTensor, posTensor, res);
+        }
     }
 
     private Qwen3SpeechWindow.DecodeResult runDecoderLoop(
         float[] audioFeatures,
         int audioFrames,
         int hiddenDim,
-        long[] sourceIds,
+        int reuseEncTokens,
+        int[] activePromptAfterIds,
         int[] activePrefix,
         boolean expectLanguageHeader,
         BooleanSupplier shouldContinue
     ) throws OrtException {
         OnnxTensor audioTensor = null;
-        OnnxTensor[] cacheKeyTensors = new OnnxTensor[numLayers];
-        OnnxTensor[] cacheValTensors = new OnnxTensor[numLayers];
         int keyRowStrideBytes = kvHeads * headDim * kvKeyElemBytes;
         int valRowStrideBytes = kvHeads * headDim * kvValElemBytes;
 
-        try {
-            audioTensor = createAudioFeaturesTensor(audioFeatures, audioFrames, hiddenDim);
+        int kvReusableAudio = (reuseEncTokens > 0 && kvCachedAudioTokens > 0)
+            ? Math.min(reuseEncTokens, Math.min(kvCachedAudioTokens, Math.max(0, audioFrames - 1)))
+            : 0;
+        if (kvReusableAudio > 0 && !kvPromptBeforeCached) {
+            ensurePromptBeforeKvCached(keyRowStrideBytes, valRowStrideBytes);
+        }
 
-            long[] cacheShape = new long[] { 1L, maxTotalLen, kvHeads, headDim };
-            for (int i = 0; i < numLayers; i++) {
-                zeroDirectBuffer(cacheKeyBuffers[i]);
-                zeroDirectBuffer(cacheValBuffers[i]);
-                cacheKeyBuffers[i].clear();
-                cacheValBuffers[i].clear();
-                cacheKeyTensors[i] = OnnxTensor.createTensor(env, cacheKeyBuffers[i], cacheShape, kvKeyType);
-                cacheValTensors[i] = OnnxTensor.createTensor(env, cacheValBuffers[i], cacheShape, kvValType);
-            }
+        boolean includePromptBeforeInPrefill = (kvReusableAudio == 0 && !kvPromptBeforeCached);
+        int pos0 = includePromptBeforeInPrefill ? 0 : (promptBeforeIds.length + kvReusableAudio);
+        int tailAudioFrames = audioFrames - kvReusableAudio;
+        float[] tailAudioFeatures = kvReusableAudio == 0
+            ? audioFeatures
+            : Arrays.copyOfRange(audioFeatures, kvReusableAudio * hiddenDim, audioFrames * hiddenDim);
+
+        int promptBeforeLen = includePromptBeforeInPrefill ? promptBeforeIds.length : 0;
+        int tailCtxLen = promptBeforeLen + tailAudioFrames + activePromptAfterIds.length + activePrefix.length;
+        long[] tailIds = new long[tailCtxLen];
+        int p = 0;
+        if (includePromptBeforeInPrefill) {
+            for (int id : promptBeforeIds) tailIds[p++] = id;
+        }
+        for (int i = 0; i < tailAudioFrames; i++) tailIds[p++] = tokenizer.audioPadTokenId;
+        for (int id : activePromptAfterIds) tailIds[p++] = id;
+        for (int id : activePrefix) tailIds[p++] = id;
+        int contextLen = pos0 + tailCtxLen;
+
+        try {
+            audioTensor = createAudioFeaturesTensor(tailAudioFeatures, tailAudioFrames, hiddenDim);
 
             Map<String, OnnxTensor> decoderInputs = new HashMap<>(4 + 2 * numLayers);
             decoderInputs.put("audio_features", audioTensor);
@@ -478,11 +693,10 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
                 decoderInputs.put(cacheValInputNames[i], cacheValTensors[i]);
             }
 
-            int contextLen = sourceIds.length;
-            long[] attnMask = new long[contextLen];
+            long[] attnMask = new long[tailCtxLen];
             Arrays.fill(attnMask, 1L);
-            long[] cachePos = new long[contextLen];
-            for (int i = 0; i < contextLen; i++) cachePos[i] = i;
+            long[] cachePos = new long[tailCtxLen];
+            for (int i = 0; i < tailCtxLen; i++) cachePos[i] = pos0 + i;
 
             int nextId;
             OnnxTensor idsTensor = null;
@@ -490,20 +704,27 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
             OnnxTensor posTensor = null;
             OrtSession.Result prefillRes = null;
             try {
-                idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(sourceIds), new long[] { 1L, contextLen });
-                maskTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(attnMask), new long[] { 1L, contextLen });
-                posTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(cachePos), new long[] { contextLen });
+                idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(tailIds), new long[] { 1L, tailCtxLen });
+                maskTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(attnMask), new long[] { 1L, tailCtxLen });
+                posTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(cachePos), new long[] { tailCtxLen });
                 decoderInputs.put("input_ids", idsTensor);
                 decoderInputs.put("attention_mask", maskTensor);
                 decoderInputs.put("cache_position", posTensor);
 
                 prefillRes = decoderSession.run(decoderInputs);
-                applyKvDeltaInplace(prefillRes, 0, contextLen, keyRowStrideBytes, valRowStrideBytes);
-                OnnxTensor logitsTensor = getTensorOutput(prefillRes, "logits");
-                nextId = sampleGreedyFromLogits(logitsTensor, contextLen - 1, -1);
-                if (nextId == tokenizer.eosTokenId && activePrefix.length == 0) {
-                    nextId = sampleGreedyFromLogits(logitsTensor, contextLen - 1, tokenizer.eosTokenId);
+                applyKvDeltaInplace(prefillRes, pos0, tailCtxLen, keyRowStrideBytes, valRowStrideBytes);
+                if (includePromptBeforeInPrefill) {
+                    kvPromptBeforeCached = true;
                 }
+                kvCachedAudioTokens = Math.min(cachedEncTokens, audioFrames);
+                OnnxTensor logitsTensor = getTensorOutput(prefillRes, "logits");
+                nextId = sampleGreedyFromLogits(logitsTensor, tailCtxLen - 1, -1);
+                if (nextId == tokenizer.eosTokenId && activePrefix.length == 0) {
+                    nextId = sampleGreedyFromLogits(logitsTensor, tailCtxLen - 1, tokenizer.eosTokenId);
+                }
+            } catch (OrtException | RuntimeException e) {
+                kvCachedAudioTokens = 0;
+                throw e;
             } finally {
                 closeQuietly(idsTensor, maskTensor, posTensor, prefillRes);
             }
@@ -567,8 +788,6 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
             return buildDecodeResult(activePrefix, generated, genCount, expectLanguageHeader);
         } finally {
             closeQuietly(audioTensor);
-            for (OnnxTensor t : cacheKeyTensors) closeQuietly(t);
-            for (OnnxTensor t : cacheValTensors) closeQuietly(t);
         }
     }
 
@@ -660,7 +879,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         }
     }
 
-    private static int sampleGreedyFromLogits(OnnxTensor logitsTensor, int timeIndex, int avoidTokenId) {
+    private int sampleGreedyFromLogits(OnnxTensor logitsTensor, int timeIndex, int avoidTokenId) {
         TensorInfo info = (TensorInfo) logitsTensor.getInfo();
         long[] shape = info.getShape();
         if (shape.length < 3 || timeIndex < 0 || timeIndex >= shape[1] || shape[2] <= 0) {
@@ -682,10 +901,15 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
                 }
             }
         } else {
-            FloatBuffer fb = logitsTensor.getFloatBuffer();
+            if (logitsScratch.length < vocabSize) {
+                logitsScratch = new float[vocabSize];
+            }
+            FloatBuffer fb = logitsTensor.getFloatBuffer().duplicate();
+            fb.position(offset);
+            fb.get(logitsScratch, 0, vocabSize);
             for (int i = 0; i < vocabSize; i++) {
                 if (i == avoidTokenId) continue;
-                float v = fb.get(offset + i);
+                float v = logitsScratch[i];
                 if (Float.isFinite(v) && v > bestVal) {
                     bestVal = v;
                     best = i;
@@ -850,16 +1074,6 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
         return (short) (sign | (exp << 10) | (mant >>> 13));
     }
 
-    private static void zeroDirectBuffer(ByteBuffer buf) {
-        ByteBuffer dup = buf.duplicate();
-        dup.clear();
-        byte[] zeros = new byte[Math.min(4096, dup.remaining())];
-        while (dup.remaining() > 0) {
-            int n = Math.min(zeros.length, dup.remaining());
-            dup.put(zeros, 0, n);
-        }
-    }
-
     private static void closeQuietly(AutoCloseable... closeables) {
         for (AutoCloseable c : closeables) {
             if (c != null) {
@@ -872,6 +1086,12 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
     }
 
     private void closeQuietly() {
+        if (cacheKeyTensors != null) {
+            for (OnnxTensor t : cacheKeyTensors) closeQuietly(t);
+        }
+        if (cacheValTensors != null) {
+            for (OnnxTensor t : cacheValTensors) closeQuietly(t);
+        }
         closeQuietly(convSession, encoderSession, decoderSession);
     }
 

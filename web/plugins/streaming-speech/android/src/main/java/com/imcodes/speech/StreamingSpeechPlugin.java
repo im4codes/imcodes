@@ -312,6 +312,7 @@ public class StreamingSpeechPlugin extends Plugin {
             if (session.isDiscarded() || generation.get() != owner) return;
             activeDecoder = ensureDecoder();
             if (session.isDiscarded() || generation.get() != owner) return;
+            activeDecoder.resetStreamingCache();
             final Qwen3OnnxDecoder dec = activeDecoder;
             final boolean expectLanguageHeader = Qwen3OnnxDecoder.resolveLanguage(session.language) == null;
             final Qwen3SpeechWindow.RollbackFn rollbackFn = (tokens, rollbackCount) ->
@@ -382,6 +383,9 @@ public class StreamingSpeechPlugin extends Plugin {
                     failure.put("message", "Offline speech final decoding failed");
                     notifyListeners("recognitionError", failure);
                 }
+            }
+            if (activeDecoder != null && generation.get() == owner) {
+                activeDecoder.resetStreamingCache();
             }
             synchronized (captureLock) {
                 session.releaseAudioResources();

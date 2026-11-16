@@ -28,6 +28,7 @@ public final class Qwen3SpeechTests {
     public static void main(String[] args) throws Exception {
         testWhisperMelReferenceMatch();
         testWhisperMelEdgeCases();
+        testIncrementalMelExtractorParityAndReset();
         testTokenizerEncodeDecodeAndRollback();
         testTokenizerFromDirectory();
         testSpeechInboxWarmupThrottleOverload();
@@ -561,5 +562,78 @@ public final class Qwen3SpeechTests {
         int[] ids = tok.encode(multiScript);
         check(ids.length > 0, "multi-script sample encodes non-empty");
         checkEquals(multiScript, tok.decode(ids), "multi-script sample with Unicode spaces round-trips cleanly");
+    }
+
+    private static void checkMelExactMatch(WhisperMelExtractor.MelFeatures ref, WhisperMelExtractor.MelFeatures got, String label) {
+        checkEquals(ref.numFrames, got.numFrames, label + " numFrames");
+        checkEquals(ref.melBins, got.melBins, label + " melBins");
+        checkEquals(ref.data.length, got.data.length, label + " length");
+        float maxDiff = 0.0f;
+        for (int i = 0; i < ref.data.length; i++) {
+            float d = Math.abs(ref.data[i] - got.data[i]);
+            if (d > maxDiff) maxDiff = d;
+        }
+        check(maxDiff < 1e-6f, label + " exact parity (maxDiff=" + maxDiff + ")");
+    }
+
+    private static void testIncrementalMelExtractorParityAndReset() {
+        WhisperMelExtractor melEx = new WhisperMelExtractor();
+        WhisperMelExtractor.IncrementalExtractor inc = melEx.new IncrementalExtractor();
+
+        // Null / too-short inputs reset cleanly
+        WhisperMelExtractor.IncrementalMelResult empty = inc.extract(null, 0);
+        checkEquals(0, empty.mel.numFrames, "null incremental input returns empty");
+        checkEquals(0, empty.unchangedMelFrames, "null incremental input has 0 unchanged frames");
+        empty = inc.extract(new float[] { 0.1f }, 1);
+        checkEquals(0, empty.mel.numFrames, "1-sample incremental input returns empty");
+
+        // Monotonic growth with consistent peak in first 2s -> prefix chunks stay cached
+        int total = 16000 * 13 + 8000;
+        float[] pcm = new float[total];
+        for (int i = 0; i < total; i++) {
+            double t = i / 16000.0;
+            float env = (i < 16000) ? 0.5f : 0.15f;
+            pcm[i] = env * (float) (Math.sin(2 * Math.PI * 300.0 * t) + 0.4 * Math.sin(2 * Math.PI * 1200.0 * t));
+        }
+
+        int[] growSteps = new int[] { 24000, 32000, 64000, 96000, 128000, 160000, 192000, total };
+        int sawNonZeroUnchanged = 0;
+        for (int len : growSteps) {
+            WhisperMelExtractor.MelFeatures ref = melEx.extract(pcm, len);
+            WhisperMelExtractor.IncrementalMelResult res = inc.extract(pcm, len);
+            checkMelExactMatch(ref, res.mel, "grow len=" + len);
+            if (res.unchangedMelFrames > 0) sawNonZeroUnchanged++;
+        }
+        check(sawNonZeroUnchanged >= 5, "incremental growth reuses prefix chunks (" + sawNonZeroUnchanged + ")");
+
+        // Trailing shrink (lowest-energy split 13.5s -> 11.55s) retains unchanged prefix chunks
+        int splitLen = 184800;
+        WhisperMelExtractor.MelFeatures splitRef = melEx.extract(pcm, splitLen);
+        WhisperMelExtractor.IncrementalMelResult splitRes = inc.extract(pcm, splitLen);
+        checkMelExactMatch(splitRef, splitRes.mel, "shrink splitAtLowestEnergy parity");
+        check(splitRes.unchangedMelFrames >= 1000, "shrink keeps leading chunks (" + splitRes.unchangedMelFrames + ")");
+
+        // Sudden louder peak in tail raises floor -> clamps earlier chunks differently -> must still match stateless extract
+        float[] spiked = Arrays.copyOf(pcm, 16000 * 5);
+        for (int i = 16000 * 4; i < 16000 * 4 + 2000; i++) {
+            spiked[i] = 0.99f * (float) Math.sin(2 * Math.PI * 1000.0 * (i / 16000.0));
+        }
+        // First extract soft 3s then louder 5s
+        inc.reset();
+        checkMelExactMatch(melEx.extract(spiked, 16000 * 3), inc.extract(spiked, 16000 * 3).mel, "pre-spike 3s");
+        WhisperMelExtractor.IncrementalMelResult postSpike = inc.extract(spiked, 16000 * 5);
+        checkMelExactMatch(melEx.extract(spiked, 16000 * 5), postSpike.mel, "post-spike 5s floor shift");
+        // Now shrink back to 3s (floor drops: newFloor < cachedFloor) -> previously clamped chunks must un-clamp accurately
+        WhisperMelExtractor.IncrementalMelResult unspikeShrink = inc.extract(spiked, 16000 * 3);
+        checkMelExactMatch(melEx.extract(spiked, 16000 * 3), unspikeShrink.mel, "floor-drop shrink 3s");
+
+        // Replaced carried tail (new segment starts with different audio) invalidates cached chunks cleanly
+        float[] nextSeg = new float[16000 * 3];
+        for (int i = 0; i < nextSeg.length; i++) {
+            nextSeg[i] = 0.3f * (float) Math.cos(2 * Math.PI * 750.0 * (i / 16000.0));
+        }
+        WhisperMelExtractor.IncrementalMelResult replaced = inc.extract(nextSeg, nextSeg.length);
+        checkEquals(0, replaced.unchangedMelFrames, "replaced segment has 0 unchanged prefix frames");
+        checkMelExactMatch(melEx.extract(nextSeg, nextSeg.length), replaced.mel, "replaced segment parity");
     }
 }
