@@ -435,4 +435,112 @@ final class SpeechGainTests: XCTestCase {
         XCTAssertEqual(StreamingSpeechPlugin.mapRecordPermissionStatus(.denied), "denied")
         XCTAssertEqual(StreamingSpeechPlugin.mapRecordPermissionStatus(.undetermined), "prompt")
     }
+
+    func testRealIphone16ThirtyFourSecondAmbientSilenceAdaptsFloorAndEmitsZeroDecodes() throws {
+        // Counterexample derived from KOCA's iPhone 16 Pro Max (UDID 236E587B-47E4-5C91-9213-4D3E2B4434AD)
+        // real 34s PCM captures (p50=0.0022..0.0030 RMS, stationary 117/148/531 Hz ambient components giving
+        // hpRatio ~0.76 and 25ms autocorrelation 0.45..0.67). Prior to fix, noiseFloorRMS froze at 0.00075 and
+        // SpeechWindow stayed locked past 13.5s segmentCapacity on 19 decode calls.
+        var inbox = SpeechInbox()
+        var window = SpeechWindow()
+        var decodeCalls = 0
+        let decode: SpeechWindow.DecodeFn = { _, _ in
+            decodeCalls += 1
+            return ("嗯", [1])
+        }
+        _ = try inbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for step in 0..<340 {
+            let off = step * 1600
+            let h1 = sineWave(count: 1600, rms: 0.0016, freqHz: 117, phaseOffset: off)
+            let h2 = sineWave(count: 1600, rms: 0.0014, freqHz: 148, phaseOffset: off)
+            let h3 = sineWave(count: 1600, rms: 0.0012, freqHz: 531, phaseOffset: off)
+            let n = broadbandNoise(count: 1600, rms: 0.0016, seed: UInt64(0x16_0000 + step))
+            let chunk = (0..<1600).map { h1[$0] + h2[$0] + h3[$0] + n[$0] }
+            _ = try inbox.offer(chunk)
+            if let batch = inbox.take() {
+                try window.append(
+                    batch.samples,
+                    speech: batch.speech,
+                    trailingSilence: batch.trailingSilence,
+                    activeSamples: batch.activeSamples,
+                    noiseFloorRMS: batch.noiseFloorRMS,
+                    decode: decode
+                ) { _ in }
+            }
+        }
+        let silenceOut = try window.finish(decode: decode)
+        XCTAssertGreaterThanOrEqual(inbox.currentNoiseFloorRMS, 0.0020)
+        XCTAssertTrue(window.samples.isEmpty)
+        XCTAssertEqual(decodeCalls, 0)
+        XCTAssertEqual(silenceOut, "")
+        XCTAssertFalse(SpeechWindow.hasDecodableEnergy(in: broadbandNoise(count: 32000, rms: 0.0031), noiseFloorRMS: inbox.currentNoiseFloorRMS))
+
+        // Quiet speech (~0.0055 RMS) over the adapted iPhone 16 floor still decodes completely.
+        for step in 0..<4 {
+            _ = try inbox.offer(sineWave(count: 1600, rms: 0.0055, freqHz: 220, phaseOffset: step * 1600))
+            if let batch = inbox.take() {
+                try window.append(
+                    batch.samples,
+                    speech: batch.speech,
+                    trailingSilence: batch.trailingSilence,
+                    activeSamples: batch.activeSamples,
+                    noiseFloorRMS: batch.noiseFloorRMS,
+                    decode: decode
+                ) { _ in }
+            }
+        }
+        let spoken = try window.finish(decode: decode)
+        XCTAssertEqual(spoken, "嗯")
+        XCTAssertEqual(decodeCalls, 1)
+
+        // Elevated room floor (~0.0055 RMS, e.g. iPhone 16 room/AC noise above legacy 0.0048 ceiling)
+        // must also adapt instead of freezing near 0.0006, producing 0 decodes across 20s while
+        // soft speech (~0.012 RMS) above that floor still decodes.
+        var elevInbox = SpeechInbox()
+        var elevWindow = SpeechWindow()
+        var elevDecodes = 0
+        let elevDecode: SpeechWindow.DecodeFn = { _, _ in
+            elevDecodes += 1
+            return ("好", [2])
+        }
+        _ = try elevInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for step in 0..<200 {
+            let off = step * 1600
+            let h1 = sineWave(count: 1600, rms: 0.0030, freqHz: 117, phaseOffset: off)
+            let h2 = sineWave(count: 1600, rms: 0.0026, freqHz: 148, phaseOffset: off)
+            let h3 = sineWave(count: 1600, rms: 0.0022, freqHz: 531, phaseOffset: off)
+            let n = broadbandNoise(count: 1600, rms: 0.0030, seed: UInt64(0x16_5500 + step))
+            let chunk = (0..<1600).map { h1[$0] + h2[$0] + h3[$0] + n[$0] }
+            _ = try elevInbox.offer(chunk)
+            if let batch = elevInbox.take() {
+                try elevWindow.append(
+                    batch.samples,
+                    speech: batch.speech,
+                    trailingSilence: batch.trailingSilence,
+                    activeSamples: batch.activeSamples,
+                    noiseFloorRMS: batch.noiseFloorRMS,
+                    decode: elevDecode
+                ) { _ in }
+            }
+        }
+        XCTAssertGreaterThanOrEqual(elevInbox.currentNoiseFloorRMS, 0.0045)
+        XCTAssertEqual(try elevWindow.finish(decode: elevDecode), "")
+        XCTAssertEqual(elevDecodes, 0)
+
+        for step in 0..<4 {
+            _ = try elevInbox.offer(sineWave(count: 1600, rms: 0.012, freqHz: 220, phaseOffset: step * 1600))
+            if let batch = elevInbox.take() {
+                try elevWindow.append(
+                    batch.samples,
+                    speech: batch.speech,
+                    trailingSilence: batch.trailingSilence,
+                    activeSamples: batch.activeSamples,
+                    noiseFloorRMS: batch.noiseFloorRMS,
+                    decode: elevDecode
+                ) { _ in }
+            }
+        }
+        XCTAssertEqual(try elevWindow.finish(decode: elevDecode), "好")
+        XCTAssertEqual(elevDecodes, 1)
+    }
 }
