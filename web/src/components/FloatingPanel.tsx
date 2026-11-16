@@ -19,6 +19,7 @@ import {
   type WindowGeometry,
 } from '../desktop-window-maximize.js';
 import { RESIZE_DIRS, RESIZE_EDGE_PX, resizeHandleClass, resizeHandleHoverEvents, type ResizeDir } from './window-resize.js';
+import { startFloatingWindowDrag, startFloatingWindowResize } from './window-drag.js';
 
 interface Props {
   id: string;
@@ -229,7 +230,13 @@ export function FloatingPanel({
   }, [fitSmallViewport, isDesktopMaximized, minH, minW]);
 
   // ── Drag ─────────────────────────────────────────────────────────────────
-  const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
+  const panelElRef = useRef<HTMLDivElement | null>(null);
+  const activeInteractionCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => () => {
+    activeInteractionCleanupRef.current?.();
+    activeInteractionCleanupRef.current = null;
+  }, []);
 
   const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
     const clamped = clampGeomToViewport({ x, y, w, h }, minW, minH, fitSmallViewport);
@@ -242,25 +249,21 @@ export function FloatingPanel({
       return;
     }
     if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable], a')) return;
-    dragStart.current = { mx: e.clientX, my: e.clientY, ox: geomRef.current.x, oy: geomRef.current.y };
-    onFocus?.();
-    const onMove = (me: MouseEvent) => {
-      if (!dragStart.current) return;
-      const dx = me.clientX - dragStart.current.mx;
-      const dy = me.clientY - dragStart.current.my;
-      setGeom((g) => {
-        const { x, y } = clampPos(dragStart.current!.ox + dx, dragStart.current!.oy + dy, g.w);
-        return { ...g, x, y };
-      });
-    };
-    const onUp = () => {
-      dragStart.current = null;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
     e.preventDefault();
+    activeInteractionCleanupRef.current?.();
+    onFocus?.();
+    const cancel = startFloatingWindowDrag({
+      element: panelElRef.current,
+      startX: e.clientX,
+      startY: e.clientY,
+      origin: geomRef.current,
+      clampPos: (x, y, w, h) => clampPos(x, y, w, h),
+      onCommit: (x, y) => {
+        activeInteractionCleanupRef.current = null;
+        setGeom((g) => (g.x === x && g.y === y ? g : { ...g, x, y }));
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
   }, [isDesktopMaximized, onFocus, clampPos]);
 
   // ── Resize ───────────────────────────────────────────────────────────────
@@ -272,14 +275,14 @@ export function FloatingPanel({
     e.stopPropagation();
     e.preventDefault();
     if (isDesktopMaximized) return;
+    activeInteractionCleanupRef.current?.();
     onFocus?.();
     setResizingDir(dir);
     const startG = { ...geomRef.current };
-    const sx = e.clientX, sy = e.clientY;
-    const onMove = (me: MouseEvent) => {
-      const dx = me.clientX - sx;
-      const dy = me.clientY - sy;
-      setGeom(() => {
+    const cancel = startFloatingWindowResize({
+      startX: e.clientX,
+      startY: e.clientY,
+      computeGeometry: (dx, dy) => {
         const bounds = currentViewportBounds(minW, minH, fitSmallViewport);
         const eff = effectiveMinimumSize(bounds, minW, minH, fitSmallViewport);
         let { x, y, w, h } = { ...startG };
@@ -298,15 +301,14 @@ export function FloatingPanel({
           h = startBottom - y;
         }
         return clampGeomToViewport({ x, y, w, h }, minW, minH, fitSmallViewport);
-      });
-    };
-    const onUp = () => {
-      setResizingDir(null);
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+      },
+      onUpdate: (next) => setGeom(next),
+      onEnd: () => {
+        activeInteractionCleanupRef.current = null;
+        setResizingDir(null);
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
   }, [fitSmallViewport, isDesktopMaximized, minH, minW, onFocus]);
 
   const onMaximizeClick = useCallback(() => {
@@ -407,6 +409,7 @@ export function FloatingPanel({
     : geom;
   return (
     <div
+      ref={panelElRef}
       className={['floating-panel', resizingDir ? 'is-resizing' : '', className].filter(Boolean).join(' ')}
       data-testid={`floating-panel-${id}`}
       style={{
@@ -431,7 +434,7 @@ export function FloatingPanel({
         style={{
           display: 'flex', alignItems: 'center', gap: 8,
           padding: '6px 12px', background: '#1e293b', cursor: isDesktopMaximized ? 'default' : 'grab',
-          borderBottom: '1px solid #334155', flexShrink: 0, userSelect: 'none',
+          borderBottom: '1px solid #334155', flexShrink: 0, userSelect: 'none', WebkitUserSelect: 'none',
         }}
       >
         <span
