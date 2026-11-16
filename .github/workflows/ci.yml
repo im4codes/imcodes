@@ -94,16 +94,16 @@ jobs:
   # ── Daemon unit tests ─────────────────────────────────────────────────────
 
   unit-tests:
-    name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/4)
+    name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/6)
     runs-on: ubuntu-latest
     # Keep both Node versions and every daemon test; split across runners instead of increasing per-runner workers.
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 12
       matrix:
         node: ['22', '24']
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout
         id: checkout_1
@@ -149,7 +149,7 @@ jobs:
           cache: 'npm'
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit -- --shard=${{ matrix.shard }}/4
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/6
 
   preview-dist-smoke:
     name: Preview Dist Smoke
@@ -191,15 +191,15 @@ jobs:
   # ── macOS daemon unit tests ─────────────────────────────────────────────
 
   macos-unit-tests:
-    name: Unit Tests (macOS, shard ${{ matrix.shard }}/3)
+    name: Unit Tests (macOS, shard ${{ matrix.shard }}/4)
     runs-on: macos-latest
-    # The measured 15–19 minute critical path is three disjoint shards, with all platform tests retained.
+    # The measured critical path is four disjoint shards, with all platform tests retained.
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 4
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -212,7 +212,7 @@ jobs:
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit -- --shard=${{ matrix.shard }}/3
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/4
 
   # ── macOS remote-desktop components (built from the immutable SDK) ────────
 
@@ -703,9 +703,9 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 6
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -721,7 +721,7 @@ jobs:
         run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - name: Run coverage shard
-        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/4 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default
+        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/6 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default
         env:
           # Shards only need JSON input for the merge; final reports are made
           # once by the merge job, avoiding four lcov/text/reporting passes.
@@ -771,6 +771,16 @@ jobs:
         with:
           name: coverage-shard-4
           path: coverage/shards/shard-4
+      - name: Download coverage shard 5
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-5
+          path: coverage/shards/shard-5
+      - name: Download coverage shard 6
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-6
+          path: coverage/shards/shard-6
       - name: Merge coverage reports
         run: npm run coverage:merge -- coverage/shards coverage
       - name: Write coverage summary and enforce thresholds
@@ -1841,8 +1851,6 @@ jobs:
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
             SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           load: true
           push: false
 
@@ -1955,8 +1963,6 @@ jobs:
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
             SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           push: true
 
       - name: Write immutable release metadata
