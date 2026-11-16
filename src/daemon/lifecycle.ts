@@ -914,10 +914,8 @@ export async function startup(): Promise<DaemonContext> {
     const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
     const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
     setServerLinkDisconnectSecurityHandler(() => {
-      // A server restart/disconnect ends private sessions; no automatic restore.
-      const projects = new Set(listSessions().filter(isIncognitoSession).map(record => record.projectName));
-      for (const project of projects) void stopProject(project, serverLink).catch(() => {});
-
+      // Incognito sessions live in RAM only and must stay open across transient
+      // server WS disconnects/reconnects until the user manually closes them.
       for (const ownerId of new Set([...capabilityServicesByOwner.keys(), ...capabilitySyncServicesByOwner.keys()])) {
         clearCapabilityAuthorizationKeys(ownerId, serverId);
       }
@@ -1115,11 +1113,13 @@ export async function startup(): Promise<DaemonContext> {
             continue;
           }
           const id = session.name.slice('deck_sub_'.length);
+          const incognito = isIncognitoSession(session);
           const transportRuntime = getTransportRuntime(session.name);
           try {
             serverLink.send({
               type: 'subsession.sync',
               id,
+              ...(incognito ? { incognito: true } : {}),
               sessionInstanceId: session.sessionInstanceId ?? null,
               runtimeEpoch: session.runtimeEpoch ?? null,
               // Including state here fixes "sidebar sub-session dot stuck
@@ -1129,14 +1129,14 @@ export async function startup(): Promise<DaemonContext> {
               sessionType,
               cwd: session.projectDir || null,
               label: session.label ?? null,
-              ccSessionId: session.ccSessionId ?? null,
-              geminiSessionId: session.geminiSessionId ?? null,
+              ccSessionId: incognito ? null : (session.ccSessionId ?? null),
+              geminiSessionId: incognito ? null : (session.geminiSessionId ?? null),
               parentSession: session.parentSession ?? null,
               ccPresetId: session.ccPreset ?? null,
               description: session.description ?? null,
               runtimeType: session.runtimeType ?? null,
               providerId: session.providerId ?? null,
-              providerSessionId: session.providerSessionId ?? null,
+              providerSessionId: incognito ? null : (session.providerSessionId ?? null),
               qwenModel: session.qwenModel ?? null,
               qwenAuthType: session.qwenAuthType ?? null,
               qwenAvailableModels: session.qwenAvailableModels ?? null,

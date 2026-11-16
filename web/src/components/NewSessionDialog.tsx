@@ -1,4 +1,5 @@
 import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
+import { scopeIncognitoTimelineCacheKey, setIncognitoTimelineKeyActive } from '../incognito-session-registry.js';
 import { useState, useEffect, useMemo, useRef } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
@@ -373,6 +374,9 @@ export function NewSessionDialog({
           } catch {
             onToast?.(t('session.identityCreateApplyFailed'));
           }
+        }
+        if (incognito) {
+          setIncognitoTimelineKeyActive(scopeIncognitoTimelineCacheKey(serverId, sessionName), true);
         }
         onSessionStarted(sessionName);
         onClose();
