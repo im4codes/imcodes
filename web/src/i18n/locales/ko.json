@@ -1597,7 +1597,11 @@
     "release_to_cancel": "놓아서 녹음 취소",
     "release_to_edit": "놓아서 텍스트 편집",
     "ended": "녹음이 종료됨",
-    "no_speech": "음성이 감지되지 않음"
+    "no_speech": "음성이 감지되지 않음",
+    "engine_label": "음성 인식 엔진",
+    "engine_builtin": "기본 모델",
+    "engine_apple": "Apple 기본",
+    "engine_system": "시스템 기본"
   },
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",

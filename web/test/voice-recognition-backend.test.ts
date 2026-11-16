@@ -3,13 +3,36 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const bridges = vi.hoisted(() => ({ legacy: {}, streaming: {}, register: vi.fn() }));
 vi.mock('@capgo/capacitor-speech-recognition', () => ({ SpeechRecognition: bridges.legacy }));
 vi.mock('@capacitor/core', () => ({ registerPlugin: bridges.register.mockReturnValue(bridges.streaming) }));
-afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
+afterEach(() => { localStorage.clear(); vi.unstubAllGlobals(); vi.resetModules(); });
 describe('shared native voice bridge', () => {
   it.each(['android', 'ios'])('uses offline streaming on a new %s shell', async platform => {
     vi.stubGlobal('Capacitor', { getPlatform: () => platform, isPluginAvailable: (name: string) => name === 'StreamingSpeech' });
-    const { getNativeSpeechRecognition } = await import('../src/voice-recognition-backend.js');
+    const { getNativeSpeechRecognition, getVoiceRecognitionEngine } = await import('../src/voice-recognition-backend.js');
+    expect(getVoiceRecognitionEngine()).toBe('builtin');
     expect(getNativeSpeechRecognition()).toBe(bridges.streaming);
     expect(bridges.register).toHaveBeenCalledWith('StreamingSpeech');
+  });
+  it.each(['android', 'ios'])('switches between builtin and system/Apple recognizer on %s when persisted', async platform => {
+    vi.stubGlobal('Capacitor', { getPlatform: () => platform, isPluginAvailable: (name: string) => name === 'StreamingSpeech' });
+    const {
+      VOICE_ENGINE_STORAGE_KEY,
+      getNativeSpeechRecognition,
+      getVoiceRecognitionEngine,
+      isIosNativePlatform,
+      setVoiceRecognitionEngine,
+    } = await import('../src/voice-recognition-backend.js');
+    expect(isIosNativePlatform()).toBe(platform === 'ios');
+    expect(getNativeSpeechRecognition()).toBe(bridges.streaming);
+
+    setVoiceRecognitionEngine('system');
+    expect(localStorage.getItem(VOICE_ENGINE_STORAGE_KEY)).toBe('system');
+    expect(getVoiceRecognitionEngine()).toBe('system');
+    expect(getNativeSpeechRecognition()).toBe(bridges.legacy);
+
+    setVoiceRecognitionEngine('builtin');
+    expect(localStorage.getItem(VOICE_ENGINE_STORAGE_KEY)).toBe('builtin');
+    expect(getVoiceRecognitionEngine()).toBe('builtin');
+    expect(getNativeSpeechRecognition()).toBe(bridges.streaming);
   });
   it.each(['en-US', 'ja-JP', 'zh-TW', 'fr-FR', 'ru-RU'])('uses multilingual offline recognition for %s', async language => {
     vi.stubGlobal('navigator', { language });
@@ -19,7 +42,9 @@ describe('shared native voice bridge', () => {
   });
   it('keeps an old native binary functional after a web-only update', async () => {
     vi.stubGlobal('Capacitor', { isPluginAvailable: () => false });
-    const { getNativeSpeechRecognition } = await import('../src/voice-recognition-backend.js');
+    const { getNativeSpeechRecognition, setVoiceRecognitionEngine } = await import('../src/voice-recognition-backend.js');
+    expect(getNativeSpeechRecognition()).toBe(bridges.legacy);
+    setVoiceRecognitionEngine('builtin');
     expect(getNativeSpeechRecognition()).toBe(bridges.legacy);
   });
   it('does not assume native registration in browsers or older bridge versions', async () => {

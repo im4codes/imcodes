@@ -1597,7 +1597,11 @@
     "release_to_cancel": "Release to cancel recording",
     "release_to_edit": "Release to edit text",
     "ended": "Recording stopped",
-    "no_speech": "No speech detected"
+    "no_speech": "No speech detected",
+    "engine_label": "Speech engine",
+    "engine_builtin": "Built-in model",
+    "engine_apple": "Apple Speech",
+    "engine_system": "System Speech"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",

@@ -45,6 +45,42 @@ interface NotepadReview {
   transcript: string;
 }
 
+type VoiceEngine = 'builtin' | 'system';
+
+function readCanSwitchVoiceEngine(): boolean {
+  return Object.prototype.hasOwnProperty.call(VoiceInput, 'canSwitchVoiceEngine')
+    && typeof (VoiceInput as { canSwitchVoiceEngine?: () => boolean }).canSwitchVoiceEngine === 'function'
+    ? (VoiceInput as { canSwitchVoiceEngine: () => boolean }).canSwitchVoiceEngine()
+    : false;
+}
+
+function readVoiceEngine(): VoiceEngine {
+  return Object.prototype.hasOwnProperty.call(VoiceInput, 'getVoiceRecognitionEngine')
+    && typeof (VoiceInput as { getVoiceRecognitionEngine?: () => VoiceEngine }).getVoiceRecognitionEngine === 'function'
+    ? (VoiceInput as { getVoiceRecognitionEngine: () => VoiceEngine }).getVoiceRecognitionEngine()
+    : 'builtin';
+}
+
+function writeVoiceEngine(engine: VoiceEngine): void {
+  if (
+    Object.prototype.hasOwnProperty.call(VoiceInput, 'setVoiceRecognitionEngine')
+    && typeof (VoiceInput as { setVoiceRecognitionEngine?: (next: VoiceEngine) => void }).setVoiceRecognitionEngine === 'function'
+  ) {
+    (VoiceInput as { setVoiceRecognitionEngine: (next: VoiceEngine) => void }).setVoiceRecognitionEngine(engine);
+  }
+}
+
+function readIsIosPlatform(): boolean {
+  if (
+    Object.prototype.hasOwnProperty.call(VoiceInput, 'isIosNativePlatform')
+    && typeof (VoiceInput as { isIosNativePlatform?: () => boolean }).isIosNativePlatform === 'function'
+  ) {
+    return (VoiceInput as { isIosNativePlatform: () => boolean }).isIosNativePlatform();
+  }
+  const capacitor = (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
+  return capacitor?.getPlatform?.() === 'ios';
+}
+
 const BAR_COUNT = 48;
 export const VOICE_HOLD_MS = 350;
 export const VOICE_DOUBLE_TAP_MS = 375;
@@ -146,6 +182,12 @@ export function VoiceOverlay({
   const [sendingNotepad, setSendingNotepad] = useState(false);
   const [notepadSendFailed, setNotepadSendFailed] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const canSwitchEngine = readCanSwitchVoiceEngine();
+  const isIosPlatform = canSwitchEngine && readIsIosPlatform();
+  const [voiceEngine, setVoiceEngine] = useState<VoiceEngine>(() => readVoiceEngine());
+  const voiceEngineRef = useRef<VoiceEngine>(voiceEngine);
+  voiceEngineRef.current = voiceEngine;
+  const engineSwitchSeqRef = useRef(0);
 
   const setReview = useCallback((next: NotepadReview | null) => {
     reviewRef.current = next;
@@ -318,6 +360,10 @@ export function VoiceOverlay({
     setSendingNotepad(false);
     setNotepadSendFailed(false);
     setVoiceError(null);
+    const savedEngine = readVoiceEngine();
+    voiceEngineRef.current = savedEngine;
+    setVoiceEngine(savedEngine);
+    engineSwitchSeqRef.current++;
     voiceRetryPendingRef.current = false;
     flushingTokenRef.current = null;
     pendingFlushRef.current = null;
@@ -389,6 +435,7 @@ export function VoiceOverlay({
       notepadRef.current = false;
       openRef.current = false;
       openSeqRef.current++;
+      engineSwitchSeqRef.current++;
       sessionTokenRef.current++;
       startingTokenRef.current = null;
       voiceRetryPendingRef.current = false;
@@ -762,6 +809,46 @@ export function VoiceOverlay({
     }
   }, [beginDraft, clearRestartTimer, startSession]);
 
+  const handleEngineChange = useCallback(async (e: Event) => {
+    const raw = (e.currentTarget as HTMLSelectElement).value;
+    const nextEngine: VoiceEngine = raw === 'system' ? 'system' : 'builtin';
+    if (nextEngine === voiceEngineRef.current) return;
+
+    const switchSeq = ++engineSwitchSeqRef.current;
+    const openSeq = openSeqRef.current;
+    const wasActive = listeningRef.current
+      || startingTokenRef.current !== null
+      || restartTimerRef.current !== null
+      || pendingFlushRef.current !== null;
+
+    voiceEngineRef.current = nextEngine;
+    setVoiceEngine(nextEngine);
+    writeVoiceEngine(nextEngine);
+    setVoiceError(null);
+
+    if (!wasActive) {
+      if (
+        openRef.current
+        && Object.prototype.hasOwnProperty.call(VoiceInput, 'prewarm')
+        && typeof (VoiceInput as { prewarm?: (opts?: { requestPermission?: boolean }) => Promise<void> }).prewarm === 'function'
+      ) {
+        void (VoiceInput as { prewarm: (opts?: { requestPermission?: boolean }) => Promise<void> })
+          .prewarm({ requestPermission: false });
+      }
+      return;
+    }
+
+    pendingResumeAfterStopRef.current = false;
+    clearRestartTimer();
+    await commitAndStop(true);
+    if (!openRef.current || openSeqRef.current !== openSeq || engineSwitchSeqRef.current !== switchSeq || reviewRef.current) {
+      return;
+    }
+    const ta = taRef.current;
+    const resumeAt = ta ? Math.min(insertPosRef.current, ta.value.length) : insertPosRef.current;
+    await startSession(resumeAt);
+  }, [clearRestartTimer, commitAndStop, startSession]);
+
   // Elapsed-time clock while notepad mode is on.
   useEffect(() => {
     if (!notepad) return;
@@ -1016,6 +1103,23 @@ export function VoiceOverlay({
           )}
         </div>
         <div class="voice-overlay-actions">
+          {canSwitchEngine && !review && (
+            <select
+              class="voice-engine-select"
+              value={voiceEngine}
+              onInput={(e) => { void handleEngineChange(e); }}
+              onChange={(e) => { void handleEngineChange(e); }}
+              aria-label={t('voice.engine_label')}
+              title={t('voice.engine_label')}
+            >
+              <option value="builtin" selected={voiceEngine === 'builtin'}>
+                {t('voice.engine_builtin')}
+              </option>
+              <option value="system" selected={voiceEngine === 'system'}>
+                {t(isIosPlatform ? 'voice.engine_apple' : 'voice.engine_system')}
+              </option>
+            </select>
+          )}
           <button
             type="button"
             class={`voice-notepad-toggle${notepad ? ' voice-notepad-toggle-active' : ''}`}

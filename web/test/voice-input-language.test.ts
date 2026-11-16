@@ -428,3 +428,51 @@ describe('bounded offline cumulative committed + unfixed snapshots', () => {
     expect(result.mock.calls).toEqual([['', true]]);
   });
 });
+
+describe('voice recognition engine preference & cache switching', () => {
+  it('clears prewarm cache on engine switch so next prewarm/start resolves the newly selected engine', async () => {
+    expect(input.canSwitchVoiceEngine()).toBe(true);
+    await input.prewarm({ requestPermission: true });
+    expect(bridges.streaming.requestPermissions).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.requestPermissions).not.toHaveBeenCalled();
+
+    input.setVoiceRecognitionEngine('system');
+    await input.prewarm({ requestPermission: true });
+    expect(bridges.platform.requestPermissions).toHaveBeenCalledTimes(1);
+
+    expect(await input.startListening(vi.fn())).toBe(true);
+    expect(bridges.platform.start).toHaveBeenCalledTimes(1);
+    expect(bridges.streaming.start).not.toHaveBeenCalled();
+  });
+
+  it('prevents an in-flight prewarm from poisoning cache after switching engines', async () => {
+    let releaseAvail!: (v: { available: boolean }) => void;
+    bridges.streaming.available.mockReturnValueOnce(new Promise((resolve) => { releaseAvail = resolve; }));
+
+    const firstPrewarm = input.prewarm({ requestPermission: false });
+    await vi.waitFor(() => expect(bridges.streaming.available).toHaveBeenCalledTimes(1));
+
+    input.setVoiceRecognitionEngine('system');
+    const secondPrewarm = input.prewarm({ requestPermission: false });
+    releaseAvail({ available: true });
+
+    await Promise.all([firstPrewarm, secondPrewarm]);
+    expect(bridges.platform.available).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not silently swap back to StreamingSpeech when system mode fails or is unavailable', async () => {
+    input.setVoiceRecognitionEngine('system');
+    bridges.platform.start.mockRejectedValueOnce(new Error('system recognizer unavailable'));
+    const onError = vi.fn();
+    expect(await input.startListening(vi.fn(), undefined, onError)).toBe(false);
+    expect(bridges.streaming.start).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith('system recognizer unavailable');
+  });
+
+  it('reports canSwitchVoiceEngine false when offline plugin is unavailable or on non-native browsers', () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true, isPluginAvailable: () => false });
+    expect(input.canSwitchVoiceEngine()).toBe(false);
+    vi.stubGlobal('Capacitor', undefined);
+    expect(input.canSwitchVoiceEngine()).toBe(false);
+  });
+});

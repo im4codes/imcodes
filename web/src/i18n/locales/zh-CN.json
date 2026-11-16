@@ -1597,7 +1597,11 @@
     "release_to_cancel": "松手取消录音",
     "release_to_edit": "松手进入编辑",
     "ended": "录音已结束",
-    "no_speech": "未检测到语音"
+    "no_speech": "未检测到语音",
+    "engine_label": "语音识别引擎",
+    "engine_builtin": "自带模型",
+    "engine_apple": "苹果原生",
+    "engine_system": "系统原生"
   },
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",

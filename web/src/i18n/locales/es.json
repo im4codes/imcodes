@@ -1597,7 +1597,11 @@
     "release_to_cancel": "Suelta para cancelar la grabación",
     "release_to_edit": "Suelta para editar el texto",
     "ended": "Grabación detenida",
-    "no_speech": "No se detectó voz"
+    "no_speech": "No se detectó voz",
+    "engine_label": "Motor de voz",
+    "engine_builtin": "Modelo local",
+    "engine_apple": "Voz de Apple",
+    "engine_system": "Voz del sistema"
   },
   "p2p": {
     "final_original_request_reminder": "No te quedes solo en el resumen de la discusión. Después de sintetizarla, asegúrate de responder y ejecutar directamente la solicitud original del usuario.\nLa solicitud original del usuario es: \"{{request}}\"",

@@ -1597,7 +1597,11 @@
     "release_to_cancel": "放開取消錄音",
     "release_to_edit": "放開進入編輯",
     "ended": "錄音已結束",
-    "no_speech": "未偵測到語音"
+    "no_speech": "未偵測到語音",
+    "engine_label": "語音辨識引擎",
+    "engine_builtin": "內建模型",
+    "engine_apple": "Apple 原生",
+    "engine_system": "系統原生"
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",
