@@ -82,7 +82,7 @@ describe('macOS raw (libvpx) video path wiring', () => {
     it('offers VP9/VP8 only on a Mac that may send them; every other Mac still offers exactly H.264', () => {
       expect(factory).toMatch(/if \(!raw_codecs_allowed\(\)\) return \{h264\};/);
       expect(factory).toContain('return {webrtc::SdpVideoFormat::VP9Profile0(), webrtc::SdpVideoFormat::VP8(),\n            h264};');
-      expect(factory).toContain('binder_->raw_video()->raw_codecs_allowed()');
+      expect(factory).toContain('raw_->raw_codecs_allowed()');
       // The libvpx encoders are only created inside the allowed branch; the default is the passthrough.
       const create = factory.slice(factory.indexOf('Create('));
       expect(create.indexOf('if (raw_codecs_allowed())')).toBeLessThan(create.indexOf('CreateVp9Encoder'));
@@ -99,7 +99,7 @@ describe('macOS raw (libvpx) video path wiring', () => {
     it('reports the network target to the session after upstream applied it, and counts encoded bytes', () => {
       const setRates = tap.slice(tap.indexOf('void SetRates('), tap.indexOf('void OnPacketLossRateUpdate'));
       expect(setRates.indexOf('inner_->SetRates(parameters)')).toBeGreaterThanOrEqual(0);
-      expect(setRates.indexOf('inner_->SetRates(parameters)')).toBeLessThan(setRates.indexOf('adapter_->ReportQualityTarget('));
+      expect(setRates.indexOf('inner_->SetRates(parameters)')).toBeLessThan(setRates.indexOf('adapter->ReportQualityTarget('));
       expect(setRates).toContain('parameters.bitrate.get_sum_bps()');
       expect(tap).toContain('raw->AddAcceptedBytes(encoded_image.size())');
       // Every other call is forwarded untouched, so libwebrtc keeps owning the encode.
