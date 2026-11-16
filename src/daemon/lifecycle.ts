@@ -196,6 +196,27 @@ export function createSupervisionHeartbeatProjectionSyncHandler(deps: {
   };
 }
 
+/**
+ * Create the ServerLink disconnect security handler used during daemon startup.
+ * Incognito sessions live in RAM only and must stay open across transient
+ * server WS disconnects/reconnects until manually closed — only capability
+ * authorization trust anchors are cleared on link drop.
+ */
+export function createServerLinkDisconnectSecurityHandler(deps: {
+  serverId: string;
+  capabilityServicesByOwner: Pick<Map<string, unknown>, 'keys'>;
+  capabilitySyncServicesByOwner: Pick<Map<string, unknown>, 'keys'>;
+}): () => void {
+  return () => {
+    for (const ownerId of new Set([
+      ...deps.capabilityServicesByOwner.keys(),
+      ...deps.capabilitySyncServicesByOwner.keys(),
+    ])) {
+      clearCapabilityAuthorizationKeys(ownerId, deps.serverId);
+    }
+  };
+}
+
 let supervisionConsole: SupervisionConsoleBinding | undefined;
 
 /** Exposed for diagnostics/tests; undefined until the link is bound. */
@@ -913,13 +934,11 @@ export async function startup(): Promise<DaemonContext> {
     const capabilitySourceConvergenceStore = new CapabilitySourceConvergenceStore();
     const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
     const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
-    setServerLinkDisconnectSecurityHandler(() => {
-      // Incognito sessions live in RAM only and must stay open across transient
-      // server WS disconnects/reconnects until the user manually closes them.
-      for (const ownerId of new Set([...capabilityServicesByOwner.keys(), ...capabilitySyncServicesByOwner.keys()])) {
-        clearCapabilityAuthorizationKeys(ownerId, serverId);
-      }
-    });
+    setServerLinkDisconnectSecurityHandler(createServerLinkDisconnectSecurityHandler({
+      serverId,
+      capabilityServicesByOwner,
+      capabilitySyncServicesByOwner,
+    }));
     const capabilitySyncServiceForOwner = (ownerId: string): CapabilitySyncService => {
       let service = capabilitySyncServicesByOwner.get(ownerId);
       if (!service) {
