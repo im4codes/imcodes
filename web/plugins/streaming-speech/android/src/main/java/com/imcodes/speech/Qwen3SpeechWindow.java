@@ -23,6 +23,12 @@ public final class Qwen3SpeechWindow {
     public static final int UNFIXED_TOKEN_NUM = 5;
     public static final int PUNCTUATION_PAUSE = SAMPLE_RATE * 4 / 10; // 400ms
     public static final int VAD_PAUSE = SAMPLE_RATE * 7 / 10; // 700ms
+    public static final int ONSET_CONFIRM_SAMPLES = SAMPLE_RATE * 15 / 100; // 150ms sustained speech before locking window
+    public static final int ONSET_CLEAR_SILENCE_SAMPLES = SAMPLE_RATE / 10; // 100ms unvoiced gap clears unconfirmed onset
+    public static final float ONSET_BYPASS_RMS = 0.05f; // Normal handheld speech opens window immediately
+    public static final float MIN_DECODE_WINDOW_RMS = 0.0024f; // Skip decoder call if no 200ms window reaches soft-speech energy
+    public static final int DECODE_ENERGY_WINDOW_SAMPLES = SAMPLE_RATE * 2 / 10; // 200ms @ 16 kHz
+    public static final int DECODE_ENERGY_HOP_SAMPLES = SAMPLE_RATE / 10; // 100ms hop @ 16 kHz
 
     public static final class DecodeResult {
         public final String text;
@@ -66,6 +72,90 @@ public final class Qwen3SpeechWindow {
     private int newSamples = 0;
     private int silentSamples = 0;
     private String lastEmitted = "";
+    private float[] pendingOnset = new float[8192];
+    private int pendingOnsetCount = 0;
+    private int pendingOnsetActiveSamples = 0;
+    private int pendingOnsetSilenceSamples = 0;
+
+    private void appendPendingOnset(float[] chunk) {
+        if (pendingOnsetCount + chunk.length > pendingOnset.length) {
+            int nextCap = Math.max(pendingOnset.length * 2, pendingOnsetCount + chunk.length);
+            pendingOnset = Arrays.copyOf(pendingOnset, nextCap);
+        }
+        System.arraycopy(chunk, 0, pendingOnset, pendingOnsetCount, chunk.length);
+        pendingOnsetCount += chunk.length;
+    }
+
+    private void clearPendingOnset() {
+        pendingOnsetCount = 0;
+        pendingOnsetActiveSamples = 0;
+        pendingOnsetSilenceSamples = 0;
+    }
+
+    private static float rms(float[] samples, int count) {
+        int n = Math.min(samples.length, Math.max(0, count));
+        if (n <= 0) return 0.0f;
+        double sumSq = 0.0;
+        for (int i = 0; i < n; i++) {
+            float v = samples[i];
+            if (Float.isFinite(v)) {
+                double dv = v;
+                sumSq += dv * dv;
+            }
+        }
+        return (float) Math.sqrt(sumSq / n);
+    }
+
+    public static boolean hasDecodableEnergy(float[] audio, int count) {
+        int n = Math.min(audio.length, Math.max(0, count));
+        if (n <= 0) return false;
+        double threshSq = (double) MIN_DECODE_WINDOW_RMS * MIN_DECODE_WINDOW_RMS;
+        int win = DECODE_ENERGY_WINDOW_SAMPLES;
+        if (n <= win) {
+            double sumSq = 0.0;
+            for (int i = 0; i < n; i++) {
+                float v = audio[i];
+                if (Float.isFinite(v)) {
+                    double dv = v;
+                    sumSq += dv * dv;
+                }
+            }
+            return (sumSq / n) >= threshSq;
+        }
+        int hop = DECODE_ENERGY_HOP_SAMPLES;
+        double prevSum = 0.0;
+        int prevCount = 0;
+        int pos = 0;
+        while (pos < n) {
+            int end = Math.min(n, pos + hop);
+            double blockSum = 0.0;
+            for (int i = pos; i < end; i++) {
+                float v = audio[i];
+                if (Float.isFinite(v)) {
+                    double dv = v;
+                    blockSum += dv * dv;
+                }
+            }
+            int blockCount = end - pos;
+            int totalCount = prevCount + blockCount;
+            if (totalCount > 0 && ((prevSum + blockSum) / totalCount) >= threshSq) {
+                return true;
+            }
+            prevSum = blockSum;
+            prevCount = blockCount;
+            pos = end;
+        }
+        int tailStart = Math.max(0, n - win);
+        double tailSum = 0.0;
+        for (int i = tailStart; i < n; i++) {
+            float v = audio[i];
+            if (Float.isFinite(v)) {
+                double dv = v;
+                tailSum += dv * dv;
+            }
+        }
+        return (tailSum / (n - tailStart)) >= threshSq;
+    }
 
     public static int[] defaultRollbackPrefix(int[] tokens, int rollbackCount) {
         if (tokens == null) return new int[0];
@@ -159,18 +249,58 @@ public final class Qwen3SpeechWindow {
         DecodeFn decode,
         Consumer<String> emit
     ) {
-        if (input == null || input.length == 0 || (sampleCount == 0 && !speech)) {
+        if (input == null || input.length == 0) {
             return;
+        }
+        float[] src;
+        if (sampleCount == 0) {
+            if (!speech) {
+                if (pendingOnsetCount == 0) {
+                    return;
+                }
+                appendPendingOnset(input);
+                pendingOnsetSilenceSamples += input.length;
+                pendingOnsetActiveSamples = Math.max(0, pendingOnsetActiveSamples - input.length / 2);
+                if (pendingOnsetSilenceSamples >= ONSET_CLEAR_SILENCE_SAMPLES || pendingOnsetActiveSamples == 0) {
+                    clearPendingOnset();
+                }
+                return;
+            }
+            int silentEnd = Math.min(input.length, Math.max(0, trailingSilence));
+            int activeInChunk = Math.max(0, input.length - silentEnd);
+            boolean bypassOnset = rms(input, input.length) >= ONSET_BYPASS_RMS;
+            if (pendingOnsetCount == 0 && (bypassOnset || activeInChunk >= ONSET_CONFIRM_SAMPLES)) {
+                src = input;
+            } else {
+                appendPendingOnset(input);
+                if (activeInChunk > 0) {
+                    pendingOnsetActiveSamples += activeInChunk;
+                    pendingOnsetSilenceSamples = silentEnd;
+                } else {
+                    pendingOnsetSilenceSamples += input.length;
+                }
+                boolean promoted = bypassOnset || pendingOnsetActiveSamples >= ONSET_CONFIRM_SAMPLES;
+                if (!promoted) {
+                    if (pendingOnsetSilenceSamples >= ONSET_CLEAR_SILENCE_SAMPLES) {
+                        clearPendingOnset();
+                    }
+                    return;
+                }
+                src = Arrays.copyOf(pendingOnset, pendingOnsetCount);
+                clearPendingOnset();
+            }
+        } else {
+            src = input;
         }
         RollbackFn rollbackFn = rollbackPrefix != null ? rollbackPrefix : Qwen3SpeechWindow::defaultRollbackPrefix;
         int offset = 0;
-        int remaining = input.length;
+        int remaining = src.length;
 
         while (sampleCount + remaining > SEGMENT_CAPACITY) {
             if (!shouldContinue.getAsBoolean()) throw new CancelledException();
             int takeCount = Math.max(0, SEGMENT_CAPACITY - sampleCount);
             if (takeCount > 0) {
-                System.arraycopy(input, offset, samples, sampleCount, takeCount);
+                System.arraycopy(src, offset, samples, sampleCount, takeCount);
                 offset += takeCount;
                 remaining -= takeCount;
                 sampleCount += takeCount;
@@ -194,7 +324,7 @@ public final class Qwen3SpeechWindow {
         if (remaining <= 0) return;
         if (!shouldContinue.getAsBoolean()) throw new CancelledException();
 
-        System.arraycopy(input, offset, samples, sampleCount, remaining);
+        System.arraycopy(src, offset, samples, sampleCount, remaining);
         sampleCount += remaining;
         newSamples += remaining;
         advanceSilence(remaining, speech, trailingSilence, 0);
@@ -232,6 +362,15 @@ public final class Qwen3SpeechWindow {
 
     public String finish(BooleanSupplier shouldContinue, RollbackFn rollbackPrefix, DecodeFn decode) {
         RollbackFn rollbackFn = rollbackPrefix != null ? rollbackPrefix : Qwen3SpeechWindow::defaultRollbackPrefix;
+        if (sampleCount == 0 && pendingOnsetCount > 0) {
+            if (pendingOnsetActiveSamples >= ONSET_CONFIRM_SAMPLES || rms(pendingOnset, pendingOnsetCount) >= ONSET_BYPASS_RMS) {
+                int copyCount = Math.min(pendingOnsetCount, SEGMENT_CAPACITY);
+                System.arraycopy(pendingOnset, 0, samples, 0, copyCount);
+                sampleCount = copyCount;
+                newSamples = copyCount;
+            }
+            clearPendingOnset();
+        }
         if (newSamples > 0) {
             float[] padded = new float[sampleCount + FINAL_SILENCE_PADDING];
             System.arraycopy(samples, 0, padded, 0, sampleCount);
@@ -273,6 +412,11 @@ public final class Qwen3SpeechWindow {
         DecodeFn decode
     ) {
         if (!shouldContinue.getAsBoolean()) throw new CancelledException();
+        if (!hasDecodableEnergy(audio, audioLen)) {
+            partial = "";
+            newSamples = 0;
+            return;
+        }
         int[] prefixTokens = (allowPrefix && chunkCount >= UNFIXED_CHUNK_NUM)
             ? rollbackPrefix.rollback(activeTokens, UNFIXED_TOKEN_NUM)
             : new int[0];
@@ -297,6 +441,7 @@ public final class Qwen3SpeechWindow {
         sampleCount = 0;
         newSamples = 0;
         silentSamples = 0;
+        clearPendingOnset();
     }
 
     public static boolean endsSentence(String text) {

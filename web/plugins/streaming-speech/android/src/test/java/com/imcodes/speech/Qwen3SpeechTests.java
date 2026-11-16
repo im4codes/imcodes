@@ -34,6 +34,7 @@ public final class Qwen3SpeechTests {
         testSpeechInboxWarmupThrottleOverload();
         testSpeechWindowPrefixRollbackAndVad();
         testSpeechWindowLowestEnergySplit();
+        testSilencePreOnsetAndDecodeEnergyGuard();
         testOnnxDecoderPureHelpers();
         testLanguagePromptMappingAndEncoding();
         testPretokenizePatternAndMultiScript();
@@ -420,6 +421,46 @@ public final class Qwen3SpeechTests {
         float[] uniform = new float[cap];
         Arrays.fill(uniform, 0.25f);
         checkEquals(cap, Qwen3SpeechWindow.lowestEnergySplitIndex(uniform, cap), "uniform signal splits at end");
+    }
+
+    private static void testSilencePreOnsetAndDecodeEnergyGuard() {
+        Qwen3SpeechWindow noiseWindow = new Qwen3SpeechWindow();
+        int[] decodeCalls = new int[] { 0 };
+        Qwen3SpeechWindow.DecodeFn countingDecode = (pcm, count, prefix) -> {
+            decodeCalls[0]++;
+            return new Qwen3SpeechWindow.DecodeResult("嗯", new int[] { 99 });
+        };
+
+        // Brief 100ms low-level click (< 150ms onset confirm) followed by 200ms silence must discard without opening window.
+        float[] briefLow = new float[1600];
+        Arrays.fill(briefLow, 0.0025f);
+        float[] gap = new float[3200];
+        noiseWindow.append(briefLow, true, 0, false, () -> true, () -> true, Qwen3SpeechWindow::defaultRollbackPrefix, countingDecode, s -> {});
+        noiseWindow.append(gap, false, gap.length, false, () -> true, () -> true, Qwen3SpeechWindow::defaultRollbackPrefix, countingDecode, s -> {});
+        checkEquals(0, noiseWindow.getSampleCount(), "brief low-level transient cleared before opening window");
+        checkEquals("", noiseWindow.finish(() -> true, Qwen3SpeechWindow::defaultRollbackPrefix, countingDecode), "transient must not emit text");
+        checkEquals(0, decodeCalls[0], "transient burst must not invoke decoder");
+
+        // Pre-decode acoustic energy guard rejects flat room noise and accepts genuine 200ms quiet speech.
+        float[] flatNoise = new float[32000];
+        Arrays.fill(flatNoise, 0.0008f);
+        check(!Qwen3SpeechWindow.hasDecodableEnergy(flatNoise, flatNoise.length), "flat low-energy noise fails energy guard");
+        float[] quietWord = new float[3200];
+        for (int i = 0; i < quietWord.length; i++) {
+            quietWord[i] = (float) (0.0025 * Math.sqrt(2.0) * Math.sin(2.0 * Math.PI * 220.0 * i / 16000.0));
+        }
+        check(Qwen3SpeechWindow.hasDecodableEnergy(quietWord, quietWord.length), "200ms quiet speech passes energy guard");
+
+        Qwen3SpeechWindow quietWindow = new Qwen3SpeechWindow();
+        int[] decodedLengths = new int[1];
+        Qwen3SpeechWindow.DecodeFn captureDecode = (pcm, count, prefix) -> {
+            decodedLengths[0] = count;
+            return new Qwen3SpeechWindow.DecodeResult("嗯", new int[] { 99 });
+        };
+        quietWindow.append(quietWord, true, 0, false, () -> true, () -> true, Qwen3SpeechWindow::defaultRollbackPrefix, captureDecode, s -> {});
+        String res = quietWindow.finish(() -> true, Qwen3SpeechWindow::defaultRollbackPrefix, captureDecode);
+        checkEquals("嗯", res, "genuine 200ms quiet word preserved and decoded");
+        checkEquals(3200 + Qwen3SpeechWindow.FINAL_SILENCE_PADDING, decodedLengths[0], "all 3200 quiet speech samples retained");
     }
 
     private static void testOnnxDecoderPureHelpers() {

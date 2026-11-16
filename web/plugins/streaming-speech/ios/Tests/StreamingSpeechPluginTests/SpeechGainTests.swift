@@ -360,4 +360,73 @@ final class SpeechGainTests: XCTestCase {
         XCTAssertTrue(completionOnMain)
         XCTAssertTrue(grantedResult)
     }
+
+    func testIphone16SilenceProfileAndPreOnsetGuardRejectsMicroBurstsWhileKeepingQuietSpeech() throws {
+        var gain = SpeechGain()
+        for _ in 0..<4 {
+            let zeroOut = gain.process([Float](repeating: 0, count: 400))
+            XCTAssertFalse(zeroOut.anyVoiced)
+        }
+        XCTAssertEqual(gain.noiseFloorRMS, SpeechGain.initialNoiseFloorRMS, accuracy: 1e-6,
+                       "digital zeros must not drag noiseFloorRMS down")
+
+        var inbox = SpeechInbox()
+        var window = SpeechWindow()
+        var decodeCalls = 0
+        let decode: SpeechWindow.DecodeFn = { _, _ in
+            decodeCalls += 1
+            return ("嗯", [1])
+        }
+        _ = try inbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for frame in 0..<400 {
+            let chunk: [Float]
+            if frame < 3 {
+                chunk = [Float](repeating: 0, count: 400)
+            } else if frame == 11 || frame == 12 {
+                // Brief 50ms codec settle pulse (< 150ms pre-onset confirmation)
+                chunk = sineWave(count: 400, rms: 0.0014, freqHz: 240, phaseOffset: frame * 400)
+            } else if frame == 184 || (frame >= 190 && frame <= 195) {
+                // Unpitched ambient noise bursts up to 0.0042 RMS
+                chunk = broadbandNoise(count: 400, rms: frame == 184 ? 0.0042 : 0.0021, seed: UInt64(0xCAFE_0000 + frame))
+            } else {
+                chunk = broadbandNoise(count: 400, rms: 0.00048, seed: UInt64(0xFACE_0000 + frame))
+            }
+            _ = try inbox.offer(chunk)
+            if let batch = inbox.take() {
+                try window.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decode) { _ in }
+            }
+        }
+        XCTAssertTrue(window.samples.isEmpty, "10s iPhone 16 room silence profile must never lock SpeechWindow open")
+        XCTAssertEqual(decodeCalls, 0)
+        let silenceResult = try window.finish(decode: decode)
+        XCTAssertEqual(silenceResult, "")
+        XCTAssertEqual(decodeCalls, 0)
+
+        // Pre-decode energy guard rejects flat room noise while accepting genuine quiet speech.
+        XCTAssertFalse(SpeechWindow.hasDecodableEnergy(in: broadbandNoise(count: 32000, rms: 0.0008)))
+        var speechWithSilence = [Float](repeating: 0.0004, count: 32000)
+        let wordTone = sineWave(count: 3200, rms: 0.0025, freqHz: 220)
+        speechWithSilence.replaceSubrange(16000..<19200, with: wordTone)
+        XCTAssertTrue(SpeechWindow.hasDecodableEnergy(in: speechWithSilence))
+
+        // Genuine soft word (200ms @ 0.0025 RMS) opens window cleanly with zero lost samples.
+        var speechInbox = SpeechInbox()
+        var speechWindow = SpeechWindow()
+        var decodedCounts: [Int] = []
+        let speechDecode: SpeechWindow.DecodeFn = { s, _ in
+            decodedCounts.append(s.count)
+            return ("嗯", [42])
+        }
+        _ = try speechInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for step in 0..<8 {
+            _ = try speechInbox.offer(sineWave(count: 400, rms: 0.0025, freqHz: 220, phaseOffset: step * 400))
+            if let batch = speechInbox.take() {
+                try speechWindow.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: speechDecode) { _ in }
+            }
+        }
+        XCTAssertEqual(speechWindow.samples.count, 3200)
+        let spoken = try speechWindow.finish(decode: speechDecode)
+        XCTAssertEqual(spoken, "嗯")
+        XCTAssertEqual(decodedCounts, [3200 + SpeechWindow.finalSilencePadding])
+    }
 }
