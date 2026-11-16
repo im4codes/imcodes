@@ -4,12 +4,15 @@ import {
   AGENT_MCP_ERROR,
   AGENT_MCP_LIMITS,
   AGENT_MCP_MSG,
+  AGENT_MCP_REGISTRY,
   AGENT_MCP_TRANSPORT,
   isReservedAgentMcpName,
+  parseAgentMcpRegistryServers,
   readAgentMcpRunRequest,
   type AgentMcpAgent,
   type AgentMcpAgentResult,
   type AgentMcpList,
+  type AgentMcpRegistryServer,
   type AgentMcpRunRequest,
   type AgentMcpRunResult,
   type AgentMcpServerEntry,
@@ -225,5 +228,27 @@ export async function handleAgentMcpCommand(
     send({ type: AGENT_MCP_MSG.RUN_RESPONSE, requestId, ...(await turn) });
   } catch {
     send({ type: AGENT_MCP_MSG.RUN_RESPONSE, requestId, ok: false, error: AGENT_MCP_ERROR.FAILED });
+  }
+}
+
+/** Query the official MCP Registry directly from the daemon / capability tools. */
+export async function searchAgentMcpRegistry(
+  query: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<AgentMcpRegistryServer[]> {
+  const trimmed = query.trim().slice(0, AGENT_MCP_REGISTRY.QUERY_CHARS);
+  const params = new URLSearchParams({ search: trimmed, limit: '10', version: 'latest' });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AGENT_MCP_REGISTRY.TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(`${AGENT_MCP_REGISTRY.SEARCH_URL}?${params.toString()}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`registry_http_${response.status}`);
+    const body = await response.json();
+    return parseAgentMcpRegistryServers(body);
+  } finally {
+    clearTimeout(timer);
   }
 }

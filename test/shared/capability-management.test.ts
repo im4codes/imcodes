@@ -68,8 +68,11 @@ describe('capability management shared contract', () => {
     };
     expect(install.description).toContain('compose source.kind=mcp_config');
     expect(install.description).toContain('The result is final');
+    expect(install.inputSchema.required).toEqual(['kind', 'source']);
     expect(source.properties?.kind?.description).toContain('Use mcp_config');
     expect(source.properties?.mcpConfig?.description).toContain('normal MCP install input');
+    const list = CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.LIST];
+    expect(list.inputSchema.properties?.searchRegistry).toMatchObject({ type: 'boolean' });
   });
 
   it('keeps state and management vocabularies unique and bounded', () => {

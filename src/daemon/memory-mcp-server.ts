@@ -51,6 +51,7 @@ import {
   registerCapabilityMcpTools,
   type CapabilityRuntimeIdentity,
 } from './capability-mcp-tools.js';
+import { listAgentMcp, searchAgentMcpRegistry } from './agent-mcp.js';
 import { createServerCapabilityService } from '../capability/server-capability-service.js';
 import { activateCapabilitySkill } from '../capability/capability-skill-activation.js';
 import {
@@ -680,6 +681,16 @@ export function mergeDefaultToolDeps(
             : capabilityError('Current authenticated Skill activation context is unavailable');
         },
       }) : undefined),
+    ...(toolDeps.listAgentMcp
+      ? { listAgentMcp: toolDeps.listAgentMcp }
+      : usesDefaultCapabilityService
+        ? { listAgentMcp: () => listAgentMcp() }
+        : {}),
+    ...(toolDeps.searchAgentMcpRegistry
+      ? { searchAgentMcpRegistry: toolDeps.searchAgentMcpRegistry }
+      : usesDefaultCapabilityService
+        ? { searchAgentMcpRegistry: (query: string) => searchAgentMcpRegistry(query) }
+        : {}),
     ...(resolveCapabilityIdentity ? { resolveCapabilityIdentity } : {}),
     peerAuditReply: toolDeps.peerAuditReply ?? (async (envelope) => {
       const port = await resolveHookPort();
