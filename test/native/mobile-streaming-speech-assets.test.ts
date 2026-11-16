@@ -1079,7 +1079,7 @@ do {
     print("BG_UNDECODED_SHORT:PASS")
 }
 
-// 2B. partial already emitted (>=24000) + 8000 tail backgrounded -> NO partial-as-final, error before stopped, ACK rejects
+// 2B. partial already emitted (>=SpeechWindow.stride) + 8000 tail backgrounded -> NO partial-as-final, error before stopped, ACK rejects
 do {
     let (coord, _, events) = makeHarness()
     let partialSeen = DispatchSemaphore(value: 0)
@@ -1092,7 +1092,7 @@ do {
     _ = (coord, events)
     let owner = coordB.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("partial_ok:\\(s.count)", [1, 2]) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     coordB.offerSamples(speech(320), owner: owner, now: 0.01) {}
-    coordB.offerSamples(speech(24000), owner: owner, now: 0.20) {}
+    coordB.offerSamples(speech(SpeechWindow.stride), owner: owner, now: 0.20) {}
     require(partialSeen.wait(timeout: .now() + 2) == .success, "B: initial partial never emitted")
     coordB.offerSamples(speech(8000), owner: owner, now: 0.30) {}
     coordB.setBackgrounded(true)
@@ -1123,7 +1123,7 @@ do {
         }
     }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
-    coord.offerSamples(speech(24000), owner: owner, now: 0.20) {}
+    coord.offerSamples(speech(SpeechWindow.stride), owner: owner, now: 0.20) {}
     require(decodeEntered.wait(timeout: .now() + 2) == .success, "C: decode did not enter")
     coord.setBackgrounded(true)
     releaseDecode.signal()
@@ -1174,7 +1174,7 @@ do {
         }
     }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner1, now: 0.01) {}
-    coord.offerSamples(speech(24000), owner: owner1, now: 0.20) {}
+    coord.offerSamples(speech(SpeechWindow.stride), owner: owner1, now: 0.20) {}
     require(decodeEntered.wait(timeout: .now() + 2) == .success, "E: owner1 decode did not enter")
     coord.setBackgrounded(true)
     coord.endCapture(stopAudio: {})
@@ -1397,7 +1397,7 @@ do {
                 guard cont() else { return nil }
                 seenPrefixes.append(prefix)
                 let stepTokens: [Int32] = Array(100..<(100 + Int32(s.count / 8000)))
-                let tokens = prefix.isEmpty ? stepTokens : prefix + stepTokens.suffix(3)
+                let tokens = prefix.isEmpty ? stepTokens : prefix + stepTokens.suffix(6)
                 return ("t:\\(tokens.count)", tokens)
             },
             rollbackPrefix: { tokens, n in
@@ -1408,7 +1408,7 @@ do {
     coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
     coord.worker.sync {}
     for step in 1...4 {
-        coord.offerSamples(speech(24000), owner: owner, now: TimeInterval(step)) {}
+        coord.offerSamples(speech(SpeechWindow.stride), owner: owner, now: TimeInterval(step)) {}
         coord.worker.sync {}
     }
     coord.offerSamples(speech(1600), owner: owner, now: 5.0) {}
@@ -1421,7 +1421,7 @@ do {
     require(seenPrefixes[0].isEmpty && seenPrefixes[1].isEmpty, "K: first 2 chunks must not lock prefix: \\(seenPrefixes)")
     require(!seenPrefixes[2].isEmpty && !seenPrefixes[4].isEmpty, "K: chunks >=3 and finish must receive rolled-back prefix: \\(seenPrefixes)")
     let evs = events()
-    require(evs.contains(.final("t:\\(seenPrefixes[4].count + 3)")), "K: missing expected final: \\(evs)")
+    require(evs.contains(.final("t:\\(seenPrefixes[4].count + 6)")), "K: missing expected final: \\(evs)")
     print("COORDINATOR_PREFIX_ROLLBACK:PASS")
 }
 
@@ -1568,7 +1568,7 @@ do {
                 try! sustainWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: dec) { _ in }
             }
         }
-        require(voicedFrames == 80 && sustainInbox.lastVoiced && sustainWin.samples.count == 32000 && sustainWin.committed.isEmpty && maxDecoded >= 24000,
+        require(voicedFrames == 80 && sustainInbox.lastVoiced && sustainWin.samples.count == 32000 && sustainWin.committed.isEmpty && maxDecoded >= SpeechWindow.stride,
                 "L: sustained quiet speech was swallowed as noise (voiced=\\(voicedFrames)/80 active=\\(sustainWin.samples.count) committed=\\(sustainWin.committed) maxDecoded=\\(maxDecoded))")
     }
     do {
@@ -1601,7 +1601,7 @@ do {
                 try! modWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: dec) { _ in }
             }
         }
-        require(voicedFrames == 80 && modInbox.lastVoiced && modWin.samples.count == 32000 && modWin.committed.isEmpty && maxDecoded >= 24000,
+        require(voicedFrames == 80 && modInbox.lastVoiced && modWin.samples.count == 32000 && modWin.committed.isEmpty && maxDecoded >= SpeechWindow.stride,
                 "L: slowly modulated <0.004 quiet speech was swallowed (voiced=\\(voicedFrames)/80 active=\\(modWin.samples.count) committed=\\(modWin.committed) maxDecoded=\\(maxDecoded))")
     }
     // Mixed 60Hz hum + broadband fan noise (0.002 total) after 0.2s speech also learns noise and commits VAD pause.
@@ -1869,7 +1869,7 @@ final class InFlightCapture {
     func decode(_ samples: [Float], _ prefix: [Int32]) -> SpeechWindow.DecodeResult? {
         lengths.append(samples.count)
         if lengths.count == 1 { entered.signal(); release.wait() }
-        return samples.count == 24000 ? ("before tail", [1, 2]) : ("before tail last word", [1, 2, 3, 4])
+        return samples.count == SpeechWindow.stride ? ("before tail", [1, 2]) : ("before tail last word", [1, 2, 3, 4])
     }
 }
 func run() throws {
@@ -1913,7 +1913,7 @@ func run() throws {
         }
     }
     for _ in 0..<4 {
-        try window.append(pcm(24000), speech: true, decode: rollbackDecode) { emitted.append($0) }
+        try window.append(pcm(SpeechWindow.stride), speech: true, decode: rollbackDecode) { emitted.append($0) }
     }
     try window.append(pcm(1600), speech: true, decode: rollbackDecode) { emitted.append($0) }
     let rollbackFinal = try window.finish(decode: rollbackDecode)
@@ -1936,7 +1936,7 @@ func run() throws {
         return (String(phraseChars.prefix(targetLen)), Array(phraseTokenIds.prefix(targetLen)))
     }
     for _ in 0..<3 {
-        try window.append(pcm(24000), speech: true, decode: phraseDecode) { _ in }
+        try window.append(pcm(SpeechWindow.stride), speech: true, decode: phraseDecode) { _ in }
     }
     let phraseOut = try window.finish(decode: phraseDecode)
     check(phraseOut == repeatedPhrase, "repeated phrase corrupted: " + phraseOut)
@@ -1944,12 +1944,12 @@ func run() throws {
     // Across segmentCapacity split too: repeated CJK tokens are never dropped
     window = SpeechWindow()
     let repeatTokens: SpeechWindow.DecodeFn = { samples, prefix in
-        let count = samples.count / 24000
+        let count = max(1, Int((Double(samples.count) / Double(SpeechWindow.stride)).rounded()))
         let toks = (0..<count).map { Int32(3000 + $0) }
         return (Array(repeating: "哈", count: count).joined(), prefix.isEmpty ? toks : prefix + toks.suffix(min(toks.count, 5)))
     }
     for _ in 0..<10 {
-        try window.append(pcm(24000), speech: true, decode: repeatTokens) { _ in }
+        try window.append(pcm(SpeechWindow.stride), speech: true, decode: repeatTokens) { _ in }
     }
     let repeatFinal = try window.finish(decode: repeatTokens)
     check(repeatFinal.count == 10 && repeatFinal == String(repeating: "哈", count: 10), "repeated tokens lost: " + repeatFinal)
@@ -1962,7 +1962,7 @@ func run() throws {
     check(window.samples.isEmpty && window.committed == "最后的字" && window.partial.isEmpty, "VAD failed to isolate segment")
     var sawSecondSegmentEmptyPrefix = false
     for s in 1...3 {
-        try window.append(pcm(24000), speech: true, decode: { _, prefix in
+        try window.append(pcm(SpeechWindow.stride), speech: true, decode: { _, prefix in
             if s == 1 { sawSecondSegmentEmptyPrefix = prefix.isEmpty }
             return ("第二句", [601, 602, 603, 604, 605, 606])
         }) { _ in }
@@ -1972,11 +1972,11 @@ func run() throws {
 
     window = SpeechWindow()
     let sentence: SpeechWindow.DecodeFn = { _, _ in ("同一句。", [701, 702]) }
-    try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
+    try window.append(pcm(SpeechWindow.stride), speech: true, decode: sentence) { _ in }
     try window.append(pcm(6400), speech: false, decode: sentence) { _ in }
     check(window.samples.isEmpty && window.committed == "同一句。", "punctuation pause did not commit")
     print("PUNCTUATION:PASS")
-    try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
+    try window.append(pcm(SpeechWindow.stride), speech: true, decode: sentence) { _ in }
     try window.append(pcm(6400), speech: false, decode: sentence) { _ in }
     check(window.committed == "同一句。同一句。", "valid repeated sentence deduplicated")
     print("REPEATED_SENTENCE:PASS")
@@ -1992,7 +1992,13 @@ func run() throws {
         check(window.samples.count <= SpeechWindow.segmentCapacity, "PCM exceeded segmentCapacity")
     }
     _ = try window.finish(decode: longDecode)
-    check(calls.count == 80 && calls.max() == SpeechWindow.segmentCapacity, "2 minute decode cadence/bound failed: \\(calls.count) max=\\(calls.max() ?? -1)")
+    let totalSamples = 1200 * 1600
+    let fullSegments = totalSamples / SpeechWindow.segmentCapacity
+    let decodesPerSegment = (SpeechWindow.segmentCapacity + SpeechWindow.stride - 1) / SpeechWindow.stride
+    let tailSamples = totalSamples % SpeechWindow.segmentCapacity
+    let tailDecodes = tailSamples > 0 ? (tailSamples + SpeechWindow.stride - 1) / SpeechWindow.stride : 0
+    let expectedCalls = fullSegments * decodesPerSegment + tailDecodes
+    check(calls.count == expectedCalls && calls.max() == SpeechWindow.segmentCapacity, "2 minute decode cadence/bound failed: \\(calls.count) != \\(expectedCalls) max=\\(calls.max() ?? -1)")
     check(window.samples.isEmpty, "final did not release PCM")
     print("LONG_CONTINUOUS:PASS")
 
@@ -2029,8 +2035,8 @@ func run() throws {
     print("VARIABLE_TAP:PASS")
 
     window = SpeechWindow(); calls = []
-    try window.append(pcm(SpeechWindow.segmentCapacity + 24000), speech: true, decode: longDecode) { _ in }
-    check(calls == [SpeechWindow.segmentCapacity, 24000] && window.samples.count == 24000, "live backlog exceeded segmentCapacity: \\(calls)")
+    try window.append(pcm(SpeechWindow.segmentCapacity + SpeechWindow.stride), speech: true, decode: longDecode) { _ in }
+    check(calls == [SpeechWindow.segmentCapacity, SpeechWindow.stride] && window.samples.count == SpeechWindow.stride, "live backlog exceeded segmentCapacity: \\(calls)")
     print("BACKLOG_CHUNKING:PASS")
 
     // Disjoint sustained-quiet-interval partitioning beyond segmentCapacity (13.5s = 216,000 samples)
@@ -2059,7 +2065,7 @@ func run() throws {
             } else {
                 var offset = 0
                 while offset < quietGapSignal.count {
-                    let end = min(quietGapSignal.count, offset + 24_000)
+                    let end = min(quietGapSignal.count, offset + SpeechWindow.stride)
                     try segWin.append(Array(quietGapSignal[offset..<end]), speech: true, decode: trackingDecode) { _ in }
                     offset = end
                 }
@@ -2102,11 +2108,11 @@ func run() throws {
                 chunk.append(contentsOf: Array(repeating: Float(0.25), count: 12_800))
                 chunk.append(contentsOf: Array(repeating: Float(0.001), count: 4_800))
                 check(chunk.count == SpeechWindow.segmentCapacity, "vad cap fixture size mismatch")
-                // Feed in 24k strides so chunkCount >= 2 before reaching capacity, ending with final voiced+300ms silence batch hitting capacity+1600
+                // Feed in stride batches so chunkCount >= 2 before reaching capacity, ending with final voiced+300ms silence batch hitting capacity+1600
                 var pos = 0
                 while pos < 192_000 {
-                    try vadWin.append(Array(chunk[pos..<(pos + 24_000)]), speech: true, trailingSilence: 0, decode: vadDecode) { _ in }
-                    pos += 24_000
+                    try vadWin.append(Array(chunk[pos..<(pos + SpeechWindow.stride)]), speech: true, trailingSilence: 0, decode: vadDecode) { _ in }
+                    pos += SpeechWindow.stride
                 }
                 let tailWithSilence = Array(chunk[pos..<216_000]) + Array(repeating: Float(0.0), count: 1_600)
                 // Last 4,800 + 1,600 = 6,400 samples (< 11,200 vadPause) trailing silence; carried tail has speech + 6,400 trailing silence
@@ -2116,15 +2122,15 @@ func run() throws {
                 try vadWin.append(pcm(4_800), speech: false, decode: vadDecode) { _ in }
                 check(vadWin.samples.isEmpty, "F1 regression: carried trailing silence lost across cap split, left \\(vadWin.samples.count) samples")
             } else {
-                try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, trailingSilence: 4_800, decode: vadDecode) { _ in }
+                try vadWin.append(Array(repeating: Float(0.25), count: SpeechWindow.stride), speech: true, trailingSilence: 4_800, decode: vadDecode) { _ in }
                 try vadWin.append(pcm(6_400), speech: false, decode: vadDecode) { _ in }
                 check(vadWin.samples.isEmpty, "no-cap control did not commit at 700ms pause")
             }
             // Subsequent speech MUST start isolated with two warmup chunks (empty prefixTokens)
             seenPrefixes.removeAll()
-            try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: vadDecode) { _ in }
-            try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: vadDecode) { _ in }
-            try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: vadDecode) { _ in }
+            try vadWin.append(Array(repeating: Float(0.25), count: SpeechWindow.stride), speech: true, decode: vadDecode) { _ in }
+            try vadWin.append(Array(repeating: Float(0.25), count: SpeechWindow.stride), speech: true, decode: vadDecode) { _ in }
+            try vadWin.append(Array(repeating: Float(0.25), count: SpeechWindow.stride), speech: true, decode: vadDecode) { _ in }
             check(seenPrefixes.count == 3 && seenPrefixes[0].isEmpty && seenPrefixes[1].isEmpty && !seenPrefixes[2].isEmpty,
                   "next segment failed warmup prefix isolation after VAD commit: \\(seenPrefixes)")
         }
@@ -2158,7 +2164,7 @@ func run() throws {
         // Verify subsequent speech starts isolated with two empty warmup prefixes
         spanPrefixes.removeAll()
         for _ in 0..<3 {
-            try spanWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: spanDecode) { _ in }
+            try spanWin.append(Array(repeating: Float(0.25), count: SpeechWindow.stride), speech: true, decode: spanDecode) { _ in }
         }
         check(spanPrefixes.count == 3 && spanPrefixes[0].isEmpty && spanPrefixes[1].isEmpty && !spanPrefixes[2].isEmpty,
               "post-straddle next segment leaked prefix tokens: \\(spanPrefixes)")
@@ -2225,13 +2231,14 @@ func run() throws {
     print("OVERLOAD:PASS")
 
     window = SpeechWindow(); calls = []
-    try window.append(pcm(24000), speech: true, decode: longDecode) { _ in }
+    try window.append(pcm(SpeechWindow.stride), speech: true, decode: longDecode) { _ in }
     let beforeStop = calls.count
     // Remaining 32s accepted backlog on stop: split into 216,000-sample (13.5s) segments + bounded tail
     try window.append(pcm(SpeechInbox.limit), speech: true, final: true, decode: longDecode) { _ in fatalError("stop emitted partial") }
     _ = try window.finish(decode: longDecode)
     let stopCalls = Array(calls.dropFirst(beforeStop))
-    check(stopCalls == [216000, 216000, 104000 + SpeechWindow.finalSilencePadding], "unexpected 32s stop split cadence: \\(stopCalls)")
+    let expectedStopTail = SpeechWindow.stride + SpeechInbox.limit - SpeechWindow.segmentCapacity * 2
+    check(stopCalls == [216000, 216000, expectedStopTail + SpeechWindow.finalSilencePadding], "unexpected 32s stop split cadence: \\(stopCalls)")
     let afterFirstFinish = calls.count
     _ = try window.finish(decode: longDecode)
     check(calls.count == afterFirstFinish, "stop decoded twice")
@@ -2279,10 +2286,10 @@ func run() throws {
     print("TAIL_BATCH:PASS")
 
     window = SpeechWindow()
-    try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
+    try window.append(pcm(SpeechWindow.stride), speech: true, decode: sentence) { _ in }
     try window.append(pcm(100), speech: true, decode: sentence) { _ in }
     do { _ = try window.finish(decode: { _, _ in nil }); fatalError("decode failure swallowed") }
-    catch SpeechWindow.Failure.decode { check(window.text == "同一句。" && window.samples.count == 24100, "failed flush discarded previous text/PCM") }
+    catch SpeechWindow.Failure.decode { check(window.text == "同一句。" && window.samples.count == SpeechWindow.stride + 100, "failed flush discarded previous text/PCM") }
     print("FAILURE:PASS")
 
     window = SpeechWindow()
@@ -2300,7 +2307,7 @@ func run() throws {
     let capture = InFlightCapture(), worker = DispatchQueue(label: "speech-window-test")
     let done = DispatchSemaphore(value: 0)
     worker.async {
-        try! capture.window.append(pcm(24000), speech: true, decode: capture.decode) { _ in capture.events.append("partial") }
+        try! capture.window.append(pcm(SpeechWindow.stride), speech: true, decode: capture.decode) { _ in capture.events.append("partial") }
     }
     check(capture.entered.wait(timeout: .now() + 2) == .success, "decode did not start")
     worker.async {
@@ -2315,25 +2322,25 @@ func run() throws {
     check(done.wait(timeout: .now() + 0.02) == .timedOut, "stop overtook in-flight decode")
     capture.release.signal()
     check(done.wait(timeout: .now() + 2) == .success, "stop barrier hung")
-    check(capture.lengths == [24000, 24137 + SpeechWindow.finalSilencePadding], "accepted tail lost or decoded twice")
+    check(capture.lengths == [SpeechWindow.stride, SpeechWindow.stride + 137 + SpeechWindow.finalSilencePadding], "accepted tail lost or decoded twice")
     check(capture.events == ["partial", "before tail last word", "stopped/ACK"], "final did not precede stopped/ACK")
     print("IN_FLIGHT_STOP:PASS")
 
     // Mid-decode & pre-append cancellation throws Failure.cancelled instead of Failure.decode or silent return
     window = SpeechWindow()
     do {
-        try window.append(pcm(24000), speech: true, shouldContinue: { false }, decode: { _, _ in fatalError("should not decode after shouldContinue=false") }) { _ in }
+        try window.append(pcm(SpeechWindow.stride), speech: true, shouldContinue: { false }, decode: { _, _ in fatalError("should not decode after shouldContinue=false") }) { _ in }
         fatalError("pre-append cancellation returned silently")
     } catch SpeechWindow.Failure.cancelled { }
     var keepGoing = true
     do {
-        try window.append(pcm(24000), speech: true, shouldContinue: { keepGoing }, decode: { _, _ in
+        try window.append(pcm(SpeechWindow.stride), speech: true, shouldContinue: { keepGoing }, decode: { _, _ in
             keepGoing = false
             return nil
         }) { _ in }
         fatalError("mid-decode cancellation did not throw Failure.cancelled")
     } catch SpeechWindow.Failure.cancelled {
-        check(window.newSamples == 24000, "cancelled decode lost un-flushed sample count")
+        check(window.newSamples == SpeechWindow.stride, "cancelled decode lost un-flushed sample count")
     }
     print("MID_DECODE_CANCEL:PASS")
 }
