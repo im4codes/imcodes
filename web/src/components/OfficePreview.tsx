@@ -13,9 +13,11 @@ import {
   type OnlyOfficeConfigResponse,
 } from '../api.js';
 import { loadOnlyOfficeScript } from '../onlyoffice-preload.js';
+import { isMobileOnlyOfficeViewport } from '../onlyoffice-viewport.js';
 import { scaledCssFontPx } from '../global-font.js';
 
 export { loadOnlyOfficeScript };
+export { isMobileOnlyOfficeViewport };
 
 export interface OfficePreviewProps {
   /**
@@ -51,14 +53,6 @@ async function fetchArrayBuffer(url: string, signal: AbortSignal): Promise<Array
   const res = await fetch(url, { credentials: 'include', signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.arrayBuffer();
-}
-
-export function isMobileOnlyOfficeViewport(): boolean {
-  if (typeof window === 'undefined') return false;
-  if (typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 768px)').matches) {
-    return true;
-  }
-  return typeof window.innerWidth === 'number' && window.innerWidth <= 768;
 }
 
 export function isLocallyPreviewableFormat(filePath: string, mimeType: string): boolean {
@@ -806,10 +800,12 @@ function OfficePreviewDocument({
     config: null,
     forceLocal: false,
   });
-  const effectiveInitialMode: 'view' | 'edit' = readOnly ? 'view' : (initialMode ?? 'edit');
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(isMobileOnlyOfficeViewport);
+  const effectiveInitialMode: 'view' | 'edit' = readOnly
+    ? 'view'
+    : (initialMode ?? (isMobileViewport ? 'view' : 'edit'));
   const [mode, setMode] = useState<'view' | 'edit'>(effectiveInitialMode);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(isMobileOnlyOfficeViewport);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;

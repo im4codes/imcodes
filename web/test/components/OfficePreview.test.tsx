@@ -1384,7 +1384,7 @@ describe('OfficePreview fallback document transitions', () => {
       const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
 
       const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-      // 1. Mobile viewport (375px) + Cloud Doc -> defaults to mode=edit, sends mobile=1, bounds wrapper height, and sets has-mode-toggle when editor
+      // 1. Mobile viewport (375px) + Cloud Doc -> defaults to mode=view, sends mobile=1, bounds wrapper height, sets has-mode-toggle when editor, and allows manual switch to edit
       setViewport(375);
       const mobileCloud = render(
         <OfficePreview
@@ -1396,7 +1396,7 @@ describe('OfficePreview fallback document transitions', () => {
       );
       await waitFor(() => expect(mobileCloud.getByTestId('onlyoffice-toolbar')).toBeTruthy());
       expect(requestedUrls[0]).toContain('/api/cloud-docs/cd-1/onlyoffice/config');
-      expect(requestedUrls[0]).toContain('mode=edit');
+      expect(requestedUrls[0]).toContain('mode=view');
       expect(requestedUrls[0]).toContain('mobile=1');
       const mobileWrapper = mobileCloud.getByTestId('onlyoffice-embedded-wrapper') as HTMLElement;
       expect(mobileWrapper.style.minHeight).toBe('0px');
@@ -1411,6 +1411,12 @@ describe('OfficePreview fallback document transitions', () => {
       expect(mobileCloud.getByTestId('onlyoffice-download-link')).toBeTruthy();
       expect(mobileCloud.getByTestId('onlyoffice-fallback-btn')).toBeTruthy();
       expect(mobileCloud.getByTestId('onlyoffice-fullscreen-btn')).toBeTruthy();
+
+      fireEvent.click(mobileCloud.getByTestId('onlyoffice-mode-edit'));
+      await waitFor(() => expect(requestedUrls.length).toBeGreaterThanOrEqual(2));
+      expect(requestedUrls[1]).toContain('/api/cloud-docs/cd-1/onlyoffice/config');
+      expect(requestedUrls[1]).toContain('mode=edit');
+      expect(requestedUrls[1]).toContain('mobile=1');
       mobileCloud.unmount();
 
       // 2. Mobile viewport (375px) + server file read-only viewer -> sends mobile=1 and mode=view, omits has-mode-toggle so read-only pill stays visible
@@ -1424,9 +1430,9 @@ describe('OfficePreview fallback document transitions', () => {
         />,
       );
       await waitFor(() => expect(mobileServerViewer.getByTestId('onlyoffice-toolbar')).toBeTruthy());
-      expect(requestedUrls[1]).toContain('/api/server/srv-1/onlyoffice/config');
-      expect(requestedUrls[1]).toContain('mode=view');
-      expect(requestedUrls[1]).toContain('mobile=1');
+      expect(requestedUrls[2]).toContain('/api/server/srv-1/onlyoffice/config');
+      expect(requestedUrls[2]).toContain('mode=view');
+      expect(requestedUrls[2]).toContain('mobile=1');
       expect(mobileServerViewer.getByTestId('onlyoffice-toolbar').classList.contains('has-mode-toggle')).toBe(false);
       mobileServerViewer.unmount();
 
@@ -1440,11 +1446,11 @@ describe('OfficePreview fallback document transitions', () => {
         />,
       );
       await waitFor(() => expect(mobilePdfViewer.getByTestId('onlyoffice-toolbar')).toBeTruthy());
-      expect(requestedUrls[2]).toContain('mobile=1');
+      expect(requestedUrls[3]).toContain('mobile=1');
       expect(mobilePdfViewer.getByTestId('onlyoffice-toolbar').classList.contains('has-mode-toggle')).toBe(false);
       mobilePdfViewer.unmount();
 
-      // 4. Desktop viewport (1280px) -> does NOT send mobile=1
+      // 4. Desktop viewport (1280px) -> defaults to mode=edit and does NOT send mobile=1
       roleState.role = 'editor';
       setViewport(1280);
       const desktopView = render(
@@ -1455,8 +1461,9 @@ describe('OfficePreview fallback document transitions', () => {
         />,
       );
       await waitFor(() => expect(desktopView.getByTestId('onlyoffice-toolbar')).toBeTruthy());
-      expect(requestedUrls[3]).toContain('/api/server/srv-1/onlyoffice/config');
-      expect(requestedUrls[3]).not.toContain('mobile=1');
+      expect(requestedUrls[4]).toContain('/api/server/srv-1/onlyoffice/config');
+      expect(requestedUrls[4]).toContain('mode=edit');
+      expect(requestedUrls[4]).not.toContain('mobile=1');
       desktopView.unmount();
     } finally {
       Object.defineProperty(window, 'innerWidth', {

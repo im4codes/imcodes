@@ -44,6 +44,7 @@ import {
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
+import { isMobileOnlyOfficeViewport } from '../onlyoffice-viewport.js';
 import type { CloudDocQuoteTarget } from '../cloud-docs-reference.js';
 import { publishCloudDocQuote } from '../cloud-docs-window.js';
 import { CloudDocsMainChatFloat, type CloudDocsMainChatContext } from './CloudDocsMainChatFloat.js';
@@ -469,6 +470,16 @@ export function CloudDocsPanel({
   const [shareAllowDownload, setShareAllowDownload] = useState(true);
 
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
+  const previewTargetKey = previewTarget
+    ? (previewTarget.kind === 'cloud_doc'
+        ? `cloud_doc:${previewTarget.id}`
+        : `server_file:${previewTarget.serverId}:${previewTarget.path}`)
+    : null;
+  const previewTargetReadOnly = previewTarget?.readOnly ?? false;
+  const previewInitialMode = useMemo<'view' | 'edit'>(
+    () => (previewTargetReadOnly || isMobileOnlyOfficeViewport() ? 'view' : 'edit'),
+    [previewTargetKey, previewTargetReadOnly],
+  );
   const [previewTitleDraft, setPreviewTitleDraft] = useState('');
   const [previewTitleStatus, setPreviewTitleStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
   const [quoteNotice, setQuoteNotice] = useState<{ kind: 'ok' | 'warn'; text: string } | null>(null);
@@ -2328,7 +2339,7 @@ export function CloudDocsPanel({
                 mimeType={previewTarget.mimeType}
                 path={previewTarget.name}
                 readOnly={previewTarget.readOnly}
-                initialMode={previewTarget.readOnly ? 'view' : 'edit'}
+                initialMode={previewInitialMode}
                 onOnlyOfficeOpened={handleOnlyOfficeOpened}
               />
             ) : (
@@ -2338,7 +2349,7 @@ export function CloudDocsPanel({
                 mimeType={previewTarget.mimeType}
                 path={previewTarget.path}
                 readOnly={previewTarget.readOnly}
-                initialMode={previewTarget.readOnly ? 'view' : 'edit'}
+                initialMode={previewInitialMode}
                 onOnlyOfficeOpened={handleOnlyOfficeOpened}
               />
             )}
