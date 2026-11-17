@@ -284,6 +284,9 @@ export interface RecentDocumentItem {
   accessReason: RecentDocumentAccessReason;
   role?: CloudDocShareRole;
   allowDownload?: boolean;
+  isOwner?: boolean;
+  ownerName?: string | null;
+  sharedTeamName?: string | null;
 }
 
 export interface RecordRecentDocumentInput {

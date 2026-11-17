@@ -1027,6 +1027,8 @@ export interface EffectiveDocumentAccess {
   allowDownload: boolean;
   isOwner: boolean;
   canManageShare: boolean;
+  ownerUserId?: string | null;
+  sharedTeamId?: string | null;
   shareId?: string | null;
   shareMode?: DocumentShareMode | null;
   participantLabel?: string | null;
@@ -1086,6 +1088,8 @@ export async function resolveEffectiveDocumentAccess(
         allowDownload: true,
         isOwner: memberRole === 'owner',
         canManageShare: true,
+        ownerUserId: server.user_id,
+        sharedTeamId: null,
         targetPath: normPath,
       };
     }
@@ -1314,6 +1318,8 @@ export async function resolveEffectiveDocumentAccess(
       allowDownload: Boolean(match.allow_download),
       isOwner: false,
       canManageShare: false,
+      ownerUserId: server.user_id,
+      sharedTeamId: parseTeamShareTargetUserId(match.target_user_id),
       shareId: match.id,
       shareMode: match.share_mode,
       participantLabel: match.participant_label,
@@ -1341,6 +1347,8 @@ export async function resolveEffectiveDocumentAccess(
       allowDownload: Boolean(match.allow_download),
       isOwner: false,
       canManageShare: false,
+      ownerUserId: server.user_id,
+      sharedTeamId: parseTeamShareTargetUserId(match.target_user_id),
       shareId: match.id,
       shareMode: match.share_mode,
       participantLabel: match.participant_label,

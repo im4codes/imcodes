@@ -19614,6 +19614,9 @@ button.quick-agent-delegation-preset.active {
 }
 
 .cloud-docs-team-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 1px 6px;
   border-radius: 6px;
   font-size: 10.5px;

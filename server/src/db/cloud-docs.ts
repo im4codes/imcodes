@@ -728,6 +728,7 @@ export type CloudDocAccessResult =
       allowDownload: boolean;
       sharedVia: 'owner' | 'doc' | 'folder';
       sharedTeamName: string | null;
+      ownerName: string | null;
       doc: CloudDocRow;
     }
   | {
@@ -970,6 +971,12 @@ export async function revokeCloudDocShare(
   return res.changes > 0;
 }
 
+export function formatCloudDocOwnerName(
+  user: Pick<UserStatusRow, 'id' | 'username' | 'display_name'>,
+): string {
+  return user.display_name || user.username || user.id;
+}
+
 export async function resolveCloudDocAccess(
   db: Database,
   docId: string,
@@ -995,6 +1002,7 @@ export async function resolveCloudDocAccess(
       allowDownload: true,
       sharedVia: 'owner',
       sharedTeamName: null,
+      ownerName: formatCloudDocOwnerName(actingUser),
       doc,
     };
   }
@@ -1006,6 +1014,7 @@ export async function resolveCloudDocAccess(
   if (!ownerUser || ownerUser.status !== 'active') {
     return { allowed: false, reason: 'access_denied' };
   }
+  const ownerName = formatCloudDocOwnerName(ownerUser);
 
   const userTeamMap = await getUserTeamMap(db, userId);
 
@@ -1021,6 +1030,7 @@ export async function resolveCloudDocAccess(
       allowDownload: docGrant.allowDownload,
       sharedVia: 'doc',
       sharedTeamName: docGrant.sharedTeamName,
+      ownerName,
       doc,
     };
   }
@@ -1045,6 +1055,7 @@ export async function resolveCloudDocAccess(
         allowDownload: folderGrant.allowDownload,
         sharedVia: 'folder',
         sharedTeamName: folderGrant.sharedTeamName,
+        ownerName,
         doc,
       };
     }
@@ -1237,7 +1248,7 @@ export async function listSharedCloudItemsForUser(
   for (const ownerId of discoveredOwners) {
     const owner = await getActiveOwner(ownerId);
     if (!owner) continue;
-    const ownerName = owner.display_name || owner.username || owner.id;
+    const ownerName = formatCloudDocOwnerName(owner);
     const ownerUsername = owner.username ?? null;
     const fRows = ownerFoldersCache.get(ownerId) ?? [];
     const dRows = ownerDocsCache.get(ownerId) ?? [];

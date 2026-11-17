@@ -2426,4 +2426,140 @@ describe('CloudDocsPanel', () => {
       });
     }
   });
+
+  it('displays ownerName, shared team chip, and shared role badge in Recent tab and filters by owner/team without leaking on inaccessible items', async () => {
+    const recItems: RecentDocumentItem[] = [
+      {
+        id: 'rec-team-shared',
+        sourceType: 'cloud_doc',
+        sourceKey: 'cloud_doc:doc-team',
+        title: '机房账号统计.xlsx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        serverId: null,
+        serverName: null,
+        filePath: null,
+        cloudDocId: 'doc-team',
+        lastOpenedAt: 500,
+        accessible: true,
+        accessReason: null,
+        role: 'editor',
+        isOwner: false,
+        ownerName: 'kk',
+        sharedTeamName: '云科',
+      },
+      {
+        id: 'rec-direct-shared',
+        sourceType: 'cloud_doc',
+        sourceKey: 'cloud_doc:doc-direct',
+        title: 'DirectSpec.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        serverId: null,
+        serverName: null,
+        filePath: null,
+        cloudDocId: 'doc-direct',
+        lastOpenedAt: 400,
+        accessible: true,
+        accessReason: null,
+        role: 'viewer',
+        isOwner: false,
+        ownerName: 'alice',
+        sharedTeamName: null,
+      },
+      {
+        id: 'rec-owned',
+        sourceType: 'cloud_doc',
+        sourceKey: 'cloud_doc:doc-owned',
+        title: 'MyPlan.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        serverId: null,
+        serverName: null,
+        filePath: null,
+        cloudDocId: 'doc-owned',
+        lastOpenedAt: 300,
+        accessible: true,
+        accessReason: null,
+        role: 'editor',
+        isOwner: true,
+        ownerName: 'bob',
+        sharedTeamName: null,
+      },
+      {
+        id: 'rec-legacy-no-owner',
+        sourceType: 'server_file',
+        sourceKey: 'server_file:srv-1:/repo/Legacy.docx',
+        title: 'Legacy.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        serverId: 'srv-1',
+        serverName: 'Node A',
+        filePath: '/repo/Legacy.docx',
+        cloudDocId: null,
+        lastOpenedAt: 200,
+        accessible: true,
+        accessReason: null,
+      },
+      {
+        id: 'rec-denied',
+        sourceType: 'cloud_doc',
+        sourceKey: 'cloud_doc:doc-denied',
+        title: 'Secret.xlsx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        serverId: null,
+        serverName: null,
+        filePath: null,
+        cloudDocId: 'doc-denied',
+        lastOpenedAt: 100,
+        accessible: false,
+        accessReason: 'access_denied',
+        isOwner: false,
+        ownerName: 'hidden-owner',
+        sharedTeamName: 'hidden-team',
+      },
+    ];
+    listRecentDocumentsApiMock.mockResolvedValue({ items: recItems });
+
+    render(<CloudDocsPanel initialTab="recent" />);
+    await waitFor(() => expect(screen.getByTestId('recent-doc-row-rec-team-shared')).toBeTruthy());
+
+    const teamDetails = screen.getByTestId('recent-doc-row-rec-team-shared').querySelector('.cloud-docs-row-col.is-details')!;
+    expect(teamDetails.textContent).toContain('kk');
+    expect(teamDetails.textContent).toContain('云科');
+    expect(teamDetails.textContent).toContain('Editor');
+    const teamChip = teamDetails.querySelector('.cloud-docs-team-chip');
+    expect(teamChip).toBeTruthy();
+    expect(teamChip?.querySelector('svg')).toBeTruthy();
+
+    const directDetails = screen.getByTestId('recent-doc-row-rec-direct-shared').querySelector('.cloud-docs-row-col.is-details')!;
+    expect(directDetails.textContent).toContain('alice');
+    expect(directDetails.textContent).toContain('Viewer');
+    expect(directDetails.querySelector('.cloud-docs-team-chip')).toBeNull();
+
+    const ownedDetails = screen.getByTestId('recent-doc-row-rec-owned').querySelector('.cloud-docs-row-col.is-details')!;
+    expect(ownedDetails.textContent).toContain('bob');
+    expect(ownedDetails.querySelector('.cloud-docs-team-chip')).toBeNull();
+    expect(ownedDetails.textContent).not.toContain('Editor');
+
+    const legacyDetails = screen.getByTestId('recent-doc-row-rec-legacy-no-owner').querySelector('.cloud-docs-row-col.is-details')!;
+    expect(legacyDetails.textContent).toContain('Node A');
+    expect(legacyDetails.textContent).toContain('/repo/Legacy.docx');
+
+    const deniedDetails = screen.getByTestId('recent-doc-row-rec-denied').querySelector('.cloud-docs-row-col.is-details')!;
+    expect(deniedDetails.textContent).not.toContain('hidden-owner');
+    expect(deniedDetails.textContent).not.toContain('hidden-team');
+    expect(deniedDetails.querySelector('.cloud-docs-team-chip')).toBeNull();
+
+    // Search filters recent items by sharedTeamName and ownerName
+    const searchInput = screen.getByTestId('cloud-docs-search') as HTMLInputElement;
+    fireEvent.input(searchInput, { target: { value: '云科' } });
+    await waitFor(() => {
+      expect(screen.getByTestId('recent-doc-row-rec-team-shared')).toBeTruthy();
+      expect(screen.queryByTestId('recent-doc-row-rec-direct-shared')).toBeNull();
+      expect(screen.queryByTestId('recent-doc-row-rec-owned')).toBeNull();
+    });
+
+    fireEvent.input(searchInput, { target: { value: 'alice' } });
+    await waitFor(() => {
+      expect(screen.getByTestId('recent-doc-row-rec-direct-shared')).toBeTruthy();
+      expect(screen.queryByTestId('recent-doc-row-rec-team-shared')).toBeNull();
+    });
+  });
 });
