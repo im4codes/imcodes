@@ -128,6 +128,7 @@ beforeAll(async () => {
   await upsertDbSession(db, `s-priv-${tag}`, M_PRIV1, PRIV_MAIN_SESSION, `priv${tag}`, 'brain', 'claude-code-sdk', '/work/priv', 'idle', 'Owner Priv Session');
   await upsertDbSession(db, `s-sh1-${tag}`, M_SHARED, SHARED_MAIN_SESSION, SHARED_PROJ, 'brain', 'claude-code-sdk', '/work/shared', 'idle', 'Shared Session');
   await upsertDbSession(db, `s-sh2-${tag}`, M_SHARED, UNSHARED_ON_SHARED_HOST, `privonshared${tag}`, 'brain', 'claude-code-sdk', '/work/p2', 'idle', 'Unshared on Shared');
+  await upsertDbSession(db, `s-w-${tag}`, M_WHOLE, `deck_w_${tag}_brain`, `w_${tag}`, 'brain', 'claude-code-sdk', '/work/w', 'idle', 'Whole Session');
 
   const now = Date.now();
   await createOrUpdateShare(db, {
@@ -289,19 +290,48 @@ describe('Vector A: Participant authority on M_shared is strictly scoped to User
     expect((await app.request('/api/aliases', { headers: partHdrs })).status).toBe(403);
     expect((await app.request('/api/verification-machines', { headers: partHdrs })).status).toBe(403);
     expect((await app.request(`/api/capabilities/${CAP_ID}?serverId=${M_SHARED}`, { headers: partHdrs })).status).toBe(403);
-    expect((await app.request(`/api/memory/projection-owner?projectionId=${MEM_PROJ_PRIV_ID}`, { headers: partHdrs })).status).toBe(403);
-    expect((await app.request('/api/shared-context/personal-memory', { headers: partHdrs })).status).toBe(403);
+    // Project/memory routes allow participant turns while strictly isolating rows to User B (Owner A's private records never leak)
+    expect((await app.request(`/api/memory/projection-owner?projectionId=${MEM_PROJ_PRIV_ID}&projectId=${encodeURIComponent(`priv${tag}`)}`, { headers: partHdrs })).status).toBe(404);
+    const partPersonalMemRes = await app.request('/api/shared-context/personal-memory', { headers: partHdrs });
+    expect(partPersonalMemRes.status).toBe(200);
+    expect((await partPersonalMemRes.json() as { records: unknown[] }).records).toEqual([]);
+    // Outbound no longer blocks participant turns with shared_participant_forbidden, while still refusing foreign bots
     expect((await app.request('/api/outbound', {
       method: 'POST',
       headers: { ...partHdrs, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ botId: 'b1', channelId: 'c1', text: 'exfil' }),
-    })).status).toBe(403);
-    expect((await app.request(`/api/server/${M_SHARED}/sessions`, { headers: partHdrs })).status).toBe(403);
+      body: JSON.stringify({ platform: 'telegram', botId: 'b-nonexistent', channelId: 'c1', content: 'hi' }),
+    })).status).toBe(404);
+    // Session/sub-session management on M_SHARED matches owner parity, while cross-server M_PRIV1 stays 403
+    expect((await app.request(`/api/server/${M_SHARED}/sessions`, { headers: partHdrs })).status).toBe(200);
+    expect((await app.request(`/api/server/${M_SHARED}/sub-sessions`, { headers: partHdrs })).status).toBe(200);
     expect((await app.request(`/api/server/${M_PRIV1}/sessions`, { headers: partHdrs })).status).toBe(403);
+    expect((await app.request(`/api/server/${M_PRIV1}/sub-sessions`, { headers: partHdrs })).status).toBe(403);
     expect((await app.request(`/api/machine/exec?serverId=${M_PRIV2}`, {
       method: 'POST',
       headers: { ...partHdrs, 'Content-Type': 'application/json' },
       body: JSON.stringify({ command: 'id' }),
+    })).status).toBe(403);
+
+    // Whole-server participant on M_WHOLE can invoke server-scoped memory recall on M_WHOLE, never on M_PRIV1
+    const wholePartToken = mintParticipantAuthority({
+      actorUserId: USER_B,
+      serverId: M_WHOLE,
+      sessionName: `deck_w_${tag}_brain`,
+      projectName: `w_${tag}`,
+      shareTarget: { kind: 'server', serverId: M_WHOLE },
+    });
+    const wholePartHdrs = daemonHeaders(M_WHOLE, TOK_WHOLE, {
+      [SHARED_MACHINE_AUTHORITY_HEADER]: wholePartToken,
+    });
+    expect((await app.request(`/api/shared-context/${M_WHOLE}/shared-context/memory/recall`, {
+      method: 'POST',
+      headers: { ...wholePartHdrs, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'deploy note', projectId: `w_${tag}` }),
+    })).status).toBe(200);
+    expect((await app.request(`/api/shared-context/${M_PRIV1}/shared-context/memory/recall`, {
+      method: 'POST',
+      headers: { ...wholePartHdrs, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'deploy note', projectId: `priv${tag}` }),
     })).status).toBe(403);
 
     // Forged authority token signed with wrong key
@@ -357,19 +387,14 @@ describe('Vector A: Participant authority on M_shared is strictly scoped to User
 });
 
 describe('Share revocation and whole-server share boundaries', () => {
-  it('blocks whole-server share participants from renaming or deleting M_whole, while Owner A succeeds', async () => {
+  it('grants whole-server share participants owner parity on server rename and delete while strictly denying share management (inviting/updating/revoking participants or observers)', async () => {
+    // Whole-server share participant USER_B CAN rename M_whole
     const patchRes = await app.request(`/api/server/${M_WHOLE}/name`, {
       method: 'PATCH',
       headers: { Authorization: userBearer(USER_B), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'hijacked' }),
+      body: JSON.stringify({ name: 'Participant Renamed Server' }),
     });
-    expect(patchRes.status).toBe(404);
-
-    const delRes = await app.request(`/api/server/${M_WHOLE}`, {
-      method: 'DELETE',
-      headers: { Authorization: userBearer(USER_B) },
-    });
-    expect(delRes.status).toBe(404);
+    expect(patchRes.status).toBe(200);
 
     const ownerPatch = await app.request(`/api/server/${M_WHOLE}/name`, {
       method: 'PATCH',
@@ -377,6 +402,45 @@ describe('Share revocation and whole-server share boundaries', () => {
       body: JSON.stringify({ name: 'Whole Server Valid Name' }),
     });
     expect(ownerPatch.status).toBe(200);
+
+    // Whole-server participant USER_B MUST still be denied from viewing/inviting/updating/revoking shares
+    expect((await app.request(`/api/server/${M_WHOLE}/shares`, {
+      headers: { Authorization: userBearer(USER_B) },
+    })).status).toBe(403);
+    expect((await app.request(`/api/server/${M_WHOLE}/shares`, {
+      method: 'POST',
+      headers: { Authorization: userBearer(USER_B), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: { kind: 'server', serverId: M_WHOLE }, targetUserId: VIEWER_C, role: 'viewer' }),
+    })).status).toBe(403);
+    expect((await app.request(`/api/server/${M_WHOLE}/shares/${WHOLE_SHARE_ID}`, {
+      method: 'PATCH',
+      headers: { Authorization: userBearer(USER_B), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'viewer' }),
+    })).status).toBe(403);
+    expect((await app.request(`/api/server/${M_WHOLE}/shares/${WHOLE_SHARE_ID}`, {
+      method: 'DELETE',
+      headers: { Authorization: userBearer(USER_B) },
+    })).status).toBe(403);
+    expect((await app.request(`/api/server/${M_WHOLE}/share-audit`, {
+      headers: { Authorization: userBearer(USER_B) },
+    })).status).toBe(403);
+
+    // Whole-server participant USER_B CAN delete a server shared with them (test on disposable server so M_WHOLE remains for downstream assertions)
+    const delSrvId = `srv-whole-del-${tag}`;
+    await createServer(db, delSrvId, OWNER_A, 'Disposable Whole Server', sha256(`tok-del-${tag}`));
+    await createOrUpdateShare(db, {
+      id: `wshare-del-${tag}`,
+      target: { kind: 'server', serverId: delSrvId },
+      targetUserId: USER_B,
+      role: 'participant',
+      createdBy: OWNER_A,
+      now: Date.now(),
+    });
+    const delRes = await app.request(`/api/server/${delSrvId}`, {
+      method: 'DELETE',
+      headers: { Authorization: userBearer(USER_B) },
+    });
+    expect(delRes.status).toBe(200);
   });
 
   it('immediately pauses participant crons when the tab share or team membership is revoked', async () => {

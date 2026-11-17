@@ -16,7 +16,7 @@ import {
   setUserPref,
 } from '../db/queries.js';
 import { resolveServerRole } from '../security/authorization.js';
-import { isSharedOrContributedServer, isWholeServerShareUser } from '../security/daemon-scope.js';
+import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -398,7 +398,7 @@ serverRoutes.patch('/:id/name', requireAuth(), async (c) => {
 
   const server = await getServerById(c.env.DB, serverId);
   const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (!server || role !== 'owner' || await isWholeServerShareUser(c.env.DB, serverId, userId)) {
+  if (!server || role !== 'owner') {
     return c.json({ error: 'not_found' }, 404);
   }
   const updated = await updateServerName(c.env.DB, serverId, server.user_id, parsed.data.name.trim());
@@ -413,7 +413,7 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
 
   const server = await getServerById(c.env.DB, serverId);
   const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (!server || role !== 'owner' || await isWholeServerShareUser(c.env.DB, serverId, userId)) {
+  if (!server || role !== 'owner') {
     return c.json({ error: 'not_found' }, 404);
   }
   const deleted = await deleteServer(c.env.DB, serverId, server.user_id);
@@ -574,7 +574,7 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
     sourceOwnerUserId: serverRow.userId,
     now: Date.now(),
   });
-  if (authority.kind === 'participant' || authority.kind === 'invalid') {
+  if (authority.kind === 'invalid') {
     return c.json({ error: 'forbidden' }, 403);
   }
   const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
@@ -610,9 +610,6 @@ async function checkDaemonSelfAccess(
     sourceOwnerUserId: serverRow.userId,
     now: Date.now(),
   });
-  if (authority.kind === 'participant') {
-    return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
-  }
   if (authority.kind === 'invalid') {
     return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
   }

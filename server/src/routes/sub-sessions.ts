@@ -43,7 +43,7 @@ subSessionRoutes.use('/*', requireAuth());
 subSessionRoutes.use('/:id/*', async (c, next) => {
   if (c.get('authServerId' as never)) {
     const authority = await resolveDaemonCallerAuthority(c, {
-      denyParticipant: true,
+      denyParticipant: false,
       denySharedHostAbsentAuthority: false,
       targetServerId: c.req.param('id')!,
       allowOwnerCrossServer: false,

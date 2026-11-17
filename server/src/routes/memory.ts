@@ -168,7 +168,7 @@ async function withProjectionFallback(
 // projection arrived through a non-MCP code path).
 
 memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
   const userId = authority.actorUserId;
   const projectionId = c.req.query('projectionId')?.trim();
@@ -225,7 +225,6 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
   if (!projectId) return c.json({ error: 'not_found' }, 404);
 
   const authority = await resolveDaemonCallerAuthority(c, {
-    denyParticipant: true,
     targetServerId: serverId,
     allowOwnerCrossServer: true,
   });
@@ -233,7 +232,9 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
   const userId = authority.actorUserId;
 
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (!access.ok && !(authority.kind === 'participant_daemon' && access.reason === 'share-direct-surface-denied')) {
+    return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
 
   const projectionRow = await loadAuthorizedProjectionSourceRow(c.env.DB, {
     projectionId,
