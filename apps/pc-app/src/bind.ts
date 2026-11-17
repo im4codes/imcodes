@@ -767,8 +767,13 @@ export class BindCoordinator {
 
     const stderrText = (result.stderr || result.error?.message || '').trim();
     const serverJsonPresent = serverJsonExistsOnDisk(this.imcodesHome, this.checkExists);
-    const deterministicNotCommitted =
-      !result.timedOut && result.signal === null && !serverJsonPresent;
+    const normalNonZeroExit =
+      result.error == null &&
+      typeof result.status === 'number' &&
+      result.status !== 0 &&
+      !result.timedOut &&
+      result.signal === null;
+    const deterministicNotCommitted = normalNonZeroExit && !serverJsonPresent;
 
     if (deterministicNotCommitted) {
       await this.revokeMintedKey(origin, sessionValue, keyId);
@@ -783,7 +788,9 @@ export class BindCoordinator {
       ? 'imcodes bind timed out before completion'
       : result.signal
         ? `imcodes bind terminated with signal ${result.signal}`
-        : `imcodes bind exited with status ${String(result.status)} after server.json appeared`;
+        : result.error != null || result.status === null
+          ? `imcodes bind failed to execute cleanly (${result.error?.message ?? 'no exit status'})`
+          : `imcodes bind exited with status ${String(result.status)} after server.json appeared`;
 
     throw new BindError(
       'cli_failed_uncertain',

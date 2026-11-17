@@ -663,6 +663,59 @@ describe('PC App V1 Phase B: bind flow, replace prompt, bundled tmux, and Launch
       expect(calls).toHaveLength(1); // No DELETE!
       expect(shownBoxes[0]?.detail).toContain('launchctl load failed');
     }
+
+    // Case 6: CLI spawn error (e.g. ENOENT, status null, error set) -> NO DELETE (retain key as uncertain!)
+    rmSync(path.join(imcodesHome, 'server.json'), { force: true });
+    {
+      const shownBoxes: BindMessageBoxOptions[] = [];
+      const calls: Array<{ method: string; url: string }> = [];
+      const coord = createCoord({
+        shownBoxes,
+        fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+          calls.push({ method: init?.method ?? 'GET', url: String(url) });
+          return new Response(JSON.stringify({ id: 'key_enoent', apiKey: 'deck_enoent_1' }), { status: 201 });
+        }) as typeof globalThis.fetch,
+        runCli: async () => ({
+          status: null,
+          signal: null,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+          error: new Error('spawn ENOENT'),
+        }),
+      });
+      const out = await coord.maybeBind('https://err.im.codes', cookies);
+      expect(out.status).toBe('failed');
+      expect(out.error?.kind).toBe('cli_failed_uncertain');
+      expect(calls).toHaveLength(1); // POST only — DELETE must NOT be called!
+      expect(shownBoxes[0]?.title).toContain('Uncertain');
+      expect(shownBoxes[0]?.detail).toContain('spawn ENOENT');
+      expect(shownBoxes[0]?.detail).toContain('imcodes bind https://err.im.codes/bind/<api-key> host-err');
+    }
+
+    // Case 7: CLI returns status null without error -> NO DELETE (retain key as uncertain!)
+    {
+      const shownBoxes: BindMessageBoxOptions[] = [];
+      const calls: Array<{ method: string; url: string }> = [];
+      const coord = createCoord({
+        shownBoxes,
+        fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+          calls.push({ method: init?.method ?? 'GET', url: String(url) });
+          return new Response(JSON.stringify({ id: 'key_null_status', apiKey: 'deck_null_1' }), { status: 201 });
+        }) as typeof globalThis.fetch,
+        runCli: async () => ({
+          status: null,
+          signal: null,
+          timedOut: false,
+          stdout: '',
+          stderr: '',
+        }),
+      });
+      const out = await coord.maybeBind('https://err.im.codes', cookies);
+      expect(out.status).toBe('failed');
+      expect(out.error?.kind).toBe('cli_failed_uncertain');
+      expect(calls).toHaveLength(1);
+    }
   });
 
   it('ensureBundledTmuxEnv leaves PATH untouched when system tmux -V passes and injects bin + TERMINFO_DIRS when missing', async () => {
