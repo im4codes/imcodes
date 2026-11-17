@@ -1,3 +1,4 @@
+import { formatRemoteDesktopBytes, addTrafficBytes } from '@shared/remote-desktop-traffic.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -92,7 +93,6 @@ import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { fullscreenContainerFor, useFullscreen } from '../hooks/useFullscreen.js';
 import { keyboardLockSupported, useKeyboardLock } from '../hooks/useKeyboardLock.js';
-import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import {
   REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
   recordRemoteDesktopBrowserDiagnostic,
@@ -146,8 +146,6 @@ const QUALITY_PRIORITIES = Object.values(REMOTE_DESKTOP_QUALITY_PRIORITY);
 
 /** A phone-keyboard editing key and its own input event arrive together. */
 const MOBILE_EDITING_KEY_DEDUPE_MS = 150;
-const REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_PREFERENCE = 'remote_desktop_touch_hint_dismissed';
-const REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT = 'remote-desktop-touch-hint-dismissed';
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
@@ -457,21 +455,6 @@ export function RemoteDesktopPanel({
   // session doesn't reset to it every time.
   const [viewScale, setViewScale] = useState<ViewScale>(() => storedZoomPreference?.viewScale ?? 'fit');
   const [mobileInputMode, setMobileInputMode] = useState<MobileInputMode>('touch');
-  const [touchHintDismissed, setTouchHintDismissed] = useSyncedPreference<boolean>(
-    REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_PREFERENCE,
-    false,
-    0,
-  );
-  useEffect(() => {
-    const onTouchHintDismissed = () => setTouchHintDismissed(true);
-    window.addEventListener(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT, onTouchHintDismissed);
-    return () => window.removeEventListener(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT, onTouchHintDismissed);
-  }, [setTouchHintDismissed]);
-
-  const dismissTouchHint = useCallback(() => {
-    setTouchHintDismissed(true);
-    window.dispatchEvent(new Event(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT));
-  }, [setTouchHintDismissed]);
   const [viewport, setViewport] = useState<RemoteDesktopViewport>(() => (
     storedZoomPreference
       ? {
@@ -3811,8 +3794,11 @@ export function RemoteDesktopPanel({
                 aria-label={t('remote_desktop.touch_ring')}
                 draggable={false}
                 style={{
-                  left: `${virtualMouse.x}px`,
-                  top: `${virtualMouse.y + TOUCH_RING_OFFSET_Y_PX}px`,
+                  // The handle may move inward at an edge; the cursor and
+                  // its remote click point must not. CSS also re-clamps on
+                  // restore before a ResizeObserver callback can arrive.
+                  '--touch-ring-x': `${virtualMouse.x}px`,
+                  '--touch-ring-y': `${virtualMouse.y + TOUCH_RING_OFFSET_Y_PX}px`,
                 }}
                 // iOS can still synthesize its magnifying loupe from a native
                 // TouchEvent even though the PointerEvent was prevented and
@@ -3918,21 +3904,10 @@ export function RemoteDesktopPanel({
           )}
           <div
             class="remote-desktop-touch-hint"
-            hidden={mobileTextOpen || (mobileInputMode === 'touch' && touchHintDismissed)}
+            hidden={mobileTextOpen || mobileInputMode !== 'mouse'}
           >
-            <span>
-              {t(mobileInputMode === 'mouse'
-                ? 'remote_desktop.mouse_hint'
-                : 'remote_desktop.touch_hint')}
-            </span>
-            {mobileInputMode === 'touch' && (
-              <button
-                type="button"
-                class="remote-desktop-touch-hint-dismiss"
-                onClick={dismissTouchHint}
-              >
-                {t('remote_desktop.touch_hint_dismiss')}
-              </button>
+            {mobileInputMode === 'mouse' && (
+              <span>{t('remote_desktop.mouse_hint')}</span>
             )}
           </div>
         </div>
@@ -4489,6 +4464,13 @@ export function RemoteDesktopPanel({
                 </>
               )}
               <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
+              <span data-remote-desktop-traffic data-bytes-sent={snapshot.traffic?.bytesSent} data-bytes-received={snapshot.traffic?.bytesReceived} title={t('remote_desktop.traffic_definition')}>
+                {snapshot.traffic ? t('remote_desktop.traffic_usage', {
+                  sent: formatRemoteDesktopBytes(snapshot.traffic.bytesSent),
+                  received: formatRemoteDesktopBytes(snapshot.traffic.bytesReceived),
+                  total: formatRemoteDesktopBytes(addTrafficBytes(snapshot.traffic.bytesSent, snapshot.traffic.bytesReceived)),
+                }) : t('remote_desktop.traffic_pending')}
+              </span>
             </div>
             <button
               type="button"

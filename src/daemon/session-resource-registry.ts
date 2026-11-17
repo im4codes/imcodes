@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
+  MCP_RESOURCE_PREFIX,
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
   SESSION_RESOURCE_LIFETIME,
@@ -582,7 +583,22 @@ export class SessionResourceRegistry {
   private async releaseRecords(records: SessionResourceRecord[], reason: string): Promise<ReleaseSummary> {
     let released = 0;
     let failed = 0;
-    for (const record of records) {
+    const isBootstrap = (record: SessionResourceRecord) => record.kind === SESSION_RESOURCE_KIND.MCP
+      && record.resourceId.startsWith(`${MCP_RESOURCE_PREFIX.BOOTSTRAP}:`);
+    // Stop all restart owners before any worker. Alphabetical ledger order
+    // puts backends first, allowing still-live supervisors to respawn workers
+    // outside this release snapshot while other old generations are reaped.
+    const ordered = [...records.filter(isBootstrap), ...records.filter((record) => !isBootstrap(record))];
+    const failedSupervisors = new Set<string>();
+    for (const record of ordered) {
+      if (record.kind === SESSION_RESOURCE_KIND.MCP
+        && record.resourceId.startsWith(`${MCP_RESOURCE_PREFIX.BACKEND}:`)
+        && failedSupervisors.has(ownerKey(record.owner))) {
+        // Retry both rows later rather than kill a worker behind a restart
+        // owner we could not stop. Other owners/epochs are independent.
+        failed += 1;
+        continue;
+      }
       let outcome = 'released';
       try {
         await this.cleanup(record, reason);
@@ -591,6 +607,7 @@ export class SessionResourceRegistry {
       } catch {
         failed += 1;
         outcome = 'failed';
+        if (isBootstrap(record)) failedSupervisors.add(ownerKey(record.owner));
       }
       if (record.kind === SESSION_RESOURCE_KIND.MCP && this.lifecycleLogPath) {
         // An MCP child killed here surfaces in its host only as "Transport

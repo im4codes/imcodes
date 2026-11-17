@@ -251,6 +251,62 @@ describe('DiscussionsPage', () => {
     expect(scrollEl.scrollTop).toBe(720);
   });
 
+  it('disengages on user scroll-up and resumes follow after returning to the bottom', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} />);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: 'disc-scroll', fileName: 'disc-scroll.md', preview: 'Scroll topic', mtime: 100 }],
+      } as ServerMessage);
+    });
+    fireEvent.click(screen.getByText('Scroll topic'));
+
+    const scrollEl = container.querySelector('.discussions-detail-scroll') as HTMLDivElement;
+    Object.defineProperties(scrollEl, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 400 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-scroll',
+        content: 'Initial content',
+      } as ServerMessage);
+    });
+    await waitFor(() => expect(scrollEl.scrollTop).toBe(600));
+
+    scrollEl.scrollTop = 0;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(false);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-scroll',
+        content: 'New content while reading history',
+      } as ServerMessage);
+    });
+    expect(scrollEl.scrollTop).toBe(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    scrollEl.scrollTop = 600;
+    fireEvent.scroll(scrollEl);
+    expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(true);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-scroll',
+        content: 'New content after returning to bottom',
+      } as ServerMessage);
+    });
+    await waitFor(() => expect(scrollEl.scrollTop).toBe(600));
+  });
+
   it('copies discussion path from the list action menu', async () => {
     render(<DiscussionsPage ws={ws} requestScope={{ projectDir: '/repo' }} />);
 

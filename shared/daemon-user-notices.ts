@@ -55,6 +55,7 @@ export const DAEMON_USER_NOTICE_CODE = {
   FAST_MODE_OFF: 'fast_mode_off',
   UNKNOWN_MODEL: 'unknown_model',
   MODEL_SWITCHED: 'model_switched',
+  MODEL_SWITCH_PENDING: 'model_switch_pending',
   MODEL_SWITCH_PROOF_GATED: 'model_switch_proof_gated',
   THINKING_LEVEL_UNSUPPORTED: 'thinking_level_unsupported',
   THINKING_LEVEL_SWITCHED: 'thinking_level_switched',
@@ -99,6 +100,7 @@ export const DAEMON_USER_NOTICE_PARAM_KEYS: Readonly<Partial<Record<DaemonUserNo
   [DAEMON_USER_NOTICE_CODE.SERVICE_TIER_CHANGE_FAILED]: ['detail'],
   [DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL]: ['model', 'detail'],
   [DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED]: ['model'],
+  [DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING]: ['model'],
   [DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED]: ['model'],
   [DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED]: ['level', 'supported', 'detail'],
   [DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_SWITCHED]: ['level'],
@@ -255,6 +257,8 @@ export function formatDaemonUserNoticeEnglish(
       return `Model ${stringParam(params, 'model')} is not available for this provider.`;
     case DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED:
       return `Switched model to ${stringParam(params, 'model')}.`;
+    case DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING:
+      return `Saved model ${stringParam(params, 'model')}; it will apply to the next turn after the current turn finishes.`;
     case DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED:
       return `Model switching for ${stringParam(params, 'model')} is unavailable until the provider capability is verified.`;
     case DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED:

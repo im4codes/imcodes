@@ -115,9 +115,16 @@ function matchScore(query: string, name: string, description: string): number {
   if (normalizedName === query) return 100;
   if (normalizedName.startsWith(query)) return 80;
   if (normalizedName.includes(query)) return 60;
-  const tokens = query.split(/[^a-z0-9]+/).filter(Boolean);
+  const tokens = query.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
   if (tokens.length === 0) return 0;
-  const matched = tokens.filter((token) => normalizedName.includes(token) || normalizedDescription.includes(token));
+  const nameWords = normalizedName.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const descWords = normalizedDescription.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const matched = tokens.filter((token) => {
+    if (/^[a-z0-9]+$/.test(token)) {
+      return nameWords.some((word) => word.startsWith(token)) || descWords.some((word) => word.startsWith(token));
+    }
+    return normalizedName.includes(token) || normalizedDescription.includes(token);
+  });
   return matched.length === tokens.length ? 20 + matched.length : 0;
 }
 

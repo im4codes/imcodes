@@ -5,7 +5,7 @@ import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-m
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '@shared/ask-answer.js';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '@shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_ASSISTANT_TEXT_EVENT_TYPE } from '@shared/timeline-protocol.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 import { FS_WRITE_MAX_BYTES } from '@shared/fs-write-limits.js';
@@ -298,6 +298,38 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it.each(['probe', 'resume', 'forced-resume'] as const)('preserves a slow ticket across repeated %s nudges', async (nudge) => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ ok: true, json: async () => ({ ticket: 'slow-ticket' }) }), 8_000);
+      init?.signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    try {
+      client.connect();
+      await vi.advanceTimersByTimeAsync(5_000);
+      if (nudge === 'probe') client.probeConnection();
+      else client.resumeConnection(nudge === 'forced-resume');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(lastWs?.url).toContain('slow-ticket');
+      const opening = lastWs!;
+      // A subsequent focus must also leave the in-progress socket alone.
+      client.probeConnection();
+      client.resumeConnection(true);
+      expect(lastWs).toBe(opening);
+      expect(opening.readyState).toBe(MockWebSocket.CONNECTING);
+      opening.emit('open');
+      expect(client.connected).toBe(true);
+    } finally {
+      client.disconnect();
+    }
+  });
+
   it('times out a hung ws-ticket request and retries instead of staying connecting forever', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
@@ -313,7 +345,11 @@ describe('WsClient', () => {
     client.connect();
     expect(client.connecting).toBe(true);
 
-    await vi.advanceTimersByTimeAsync(30_000);
+    for (let i = 0; i < 6; i++) {
+      client.resumeConnection(true);
+      client.probeConnection();
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(client.connected).toBe(false);
     // The first hung ticket attempt has yielded to a reconnect timer.
@@ -334,7 +370,11 @@ describe('WsClient', () => {
     const firstWs = lastWs!;
 
     expect(firstWs.readyState).toBe(MockWebSocket.CONNECTING);
-    await vi.advanceTimersByTimeAsync(15_000);
+    for (let i = 0; i < 3; i++) {
+      client.resumeConnection(true);
+      client.probeConnection();
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
 
     expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
     expect(client.connected).toBe(false);
@@ -347,6 +387,26 @@ describe('WsClient', () => {
 
     client.disconnect();
     vi.useRealTimers();
+  });
+
+  it('still resumes immediately from retry backoff when no attempt is in flight', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    try {
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const previous = lastWs;
+      previous!.emit('close');
+      expect(client.connecting).toBe(true);
+      expect(client.connectionAttemptInFlight).toBe(false);
+      client.resumeConnection(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lastWs).not.toBe(previous);
+      expect(client.connectionAttemptInFlight).toBe(true);
+    } finally {
+      client.disconnect();
+    }
   });
 
   it('does not stack multiple reconnect timers for the same outage', async () => {
@@ -878,6 +938,107 @@ describe('WsClient', () => {
 
     client.disconnect();
     vi.useRealTimers();
+  });
+
+  describe('queued cumulative stream snapshots', () => {
+    async function start() {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      const delivered: Array<Record<string, any>> = [];
+      client.onMessage(msg => { if (msg.type === TIMELINE_MESSAGES.EVENT) delivered.push(msg.event); });
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = lastWs!;
+      socket.emit('open');
+      const send = (seq: number, changes: Record<string, unknown> = {}) => {
+        socket.emit('message', { data: JSON.stringify({ type: TIMELINE_MESSAGES.EVENT, event: {
+          sessionId: 's1', eventId: 'stream', epoch: 1, seq,
+          type: TIMELINE_ASSISTANT_TEXT_EVENT_TYPE,
+          payload: { text: `snapshot-${seq}`, streaming: true }, ...changes,
+        } }) });
+      };
+      return { client, delivered, send };
+    }
+
+    it('retains one undelivered snapshot, without mutating a previously delivered one', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        for (let i = 0; i < 1_500; i++) send(i);
+        expect((client as unknown as { pendingTimelineEvents: unknown[] }).pendingTimelineEvents).toHaveLength(1);
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0].payload.text).toBe('snapshot-0');
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered.map(event => event.payload.text)).toEqual(['snapshot-0', 'snapshot-1499']);
+        send(1500);
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered.map(event => event.payload.text)).toEqual(['snapshot-0', 'snapshot-1499', 'snapshot-1500']);
+      } finally { client.disconnect(); }
+    });
+
+    it('coalesces interleaved sessions independently, including identical message IDs', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(1); send(1, { sessionId: 's2' }); send(2); send(2, { sessionId: 's2' });
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered.slice(1).map(event => [event.sessionId, event.seq])).toEqual([['s1', 2], ['s2', 2]]);
+      } finally { client.disconnect(); }
+    });
+
+    it('keeps every snapshot live when the consumer is keeping up', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        for (let i = 0; i < 10; i++) {
+          send(i);
+          await vi.advanceTimersByTimeAsync(10);
+        }
+        expect(delivered.map(event => event.seq)).toEqual(Array.from({ length: 10 }, (_, i) => i));
+      } finally { client.disconnect(); }
+    });
+
+    it.each(['tool.call', 'tool.result', 'user.message', 'session.state'])('preserves the %s barrier and final text/metadata', async (type) => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(1); send(2);
+        send(3, { type, eventId: 'boundary', payload: { state: 'idle', text: 'durable' } });
+        send(4); send(5);
+        send(6, { payload: { text: 'FINAL', streaming: false, retainedMetadata: 'yes' } });
+        await vi.advanceTimersByTimeAsync(20);
+        expect(delivered.map(event => event.seq)).toEqual([0, 2, 3, 5, 6]);
+        expect(delivered.at(-1)?.payload).toEqual({ text: 'FINAL', streaming: false, retainedMetadata: 'yes' });
+      } finally { client.disconnect(); }
+    });
+
+    it('does not merge epochs, distinct messages or backwards sequence revisions', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(10); send(11, { epoch: 2 }); send(12, { eventId: 'other' });
+        send(12, { eventId: 'other', ts: 1 }); send(9, { eventId: 'other' });
+        await vi.advanceTimersByTimeAsync(20);
+        expect(delivered.map(event => event.seq)).toEqual([0, 10, 11, 12, 12, 9]);
+      } finally { client.disconnect(); }
+    });
+
+    it.each([{ eventId: '' }, { sessionId: '' }, { epoch: undefined }, { seq: undefined }, { payload: { streaming: true, delta: 'not a complete text snapshot' } }, { completeness: 'preview' }, { payload: { streaming: true, text: 'partial', payloadTruncated: true } }, { summary: true }, { hidden: true }])('keeps legacy or non-snapshot data unmodified: %j', async (changes) => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(1, changes); send(2, changes);
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered).toHaveLength(3);
+      } finally { client.disconnect(); }
+    });
+
+    it('drops both the queue and its stream references on disconnect', async () => {
+      const { client, delivered, send } = await start();
+      send(0); send(1);
+      client.disconnect();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(delivered).toHaveLength(1);
+      expect((client as unknown as { pendingTimelineStreams: Map<string, unknown> }).pendingTimelineStreams.size).toBe(0);
+    });
   });
 
   it('keeps full-mode transient status frames live', async () => {
@@ -2335,6 +2496,51 @@ describe('WsClient', () => {
       expect(() => client.subscribeTerminal('s', false)).not.toThrow();
       expect(lastWs).toBeNull();
     });
+
+    it('resets _lastPongAt on forced resume so post-open timeline/terminal interactions do not loop reconnectNow', async () => {
+      vi.useFakeTimers();
+      try {
+        const client = new WsClient('http://localhost:8787', 'srv-1');
+        client.connect();
+        await vi.advanceTimersByTimeAsync(0);
+        const sock1 = lastWs!;
+        sock1.emit('open');
+        // Record a real pong, then sleep longer than 2x stale threshold (>60s).
+        sock1.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+        vi.setSystemTime(Date.now() + 90_000);
+
+        const events: Array<{ event?: string; reason?: string }> = [];
+        client.onMessage((msg) => {
+          if (msg.type === 'session.event') events.push(msg);
+          if (msg.type === 'session.event' && msg.event === 'connected') {
+            // Mirrors App.tsx on('connected'): immediately refresh timeline + subscribe
+            // before the new socket's first pong arrives.
+            client.sendTimelineHistoryRequest('deck_sub_chat');
+            client.subscribeTerminal('deck_sub_term', false);
+          }
+        });
+
+        client.resumeConnection(true);
+        await vi.advanceTimersByTimeAsync(0);
+        const sock2 = lastWs!;
+        expect(sock2).not.toBe(sock1);
+        events.length = 0;
+
+        sock2.emit('open');
+        sock2.send.mockClear();
+        // Also simulate a focus probe right after open before first pong arrives.
+        client.probeConnection();
+
+        expect(sock2.readyState).toBe(MockWebSocket.OPEN);
+        expect(lastWs).toBe(sock2);
+        expect(client.connected).toBe(true);
+        expect(events.filter((e) => e.event === 'disconnected')).toHaveLength(0);
+
+        client.disconnect();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('send() never throws on a disconnected socket (ChatView crash guard)', () => {
@@ -2425,6 +2631,60 @@ describe('WsClient', () => {
       lastWs!.send.mockClear();
       client.consumeCodexResetCredit('req-3', '');
       expect(lastWs!.send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('beginOwnedDataRequest disconnect resilience', () => {
+    it('does not poison ownedDataRequests when called while disconnected before socket open', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(client.connected).toBe(false);
+
+      const preConnectId = client.fsListDir('/srv/alpha', true, false);
+      const preConnectGitId = client.fsGitStatus('/srv/alpha', { includeStats: true });
+
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const liveId = client.fsListDir('/srv/alpha', true, false);
+      const liveGitId = client.fsGitStatus('/srv/alpha', { includeStats: true });
+      expect(liveId).not.toBe(preConnectId);
+      expect(liveGitId).not.toBe(preConnectGitId);
+
+      await vi.advanceTimersByTimeAsync(500);
+      const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string; requestId?: string });
+      expect(sent.find((m) => m.type === 'fs.ls')?.requestId).toBe(liveId);
+      expect(sent.find((m) => m.type === 'fs.git_status')?.requestId).toBe(liveGitId);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('clears orphaned ownedDataRequests on socket close so reconnect retries hit the wire', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+
+      const firstId = client.fsListDir('/srv/alpha', true, false);
+      lastWs!.emit('close', { code: 1006 });
+
+      // Reconnect opens a new socket
+      await vi.advanceTimersByTimeAsync(1_500);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const retryId = client.fsListDir('/srv/alpha', true, false);
+      expect(retryId).not.toBe(firstId);
+      await vi.advanceTimersByTimeAsync(500);
+      const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string; requestId?: string });
+      expect(sent.find((m) => m.type === 'fs.ls')?.requestId).toBe(retryId);
+
+      client.disconnect();
+      vi.useRealTimers();
     });
   });
 });

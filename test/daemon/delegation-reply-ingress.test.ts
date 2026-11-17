@@ -329,6 +329,7 @@ describe('delegation reply ingress', () => {
       notificationId: record.notificationId,
       delegationId: record.delegationId,
       sourceSessionName: target.sessionName,
+      messageOrigin: 'system',
       text: expect.stringContaining(AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER),
     });
     expect(mocks.runtime?.deliverDelegationNotification).toHaveBeenCalledWith(
@@ -2642,5 +2643,157 @@ describe('sweepStaleDeliveryOriginsForAutoRebind', () => {
     sweepStaleDeliveryOriginsForAutoRebind();
 
     expect(rebind).not.toHaveBeenCalled();
+  });
+});
+
+describe('delegation_reply originAuthority propagation', () => {
+  const origin = {
+    sessionName: 'deck_brain_auth',
+    sessionInstanceId: 'inst-brain-auth',
+    runtimeEpoch: 'epoch-brain-auth',
+  };
+  const target = {
+    sessionName: 'deck_sub_auth',
+    sessionInstanceId: 'inst-sub-auth',
+    runtimeEpoch: 'epoch-sub-auth',
+  };
+
+  beforeEach(() => {
+    clearDelegationReplyIngressForTests();
+    clearPeerAuditReplyIngressRateLimits();
+    registerPeerAuditReplyIngressHandler(null);
+    mocks.sessions.clear();
+    mocks.sessions.set(origin.sessionName, session(origin));
+    mocks.sessions.set(target.sessionName, session(target));
+    mocks.realStore = undefined;
+    mocks.store.receive.mockReset();
+    mocks.store.suppressHeldAuditCompletions.mockReset().mockReturnValue([]);
+    mocks.store.markDelivered.mockReset().mockReturnValue(true);
+    mocks.store.getMessage.mockReset();
+    mocks.timelineEmit.mockReset();
+    mocks.getAssignment.mockReset();
+    mocks.getTaskRecord.mockReset();
+  });
+
+  afterEach(() => {
+    clearDelegationReplyIngressForTests();
+    mocks.realStore = undefined;
+  });
+
+  it('forwards owner originAuthority and messageOrigin=system on non-task deliverDelegationNotification', async () => {
+    const deliverDelegationNotification = vi.fn(async () => AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    mocks.runtime = { deliverDelegationNotification };
+    const authRecord = {
+      delegationId: 'dlg_auth_owner_1',
+      capabilityHash: 'hash-owner-1',
+      origin,
+      originAuthority: { kind: 'owner' as const, ownerMachineAuthority: 'owner-jwt-dlg' },
+      target,
+      dispatchId: 'disp-owner-1',
+      messageId: 'msg-owner-1',
+      notificationId: 'notif_auth_owner_1',
+      status: 'received' as const,
+      result: 'Done with owner auth',
+      createdAt: 900,
+      expiresAt: Date.now() + 60_000,
+      updatedAt: 1000,
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: authRecord, replay: false });
+    mocks.store.getMessage.mockReturnValue({ ...authRecord, status: 'delivered', deliveredAt: Date.now() });
+
+    const res = await submitDelegationReply({
+      rawBody: {
+        version: AGENT_DELEGATION_REPLY_VERSION,
+        delegationId: authRecord.delegationId,
+        result: authRecord.result,
+      },
+      senderSessionName: target.sessionName,
+    });
+    expect(res.ok).toBe(true);
+
+    expect(deliverDelegationNotification).toHaveBeenCalledWith(expect.objectContaining({
+      delegationId: 'dlg_auth_owner_1',
+      messageOrigin: 'system',
+      ownerMachineAuthority: 'owner-jwt-dlg',
+    }));
+  });
+
+  it('forwards participant originAuthority without ownerMachineAuthority on taskBound runtime.send', async () => {
+    const send = vi.fn(() => 'sent' as const);
+    const deliverDelegationNotification = vi.fn(async () => AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    mocks.runtime = {
+      recipientIdentity: {
+        sessionInstanceId: origin.sessionInstanceId,
+        runtimeEpoch: origin.runtimeEpoch,
+      },
+      send,
+      deliverDelegationNotification,
+    };
+
+    const taskRecord = {
+      delegationId: 'dlg_auth_part_task',
+      capabilityHash: 'hash-part-1',
+      taskId: 'tsk_auth_1',
+      assignmentId: 'asg_auth_1',
+      origin,
+      originAuthority: {
+        kind: 'participant' as const,
+        sharedActor: {
+          actorUserId: 'user-p',
+          actorDisplayName: 'Bob',
+          effectiveActorRole: 'participant' as const,
+          actionId: 'act-part-1',
+          origin: 'server-member',
+          primaryShareId: null,
+          authorizedAt: 1,
+          queuedAt: 1,
+          snapshot: {
+            target: { kind: 'main' as const, serverId: 'local', sessionName: origin.sessionName },
+            effectiveRole: 'participant' as const,
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: [],
+            primaryShareId: null,
+            authorizedAt: 1,
+          },
+        },
+        sharedMachineAuthority: 'part-jwt-dlg',
+      },
+      target,
+      dispatchId: 'disp-part-1',
+      messageId: 'msg-part-1',
+      notificationId: 'notif_auth_part_1',
+      status: 'received' as const,
+      result: 'Done for participant',
+      createdAt: 900,
+      expiresAt: Date.now() + 60_000,
+      updatedAt: 1000,
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.store.getMessage.mockReturnValue({ ...taskRecord, status: 'delivered', deliveredAt: Date.now() });
+
+    const res = await submitDelegationReply({
+      rawBody: {
+        version: AGENT_DELEGATION_REPLY_VERSION,
+        delegationId: taskRecord.delegationId,
+        result: taskRecord.result,
+      },
+      senderSessionName: target.sessionName,
+    });
+    expect(res.ok).toBe(true);
+
+    expect(send).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      undefined,
+      undefined,
+      expect.objectContaining({
+        messageOrigin: 'system',
+        sharedMachineAuthority: 'part-jwt-dlg',
+        sharedActor: expect.objectContaining({ actorUserId: 'user-p' }),
+      }),
+    );
+    const sendOpts = send.mock.calls[0]?.[4] as Record<string, unknown>;
+    expect(sendOpts.ownerMachineAuthority).toBeUndefined();
   });
 });

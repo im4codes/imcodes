@@ -1,6 +1,7 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { parseRemoteUrl } from '../../../src/repo/detector.js';
@@ -386,7 +387,9 @@ function buildSharedMemoryResponse(
 }
 
 sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const memoryId = c.req.param('memoryId');
   if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
   const deleted = await deletePersonalMemoryProjection(c.env.DB, userId, memoryId);
@@ -396,7 +399,9 @@ sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
 });
 
 sharedContextRoutes.get('/personal-memory', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const projectId = c.req.query('projectId')?.trim();
   const projectionClass = c.req.query('projectionClass') === 'recent_summary' || c.req.query('projectionClass') === 'durable_memory_candidate'
     ? c.req.query('projectionClass') as 'recent_summary' | 'durable_memory_candidate'
@@ -490,11 +495,9 @@ sharedContextRoutes.get('/personal-memory', async (c) => {
 });
 
 sharedContextRoutes.post('/memory/search', async (c) => {
-  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
-  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.quickSearch, featureFlags)) {
-    return c.json(sameShapeSearchEnvelope());
-  }
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const body = await readJsonBody<{
     query?: string;
     scope?: SearchRequestScope;
@@ -503,6 +506,13 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     excludeSourceSessionName?: string;
   }>(c);
   const query = body?.query?.trim() ?? '';
+  if (!query) {
+    return c.json(sameShapeSearchEnvelope());
+  }
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.quickSearch, featureFlags)) {
+    return c.json(sameShapeSearchEnvelope());
+  }
   const requestedScope = isSearchRequestScope(body?.scope) ? body.scope : 'all_authorized';
   const limit = Math.max(1, Math.min(50, typeof body?.limit === 'number' ? body.limit : 20));
   const excludeSourceSessionName = typeof body?.excludeSourceSessionName === 'string'
@@ -695,7 +705,9 @@ async function getOrRepairProjectionContentHash(
 }
 
 sharedContextRoutes.post('/memory/citations', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
   if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citation, featureFlags)) return sameShapeNotFound(c);
   const body = await readJsonBody<{ projectionId?: string; citingMessageId?: string }>(c);
@@ -759,7 +771,9 @@ sharedContextRoutes.post('/memory/citations', async (c) => {
 });
 
 sharedContextRoutes.get('/memory/citations/:citationId', async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
   if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citation, featureFlags)) return sameShapeNotFound(c);
   const citationId = c.req.param('citationId');
@@ -1548,8 +1562,14 @@ sharedContextRoutes.post('/document-bindings/:bindingId/deactivate', async (c) =
  * Used by daemon send path to auto-inject relevant memories into agent prompts.
  */
 sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
-  const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
+  const authority = await resolveDaemonCallerAuthority(c, {
+    denyParticipant: true,
+    targetServerId: serverId,
+    allowOwnerCrossServer: false,
+  });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
   const runtimeConfigRow = await c.env.DB.queryOne<{ shared_context_runtime_config: Record<string, unknown> | string | null }>(

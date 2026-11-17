@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 /**
  * tsk_cd_console_pairs_snapshot_delta: pair changes reach a console viewer as a
  * one-pair delta, snapshots no longer embed briefs, and briefs are fetched on
@@ -48,7 +49,7 @@ function subscribe(over: Record<string, unknown> = {}) {
 
 function save(taskId: string, over: Record<string, unknown> = {}) {
   clock += 1;
-  return store.savePair(PROJECT, {
+  return putTaskPairFixture(store, PROJECT, {
     taskId, brain: BRAIN, executor: `deck_sub_${taskId}_x`, auditor: `deck_sub_${taskId}_a`,
     title: `Pair ${taskId}`, status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
     previousAuditors: [], createdAt: 1, updatedAt: 1_000 + clock, brief: BRIEF, executorPool: 'primary',
@@ -331,7 +332,7 @@ describe('on-demand brief fetch', () => {
   });
 
   it('does not let a project read another project\'s pair by task id', () => {
-    store.savePair('otherproject', {
+    putTaskPairFixture(store, 'otherproject', {
       taskId: 'secret', brain: BRAIN, title: 'x', status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
       previousAuditors: [], createdAt: 1, updatedAt: 1, brief: 'other project brief',
     } as never);

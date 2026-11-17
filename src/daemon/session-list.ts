@@ -1,3 +1,4 @@
+import type { SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import type { SessionRecord } from '../store/session-store.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import { listSessions, upsertSession } from '../store/session-store.js';
@@ -25,7 +26,7 @@ import type { SupervisionHeartbeatSnapshot } from '../../shared/supervision-hear
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
-export interface SessionListItem extends SessionContextBootstrapState {
+export interface SessionListItem extends SessionContextBootstrapState, SessionIncognitoConfig {
   name: string;
   sessionInstanceId?: string;
   runtimeEpoch?: string;
@@ -161,6 +162,7 @@ function baseItem(s: SessionRecord): SessionListItem {
   const eligibility = computeExecutionTemplateEligibility(s);
   return {
     name: s.name,
+    ...(s.incognito ? { incognito: true } : {}),
     sessionInstanceId: s.sessionInstanceId,
     runtimeEpoch: s.runtimeEpoch,
     project: s.projectName,

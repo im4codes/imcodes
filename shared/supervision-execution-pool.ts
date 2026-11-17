@@ -20,6 +20,7 @@ export type SupervisionExecutionPoolRole = typeof SUPERVISION_EXECUTION_POOL_ROL
 export const SUPERVISION_TIER_PAIRS = [
   { providerFamily: 'openai', executor: 'gpt-6-luna', auditor: 'gpt-6-sol', secondaryLaunchModel: 'gpt-6-sol' },
   { providerFamily: 'anthropic', executor: 'claude-haiku', auditor: 'claude-sonnet', secondaryLaunchModel: 'sonnet' },
+  { providerFamily: 'google', executor: 'gemini-flash', auditor: 'gemini-flash', secondaryLaunchModel: 'gemini-4-hydrogen-high' },
   // No launchable id can be inferred for DeepSeek's secondary model, so a session for it cannot be created automatically.
   { providerFamily: 'deepseek', executor: 'deepseek-flash', auditor: 'deepseek-pro', secondaryLaunchModel: undefined },
 ] as const;
@@ -53,6 +54,9 @@ function matchesTierModel(model: string, tierModel: string): boolean {
   if (tierModel === 'claude-sonnet') return normalized.includes('sonnet');
   if (tierModel === 'deepseek-flash') return normalized.includes('deepseek') && normalized.includes('flash');
   if (tierModel === 'deepseek-pro') return normalized.includes('deepseek') && (normalized.includes('pro') || normalized.includes('reasoner'));
+  if (tierModel === 'gemini-flash') return normalized.includes('gemini') && (normalized.includes('flash') || normalized.includes('argon') || normalized.includes('hydrogen'));
+  if (tierModel === 'gpt-6-sol') return normalized.includes('sol');
+  if (tierModel === 'gpt-6-luna') return normalized.includes('luna');
   return normalized.includes(modelFamily(tierModel));
 }
 
@@ -444,8 +448,56 @@ function normalizePool(value: unknown, kind: SupervisionExecutionPoolKind): Supe
       byCapability.set(item.capabilityId, { ...item, role: mergedRole });
     }
   }
+  // Modern transport runtimes supersede legacy process runtimes for the same
+  // provider family, model, and preset (e.g. transport:codex-sdk supersedes process:codex,
+  // transport:agy-sdk supersedes process:gemini).
+  // 1. Explicit role on modern transport is strictly preserved (never widened or erased).
+  // 2. When modern transport lacks an explicit role, it safely inherits from legacy process
+  //    if and only if all matching legacy process entries agree on a single unambiguous role.
+  //    Conflicting legacy roles leave the modern transport role as both (undefined), regardless
+  //    of traversal or array arrival order.
+  const entries = [...byCapability.values()];
+  const processIndicesToDrop = new Set<number>();
+  const transportEntries = entries.filter((e) => e.runtimeType === 'transport');
+  const transportLegacyRoles = new Map<SupervisionExecutionConfig, Set<SupervisionExecutionPoolRole>>();
+
+  for (let i = 0; i < entries.length; i++) {
+    const item = entries[i]!;
+    if (item.runtimeType !== 'process') continue;
+    const matchingTransport = transportEntries.find((t) => (
+      t.providerFamily === item.providerFamily
+      && t.model === item.model
+      && t.ccPresetId === item.ccPresetId
+    ));
+    if (matchingTransport) {
+      processIndicesToDrop.add(i);
+      if (item.role !== undefined) {
+        let set = transportLegacyRoles.get(matchingTransport);
+        if (!set) {
+          set = new Set();
+          transportLegacyRoles.set(matchingTransport, set);
+        }
+        set.add(item.role);
+      }
+    }
+  }
+
+  for (const transport of transportEntries) {
+    if (transport.role !== undefined) {
+      // Modern explicit role is always preserved verbatim
+      continue;
+    }
+    const legacyRoles = transportLegacyRoles.get(transport);
+    if (legacyRoles && legacyRoles.size === 1) {
+      const [onlyRole] = legacyRoles;
+      if (onlyRole) transport.role = onlyRole;
+    }
+    // If legacyRoles.size > 1 (conflicted) or 0 (no legacy role), transport.role remains undefined (both)
+  }
+
+  const finalConfigs = entries.filter((_, idx) => !processIndicesToDrop.has(idx));
   return {
-    configs: [...byCapability.values()],
+    configs: finalConfigs,
     controls: {
       maxConcurrency: positive(controls.maxConcurrency, DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[kind].maxConcurrency),
       maxSpawned: positive(controls.maxSpawned, DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[kind].maxSpawned),

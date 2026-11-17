@@ -6,6 +6,7 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import {
   getDaemonBadgeState,
   getSelectedServerName,
+  mergeServerNavigation,
   hasResolvedActiveSession,
   hasSelectedServer,
   isServerOnline,
@@ -230,5 +231,23 @@ describe('getDaemonBadgeState', () => {
 
   it('uses connecting when the browser websocket itself is still reconnecting', () => {
     expect(getDaemonBadgeState(false, true, false, null)).toBe('connecting');
+  });
+});
+
+describe('mergeServerNavigation', () => {
+  it('preserves visited active shares while refreshing owned metadata and removing deleted servers', () => {
+    const previous = [{ id: 'own', name: 'Old' }, { id: 'shared', name: '本机' }, { id: 'deleted', name: 'Deleted' }];
+    const incoming = [{ id: 'own', name: 'Renamed' }];
+    expect(mergeServerNavigation(incoming, previous, new Set(['shared']))).toEqual([
+      { id: 'own', name: 'Renamed' }, { id: 'shared', name: '本机' },
+    ]);
+    expect(previous).toHaveLength(3);
+    expect(incoming).toHaveLength(1);
+  });
+  it('never duplicates ids or retains revoked shares, and supports empty full-server inventories', () => {
+    const shared = { id: 'shared', name: '本机' };
+    expect(mergeServerNavigation([], [shared, shared], new Set(['shared']))).toEqual([shared]);
+    expect(mergeServerNavigation([], [shared], new Set())).toEqual([]);
+    expect(mergeServerNavigation([shared], [shared], new Set(['shared']))).toEqual([shared]);
   });
 });

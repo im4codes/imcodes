@@ -17,7 +17,7 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { usesProviderResumeId } from '../agent/transport-resume-opts.js';
 import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
-import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
 
 import logger from '../util/logger.js';
@@ -26,6 +26,20 @@ import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../
 import { emitSessionInlineError } from './session-error.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { clearResend } from './transport-resend-queue.js';
+import {
+  claimProcessRestartContinuationRecovery,
+  clearSessionRestartContinuation,
+  consumeRestartContinuation,
+  dispatchProcessRestartContinuation,
+  emitSystemContinueUserMessage,
+  hasActiveProcessRestartContinuationRecovery,
+  retireRestartContinuation,
+  shouldAutoRespawnDeadProcessSubSession,
+} from './restart-continuation.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { isIncognitoSessionName, notifySessionTeardown, setSessionIncognito } from '../../shared/session-incognito-context.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
+import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
@@ -74,6 +88,7 @@ export interface SubSessionRecord {
   pairCreatedMetadata?: TaskPairCreatedSessionMetadata | null;
   effort?: TransportEffortLevel;
   fresh?: boolean;
+  incognito?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
 }
@@ -328,91 +343,122 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...hookCredentialEnv(hookCredential),
   });
 
-  await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
-  const paneId = await getPaneId(sessionName);
-
-  if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
-    const { waitForOpenCodeSessionId } = await import('./opencode-history.js');
-    sub.opencodeSessionId = await waitForOpenCodeSessionId(sub.cwd, {
-      updatedAfter: launchStart,
-      exactDirectory: sub.cwd,
-      knownSessionIds: knownOpenCodeSessionIds,
-    });
-  }
-
-  // Rebind pipe-pane stream — on restart (stopSubSession killed the old tmux session),
-  // the streamer's pipe broke and scheduleRebind may have a pending timer that will fail.
-  // rebindSession clears old state + timers, then starts a fresh pipe.
-  const { terminalStreamer } = await import('./terminal-streamer.js');
-  void terminalStreamer.rebindSession(sessionName);
-
-  // Auto-dismiss startup prompts, then inject init message
-  const initParts: string[] = [];
-  if (sub.description) initParts.push(sub.description);
-  const initIdentity = sub.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name: sessionName, projectName });
-  if (initIdentity) initParts.push(initIdentity);
-  if (presetInitMessage) initParts.push(presetInitMessage);
-  if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
-  const injectInit = async () => {
-    // Wait for CC to pass trust-folder / settings-error dialogs
-    if (driver.postLaunch) {
-      const { capturePane, sendKey } = await import('../agent/tmux.js');
-      await driver.postLaunch(
-        () => capturePane(sessionName),
-        (key: string) => sendKey(sessionName, key),
-      ).catch(() => {});
-    }
-    if (initParts.length > 0) {
-      const { sendKeys } = await import('../agent/tmux.js');
-      const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
-      try { await sendKeys(sessionName, initMsg); } catch { /* ignore */ }
-    }
-  };
-  void injectInit();
-  timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
-
-  const record = markSessionLaunchIdentity<SessionRecord>({
-    name: sessionName, projectName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
-    sessionInstanceId: resourceSessionInstanceId,
-    // Reaching this write means a previously absent process authority was
-    // created above. Preserve the logical identity but install a new epoch.
-    runtimeEpoch: resourceRuntimeEpoch,
-    paneId,
-    projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
-    ccSessionId: sub.ccSessionId ?? undefined,
-    codexSessionId: sub.codexSessionId ?? undefined,
-    geminiSessionId: sub.geminiSessionId ?? undefined,
-    opencodeSessionId: sub.opencodeSessionId ?? undefined,
-    parentSession: sub.parentSession ?? undefined,
-    ccPreset: sub.ccPreset ?? undefined,
-    description: sub.description ?? undefined,
-    ...(sub.identityPrompt ? { appliedIdentityHash: identityPromptHash(sub.identityPrompt) } : {}),
-    provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
-    ...(sub.pairCreatedMetadata ? { pairCreatedMetadata: sub.pairCreatedMetadata } : {}),
-    // shellBin (already host-normalized above) persisted for shell/script so a
-    // clone/restore that inherited it keeps a runnable launch binary. Config,
-    // not identity.
-    ...((agentType === 'shell' || agentType === 'script') && sub.shellBin ? { shellBin: sub.shellBin } : {}),
-    ...(sub.effort ? { effort: sub.effort } : {}),
-    nativeAgentLaunchFence: {
-      fence: processLaunchFence(agentType, {
-        nativeAgentsFenced,
-        resumesExistingConversation: useResume || Boolean(sub.codexSessionId) || !sub.fresh,
-      }),
-      sessionInstanceId: resourceSessionInstanceId,
-      runtimeEpoch: resourceRuntimeEpoch,
-      decidedAt: Date.now(),
-    },
-    hookCredential,
-    restarts: 0, restartTimestamps: [], createdAt: storedBeforeLaunch?.createdAt ?? Date.now(), updatedAt: Date.now()
-  });
+  const releaseRecovery = (!sub.fresh && agentType !== 'shell' && agentType !== 'script')
+    ? claimProcessRestartContinuationRecovery(sessionName, resourceRuntimeEpoch)
+    : undefined;
+  let recoveryHandedOff = false;
   try {
-    await registerTmuxSessionResource(record);
+    await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
+    const paneId = await getPaneId(sessionName);
+
+    if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
+      const { waitForOpenCodeSessionId } = await import('./opencode-history.js');
+      sub.opencodeSessionId = await waitForOpenCodeSessionId(sub.cwd, {
+        updatedAfter: launchStart,
+        exactDirectory: sub.cwd,
+        knownSessionIds: knownOpenCodeSessionIds,
+      });
+    }
+
+    // Rebind pipe-pane stream — on restart (stopSubSession killed the old tmux session),
+    // the streamer's pipe broke and scheduleRebind may have a pending timer that will fail.
+    // rebindSession clears old state + timers, then starts a fresh pipe.
+    const { terminalStreamer } = await import('./terminal-streamer.js');
+    void terminalStreamer.rebindSession(sessionName);
+
+    // Auto-dismiss startup prompts, then inject init message
+    const initParts: string[] = [];
+    if (sub.description) initParts.push(sub.description);
+    const initIdentity = sub.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name: sessionName, projectName });
+    if (initIdentity) initParts.push(initIdentity);
+    if (presetInitMessage) initParts.push(presetInitMessage);
+    if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
+    if (sub.fresh) {
+      retireRestartContinuation(sessionName);
+    }
+    const injectInit = async () => {
+      try {
+        // Wait for CC to pass trust-folder / settings-error dialogs
+        if (driver.postLaunch) {
+          const { capturePane, sendKey } = await import('../agent/tmux.js');
+          await driver.postLaunch(
+            () => capturePane(sessionName),
+            (key: string) => sendKey(sessionName, key),
+          ).catch(() => {});
+        }
+        if (initParts.length > 0) {
+          const { sendKeys } = await import('../agent/tmux.js');
+          const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
+          try { await sendKeys(sessionName, initMsg); } catch { /* ignore */ }
+        }
+        if (!sub.fresh && agentType !== 'shell' && agentType !== 'script') {
+          try {
+            const { sendKeys } = await import('../agent/tmux.js');
+            await dispatchProcessRestartContinuation({
+              sessionName,
+              currentSession: getSession(sessionName),
+              sendKeys: (name, keys) => sendKeys(name, keys),
+              emitUserMessage: (name, commandId) =>
+                emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'process'),
+            });
+          } catch (err) {
+            logger.warn({ err, sessionName }, 'Process sub-session restart continuation failed');
+          }
+        }
+      } finally {
+        releaseRecovery?.();
+      }
+    };
+    recoveryHandedOff = true;
+    void injectInit();
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
+
+    const record = markSessionLaunchIdentity<SessionRecord>({
+      name: sessionName, projectName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
+      sessionInstanceId: resourceSessionInstanceId,
+      // Reaching this write means a previously absent process authority was
+      // created above. Preserve the logical identity but install a new epoch.
+      runtimeEpoch: resourceRuntimeEpoch,
+      paneId,
+      projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
+      ccSessionId: sub.ccSessionId ?? undefined,
+      codexSessionId: sub.codexSessionId ?? undefined,
+      geminiSessionId: sub.geminiSessionId ?? undefined,
+      opencodeSessionId: sub.opencodeSessionId ?? undefined,
+      parentSession: sub.parentSession ?? undefined,
+      ccPreset: sub.ccPreset ?? undefined,
+      description: sub.description ?? undefined,
+      ...(sub.identityPrompt ? { appliedIdentityHash: identityPromptHash(sub.identityPrompt) } : {}),
+      provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
+      ...(sub.pairCreatedMetadata ? { pairCreatedMetadata: sub.pairCreatedMetadata } : {}),
+      // shellBin (already host-normalized above) persisted for shell/script so a
+      // clone/restore that inherited it keeps a runnable launch binary. Config,
+      // not identity.
+      ...((agentType === 'shell' || agentType === 'script') && sub.shellBin ? { shellBin: sub.shellBin } : {}),
+      ...(sub.effort ? { effort: sub.effort } : {}),
+      nativeAgentLaunchFence: {
+        fence: processLaunchFence(agentType, {
+          nativeAgentsFenced,
+          resumesExistingConversation: useResume || Boolean(sub.codexSessionId) || !sub.fresh,
+        }),
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
+        decidedAt: Date.now(),
+      },
+      hookCredential,
+      restarts: 0, restartTimestamps: [], createdAt: storedBeforeLaunch?.createdAt ?? Date.now(), updatedAt: Date.now()
+    });
+    try {
+      await registerTmuxSessionResource(record);
+    } catch (error) {
+      await killSession(sessionName).catch(() => {});
+      throw error;
+    }
+    upsertSession(record);
   } catch (error) {
-    await killSession(sessionName).catch(() => {});
+    if (!recoveryHandedOff) releaseRecovery?.();
     throw error;
   }
-  upsertSession(record);
 
   // Start Watchers
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
@@ -444,6 +490,17 @@ export async function stopSubSession(
 ): Promise<CloseTreeResult> {
   const record = getSession(sessionName);
   if (!record) {
+    const id = sessionName.replace(/^deck_sub_/, '');
+    if (serverLink && id !== sessionName) {
+      try { serverLink.send({ type: 'subsession.closed', id, sessionName }); } catch { /* ignore */ }
+    }
+    clearResend(sessionName, 'session_removed');
+    clearSessionRestartContinuation(sessionName);
+    timelineEmitter.forgetSession(sessionName);
+    notifySessionTeardown(sessionName);
+    getTransportQueueStore().discardSessionQueueState(sessionName);
+    getDefaultTimelineDetailStore().forgetSession(sessionName);
+    setSessionIncognito(sessionName, false);
     return { ok: true, closed: [], failed: [] };
   }
 
@@ -508,8 +565,14 @@ export async function stopSubSession(
         serverLink.send({ type: 'subsession.closed', id, sessionName });
       }
       clearResend(sessionName, 'session_removed');
+      clearSessionRestartContinuation(sessionName);
       removeSession(sessionName);
       timelineEmitter.forgetSession(sessionName);
+      notifySessionTeardown(sessionName);
+      if (isIncognitoSession(record) || isIncognitoSessionName(sessionName)) {
+        getTransportQueueStore().discardSessionQueueState(sessionName);
+        getDefaultTimelineDetailStore().forgetSession(sessionName);
+      }
     },
     emitFailure: async (_record, failure) => {
       const message = buildSubSessionCloseFailureMessage(failure);
@@ -608,9 +671,30 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
     const rebuildCcPreset = hasWirePreset || hasLegacyPreset
       ? normalizedSuppliedPreset
       : existing?.ccPreset;
-    if (isTransportAgent(sub.type)) {
-      const existingRuntime = getTransportRuntime(sessionName);
+    const existingRuntime = getTransportRuntime(sessionName);
+    if (!existingRuntime && (isIncognitoSession(sub) || isIncognitoSession(existing) || isIncognitoSessionName(sessionName))) {
+      continue;
+    }
+    const runtimeOwner = existingRuntime?.recipientIdentity;
+    // A reconnect DTO is a projection, not a runtime-replacement command.
+    // AG's local route and learned native handle belong to this exact live
+    // owner. Replaying an older route would rotate the store epoch behind
+    // the runtime and make its next lazy native start look foreign.
+    const ownsLiveAgy = existing?.agentType === AGY_SDK_PROVIDER_ID
+      && !!runtimeOwner
+      && existing.sessionInstanceId === runtimeOwner.sessionInstanceId
+      && existing.runtimeEpoch === runtimeOwner.runtimeEpoch
+      && existing.providerSessionId === existingRuntime?.providerSessionId;
+    if (isTransportAgent(sub.type) || ownsLiveAgy) {
       const now = Date.now();
+      const targetAgentType = ownsLiveAgy ? existing.agentType : sub.type;
+      const isAgySub = targetAgentType === AGY_SDK_PROVIDER_ID;
+      const rebuiltRequestedModel = sub.requestedModel ?? existing?.requestedModel;
+      const candidateActiveModel = sub.activeModel ?? existing?.activeModel;
+      const rebuiltActiveModel = isAgySub && !ownsLiveAgy
+        ? (rebuiltRequestedModel
+          ?? (candidateActiveModel === 'gemini-4-carbon-medium' ? AGY_DEFAULT_MODEL_ID : candidateActiveModel))
+        : (isAgySub && ownsLiveAgy ? (existing.activeModel ?? candidateActiveModel) : candidateActiveModel);
       const nextRecord: SessionRecord = {
         ...existing,
         name: sessionName,
@@ -627,8 +711,11 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         updatedAt: now,
         label: sub.label ?? existing?.label,
         parentSession: sub.parentSession ?? existing?.parentSession,
-        requestedModel: sub.requestedModel ?? existing?.requestedModel,
-        activeModel: sub.activeModel ?? existing?.activeModel,
+        requestedModel: rebuiltRequestedModel,
+        activeModel: rebuiltActiveModel,
+        ...(isAgySub && !ownsLiveAgy && rebuiltActiveModel ? {
+          modelDisplay: rebuiltActiveModel,
+        } : {}),
         providerSessionId: sub.providerSessionId ?? existing?.providerSessionId,
         providerResumeId: sub.providerResumeId ?? ((existing?.providerId ?? existing?.agentType) === (sub.providerId ?? sub.type) ? existing?.providerResumeId : undefined),
         ccSessionId: sub.ccSessionId ?? existing?.ccSessionId,
@@ -637,6 +724,13 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         transportConfig: sub.transportConfig ?? existing?.transportConfig,
         description: sub.description ?? existing?.description,
         ccPreset: rebuildCcPreset,
+        ...(isIncognitoSession(existing) || isIncognitoSession(sub) ? { incognito: true } : {}),
+        ...(ownsLiveAgy ? {
+          agentType: existing.agentType,
+          providerId: existing.providerId,
+          providerSessionId: existing.providerSessionId,
+          providerResumeId: existing.providerResumeId,
+        } : {}),
       };
       // Rebuild is REPLAYED, not one-shot: the server re-sends it on every
       // reconnect. Writing all of them unconditionally made a reconnect cost a
@@ -658,9 +752,12 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
     }
     const exists = await sessionExists(sessionName);
     if (!exists) {
+      if (existing && (existing.state === 'error' || isIncognitoSession(existing))) {
+        continue;
+      }
       await startSubSession({ ...sub, ccPreset: rebuildCcPreset }).catch(() => {});
     } else {
-      const stored = existing ?? getSession(sessionName);
+      let stored = existing ?? getSession(sessionName);
       // A sub-session already marked stopped must never have its watcher
       // (re)started here just because its tmux artifact still exists on
       // disk (e.g. remain-on-exit) — rebuildSubSessions is replayed on every
@@ -668,6 +765,30 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       // watcher gets restarted repeatedly, free to adopt another live
       // session's file via directory scan.
       const isStoppedSubSession = stored?.state === 'stopped';
+      const tmuxMod = await import('../agent/tmux.js');
+      const isPaneAliveFn = Object.prototype.hasOwnProperty.call(tmuxMod, 'isPaneAlive') && typeof tmuxMod.isPaneAlive === 'function'
+        ? tmuxMod.isPaneAlive
+        : null;
+      const paneAlive = isStoppedSubSession || !isPaneAliveFn
+        ? true
+        : await isPaneAliveFn(sessionName);
+      if (!isStoppedSubSession && !paneAlive) {
+        if (shouldAutoRespawnDeadProcessSubSession(stored)) {
+          const sm = await import('../agent/session-manager.js');
+          if (Object.prototype.hasOwnProperty.call(sm, 'respawnSession') && typeof sm.respawnSession === 'function') {
+            await sm.respawnSession(stored!).catch((err) => {
+              logger.warn({ err, sessionName }, 'Failed to respawn dead-pane sub-session during rebuild');
+            });
+            stored = getSession(sessionName) ?? stored;
+          }
+        } else {
+          // Dead pane not eligible for continuation respawn (error, incognito, shell,
+          // script, userStopped, or no pending marker): never resurrect or attach watchers.
+          continue;
+        }
+      } else if (!isStoppedSubSession && paneAlive && !hasActiveProcessRestartContinuationRecovery(sessionName)) {
+        consumeRestartContinuation(sessionName);
+      }
       const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
       if (!isStoppedSubSession && sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
         // Pre-claim before seed creation to prevent main session's watchDir from stealing the file
@@ -744,6 +865,8 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         ...(stored?.recentInjectionHistory && stored.recentInjectionHistory.length > 0
           ? { recentInjectionHistory: stored.recentInjectionHistory }
           : {}),
+        ...(stored?.hookCredential ? { hookCredential: stored.hookCredential } : {}),
+        ...(stored?.nativeAgentLaunchFence ? { nativeAgentLaunchFence: stored.nativeAgentLaunchFence } : {}),
         ...(stored?.summarySyncFingerprints && stored.summarySyncFingerprints.length > 0
           ? { summarySyncFingerprints: stored.summarySyncFingerprints }
           : {}),

@@ -1,3 +1,6 @@
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { inIncognitoContext, isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { getSession } from '../store/session-store.js';
 import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
@@ -182,7 +185,7 @@ export function readTailLines(filePath: string, maxLines: number): string[] {
 }
 
 class TimelineStore {
-  private initialized = false;
+  private initializedDir: string | null = null;
   /**
    * Per-session async append chains. Each session has at most one
    * outstanding write Promise; appends are serialized per-session to
@@ -191,19 +194,21 @@ class TimelineStore {
   private sessionChains = new Map<string, Promise<void>>();
 
   private ensureDirSync(): void {
-    if (this.initialized) return;
+    const dir = timelineDir();
+    if (this.initializedDir === dir) return;
     try {
-      mkdirSync(timelineDir(), { recursive: true });
+      mkdirSync(dir, { recursive: true });
     } catch { /* exists */ }
-    this.initialized = true;
+    this.initializedDir = dir;
   }
 
   private async ensureDirAsync(): Promise<void> {
-    if (this.initialized) return;
+    const dir = timelineDir();
+    if (this.initializedDir === dir) return;
     try {
-      await mkdir(timelineDir(), { recursive: true });
+      await mkdir(dir, { recursive: true });
     } catch { /* exists */ }
-    this.initialized = true;
+    this.initializedDir = dir;
   }
 
   filePath(sessionName: string): string {
@@ -223,6 +228,7 @@ class TimelineStore {
    * as ack-outbox `appendRecord`).
    */
   append(event: TimelineEvent): Promise<void> {
+    if (isIncognitoSession(event.payload) || isIncognitoSessionName(event.sessionId) || inIncognitoContext()) return Promise.resolve();
     const sessionId = event.sessionId;
     const prev = this.sessionChains.get(sessionId) ?? Promise.resolve();
     const next = prev.then(
@@ -248,6 +254,7 @@ class TimelineStore {
         logger.debug({ err, sessionId: event.sessionId, eventId: event.eventId }, 'TimelineProjection: append mirror failed');
       });
     } catch (err) {
+      this.initializedDir = null;
       logger.debug({ err, sessionId: event.sessionId }, 'TimelineStore: append failed');
     }
   }
@@ -282,6 +289,19 @@ class TimelineStore {
   }
 
   /**
+   * Unconditionally wait until all currently pending and newly queued
+   * per-session append/truncate chains settle. Unlike {@link flushAll} (used
+   * by SIGTERM shutdown to bound latency), this never returns early on a
+   * timeout while writers remain active, making it safe as a filesystem
+   * teardown barrier in tests.
+   */
+  async drainAll(): Promise<void> {
+    while (this.sessionChains.size > 0) {
+      await Promise.allSettled([...this.sessionChains.values()]);
+    }
+  }
+
+  /**
    * Wait for a single session's append chain to settle. Used by tests
    * that need synchronous visibility after a few `emit()` calls.
    */
@@ -303,7 +323,12 @@ class TimelineStore {
    * Uses reverse-read from file tail for efficiency — only reads as many lines
    * as needed instead of loading the entire file.
    */
+  private isPrivateSession(sessionName: string): boolean {
+    return inIncognitoContext() || isIncognitoSessionName(sessionName) || isIncognitoSession(getSession(sessionName));
+  }
+
   read(sessionName: string, opts?: { epoch?: number; afterSeq?: number; afterTs?: number; beforeTs?: number; limit?: number }): TimelineEvent[] {
+    if (this.isPrivateSession(sessionName)) return [];
     const filePath = this.filePath(sessionName);
     // Read more lines than limit to account for filtered-out events.
     // For most queries (no epoch/afterTs filter), 2x is plenty.
@@ -333,14 +358,23 @@ class TimelineStore {
     sessionName: string,
     opts?: { afterTs?: number; afterSeq?: number; epoch?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryHistory({
-      sessionId: sessionName,
-      afterTs: opts?.afterTs,
-      afterSeq: opts?.afterSeq,
-      epoch: opts?.epoch,
-      beforeTs: opts?.beforeTs,
-      limit: opts?.limit,
-    });
+    if (this.isPrivateSession(sessionName)) return [];
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryHistory({
+        sessionId: sessionName,
+        afterTs: opts?.afterTs,
+        afterSeq: opts?.afterSeq,
+        epoch: opts?.epoch,
+        beforeTs: opts?.beforeTs,
+        limit: opts?.limit,
+      });
+    } catch (err) {
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }
@@ -350,6 +384,7 @@ class TimelineStore {
     types: TimelineEvent['type'][],
     opts?: TimelineProjectionQueryOpts,
   ): Promise<TimelineEvent[]> {
+    if (this.isPrivateSession(sessionName)) return [];
     let events: TimelineEvent[] | null;
     try {
       events = await timelineProjection.queryByTypes({
@@ -374,7 +409,16 @@ class TimelineStore {
   }
 
   async readCompletedTextTail(sessionName: string, limit = 50, options?: TimelineTextTailOptions): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryCompletedTextTail(sessionName, limit, options);
+    if (this.isPrivateSession(sessionName)) return [];
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryCompletedTextTail(sessionName, limit, options);
+    } catch (err) {
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }
@@ -383,6 +427,7 @@ class TimelineStore {
    * Get the latest epoch and seq for a session (from the last line).
    */
   getLatest(sessionName: string): { epoch: number; seq: number } | null {
+    if (this.isPrivateSession(sessionName)) return null;
     const filePath = this.filePath(sessionName);
     const lines = readTailLines(filePath, 5); // read last few lines in case some are corrupt
     for (const line of lines) {
@@ -395,6 +440,7 @@ class TimelineStore {
   }
 
   async getLatestPreferred(sessionName: string): Promise<{ epoch: number; seq: number } | null> {
+    if (this.isPrivateSession(sessionName)) return null;
     return await timelineProjection.getLatest(sessionName);
   }
 
@@ -407,6 +453,7 @@ class TimelineStore {
    * reset so subsequent appends open a fresh fd against the new inode.
    */
   async truncate(sessionName: string, keepLast = MAX_EVENTS_PER_FILE): Promise<void> {
+    if (this.isPrivateSession(sessionName)) return;
     // Put compaction on the same per-session chain as appends. Merely awaiting
     // the current chain leaves a race where a new append can start while the
     // tmp file is being written and then be erased by rename. Reserving the

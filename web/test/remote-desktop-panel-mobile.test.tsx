@@ -1194,6 +1194,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       inputEpoch: 1,
       inputEnabled: true,
       route: 'relay',
+      traffic: { bytesSent: 1024, bytesReceived: 2048 },
       displays: [{
         id: 'display-primary', label: 'Display 1', primary: true, available: true,
         width: 1920, height: 1080, dpiScale: 1.5, rotation: 0,
@@ -1218,6 +1219,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // Resolution, frame rate and bitrate are always on: they are how you tell a
     // usable session from a bad one, so they must not need a toggle first.
     const stats = container.querySelector('.remote-desktop-stats');
+    const traffic = stats?.querySelector('[data-remote-desktop-traffic]');
+    expect(traffic?.getAttribute('data-bytes-sent')).toBe('1024');
+    expect(traffic?.getAttribute('data-bytes-received')).toBe('2048');
+    expect(traffic?.textContent).toContain('remote_desktop.traffic_usage');
     expect(stats?.textContent).toContain('1920×1080');
     expect(stats?.textContent).toContain('29 FPS');
     expect(stats?.textContent).toContain('4.2 Mbps · 24 ms');
@@ -1752,8 +1757,13 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'),
       'utf8',
     );
-    expect(container.querySelector('.remote-desktop-touch-hint')).not.toBeNull();
+    expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(true);
     expect(container.querySelector('.remote-desktop-stats')).not.toBeNull();
+
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.mouse_mode' }) as HTMLButtonElement).click();
+    });
+    expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(false);
 
     act(() => {
       (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click();
@@ -2329,8 +2339,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // completes the same initial-centre pass that ResizeObserver performs in
     // a browser.
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('200px');
-    expect(ring.style.top).toBe(`${150 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('200px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${150 + 72}px`);
 
     // Move the ring away from centre, then resize without changing display,
     // layout, scale or input mode. The position must survive unchanged.
@@ -2338,8 +2348,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointer(stage, 'pointerdown', { pointerId: 301, clientX: 320, clientY: 120 });
       pointer(stage, 'pointerup', { pointerId: 301, clientX: 320, clientY: 120 });
     });
-    expect(ring.style.left).toBe('320px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('320px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     // Minimizing a floating panel can briefly report a zero-sized stage. That
     // transient geometry must not overwrite the last usable ring coordinate;
@@ -2349,24 +2359,24 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       clientHeight: { value: 0, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('320px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('320px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     Object.defineProperties(stage, {
       clientWidth: { value: 400, configurable: true },
       clientHeight: { value: 300, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('320px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('320px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     Object.defineProperties(stage, {
       clientWidth: { value: 240, configurable: true },
       clientHeight: { value: 180, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('240px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('240px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     // A still smaller stage clamps both coordinates, and growing it again
     // does not recenter the user's ring.
@@ -2375,16 +2385,16 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       clientHeight: { value: 80, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('100px');
-    expect(ring.style.top).toBe(`${80 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('100px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${80 + 72}px`);
 
     Object.defineProperties(stage, {
       clientWidth: { value: 600, configurable: true },
       clientHeight: { value: 500, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('100px');
-    expect(ring.style.top).toBe(`${80 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('100px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${80 + 72}px`);
   });
 
   it('remembers a new zoom ratio for this machine once it settles, without saving on every intermediate change', async () => {
@@ -2420,8 +2430,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // use of the same base class.
     expect(cursor.classList.contains('is-touch-ring-marker')).toBe(true);
     const ring = getByLabelText('remote_desktop.touch_ring');
-    expect(ring.style.left).toBe('300px');
-    expect(ring.style.top).toBe(`${150 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('300px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${150 + 72}px`);
 
     pointerClick.mockClear();
     act(() => {
@@ -2452,7 +2462,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // The cursor marker and the ring are bound to the same underlying
     // position -- dragging the ring carries the marker along with it.
     expect(cursor.style.left).toBe('250px');
-    expect(ring.style.left).toBe('250px');
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('250px');
     act(() => { pointer(ring, 'pointerup', { pointerId: 9, clientX: 250, clientY: 150 }); });
     // The drag itself moved the cursor; release must not additionally click.
     expect(pointerClick).not.toHaveBeenCalled();
@@ -3348,33 +3358,50 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(queryByRole('button', { name: 'remote_desktop.touch_right_click' })).toBeNull();
   });
 
-  it('dismisses the touch hint per account and keeps the mouse hint behavior unchanged', async () => {
+  it('keeps the touch hint and Got it button hidden in touch mode across legacy prefs, resizes, and keyboard toggles while preserving mouse hint', async () => {
     const first = await renderPanel();
-    const hint = first.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
-    const dismiss = first.getByRole('button', { name: 'remote_desktop.touch_hint_dismiss' });
-    expect(hint.hidden).toBe(false);
-
-    await act(async () => {
-      fireEvent.click(dismiss);
-      await Promise.resolve();
-    });
-    expect(hint.hidden).toBe(true);
-    expect(localStorage.getItem('rcc_sync_remote_desktop_touch_hint_dismissed')).toContain('"v":true');
-    expect(fileApiMocks.saveUserPref).toHaveBeenCalledWith(
-      'remote_desktop_touch_hint_dismissed',
-      expect.stringContaining('"v":true'),
-    );
-
+    const firstHint = first.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
+    expect(firstHint.hidden).toBe(true);
+    expect(firstHint.textContent).toBe('');
+    expect(first.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
     first.unmount();
-    const reopened = await renderPanel();
-    expect((reopened.container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(true);
-    act(() => {
-      fireEvent.click(reopened.getByRole('button', { name: 'remote_desktop.mouse_mode' }));
-    });
-    const mouseHint = reopened.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
-    expect(mouseHint.hidden).toBe(false);
-    expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
-    expect(mouseHint.textContent).toContain('remote_desktop.mouse_hint');
+
+    for (const storedValue of ['{"v":false,"t":1}', '{"v":true,"t":1}']) {
+      localStorage.setItem('rcc_sync_remote_desktop_touch_hint_dismissed', storedValue);
+      fileApiMocks.getUserPref.mockResolvedValueOnce(storedValue as never);
+      const reopened = await renderPanel();
+      const hint = reopened.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
+      expect(hint.hidden).toBe(true);
+      expect(hint.textContent).toBe('');
+      expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
+
+      act(() => {
+        window.dispatchEvent(new Event('resize'));
+        window.dispatchEvent(new Event('remote-desktop-touch-hint-dismissed'));
+        (reopened.getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click();
+      });
+      expect(hint.hidden).toBe(true);
+      act(() => {
+        (reopened.getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click();
+      });
+      expect(hint.hidden).toBe(true);
+      expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
+
+      act(() => {
+        fireEvent.click(reopened.getByRole('button', { name: 'remote_desktop.mouse_mode' }));
+      });
+      expect(hint.hidden).toBe(false);
+      expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
+      expect(hint.textContent).toContain('remote_desktop.mouse_hint');
+
+      act(() => {
+        fireEvent.click(reopened.getByRole('button', { name: 'remote_desktop.touch_mode' }));
+      });
+      expect(hint.hidden).toBe(true);
+      expect(hint.textContent).toBe('');
+      reopened.unmount();
+    }
+    expect(fileApiMocks.saveUserPref).not.toHaveBeenCalled();
   });
 
   it('provides a readable auto-zoomed virtual mouse with buttons, wheel, and edge pan', async () => {

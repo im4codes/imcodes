@@ -206,6 +206,23 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(screen.getByTestId('window-local-seed').textContent).toBe('this window snapshot');
   });
 
+  it.each(['session', 'local'])('heals stable send duplicates on the first offline %s snapshot paint, without collapsing intentional repeats', (tier) => {
+    const sessionName = `deck_cached_identity_${tier}`;
+    const cacheKey = `srv:${sessionName}`;
+    const rows = makeEvents(sessionName, 4).map((event, index) => ({
+      ...event, type: 'user.message' as const,
+      payload: { text: 'Intentional same body', allowDuplicate: true, commandId: index < 3 ? 'one-send' : 'another-send' },
+    }));
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(rows));
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, 'srv');
+      return h('div', { 'data-testid': 'cold-identity' }, String(timeline.events.length));
+    }
+    render(h(Probe));
+    // No socket, awaited request or effect flush may be needed to heal first paint.
+    expect(screen.getByTestId('cold-identity').textContent).toBe('2');
+  });
+
   it('prefers this window raw-key seed over another window durable scoped seed', () => {
     const sessionName = `deck_window_scope_${Date.now()}`;
     const cacheKey = `srv:${sessionName}`;
@@ -1018,6 +1035,111 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(screen.getByTestId('visible-cold-bound-probe').textContent).toBe('200');
   });
 
+  it.each(['scoped', 'raw-fallback', 'split'].flatMap((segment) =>
+    ['cache-first', 'live-first'].map((order) => ({ segment, order })),
+  ))('restores $segment IDB send identity in $order order without changing disk scope', async ({ segment, order }) => {
+    const sessionName = `deck_restore_identity_${segment}_${order}`;
+    const cacheKey = `srv:${sessionName}`;
+    const old: TimelineEvent = {
+      eventId: 'transport-history:old-projection', sessionId: segment === 'scoped' ? cacheKey : sessionName,
+      ts: 100, epoch: 0, seq: 1, type: 'user.message', source: 'daemon', confidence: 'high',
+      payload: { text: 'Synthetic restored send', commandId: 'one-command', allowDuplicate: true,
+        attachments: [{ name: 'synthetic.png' }] },
+    };
+    const primary: TimelineEvent = { ...old, eventId: 'primary-live', sessionId: sessionName, epoch: 1, seq: 2,
+      payload: { text: 'Synthetic restored send', commandId: 'one-command', allowDuplicate: true } };
+    const header = makeEvents(cacheKey, 1);
+    let release!: (events: TimelineEvent[]) => void;
+    const held = new Promise<TimelineEvent[]>((resolve) => { release = resolve; });
+    const heldKey = segment === 'scoped' ? cacheKey : sessionName;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ epoch: 0, seq: 1 });
+    const reads = vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key) => {
+      if (key === heldKey) return held;
+      return key === cacheKey && segment === 'split' ? header : [];
+    });
+    const migrate = vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockResolvedValue();
+    let handler: ((msg: ServerMessage) => void) | undefined;
+    const ws = { connected: true, onMessage: (fn: typeof handler) => { handler = fn; return () => { handler = undefined; }; },
+      sendTimelineHistoryRequest: () => 'identity-history' } as unknown as WsClient;
+    let seen: TimelineEvent[] = [];
+    function Probe() { seen = useTimeline(sessionName, ws, 'srv').events; return null; }
+    render(h(Probe));
+    await waitFor(() => expect(reads).toHaveBeenCalledWith(heldKey, { limit: 300 }));
+    if (order === 'live-first') act(() => handler?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as ServerMessage));
+    await act(async () => { release([old]); await flushMicrotasks(); });
+    await waitFor(() => expect(seen.some((event) => event.payload.attachments)).toBe(true));
+    act(() => handler?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as ServerMessage));
+    expect(seen.filter((event) => event.type === 'user.message')).toHaveLength(1);
+    expect(seen.every((event) => event.sessionId === sessionName)).toBe(true);
+    expect(old.sessionId).toBe(segment === 'scoped' ? cacheKey : sessionName);
+    if (segment !== 'scoped') expect(migrate).toHaveBeenCalledWith(sessionName, cacheKey, [old]);
+  });
+
+  it.each(['session', 'local'] as const)('merges scoped %s snapshot with actual HTTP catchup and manual local reload', async (tier) => {
+    const sessionName = `deck_snapshot_http_${tier}`;
+    const cacheKey = `srv:${sessionName}`;
+    const old: TimelineEvent = { ...makeEvents(cacheKey, 1)[0], type: 'user.message',
+      eventId: 'transport-history:old-http', payload: { text: 'Synthetic HTTP send', commandId: 'http-command', allowDuplicate: true } };
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify([old]));
+    const primary = { ...old, sessionId: sessionName, eventId: 'http-primary', epoch: 2, seq: 2 };
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([old]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchHistorySpy.mockResolvedValue({ events: [primary], epoch: 2, hasMore: false });
+    let seen: TimelineEvent[] = [];
+    let refresh = () => {};
+    function Probe() { const t = useTimeline(sessionName, null, 'srv'); seen = t.events; refresh = t.forceRefresh; return null; }
+    render(h(Probe));
+    act(() => refresh());
+    await waitFor(() => expect(fetchHistorySpy).toHaveBeenCalled());
+    await waitFor(() => expect(seen.some((event) => event.eventId === 'http-primary')).toBe(true));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].sessionId).toBe(sessionName);
+  });
+
+  it('ignores a late old-owner IDB restore after switching server with the same raw session and command', async () => {
+    const sessionName = 'deck_restore_old_owner';
+    const row = (server: string): TimelineEvent => ({ ...makeEvents(`${server}:${sessionName}`, 1)[0],
+      type: 'user.message', payload: { text: server, commandId: 'same-command', allowDuplicate: true } });
+    let release!: (rows: TimelineEvent[]) => void;
+    const held = new Promise<TimelineEvent[]>((resolve) => { release = resolve; });
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    const reads = vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key) => {
+      if (key === `server-A:${sessionName}`) return held;
+      return key === `server-B:${sessionName}` ? [row('server-B')] : [];
+    });
+    let seen: TimelineEvent[] = [];
+    function Probe({ server }: { server: string }) { seen = useTimeline(sessionName, null, server).events; return null; }
+    const view = render(h(Probe, { server: 'server-A' }));
+    await waitFor(() => expect(reads).toHaveBeenCalledWith(`server-A:${sessionName}`, { limit: 300 }));
+    view.rerender(h(Probe, { server: 'server-B' }));
+    await waitFor(() => expect(seen[0]?.payload.text).toBe('server-B'));
+    await act(async () => { release([row('server-A')]); await flushMicrotasks(); });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].payload.text).toBe('server-B');
+    expect(seen[0].sessionId).toBe(sessionName);
+    expect(__getTimelineCacheForTests(`server-A:${sessionName}`)).toBeUndefined();
+  });
+
+  it.each(['deck_owner_identity', 'deck_owner:variant'])('restores only exact known owners and never joins command across servers (%s)', (sessionName) => {
+    for (const server of ['server-A', 'server-B']) {
+      const key = `${server}:${sessionName}`;
+      const own: TimelineEvent = { ...makeEvents(key, 1)[0], type: 'user.message',
+        payload: { text: server, commandId: 'same-command', allowDuplicate: true } };
+      const foreign = { ...own, eventId: `${server}-foreign`, sessionId: `other-server:${sessionName}` };
+      sessionStorage.setItem(`rcc_timeline_snapshot:${key}`, JSON.stringify([own, foreign]));
+    }
+    const seen = new Map<string, TimelineEvent[]>();
+    function Probe({ server }: { server: string }) { seen.set(server, useTimeline(sessionName, null, server).events); return null; }
+    render(h('div', null, h(Probe, { server: 'server-A' }), h(Probe, { server: 'server-B' })));
+    expect(seen.get('server-A')).toHaveLength(1);
+    expect(seen.get('server-B')).toHaveLength(1);
+    expect(seen.get('server-A')![0].payload.text).toBe('server-A');
+    expect(seen.get('server-B')![0].payload.text).toBe('server-B');
+  });
+
   it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
     // Regression for the scope-drift bug — PR-4 in
     // .imc/discussions/e9dbc48c-dda.md. When the app mounts before
@@ -1642,6 +1764,77 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(text, 'oversized conversation text was replaced by a tool-only first paint').toBeTruthy();
     expect(String(text?.payload.text ?? '')).toContain('answer:');
     expect(text?.payload.historyPayloadTruncated).toBe(true);
+  });
+
+  it('reads only the Unicode preview prefix of an oversized answer during snapshot persistence', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_prefix_cost_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const rawText = '😀'.repeat(1_024) + '中'.repeat(300_000);
+    const [event] = makeEvents(sessionName, 1);
+    const original = String.prototype[Symbol.iterator];
+    let consumed = 0;
+    const spy = vi.spyOn(String.prototype, Symbol.iterator).mockImplementation(function* (this: string) {
+      for (const char of original.call(this)) {
+        if (String(this) === rawText) consumed++;
+        yield char;
+      }
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, [{ ...event!, payload: { text: rawText } }]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(consumed).toBe(1_025);
+    const snapshot = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]') as TimelineEvent[];
+    expect(snapshot[0]?.payload.text).toBe('😀'.repeat(1_024) + '…');
+    expect(snapshot[0]?.payload.historyPayloadTruncated).toBe(true);
+  });
+
+  it('never stringifies an already oversized text body just to discard it for a preview', async () => {
+    vi.useFakeTimers();
+    const sessionName = 'deck_snapshot_oversized_work_brain';
+    const cacheKey = `srv:${sessionName}`;
+    const [event] = makeEvents(sessionName, 1);
+    const oversized = { ...event!, payload: { text: '中'.repeat(300_000) } };
+    const stringify = JSON.stringify;
+    let fullCopies = 0;
+    const spy = vi.spyOn(JSON, 'stringify').mockImplementation((value, ...args) => {
+      if (value === oversized) fullCopies++;
+      return stringify(value, ...args);
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, [oversized]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally { spy.mockRestore(); }
+    expect(fullCopies).toBe(0);
+    const stored = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]');
+    expect(stored[0].payload.text).toBe('中'.repeat(1_024) + '…');
+  });
+
+  it('serializes each source only once while shrinking its own quota budget', async () => {
+    vi.useFakeTimers();
+    const sessionName = 'deck_snapshot_retry_work_brain';
+    const cacheKey = `srv:${sessionName}`;
+    const events = makeEvents(sessionName, 2);
+    const stringify = JSON.stringify;
+    const setItem = Storage.prototype.setItem;
+    let fullCopies = 0;
+    const jsonSpy = vi.spyOn(JSON, 'stringify').mockImplementation((value, ...args) => {
+      if (events.includes(value as TimelineEvent)) fullCopies++;
+      return stringify(value, ...args);
+    });
+    const storageSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+      if (this === localStorage && key === `rcc_timeline_snapshot:${cacheKey}`) throw new DOMException('synthetic full store', 'QuotaExceededError');
+      return setItem.call(this, key, value);
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, events);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally { jsonSpy.mockRestore(); storageSpy.mockRestore(); }
+    expect(fullCopies).toBe(events.length);
+    expect(JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]')).toEqual(events);
   });
 
   it('bounds each independent synchronous snapshot to 256 KiB without borrowing from peer windows', async () => {

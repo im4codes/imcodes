@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFile, rm, writeFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   getLocalSessionIdentityProfile,
@@ -14,7 +15,7 @@ import {
   resetIdentityStoreCacheForTests,
 } from '../../src/daemon/session-identity-local-store.js';
 
-const home = join(process.cwd(), '.tmp-identity-local-store');
+const home = mkdtempSync(join(tmpdir(), 'imcodes-identity-local-store-'));
 
 beforeEach(async () => {
   resetIdentityStoreCacheForTests();

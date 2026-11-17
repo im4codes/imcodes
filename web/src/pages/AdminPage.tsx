@@ -335,7 +335,7 @@ export function AdminPage({ onBack }: Props) {
 
         {/* Confirmation dialog */}
         {confirmAction && (
-          <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
+          <div style={{ position: 'fixed', inset: 0, width: 'var(--imcodes-ui-vw, 100%)', height: 'var(--vvh, var(--imcodes-ui-dvh))', boxSizing: 'border-box', background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
             <div style={{ background: '#1e293b', borderRadius: '12px', padding: '24px', maxWidth: '400px', width: '90%' }}>
               <h3 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px' }}>
                 {confirmAction.type === 'delete' ? t('admin.confirm_delete_title') : t('admin.confirm_disable_title')}

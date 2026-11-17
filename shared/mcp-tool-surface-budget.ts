@@ -56,16 +56,14 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // the ceilings move deliberately and reviewably to accommodate them. The
 // pause/resume Cron controls add 503 measured authored bytes to the full
 // catalog, so retain bounded headroom above the resulting 53,503-byte surface.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 57_000;
-// Raw = authored + the MCP SDK framing. The pair-resource-claim tool adds one
-// intentionally discoverable contract and `command` one published parameter;
-// the structured pair_create/pair_dispatch and pair lifecycle contracts add
-// about 4.3 KiB to that wire payload; the pause/resume Cron controls add two
-// schemas to the scheduling group, bringing the measured raw surface to
-// 60,991 bytes. Retain bounded review headroom above that exact catalog.
-// The pair decision record/history contracts add two bounded schemas to the
-// supervision group; keep explicit headroom for the resulting wire payload.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 64_000;
+// Consolidating the 6 partial Cloud Docs MCP tools into the single unified
+// `cloud_docs` CLI-passthrough tool shrinks the measured full stdio surface
+// (with alias + pool tools) from 67,616 raw bytes down to 64,592 raw bytes
+// (51,915 authored without pool/alias; ~56.3 KiB authored on full stdio).
+// Keep tight reviewable headroom above that reduced surface.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 58_500;
+// Raw = authored + the MCP SDK framing (measured 64,592 bytes on full stdio).
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 67_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

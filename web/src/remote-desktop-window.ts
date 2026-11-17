@@ -102,7 +102,7 @@ export function remoteDesktopWindowBounds(fallbackWidth: number, fallbackHeight:
   };
 }
 
-function remoteDesktopWindowFeatures(bounds: WindowBounds): string {
+export function remoteDesktopWindowFeatures(bounds: WindowBounds): string {
   return [
     'popup=yes',
     'location=no',

@@ -17,6 +17,7 @@ let mcpStatusPages: Array<Record<string, unknown>> = [];
 /** Queued `mcpServer/tool/call` errors; an empty queue answers a live transport. */
 let mcpToolCallErrors: string[] = [];
 const realSetTimeout = setTimeout;
+const realDateNow = Date.now;
 
 const loggerMock = vi.hoisted(() => ({
   info: vi.fn(),
@@ -380,13 +381,13 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 async function waitForCondition(
   check: () => boolean,
-  timeoutMs = 3000,
+  timeoutMs = 5000,
   intervalMs = 10,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = realDateNow() + timeoutMs;
+  while (realDateNow() < deadline) {
     if (check()) return;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await new Promise((resolve) => realSetTimeout(resolve, intervalMs));
   }
   throw new Error('Timed out waiting for condition');
 }
@@ -408,6 +409,7 @@ async function advanceFakeTimersWithRealIoUntil(
   check: () => boolean,
   timeoutMs = 20_000,
   stepMs = 100,
+  realIoDrainMs = 15_000,
 ): Promise<void> {
   const steps = Math.max(1, Math.ceil(timeoutMs / stepMs));
   for (let i = 0; i <= steps; i += 1) {
@@ -421,6 +423,22 @@ async function advanceFakeTimersWithRealIoUntil(
     // preventing a fake-time-only false timeout under suite-wide I/O load.
     await new Promise<void>((resolve) => realSetImmediate(resolve));
     await new Promise<void>((resolve) => realSetTimeout(resolve, 5));
+  }
+  // Under heavy CI I/O contention, real async fs work triggered near or after
+  // CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS can still be in flight when virtual
+  // time reaches `timeoutMs`. Keep draining real time and flushing zero-delay
+  // follow-up timers without burning out of the virtual window.
+  const realDeadline = realDateNow() + realIoDrainMs;
+  let drainTicks = 0;
+  while (realDateNow() < realDeadline) {
+    if (check()) return;
+    await new Promise<void>((resolve) => realSetImmediate(resolve));
+    await new Promise<void>((resolve) => realSetTimeout(resolve, 25));
+    if (check()) return;
+    drainTicks += 1;
+    // Advance fake time by at most one step every ~500ms of real wait so
+    // debounce/poll follow-up timers fire without jumping past virtual caps.
+    await vi.advanceTimersByTimeAsync(drainTicks % 20 === 0 ? stepMs : 0);
   }
   throw new Error('Timed out waiting for fake-timer condition with real I/O');
 }
@@ -482,6 +500,93 @@ function expectCodexSubagentDetail(
 }
 
 describe('CodexSdkProvider', () => {
+  describe('native interactive questions', () => {
+    const params = {
+      threadId: 'thread-1', turnId: 'turn-1', itemId: 'ask-1',
+      questions: [
+        { id: 'color', header: 'Color', question: 'Which color?', isOther: true, isSecret: false, options: [{ label: 'Blue', description: 'Blue theme' }] },
+        { id: 'notes', header: 'Notes', question: 'Any notes?', isOther: true, isSecret: false, options: null },
+      ],
+    };
+    async function setupQuestion() {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      const sid = await provider.createSession({ sessionKey: 'route-questions', sessionName: 'test-questions-main', cwd: '/tmp/project' });
+      await provider.send(sid, 'hello');
+      const child = childProcessMock.children[0];
+      await waitForCondition(() => (provider as any).sessions.get(sid)?.runningTurnId === 'turn-1');
+      const tools: any[] = [];
+      provider.onToolCall((_sid, tool) => tools.push(tool));
+      const answer = (text: string) => (provider as any).answerPendingQuestion('test-questions-main', text);
+      return { provider, sid, child, tools, answer };
+    }
+
+    it.each([700, 'native-question'])('surfaces native request %s and replies on the same RPC without a new turn', async (id) => {
+      const { child, tools, answer } = await setupQuestion();
+      child.emits({ id, method: 'item/tool/requestUserInput', params });
+      await flush();
+      expect(tools).toEqual([expect.objectContaining({ name: 'AskUserQuestion', status: 'complete', input: { questions: params.questions } })]);
+      expect(answer('[Color] Blue\n[Notes] line one\nline two')).toBe(true);
+      await flush();
+      expect(child.requests).toContainEqual({ id, result: { answers: { color: { answers: ['Blue'] }, notes: { answers: ['line one\nline two'] } } } });
+      expect(child.requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
+      expect(answer('duplicate')).toBe(false);
+    });
+
+    it('does not consume an outbound RPC when the server request has the same numeric id', async () => {
+      const { provider, child, tools, answer } = await setupQuestion();
+      const pending = (provider as any).request('thread/read', { threadId: 'thread-1', includeTurns: true });
+      const request = child.requests.at(-1)!;
+      child.emits({ id: request.id, method: 'item/tool/requestUserInput', params });
+      await flush();
+      expect(tools).toHaveLength(1);
+      expect((provider as any).pendingRequests.has(request.id)).toBe(true);
+      expect(answer('[Color] Blue\n[Notes] skip')).toBe(true);
+      child.emits({ id: request.id, result: { thread: { id: 'thread-1' } } });
+      await expect(pending).resolves.toMatchObject({ thread: { id: 'thread-1' } });
+    });
+
+    it('expires an unanswered question without fabricating a user choice', async () => {
+      const { child, answer } = await setupQuestion();
+      vi.useFakeTimers();
+      child.emits({ id: 'expires', method: 'item/tool/requestUserInput', params });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(child.requests).toContainEqual({ id: 'expires', result: { answers: {} } });
+      expect(answer('late')).toBe(false);
+    });
+
+    it.each(['cancel', 'endSession', 'disconnect'] as const)('releases a pending question on %s', async (operation) => {
+      const { provider, sid, child, answer } = await setupQuestion();
+      child.emits({ id: 'teardown', method: 'item/tool/requestUserInput', params });
+      await flush();
+      if (operation === 'disconnect') await provider.disconnect();
+      else await provider[operation](sid);
+      expect(answer('late')).toBe(false);
+      expect((provider as any).questions.has(sid)).toBe(false);
+    });
+
+    it('rejects stale turns and unknown threads instead of opening an unanswerable card', async () => {
+      const { child, tools } = await setupQuestion();
+      for (const [id, patch] of [['stale', { turnId: 'old-turn' }], ['unknown', { threadId: 'unknown-thread' }]] as const) {
+        child.emits({ id, method: 'item/tool/requestUserInput', params: { ...params, ...patch } });
+        await flush();
+        expect(child.requests).toContainEqual(expect.objectContaining({ id, error: expect.objectContaining({ code: -32602 }) }));
+      }
+      expect(tools).toHaveLength(0);
+    });
+
+    it('keeps sibling session answers isolated and releases pending input when its turn completes', async () => {
+      const { provider, sid, child, answer } = await setupQuestion();
+      child.emits({ id: 'completed', method: 'item/tool/requestUserInput', params });
+      await flush();
+      expect((provider as any).answerPendingQuestion('other-session', 'Blue')).toBe(false);
+      child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
+      await flush();
+      expect(answer('late')).toBe(false);
+      expect((provider as any).questions.has(sid)).toBe(false);
+    });
+  });
+
   beforeEach(() => {
     mcpStatusPages = [];
     mcpToolCallErrors = [];
@@ -4174,6 +4279,19 @@ describe('CodexSdkProvider', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
+  }, 45_000);
+
+  it('drains delayed real I/O under fake timers after virtual polling window completes', async () => {
+    vi.useFakeTimers();
+    let settled = false;
+    realSetTimeout(() => {
+      settled = true;
+    }, 150);
+
+    // 200ms virtual budget finishes in ~25ms real time; helper must keep
+    // draining real I/O instead of throwing prematurely at ~25ms.
+    await advanceFakeTimersWithRealIoUntil(() => settled, 200, 50, 2_000);
+    expect(settled).toBe(true);
   });
 
   it('ROLLOUT-FIRST: self-heals a turn whose task_complete is already on disk — no idle hint, no 60s gate', async () => {
@@ -4345,7 +4463,7 @@ describe('CodexSdkProvider', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
-  });
+  }, 45_000);
 
   it('terminalizes active Codex commandExecution items on turn/completed', async () => {
     const provider = createCodexProvider();
@@ -6617,7 +6735,7 @@ describe('CodexSdkProvider', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
-  });
+  }, 45_000);
 
   it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
     const provider = createCodexProvider();

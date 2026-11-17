@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { SESSION_INCOGNITO_UNSUPPORTED } from '../../shared/session-incognito-types.js';
 
 const createSubSessionMock = vi.fn();
 const updateSubSessionMock = vi.fn();
@@ -423,5 +424,52 @@ describe('sub-session routes', () => {
     expect(await res.json()).toEqual({ error: 'forbidden', reason: 'brain_session_required' });
     expect(updateSubSessionMock).not.toHaveBeenCalled();
     expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /sub-sessions with incognito=true returns ephemeral 201 without DB write', async () => {
+    const res = await app.request('/api/server/srv1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'claude-code-sdk',
+        cwd: '/tmp/secret',
+        label: 'Ghost Sub',
+        parent_session: 'deck_test_brain',
+        incognito: true,
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    expect(typeof body.id).toBe('string');
+    expect(body.id).toHaveLength(8);
+    expect(body.sessionName).toBe(`deck_sub_${body.id}`);
+    expect(body.subSession).toMatchObject({
+      id: body.id,
+      server_id: 'srv1',
+      type: 'claude-code-sdk',
+      cwd: '/tmp/secret',
+      label: 'Ghost Sub',
+      parent_session: 'deck_test_brain',
+      incognito: true,
+    });
+    expect(createSubSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /sub-sessions with incognito=true rejects unsupported session types with 400 and no DB write', async () => {
+    const res = await app.request('/api/server/srv1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'shell',
+        cwd: '/tmp/secret',
+        parent_session: 'deck_test_brain',
+        incognito: true,
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: SESSION_INCOGNITO_UNSUPPORTED });
+    expect(createSubSessionMock).not.toHaveBeenCalled();
   });
 });

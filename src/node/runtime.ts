@@ -1,3 +1,4 @@
+import type { RemoteDesktopTrafficHistory } from '../../shared/remote-desktop-traffic.js';
 import {
   CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile,
 } from '../../shared/controlled-node-abi.js';
@@ -6,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.js';
+import { CONTROLLED_NODE_ARTIFACT_ASSETS, CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.js';
 import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
@@ -34,6 +35,7 @@ import {
 } from './startup-diagnostics.js';
 import {
   downloadControlledNodeMacosRemoteDesktopComponentSet,
+  probeControlledNodeArtifactMetadata,
   refreshControlledNodeRemoteDesktopWorker,
   startControlledNodeUpgradeScavenger,
   startControlledNodeSelfUpgrade,
@@ -224,6 +226,7 @@ export interface ControlledNodeRemoteDesktopWorker {
   onPrivacyFrame?(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void;
   supportsDefaultShieldedRoute?(): boolean;
   handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
+  trafficStatus?(): RemoteDesktopTrafficHistory;
   activeConnections?(): readonly RemoteDesktopLocalConnection[];
   stopConnection?(publicId: string): Promise<boolean>;
   stopAllConnections?(): Promise<void>;
@@ -268,10 +271,11 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
   macos?: MacosRemoteDesktopWorkerHostOptions;
   linux?: LinuxRemoteDesktopWorkerHostOptions;
   headless?: boolean;
+  trafficStorePath?: string;
 }): PlatformRemoteDesktopWorkerSelection {
   if (input.headless) return { worker: new UnavailableRemoteDesktopWorkerHost() };
   if (input.platform === 'win32') {
-    const worker = new RemoteDesktopWorkerHost(input.onMessage, input.windows);
+    const worker = new RemoteDesktopWorkerHost(input.onMessage, { ...input.windows, trafficStorePath: input.trafficStorePath ?? input.windows?.trafficStorePath });
     return worker.available()
       ? { worker, startup: () => worker.start() }
       : { worker };
@@ -281,12 +285,13 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
     && input.macos) {
     const worker = new MacosRemoteDesktopWorkerHost(input.onMessage, {
       ...input.macos,
+      trafficStorePath: input.trafficStorePath ?? input.macos.trafficStorePath,
       runtime: { platform: input.platform, arch: input.arch },
     });
     return { worker, startup: () => worker.start() };
   }
   if (input.platform === 'linux' && input.arch === 'x64') {
-    const worker = new LinuxRemoteDesktopWorkerHost(input.onMessage, input.linux);
+    const worker = new LinuxRemoteDesktopWorkerHost(input.onMessage, { ...input.linux, trafficStorePath: input.trafficStorePath ?? input.linux?.trafficStorePath });
     return worker.available()
       ? {
         worker,
@@ -349,6 +354,7 @@ class FinalizingAuthenticatedWebSocketClient extends AuthenticatedWebSocketClien
 }
 
 export interface ControlledNodeRuntimeOptions {
+  remoteDesktopTrafficStorePath?: string;
   /**
    * Injected so the install path can be exercised without a server, a notary
    * and four signed binaries. The default implementation downloads this
@@ -442,12 +448,13 @@ export interface ControlledNodeRuntimeOptions {
   platform?: NodeJS.Platform;
   arch?: string;
   now?: () => number;
+  fetchImpl?: typeof fetch;
   /** Persisted before construction; the runtime owns enforcement, not storage. */
   remoteDesktopAccessPaused?: boolean;
 }
 
 export interface ControlledNodeRuntimeClient extends AuthenticatedWebSocketClient {
-  remoteDesktopAccessStatus(): { paused: boolean; connections: readonly RemoteDesktopLocalConnection[] };
+  remoteDesktopAccessStatus(): { paused: boolean; connections: readonly RemoteDesktopLocalConnection[]; traffic?: RemoteDesktopTrafficHistory };
   /** Host name and (macOS) permission state for the local panel; read off state the node already keeps, never probed. */
   remoteDesktopLocalExtras(): RemoteDesktopLocalExtras;
   /** Which server address the node dials and, when it cannot reach it, why. No secret. */
@@ -458,7 +465,9 @@ export interface ControlledNodeRuntimeClient extends AuthenticatedWebSocketClien
 }
 
 const REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS = 5 * 60_000;
+const REMOTE_DESKTOP_WORKER_CURRENT_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
 const MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS = 5 * 60_000;
+const MACOS_REMOTE_DESKTOP_CURRENT_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
 /**
  * How soon components that ARE installed but did not start are started again.
  * Much shorter than the install back-off because the usual cause is a state a
@@ -499,6 +508,7 @@ export function createControlledNodeRuntime(
   const platformWorker: PlatformRemoteDesktopWorkerSelection = headlessProfile ? { worker: new UnavailableRemoteDesktopWorkerHost() } : options.remoteDesktopWorker
     ? { worker: options.remoteDesktopWorker }
     : createPlatformRemoteDesktopWorkerHost({
+      trafficStorePath: options.remoteDesktopTrafficStorePath,
       platform,
       arch,
       onMessage: (message) => {
@@ -1146,17 +1156,51 @@ export function createControlledNodeRuntime(
       });
     };
     emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.STARTED);
+    let installedCurrentVersion: string | undefined;
     let installedTargetVersion: string | undefined;
     let installFailureReason: string | undefined;
     let installedArtifactSha256: string | undefined;
     const install = options.installMacosRemoteDesktopComponents ?? (async () => {
+      const fetchImpl = options.fetchImpl ?? fetch;
+      const current = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
+        runtime: { platform, arch: componentArch },
+      }).catch(() => null);
+      if (current?.manifest.workerVersion) {
+        installedCurrentVersion = current.manifest.workerVersion;
+        const probe = await probeControlledNodeArtifactMetadata({
+          credential,
+          target: { os: CONTROLLED_NODE_OS_MAC, arch: componentArch },
+          asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET,
+          fetchImpl,
+        });
+        if (probe.status === 'ok' && probe.version) {
+          installedTargetVersion = probe.version;
+          if (probe.sha256) installedArtifactSha256 = probe.sha256;
+          const order = compareImcodesVersions(current.manifest.workerVersion, probe.version);
+          if (order === null) {
+            installFailureReason = 'worker_version_unparseable';
+            return false;
+          }
+          if (order >= 0) {
+            installFailureReason = order === 0 ? 'worker_current' : 'worker_downgrade_rejected';
+            return false;
+          }
+        } else if (probe.status === 'unavailable') {
+          logger.warn(
+            { daemonVersion: DAEMON_VERSION, arch: componentArch },
+            'macOS remote-desktop component set unavailable from the hosted release '
+            + '(auto-install will retry)',
+          );
+          return false;
+        }
+      }
       const staging = await mkdtemp(join(tmpdir(), 'imcodes-macos-rd-install-'));
       try {
         const downloaded = await downloadControlledNodeMacosRemoteDesktopComponentSet({
           credential,
           target: { os: CONTROLLED_NODE_OS_MAC, arch: componentArch },
           dir: staging,
-          fetchImpl: fetch,
+          fetchImpl,
         });
         if (!downloaded) {
           // The server has no signed macOS component set for THIS daemon
@@ -1187,10 +1231,8 @@ export function createControlledNodeRuntime(
           return false;
         }
         installedTargetVersion = targetVersion;
-        const current = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
-          runtime: { platform, arch: componentArch },
-        }).catch(() => null);
         if (current?.manifest.workerVersion) {
+          installedCurrentVersion = current.manifest.workerVersion;
           const order = compareImcodesVersions(current.manifest.workerVersion, targetVersion);
           if (order === null) {
             installFailureReason = 'worker_version_unparseable';
@@ -1216,11 +1258,13 @@ export function createControlledNodeRuntime(
       const installResult = await install();
       const installed = typeof installResult === 'boolean' ? installResult : !installResult.reason;
       if (typeof installResult !== 'boolean') {
+        installedCurrentVersion = installResult.installedVersion ?? installedCurrentVersion;
         installedTargetVersion = installResult.targetVersion ?? installResult.installedVersion ?? installedTargetVersion;
         installedArtifactSha256 = installResult.artifactSha256 ?? installedArtifactSha256;
         installFailureReason = installResult.reason ?? installFailureReason;
       }
       if (installed) {
+        macosRemoteDesktopInstallNextAttemptAt = (options.now?.() ?? Date.now()) + MACOS_REMOTE_DESKTOP_CURRENT_CHECK_INTERVAL_MS;
         logger.info('installed the macOS remote-desktop component set');
         macosRemoteDesktopInstalledForRelease = true;
         pruneMacosRemoteDesktopReleases();
@@ -1246,12 +1290,26 @@ export function createControlledNodeRuntime(
         // Re-read rather than assume: starting does not imply readiness, and
         // screen recording may not be granted yet.
         republishCapabilitiesIfChanged();
+        macosRemoteDesktopInstallInFlight = false;
         emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, {
           installedVersion: installedTargetVersion ?? DAEMON_VERSION,
           targetVersion: installedTargetVersion ?? DAEMON_VERSION,
           ...(installedArtifactSha256 ? { artifactSha256: installedArtifactSha256 } : {}),
         });
+      } else if (installFailureReason === 'worker_current') {
+        macosRemoteDesktopInstallNextAttemptAt = (options.now?.() ?? Date.now()) + MACOS_REMOTE_DESKTOP_CURRENT_CHECK_INTERVAL_MS;
+        macosRemoteDesktopInstallInFlight = false;
+        emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, {
+          installedVersion: installedCurrentVersion ?? installedTargetVersion ?? DAEMON_VERSION,
+          targetVersion: installedTargetVersion ?? installedCurrentVersion ?? DAEMON_VERSION,
+          ...(installedArtifactSha256 ? { artifactSha256: installedArtifactSha256 } : {}),
+          reason: installFailureReason,
+        });
       } else {
+        if (installFailureReason === 'worker_downgrade_rejected') {
+          macosRemoteDesktopInstallNextAttemptAt = (options.now?.() ?? Date.now()) + MACOS_REMOTE_DESKTOP_CURRENT_CHECK_INTERVAL_MS;
+        }
+        macosRemoteDesktopInstallInFlight = false;
         emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
           ...(installedTargetVersion ? { targetVersion: installedTargetVersion } : {}),
           reason: installFailureReason ?? 'worker_not_available',
@@ -1259,6 +1317,7 @@ export function createControlledNodeRuntime(
       }
       return installed;
     } catch (error) {
+      macosRemoteDesktopInstallInFlight = false;
       logger.warn({ err: error }, 'macOS remote-desktop component install failed');
       emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
         reason: error instanceof Error ? error.message : 'worker_refresh_failed',
@@ -1313,6 +1372,13 @@ export function createControlledNodeRuntime(
     const repair = options.repairMissingRemoteDesktopWorker
       ?? ((targetVersion: string) => startControlledNodeSelfUpgrade(credential, targetVersion));
     void repair(DAEMON_VERSION).then((result) => {
+      if (result.alreadyCurrent) {
+        clearUpgradeGate();
+        refreshRemoteDesktopCapabilityState();
+        republishCapabilitiesIfChanged();
+        logger.info({ targetVersion: result.targetVersion }, 'controlled node release artifacts already match disk; skipping repair handoff');
+        return;
+      }
       if (result.ok) {
         client.send({
           type: DAEMON_MSG.UPGRADING,
@@ -1372,6 +1438,7 @@ export function createControlledNodeRuntime(
         credential,
         platform,
         arch,
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
         canCommit: () => !upgradeInFlight
           && remoteDesktopPrepareInFlight === 0
           && !remoteDesktopWorkerHasActiveConnections(),
@@ -1397,64 +1464,83 @@ export function createControlledNodeRuntime(
     const refreshContext: ControlledNodeRemoteDesktopWorkerRefreshContext = {
       commitFence: remoteDesktopCommitFence,
     };
-    void refresh(refreshContext).then(async (result) => {
-      if (!result.updated) {
-        emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, result);
-        return;
-      }
-      if (refreshActivationFailureReason) {
-        emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
-          ...result,
-          reason: refreshActivationFailureReason,
-        });
-        return;
-      }
-      // Custom test/integration refreshers may perform the swap themselves.
-      // Keep activation behind the same fence unless they explicitly report
-      // that activation already happened under it.
-      if (!result.activated) {
-        const release = remoteDesktopCommitFence.acquire();
-        if (!release) {
-          logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh activation was busy');
+    void (async () => {
+      try {
+        const result = await refresh(refreshContext);
+        if (!result.updated) {
+          if (result.reason === 'worker_current') {
+            remoteDesktopWorkerRefreshNextAttemptAt = (options.now?.() ?? Date.now()) + REMOTE_DESKTOP_WORKER_CURRENT_CHECK_INTERVAL_MS;
+            remoteDesktopWorkerRefreshInFlight = false;
+            emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, result);
+            return;
+          }
+          if (result.reason === 'worker_downgrade_rejected') {
+            remoteDesktopWorkerRefreshNextAttemptAt = (options.now?.() ?? Date.now()) + REMOTE_DESKTOP_WORKER_CURRENT_CHECK_INTERVAL_MS;
+          }
+          remoteDesktopWorkerRefreshInFlight = false;
+          emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, result);
+          return;
+        }
+        if (refreshActivationFailureReason) {
+          remoteDesktopWorkerRefreshInFlight = false;
           emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
             ...result,
-            reason: 'worker_reload_busy',
+            reason: refreshActivationFailureReason,
           });
           return;
         }
-        try {
-          const reloaded = remoteDesktopWorker.reloadFromDisk
-            ? remoteDesktopWorker.reloadFromDisk()
-            : (remoteDesktopWorker.close(), true);
-          if (!reloaded) {
-            logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh was not loadable');
+        // Custom test/integration refreshers may perform the swap themselves.
+        // Keep activation behind the same fence unless they explicitly report
+        // that activation already happened under it.
+        if (!result.activated) {
+          const release = remoteDesktopCommitFence.acquire();
+          if (!release) {
+            logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh activation was busy');
+            remoteDesktopWorkerRefreshInFlight = false;
             emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
               ...result,
-              reason: 'worker_reload_failed',
+              reason: 'worker_reload_busy',
             });
             return;
           }
           try {
-            await remoteDesktopWorkerStartup?.();
-          } catch (error) {
-            logger.warn({ err: error }, 'refreshed remote-desktop worker did not start');
+            const reloaded = remoteDesktopWorker.reloadFromDisk
+              ? remoteDesktopWorker.reloadFromDisk()
+              : (remoteDesktopWorker.close(), true);
+            if (!reloaded) {
+              logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh was not loadable');
+              remoteDesktopWorkerRefreshInFlight = false;
+              emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+                ...result,
+                reason: 'worker_reload_failed',
+              });
+              return;
+            }
+            try {
+              await remoteDesktopWorkerStartup?.();
+            } catch (error) {
+              logger.warn({ err: error }, 'refreshed remote-desktop worker did not start');
+            }
+            refreshRemoteDesktopCapabilityState();
+            republishCapabilitiesIfChanged();
+          } finally {
+            release();
           }
-          refreshRemoteDesktopCapabilityState();
-          republishCapabilitiesIfChanged();
-        } finally {
-          release();
         }
+        remoteDesktopWorkerRefreshNextAttemptAt = (options.now?.() ?? Date.now()) + REMOTE_DESKTOP_WORKER_CURRENT_CHECK_INTERVAL_MS;
+        remoteDesktopWorkerRefreshInFlight = false;
+        logger.info({ targetVersion: result.targetVersion }, 'refreshed remote-desktop worker independently of daemon version');
+        emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, result);
+      } catch (error) {
+        remoteDesktopWorkerRefreshInFlight = false;
+        logger.warn({ err: error }, 'remote-desktop worker refresh attempt failed');
+        emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+          reason: error instanceof Error ? error.message : 'worker_refresh_failed',
+        });
+      } finally {
+        remoteDesktopWorkerRefreshInFlight = false;
       }
-      logger.info({ targetVersion: result.targetVersion }, 'refreshed remote-desktop worker independently of daemon version');
-      emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, result);
-    }).catch((error) => {
-      logger.warn({ err: error }, 'remote-desktop worker refresh attempt failed');
-      emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
-        reason: error instanceof Error ? error.message : 'worker_refresh_failed',
-      });
-    }).finally(() => {
-      remoteDesktopWorkerRefreshInFlight = false;
-    });
+    })();
     return true;
   };
   const startDeferredDaemonUpgrade = (targetVersion: string): boolean => {
@@ -1463,6 +1549,13 @@ export function createControlledNodeRuntime(
     pendingDaemonUpgradeTarget = undefined;
     const startSelfUpgrade = options.startSelfUpgrade ?? startControlledNodeSelfUpgrade;
     void startSelfUpgrade(credential, targetVersion).then((result) => {
+      if (result.alreadyCurrent) {
+        clearUpgradeGate();
+        refreshRemoteDesktopCapabilityState();
+        republishCapabilitiesIfChanged();
+        logger.info({ targetVersion: result.targetVersion, artifactSha256: result.artifactSha256 }, 'controlled node release artifacts already match disk; skipping self-upgrade handoff');
+        return;
+      }
       if (result.ok) {
         client.send({ type: DAEMON_MSG.UPGRADING, targetVersion: result.targetVersion, artifactSha256: result.artifactSha256 });
         armUpgradeHandoffWatchdog();
@@ -1901,6 +1994,10 @@ export function createControlledNodeRuntime(
         // the independently published release and keeps all signature/hash,
         // version, busy-session, and atomic-commit fences local.
         if (Object.keys(message).length !== 1) return;
+        if (platform === 'darwin') {
+          void installMacosRemoteDesktopComponents(true);
+          return;
+        }
         refreshRemoteDesktopWorkerIfDue(true);
         return;
       }
@@ -2257,6 +2354,7 @@ export function createControlledNodeRuntime(
   runtimeClient.connectionStatus = () => connection.status();
   runtimeClient.remoteDesktopAccessStatus = () => ({
     paused: remoteDesktopAccessPaused,
+    traffic: remoteDesktopWorker.trafficStatus?.(),
     connections: remoteDesktopWorker.activeConnections?.() ?? [],
   });
   runtimeClient.remoteDesktopLocalExtras = () => buildLocalPanelExtras({

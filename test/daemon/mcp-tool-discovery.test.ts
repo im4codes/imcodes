@@ -105,6 +105,58 @@ describe('exact MCP discovery fallback', () => {
     expect(targets.every((tool) => tool.enabled === false)).toBe(true);
   });
 
+  it('publishes only the bounded cloud-docs group for cloud doc / 云文档 / 共享文档 / onlyoffice aliases and tokenizes Chinese queries cleanly', async () => {
+    const cloudDocNames = [
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+      'unrelated_hidden_tool',
+    ];
+    const targets = cloudDocNames.map((name) => registeredTool({
+      name,
+      handler: vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'ok' }] })),
+    }));
+    const { call, sendToolListChanged } = harness(targets);
+    const expected = [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS];
+
+    for (const query of ['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'shared docs', 'onlyoffice', 'docbuilder', 'convert', 'group:cloud-docs']) {
+      await expect(call({ query })).resolves.toMatchObject({
+        structuredContent: {
+          status: 'ok',
+          publishedGroups: ['cloud-docs'],
+          published: expected,
+          groups: [expect.objectContaining({
+            id: 'cloud-docs',
+            selector: 'group:cloud-docs',
+            tools: expected,
+            published: true,
+          })],
+        },
+      });
+      expect(targets.find((tool) => tool.name === 'unrelated_hidden_tool')?.enabled).toBe(false);
+    }
+    expect(sendToolListChanged).toHaveBeenCalledTimes(11);
+
+    // Multi-token query containing Chinese keywords matches preview metadata via Unicode tokenization without wildcard publishing
+    const chinesePreview = await call({ query: '云文档 xlsx' });
+    expect(chinesePreview).toMatchObject({
+      structuredContent: {
+        publishedGroups: [],
+        published: [],
+        groups: [expect.objectContaining({ id: 'cloud-docs', published: false })],
+      },
+    });
+
+    // Unrelated normal queries do not false-trigger cloud-docs
+    for (const unrelated of ['weather forecast today', '今天天气怎么样']) {
+      await expect(call({ query: unrelated })).resolves.toMatchObject({
+        structuredContent: {
+          publishedGroups: [],
+          published: [],
+          groups: [],
+        },
+      });
+    }
+  });
+
   it('uses the canonical target input/output schemas and passes the original authority context', async () => {
     const authority = { authInfo: { token: 'opaque-test-authority' }, requestId: 'request-1' };
     const handler = vi.fn(async (_args, extra) => extra === authority

@@ -108,6 +108,32 @@ describe('SubSessionCard', () => {
     localStorage.clear();
   });
 
+  it('shows its canonical task name/status in the preview-card title', () => {
+    const sub = makeSubSession();
+    (window as any).__imcodesTaskPairSnapshot = { authoritative: true, serverId: sub.serverId, tasks: [{ taskId: 'header-task', title: 'Current card task', pair: { status: 'in_audit', executor: sub.sessionName } }] };
+    try {
+      const view = render(<SubSessionCard sub={sub} ws={null} connected isOpen={false} onOpen={vi.fn()} onDiff={vi.fn()} onHistory={vi.fn()} />);
+      expect(view.container.querySelector('.subcard-label')?.textContent).toContain('Current card task');
+      expect(view.container.querySelector('.subsession-task-state')?.textContent).toBe('taskPair.status.in_audit');
+    } finally { delete (window as any).__imcodesTaskPairSnapshot; }
+  });
+
+  it('caps expanded model labels without shortening the control identity', () => {
+    const sub = makeSubSession({ type: 'gemini', activeModel: 'gemini-4-argon-high' });
+    const props = { sub, ws: null, connected: true, isOpen: false,
+      quickData: { data: [], recordHistory: vi.fn() } as any,
+      onOpen: vi.fn(), onDiff: vi.fn(), onHistory: vi.fn() };
+    const view = render(<SubSessionCard {...props} />);
+    expect(view.container.querySelector('.subcard-model')?.textContent).toBe('argon-high');
+    expect(view.container.querySelector('.subcard-model')?.getAttribute('title')).toBe('gemini-4-argon-high');
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.activeModel).toBe('gemini-4-argon-high');
+    view.rerender(<SubSessionCard {...props} sub={{ ...sub, activeModel: 'gpt-6.1-sol' }} />);
+    expect(view.container.querySelector('.subcard-model')?.textContent).toBe('6.1-sol');
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.activeModel).toBe('gpt-6.1-sol');
+    view.rerender(<SubSessionCard {...props} sub={{ ...sub, activeModel: null }} />);
+    expect(view.container.querySelector('.subcard-model')).toBeNull();
+  });
+
   it('projects canonical peer-audit identity/model metadata into compact SessionControls', () => {
     render(
       <SubSessionCard
@@ -908,5 +934,55 @@ describe('SubSessionCard', () => {
         resendExtra: { mode: 'quick' },
       },
     );
+  });
+
+  it('renders sequence number corner badge in subcard header and updates on rerender', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        sequenceNumber={2}
+      />,
+    );
+    const seq = view.getByTestId('subsession-seq-sub-card-1');
+    expect(seq.tagName).toBe('SUP');
+    expect(seq.classList.contains('subcard-seq')).toBe(true);
+    expect(seq.textContent).toBe('2');
+    expect(view.container.querySelector('.subcard-header')?.classList.contains('has-seq')).toBe(true);
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        sequenceNumber={5}
+      />,
+    );
+    expect(view.getByTestId('subsession-seq-sub-card-1').textContent).toBe('5');
+  });
+
+  it('renders .incognito class on subcard when sub.incognito is true', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession({ incognito: true })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const card = view.container.querySelector('.subcard');
+    expect(card?.classList.contains('incognito')).toBe(true);
   });
 });

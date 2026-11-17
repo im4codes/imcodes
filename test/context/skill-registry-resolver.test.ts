@@ -1,11 +1,12 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getUserSkillPath } from '../../shared/skill-store.js';
 import { SKILL_REGISTRY_FILE_NAME } from '../../shared/skill-registry-types.js';
-import { buildUserSkillRegistry } from '../../src/context/skill-registry-builder.js';
-import { getSkillRegistrySnapshot, SKILL_REGISTRY_TESTING, writeSkillRegistryManagementSnapshot } from '../../src/context/skill-registry.js';
+import { buildProjectSkillRegistry, buildUserSkillRegistry, ensureFreshSkillRegistries } from '../../src/context/skill-registry-builder.js';
+import { assertManagedSkillPathSync, assertReadableSkillPathSync, assertSafeRegistryPayloadPathSync } from '../../src/context/managed-skill-path.js';
+import { getSkillRegistryManagementSnapshot, getSkillRegistrySnapshot, SKILL_REGISTRY_TESTING, writeSkillRegistryManagementSnapshot } from '../../src/context/skill-registry.js';
 import { buildTransportStartupMemory } from '../../src/agent/runtime-context-bootstrap.js';
 import { resolveSkillByKey, resolveSkillsForTurn } from '../../src/context/skill-resolver.js';
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
@@ -168,5 +169,229 @@ describe('skill registry and on-demand resolver', () => {
     const startup = await buildTransportStartupMemory(namespace, { homeDir, skillsFeatureEnabled: true });
     expect(startup?.injectedText).toContain('skill://');
     expect(startup?.injectedText).not.toContain('/home/alice');
+  });
+
+  it('indexes third-party agent skills, allows cross-agent symlinks within home/project, rejects escapes, and auto-rebuilds stale registries cleanly', async () => {
+    homeDir = await mkdtemp(join(tmpdir(), 'skill-registry-home-'));
+    const projectDir = join(homeDir, 'workspace');
+    const cleanProjectDir = join(homeDir, 'clean-workspace');
+    const outside = await mkdtemp(join(tmpdir(), 'skill-registry-outside-'));
+    await mkdir(projectDir, { recursive: true });
+    await mkdir(cleanProjectDir, { recursive: true });
+
+    try {
+      // Third-party frontmatter with version: 3, nested metadata, license, no schemaVersion/category
+      const thirdPartyMd = [
+        '---',
+        'name: openspec-apply',
+        'description: Apply OpenSpec tasks',
+        'license: MIT',
+        'compatibility: claude, codex',
+        'metadata:',
+        '  author: openspec',
+        '  version: "3.0"',
+        'version: 3',
+        '---',
+        '# Apply Instructions',
+        'Follow tasks.',
+      ].join('\n');
+
+      for (const dir of ['.claude', '.codex', '.gemini']) {
+        await mkdir(join(homeDir, dir, 'skills', 'openspec-apply'), { recursive: true });
+        await writeFile(join(homeDir, dir, 'skills', 'openspec-apply', 'SKILL.md'), thirdPartyMd);
+      }
+
+      // Cross-agent symlink inside homeDir -> readable and resolvable
+      await mkdir(join(homeDir, '.agents', 'skills', 'linked-agent-skill'), { recursive: true });
+      await writeFile(
+        join(homeDir, '.agents', 'skills', 'linked-agent-skill', 'SKILL.md'),
+        '---\ndescription: Linked skill\n---\n# Linked Agent Skill\n',
+      );
+      await symlink(
+        join(homeDir, '.agents', 'skills', 'linked-agent-skill'),
+        join(homeDir, '.claude', 'skills', 'linked-alias'),
+      );
+
+      // Escape symlink outside homeDir -> must be rejected
+      await mkdir(join(outside, 'escape-skill'), { recursive: true });
+      await writeFile(join(outside, 'escape-skill', 'SKILL.md'), '---\ndescription: bad\n---\nsecret');
+      await symlink(join(outside, 'escape-skill'), join(homeDir, '.claude', 'skills', 'escape-skill'));
+
+      // Project skill
+      await mkdir(join(projectDir, '.claude', 'skills', 'repo-local'), { recursive: true });
+      await writeFile(join(projectDir, '.claude', 'skills', 'repo-local', 'SKILL.md'), '---\ndescription: Project scoped\n---\n# Repo Local\n');
+
+      // Auto-build when registry does not exist yet
+      const firstRefresh = ensureFreshSkillRegistries({ homeDir, projectDir: cleanProjectDir });
+      expect(firstRefresh.rebuiltUser).toBe(true);
+      expect(firstRefresh.rebuiltProject).toBe(false);
+      // Clean project must never receive an empty .imc/skills/registry.json
+      expect(() => assertManagedSkillPathSync({ path: join(cleanProjectDir, '.imc', 'skills', 'registry.json'), projectDir: cleanProjectDir, homeDir })).toThrow();
+
+      // Snapshot contains deduplicated user agent skills + no escape skill + no host path in displayPath
+      const snapshot = getSkillRegistrySnapshot({ namespace, homeDir, projectDir });
+      const applyEntries = snapshot.entries.filter((entry) => entry.metadata.name === 'openspec-apply');
+      expect(applyEntries).toHaveLength(1);
+      expect(applyEntries[0]?.displayPath).toBe('~/.claude/skills/openspec-apply/SKILL.md');
+      expect(applyEntries[0]?.displayPath).not.toContain(homeDir);
+      expect(snapshot.entries.some((entry) => entry.metadata.name === 'escape-skill')).toBe(false);
+
+      // Resolving indexed third-party skill succeeds despite version: 3 & nested YAML
+      const resolved = resolveSkillByKey({ namespace, key: applyEntries[0]!.key, homeDir, projectDir });
+      expect(resolved).toMatchObject({ ok: true, key: applyEntries[0]!.key });
+      if (resolved.ok) expect(resolved.text).toContain('# Apply Instructions');
+
+      // Project auto-build succeeds when project skills exist
+      const projRefresh = ensureFreshSkillRegistries({ homeDir, projectDir });
+      expect(projRefresh.rebuiltProject).toBe(true);
+      const withProject = getSkillRegistrySnapshot({ namespace, homeDir, projectDir });
+      expect(withProject.entries.some((entry) => entry.metadata.name === 'repo-local')).toBe(true);
+
+      // Preview validator allows agent root + safe symlink, rejects escape, and delete guard rejects external root
+      const validAgentPath = join(homeDir, '.claude', 'skills', 'openspec-apply', 'SKILL.md');
+      expect(assertReadableSkillPathSync({ path: validAgentPath, homeDir, projectDir }).externalAgentRoot).toBe(true);
+      expect(assertReadableSkillPathSync({ path: join(homeDir, '.claude', 'skills', 'linked-alias', 'SKILL.md'), homeDir }).externalAgentRoot).toBe(true);
+      expect(() => assertReadableSkillPathSync({ path: join(homeDir, '.claude', 'skills', 'escape-skill', 'SKILL.md'), homeDir })).toThrow();
+      expect(() => assertManagedSkillPathSync({ path: validAgentPath, homeDir, projectDir })).toThrow();
+
+      // Explicit rebuild preserves project + user counts
+      const rebuiltProj = buildProjectSkillRegistry({ projectDir });
+      expect(rebuiltProj.entries.some((entry) => entry.metadata.name === 'repo-local')).toBe(true);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('reconciles legacy newer registry.json, sub-directory additions without parent mtime change, and purged symlink redirects', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-skill-f1-f2-'));
+    const outside = await mkdtemp(join(tmpdir(), 'imcodes-skill-outside-'));
+
+    const homeDir = join(dir, 'home');
+    const projectDir = join(dir, 'project');
+    const userSkillsRoot = join(homeDir, '.claude', 'skills');
+    const projectSkillsRoot = join(projectDir, '.claude', 'skills');
+    const sharedStoreRoot = join(homeDir, 'shared-store');
+    const managedUserRoot = join(homeDir, '.imcodes', 'skills');
+    const managedProjectRoot = join(projectDir, '.imc', 'skills');
+
+    const olderDate = new Date(Date.now() - 120_000);
+    const newerDate = new Date(Date.now() + 60_000);
+
+    try {
+      // 1. Pre-existing external skills (user & project) whose mtime is OLDER than a legacy empty registry.json
+      await mkdir(join(userSkillsRoot, 'already-installed'), { recursive: true });
+      await writeFile(
+        join(userSkillsRoot, 'already-installed', 'SKILL.md'),
+        '---\nname: already-installed\ndescription: Preexisting user skill\n---\nBody\n',
+        'utf8',
+      );
+      await utimes(join(userSkillsRoot, 'already-installed', 'SKILL.md'), olderDate, olderDate);
+      await utimes(join(userSkillsRoot, 'already-installed'), olderDate, olderDate);
+      await utimes(userSkillsRoot, olderDate, olderDate);
+
+      await mkdir(join(projectSkillsRoot, 'already-installed-proj'), { recursive: true });
+      await writeFile(
+        join(projectSkillsRoot, 'already-installed-proj', 'SKILL.md'),
+        '---\nname: already-installed-proj\ndescription: Preexisting project skill\n---\nBody\n',
+        'utf8',
+      );
+      await utimes(join(projectSkillsRoot, 'already-installed-proj', 'SKILL.md'), olderDate, olderDate);
+      await utimes(join(projectSkillsRoot, 'already-installed-proj'), olderDate, olderDate);
+      await utimes(projectSkillsRoot, olderDate, olderDate);
+
+      await mkdir(managedUserRoot, { recursive: true });
+      const userRegistryPath = join(managedUserRoot, SKILL_REGISTRY_FILE_NAME);
+      await writeFile(userRegistryPath, JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: newerDate.getTime(),
+        entries: [],
+      }), 'utf8');
+      await utimes(userRegistryPath, newerDate, newerDate);
+
+      await mkdir(managedProjectRoot, { recursive: true });
+      const projectRegistryPath = join(managedProjectRoot, SKILL_REGISTRY_FILE_NAME);
+      await writeFile(projectRegistryPath, JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: newerDate.getTime(),
+        entries: [],
+      }), 'utf8');
+      await utimes(projectRegistryPath, newerDate, newerDate);
+
+      const firstRefresh = ensureFreshSkillRegistries({ homeDir, projectDir });
+      expect(firstRefresh.rebuiltUser).toBe(true);
+      expect(firstRefresh.rebuiltProject).toBe(true);
+      expect(getSkillRegistryManagementSnapshot({ homeDir }).entries.map((e) => e.metadata.name)).toContain('already-installed');
+      expect(getSkillRegistryManagementSnapshot({ projectDir }).entries.map((e) => e.metadata.name)).toContain('already-installed-proj');
+
+      const warmRefresh = ensureFreshSkillRegistries({ homeDir, projectDir });
+      expect(warmRefresh).toEqual({ rebuiltUser: false, rebuiltProject: false });
+
+      // 2. Sub-directory without SKILL.md already present when registry builds, then SKILL.md added without advancing root mtime
+      await mkdir(join(userSkillsRoot, 'completed-install'), { recursive: true });
+      await mkdir(join(managedUserRoot, 'later-cat'), { recursive: true });
+      ensureFreshSkillRegistries({ homeDir, projectDir });
+
+      await writeFile(
+        join(userSkillsRoot, 'completed-install', 'SKILL.md'),
+        '---\nname: completed-install\ndescription: Completed later\n---\nBody\n',
+        'utf8',
+      );
+      await utimes(userSkillsRoot, olderDate, olderDate);
+
+      await writeFile(
+        join(managedUserRoot, 'later-cat', 'new.md'),
+        '---\nname: later-cat-skill\ndescription: Added inside existing dir\n---\nBody\n',
+        'utf8',
+      );
+      await utimes(managedUserRoot, olderDate, olderDate);
+
+      const afterSubdirAdd = ensureFreshSkillRegistries({ homeDir, projectDir });
+      expect(afterSubdirAdd.rebuiltUser).toBe(true);
+      const refreshedUserNames = getSkillRegistryManagementSnapshot({ homeDir }).entries.map((e) => e.metadata.name);
+      expect(refreshedUserNames).toContain('completed-install');
+      expect(refreshedUserNames).toContain('later-cat-skill');
+      expect(ensureFreshSkillRegistries({ homeDir, projectDir })).toEqual({ rebuiltUser: false, rebuiltProject: false });
+
+      // 3. Indexed scoped symlink redirected outside homeDir: rejected immediately and purged on refresh
+      await mkdir(join(sharedStoreRoot, 'linked'), { recursive: true });
+      await writeFile(
+        join(sharedStoreRoot, 'linked', 'SKILL.md'),
+        '---\nname: linked\ndescription: Valid scoped target\n---\nGOOD_SECRET\n',
+        'utf8',
+      );
+      await symlink(join(sharedStoreRoot, 'linked'), join(userSkillsRoot, 'linked'), 'dir');
+      await mkdir(join(outside, 'evil'), { recursive: true });
+      await writeFile(
+        join(outside, 'evil', 'SKILL.md'),
+        '---\nname: linked\ndescription: Outside target\n---\nOUTSIDE_SCOPE_SECRET\n',
+        'utf8',
+      );
+
+      ensureFreshSkillRegistries({ homeDir, projectDir });
+      const linkedEntry = getSkillRegistryManagementSnapshot({ homeDir }).entries.find((e) => e.metadata.name === 'linked');
+      expect(linkedEntry).toBeDefined();
+      const linkedSkillPath = join(userSkillsRoot, 'linked', 'SKILL.md');
+      expect(assertSafeRegistryPayloadPathSync({ path: linkedSkillPath, layer: 'user', homeDir }).realPath).toBeTruthy();
+
+      await rm(join(userSkillsRoot, 'linked'), { recursive: true, force: true });
+      await symlink(join(outside, 'evil'), join(userSkillsRoot, 'linked'), 'dir');
+
+      expect(() => assertReadableSkillPathSync({ path: linkedSkillPath, homeDir })).toThrow();
+      expect(() => assertSafeRegistryPayloadPathSync({ path: linkedSkillPath, layer: 'user', homeDir })).toThrow();
+      const resolvedAfterRedirect = resolveSkillByKey({ namespace, key: linkedEntry!.key, homeDir, projectDir });
+      expect(resolvedAfterRedirect.ok).toBe(false);
+      if (!resolvedAfterRedirect.ok) {
+        expect(resolvedAfterRedirect.reason).toBe('unauthorized');
+      }
+
+      const purgeRefresh = ensureFreshSkillRegistries({ homeDir, projectDir });
+      expect(purgeRefresh.rebuiltUser).toBe(true);
+      const rawUserRegistry = await readFile(userRegistryPath, 'utf8');
+      expect(rawUserRegistry).not.toContain(linkedEntry!.key);
+      expect(rawUserRegistry).not.toContain('OUTSIDE_SCOPE_SECRET');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });

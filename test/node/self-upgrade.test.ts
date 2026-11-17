@@ -43,6 +43,7 @@ import {
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
   withArtifactDownloadRetries,
+  probeControlledNodeArtifactMetadata,
 } from '../../src/node/self-upgrade.js';
 import {
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
@@ -1733,6 +1734,33 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('/delete-driver ([string]$newVirtualDisplayDriver.Driver) /uninstall /force');
     expect(script.indexOf('/delete-driver ([string]$newVirtualDisplayDriver.Driver)'))
       .toBeLessThan(script.indexOf('/add-driver $rollbackVirtualDisplayInf /install'));
+
+    // Offline liveness + sleep clamping + .new ACL/ReadOnly recovery + rollback ACL re-application
+    expect(script).toContain('function Get-IMCodesLivenessLease');
+    expect(script).toContain(`$stepMs -gt ${CONTROLLED_NODE_UPGRADE_HEALTH.SLEEP_JUMP_GAP_MS}`);
+    expect(script).toContain("$livenessLease = Join-Path (Split-Path -Parent $dst) 'liveness-lease.json'");
+    expect(script).toContain('Remove-Item -Force $healthLease,$livenessLease -ErrorAction SilentlyContinue');
+    expect(script).toContain('$clearStagingDir = { param([string]$target)');
+    expect(script).toContain('& $clearStagingDir $pendingRemoteDesktop; & $clearStagingDir $backupRemoteDesktop');
+    expect(script.indexOf('& $clearStagingDir $pendingRemoteDesktop'))
+      .toBeLessThan(script.indexOf("'C:\\ProgramData\\imcodes-node\\remote-desktop-worker.new' '/reset'"));
+    const restoreMainIdx = script.indexOf("& $runRecovery 'restore_main'");
+    const restoreRdIdx = script.indexOf("& $runRecovery 'restore_remote_desktop'");
+    expect(restoreMainIdx).toBeGreaterThan(0);
+    expect(restoreRdIdx).toBeGreaterThan(0);
+    expect(script.indexOf("'*S-1-5-11:RX'", restoreMainIdx)).toBeGreaterThan(restoreMainIdx);
+    expect(script.indexOf("'C:\\ProgramData\\imcodes-node\\remote-desktop-worker\\win32-x64\\imcodes-remote-desktop-worker.exe' '/reset'", restoreRdIdx)).toBeGreaterThan(restoreRdIdx);
+
+    const helperScript = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\tmp\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\tmp\\imcodes-node.exe.manifest.json',
+      stagedComputerUseHelperDir: 'C:\\tmp\\computer-use-helper',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+    });
+    const restoreHelperIdx = helperScript.indexOf("& $runRecovery 'restore_helper'");
+    expect(restoreHelperIdx).toBeGreaterThan(0);
+    expect(helperScript.indexOf("'C:\\ProgramData\\imcodes-node\\computer-use-helper' '/reset'", restoreHelperIdx)).toBeGreaterThan(restoreHelperIdx);
   });
 
   it('escapes the one-shot upgrade script path in Task Scheduler XML', () => {
@@ -2370,5 +2398,689 @@ describe('self-upgrade ABI fence', () => {
     } })) as typeof fetch });
     expect(result).toBeDefined();
     expect(JSON.parse(await readFile(`${result!.artifactPath}.manifest.json`, 'utf8')).artifact.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+  });
+});
+
+describe('refreshControlledNodeRemoteDesktopWorker lightweight precheck', () => {
+  it('skips downloading the Linux worker binary when HEAD confirms worker_current or older version', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-head-linux-'));
+    dirs.push(root);
+    const workerDir = join(root, 'remote-desktop-worker', REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    await mkdir(workerDir, { recursive: true });
+    const workerBytes = Buffer.from('installed-linux-worker');
+    const workerPath = join(workerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    await writeFile(workerPath, workerBytes, { mode: 0o755 });
+    await writeFile(`${workerPath}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        os: 'linux',
+        arch: 'x64',
+        size: workerBytes.length,
+        sha256: createHash('sha256').update(workerBytes).digest('hex'),
+      },
+      build: { source: 'ci', version: '2026.9.5113-dev.5644' },
+    }));
+
+    const requests: Array<{ method: string; asset: string | null }> = [];
+    const downloadLinuxWorker = vi.fn();
+    const currentFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      requests.push({ method: init?.method ?? 'GET', asset: url.searchParams.get('asset') });
+      return new Response(null, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.5113-dev.5644',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: 'a'.repeat(64),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: '8000000',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        },
+      });
+    }) as typeof fetch;
+
+    const currentResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: currentFetch,
+      downloadLinuxWorker,
+    });
+    expect(currentResult).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    });
+    expect(requests).toEqual([{ method: 'HEAD', asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER }]);
+    expect(downloadLinuxWorker).not.toHaveBeenCalled();
+
+    const olderFetch = vi.fn(async () => new Response(null, {
+      status: 200,
+      headers: { [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.5000-dev.1' },
+    })) as typeof fetch;
+    const downgradeResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: olderFetch,
+      downloadLinuxWorker,
+    });
+    expect(downgradeResult).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5000-dev.1',
+      reason: 'worker_downgrade_rejected',
+    });
+    expect(downloadLinuxWorker).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the tiny manifest JSON when HEAD returns 405 and still skips the binary download when current, then upgrades when newer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-fallback-linux-'));
+    dirs.push(root);
+    const workerDir = join(root, 'remote-desktop-worker', REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    await mkdir(workerDir, { recursive: true });
+    const oldBytes = Buffer.from('old-linux-worker');
+    const oldPath = join(workerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    await writeFile(oldPath, oldBytes, { mode: 0o755 });
+    await writeFile(`${oldPath}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        os: 'linux',
+        arch: 'x64',
+        size: oldBytes.length,
+        sha256: createHash('sha256').update(oldBytes).digest('hex'),
+      },
+      build: { source: 'ci', version: '2026.9.5113-dev.5644' },
+    }));
+
+    const seenAssets: string[] = [];
+    const fallbackFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const asset = url.searchParams.get('asset') ?? '';
+      seenAssets.push(`${init?.method ?? 'GET'}:${asset}`);
+      if ((init?.method ?? 'GET') === 'HEAD') {
+        return new Response(null, { status: 405 });
+      }
+      if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST) {
+        const body = JSON.stringify({
+          schemaVersion: 1,
+          artifact: {
+            fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+            os: 'linux',
+            arch: 'x64',
+            size: oldBytes.length,
+            sha256: createHash('sha256').update(oldBytes).digest('hex'),
+          },
+          build: { source: 'ci', version: '2026.9.5113-dev.5644' },
+        });
+        return new Response(body, { status: 200 });
+      }
+      throw new Error(`unexpected binary download for ${asset}`);
+    }) as typeof fetch;
+
+    const currentResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: fallbackFetch,
+    });
+    expect(currentResult).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    });
+    expect(seenAssets).toEqual([
+      `HEAD:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+      `GET:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST}`,
+    ]);
+
+    const newBytes = Buffer.from('new-linux-worker-binary');
+    const newManifest = JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+        os: 'linux',
+        arch: 'x64',
+        size: newBytes.length,
+        sha256: createHash('sha256').update(newBytes).digest('hex'),
+      },
+      build: { source: 'ci', version: '2026.10.5371-dev.5816' },
+    });
+    const upgradeAssets: string[] = [];
+    const upgradeFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const asset = url.searchParams.get('asset') ?? '';
+      upgradeAssets.push(`${init?.method ?? 'GET'}:${asset}`);
+      if ((init?.method ?? 'GET') === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: { [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.10.5371-dev.5816' },
+        });
+      }
+      if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER) {
+        return new Response(newBytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(newBytes).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(newBytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.10.5371-dev.5816',
+          },
+        });
+      }
+      if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST) {
+        return new Response(newManifest, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(newManifest).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(Buffer.byteLength(newManifest)),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.10.5371-dev.5816',
+          },
+        });
+      }
+      throw new Error(`unexpected asset ${asset}`);
+    }) as typeof fetch;
+
+    const upgradeResult = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      fetchImpl: upgradeFetch,
+    });
+    expect(upgradeResult).toMatchObject({
+      updated: true,
+      installedVersion: '2026.10.5371-dev.5816',
+      targetVersion: '2026.10.5371-dev.5816',
+    });
+    expect(upgradeAssets).toEqual([
+      `HEAD:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+      `GET:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER}`,
+      `GET:${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST}`,
+    ]);
+    expect(await readFile(oldPath, 'utf8')).toBe('new-linux-worker-binary');
+  });
+
+  it('skips downloading Windows worker and virtual-display archives when HEAD or manifest confirms worker_current', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-head-win-'));
+    dirs.push(root);
+    const workerDir = join(root, 'remote-desktop-worker', 'win32-x64');
+    await mkdir(workerDir, { recursive: true });
+    const workerBytes = Buffer.from('installed-win-worker');
+    const vdBytes = Buffer.from('installed-vd-zip');
+    await writeFile(join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME), workerBytes);
+    await writeFile(
+      join(workerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+      JSON.stringify({
+        manifestVersion: 2,
+        workerVersion: '2026.9.5113-dev.5644',
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ipcVersion: 1,
+        os: 'win32',
+        arch: 'x64',
+        fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+        size: workerBytes.length,
+        sha256: createHash('sha256').update(workerBytes).digest('hex'),
+        authenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+        libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+        virtualDisplay: {
+          archiveFileName: 'imcodes-virtual-display.zip',
+          packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+          size: vdBytes.length,
+          sha256: createHash('sha256').update(vdBytes).digest('hex'),
+        },
+        toolchain: {
+          msvc: '14.44',
+          windowsSdk: '10.0.26100.0',
+          cmake: 'not-used-gn',
+          ninja: '1.13.1',
+          depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+        },
+      }),
+    );
+
+    const downloadWindowsWorker = vi.fn();
+    const methods: string[] = [];
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      methods.push(init?.method ?? 'GET');
+      return new Response(null, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.5113-dev.5644',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(workerBytes).digest('hex'),
+        },
+      });
+    }) as typeof fetch;
+
+    const result = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'win32',
+      arch: 'x64',
+      root,
+      fetchImpl,
+      downloadWindowsWorker,
+    });
+    expect(result).toMatchObject({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      targetVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    });
+    expect(methods).toEqual(['HEAD']);
+    expect(downloadWindowsWorker).not.toHaveBeenCalled();
+
+    const probe501 = await probeControlledNodeArtifactMetadata({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
+      fetchImpl: vi.fn(async () => new Response(null, { status: 501 })) as typeof fetch,
+    });
+    expect(probe501).toEqual({ status: 'unsupported', httpStatus: 501 });
+  });
+
+  it('follows HTTPS 302 external redirects using origin metadata headers and strips auth headers cross-origin', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-redirect-test-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('external-cdn-binary-payload');
+    const expectedSha = createHash('sha256').update(bytes).digest('hex');
+    const seenRequests: Array<{ url: string; auth: string | null; serverId: string | null; optIn: string | null }> = [];
+
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const headers = new Headers(init?.headers);
+      seenRequests.push({
+        url,
+        auth: headers.get('authorization'),
+        serverId: headers.get('x-server-id'),
+        optIn: headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT),
+      });
+      if (url.startsWith('https://im.example')) {
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: 'https://objects.githubusercontent.com/imcodes-release/imcodes-node.exe',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: expectedSha,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.11.1',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+          },
+        });
+      }
+      return new Response(bytes, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const downloaded = await downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      expectedVersion: '2026.11.1',
+      fetchImpl,
+    });
+
+    expect(downloaded).toMatchObject({ sha256: expectedSha, sizeBytes: bytes.length });
+    const savedManifest = JSON.parse(await readFile(`${downloaded!.artifactPath}.manifest.json`, 'utf8')) as { build?: { version?: string } };
+    expect(savedManifest.build?.version).toBe('2026.11.1');
+    expect(seenRequests).toHaveLength(2);
+    expect(seenRequests[0]!.optIn).toBe('1');
+    expect(seenRequests[0]!.auth).toBe(`Bearer ${credential.token}`);
+    expect(seenRequests[1]!.url).toBe('https://objects.githubusercontent.com/imcodes-release/imcodes-node.exe');
+    expect(seenRequests[1]!.auth).toBeNull();
+    expect(seenRequests[1]!.serverId).toBeNull();
+    expect(seenRequests[1]!.optIn).toBeNull();
+  });
+
+  it('rejects non-HTTPS redirects, credential-bearing redirects, >5 redirect hops, and CDN hash mismatches', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-redirect-reject-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('good-bytes');
+    const goodSha = createHash('sha256').update(bytes).digest('hex');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => new Response(null, {
+        status: 302,
+        headers: {
+          location: 'http://cdn.insecure.test/imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+        },
+      })) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_redirect_non_https');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => new Response(null, {
+        status: 302,
+        headers: {
+          location: 'https://user:pass@cdn.example.test/imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+        },
+      })) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_redirect_credentials_forbidden');
+
+    let hop = 0;
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => {
+        hop += 1;
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: `https://cdn.example.test/hop-${hop}`,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          },
+        });
+      }) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_redirect_limit_exceeded');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.startsWith('https://im.example')) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: 'https://cdn.example.test/imcodes-node.exe',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.11.1',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+            },
+          });
+        }
+        return new Response('tamper-bad', { status: 200 });
+      }) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_sha256_mismatch');
+  });
+});
+
+describe('controlled-node Windows same-hash rollback, access-denied hardening, and UTF-8 encoding regressions', () => {
+  it('never deletes intact imcodes-node.exe during rollback when target hash matched and no backup was created', () => {
+    const script = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\tmp\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\tmp\\imcodes-node.exe.manifest.json',
+      stagedRemoteDesktopWorkerDir: 'C:\\tmp\\remote-desktop-worker',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+    });
+
+    const sameHashBranchIdx = script.indexOf('if ($currentPublishedHash -cne $srcHash)');
+    const verifyDstIdx = script.indexOf('& $verifyReleaseArtifact $dst');
+    expect(sameHashBranchIdx).toBeGreaterThan(0);
+    expect(verifyDstIdx).toBeGreaterThan(sameHashBranchIdx);
+    const sameHashBlock = script.slice(sameHashBranchIdx, verifyDstIdx);
+    expect(sameHashBlock).toContain('$mainPublished = $true');
+    expect(sameHashBlock).toContain('$mainSkippedSameHash = $true');
+    expect(sameHashBlock).toContain('$mainBackedUp = (-not $mainSkippedSameHash) -and (Test-Path -LiteralPath $backupDst)');
+    // Regression guard: $mainPublished = $true must stay INSIDE the if ($currentPublishedHash -cne $srcHash) block,
+    // never after its closing brace.
+    expect(sameHashBlock.indexOf('$mainPublished = $true')).toBeLessThan(sameHashBlock.indexOf('} else {'));
+
+    const restoreMainIdx = script.indexOf("& $runRecovery 'restore_main'");
+    expect(restoreMainIdx).toBeGreaterThan(0);
+    const restoreMainLine = script.slice(restoreMainIdx, script.indexOf('\r\n', restoreMainIdx));
+    expect(restoreMainLine).toContain('elseif ($mainPublished -and -not $mainSkippedSameHash) { Remove-Item -Force $dst -ErrorAction Stop }');
+    expect(restoreMainLine).toContain('elseif ($mainSkippedSameHash -and (Test-Path -LiteralPath $dst))');
+  });
+
+  it('releases sidecar processes, fixes staging dir ACL order, clears ReadOnly, retries swaps, and configures UTF-8', () => {
+    const script = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\tmp\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\tmp\\imcodes-node.exe.manifest.json',
+      stagedComputerUseHelperDir: 'C:\\tmp\\computer-use-helper',
+      stagedRemoteDesktopWorkerDir: 'C:\\tmp\\remote-desktop-worker',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+    });
+
+    // UTF-8 Console/Output encoding & -Encoding UTF8 on Get-Content reads
+    expect(script).toContain('$utf8NoBom = [Text.UTF8Encoding]::new($false)');
+    expect(script).toContain('[Console]::InputEncoding = $utf8NoBom');
+    expect(script).toContain('[Console]::OutputEncoding = $utf8NoBom');
+    expect(script).toContain('$OutputEncoding = $utf8NoBom');
+    expect(script).toContain('Get-Content -LiteralPath $srcManifest -Encoding UTF8 -Raw');
+    expect(script).toContain('Get-Content -LiteralPath $srcRemoteDesktopManifestPath -Encoding UTF8 -Raw');
+
+    // Sidecar release in $waitForNodeExecutableRelease
+    expect(script).toContain("@('imcodes-remote-desktop-worker','open-computer-use','aidesk-local-ui')");
+    expect(script).toContain('remote-desktop-worker\\win32-x64\\imcodes-remote-desktop-worker.exe');
+    expect(script).toContain('computer-use-helper\\open-computer-use.exe');
+    expect(script).toContain('aidesk-local-ui\\aidesk-local-ui.exe');
+
+    // $clearStagingDir ownership-before-reset + ReadOnly strip + retry
+    const clearIdx = script.indexOf('$clearStagingDir = { param([string]$target)');
+    const clearEndIdx = script.indexOf('\r\n}\r\n', clearIdx);
+    const clearBody = script.slice(clearIdx, clearEndIdx);
+    expect(clearBody).toContain('& $clearReadOnlyAttributes $target');
+    expect(clearBody.indexOf("/setowner '*S-1-5-18' /T /C /Q")).toBeLessThan(clearBody.indexOf('/reset /T /C /Q'));
+    expect(clearBody.indexOf('/reset /T /C /Q')).toBeLessThan(clearBody.indexOf("/grant:r '*S-1-5-18:(OI)(CI)F' /T /C /Q"));
+    expect(clearBody).toContain('& $invokeWithIoRetry { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop }');
+
+    // ReadOnly clear + IO retry in remote-desktop and helper swaps
+    expect(script).toContain('& $clearReadOnlyAttributes $srcRemoteDesktop');
+    expect(script).toContain("& $invokeWithIoRetry { & $clearReadOnlyAttributes $pendingRemoteDesktop; & (Join-Path $env:WINDIR 'System32\\icacls.exe') $pendingRemoteDesktop /grant:r '*S-1-5-18:(OI)(CI)F' /T /C /Q | Out-Null; Copy-Item -Recurse -Force -Path (Join-Path $srcRemoteDesktop '*') -Destination $pendingRemoteDesktop }");
+    expect(script).toContain('& $invokeWithIoRetry { Move-Item -Force $pendingRemoteDesktop $dstRemoteDesktop }');
+    expect(script).toContain('& $clearReadOnlyAttributes $srcHelper');
+    expect(script).toContain('& $invokeWithIoRetry { Move-Item -Force $pendingHelper $dstHelper }');
+  });
+
+  it('converges same-version/same-sha256 upgrades without scheduling upgrade.ps1 when all installed artifacts match, but still runs partial/sidecar repairs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-same-sha-'));
+    dirs.push(root);
+    const installDir = join(root, 'installed');
+    const stageTemp = join(root, 'temp');
+    await mkdir(installDir, { recursive: true });
+    await mkdir(stageTemp, { recursive: true });
+
+    const version = '2026.11.6577-dev.6641';
+    const exeBytes = Buffer.from('controlled-node-same-version-binary');
+    const exeSha = createHash('sha256').update(exeBytes).digest('hex');
+    const helperBytes = Buffer.from('computer-use-helper-same-version');
+    const helperSha = createHash('sha256').update(helperBytes).digest('hex');
+    const workerBytes = Buffer.from('remote-desktop-worker-same-version');
+    const workerSha = createHash('sha256').update(workerBytes).digest('hex');
+    const vdBytes = Buffer.from('virtual-display-archive-same-version');
+    const vdSha = createHash('sha256').update(vdBytes).digest('hex');
+
+    const vdFiles = [
+      'imcodes-virtual-display.dll',
+      'imcodes-virtual-display.inf',
+      'imcodes-virtual-display.cat',
+      'LICENSE.microsoft.txt',
+      'THIRD_PARTY_NOTICES.webrtc.md',
+    ].map((name) => {
+      const content = Buffer.from(`vd-${name}`);
+      return {
+        name,
+        content,
+        size: content.length,
+        sha256: createHash('sha256').update(content).digest('hex'),
+      };
+    });
+
+    const nodeManifestText = JSON.stringify({
+      schemaVersion: 1,
+      build: { version },
+      artifact: {
+        fileName: 'imcodes-node.exe',
+        os: 'win32',
+        arch: 'x64',
+        size: exeBytes.length,
+        sha256: exeSha,
+        authenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+      },
+    });
+    const workerManifestText = JSON.stringify({
+      manifestVersion: 2,
+      workerVersion: version,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      ipcVersion: 1,
+      os: 'win32',
+      arch: 'x64',
+      fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+      size: workerBytes.length,
+      sha256: workerSha,
+      authenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+      libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+      virtualDisplay: {
+        archiveFileName: 'imcodes-virtual-display.zip',
+        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+        size: vdBytes.length,
+        sha256: vdSha,
+      },
+      toolchain: {
+        msvc: '14.44',
+        windowsSdk: '10.0.26100.0',
+        cmake: 'not-used-gn',
+        ninja: '1.13.1',
+        depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+      },
+    });
+
+    const execPath = join(installDir, 'imcodes-node.exe');
+    const journalPath = join(installDir, 'install-journal.json');
+    await writeFile(execPath, exeBytes);
+    await writeFile(`${execPath}.manifest.json`, nodeManifestText);
+    await mkdir(join(installDir, 'computer-use-helper'), { recursive: true });
+    await writeFile(join(installDir, 'computer-use-helper', 'open-computer-use.exe'), helperBytes);
+
+    const installedWorkerDir = join(installDir, 'remote-desktop-worker', 'win32-x64');
+    const installedVdDir = join(installedWorkerDir, 'virtual-display');
+    await mkdir(installedVdDir, { recursive: true });
+    await writeFile(join(installedWorkerDir, REMOTE_DESKTOP_WORKER_FILENAME), workerBytes);
+    await writeFile(join(installedWorkerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`), workerManifestText);
+    await writeFile(join(installedWorkerDir, 'imcodes-virtual-display.zip'), vdBytes);
+    for (const f of vdFiles) {
+      await writeFile(join(installedVdDir, f.name), f.content);
+    }
+    await writeFile(join(installedVdDir, 'imcodes-virtual-display.manifest.json'), JSON.stringify({
+      manifestVersion: 1,
+      hardwareId: 'ImcodesVirtualDisplay',
+      files: vdFiles.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
+    }));
+    await writeFile(journalPath, JSON.stringify({
+      version: 1,
+      phase: 'service_healthy',
+      updatedAt: 1,
+      installId: 'install-same',
+      nodeTokenHash: 'a'.repeat(64),
+      sourceExePath: execPath,
+      sourceArtifact: { sha256: exeSha, size: exeBytes.length },
+      stagedExePath: execPath,
+      stagedReceipt: {
+        path: execPath,
+        size: exeBytes.length,
+        sha256: exeSha,
+        sourceIdentity: { size: exeBytes.length, mtimeMs: 1, ctimeMs: 1 },
+        stagedIdentity: { size: exeBytes.length, mtimeMs: 1, ctimeMs: 1 },
+      },
+      serverId: 'srv-1',
+      serviceName: 'imcodes-node',
+      serviceReceipt: { name: 'imcodes-node', platform: 'win32', action: execPath },
+      serviceStartRequestedAt: 1,
+      healthyAt: 1,
+    }));
+
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes('asset=computer-use-helper')) {
+        return new Response(helperBytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: helperSha,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(helperBytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'open-computer-use.exe',
+          },
+        });
+      }
+      const isWorkerManifest = url.includes('asset=remote-desktop-worker-manifest');
+      const isVirtualDisplay = url.includes('asset=remote-desktop-virtual-display');
+      const isWorker = url.includes('asset=remote-desktop-worker');
+      if (isWorkerManifest || isVirtualDisplay || isWorker) {
+        const body = isWorkerManifest ? workerManifestText : isVirtualDisplay ? vdBytes : workerBytes;
+        return new Response(body, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: isWorkerManifest
+              ? `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+              : isVirtualDisplay ? 'imcodes-virtual-display.zip' : REMOTE_DESKTOP_WORKER_FILENAME,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
+          },
+        });
+      }
+      return new Response(exeBytes, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: exeSha,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(exeBytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+        },
+      });
+    });
+
+    const scheduledNoop: string[] = [];
+    const noopResult = await startControlledNodeSelfUpgrade(credential, version, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      platform: 'win32',
+      arch: 'x64',
+      execPath,
+      journalPath,
+      tmpdir: () => stageTemp,
+      now: () => 100,
+      runningVersion: version,
+      freeBytes: async () => 10 * CONTROLLED_NODE_UPGRADE_MIN_FREE_BYTES,
+      scheduleWindowsUpgrade: (taskName) => { scheduledNoop.push(taskName); },
+    });
+    expect(noopResult).toEqual({
+      ok: true,
+      alreadyCurrent: true,
+      targetVersion: version,
+      artifactSha256: exeSha,
+    });
+    expect(scheduledNoop).toEqual([]);
+
+    // Remove installed remote-desktop-worker -> legitimate partial/sidecar repair must still run,
+    // AND upgrade.ps1 must be written with a UTF-8 BOM for PowerShell 5.1.
+    await rm(join(installDir, 'remote-desktop-worker'), { recursive: true, force: true });
+    const scheduledRepair: string[] = [];
+    const repairResult = await startControlledNodeSelfUpgrade(credential, version, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      platform: 'win32',
+      arch: 'x64',
+      execPath,
+      journalPath,
+      tmpdir: () => stageTemp,
+      now: () => 200,
+      runningVersion: version,
+      freeBytes: async () => 10 * CONTROLLED_NODE_UPGRADE_MIN_FREE_BYTES,
+      scheduleWindowsUpgrade: (taskName) => { scheduledRepair.push(taskName); },
+    });
+    expect(repairResult).toMatchObject({ ok: true, targetVersion: version, artifactSha256: exeSha });
+    expect(repairResult.alreadyCurrent).toBeUndefined();
+    expect(scheduledRepair).toHaveLength(1);
+    const writtenPs1 = await readFile(repairResult.scriptPath!, 'utf8');
+    expect(writtenPs1.charCodeAt(0)).toBe(0xfeff);
   });
 });

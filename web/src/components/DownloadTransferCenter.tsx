@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
+  DOWNLOAD_TRANSFER_ROUTE,
   DOWNLOAD_TRANSFER_STATUS,
   canRevealDownloadTransfer,
   canSaveDownloadTransfer,
@@ -100,7 +101,7 @@ export function DownloadTransferCenter() {
                       <span class="download-transfer-name-trailing">{displayName.trailing}</span>
                     )}
                   </span>
-                  <span class={`download-transfer-route route-${item.route}`}>{t(`downloads.route.${item.route}`)}</span>
+                  <span class={`download-transfer-route route-${item.route}`}>{item.route === DOWNLOAD_TRANSFER_ROUTE.R2 ? t('r2_relay.route') : t(`downloads.route.${item.route}`)}</span>
                 </div>
                 <div class="download-transfer-status-line">
                   <span>{t(`downloads.status.${item.status}`)}</span>
@@ -119,6 +120,10 @@ export function DownloadTransferCenter() {
                     {!knownTotal && <span />}
                   </div>
                 )}
+                {item.route === DOWNLOAD_TRANSFER_ROUTE.R2 && !isInactive && <div class="download-transfer-details">
+                  <span>{t('r2_relay.preparing')}</span>
+                  <span>{item.etaSeconds == null ? t('r2_relay.estimating') : t('r2_relay.eta', { seconds: item.etaSeconds })}</span>
+                </div>}
                 <div class="download-transfer-details">
                   <span>
                     {item.totalBytes === null

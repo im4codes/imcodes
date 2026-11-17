@@ -10,6 +10,9 @@ import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 const fileBrowserProps: any[] = [];
 const cronManagerProps: any[] = [];
 const repoPageProps: any[] = [];
+const localWebPreviewProps: any[] = [];
+const sharedContextManagementProps: any[] = [];
+const sharedContextDiagnosticsProps: any[] = [];
 
 vi.mock('../../src/components/file-browser-lazy.js', () => ({
   FileBrowser: (props: any) => {
@@ -40,9 +43,24 @@ vi.mock('../../src/pages/CronManager.js', () => ({
     return <div data-testid="mock-cron-manager" />;
   },
 }));
-vi.mock('../../src/components/LocalWebPreviewPanel.js', () => ({ LocalWebPreviewPanel: () => null }));
-vi.mock('../../src/components/SharedContextManagementPanel.js', () => ({ SharedContextManagementPanel: () => null }));
-vi.mock('../../src/components/ContextDiagnosticsPanel.js', () => ({ ContextDiagnosticsPanel: () => null }));
+vi.mock('../../src/components/LocalWebPreviewPanel.js', () => ({
+  LocalWebPreviewPanel: (props: any) => {
+    localWebPreviewProps.push(props);
+    return <div data-testid="mock-local-web-preview" />;
+  },
+}));
+vi.mock('../../src/components/SharedContextManagementPanel.js', () => ({
+  SharedContextManagementPanel: (props: any) => {
+    sharedContextManagementProps.push(props);
+    return <div data-testid="mock-shared-context-management" />;
+  },
+}));
+vi.mock('../../src/components/ContextDiagnosticsPanel.js', () => ({
+  ContextDiagnosticsPanel: (props: any) => {
+    sharedContextDiagnosticsProps.push(props);
+    return <div data-testid="mock-shared-context-diagnostics" />;
+  },
+}));
 vi.mock('../../src/components/UsageFooter.js', () => ({ UsageFooter: () => null }));
 vi.mock('../../src/hooks/useTimeline.js', () => ({ useTimeline: () => ({ events: [], refreshing: false, historyStatus: 'idle' }) }));
 vi.mock('../../src/hooks/useNowTicker.js', () => ({ useNowTicker: () => Date.now() }));
@@ -55,14 +73,21 @@ vi.mock('../../src/thinking-utils.js', () => ({
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
-import '../../src/components/pinnedPanelTypes.js';
-import { renderPanelContent } from '../../src/components/PinnedPanelRegistry.js';
+import {
+  LOCAL_WEB_PREVIEW_PANEL_TYPE,
+  SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE,
+  SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
+} from '../../src/components/pinnedPanelTypes.js';
+import { renderPanelContent, hasPinnedPanelServerProvenance } from '../../src/components/PinnedPanelRegistry.js';
 
 afterEach(() => {
   cleanup();
   fileBrowserProps.length = 0;
   cronManagerProps.length = 0;
   repoPageProps.length = 0;
+  localWebPreviewProps.length = 0;
+  sharedContextManagementProps.length = 0;
+  sharedContextDiagnosticsProps.length = 0;
 });
 
 describe('pinned cron manager panel', () => {
@@ -231,5 +256,303 @@ describe('pinned repository panel', () => {
       scopeToSessionRoot: true,
       readOnly: false,
     });
+  });
+});
+
+describe('pinned panel server-switch isolation', () => {
+  const srv1Session = {
+    name: 'deck_srv1_brain',
+    project: 'srv1_app',
+    role: 'main' as const,
+    agentType: 'codex',
+    state: 'idle',
+    projectDir: '/srv1/app',
+  };
+  const srv2Session = {
+    name: 'deck_srv2_brain',
+    project: 'srv2_app',
+    role: 'main' as const,
+    agentType: 'codex',
+    state: 'idle',
+    projectDir: '/srv2/app',
+  };
+
+  function makeCtx(overrides: Partial<Parameters<typeof renderPanelContent>[1]> = {}): Parameters<typeof renderPanelContent>[1] {
+    return {
+      ws: {} as any,
+      connected: true,
+      serverId: 'srv-2',
+      subSessions: [],
+      activeSession: null,
+      sessions: [],
+      sessionsLoading: false,
+      t: (key: string) => key,
+      ...overrides,
+    };
+  }
+
+  it('holds follow-current panels on loading placeholder while target server sessions are pending', () => {
+    const panels = [
+      { id: 'filebrowser', type: 'filebrowser', props: { serverId: 'srv-1', projectDir: '/srv1/app', changesRootPath: '/srv1/app' } },
+      { id: 'repo-alias', type: 'repo', props: { serverId: 'srv-1', projectDir: '/srv1/app' } },
+      { id: 'repopage', type: 'repopage', props: { serverId: 'srv-1', projectDir: '/srv1/app', sessionName: 'deck_srv1_brain' } },
+      { id: 'cronmanager', type: 'cronmanager', props: { serverId: 'srv-1', projectName: 'srv1_app' } },
+    ];
+
+    for (const panel of panels) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({ serverId: 'srv-2', sessionsLoading: true }))}</>);
+      expect(screen.getByText('common.loading')).toBeTruthy();
+    }
+
+    expect(fileBrowserProps).toHaveLength(0);
+    expect(repoPageProps).toHaveLength(0);
+    expect(cronManagerProps).toHaveLength(0);
+  });
+
+  it('never falls back to srv-1 captured props when srv-2 finishes loading with zero sessions (serverId-tagged and legacy pins)', () => {
+    const taggedAndLegacyPins = [
+      { id: 'fb-tagged', type: 'filebrowser', props: { serverId: 'srv-1', projectDir: '/srv1/app', changesRootPath: '/srv1/app' } },
+      { id: 'fb-legacy', type: 'filebrowser', props: { projectDir: '/srv1/app', changesRootPath: '/srv1/app' } },
+      { id: 'repo-tagged', type: 'repo', props: { serverId: 'srv-1', projectDir: '/srv1/app' } },
+      { id: 'rp-tagged', type: 'repopage', props: { serverId: 'srv-1', projectDir: '/srv1/app', sessionName: 'deck_srv1_brain' } },
+      { id: 'rp-legacy', type: 'repopage', props: { projectDir: '/srv1/app', sessionName: 'deck_srv1_brain' } },
+      { id: 'cron-tagged', type: 'cronmanager', props: { serverId: 'srv-1', projectName: 'srv1_app' } },
+      { id: 'cron-legacy', type: 'cronmanager', props: { projectName: 'srv1_app' } },
+    ];
+
+    for (const panel of taggedAndLegacyPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({ serverId: 'srv-2', sessions: [], sessionsLoading: false }))}</>);
+      if (panel.type === 'cronmanager') {
+        expect(screen.getByText('No project')).toBeTruthy();
+      } else {
+        expect(screen.getByText('No project dir')).toBeTruthy();
+      }
+    }
+
+    expect(fileBrowserProps).toHaveLength(0);
+    expect(repoPageProps).toHaveLength(0);
+    expect(cronManagerProps).toHaveLength(0);
+  });
+
+  it('rebinds follow-current panels to srv-2 once hydrated and restores srv-1 on switch back', () => {
+    const panels = [
+      { id: 'fb', type: 'filebrowser', props: { serverId: 'srv-1', projectDir: '/srv1/app', changesRootPath: '/srv1/app' } },
+      { id: 'repo', type: 'repo', props: { serverId: 'srv-1', projectDir: '/srv1/app' } },
+      { id: 'rp', type: 'repopage', props: { serverId: 'srv-1', projectDir: '/srv1/app', sessionName: 'deck_srv1_brain' } },
+      { id: 'cron', type: 'cronmanager', props: { serverId: 'srv-1', projectName: 'srv1_app' } },
+    ];
+
+    for (const panel of panels) {
+      cleanup();
+      render(
+        <>{renderPanelContent(panel, makeCtx({
+          serverId: 'srv-2',
+          activeSession: 'deck_srv2_brain',
+          activeProjectDir: '/srv2/app',
+          sessions: [srv2Session],
+        }))}</>,
+      );
+    }
+
+    expect(fileBrowserProps).toHaveLength(2);
+    expect(fileBrowserProps[0]).toMatchObject({ initialPath: '/srv2/app', changesRootPath: '/srv2/app' });
+    expect(fileBrowserProps[1]).toMatchObject({ initialPath: '/srv2/app' });
+    expect(repoPageProps).toHaveLength(1);
+    expect(repoPageProps[0]).toMatchObject({ projectDir: '/srv2/app', sessionId: 'deck_srv2_brain' });
+    expect(cronManagerProps).toHaveLength(1);
+    expect(cronManagerProps[0]).toMatchObject({ projectName: 'srv2_app' });
+
+    fileBrowserProps.length = 0;
+    repoPageProps.length = 0;
+    cronManagerProps.length = 0;
+
+    for (const panel of panels) {
+      cleanup();
+      render(
+        <>{renderPanelContent(panel, makeCtx({
+          serverId: 'srv-1',
+          activeSession: 'deck_srv1_brain',
+          activeProjectDir: '/srv1/app',
+          sessions: [srv1Session],
+        }))}</>,
+      );
+    }
+
+    expect(fileBrowserProps[0]).toMatchObject({ initialPath: '/srv1/app', changesRootPath: '/srv1/app' });
+    expect(repoPageProps[0]).toMatchObject({ projectDir: '/srv1/app', sessionId: 'deck_srv1_brain' });
+    expect(cronManagerProps[0]).toMatchObject({ projectName: 'srv1_app' });
+  });
+
+  it('isolates server-bound local-web-preview and shared-context pinned panels across servers', () => {
+    const boundPanels = [
+      {
+        id: 'preview-1',
+        type: LOCAL_WEB_PREVIEW_PANEL_TYPE,
+        props: { serverId: 'srv-1', port: '3000', path: '/app' },
+      },
+      {
+        id: 'sc-mgmt-1',
+        type: SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
+        props: { serverId: 'srv-1', enterpriseId: 'ent-1', canonicalRepoId: 'repo-1', workspaceId: 'ws-1' },
+      },
+      {
+        id: 'sc-diag-1',
+        type: SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE,
+        props: { serverId: 'srv-1', enterpriseId: 'ent-1', canonicalRepoId: 'repo-1', workspaceId: 'ws-1' },
+      },
+    ];
+
+    for (const panel of boundPanels) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({ serverId: 'srv-2', activeSession: 'deck_srv2_brain', activeProjectDir: '/srv2/app', sessions: [srv2Session] }))}</>);
+    }
+
+    expect(localWebPreviewProps).toHaveLength(0);
+    expect(sharedContextManagementProps).toHaveLength(0);
+    expect(sharedContextDiagnosticsProps).toHaveLength(0);
+
+    for (const panel of boundPanels) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({ serverId: 'srv-1', activeSession: 'deck_srv1_brain', activeProjectDir: '/srv1/app', sessions: [srv1Session] }))}</>);
+    }
+
+    expect(localWebPreviewProps).toHaveLength(1);
+    expect(localWebPreviewProps[0]).toMatchObject({ serverId: 'srv-1', port: '3000', path: '/app' });
+    expect(sharedContextManagementProps).toHaveLength(1);
+    expect(sharedContextManagementProps[0]).toMatchObject({ enterpriseId: 'ent-1', serverId: 'srv-1', activeProjectDir: '/srv1/app' });
+    expect(sharedContextDiagnosticsProps).toHaveLength(1);
+    expect(sharedContextDiagnosticsProps[0]).toMatchObject({ enterpriseId: 'ent-1', canonicalRepoId: 'repo-1', workspaceId: 'ws-1' });
+  });
+
+  it('requires positive matching serverId provenance and never falls back on legacy pins without serverId when target server has non-empty sessions lacking project_dir or project', () => {
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: 'srv-1' } }, 'srv-1')).toBe(true);
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: 'srv-1' } }, 'srv-2')).toBe(false);
+    expect(hasPinnedPanelServerProvenance({ props: {} }, 'srv-2')).toBe(false);
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: '  ' } }, 'srv-2')).toBe(false);
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: 'srv-1' } }, '')).toBe(false);
+
+    const legacyFollowPins = [
+      { id: 'fb-legacy', type: 'filebrowser', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret', changesRootPath: '/srv-A/secret' } },
+      { id: 'repo-legacy', type: 'repo', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'rp-legacy', type: 'repopage', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+    ];
+    const srvBNoDirSession = {
+      name: 'deck_B_brain',
+      project: 'B',
+      role: 'brain',
+      agentType: 'codex',
+      state: 'idle',
+    };
+
+    for (const panel of legacyFollowPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-B',
+        activeSession: 'deck_B_brain',
+        activeProjectDir: undefined,
+        sessions: [srvBNoDirSession],
+        sessionsLoading: false,
+      }))}</>);
+      expect(screen.getByText('No project dir')).toBeTruthy();
+    }
+
+    cleanup();
+    render(<>{renderPanelContent(
+      { id: 'cron-legacy', type: 'cronmanager', props: { sessionName: 'deck_A_brain', projectName: 'AlphaSecret' } },
+      makeCtx({
+        serverId: 'srv-B',
+        activeSession: 'deck_B_brain',
+        sessions: [{ name: 'deck_B_brain', project: '', role: 'brain', agentType: 'codex', state: 'idle' }],
+        sessionsLoading: false,
+      }),
+    )}</>);
+    expect(screen.getByText('No project')).toBeTruthy();
+
+    expect(fileBrowserProps).toHaveLength(0);
+    expect(repoPageProps).toHaveLength(0);
+    expect(cronManagerProps).toHaveLength(0);
+  });
+
+  it('never leaks legacy stale sessionName when target server has sessions but activeSession is null', () => {
+    const legacyPins = [
+      { id: 'fb-stale', type: 'filebrowser', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'rp-stale', type: 'repopage', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+    ];
+
+    for (const panel of legacyPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-B',
+        activeSession: null,
+        activeProjectDir: '/srv-B/repo',
+        sessions: [srv2Session],
+        sessionsLoading: false,
+      }))}</>);
+    }
+
+    expect(fileBrowserProps).toHaveLength(1);
+    expect(fileBrowserProps[0].initialPath).toBe('/srv-B/repo');
+    expect(fileBrowserProps[0].sessionName).toBeUndefined();
+    expect(repoPageProps).toHaveLength(1);
+    expect(repoPageProps[0].projectDir).toBe('/srv-B/repo');
+    expect(repoPageProps[0].sessionId).toBeUndefined();
+  });
+
+  it('fails closed on legacy server-bound pins missing serverId while allowing legacy follow-current pins to use live target context', () => {
+    const legacyBoundPins = [
+      { id: 'sub-legacy', type: 'subsession', props: { sessionName: 'deck_sub_A_1', label: 'A Helper' } },
+      { id: 'preview-legacy', type: LOCAL_WEB_PREVIEW_PANEL_TYPE, props: { port: '3000', path: '/secret' } },
+      { id: 'sc-mgmt-legacy', type: SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, props: { enterpriseId: 'ent-A' } },
+      { id: 'sc-diag-legacy', type: SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, props: { enterpriseId: 'ent-A', workspaceId: 'ws-A' } },
+    ];
+
+    for (const panel of legacyBoundPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-2',
+        activeSession: 'deck_srv2_brain',
+        activeProjectDir: '/srv2/app',
+        sessions: [srv2Session],
+        subSessions: [{
+          id: 'sub-a',
+          sessionName: 'deck_sub_A_1',
+          parentSession: 'deck_srv2_brain',
+          label: 'Spoofed Name',
+          type: 'codex-sdk',
+          state: 'running',
+        } as any],
+      }))}</>);
+      expect(screen.getByText('No server selected')).toBeTruthy();
+    }
+
+    expect(localWebPreviewProps).toHaveLength(0);
+    expect(sharedContextManagementProps).toHaveLength(0);
+    expect(sharedContextDiagnosticsProps).toHaveLength(0);
+
+    // Follow-current legacy pins still work cleanly once B has legitimate live project context
+    const legacyFollowPins = [
+      { id: 'fb-legacy', type: 'filebrowser', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'repo-legacy', type: 'repo', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'rp-legacy', type: 'repopage', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'cron-legacy', type: 'cronmanager', props: { sessionName: 'deck_A_brain', projectName: 'AlphaSecret' } },
+    ];
+    for (const panel of legacyFollowPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-2',
+        activeSession: 'deck_srv2_brain',
+        activeProjectDir: '/srv2/app',
+        sessions: [srv2Session],
+      }))}</>);
+    }
+
+    expect(fileBrowserProps).toHaveLength(2);
+    expect(fileBrowserProps[0]).toMatchObject({ initialPath: '/srv2/app', sessionName: 'deck_srv2_brain' });
+    expect(repoPageProps).toHaveLength(1);
+    expect(repoPageProps[0]).toMatchObject({ projectDir: '/srv2/app', sessionId: 'deck_srv2_brain' });
+    expect(cronManagerProps).toHaveLength(1);
+    expect(cronManagerProps[0]).toMatchObject({ projectName: 'srv2_app', activeSession: 'deck_srv2_brain' });
   });
 });

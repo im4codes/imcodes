@@ -1,3 +1,4 @@
+import type { MacosRemoteDesktopWorkerMessage } from './macos-remote-desktop-ipc.js';
 import { randomBytes } from 'node:crypto';
 import type { MacosRemoteDesktopUnlockSecretStore } from './macos-remote-desktop-unlock-secret.js';
 import type { Socket } from 'node:net';
@@ -208,6 +209,7 @@ export const MACOS_REMOTE_DESKTOP_HOST_CLEANUP_TIMEOUT_MS = 5_000;
 export const MACOS_REMOTE_DESKTOP_PRIVACY_REPLY_TIMEOUT_MS = 10_000;
 
 export interface MacosRemoteDesktopWorkerHostOptions {
+  trafficStorePath?: string;
   /**
    * Root-only store for the sign-in secret that unlocks a locked Mac. Absent
    * means this host offers no auto-unlock.
@@ -568,6 +570,7 @@ export class MacosRemoteDesktopWorkerHost {
     private readonly options: MacosRemoteDesktopWorkerHostOptions,
   ) {
     this.core = new RemoteDesktopWorkerHostCore({
+      trafficStorePath: options.trafficStorePath,
       nonce: randomBytes(32).toString('base64url'),
       prepareReadyTimeoutMs: options.prepareReadyTimeoutMs,
       offerAnswerTimeoutMs: options.offerAnswerTimeoutMs,
@@ -660,6 +663,8 @@ export class MacosRemoteDesktopWorkerHost {
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
     return this.available() ? this.profile.adapterCapabilities : Object.freeze([]);
   }
+
+  trafficStatus() { return this.core.traffic.snapshot(); }
 
   activeConnections() {
     return activeLocalRemoteDesktopConnections(this.core);
@@ -1342,7 +1347,7 @@ export class MacosRemoteDesktopWorkerHost {
     this.readinessTimer = null;
   }
 
-  private onWorkerMessage(message: RemoteDesktopDaemonMessage, generation: number): void {
+  private onWorkerMessage(message: MacosRemoteDesktopWorkerMessage, generation: number): void {
     if (!this.isCurrent(generation) || !this.authenticated || this.connectionGeneration === 0) return;
     const result = this.core.pushInbound(
       this.core.frameOutbound(message),

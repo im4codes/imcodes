@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * How Brain's work becomes a driven pair (2026-09-25, 215 / jdzj: "new
  * dispatches get no audit window").
@@ -181,7 +182,7 @@ describe('Brain work dispatch opens driven pairs', () => {
         flags: status === 'working' ? ['blocked', 'needs_input'] : [],
         updatedAt: now += 1,
       } as typeof stored;
-      getTaskPairStore().savePair(PROJECT, state);
+      putTaskPairFixture(getTaskPairStore(), PROJECT, state);
       const followUp = await dispatchSendMessage(brainCaller, {
         target: EXEC, message: `Continue while ${status}.`,
       } as never, deps());
@@ -189,7 +190,7 @@ describe('Brain work dispatch opens driven pairs', () => {
       expect(getTaskPairStore().listActivePairs(PROJECT)).toHaveLength(1);
     }
 
-    getTaskPairStore().savePair(PROJECT, { ...stored, status: 'done', updatedAt: now += 1 });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...stored, status: 'done', updatedAt: now += 1 });
     const fresh = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Start unrelated work.' } as never, deps());
     expect(fresh.status).toBe('accepted');
     expect((fresh as { taskId?: string }).taskId).toBeUndefined();

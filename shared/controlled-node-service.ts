@@ -57,6 +57,12 @@ export const CONTROLLED_NODE_UPGRADE_HEALTH = {
    * "starting" however often a poll happens to catch it alive between restarts.
    */
   CRASH_LOOP_RESTARTS: 3,
+  /** Single-poll clock jump above this indicates OS sleep/suspend rather than active wait time. */
+  SLEEP_JUMP_GAP_MS: 120_000,
+  /** Liveness lease must have been updated within this window to count as actively running offline. */
+  LIVENESS_FRESH_MS: 45_000,
+  /** Minimum span between observed liveness updates for the same PID before accepting offline liveness. */
+  LIVENESS_MIN_RENEWAL_SPAN_MS: 60_000,
 } as const;
 
 /**

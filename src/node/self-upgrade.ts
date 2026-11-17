@@ -25,6 +25,7 @@ import {
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import { isTransientRequestFailure } from '../../shared/request-failure.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
+import { fetchControlledNodeArtifactWithRedirect } from '../util/external-artifact-fetch.js';
 import {
   CONTROLLED_NODE_UPGRADE_RESULT_FILE,
   CONTROLLED_NODE_UPGRADE_RESULT_STATUS,
@@ -36,6 +37,12 @@ import {
   CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION,
 } from '../../shared/controlled-node-service.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
+import {
+  releaseTargetFromRuntime,
+  validateDesktopReleaseManifest,
+  verifyDesktopReleaseComponentIdentity,
+  type DesktopReleaseManifest,
+} from '../../shared/desktop-release-manifest.js';
 import {
   REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
   REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES,
@@ -182,11 +189,15 @@ export interface ControlledNodeSelfUpgradeDeps {
   beforeStaleCandidateRevalidation?: (candidatePath: string) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
   freeBytes?: (path: string) => Promise<number | null>;
+  /** Test seam: override current running version when checking whether artifacts already match disk. */
+  runningVersion?: string;
 }
 
 export interface ControlledNodeSelfUpgradeResult {
   ok: boolean;
   reason?: string;
+  /** True when running version and all applicable installed artifacts already match the target release on disk. */
+  alreadyCurrent?: boolean;
   targetVersion: string;
   artifactSha256?: string;
   scriptPath?: string;
@@ -649,6 +660,72 @@ function readHeader(headers: Headers, name: string): string | null {
   return headers.get(name) ?? headers.get(name.toLowerCase()) ?? headers.get(name.toUpperCase());
 }
 
+function buildControlledNodeArtifactRequestHeaders(credential: ArtifactDownloadCredential): Record<string, string> {
+  return {
+    Authorization: `Bearer ${credential.token}`,
+    'X-Server-Id': credential.serverId,
+    [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
+  };
+}
+
+export type ControlledNodeArtifactMetadataProbe =
+  | {
+      status: 'ok';
+      version?: string;
+      sha256?: string;
+      sizeBytes?: number;
+      filename?: string;
+    }
+  | {
+      status: 'unsupported';
+      httpStatus: number;
+    }
+  | {
+      status: 'unavailable';
+      httpStatus: number;
+    };
+
+/**
+ * Lightweight HEAD precheck against `/api/enroll/v2/node-artifact` to inspect
+ * the hosted version/digest headers without streaming multi-megabyte payloads.
+ */
+export async function probeControlledNodeArtifactMetadata(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  asset?: typeof CONTROLLED_NODE_ARTIFACT_ASSETS[keyof typeof CONTROLLED_NODE_ARTIFACT_ASSETS];
+  fetchImpl?: typeof fetch;
+}): Promise<ControlledNodeArtifactMetadataProbe> {
+  const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
+  const response = await (input.fetchImpl ?? fetch)(
+    controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset),
+    {
+      method: 'HEAD',
+      headers: buildControlledNodeArtifactRequestHeaders(input.credential),
+    },
+  );
+  await response.body?.cancel().catch(() => {});
+  if (response.status === 404 || response.status === 405 || response.status === 501) {
+    return { status: 'unsupported', httpStatus: response.status };
+  }
+  if (!response.ok) {
+    return { status: 'unavailable', httpStatus: response.status };
+  }
+  const version = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim() || undefined;
+  const sha256Header = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  const sha256 = sha256Header && /^[0-9a-f]{64}$/.test(sha256Header) ? sha256Header : undefined;
+  const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const parsedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : undefined;
+  const sizeBytes = parsedSize !== undefined && Number.isSafeInteger(parsedSize) ? parsedSize : undefined;
+  const filename = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME)?.trim() || undefined;
+  return {
+    status: 'ok',
+    ...(version ? { version } : {}),
+    ...(sha256 ? { sha256 } : {}),
+    ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+    ...(filename ? { filename } : {}),
+  };
+}
+
 async function streamResponseBodyToFile(input: {
   response: Response;
   path: string;
@@ -762,34 +839,39 @@ async function downloadArtifact(input: {
   /** Default true: the generic `<file>.manifest.json` record beside the download. Assets that have their own manifest turn it off. */
   writeManifest?: boolean;
   onProgress?: (phase: ControlledNodeArtifactDownloadPhase) => Promise<void>;
-}): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string }> {
+}): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string; releaseManifestSha256?: string }> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
   await input.onProgress?.('artifact_request_started');
-  const response = await input.fetchImpl(controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset), {
-    headers: {
-      Authorization: `Bearer ${input.credential.token}`,
-      'X-Server-Id': input.credential.serverId,
-      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
-    },
+  const { response, metadataHeaders } = await fetchControlledNodeArtifactWithRedirect({
+    fetchImpl: input.fetchImpl,
+    url: controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset),
+    headers: buildControlledNodeArtifactRequestHeaders(input.credential),
   });
-  if (!response.ok) throw new Error(`download_failed_${response.status}`);
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`download_failed_${response.status}`);
+  }
   const abiProfile = normalizeControlledNodeAbiProfile(input.target.abiProfile);
   if (!abiProfile || !isControlledNodeAbiTarget(input.target.os, input.target.arch, abiProfile)) throw new Error('invalid_artifact_abi_profile');
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.NODE) {
-    const responseProfile = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE);
+    const responseProfile = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE);
     if (normalizeControlledNodeAbiProfile(responseProfile === null ? undefined : responseProfile) !== abiProfile) {
       await response.body?.cancel().catch(() => {});
       throw new Error('artifact_abi_profile_mismatch');
     }
   }
-  const expectedSha = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256);
-  const filename = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME) || basename(defaultStagedExecutablePath());
+  const expectedSha = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256);
+  const filename = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME) || basename(defaultStagedExecutablePath());
   if (input.expectedFileName && basename(filename) !== input.expectedFileName) throw new Error('artifact_filename_mismatch');
-  const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
-  const versionHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
+  const sizeHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const versionHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
   const authenticodeSignerSha256 = readHeader(
-    response.headers,
+    metadataHeaders,
     CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
+  )?.trim().toLowerCase();
+  const releaseManifestSha256 = readHeader(
+    metadataHeaders,
+    CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256,
   )?.trim().toLowerCase();
   if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) throw new Error('missing_artifact_sha256');
   const expectedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : null;
@@ -837,6 +919,7 @@ async function downloadArtifact(input: {
       sizeBytes: downloaded.sizeBytes,
       filename: basename(filename),
       ...(versionHeader ? { version: versionHeader } : {}),
+      ...(releaseManifestSha256 ? { releaseManifestSha256 } : {}),
     };
   }
   await writeFile(manifestPath, `${JSON.stringify({
@@ -862,6 +945,7 @@ async function downloadArtifact(input: {
     sizeBytes: downloaded.sizeBytes,
     filename: basename(filename),
     ...(versionHeader ? { version: versionHeader } : {}),
+    ...(releaseManifestSha256 ? { releaseManifestSha256 } : {}),
   };
 }
 
@@ -952,6 +1036,87 @@ export async function downloadControlledNodeAideskLocalUiFile(input: {
   }
 }
 
+const RELEASE_MANIFEST_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Fetch and verify the unified Desktop Release Manifest when published by the server.
+ * Returns `undefined` if the server does not publish one (403/404/501/503 or legacy binary fallback).
+ */
+export async function downloadDesktopReleaseManifest(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  fetchImpl: typeof fetch;
+  expectedVersion?: string;
+  expectedSha256?: string;
+}): Promise<DesktopReleaseManifest | undefined> {
+  const { response, metadataHeaders } = await fetchControlledNodeArtifactWithRedirect({
+    fetchImpl: input.fetchImpl,
+    url: controlledNodeArtifactUpgradeUrl(
+      input.credential,
+      input.target,
+      CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
+    ),
+    headers: {
+      Authorization: `Bearer ${input.credential.token}`,
+      'X-Server-Id': input.credential.serverId,
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
+    },
+  });
+  if (response.status === 403 || response.status === 404 || response.status === 501 || response.status === 503) {
+    await response.body?.cancel().catch(() => {});
+    if (input.expectedSha256) {
+      throw new Error(`release_manifest_unavailable_${response.status}`);
+    }
+    return undefined;
+  }
+  if (!response.ok) {
+    throw new Error(`download_failed_${response.status}`);
+  }
+  const filenameHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME)?.trim();
+  if (filenameHeader && !filenameHeader.endsWith('.manifest.json')) {
+    await response.body?.cancel().catch(() => {});
+    if (input.expectedSha256) {
+      throw new Error('release_manifest_unexpected_filename');
+    }
+    return undefined;
+  }
+  const sizeHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const declaredSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : null;
+  if (declaredSize !== null && (!Number.isSafeInteger(declaredSize) || declaredSize > RELEASE_MANIFEST_MAX_DOWNLOAD_BYTES)) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error('release_manifest_too_large');
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length === 0 || bytes.length > RELEASE_MANIFEST_MAX_DOWNLOAD_BYTES) {
+    throw new Error('release_manifest_invalid_size');
+  }
+  if (declaredSize !== null && bytes.length !== declaredSize) {
+    throw new Error('release_manifest_size_mismatch');
+  }
+  const actualSha = createHash('sha256').update(bytes).digest('hex');
+  const shaHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  if (shaHeader) {
+    if (!/^[0-9a-f]{64}$/.test(shaHeader)) {
+      throw new Error('release_manifest_invalid_sha256_header');
+    }
+    if (actualSha !== shaHeader) {
+      throw new Error('release_manifest_sha256_mismatch');
+    }
+  }
+  if (input.expectedSha256 && actualSha !== input.expectedSha256.toLowerCase()) {
+    throw new Error('release_manifest_pinned_sha256_mismatch');
+  }
+  const manifest = validateDesktopReleaseManifest(JSON.parse(bytes.toString('utf8')));
+  if (
+    input.expectedVersion
+    && input.expectedVersion !== DAEMON_UPGRADE_TARGET_LATEST
+    && manifest.releaseVersion !== input.expectedVersion
+  ) {
+    throw new Error(`release_manifest_version_mismatch:expected_${input.expectedVersion}_got_${manifest.releaseVersion}`);
+  }
+  return manifest;
+}
+
 export async function downloadControlledNodeComputerUseHelper(input: {
   credential: ControlledNodeCredential;
   target: ControlledNodeArtifactTarget;
@@ -978,9 +1143,45 @@ export async function downloadControlledNodeComputerUseHelper(input: {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/^download_failed_(404|503)$/.test(message) || message === 'artifact_filename_mismatch') return undefined;
+    if (/^download_failed_(404|503)$/.test(message)) return undefined;
     throw error;
   }
+}
+
+async function verifyInstalledComputerUseHelperMatchesManifest(input: {
+  destinationPath: string;
+  target: ControlledNodeArtifactTarget;
+  releaseManifest: ReturnType<typeof validateDesktopReleaseManifest>;
+  releaseTarget: ReturnType<typeof releaseTargetFromRuntime>;
+}): Promise<boolean> {
+  if (!input.releaseTarget) return false;
+  const helperFileName = controlledNodeComputerUseHelperFilename(input.target.os);
+  const candidates = [
+    join(dirname(input.destinationPath), 'computer-use-helper', controlledNodePlatformArchKey(input.target), helperFileName),
+    join(dirname(input.destinationPath), 'computer-use-helper', helperFileName),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const st = await lstat(candidate);
+      if (st.isSymbolicLink() || !st.isFile()) continue;
+      const bytes = await readFile(candidate);
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+      const check = verifyDesktopReleaseComponentIdentity(
+        input.releaseManifest,
+        input.releaseTarget,
+        'open-computer-use',
+        {
+          fileName: helperFileName,
+          sha256,
+          sizeBytes: bytes.length,
+        },
+      );
+      if (check.ok) return true;
+    } catch {
+      // candidate absent or unreadable; check next
+    }
+  }
+  return false;
 }
 
 /**
@@ -1337,7 +1538,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     ? `try {\r\n`
       + `  $stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
       + `  $stagingMarkerItem = Get-Item -LiteralPath $stagingOwnershipMarker -Force -ErrorAction Stop\r\n`
-      + `  $stagingMarker = Get-Content -LiteralPath $stagingOwnershipMarker -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
+      + `  $stagingMarker = Get-Content -LiteralPath $stagingOwnershipMarker -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
       + `  if (-not $stagingItem.PSIsContainer -or ($stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingMarkerItem.PSIsContainer -or ($stagingMarkerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingItem.Name -cnotmatch '^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$' -or [int]$stagingMarker.schemaVersion -ne 1 -or [string]$stagingMarker.product -cne ${psQuote(CONTROLLED_NODE_UPGRADE_PRODUCT)} -or [string]$stagingMarker.directoryName -cne $stagingItem.Name -or [string]$stagingMarker.ownerToken -cne $stagingOwnerToken) { throw 'staging ownership refused' }\r\n`
       + `  Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction Stop\r\n`
       + `} catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=cleanup_refused_or_failed' }\r\n`
@@ -1345,7 +1546,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   const stagingActivation = input.stagingOwnership
     ? `$stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
       + `$stagingMarkerItem = Get-Item -LiteralPath $stagingOwnershipMarker -Force -ErrorAction Stop\r\n`
-      + `$stagingMarkerState = Get-Content -LiteralPath $stagingOwnershipMarker -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
+      + `$stagingMarkerState = Get-Content -LiteralPath $stagingOwnershipMarker -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
       + `if (-not $stagingItem.PSIsContainer -or ($stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingMarkerItem.PSIsContainer -or ($stagingMarkerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingItem.Name -cnotmatch '^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$' -or [int]$stagingMarkerState.schemaVersion -ne 1 -or [string]$stagingMarkerState.product -cne ${psQuote(CONTROLLED_NODE_UPGRADE_PRODUCT)} -or [string]$stagingMarkerState.directoryName -cne $stagingItem.Name -or [string]$stagingMarkerState.ownerToken -cne $stagingOwnerToken) { throw 'staging ownership activation refused' }\r\n`
       + `$stagingMarkerState.pid = $PID\r\n`
       + `$stagingMarkerTemp = "$stagingOwnershipMarker.active-$PID"\r\n`
@@ -1362,7 +1563,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `}\r\n`
     + `& $verifyReleaseArtifact $src\r\n`
     + `if (-not (Test-Path -LiteralPath $srcManifest -PathType Leaf)) { throw 'controlled node release manifest is missing' }\r\n`
-    + `$srcNodeManifest = Get-Content -LiteralPath $srcManifest -Raw | ConvertFrom-Json\r\n`
+    + `$srcNodeManifest = Get-Content -LiteralPath $srcManifest -Encoding UTF8 -Raw | ConvertFrom-Json\r\n`
     + `$srcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $src).Hash.ToLowerInvariant()\r\n`
     + `if ([int]$srcNodeManifest.schemaVersion -ne 1 -or [string]$srcNodeManifest.artifact.fileName -cne 'imcodes-node.exe' -or [string]$srcNodeManifest.artifact.os -cne 'win32' -or [string]$srcNodeManifest.artifact.arch -cne 'x64' -or [int64]$srcNodeManifest.artifact.size -ne (Get-Item -LiteralPath $src).Length -or [string]$srcNodeManifest.artifact.sha256 -cne $srcHash -or [string]$srcNodeManifest.artifact.authenticodeSignerSha256 -cne $trustedReleaseSigner) { throw ${psQuote(CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE)} }\r\n`
     + `if (${psQuote(input.artifactSha256 ?? '')} -and $srcHash -cne ${psQuote(input.artifactSha256 ?? '')}) { throw 'controlled node staged artifact hash differs from upgrade authority' }\r\n`
@@ -1380,7 +1581,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `$srcRemoteDesktopExe = Join-Path $srcRemoteDesktopPlatform ${psQuote(REMOTE_DESKTOP_WORKER_FILENAME)}\r\n`
       + `$srcRemoteDesktopManifestPath = "$srcRemoteDesktopExe${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}"\r\n`
       + `if (-not (Test-Path -LiteralPath $srcRemoteDesktopExe) -or -not (Test-Path -LiteralPath $srcRemoteDesktopManifestPath)) { throw 'remote desktop worker artifact set is incomplete' }\r\n`
-      + `$srcRemoteDesktopManifest = Get-Content -LiteralPath $srcRemoteDesktopManifestPath -Raw | ConvertFrom-Json\r\n`
+      + `$srcRemoteDesktopManifest = Get-Content -LiteralPath $srcRemoteDesktopManifestPath -Encoding UTF8 -Raw | ConvertFrom-Json\r\n`
       + `if ([int]$srcRemoteDesktopManifest.manifestVersion -ne 2 -or $srcRemoteDesktopManifest.fileName -ne ${psQuote(REMOTE_DESKTOP_WORKER_FILENAME)} -or [int64]$srcRemoteDesktopManifest.size -ne (Get-Item -LiteralPath $srcRemoteDesktopExe).Length) { throw 'remote desktop worker manifest identity mismatch' }\r\n`
       + `$srcRemoteDesktopHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $srcRemoteDesktopExe).Hash.ToLowerInvariant()\r\n`
       + `if ($srcRemoteDesktopHash -ne [string]$srcRemoteDesktopManifest.sha256) { throw 'remote desktop worker hash verification failed' }\r\n`
@@ -1399,7 +1600,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `Expand-Archive -LiteralPath $srcVirtualDisplayArchive -DestinationPath $srcVirtualDisplay -Force\r\n`
       + `$srcVirtualDisplayManifestPath = Join-Path $srcVirtualDisplay ${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME)}\r\n`
       + `if (-not (Test-Path -LiteralPath $srcVirtualDisplayManifestPath)) { throw 'virtual display package manifest missing' }\r\n`
-      + `$srcVirtualDisplayManifest = Get-Content -LiteralPath $srcVirtualDisplayManifestPath -Raw | ConvertFrom-Json\r\n`
+      + `$srcVirtualDisplayManifest = Get-Content -LiteralPath $srcVirtualDisplayManifestPath -Encoding UTF8 -Raw | ConvertFrom-Json\r\n`
       + `if ([int]$srcVirtualDisplayManifest.manifestVersion -ne 1 -or [string]$srcVirtualDisplayManifest.hardwareId -ne 'ImcodesVirtualDisplay') { throw 'virtual display package identity mismatch' }\r\n`
       + `$expectedVirtualDisplayFiles = @('imcodes-virtual-display.dll','imcodes-virtual-display.inf','imcodes-virtual-display.cat','LICENSE.microsoft.txt','THIRD_PARTY_NOTICES.webrtc.md')\r\n`
       + `if (@($srcVirtualDisplayManifest.files).Count -ne $expectedVirtualDisplayFiles.Count) { throw 'virtual display package file count mismatch' }\r\n`
@@ -1412,7 +1613,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `  $platformEntries = @(Get-ChildItem -LiteralPath $platform -Force); $expectedPlatformEntries = @(${psQuote(REMOTE_DESKTOP_WORKER_FILENAME)},${psQuote(`${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`)},${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME)},'virtual-display'); if ($platformEntries.Count -ne $expectedPlatformEntries.Count) { throw 'remote desktop platform directory contains unexpected entries' }; foreach ($expected in $expectedPlatformEntries) { if (@($platformEntries | Where-Object { $_.Name -ceq $expected }).Count -ne 1) { throw 'remote desktop platform entry mismatch' } }\r\n`
       + `  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant() -cne $workerHash -or (Get-FileHash -Algorithm SHA256 -LiteralPath $manifestPath).Hash.ToLowerInvariant() -cne $manifestHash -or (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -cne $archiveHash) { throw 'remote desktop copied artifact hash mismatch' }\r\n`
       + `  $workerSignature = Get-AuthenticodeSignature -LiteralPath $exe; if ($workerSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or $null -eq $workerSignature.SignerCertificate) { throw 'remote desktop copied worker Authenticode verification failed' }; $workerSha256 = [System.Security.Cryptography.SHA256]::Create(); try { $workerSigner = [BitConverter]::ToString($workerSha256.ComputeHash($workerSignature.SignerCertificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $workerSha256.Dispose() }; if ($workerSigner -cne $trustedSigner) { throw 'remote desktop copied worker signer mismatch' }\r\n`
-      + `  $packageManifestPath = Join-Path $virtualDisplay ${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME)}; $packageManifest = Get-Content -LiteralPath $packageManifestPath -Raw | ConvertFrom-Json; if ([int]$packageManifest.manifestVersion -ne 1 -or [string]$packageManifest.hardwareId -cne 'ImcodesVirtualDisplay') { throw 'virtual display copied package identity mismatch' }; $expectedFiles = @('imcodes-virtual-display.dll','imcodes-virtual-display.inf','imcodes-virtual-display.cat','LICENSE.microsoft.txt','THIRD_PARTY_NOTICES.webrtc.md'); if (@($packageManifest.files).Count -ne $expectedFiles.Count) { throw 'virtual display copied package manifest count mismatch' }; $packageEntries = @(Get-ChildItem -LiteralPath $virtualDisplay -Force); if ($packageEntries.Count -ne ($expectedFiles.Count + 1)) { throw 'virtual display package contains unexpected entries' }; foreach ($expected in @($expectedFiles + ${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME)})) { $actual = @($packageEntries | Where-Object { $_.Name -ceq $expected }); if ($actual.Count -ne 1 -or $actual[0].PSIsContainer -or ($actual[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'virtual display copied package entry mismatch' } }\r\n`
+      + `  $packageManifestPath = Join-Path $virtualDisplay ${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME)}; $packageManifest = Get-Content -LiteralPath $packageManifestPath -Encoding UTF8 -Raw | ConvertFrom-Json; if ([int]$packageManifest.manifestVersion -ne 1 -or [string]$packageManifest.hardwareId -cne 'ImcodesVirtualDisplay') { throw 'virtual display copied package identity mismatch' }; $expectedFiles = @('imcodes-virtual-display.dll','imcodes-virtual-display.inf','imcodes-virtual-display.cat','LICENSE.microsoft.txt','THIRD_PARTY_NOTICES.webrtc.md'); if (@($packageManifest.files).Count -ne $expectedFiles.Count) { throw 'virtual display copied package manifest count mismatch' }; $packageEntries = @(Get-ChildItem -LiteralPath $virtualDisplay -Force); if ($packageEntries.Count -ne ($expectedFiles.Count + 1)) { throw 'virtual display package contains unexpected entries' }; foreach ($expected in @($expectedFiles + ${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME)})) { $actual = @($packageEntries | Where-Object { $_.Name -ceq $expected }); if ($actual.Count -ne 1 -or $actual[0].PSIsContainer -or ($actual[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'virtual display copied package entry mismatch' } }\r\n`
       + `  foreach ($expected in $expectedFiles) { $entry = @($packageManifest.files | Where-Object { [string]$_.name -ceq $expected }); $path = Join-Path $virtualDisplay $expected; if ($entry.Count -ne 1 -or [int64]$entry[0].size -ne (Get-Item -LiteralPath $path).Length -or [string]$entry[0].sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()) { throw 'virtual display copied package file verification failed' } }\r\n`
       + `  foreach ($signed in @('imcodes-virtual-display.dll','imcodes-virtual-display.cat')) { $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $virtualDisplay $signed); if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or $null -eq $signature.SignerCertificate) { throw 'virtual display copied Authenticode verification failed' }; $sha256 = [System.Security.Cryptography.SHA256]::Create(); try { $signer = [BitConverter]::ToString($sha256.ComputeHash($signature.SignerCertificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }; if ($signer -cne $trustedSigner) { throw 'virtual display copied signer mismatch' } }\r\n`
       + `}\r\n`
@@ -1432,22 +1633,24 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     ? `if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstHelperExe).Hash.ToLowerInvariant() -cne $currentHelperHash) { throw 'computer-use helper rollback hash mismatch' }; if ($currentHelperManifestHash -and (Get-FileHash -Algorithm SHA256 -LiteralPath $dstHelperManifest).Hash.ToLowerInvariant() -cne $currentHelperManifestHash) { throw 'computer-use helper manifest rollback hash mismatch' }`
     : '';
   const helperSwap = input.stagedComputerUseHelperDir
-    ? `Remove-Item -Recurse -Force $pendingHelper,$backupHelper -ErrorAction SilentlyContinue\r\n`
+    ? `& $clearStagingDir $pendingHelper; & $clearStagingDir $backupHelper\r\n`
       + `New-Item -ItemType Directory -Force $pendingHelper | Out-Null\r\n`
-      + `Copy-Item -Recurse -Force -Path (Join-Path $srcHelper '*') -Destination $pendingHelper\r\n`
+      + `& $clearReadOnlyAttributes $srcHelper\r\n`
+      + `& $invokeWithIoRetry { & $clearReadOnlyAttributes $pendingHelper; Copy-Item -Recurse -Force -Path (Join-Path $srcHelper '*') -Destination $pendingHelper }\r\n`
       + `& $verifyReleaseArtifact (Join-Path $pendingHelper 'open-computer-use.exe')\r\n`
-      + `if (Test-Path $dstHelper) { ${verifyRollbackHelper}; Move-Item -Force $dstHelper $backupHelper; $dstHelperExe = Join-Path $backupHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper}; $dstHelperExe = Join-Path $dstHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; $helperBackedUp = $true }\r\n`
-      + `Move-Item -Force $pendingHelper $dstHelper\r\n`
+      + `if (Test-Path $dstHelper) { ${verifyRollbackHelper}; & $clearReadOnlyAttributes $dstHelper; & $invokeWithIoRetry { Move-Item -Force $dstHelper $backupHelper }; $dstHelperExe = Join-Path $backupHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper}; $dstHelperExe = Join-Path $dstHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; $helperBackedUp = $true }\r\n`
+      + `& $invokeWithIoRetry { Move-Item -Force $pendingHelper $dstHelper }\r\n`
       + `$helperPublished = $true\r\n`
       + `& $verifyReleaseArtifact (Join-Path $dstHelper 'open-computer-use.exe')\r\n`
     : '';
   const helperRollback = input.stagedComputerUseHelperDir
-    ? `if ($helperPublished -and (Test-Path $dstHelper)) { Remove-Item -Recurse -Force $dstHelper }\r\n`
-      + `if ($helperBackedUp -and (Test-Path $backupHelper)) { $dstHelperExe = Join-Path $backupHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper}; Move-Item -Force $backupHelper $dstHelper; $dstHelperExe = Join-Path $dstHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper} }\r\n`
-      + `Remove-Item -Recurse -Force $pendingHelper -ErrorAction SilentlyContinue\r\n`
+    ? `if ($helperPublished -and (Test-Path $dstHelper)) { & $clearStagingDir $dstHelper }\r\n`
+      + `if ($helperBackedUp -and (Test-Path $backupHelper)) { $dstHelperExe = Join-Path $backupHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper}; & $clearReadOnlyAttributes $backupHelper; & $invokeWithIoRetry { Move-Item -Force $backupHelper $dstHelper }; $dstHelperExe = Join-Path $dstHelper 'open-computer-use.exe'; $dstHelperManifest = "$dstHelperExe.manifest.json"; ${verifyRollbackHelper} }\r\n`
+      + `if (Test-Path $dstHelper) { ${helperAcl.replaceAll('\r\n', '; ')} }\r\n`
+      + `try { & $clearStagingDir $pendingHelper } catch { }\r\n`
     : '';
   const helperCleanup = input.stagedComputerUseHelperDir
-    ? `Remove-Item -Recurse -Force $backupHelper,$pendingHelper -ErrorAction SilentlyContinue\r\n`
+    ? `try { & $clearStagingDir $backupHelper } catch { }; try { & $clearStagingDir $pendingHelper } catch { }\r\n`
     : '';
   const remoteDesktopVariables = input.stagedRemoteDesktopWorkerDir
     ? `$dstRemoteDesktop = ${psQuote(remoteDesktopWorkerDir)}\r\n`
@@ -1458,22 +1661,24 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `$rollbackRemoteDesktopArchiveHash = ''\r\n`
     : '';
   const remoteDesktopSwap = input.stagedRemoteDesktopWorkerDir
-    ? `Remove-Item -Recurse -Force $pendingRemoteDesktop,$backupRemoteDesktop -ErrorAction SilentlyContinue\r\n`
+    ? `& $clearStagingDir $pendingRemoteDesktop; & $clearStagingDir $backupRemoteDesktop\r\n`
       + `New-Item -ItemType Directory -Force $pendingRemoteDesktop | Out-Null\r\n`
       + pendingRemoteDesktopAcl + `\r\n`
-      + `Copy-Item -Recurse -Force -Path (Join-Path $srcRemoteDesktop '*') -Destination $pendingRemoteDesktop\r\n`
+      + `& $clearReadOnlyAttributes $srcRemoteDesktop\r\n`
+      + `& $invokeWithIoRetry { & $clearReadOnlyAttributes $pendingRemoteDesktop; & (Join-Path $env:WINDIR 'System32\\icacls.exe') $pendingRemoteDesktop /grant:r '*S-1-5-18:(OI)(CI)F' /T /C /Q | Out-Null; Copy-Item -Recurse -Force -Path (Join-Path $srcRemoteDesktop '*') -Destination $pendingRemoteDesktop }\r\n`
       + `& $verifyRemoteDesktopArtifactSet $pendingRemoteDesktop $srcRemoteDesktopHash $srcRemoteDesktopManifestHash $srcVirtualDisplayHash $srcRemoteDesktopSignerSha256\r\n`
-      + `if (Test-Path $dstRemoteDesktop) { & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; Move-Item -Force $dstRemoteDesktop $backupRemoteDesktop; & $verifyRemoteDesktopArtifactSet $backupRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; $remoteDesktopBackedUp = $true }\r\n`
-      + `Move-Item -Force $pendingRemoteDesktop $dstRemoteDesktop\r\n`
+      + `if (Test-Path $dstRemoteDesktop) { & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; & $clearReadOnlyAttributes $dstRemoteDesktop; & $invokeWithIoRetry { Move-Item -Force $dstRemoteDesktop $backupRemoteDesktop }; & $verifyRemoteDesktopArtifactSet $backupRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; $remoteDesktopBackedUp = $true }\r\n`
+      + `& $invokeWithIoRetry { Move-Item -Force $pendingRemoteDesktop $dstRemoteDesktop }\r\n`
       + `$remoteDesktopPublished = $true\r\n`
     : '';
   const remoteDesktopRollback = input.stagedRemoteDesktopWorkerDir
-    ? `if ($remoteDesktopPublished -and (Test-Path $dstRemoteDesktop)) { Remove-Item -Recurse -Force $dstRemoteDesktop }\r\n`
-      + `if ($remoteDesktopBackedUp -and (Test-Path $backupRemoteDesktop)) { & $verifyRemoteDesktopArtifactSet $backupRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; Move-Item -Force $backupRemoteDesktop $dstRemoteDesktop; & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner }\r\n`
-      + `Remove-Item -Recurse -Force $pendingRemoteDesktop -ErrorAction SilentlyContinue\r\n`
+    ? `if ($remoteDesktopPublished -and (Test-Path $dstRemoteDesktop)) { & $clearStagingDir $dstRemoteDesktop }\r\n`
+      + `if ($remoteDesktopBackedUp -and (Test-Path $backupRemoteDesktop)) { & $verifyRemoteDesktopArtifactSet $backupRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; & $clearReadOnlyAttributes $backupRemoteDesktop; & $invokeWithIoRetry { Move-Item -Force $backupRemoteDesktop $dstRemoteDesktop }; & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner }\r\n`
+      + `if (Test-Path $dstRemoteDesktop) { ${remoteDesktopWorkerAcl.replaceAll('\r\n', '; ')} }\r\n`
+      + `try { & $clearStagingDir $pendingRemoteDesktop } catch { }\r\n`
     : '';
   const remoteDesktopCleanup = input.stagedRemoteDesktopWorkerDir
-    ? `Remove-Item -Recurse -Force $backupRemoteDesktop,$pendingRemoteDesktop -ErrorAction SilentlyContinue\r\n`
+    ? `try { & $clearStagingDir $backupRemoteDesktop } catch { }; try { & $clearStagingDir $pendingRemoteDesktop } catch { }\r\n`
     : '';
   const virtualDisplayDriverInventory = input.stagedRemoteDesktopWorkerDir
     ? `$driverInventoryAvailable = $false\r\n`
@@ -1527,14 +1732,18 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   const transactionIntent = input.stagedJournalPath && input.destinationJournalPath && input.upgradeTaskName
     ? `$transactionMarkerTemp = "$upgradeMarker.pending-$PID"\r\n`
       + `if (-not (Test-Path -LiteralPath $upgradeMarker)) {\r\n`
-      + `  $previousJournal = Get-Content -LiteralPath $dstJournal -Raw | ConvertFrom-Json\r\n`
-      + `  $targetJournal = Get-Content -LiteralPath $srcJournal -Raw | ConvertFrom-Json\r\n`
+      + `  $previousJournal = Get-Content -LiteralPath $dstJournal -Encoding UTF8 -Raw | ConvertFrom-Json\r\n`
+      + `  $targetJournal = Get-Content -LiteralPath $srcJournal -Encoding UTF8 -Raw | ConvertFrom-Json\r\n`
       + `  $transaction = [ordered]@{ version = ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION}; product = ${psQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT)}; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); targetVersion = ${psQuote(input.targetVersion ?? '')}; taskName = ${psQuote(input.upgradeTaskName)}; executablePath = $dst; backupExecutablePath = $backupDst; journalPath = $dstJournal; backupJournalPath = $backupJournal; previousReceipt = $previousJournal.stagedReceipt; targetReceipt = $targetJournal.stagedReceipt }\r\n`
       + `  [IO.File]::WriteAllText($transactionMarkerTemp, ($transaction | ConvertTo-Json -Compress -Depth 8), [Text.UTF8Encoding]::new($false))\r\n`
       + `  Move-Item -Force -LiteralPath $transactionMarkerTemp -Destination $upgradeMarker\r\n`
       + `}\r\n`
     : `@{ version = 1; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeMarker -Encoding utf8\r\n`;
   return `$ErrorActionPreference = 'Stop'\r\n`
+    + `$utf8NoBom = [Text.UTF8Encoding]::new($false)\r\n`
+    + `[Console]::InputEncoding = $utf8NoBom\r\n`
+    + `[Console]::OutputEncoding = $utf8NoBom\r\n`
+    + `$OutputEncoding = $utf8NoBom\r\n`
     + `Start-Sleep -Seconds 3\r\n`
     + `$task = ${psQuote(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
     + `$dst = ${psQuote(input.destinationPath)}\r\n`
@@ -1573,11 +1782,13 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + windowsUpgradeHealthWaitScript()
     + `$upgradePhase = 'preflight'\r\n`
     + `$healthLease = Join-Path (Split-Path -Parent $dst) 'health-lease.json'\r\n`
+    + `$livenessLease = Join-Path (Split-Path -Parent $dst) 'liveness-lease.json'\r\n`
     + `$upgradeMarker = Join-Path (Split-Path -Parent $dst) ${psQuote(WINDOWS_UPGRADE_MARKER_NAME)}\r\n`
     + `$backupDst = "$dst.upgrade-old"\r\n`
     + `$backupManifest = "$dstManifest.upgrade-old"\r\n`
     + `$mainBackedUp = $false\r\n`
     + `$mainPublished = $false\r\n`
+    + `$mainSkippedSameHash = $false\r\n`
     + `$manifestBackedUp = $false\r\n`
     + `$rollbackManifestHash = ''\r\n`
     + `$manifestPublished = $false\r\n`
@@ -1596,7 +1807,31 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$recoveryFailures = [System.Collections.Generic.List[string]]::new()\r\n`
     + `$rollbackProgress = [System.Collections.Generic.List[string]]::new()\r\n`
     + `$runRecovery = { param([string]$label,[scriptblock]$action) try { & $action; [void]$rollbackProgress.Add($label); try { [void](& $writeUpgradeResult @{ status = '${CONTROLLED_NODE_UPGRADE_RESULT_STATUS.ROLLBACK_STARTED}'; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; rollbackProgress = @($rollbackProgress) }) } catch { } } catch { $recoveryFailure = ('{0}: {1}' -f $label, [string]$_.Exception.Message); if ($recoveryFailure.Length -gt 240) { $recoveryFailure = $recoveryFailure.Substring(0, 240) }; [void]$recoveryFailures.Add($recoveryFailure) } }\r\n`
+    + `$clearReadOnlyAttributes = { param([string]$target)\r\n`
+    + `  if (-not (Test-Path -LiteralPath $target)) { return }\r\n`
+    + `  try {\r\n`
+    + `    $rootItem = Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue\r\n`
+    + `    if ($rootItem -and ($rootItem.Attributes -band [IO.FileAttributes]::ReadOnly)) { try { $rootItem.Attributes = $rootItem.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } catch { } }\r\n`
+    + `    Get-ChildItem -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {\r\n`
+    + `      if ($_.Attributes -band [IO.FileAttributes]::ReadOnly) { try { $_.Attributes = $_.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } catch { } }\r\n`
+    + `    }\r\n`
+    + `  } catch { }\r\n`
+    + `}\r\n`
+    + `$invokeWithIoRetry = { param([scriptblock]$action,[int]$attempts = 6,[int]$delayMs = 250)\r\n`
+    + `  for ($attempt = 1; $attempt -le $attempts; $attempt++) {\r\n`
+    + `    try {\r\n`
+    + `      return (& $action)\r\n`
+    + `    } catch [IO.IOException], [UnauthorizedAccessException] {\r\n`
+    + `      if ($attempt -ge $attempts) { throw }\r\n`
+    + `      [GC]::Collect(); [GC]::WaitForPendingFinalizers()\r\n`
+    + `      [Threading.Thread]::Sleep($delayMs)\r\n`
+    + `    }\r\n`
+    + `  }\r\n`
+    + `}\r\n`
     + `$waitForNodeExecutableRelease = { param([int]$timeoutMs = 30000)\r\n`
+    + `  $installDir = Split-Path -Parent $dst\r\n`
+    + `  $installDirPrefix = if ($installDir.EndsWith('\\')) { $installDir } else { "$installDir\\" }\r\n`
+    + `  $sidecarPaths = @((Join-Path $installDir 'remote-desktop-worker\\win32-x64\\imcodes-remote-desktop-worker.exe'), (Join-Path $installDir 'computer-use-helper\\open-computer-use.exe'), (Join-Path $installDir 'aidesk-local-ui\\aidesk-local-ui.exe'))\r\n`
     + `  $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $timeoutMs\r\n`
     + `  $passes = 0\r\n`
     + `  do {\r\n`
@@ -1604,16 +1839,35 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     // Get-Process, not WMI: a single WMI query took 3 minutes on a loaded real node, blowing the whole
     // deadline in one pass and failing a stop that had in fact succeeded.
     + `    $matchingProcesses = @(Get-Process -Name imcodes-node -ErrorAction SilentlyContinue | Where-Object { $_.Path -and [string]::Equals($_.Path, $dst, [StringComparison]::OrdinalIgnoreCase) })\r\n`
+    + `    $sidecarProcesses = @(Get-Process -Name @('imcodes-remote-desktop-worker','open-computer-use','aidesk-local-ui') -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($installDirPrefix, [StringComparison]::OrdinalIgnoreCase) })\r\n`
     + `    foreach ($matchingProcess in $matchingProcesses) { Stop-Process -Id $matchingProcess.Id -Force -ErrorAction SilentlyContinue }\r\n`
-    + `    $exclusiveHandle = $null\r\n`
+    + `    foreach ($sidecarProcess in $sidecarProcesses) { Stop-Process -Id $sidecarProcess.Id -Force -ErrorAction SilentlyContinue }\r\n`
+    + `    $exclusiveHandles = [System.Collections.Generic.List[IDisposable]]::new()\r\n`
     + `    try {\r\n`
-    + `      if (Test-Path -LiteralPath $dst) { $exclusiveHandle = [IO.File]::Open($dst, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }\r\n`
-    + `      if ($matchingProcesses.Count -eq 0) { return }\r\n`
-    + `    } catch [IO.IOException] { } finally { if ($exclusiveHandle) { $exclusiveHandle.Dispose() } }\r\n`
+    + `      if (Test-Path -LiteralPath $dst -PathType Leaf) { $exclusiveHandles.Add([IO.File]::Open($dst, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)) }\r\n`
+    + `      foreach ($sidecarPath in $sidecarPaths) {\r\n`
+    + `        if (Test-Path -LiteralPath $sidecarPath -PathType Leaf) {\r\n`
+    + `          try { $si = Get-Item -LiteralPath $sidecarPath -Force; if ($si.Attributes -band [IO.FileAttributes]::ReadOnly) { $si.Attributes = $si.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } } catch { }\r\n`
+    + `          $exclusiveHandles.Add([IO.File]::Open($sidecarPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None))\r\n`
+    + `        }\r\n`
+    + `      }\r\n`
+    + `      if ($matchingProcesses.Count -eq 0 -and $sidecarProcesses.Count -eq 0) { return }\r\n`
+    + `    } catch [IO.IOException], [UnauthorizedAccessException] { } finally { foreach ($h in $exclusiveHandles) { try { $h.Dispose() } catch { } } }\r\n`
     + `    [Threading.Thread]::Sleep(250)\r\n`
     // Always one verification pass AFTER the kill, however slow the first pass was.
     + `  } while ($passes -lt 2 -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline)\r\n`
     + `  throw 'controlled node executable remained locked after stop'\r\n`
+    + `}\r\n`
+    + `$clearStagingDir = { param([string]$target)\r\n`
+    + `  if (-not (Test-Path -LiteralPath $target)) { return }\r\n`
+    + `  & $clearReadOnlyAttributes $target\r\n`
+    + `  $icaclsExe = Join-Path $env:WINDIR 'System32\\icacls.exe'\r\n`
+    + `  & $icaclsExe $target /setowner '*S-1-5-18' /T /C /Q | Out-Null\r\n`
+    + `  & $icaclsExe $target /reset /T /C /Q | Out-Null\r\n`
+    + `  & $icaclsExe $target /grant:r '*S-1-5-18:(OI)(CI)F' /T /C /Q | Out-Null\r\n`
+    + `  & $icaclsExe $target /grant:r '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null\r\n`
+    + `  & $clearReadOnlyAttributes $target\r\n`
+    + `  & $invokeWithIoRetry { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop }\r\n`
     + `}\r\n`
     + releasePreflightGuard
     + `$upgradePhase = 'install'\r\n`
@@ -1624,19 +1878,21 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     // that has since succeeded, and `in_progress` is what a killed script leaves.
     + `try { [void](& $writeUpgradeResult @{ status = '${CONTROLLED_NODE_UPGRADE_RESULT_STATUS.IN_PROGRESS}'; phase = 'install' }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=in_progress' }\r\n`
     + `$rollbackMainHash = $currentMainHash\r\n`
-    + `try { $durableTransaction = Get-Content -LiteralPath $upgradeMarker -Raw | ConvertFrom-Json; if ([int]$durableTransaction.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$durableTransaction.previousReceipt.sha256 -cmatch '^[a-f0-9]{64}$') { $rollbackMainHash = [string]$durableTransaction.previousReceipt.sha256 } } catch { }\r\n`
+    + `try { $durableTransaction = Get-Content -LiteralPath $upgradeMarker -Encoding UTF8 -Raw | ConvertFrom-Json; if ([int]$durableTransaction.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$durableTransaction.previousReceipt.sha256 -cmatch '^[a-f0-9]{64}$') { $rollbackMainHash = [string]$durableTransaction.previousReceipt.sha256 } } catch { }\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
     + `& $waitForNodeExecutableRelease\r\n`
-    + `$publishAtomic = { param([string]$source,[string]$destination,[string]$backup) $pending = "$destination.pending-$PID"; Remove-Item -Force -LiteralPath $pending -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $source -Destination $pending; if (Test-Path -LiteralPath $destination) { [IO.File]::Replace($pending, $destination, $backup, $true) } else { Move-Item -LiteralPath $pending -Destination $destination }; }\r\n`
+    + `$publishAtomic = { param([string]$source,[string]$destination,[string]$backup) $pending = "$destination.pending-$PID"; Remove-Item -Force -LiteralPath $pending -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $source -Destination $pending; if (Test-Path -LiteralPath $destination) { try { $di = Get-Item -LiteralPath $destination -Force; if ($di.Attributes -band [IO.FileAttributes]::ReadOnly) { $di.Attributes = $di.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } } catch { }; [IO.File]::Replace($pending, $destination, $backup, $true) } else { Move-Item -LiteralPath $pending -Destination $destination }; }\r\n`
     + `$currentPublishedHash = if (Test-Path -LiteralPath $dst) { (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() } else { '' }\r\n`
     + `if ($currentPublishedHash -cne $srcHash) {\r\n`
     + `  if ($currentPublishedHash -cne $rollbackMainHash -and (Test-Path -LiteralPath $backupDst) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -eq $rollbackMainHash) { & $publishAtomic $backupDst $dst "$dst.recovery-discard"; Remove-Item -Force "$dst.recovery-discard" -ErrorAction SilentlyContinue }\r\n`
     + `  if ((Test-Path -LiteralPath $dst) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node interrupted upgrade has no trusted publication base' }\r\n`
     + `  Remove-Item -Force $backupDst -ErrorAction SilentlyContinue\r\n`
     + `  & $publishAtomic $src $dst $backupDst\r\n`
+    + `  $mainPublished = $true\r\n`
+    + `} else {\r\n`
+    + `  $mainSkippedSameHash = $true\r\n`
     + `}\r\n`
-    + `$mainBackedUp = Test-Path -LiteralPath $backupDst\r\n`
-    + `$mainPublished = $true\r\n`
+    + `$mainBackedUp = (-not $mainSkippedSameHash) -and (Test-Path -LiteralPath $backupDst)\r\n`
     + `& $verifyReleaseArtifact $dst\r\n`
     + windowsManifestBackupScript()
     + `$pendingManifest = "$dstManifest.pending-$PID"; $manifestSwapBackup = "$dstManifest.swap-old-$PID"; Remove-Item -Force $manifestSwapBackup -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $srcManifest -Destination $pendingManifest; if (Test-Path -LiteralPath $dstManifest) { [IO.File]::Replace($pendingManifest, $dstManifest, $manifestSwapBackup, $true); Remove-Item -Force $manifestSwapBackup -ErrorAction SilentlyContinue } else { Move-Item -LiteralPath $pendingManifest -Destination $dstManifest }\r\n`
@@ -1657,7 +1913,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
         + `if ($driverInventoryAvailable) { try { $currentVirtualDisplayDrivers = @(Get-WindowsDriver -Online -All | Where-Object { [IO.Path]::GetFileName([string]$_.OriginalFileName) -ceq 'imcodes-virtual-display.inf' -and [string]$_.ProviderName -ceq 'IM.codes' -and [string]$_.ClassName -ceq 'Display' }); $newVirtualDisplayDrivers = @($currentVirtualDisplayDrivers | Where-Object { $previousVirtualDisplayDrivers.Driver -cnotcontains $_.Driver }); if ($newVirtualDisplayDrivers.Count -gt 1) { $newVirtualDisplayDrivers = @(); $driverInventoryAvailable = $false } } catch { $newVirtualDisplayDrivers = @(); $driverInventoryAvailable = $false } }\r\n`
         + `$virtualDisplayDriverInstalled = $newVirtualDisplayDrivers.Count -eq 1\r\n`
       : '')
-    + `Remove-Item -Force $healthLease -ErrorAction SilentlyContinue\r\n`
+    + `Remove-Item -Force $healthLease,$livenessLease -ErrorAction SilentlyContinue\r\n`
     + `$upgradeStartedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\r\n`
     + `$upgradePhase = 'restart_health'\r\n`
     + `Start-ScheduledTask -TaskName $task\r\n`
@@ -1678,7 +1934,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = 'rollback_started'; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recordedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback_started' }\r\n`
     + `$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })\r\n`
     + `if ($rollbackExecutableReleased) {\r\n`
-    + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node rollback source hash mismatch' }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node restored hash mismatch' } } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
+    + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node rollback source hash mismatch' }; if (Test-Path -LiteralPath $dst) { try { $di = Get-Item -LiteralPath $dst -Force; if ($di.Attributes -band [IO.FileAttributes]::ReadOnly) { $di.Attributes = $di.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } } catch { } }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node restored hash mismatch' }; ${exeAcl.replaceAll('\r\n', '; ')} } elseif ($mainPublished -and -not $mainSkippedSameHash) { Remove-Item -Force $dst -ErrorAction Stop } elseif ($mainSkippedSameHash -and (Test-Path -LiteralPath $dst)) { ${exeAcl.replaceAll('\r\n', '; ')} } }\r\n`
     + windowsManifestRestoreScript()
     + (helperRollback ? `& $runRecovery 'restore_helper' { ${helperRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
     + (remoteDesktopRollback ? `& $runRecovery 'restore_remote_desktop' { ${remoteDesktopRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
@@ -1828,6 +2084,86 @@ export async function extractWindowsRemoteDesktopVirtualDisplay(
  * controlled-node executable, so a daemon whose own version is unchanged can
  * still receive a newer worker at an authenticated idle/reconnect boundary.
  */
+function evaluateWorkerVersionUpgrade(
+  installedVersion: string,
+  targetVersion: string,
+  artifactSha256?: string,
+): ControlledNodeRemoteDesktopWorkerRefreshResult | null {
+  const releaseOrder = compareImcodesVersions(installedVersion, targetVersion);
+  if (releaseOrder === null) {
+    return {
+      updated: false,
+      installedVersion,
+      targetVersion,
+      ...(artifactSha256 ? { artifactSha256 } : {}),
+      reason: 'worker_version_unparseable',
+    };
+  }
+  if (releaseOrder >= 0) {
+    return {
+      updated: false,
+      installedVersion,
+      targetVersion,
+      ...(artifactSha256 ? { artifactSha256 } : {}),
+      reason: releaseOrder === 0 ? 'worker_current' : 'worker_downgrade_rejected',
+    };
+  }
+  return null;
+}
+
+async function probeRemoteDesktopWorkerVersionFallback(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  platform: 'win32' | 'linux';
+  fetchImpl: typeof fetch;
+}): Promise<
+  | { status: 'ok'; targetVersion: string; sha256?: string }
+  | { status: 'unavailable' | 'error' }
+> {
+  const response = await input.fetchImpl(
+    controlledNodeArtifactUpgradeUrl(
+      input.credential,
+      input.target,
+      CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+    ),
+    {
+      headers: buildControlledNodeArtifactRequestHeaders(input.credential),
+    },
+  );
+  if (response.status === 404 || response.status === 409 || response.status === 503) {
+    await response.body?.cancel().catch(() => {});
+    return { status: 'unavailable' };
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    return { status: 'error' };
+  }
+  const shaHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  try {
+    const raw = JSON.parse(await response.text()) as unknown;
+    if (input.platform === 'win32') {
+      const manifest = validateRemoteDesktopWorkerManifest(raw);
+      if (!manifest) return { status: 'error' };
+      return {
+        status: 'ok',
+        targetVersion: manifest.workerVersion,
+        ...(manifest.sha256 ? { sha256: manifest.sha256 } : {}),
+      };
+    }
+    const manifest = validateRemoteDesktopLinuxWorkerManifest(raw);
+    if (!manifest) return { status: 'error' };
+    return {
+      status: 'ok',
+      targetVersion: manifest.build.version,
+      ...(manifest.artifact.sha256
+        ? { sha256: manifest.artifact.sha256 }
+        : (shaHeader && /^[0-9a-f]{64}$/.test(shaHeader) ? { sha256: shaHeader } : {})),
+    };
+  } catch {
+    return { status: 'error' };
+  }
+}
+
 export async function refreshControlledNodeRemoteDesktopWorker(
   input: ControlledNodeRemoteDesktopWorkerRefreshDeps,
 ): Promise<ControlledNodeRemoteDesktopWorkerRefreshResult> {
@@ -1863,26 +2199,64 @@ export async function refreshControlledNodeRemoteDesktopWorker(
     return { updated: false, reason: 'installed_manifest_missing' };
   }
 
+  const target = platform === 'win32'
+    ? { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 }
+    : { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 };
+  const customDownloader = platform === 'win32' ? input.downloadWindowsWorker : input.downloadLinuxWorker;
+  const fetchImpl = input.fetchImpl ?? fetch;
+  if (input.fetchImpl || !customDownloader) {
+    let precheckedVersion: string | undefined;
+    let precheckedSha256: string | undefined;
+    const probe = await probeControlledNodeArtifactMetadata({
+      credential: input.credential,
+      target,
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
+      fetchImpl,
+    });
+    if (probe.status === 'ok' && probe.version) {
+      precheckedVersion = probe.version;
+      precheckedSha256 = probe.sha256;
+    } else if (probe.status === 'unavailable') {
+      if (!customDownloader) {
+        return { updated: false, installedVersion, reason: 'worker_not_available' };
+      }
+    } else {
+      const manifestProbe = await probeRemoteDesktopWorkerVersionFallback({
+        credential: input.credential,
+        target,
+        platform,
+        fetchImpl,
+      });
+      if (manifestProbe.status === 'ok') {
+        precheckedVersion = manifestProbe.targetVersion;
+        precheckedSha256 = manifestProbe.sha256;
+      } else if (manifestProbe.status === 'unavailable' && !customDownloader) {
+        return { updated: false, installedVersion, reason: 'worker_not_available' };
+      }
+    }
+    if (precheckedVersion) {
+      const precheckResult = evaluateWorkerVersionUpgrade(installedVersion, precheckedVersion, precheckedSha256);
+      if (precheckResult) return precheckResult;
+    }
+  }
+
   const stagingRoot = await mkdtemp(join(root, '.remote-desktop-worker-refresh-'));
   const cleanup = async (): Promise<void> => {
     await rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
   };
   try {
-    const target = platform === 'win32'
-      ? { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 }
-      : { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 };
     const downloaded = platform === 'win32'
       ? await (input.downloadWindowsWorker ?? downloadControlledNodeRemoteDesktopWorker)({
         credential: input.credential,
         target,
         dir: stagingRoot,
-        fetchImpl: input.fetchImpl ?? fetch,
+        fetchImpl,
       })
       : await (input.downloadLinuxWorker ?? downloadControlledNodeLinuxRemoteDesktopWorker)({
         credential: input.credential,
         target,
         dir: stagingRoot,
-        fetchImpl: input.fetchImpl ?? fetch,
+        fetchImpl,
       });
     if (!downloaded) return { updated: false, installedVersion, reason: 'worker_not_available' };
     const targetManifest = JSON.parse(await readFile(downloaded.manifestPath, 'utf8')) as Record<string, unknown>;
@@ -1890,13 +2264,8 @@ export async function refreshControlledNodeRemoteDesktopWorker(
       ? validateRemoteDesktopWorkerManifest(targetManifest)?.workerVersion
       : validateRemoteDesktopLinuxWorkerManifest(targetManifest)?.build.version;
     if (!targetVersion || !installedVersion) return { updated: false, reason: 'worker_version_missing' };
-    const releaseOrder = compareImcodesVersions(installedVersion, targetVersion);
-    if (releaseOrder === null) {
-      return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: 'worker_version_unparseable' };
-    }
-    if (releaseOrder >= 0) {
-      return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: releaseOrder === 0 ? 'worker_current' : 'worker_downgrade_rejected' };
-    }
+    const versionCheck = evaluateWorkerVersionUpgrade(installedVersion, targetVersion, downloaded.sha256);
+    if (versionCheck) return versionCheck;
     if (platform === 'win32') {
       const target = validateRemoteDesktopWorkerManifest(targetManifest);
       if (!target || !installedSigner || target.authenticodeSignerSha256 !== installedSigner) {
@@ -1954,6 +2323,146 @@ export async function refreshControlledNodeRemoteDesktopWorker(
 
 export { scheduleLinuxControlledNodeUpgrade } from './linux-upgrade-scheduler.js';
 import { scheduleLinuxControlledNodeUpgrade } from './linux-upgrade-scheduler.js';
+
+async function sha256FileOrNull(filePath: string): Promise<string | null> {
+  try {
+    const content = await readFile(filePath);
+    return createHash('sha256').update(content).digest('hex').toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+async function filesMatchSha256(installedPath: string, stagedPath: string): Promise<boolean> {
+  const [installedHash, stagedHash] = await Promise.all([
+    sha256FileOrNull(installedPath),
+    sha256FileOrNull(stagedPath),
+  ]);
+  return installedHash !== null && stagedHash !== null && installedHash === stagedHash;
+}
+
+async function isControlledNodeInstallationCurrent(input: {
+  runningVersion: string;
+  platform: NodeJS.Platform;
+  target: ControlledNodeArtifactTarget;
+  destinationPath: string;
+  destinationManifestPath: string;
+  downloaded: {
+    version?: string;
+    sha256: string;
+    manifestPath: string;
+  };
+  helper?: {
+    helperDir: string;
+    sha256: string;
+  };
+  remoteDesktopWorker?: {
+    workerDir: string;
+    manifestPath: string;
+    sha256: string;
+  };
+}): Promise<boolean> {
+  if (!input.downloaded.version || input.runningVersion !== input.downloaded.version) return false;
+  const installedExeHash = await sha256FileOrNull(input.destinationPath);
+  if (installedExeHash !== input.downloaded.sha256.toLowerCase()) return false;
+  try {
+    const rawManifest = await readFile(input.destinationManifestPath, 'utf8');
+    const parsedManifest = JSON.parse(rawManifest) as {
+      schemaVersion?: number;
+      artifact?: { sha256?: string };
+      build?: { version?: string };
+    };
+    if (
+      parsedManifest.schemaVersion !== 1
+      || parsedManifest.artifact?.sha256?.toLowerCase() !== input.downloaded.sha256.toLowerCase()
+      || parsedManifest.build?.version !== input.downloaded.version
+    ) {
+      return false;
+    }
+  } catch (error) {
+    // Windows desktop installer (Inno Setup) installs imcodes-node.exe without writing
+    // a standalone .manifest.json next to it; treat ENOENT as acceptable when binary + version match.
+    if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) {
+      return false;
+    }
+  }
+
+  const installDir = dirname(input.destinationPath);
+  if (input.helper) {
+    const helperFilename = controlledNodeComputerUseHelperFilename(input.target.os);
+    if (!helperFilename) return false;
+    const expectedHelperHash = input.helper.sha256.toLowerCase();
+    const helperCandidates = [
+      join(installDir, 'computer-use-helper', helperFilename),
+      join(installDir, 'computer-use-helper', controlledNodePlatformArchKey(input.target), helperFilename),
+    ];
+    let matchedHelper = false;
+    for (const candidate of helperCandidates) {
+      if ((await sha256FileOrNull(candidate)) === expectedHelperHash) {
+        matchedHelper = true;
+        break;
+      }
+    }
+    if (!matchedHelper) return false;
+  }
+
+  if (input.remoteDesktopWorker) {
+    if (input.platform === 'win32') {
+      const installedWorkerDir = join(installDir, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, 'win32-x64');
+      const installedWorkerHash = await sha256FileOrNull(join(installedWorkerDir, REMOTE_DESKTOP_WORKER_FILENAME));
+      if (installedWorkerHash !== input.remoteDesktopWorker.sha256.toLowerCase()) return false;
+      if (!(await filesMatchSha256(
+        join(installedWorkerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+        input.remoteDesktopWorker.manifestPath,
+      ))) {
+        return false;
+      }
+      const stagedArchive = join(input.remoteDesktopWorker.workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME);
+      if ((await sha256FileOrNull(stagedArchive)) !== null) {
+        if (!(await filesMatchSha256(
+          join(installedWorkerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME),
+          stagedArchive,
+        ))) {
+          return false;
+        }
+        const installedVirtualDisplayDir = join(installedWorkerDir, 'virtual-display');
+        const vdManifestPath = join(installedVirtualDisplayDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME);
+        try {
+          const vdManifest = JSON.parse(await readFile(vdManifestPath, 'utf8')) as {
+            manifestVersion?: number;
+            hardwareId?: string;
+            files?: Array<{ name?: string; size?: number; sha256?: string }>;
+          };
+          if (vdManifest.manifestVersion !== 1 || vdManifest.hardwareId !== 'ImcodesVirtualDisplay' || !Array.isArray(vdManifest.files) || vdManifest.files.length !== 5) {
+            return false;
+          }
+          for (const entry of vdManifest.files) {
+            if (!entry.name || typeof entry.sha256 !== 'string' || typeof entry.size !== 'number') return false;
+            const entryPath = join(installedVirtualDisplayDir, entry.name);
+            const entryStat = await stat(entryPath).catch(() => null);
+            if (!entryStat || entryStat.size !== entry.size) return false;
+            const entryHash = await sha256FileOrNull(entryPath);
+            if (entryHash !== entry.sha256.toLowerCase()) return false;
+          }
+        } catch {
+          return false;
+        }
+      }
+    } else if (input.platform === 'linux') {
+      const installedWorkerDir = join(installDir, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+      const installedWorkerHash = await sha256FileOrNull(join(installedWorkerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME));
+      if (installedWorkerHash !== input.remoteDesktopWorker.sha256.toLowerCase()) return false;
+      if (!(await filesMatchSha256(
+        join(installedWorkerDir, `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+        input.remoteDesktopWorker.manifestPath,
+      ))) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
 
 export async function startControlledNodeSelfUpgrade(
   credential: ControlledNodeCredential,
@@ -2062,6 +2571,101 @@ export async function startControlledNodeSelfUpgrade(
     const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
     const destinationManifestPath = `${destinationPath}.manifest.json`;
     const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');
+    if (abiProfile !== CONTROLLED_NODE_ABI_GLIBC217 && downloaded.releaseManifestSha256) {
+      const releaseTarget = releaseTargetFromRuntime(platform, arch);
+      if (releaseTarget) {
+        const manifestTarget: ControlledNodeArtifactTarget = {
+          os: target.os,
+          arch: platform === 'darwin' && (arch === 'x64' || arch === 'arm64') ? arch : target.arch,
+        };
+        const releaseManifest = await withArtifactDownloadRetries(
+          () => downloadDesktopReleaseManifest({
+            credential,
+            target: manifestTarget,
+            fetchImpl,
+            expectedVersion: downloaded.version,
+            expectedSha256: downloaded.releaseManifestSha256,
+          }),
+          { sleep: deps.sleep },
+        );
+        if (!releaseManifest) {
+          throw new Error('release_manifest_missing_after_announcement');
+        }
+        const downloadedNodeManifest = JSON.parse(await readFile(downloaded.manifestPath, 'utf8')) as {
+          artifact?: { authenticodeSignerSha256?: string };
+        };
+        const nodeCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'imcodes-node', {
+          version: downloaded.version,
+          fileName: downloaded.filename,
+          sha256: downloaded.sha256,
+          sizeBytes: downloaded.sizeBytes,
+          ...(downloadedNodeManifest.artifact?.authenticodeSignerSha256
+            ? { authenticodeSignerSha256: downloadedNodeManifest.artifact.authenticodeSignerSha256 }
+            : {}),
+        });
+        if (!nodeCheck.ok) throw new Error(`release_manifest_${nodeCheck.reason}`);
+
+        if (helper) {
+          const helperCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'open-computer-use', {
+            sha256: helper.sha256,
+            sizeBytes: helper.sizeBytes,
+          });
+          if (!helperCheck.ok) throw new Error(`release_manifest_${helperCheck.reason}`);
+        } else {
+          const installedMatches = await verifyInstalledComputerUseHelperMatchesManifest({
+            destinationPath,
+            target,
+            releaseManifest,
+            releaseTarget,
+          });
+          if (!installedMatches) {
+            throw new Error('release_manifest_missing_required_component:open-computer-use');
+          }
+        }
+
+        if (remoteDesktopWorker) {
+          const rdManifest = JSON.parse(await readFile(remoteDesktopWorker.manifestPath, 'utf8')) as {
+            workerVersion?: string;
+            protocolVersion?: number;
+            authenticodeSignerSha256?: string;
+            build?: { version?: string };
+          };
+          const rdStat = await stat(remoteDesktopWorker.artifactPath);
+          const rdVersion = rdManifest.workerVersion ?? rdManifest.build?.version;
+          const rdCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'remote-desktop', {
+            ...(rdVersion ? { version: rdVersion } : {}),
+            sha256: remoteDesktopWorker.sha256,
+            sizeBytes: rdStat.size,
+            ...(typeof rdManifest.protocolVersion === 'number' ? { protocolVersion: rdManifest.protocolVersion } : {}),
+            ...(rdManifest.authenticodeSignerSha256
+              ? { authenticodeSignerSha256: rdManifest.authenticodeSignerSha256 }
+              : {}),
+          });
+          if (!rdCheck.ok) throw new Error(`release_manifest_${rdCheck.reason}`);
+        } else if (target.os !== CONTROLLED_NODE_OS_MAC) {
+          throw new Error('release_manifest_missing_required_component:remote-desktop');
+        }
+      }
+    }
+    const runningVersion = deps.runningVersion ?? DAEMON_VERSION;
+    if (await isControlledNodeInstallationCurrent({
+      runningVersion,
+      platform,
+      target,
+      destinationPath,
+      destinationManifestPath,
+      downloaded,
+      helper,
+      remoteDesktopWorker,
+    })) {
+      await removeUpgradeDirBestEffort(updateDir, 'pre_handoff', deps);
+      return {
+        ok: true,
+        alreadyCurrent: true,
+        targetVersion: downloaded.version,
+        artifactSha256: downloaded.sha256,
+      };
+    }
     const stagedJournalPath = await prepareUpgradeJournal({
       currentJournalPath: destinationJournalPath,
       outputJournalPath: join(updateDir, 'install-journal.json'),
@@ -2124,7 +2728,7 @@ export async function startControlledNodeSelfUpgrade(
           ownerToken: ownership.ownerToken,
         },
       });
-    await writeUpgradeFile(scriptPath, script, { mode: 0o700 });
+    await writeUpgradeFile(scriptPath, platform === 'win32' ? `\uFEFF${script}` : script, { mode: 0o700 });
     if (platform !== 'win32') await chmod(scriptPath, 0o700).catch(() => {});
     if (platform === 'win32') {
       const taskXmlPath = join(updateDir, 'upgrade-task.xml');

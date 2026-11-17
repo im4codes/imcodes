@@ -6,7 +6,8 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
-import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 
@@ -105,6 +106,8 @@ describe('NewSessionDialog', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    __clearTransportModelCacheForTests();
   });
 
   it('renders project name input', () => {
@@ -235,18 +238,22 @@ describe('NewSessionDialog', () => {
     });
   });
 
-  it('starts the independent CC CLI SDK agent type without changing the legacy SDK choice', () => {
+  it('hides and disables CC CLI SDK while preserving both usable Claude choices', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    selectAgent(CLAUDE_CODE_CLI_SDK_AGENT_TYPE);
-    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'cli-sdk-app' } });
-    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/cli-sdk-app' } });
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    const hidden = getAgentButton(CLAUDE_CODE_CLI_SDK_AGENT_TYPE);
+    expect(hidden.style.display).toBe('none');
+    expect(hidden.disabled).toBe(true);
+    fireEvent.click(hidden);
+    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: /claude_code_cli/i }));
+    expect(getAgentButton('claude-code').getAttribute('aria-pressed')).toBe('true');
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'claude-cli-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/claude-cli-app' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      project: 'cli-sdk-app',
-      agentType: CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
-    }));
-    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('false');
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({ agentType: 'claude-code' }));
   });
 
   it('includes optional git remote URL for main-session starts', () => {
@@ -653,7 +660,8 @@ describe('NewSessionDialog', () => {
     });
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    selectAgent('gemini-sdk');
+    selectAgent('openclaw');
+    expect(getAgentButton('openclaw').getAttribute('aria-pressed')).toBe('true');
 
     const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
     expect(toggle.checked).toBe(false);
@@ -921,42 +929,21 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('keeps auto in gemini-sdk options when dynamic models are discovered', async () => {
+  it('hides and disables Gemini SDK and Gemini CLI in SDK and CLI selectors', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
-    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    selectAgent('gemini-sdk');
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini cli/i })).toBeNull();
 
-    await waitFor(() => {
-      expect(ws.send.mock.calls.some((call) => (
-        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'gemini-sdk'
-      ))).toBe(true);
-    });
-    const request = ws.send.mock.calls.find((call) => (
-      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'gemini-sdk'
-    ))?.[0];
-    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'gemini-sdk' });
-    act(() => ws.emit({
-      type: 'transport.models_response',
-      agentType: 'gemini-sdk',
-      requestId: request?.requestId,
-      models: [
-        { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
-        { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
-      ],
-    }));
-
-    await waitFor(() => expect(screen.getByRole('option', { name: 'auto' })).toBeDefined());
-    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[0], { target: { value: 'auto' } });
-    fireEvent.click(screen.getByRole('button', { name: /start/i }));
-
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      agentType: 'gemini-sdk',
-      requestedModel: 'auto',
-    }));
+    for (const unavailableType of ['gemini-sdk', 'gemini'] as const) {
+      const hidden = getAgentButton(unavailableType);
+      expect(hidden.style.display).toBe('none');
+      expect(hidden.disabled).toBe(true);
+      fireEvent.click(hidden);
+      expect(hidden.getAttribute('aria-pressed')).toBe('false');
+    }
+    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
   });
 
   it('uses dynamically discovered kimi-sdk models when starting a session', async () => {
@@ -1204,13 +1191,13 @@ describe('NewSessionDialog', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('grok_prerequisite_error');
   });
 
-  it('keeps Antigravity options and Flash High default available offline', async () => {
+  it('keeps Antigravity options and Hydrogen High default available offline', async () => {
     const ws = Object.assign(makeWs(), { connected: false });
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     selectAgent(AGY_SDK_PROVIDER_ID);
-    expect(await screen.findByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined();
-    const option = screen.getByRole('option', { name: 'gemini-3.8-flash-high' });
-    expect((option.parentElement as HTMLSelectElement).value).toBe('gemini-3.8-flash-high');
+    expect(await screen.findByRole('option', { name: 'gemini-4-hydrogen-high' })).toBeDefined();
+    const option = screen.getByRole('option', { name: 'gemini-4-hydrogen-high' });
+    expect((option.parentElement as HTMLSelectElement).value).toBe('gemini-4-hydrogen-high');
   });
 
   it('uses dynamically discovered agy-sdk models when starting a session', async () => {
@@ -1247,5 +1234,52 @@ describe('NewSessionDialog', () => {
       agentType: AGY_SDK_PROVIDER_ID,
       requestedModel: 'gemini-2.5-pro',
     }));
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('gemini-2.5-pro');
+  });
+
+  it('defaults agy-sdk to gemini-4-hydrogen-high over upstream carbon-medium when no preference exists, then remembers user-selected AGY models on reopen', async () => {
+    const ws1 = makeWs();
+    const first = render(<NewSessionDialog ws={ws1 as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'agy-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/agy-app' } });
+    selectAgent(AGY_SDK_PROVIDER_ID);
+
+    const req1 = ws1.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === AGY_SDK_PROVIDER_ID
+    ))?.[0];
+    act(() => ws1.emit({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: req1?.requestId,
+      models: [
+        { id: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+        { id: AGY_DEFAULT_MODEL_ID, name: 'Gemini 4 Hydrogen (High)' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+      ],
+      defaultModel: 'gemini-4-carbon-medium',
+      isAuthenticated: true,
+    }));
+
+    const select1 = (await screen.findByRole('option', { name: 'gemini-4-argon-high' })).parentElement as HTMLSelectElement;
+    expect(select1.value).toBe(AGY_DEFAULT_MODEL_ID);
+
+    // User selects gemini-4-argon-high and starts the session:
+    fireEvent.input(select1, { target: { value: 'gemini-4-argon-high' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws1.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestedModel: 'gemini-4-argon-high',
+    }));
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('gemini-4-argon-high');
+
+    first.unmount();
+
+    // Reopening NewSessionDialog pre-fills the remembered gemini-4-argon-high model:
+    const ws2 = makeWs();
+    render(<NewSessionDialog ws={ws2 as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    selectAgent(AGY_SDK_PROVIDER_ID);
+    const select2 = (await screen.findByRole('option', { name: 'gemini-4-argon-high' })).parentElement as HTMLSelectElement;
+    expect(select2.value).toBe('gemini-4-argon-high');
   });
 });

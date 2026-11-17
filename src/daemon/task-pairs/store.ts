@@ -1,3 +1,5 @@
+import { TASK_PAIR_DECISION_KIND, type TaskPairDecisionRecord } from '../../../shared/task-pair-decision.js';
+export type { TaskPairDecisionRecord } from '../../../shared/task-pair-decision.js';
 import { TASK_PAIR_SCHEDULING_FIELD, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_FIELD, type TaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
@@ -27,6 +29,12 @@ import {
 import { assertNotRealImcodesPathInTests } from '../../util/test-home-guard.js';
 import { imcodesStateDir } from '../../util/imcodes-state-dir.js';
 import { randomUUID } from 'node:crypto';
+import {
+  mergePairAuthority,
+  parseTaskPairAuthority,
+  serializeTaskPairAuthority,
+  type TaskPairAuthorityContext,
+} from './authority.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -132,7 +140,19 @@ export interface StoredTaskPair {
   state: TaskPairState;
   liveness: TaskPairLiveness;
   queueOrder: number;
+  /** Opaque, store-local CAS token: the exact persisted state_json, never a wire field. */
+  revision?: string;
   legacyTaskId?: string;
+  /** Internal persisted machine-control authority for this pair; never exported to UI/MCP snapshots. */
+  authority?: TaskPairAuthorityContext;
+}
+
+/** A full-state write was based on an authority snapshot that no longer exists. */
+export class TaskPairWriteConflictError extends Error {
+  constructor(readonly project: string, readonly taskId: string) {
+    super(`Task pair changed while applying update: ${project}/${taskId}`);
+    this.name = 'TaskPairWriteConflictError';
+  }
 }
 
 export interface TaskPairEventRecord {
@@ -156,19 +176,6 @@ export interface TaskPairProjectSettings {
 }
 
 /** Durable Brain decisions attached to one task-pair round. */
-export interface TaskPairDecisionRecord {
-  id: string;
-  project: string;
-  taskId: string;
-  round: number;
-  kind: 'request' | 'decision';
-  conclusion: string;
-  summary: string;
-  author: string;
-  at: number;
-  related?: string[];
-  idempotencyKey?: string;
-}
 
 export interface TaskPairDecisionNotification {
   id: string;
@@ -181,6 +188,8 @@ export interface TaskPairDecisionNotification {
   attempts: number;
   lastAttemptAt?: number;
   deliveredAt?: number;
+  /** Internal server-stamped authority for this notification delivery; never exported publicly. */
+  authority?: TaskPairAuthorityContext;
 }
 
 function emptyLiveness(now: number): TaskPairLiveness {
@@ -250,6 +259,7 @@ function freezeShared(pair: StoredTaskPair): StoredTaskPair {
   };
   freeze(pair.state);
   freeze(pair.liveness);
+  if (pair.authority) freeze(pair.authority);
   return pair;
 }
 
@@ -308,6 +318,7 @@ export class TaskPairStore {
         legacy_task_id TEXT,
         state_json TEXT NOT NULL,
         liveness_json TEXT NOT NULL,
+        authority_json TEXT,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (project, task_id)
       );
@@ -370,6 +381,7 @@ export class TaskPairStore {
         target TEXT NOT NULL,
         reason TEXT NOT NULL,
         text TEXT NOT NULL,
+        authority_json TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         last_attempt_at INTEGER,
         delivered_at INTEGER,
@@ -377,6 +389,21 @@ export class TaskPairStore {
       );
       CREATE INDEX IF NOT EXISTS task_pair_decision_notifications_pending_idx ON task_pair_decision_notifications (delivered_at, last_attempt_at);
     `);
+    // Additive and restart-safe for databases created by older daemons.
+    this.#ensureColumn('task_pair_decisions', 'details_json', 'TEXT');
+    this.#ensureColumn('task_pairs', 'authority_json', 'TEXT');
+    this.#ensureColumn('task_pair_decision_notifications', 'authority_json', 'TEXT');
+  }
+
+  #ensureColumn(table: 'task_pairs' | 'task_pair_decisions' | 'task_pair_decision_notifications', column: string, definition: string): void {
+    const columns = this.#db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some((entry) => entry.name === column)) return;
+    try {
+      this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    } catch (error) {
+      const rechecked = this.#db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!rechecked.some((entry) => entry.name === column)) throw error;
+    }
   }
 
   close(): void {
@@ -634,17 +661,36 @@ export class TaskPairStore {
     ));
   }
 
-  savePair(project: string, state: TaskPairState, options: { liveness?: TaskPairLiveness; legacyTaskId?: string } = {}): StoredTaskPair {
+  /** Full-state compare-and-update. No token means INSERT ONLY, never an unguarded overwrite. */
+  savePair(project: string, state: TaskPairState, options: {
+    expectedRevision?: string;
+    liveness?: TaskPairLiveness;
+    legacyTaskId?: string;
+    /** Lifecycle marker receipt and its state transition commit together. */
+    event?: TaskPairEventRecord;
+    authority?: TaskPairAuthorityContext;
+    allowOwnerOverride?: boolean;
+  } = {}): StoredTaskPair {
     const existing = this.getPair(project, state.taskId);
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();
     const legacyTaskId = options.legacyTaskId ?? existing?.legacyTaskId;
+    const authorityJson = options.authority !== undefined
+      ? serializeTaskPairAuthority(
+          mergePairAuthority(existing?.authority, options.authority, { allowOwnerOverride: options.allowOwnerOverride }),
+        )
+      : null;
     const titleState = `CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') IS NOT NULL
       THEN json_set(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}'))
       ELSE json_remove(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') END`;
-    const saved = this.#db.prepare(`
-      INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    const expected = options.expectedRevision ?? null;
+    if (options.event) this.#db.exec('BEGIN IMMEDIATE');
+    let saved: Record<string, unknown>;
+    try {
+      const row = this.#db.prepare(`
+      INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, authority_json, updated_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ? IS NULL OR EXISTS (SELECT 1 FROM task_pairs WHERE project = ? AND task_id = ? AND state_json = ?)
       ON CONFLICT (project, task_id) DO UPDATE SET
         status = excluded.status, brain = excluded.brain, executor = excluded.executor, auditor = excluded.auditor,
         legacy_task_id = excluded.legacy_task_id,
@@ -652,24 +698,54 @@ export class TaskPairStore {
         state_json = CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}') IS NOT NULL
           THEN json_set(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}'))
           ELSE json_remove(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}') END,
-        liveness_json = excluded.liveness_json, updated_at = excluded.updated_at
-      RETURNING json_quote(json_extract(state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}')) AS title_access_json, json_quote(json_extract(state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}')) AS scheduling_json
+        liveness_json = excluded.liveness_json,
+        authority_json = COALESCE(excluded.authority_json, task_pairs.authority_json),
+        updated_at = excluded.updated_at
+      WHERE task_pairs.state_json = ?
+      RETURNING *
     `).get(
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
-      queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
-    ) as { title_access_json: string | null; scheduling_json: string | null };
-    const savedState = { ...state };
-    if (!saved.scheduling_json || saved.scheduling_json === 'null') delete savedState.scheduling;
-    else savedState.scheduling = JSON.parse(saved.scheduling_json) as TaskPairScheduling;
-    if (saved.title_access_json === null || saved.title_access_json === 'null') delete savedState.titleAccess;
-    else savedState.titleAccess = JSON.parse(saved.title_access_json) as TaskPairTitleAccess;
+      queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), authorityJson, state.updatedAt,
+      expected, project, state.taskId, expected, expected,
+    ) as Record<string, unknown> | undefined;
+      if (!row || (options.event && !this.recordEvent(options.event))) {
+        throw new TaskPairWriteConflictError(project, state.taskId);
+      }
+      saved = row;
+      if (options.event) this.#db.exec('COMMIT');
+    } catch (error) {
+      if (options.event) this.#db.exec('ROLLBACK');
+      throw error;
+    }
     this.#pendingLiveness.delete(pairKey(project, state.taskId));
     this.#livenessDbWriteAt.delete(pairKey(project, state.taskId));
     this.#refreshIndexEntry(project, state.taskId);
     for (const listener of this.#listeners) {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
-    return { project, state: savedState, liveness, queueOrder, ...(legacyTaskId ? { legacyTaskId } : {}) };
+    return rowToPair(saved);
+  }
+
+  /**
+   * Persist or refresh internal machine authority without triggering a public
+   * supervision-console snapshot broadcast or mutating pair state.
+   */
+  savePairAuthority(
+    project: string,
+    taskId: string,
+    authority: TaskPairAuthorityContext | undefined,
+    options?: { allowOwnerOverride?: boolean },
+  ): StoredTaskPair | undefined {
+    if (!authority) return this.getPair(project, taskId);
+    const existing = this.getPair(project, taskId);
+    if (!existing) return undefined;
+    const merged = mergePairAuthority(existing.authority, authority, options);
+    const nextJson = serializeTaskPairAuthority(merged);
+    if (nextJson === serializeTaskPairAuthority(existing.authority)) return existing;
+    this.#db.prepare('UPDATE task_pairs SET authority_json = ? WHERE project = ? AND task_id = ?')
+      .run(nextJson, project, taskId);
+    this.#refreshIndexEntry(project, taskId);
+    return this.getPair(project, taskId);
   }
 
   /** Atomic metadata patch: never replace lifecycle, liveness or another MCP writer's unrelated fields. */
@@ -795,11 +871,13 @@ export class TaskPairStore {
     }
     const id = input.id ?? randomUUID();
     const result = this.#db.prepare(`
-      INSERT OR IGNORE INTO task_pair_decisions (id, project, task_id, round, kind, conclusion, summary, author, related_json, idempotency_key, at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO task_pair_decisions (id, project, task_id, round, kind, conclusion, summary, author, related_json, idempotency_key, at, details_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, input.project, input.taskId, input.round, input.kind, input.conclusion, input.summary, input.author,
       input.related ? JSON.stringify(input.related) : null, input.idempotencyKey ?? null, input.at,
+      JSON.stringify({ deliveryRound: input.deliveryRound, question: input.question, options: input.options, recommendation: input.recommendation,
+        requestId: input.requestId, selectedOptionId: input.selectedOptionId }),
     );
     const row = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (row) return { record: decisionFromRow(row), created: Number(result.changes) > 0 };
@@ -811,6 +889,35 @@ export class TaskPairStore {
       if (raced) return { record: decisionFromRow(raced), created: false };
     }
     throw new Error('failed to persist task pair decision');
+  }
+
+  decisionById(project: string, taskId: string, id: string): TaskPairDecisionRecord | undefined {
+    const row = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND id = ?').get(project, taskId, id) as Record<string, unknown> | undefined;
+    return row ? decisionFromRow(row) : undefined;
+  }
+
+  decisionByRetryKey(project: string, taskId: string, key: string): TaskPairDecisionRecord | undefined {
+    const row = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND idempotency_key = ?').get(project, taskId, key) as Record<string, unknown> | undefined;
+    return row ? decisionFromRow(row) : undefined;
+  }
+
+  latestDecisionRequest(project: string, taskId: string, round: number, deliveryRound = 1): TaskPairDecisionRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND round = ? AND kind = 'request' AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ? ORDER BY at DESC, id DESC LIMIT 1").get(project, taskId, round, deliveryRound) as Record<string, unknown> | undefined;
+    return row ? decisionFromRow(row) : undefined;
+  }
+
+  isDecisionResolved(question: TaskPairDecisionRecord): boolean {
+    return !!this.#db.prepare(`
+      SELECT id FROM task_pair_decisions
+      WHERE project = ? AND task_id = ? AND kind = 'decision'
+        AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ?
+        AND round = ?
+        AND (
+          json_extract(details_json, '$.requestId') = ?
+          OR (json_extract(details_json, '$.requestId') IS NULL AND at >= ?)
+        )
+      LIMIT 1
+    `).get(question.project, question.taskId, question.deliveryRound ?? 1, question.round, question.id, question.at);
   }
 
   latestDecision(project: string, taskId: string, round?: number): TaskPairDecisionRecord | undefined {
@@ -830,13 +937,14 @@ export class TaskPairStore {
     return rows.map(decisionFromRow);
   }
 
-  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification {
+  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification & { inserted: boolean } {
     const id = `${input.decisionId}:${input.target}`;
-    this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
-      id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text,
+    const authorityJson = serializeTaskPairAuthority(input.authority);
+    const result = this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, authority_json, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`).run(
+      id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text, authorityJson,
     );
     const row = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE id = ?').get(id) as Record<string, unknown>;
-    return decisionNotificationFromRow(row);
+    return Object.assign(decisionNotificationFromRow(row), { inserted: result.changes > 0 });
   }
 
   listPendingDecisionNotifications(limit = 100): TaskPairDecisionNotification[] {
@@ -969,12 +1077,15 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.decisionLastAt)) ? { decisionLastAt: Number(raw.decisionLastAt) } : {}),
     ...(Number.isFinite(Number(raw.decisionReminderAt)) ? { decisionReminderAt: Number(raw.decisionReminderAt) } : {}),
   };
+  const authority = parseTaskPairAuthority(row.authority_json);
   return {
     project: String(row.project),
+    revision: String(row.state_json),
     state: JSON.parse(String(row.state_json)) as TaskPairState,
     liveness,
     queueOrder: Number(row.queue_order),
     ...(row.legacy_task_id ? { legacyTaskId: String(row.legacy_task_id) } : {}),
+    ...(authority ? { authority } : {}),
   };
 }
 
@@ -986,7 +1097,8 @@ function decisionFromRow(row: Record<string, unknown>): TaskPairDecisionRecord {
     project: String(row.project),
     taskId: String(row.task_id),
     round: Number(row.round),
-    kind: row.kind === 'request' ? 'request' : 'decision',
+    kind: row.kind === TASK_PAIR_DECISION_KIND.REQUEST ? TASK_PAIR_DECISION_KIND.REQUEST : row.kind === TASK_PAIR_DECISION_KIND.FEEDBACK ? TASK_PAIR_DECISION_KIND.FEEDBACK : TASK_PAIR_DECISION_KIND.DECISION,
+    ...(row.details_json ? JSON.parse(String(row.details_json)) : {}),
     conclusion: String(row.conclusion),
     summary: String(row.summary),
     author: String(row.author),
@@ -997,11 +1109,13 @@ function decisionFromRow(row: Record<string, unknown>): TaskPairDecisionRecord {
 }
 
 function decisionNotificationFromRow(row: Record<string, unknown>): TaskPairDecisionNotification {
+  const authority = parseTaskPairAuthority(row.authority_json);
   return {
     id: String(row.id), project: String(row.project), taskId: String(row.task_id), decisionId: String(row.decision_id),
     target: String(row.target), reason: String(row.reason), text: String(row.text), attempts: Number(row.attempts ?? 0),
     ...(row.last_attempt_at != null ? { lastAttemptAt: Number(row.last_attempt_at) } : {}),
     ...(row.delivered_at != null ? { deliveredAt: Number(row.delivered_at) } : {}),
+    ...(authority ? { authority } : {}),
   };
 }
 
@@ -1022,6 +1136,6 @@ export function flushTaskPairStoreLiveness(): void {
 }
 
 export function setTaskPairStoreForTests(store: TaskPairStore | undefined): void {
-  singleton?.close?.();
+  try { singleton?.close?.(); } catch { /* database may already be closed */ }
   singleton = store;
 }

@@ -129,6 +129,24 @@ afterEach(async () => {
   await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
+describe('incognito durable session-store isolation', () => {
+  it('keeps private state live, preserves privacy across metadata rebuilds, and restores only normal records', async () => {
+    await fresh();
+    upsertSession(record('ordinary-session', { description: 'ordinary-store-sentinel' }));
+    upsertSession(record('private-session', { incognito: true, description: 'private-store-sentinel' }));
+    // Simulates a provider metadata rebuild that omits the privacy field.
+    upsertSession(record('private-session', { description: 'private-store-sentinel' }));
+    expect(getSession('private-session')?.incognito).toBe(true);
+    await flushStore();
+    const persisted = await persistedSessions(home);
+    expect(persisted['ordinary-session']).toBeDefined();
+    expect(persisted['private-session']).toBeUndefined();
+    await fresh();
+    expect(getSession('private-session')).toBeUndefined();
+    expect(getSession('ordinary-session')).toBeDefined();
+  });
+});
+
 describe('one-time migration from sessions.json', () => {
   it('imports a production-shaped store losslessly and freezes the file as a rollback export', async () => {
     const { text, expected } = productionShapedFile(300);

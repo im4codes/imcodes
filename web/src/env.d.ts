@@ -2,12 +2,13 @@ declare const __BUILD_TIME__: string;
 declare const __WEB_BUILD_ID__: string;
 
 /**
- * Compile-time push channel selector, set by vite.config.ts based on the
- * VITE_REGION env var. 'china' triggers the JPush registration path on
- * Android; 'global' uses FCM via @capacitor/push-notifications. iOS ignores
- * this entirely and always uses APNs.
+ * Compile-time push configuration macros injected by vite.config.ts.
+ * `__PUSH_FCM__` enables Android FCM registration (false for the pure without-fcm build).
+ * `__PUSH_REGION__` is retained for inline test/build harness compatibility.
+ * iOS ignores both and always uses APNs.
  */
 declare const __PUSH_REGION__: 'china' | 'global';
+declare const __PUSH_FCM__: boolean;
 
 // Vite ?url suffix — returns the asset URL as a string
 declare module '*?url' {

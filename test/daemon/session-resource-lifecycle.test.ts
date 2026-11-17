@@ -52,6 +52,45 @@ describe('session resource lifecycle', () => {
     expect(cleanup).toHaveBeenCalledTimes(4);
   });
 
+  it.each(['owner', 'kinds', 'legacy', 'prefixes', 'orphan'] as const)(
+    '%s cleanup stops every MCP supervisor before any backend', async (entry) => {
+      const { registry, cleanup } = await fixture();
+      for (const epoch of ['a', 'b']) {
+        for (const prefix of ['mcp-backend', 'mcp-bootstrap']) {
+          await registry.register({ resourceId: `${prefix}:${epoch}:501`, kind: 'mcp',
+            owner: owner(), handle: { type: 'pid', pid: 501 } });
+        }
+      }
+      if (entry === 'owner') await registry.releaseOwner(owner(), 'session_completed');
+      if (entry === 'kinds') await registry.releaseOwnerKinds(owner(), ['mcp'], 'session_completed', PROVIDER_HOSTED_RELEASE.REAP_ALL_EPOCHS);
+      if (entry === 'legacy') await registry.releaseSessionName(owner().sessionName, 'session_completed');
+      if (entry === 'prefixes') await registry.releaseResourceIdPrefixes(['mcp-'], 'session_completed');
+      if (entry === 'orphan') await registry.sweepOrphans([]);
+      expect(cleanup.mock.calls.map(([r]) => r.resourceId)).toEqual([
+        'mcp-bootstrap:a:501', 'mcp-bootstrap:b:501', 'mcp-backend:a:501', 'mcp-backend:b:501',
+      ]);
+    },
+  );
+
+  it("preserves only a failed supervisor's workers and allows a later retry", async () => {
+    const { registry, cleanup } = await fixture();
+    for (const who of [owner(), owner('independent')]) {
+      for (const prefix of ['mcp-backend', 'mcp-bootstrap']) {
+        await registry.register({ resourceId: `${prefix}:${who.sessionInstanceId}:501`, kind: 'mcp',
+          owner: who, handle: { type: 'pid', pid: 501 } });
+      }
+    }
+    cleanup.mockImplementation(async (record) => {
+      if (record.resourceId === 'mcp-bootstrap:instance-a:501') throw new Error('signal denied');
+    });
+    expect(await registry.releaseSessionName(owner().sessionName, 'session_completed')).toEqual({ released: 2, failed: 2 });
+    expect(cleanup.mock.calls.some(([r]) => r.resourceId === 'mcp-backend:instance-a:501')).toBe(false);
+    expect(await registry.list()).toHaveLength(2);
+    cleanup.mockImplementation(async () => {});
+    expect(await registry.releaseOwner(owner(), 'session_completed')).toEqual({ released: 2, failed: 0 });
+    expect(await registry.list()).toEqual([]);
+  });
+
   it('releases legacy rows by exact session name when the persisted owner tuple is missing', async () => {
     const { registry, cleanup } = await fixture();
     const legacyOwner = { sessionName: owner().sessionName, sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch' };

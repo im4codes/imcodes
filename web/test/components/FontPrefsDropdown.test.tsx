@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
-import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   applyGlobalFontPrefs,
@@ -45,17 +45,77 @@ describe('FontPrefsDropdown', () => {
     vi.useRealTimers();
   });
 
-  it('updates font size on pointer down so Android taps do not depend on synthetic click', () => {
+  it.each(['mouse', 'touch'])('counts a %s press across the old timer boundary only at activation', (pointerType) => {
+    vi.useFakeTimers();
     const onChange = vi.fn();
-    const prefs = { ...DEFAULT_CHAT_FONT, size: 14 };
-
-    render(<FontPrefsDropdown prefs={prefs} onChange={onChange} />);
-
+    function Harness() {
+      const [prefs, update] = useFontPrefs('activation', DEFAULT_CHAT_FONT);
+      return <FontPrefsDropdown prefs={prefs} onChange={next => { onChange(next); update(next); }} />;
+    }
+    render(<Harness />);
     fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
-    fireEvent.pointerDown(screen.getByRole('button', { name: '+' }), { pointerId: 1, pointerType: 'touch' });
+    const plus = screen.getByRole('button', { name: '+' });
+    fireEvent.pointerDown(plus, { pointerId: 1, pointerType });
+    act(() => { vi.advanceTimersByTime(1); });
+    fireEvent.pointerUp(plus, { pointerId: 1, pointerType });
+    fireEvent.click(plus);
+    expect(onChange.mock.calls.map(([prefs]) => prefs.size)).toEqual([15]);
+    expect(readFontPrefs('activation', DEFAULT_CHAT_FONT).size).toBe(15);
+  });
 
-    expect(onChange).toHaveBeenCalledTimes(1);
-    expect(onChange).toHaveBeenCalledWith({ ...prefs, size: 15 });
+  it('does not commit a cancelled press and the next click still works', () => {
+    const onChange = vi.fn();
+    render(<FontPrefsDropdown prefs={DEFAULT_CHAT_FONT} onChange={onChange} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    const plus = screen.getByRole('button', { name: '+' });
+    fireEvent.pointerDown(plus, { pointerId: 1 });
+    fireEvent.pointerCancel(plus, { pointerId: 1 });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.click(plus);
+    expect(onChange).toHaveBeenCalledExactlyOnceWith({ ...DEFAULT_CHAT_FONT, size: 15 });
+  });
+
+  it('advances rapid activations against the pending value, clamps, and takes new props', () => {
+    const onChange = vi.fn();
+    const { rerender } = render(<FontPrefsDropdown prefs={DEFAULT_CHAT_FONT} onChange={onChange} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    const plus = screen.getByRole('button', { name: '+' });
+    const minus = screen.getByRole('button', { name: '−' });
+    act(() => { plus.click(); plus.click(); minus.click(); plus.click(); });
+    expect(onChange.mock.calls.map(([prefs]) => prefs.size)).toEqual([15, 16, 15, 16]);
+    rerender(<FontPrefsDropdown prefs={{ ...DEFAULT_CHAT_FONT, size: 23 }} onChange={onChange} />);
+    act(() => { plus.click(); plus.click(); });
+    expect(onChange.mock.calls.map(([prefs]) => prefs.size)).toEqual([15, 16, 15, 16, 24]);
+    rerender(<FontPrefsDropdown prefs={{ ...DEFAULT_CHAT_FONT, size: 10 }} onChange={onChange} />);
+    expect((minus as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(plus);
+    expect(onChange.mock.calls.at(-1)?.[0].size).toBe(11);
+  });
+
+  it('syncs same-scope values without another increment and isolates another scope', () => {
+    function Harness({ scope, id }: { scope: string; id: string }) {
+      const [prefs, update] = useFontPrefs(scope, DEFAULT_CHAT_FONT);
+      return <section data-testid={id}><output>{prefs.size}</output><FontPrefsDropdown prefs={prefs} onChange={update} /></section>;
+    }
+    render(<><Harness scope="sync" id="main" /><Harness scope="sync" id="sub" /><Harness scope="other" id="other" /></>);
+    const main = screen.getByTestId('main');
+    fireEvent.click(main.querySelector('button')!);
+    fireEvent.click(main.querySelector('button[aria-label="+"]')!);
+    expect(main.querySelector('output')?.textContent).toBe('15');
+    expect(screen.getByTestId('sub').querySelector('output')?.textContent).toBe('15');
+    expect(screen.getByTestId('other').querySelector('output')?.textContent).toBe('14');
+    expect(readFontPrefs('sync', DEFAULT_CHAT_FONT).size).toBe(15);
+  });
+
+  it('keeps click activation safe when storage is unavailable and legacy prefs are absent', () => {
+    const setItem = vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    const onChange = vi.fn();
+    render(<FontPrefsDropdown prefs={readFontPrefs('missing', DEFAULT_CHAT_FONT)} onChange={onChange} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    fireEvent.click(screen.getByRole('button', { name: '+' }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith({ ...DEFAULT_CHAT_FONT, size: 15 });
+    expect(readFontPrefs('missing', DEFAULT_CHAT_FONT)).toEqual(DEFAULT_CHAT_FONT);
+    setItem.mockRestore();
   });
 
   it('keeps click as a fallback for non-pointer environments', () => {

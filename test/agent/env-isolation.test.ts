@@ -56,4 +56,26 @@ describe('Claude SDK environment isolation', () => {
     expect(env).not.toHaveProperty('OPENAI_API_KEY');
     expect(env).not.toHaveProperty('RANDOM_SECRET');
   });
+
+  it('preserves CLAUDE_CODE_OAUTH_TOKEN from explicit route env and CLAUDE_CONFIG_DIR across host/session config', () => {
+    const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = '/tmp/host-claude-config';
+    try {
+      const fromHost = buildClaudeAgentEnv({
+        CLAUDE_CODE_OAUTH_TOKEN: 'explicit-oauth-fixture',
+        OPENAI_API_KEY: 'must-not-cross-provider',
+      });
+      expect(fromHost.CLAUDE_CODE_OAUTH_TOKEN).toBe('explicit-oauth-fixture');
+      expect(fromHost.CLAUDE_CONFIG_DIR).toBe('/tmp/host-claude-config');
+      expect(fromHost).not.toHaveProperty('OPENAI_API_KEY');
+
+      const overridden = buildClaudeAgentEnv({
+        CLAUDE_CONFIG_DIR: '/tmp/session-claude-config',
+      });
+      expect(overridden.CLAUDE_CONFIG_DIR).toBe('/tmp/session-claude-config');
+    } finally {
+      if (prevConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prevConfigDir;
+    }
+  });
 });

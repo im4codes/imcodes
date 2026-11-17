@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, win32 as win32Path } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import {
   CONTROLLED_NODE_SERVICE,
@@ -283,10 +283,11 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(windowsCredentialDir({ ProgramData: 'C:\\ProgramData' })).not.toMatch(/Users/i);
   });
 
-  it('Windows credential ACL grants only SYSTEM + Administrators and strips inheritance (10.10)', () => {
+  it('Windows credential ACL strips unauthorized explicit ACEs, grants only SYSTEM + Administrators, and removes inheritance (10.10)', async () => {
     const dir = 'C:\\ProgramData\\imcodes-node';
     const commands = windowsCredentialAclCommands(dir);
     expect(commands).toEqual([
+      [dir, '/reset'],
       [dir, '/grant:r', '*S-1-5-18:(OI)(CI)F'],
       [dir, '/grant:r', '*S-1-5-32-544:(OI)(CI)F'],
       [dir, '/inheritance:r'],
@@ -302,6 +303,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(joined).not.toMatch(/Authenticated Users/i);
     const exeCommands = windowsExecutableFileAclCommands(`${dir}\\imcodes-node.exe`);
     expect(exeCommands).toEqual([
+      [`${dir}\\imcodes-node.exe`, '/reset'],
       [`${dir}\\imcodes-node.exe`, '/grant:r', '*S-1-5-18:F'],
       [`${dir}\\imcodes-node.exe`, '/grant:r', '*S-1-5-32-544:F'],
       [`${dir}\\imcodes-node.exe`, '/grant:r', '*S-1-5-11:RX'],
@@ -309,6 +311,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       [`${dir}\\imcodes-node.exe`, '/setowner', '*S-1-5-18'],
     ]);
     expect(windowsComputerUseHelperAclCommands(`${dir}\\computer-use-helper`)).toEqual([
+      [`${dir}\\computer-use-helper`, '/reset'],
       [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-18:(OI)(CI)F'],
       [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-32-544:(OI)(CI)F'],
       [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-11:(OI)(CI)RX'],
@@ -318,6 +321,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
 
     const fileCommands = windowsSecretFileAclCommands(`${dir}\\credential.json`);
     expect(fileCommands).toEqual([
+      [`${dir}\\credential.json`, '/reset'],
       [`${dir}\\credential.json`, '/grant:r', '*S-1-5-18:F'],
       [`${dir}\\credential.json`, '/grant:r', '*S-1-5-32-544:F'],
       [`${dir}\\credential.json`, '/inheritance:r'],
@@ -326,13 +330,31 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(fileCommands.flat().join(' ')).not.toMatch(/\bUsers:/);
   });
 
-  it('runs each Windows ACL operation as its own icacls process', () => {
+  it('runs each Windows ACL operation as its own icacls process and re-secures existing secret files', async () => {
     const calls: Array<{ file: string; args: readonly string[] }> = [];
     const commands = windowsCredentialAclCommands('C:\\ProgramData\\imcodes-node');
     applyWindowsAclCommands(commands, (file, args) => calls.push({ file, args }));
 
     expect(calls).toEqual(commands.map((args) => ({ file: 'icacls', args })));
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(5);
+
+    const repairDir = await mkdtemp(join(tmpdir(), 'imcodes-win-acl-dir-'));
+    try {
+      const repairCalls: Array<{ file: string; args: readonly string[] }> = [];
+      const { secureWindowsCredentialDir } = await import('../../src/node/installer.js');
+      const credFilePath = win32Path.join(repairDir, 'credential.json');
+      const identityFilePath = win32Path.join(repairDir, 'install-identity.json');
+      await secureWindowsCredentialDir(repairDir, {
+        platform: 'win32',
+        runCommand: (file, args) => repairCalls.push({ file, args }),
+        pathExists: async (filePath) => filePath === credFilePath,
+      });
+      expect(repairCalls.some((c) => c.args[0] === repairDir && c.args[1] === '/reset')).toBe(true);
+      expect(repairCalls.some((c) => c.args[0] === credFilePath && c.args[1] === '/reset')).toBe(true);
+      expect(repairCalls.some((c) => c.args[0] === identityFilePath)).toBe(false);
+    } finally {
+      await rm(repairDir, { recursive: true, force: true });
+    }
   });
 
   it('Windows reinstall terminates the resident task generation before starting the new bytes', async () => {

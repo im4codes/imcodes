@@ -12,6 +12,7 @@
  * the only way to show the transaction actually holds.
  */
 import { getTaskPairStore } from './task-pairs/store.js';
+import { buildDependencyTitleRecord } from '../../shared/task-pair-display.js';
 import {
   buildPairConsoleRow,
   computePairQueuePositions,
@@ -965,15 +966,21 @@ export class SupervisionConsoleProducer {
   ): { tasks: SupervisionTaskConsoleTaskRow[]; assignments: SupervisionTaskConsoleAssignmentRow[]; entries: SupervisionTaskConsolePairUpsert[] } {
     const inlineBrief = options.inlineBrief !== false;
     const pairs = getTaskPairStore().listPairs(projectName);
+    const pairById = new Map(pairs.map((p) => [p.state.taskId, p.state] as const));
     const queuePositions = computePairQueuePositions(pairs);
     const tasks: SupervisionTaskConsoleTaskRow[] = [];
     const assignments: SupervisionTaskConsoleAssignmentRow[] = [];
     const entries: SupervisionTaskConsolePairUpsert[] = [];
     for (const stored of pairs) {
+      const rawRequest = getTaskPairStore().latestDecisionRequest(projectName, stored.state.taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1);
+      const activeRequest = (rawRequest && !getTaskPairStore().isDecisionResolved(rawRequest)) ? rawRequest : undefined;
       const entry = buildPairConsoleRow(stored, {
         inlineBrief,
+        latestDecision: getTaskPairStore().latestDecision(projectName, stored.state.taskId),
+        decisionRequest: activeRequest,
         queuePosition: queuePositions.get(stored.state.taskId),
         resolvePresentation: this.#resolveSessionPresentation,
+        dependencyTitles: buildDependencyTitleRecord(stored.state.scheduling?.dependsOn, (id) => pairById.get(id) ?? getTaskPairStore().getPair(projectName, id)?.state),
       });
       entries.push(entry);
       tasks.push(entry.task);
@@ -1064,10 +1071,15 @@ export class SupervisionConsoleProducer {
           if (view.rows.has(taskId)) removes.push(taskId);
           continue;
         }
+        const rawRequest = store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1);
+        const activeRequest = (rawRequest && !store.isDecisionResolved(rawRequest)) ? rawRequest : undefined;
         const upsert = buildPairConsoleRow(stored, {
           inlineBrief: false,
+          latestDecision: store.latestDecision(scope.projectName, taskId),
+          decisionRequest: activeRequest,
           queuePosition: queuePositions.get(taskId),
           resolvePresentation: this.#resolveSessionPresentation,
+          dependencyTitles: buildDependencyTitleRecord(stored.state.scheduling?.dependsOn, (id) => store.getPair(scope.projectName, id)?.state),
         });
         const json = pairRowJson(upsert);
         const previous = view.rows.get(taskId);
@@ -1111,7 +1123,9 @@ export class SupervisionConsoleProducer {
     if (pairDelta && this.#showsPairs(scope.projectName)) {
       return this.#withAssignmentPass(() => this.#buildSnapshotParts(scope, cursor, true));
     }
-    const now = Date.now();
+    // TTL comparisons must use a monotonic clock. Wall-clock adjustments on a
+    // busy runner can make an otherwise fresh snapshot appear expired.
+    const now = this.#monotonicNowMs();
     const dataVersion = this.#readDataVersion();
     const cached = this.#snapshotCache.get(key);
     if (cached

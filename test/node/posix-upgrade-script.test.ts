@@ -330,14 +330,55 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
     expect(await elapsedVirtual(rig)).toBeGreaterThanOrEqual(CONTROLLED_NODE_LINUX_WATCHDOG_SURVIVAL_MS / 1000);
   });
 
-  it('a Linux target that publishes the liveness lease but is never acknowledged is NOT accepted by survival: it is rolled back at the cap', async () => {
-    // A current node feeds the watchdog while the server is unreachable, so outliving the watchdog proves nothing about
-    // authentication any more: only the authenticated lease does.
-    const { rig, script } = await scenario({ newNode: marker('liveonly') });
+  it('an offline Linux or macOS node that keeps renewing its liveness lease succeeds after the base window instead of rolling back', async () => {
+    for (const platform of ['linux', 'darwin'] as const) {
+      const { rig, script, staged } = await scenario({
+        newNode: marker('liveonly'),
+        platform,
+        extra: platform === 'darwin' ? { serviceDefinitionPaths: [] } : {},
+      });
+      const { code, stderr } = await run(rig, script, { scale: 10 });
+      expect(code, stderr).toBe(0);
+      expect(await text(rig.dst)).toBe(staged);
+      expect(await readResult(rig)).toMatchObject({ status: S.SUCCESS });
+      expect(await elapsedVirtual(rig)).toBeGreaterThanOrEqual(H.BASE_WINDOW_MS / 1000);
+    }
+  });
+
+  it('a node that writes liveness once at startup and freezes without renewing still rolls back at the hard cap', async () => {
+    const { rig, script } = await scenario({ newNode: marker('liveonce') });
     const oldBytes = await text(rig.dst);
     await run(rig, script, { scale: HARD_CAP_SCALE });
     expect(await hardCapViolations(rig, oldBytes)).toEqual([]);
     expect(await readResult(rig)).toMatchObject({ status: S.ROLLED_BACK });
+  });
+
+  it('an OS sleep/suspend wall-clock jump during the upgrade health wait does not immediately trigger fail_hard_cap', async () => {
+    const { rig, script, staged } = await scenario({ newNode: marker('healthy', 1900) });
+    // After the new node starts, the first poll sees a 30-minute (+1800s > HARD_CAP_MS) wall-clock jump (sleep)
+    // BEFORE the lease appears at virtual el=1900s: active elapsed clamps the jump instead of hitting fail_hard_cap.
+    await writeFile(
+      join(rig.bin, 'sleep'),
+      [
+        '#!/bin/sh',
+        'now=$(cat "$FAKE/clock")',
+        'if [ -f "$FAKE/started_at" ] && [ ! -f "$FAKE/sleep_jumped" ] && grep -q "lease_at=1900" "$DST"; then',
+        '  touch "$FAKE/sleep_jumped"',
+        '  now=$((now + 1800))',
+        'else',
+        '  now=$((now + $1 * ${FAKE_SLEEP_SCALE:-1}))',
+        'fi',
+        'echo "$now" > "$FAKE/clock"',
+        'if [ $((now - 1800000000)) -gt 7200 ]; then echo runaway > "$FAKE/runaway"; kill -KILL "$PPID"; fi',
+        'exit 0',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const { code, stderr } = await run(rig, script, { scale: 10 });
+    expect(code, stderr).toBe(0);
+    expect(await text(rig.dst)).toBe(staged);
+    expect(await readResult(rig)).toMatchObject({ status: S.SUCCESS });
   });
 
   it('the macOS script has no lease-less shortcut: an alive node that never authenticates is rolled back at the cap', async () => {

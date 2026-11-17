@@ -84,6 +84,28 @@ describe('styles.css regression contracts', () => {
     : '';
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('retains blocked-window dismissal styles without removed install UI styles', () => {
+    expect(css).toContain('.remote-desktop-window-blocked {');
+    expect(css).toContain('.remote-desktop-window-blocked-dismiss {');
+    expect(css).not.toContain('.remote-desktop-install-entry');
+    expect(css).not.toContain('.remote-desktop-install-guide');
+    expect(css).not.toContain('.remote-desktop-window-blocked-install');
+  });
+
+  it('keeps compact decision copy a native five-line scrollport and contains only overflowing copy', () => {
+    const text = css.match(/\.task-pair-decision-copy \.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
+    expect(text).toMatch(/overflow-y:\s*auto/);
+    expect(text).toMatch(/user-select:\s*text/);
+    const compact = css.match(/\.task-pair-decision-copy \.expandable-task-objective-text\.is-measuring-clamped\s*\{[^}]*\}/)?.[0];
+    expect(compact).toMatch(/display:\s*block/);
+    expect(compact).toMatch(/max-height:\s*7\.5em/);
+    expect(compact).toMatch(/min-height:\s*0/);
+    expect(compact).toMatch(/-webkit-line-clamp:\s*unset/);
+    const contained = css.match(/\.task-pair-decision-copy\[data-objective-overflow="true"\] \.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
+    expect(contained).toMatch(/overscroll-behavior-y:\s*contain/);
+    expect(css).not.toMatch(/\.task-pair-decision-copy \.expandable-task-objective-text\s*\{[^}]*overscroll-behavior[^}]*contain/);
+  });
+
   it('keeps the desktop rail exactly one bottom card wide and its vertical cards compact and scrollable', () => {
     const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
     expect(rootRule).toMatch(/--subsession-compact-card-width:\s*54px/);
@@ -132,9 +154,63 @@ describe('styles.css regression contracts', () => {
     expect(cssWithoutComments).not.toMatch(/\.subsession-vertical-rail-host\s*\{[^}]*(?:136px|148px)/);
   });
 
+  it('floats compact sub-session sequence badges at bottom-left without increasing card height', () => {
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card\.has-seq[^{]*\{[^}]*(?:min-height|padding)/);
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card-rail\.has-seq[^{]*\{[^}]*(?:min-height|padding)/);
+    const cardRule = cssWithoutComments.match(/\.subsession-card\s*\{[^}]*\}/)?.[0];
+    expect(cardRule).toMatch(/overflow:\s*visible/);
+    const seqRule = cssWithoutComments.match(/\.subsession-card-seq\s*\{[^}]*\}/)?.[0];
+    expect(seqRule).toBeTruthy();
+    expect(seqRule).toMatch(/position:\s*absolute/);
+    expect(seqRule).toMatch(/bottom:\s*-4px/);
+    expect(seqRule).toMatch(/left:\s*-3px/);
+    expect(seqRule).toMatch(/pointer-events:\s*none/);
+  });
+
+  it('floats the compact Team T subscript at bottom-right symmetrically with seq without increasing card height', () => {
+    const teamRule = cssWithoutComments.match(/\.subsession-card-team\s*\{[^}]*\}/)?.[0];
+    expect(teamRule).toBeTruthy();
+    expect(teamRule).toMatch(/position:\s*absolute/);
+    expect(teamRule).toMatch(/bottom:\s*-4px/);
+    expect(teamRule).toMatch(/right:\s*-3px/);
+    expect(teamRule).toMatch(/font-size:\s*9px/);
+    expect(teamRule).toMatch(/font-weight:\s*700/);
+    expect(teamRule).toMatch(/line-height:\s*1/);
+    expect(teamRule).toMatch(/z-index:\s*3/);
+    expect(teamRule).toMatch(/pointer-events:\s*none/);
+    expect(teamRule).toMatch(/box-sizing:\s*border-box/);
+    expect(teamRule).toMatch(/color:\s*#dbeafe/);
+    expect(teamRule).toMatch(/background:/);
+
+    // Must not collide with top-right share indicator or alter desktop/rail/mobile card height or padding
+    const shareRule = cssWithoutComments.match(/\.subsession-card\s*>\s*\.share-state-indicator\s*\{[^}]*\}/)?.[0];
+    expect(shareRule).toMatch(/top:\s*2px/);
+    expect(shareRule).toMatch(/right:\s*2px/);
+
+    const bottomCardRule = cssWithoutComments.match(/\.subsession-card\s*\{[^}]*\}/)?.[0];
+    expect(bottomCardRule).toMatch(/min-height:\s*54px/);
+    expect(bottomCardRule).toMatch(/padding:\s*6px\s+2px\s+9px/);
+
+    const railCardRule = cssWithoutComments.match(/\.subsession-card-rail\s*\{[^}]*\}/)?.[0];
+    expect(railCardRule).toMatch(/min-height:\s*48px/);
+    expect(railCardRule).toMatch(/padding:\s*4px\s+1px\s+5px/);
+
+    const mobileBottomCardRule = cssWithoutComments.match(
+      /@media\s*\(max-width:\s*640px\)\s*\{\s*\.subsession-card:not\(\.subsession-card-rail\)\s*\{[^}]*\}/,
+    )?.[0];
+    expect(mobileBottomCardRule).toMatch(/min-height:\s*42px/);
+    expect(mobileBottomCardRule).toMatch(/padding:\s*2px\s+1px/);
+
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card\.(?:has-team|in-p2p|team)[^{]*\{[^}]*(?:min-height|padding|height)/);
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card-rail\.(?:has-team|in-p2p|team)[^{]*\{[^}]*(?:min-height|padding|height)/);
+    expect(teamRule).not.toMatch(/(?:^|[;\s{])(?:min-)?height:/);
+    // Keep non-button .p2p-tag style intact for cards/tabs/dialogs
+    expect(cssWithoutComments).toMatch(/\.p2p-tag\s*\{/);
+  });
+
   it('keeps the Team discussion rail narrow, in root flex flow, and independently scrollable', () => {
     const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
-    expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*17vw,\s*220px\)/);
+    expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*calc\(var\(--imcodes-ui-vw, 100vw\) \* 0\.17\),\s*220px\)/);
 
     const hostRule = cssWithoutComments.match(/\.team-discussion-rail-host\s*\{[^}]*\}/)?.[0];
     expect(hostRule).toMatch(/display:\s*flex/);
@@ -271,11 +347,11 @@ describe('styles.css regression contracts', () => {
   it('uses half the desktop viewport and full mobile width for pinned-message previews', () => {
     const previewRule = css.match(/\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
     expect(previewRule).toBeTruthy();
-    expect(previewRule).toMatch(/width:\s*min\(50vw,\s*calc\(100vw - 24px\)\)/);
+    expect(previewRule).toMatch(/width:\s*min\(calc\(var\(--imcodes-ui-vw, 100vw\) \* 0\.5\),\s*calc\(var\(--imcodes-ui-vw, 100vw\) - 24px\)\)/);
 
     const mobileRule = css.match(/@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
     expect(mobileRule).toBeTruthy();
-    expect(mobileRule).toMatch(/width:\s*calc\(100vw - 16px\)/);
+    expect(mobileRule).toMatch(/width:\s*calc\(var\(--imcodes-ui-vw, 100vw\) - 16px\)/);
 
     const mobileActionsRule = css.match(/@media\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview \.zoom-text-actions\s*\{[^}]*\}/)?.[0];
     expect(mobileActionsRule).toBeTruthy();
@@ -642,7 +718,7 @@ describe('styles.css regression contracts', () => {
     const mobileP2pRule = css.match(/\.menu-dropdown-p2p\s*\{[^}]*position:\s*fixed[^}]*\}/);
     expect(mobileP2pRule).not.toBeNull();
     expect(mobileP2pRule![0]).toMatch(/z-index:\s*2147483646/);
-    expect(mobileP2pRule![0]).toMatch(/max-height:\s*min\(72vh,\s*calc\(var\(--vvh,\s*100dvh\)/);
+    expect(mobileP2pRule![0]).toMatch(/max-height:\s*min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.72\),\s*calc\(var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)/);
     expect(mobileP2pRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
@@ -791,7 +867,7 @@ describe('styles.css regression contracts', () => {
 
     const panelRule = css.match(/\.daemon-details-panel\s*\{[^}]*\}/);
     expect(panelRule).not.toBeNull();
-    expect(panelRule![0]).toMatch(/max-height:\s*min\(82dvh,\s*680px\)/);
+    expect(panelRule![0]).toMatch(/max-height:\s*min\(calc\(var\(--imcodes-ui-dvh\) \* 0\.82\),\s*680px\)/);
     expect(panelRule![0]).toMatch(/overflow:\s*auto/);
 
     const triggerRule = css.match(/\.daemon-stats-trigger\s*\{[^}]*\}/);
@@ -870,12 +946,12 @@ describe('styles.css regression contracts', () => {
     const mobileRule = inlineRules.find((rule) => /position:\s*fixed/.test(rule));
     expect(mobileRule).toBeTruthy();
     expect(mobileRule!).toMatch(/top:\s*var\(--sat,\s*0px\)/);
-    expect(mobileRule!).toMatch(/height:\s*calc\(var\(--vvh,\s*100dvh\)/);
+    expect(mobileRule!).toMatch(/height:\s*calc\(var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)/);
     expect(mobileRule!).toMatch(/overflow:\s*hidden/);
 
     const autoLauncherRule = css.match(/\.menu-dropdown-openspec-inline \.openspec-auto-launcher\s*\{[^}]*\}/);
     expect(autoLauncherRule).not.toBeNull();
-    expect(autoLauncherRule![0]).toMatch(/max-height:\s*min\(58vh/);
+    expect(autoLauncherRule![0]).toMatch(/max-height:\s*min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.58\)/);
     expect(autoLauncherRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
@@ -936,13 +1012,13 @@ describe('styles.css regression contracts', () => {
   it('fullscreen HTML preview must be clamped to the browser viewport', () => {
     const overlayRule = css.match(/\.html-fullscreen-preview\s*\{[^}]*\}/);
     expect(overlayRule).not.toBeNull();
-    expect(overlayRule![0]).toMatch(/width:\s*100vw/);
-    expect(overlayRule![0]).toMatch(/max-width:\s*100vw/);
+    expect(overlayRule![0]).toMatch(/width:\s*var\(--imcodes-ui-vw, 100vw\)/);
+    expect(overlayRule![0]).toMatch(/max-width:\s*var\(--imcodes-ui-vw, 100vw\)/);
     expect(overlayRule![0]).toMatch(/overflow:\s*hidden/);
 
     const bodyRule = css.match(/\.html-fullscreen-preview-body\s*\{[^}]*\}/);
     expect(bodyRule).not.toBeNull();
-    expect(bodyRule![0]).toMatch(/max-width:\s*100vw/);
+    expect(bodyRule![0]).toMatch(/max-width:\s*var\(--imcodes-ui-vw, 100vw\)/);
     expect(bodyRule![0]).toMatch(/min-width:\s*0/);
 
     const iframeRule = css.match(/\.html-safe-preview-frame\s*\{[^}]*\}/);
@@ -993,11 +1069,22 @@ describe('styles.css regression contracts', () => {
 
     const menuRule = css.match(/\.mobile-server-menu\s*\{[^}]*\}/);
     expect(menuRule).not.toBeNull();
-    expect(menuRule![0]).toMatch(/display:\s*grid/);
-    expect(menuRule![0]).toMatch(/grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
-    expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+    expect(menuRule![0]).toMatch(/display:\s*flex/);
+    const bodyRule = css.match(/\.mobile-server-menu-body\s*\{[^}]*\}/);
+    expect(bodyRule).not.toBeNull();
+    expect(bodyRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*var\(--imcodes-ui-dvh\)\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+    // Only the body scrolls; the language footer stays outside that scrollport.
+    expect(menuRule![0]).toMatch(/overflow-y:\s*hidden/);
+    expect(bodyRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(bodyRule![0]).toMatch(/min-height:\s*0/);
+    expect(bodyRule![0]).toMatch(/overflow-y:\s*auto/);
+    expect(bodyRule![0]).toMatch(/overscroll-behavior:\s*contain/);
+    const languageRule = css.match(/\.mobile-server-menu-language\s*\{[^}]*\}/);
+    expect(languageRule).not.toBeNull();
+    expect(languageRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
 
     const menuItemRule = css.match(/\.mobile-server-menu-item\s*\{[^}]*\}/);
     expect(menuItemRule).not.toBeNull();
@@ -1018,23 +1105,36 @@ describe('styles.css regression contracts', () => {
     expect(menuNameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
     expect(menuNameRule![0]).toMatch(/white-space:\s*nowrap/);
 
-    const wideMenuRule = css.match(/@media\s*\(min-width:\s*380px\)\s*\{\s*\.mobile-server-menu\s*\{[^}]*\}\s*\}/);
-    expect(wideMenuRule).not.toBeNull();
-    expect(wideMenuRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    expect(bodyRule![0]).toMatch(/grid-auto-rows:\s*max-content/);
+    expect(bodyRule![0]).toMatch(/align-content:\s*start/);
+    expect(bodyRule![0]).toMatch(/overflow-y:\s*auto/);
+    expect(sharedEntriesRule![0]).toMatch(/overflow:\s*visible/);
+    const sharedGrid = css.match(/\.mobile-server-menu-shared \.shared-entries-list\s*\{[^}]*\}/);
+    expect(sharedGrid?.[0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    expect(sharedGrid?.[0]).toMatch(/max-height:\s*none/);
+    expect(sharedGrid?.[0]).toMatch(/overflow:\s*visible/);
 
     const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
     expect(app).toContain('mobile-server-menu-server');
-    expect(app).toContain('mobile-server-menu-language');
+    expect(app).toContain('footer={<><LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle /></>}');
     expect(app).toContain('server-item-pin');
-    expect(app).toContain('mobile-server-menu-pin');
+    expect(app).not.toContain('mobile-server-menu-pin');
+    expect(app).toContain("? ' pinned'");
     expect(app).toContain('pinnedServerIds');
 
     const serverPinRule = css.match(/\.server-item-pin\s*\{[^}]*\}/);
     expect(serverPinRule).not.toBeNull();
     expect(serverPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
-    const menuPinRule = css.match(/\.mobile-server-menu-pin\s*\{[^}]*\}/);
-    expect(menuPinRule).not.toBeNull();
-    expect(menuPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
+    const mobilePinnedRule = css.match(/\.mobile-server-menu-server\.pinned\s*\{[^}]*\}/);
+    expect(mobilePinnedRule).not.toBeNull();
+    expect(mobilePinnedRule![0]).toMatch(/position:\s*relative/);
+    expect(mobilePinnedRule![0]).toMatch(/box-shadow:\s*inset\s+2px\s+0\s+0/);
+    expect(mobilePinnedRule![0]).not.toMatch(/border:/);
+    expect(mobilePinnedRule![0]).toMatch(/rgb\(74 222 128/);
+    const mobilePinnedLineRule = css.match(/\.mobile-server-menu-server\.pinned::after\s*\{[^}]*\}/);
+    expect(mobilePinnedLineRule).not.toBeNull();
+    expect(mobilePinnedLineRule![0]).toMatch(/height:\s*1px/);
+    expect(mobilePinnedLineRule![0]).toMatch(/linear-gradient/);
     const iconPinRule = css.match(/\.server-icon-pin\s*\{[^}]*\}/);
     expect(iconPinRule).not.toBeNull();
     expect(iconPinRule![0]).toMatch(/position:\s*absolute/);
@@ -1087,7 +1187,7 @@ describe('styles.css regression contracts', () => {
   it('session creation dialogs cannot exceed narrow mobile viewports', () => {
     const dialogRule = css.match(/\.dialog\s*\{[^}]*\}/);
     expect(dialogRule).not.toBeNull();
-    expect(dialogRule![0]).toMatch(/max-width:\s*calc\(100vw - env\(safe-area-inset-left/);
+    expect(dialogRule![0]).toMatch(/max-width:\s*calc\(var\(--imcodes-ui-vw, 100vw\) - env\(safe-area-inset-left/);
     expect(dialogRule![0]).toMatch(/min-width:\s*0/);
     expect(dialogRule![0]).toMatch(/box-sizing:\s*border-box/);
 
@@ -1095,7 +1195,7 @@ describe('styles.css regression contracts', () => {
     const subSessionDialog = readFileSync(resolve(__dirname, '../src/components/StartSubSessionDialog.tsx'), 'utf8');
     for (const source of [newSessionDialog, subSessionDialog]) {
       expect(source).toContain('responsiveDialogStyle');
-      expect(source).toContain('calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)');
+      expect(source).toContain('calc(var(--imcodes-ui-vw, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)');
       expect(source).toContain('boxSizing');
       expect(source).toContain('overflowWrap');
       expect(source).not.toContain('style={{ width: "100%", maxWidth: 380 }}');
@@ -1146,6 +1246,33 @@ describe('styles.css regression contracts', () => {
     expect(rule, '.chat-tool-activity rule missing').toBeTruthy();
     expect(rule).toMatch(/width:\s*100%/);
     expect(rule).not.toMatch(/width:\s*fit-content/);
+  });
+
+  it('tool-activity child elements keep explicit compact font-size and line-height constraints', () => {
+    const lastNameRule = cssWithoutComments.match(/\.chat-tool-activity-last-name\s*\{[^}]*\}/)?.[0];
+    expect(lastNameRule, '.chat-tool-activity-last-name rule missing').toBeTruthy();
+    expect(lastNameRule).toMatch(/font-size:\s*10px/);
+    expect(lastNameRule).toMatch(/line-height:\s*1/);
+
+    const lastInputRule = cssWithoutComments.match(/\.chat-tool-activity-last-input\s*\{[^}]*\}/)?.[0];
+    expect(lastInputRule, '.chat-tool-activity-last-input rule missing').toBeTruthy();
+    expect(lastInputRule).toMatch(/font-size:\s*10px/);
+    expect(lastInputRule).toMatch(/line-height:\s*1/);
+
+    const timeRule = cssWithoutComments.match(/\.chat-tool-activity-time\s*\{[^}]*\}/)?.[0];
+    expect(timeRule, '.chat-tool-activity-time rule missing').toBeTruthy();
+    expect(timeRule).toMatch(/font-size:\s*10px/);
+    expect(timeRule).toMatch(/line-height:\s*1/);
+
+    const labelRule = cssWithoutComments.match(/\.chat-tool-activity-label\s*\{[^}]*\}/)?.[0];
+    expect(labelRule, '.chat-tool-activity-label rule missing').toBeTruthy();
+    expect(labelRule).toMatch(/font-size:\s*10px/);
+    expect(labelRule).toMatch(/line-height:\s*1/);
+
+    const iosRule = cssWithoutComments.match(/html\.native-ios-mac\s+\.chat-tool-activity(?:[^{]*)\{[^}]*\}/)?.[0];
+    expect(iosRule, 'html.native-ios-mac .chat-tool-activity rule missing').toBeTruthy();
+    expect(iosRule).toMatch(/font-size:\s*10px/);
+    expect(iosRule).toMatch(/line-height:\s*1/);
   });
   it('the collapsed tool fold must not carry a grid texture', () => {
     // User reported "多余的线" between messages twice. Root cause: the fold's
@@ -1239,13 +1366,12 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/@media\s*\(pointer:\s*coarse\)[\s\S]*?\.remote-desktop-footer\s*\{[\s\S]*?height:\s*44px;[\s\S]*?min-height:\s*44px;[\s\S]*?max-height:\s*44px;[\s\S]*?overflow-y:\s*auto/);
   });
 
-  it('keeps the touch hint dismiss action interactive without enabling the overlay itself', () => {
+  it('keeps the remote-desktop hint overlay non-interactive and display:none when hidden', () => {
     const hintRule = css.match(/\.remote-desktop-touch-hint\s*\{[^}]*\}/)?.[0];
+    expect(hintRule).toBeTruthy();
     expect(hintRule).toMatch(/pointer-events:\s*none/);
-    const dismissRule = css.match(/\.remote-desktop-touch-hint-dismiss\s*\{[^}]*\}/)?.[0];
-    expect(dismissRule).toBeTruthy();
-    expect(dismissRule).toMatch(/pointer-events:\s*auto/);
-    expect(dismissRule).toMatch(/white-space:\s*nowrap/);
+    expect(css).toMatch(/\.remote-desktop-touch-hint\[hidden\],[\s\S]*?\.remote-desktop-footer\[hidden\]\s*\{[^}]*display:\s*none/);
+    expect(css).not.toMatch(/\.remote-desktop-touch-hint-dismiss\b/);
   });
 
   it('keeps the mobile collapsed task strip in normal titlebar flow', () => {
@@ -1253,8 +1379,11 @@ describe('styles.css regression contracts', () => {
       /@media\s*\(max-width:\s*720px\)[\s\S]*?\.chat-titlebar > \.task-pair-status-panel\.is-mobile\.is-collapsed\s*\{([^}]*)\}/,
     )?.[1] ?? '';
     expect(mobileRule).toMatch(/margin:\s*0 0 0 auto/);
-    expect(mobileRule).toMatch(/max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
-    expect(css).toMatch(/@media\s*\(max-width:\s*350px\)[\s\S]*?max-width:\s*calc\(100% - var\(--chat-top-actions-reserve/);
+    // The titlebar already reserves the absolute actions. Deducting it again
+    // from the strip is the regression measured by task-pair-mobile-layout.
+    expect(mobileRule).toMatch(/max-width:\s*100%/);
+    expect(mobileRule).not.toMatch(/max-width:[^;]*--chat-top-actions-reserve/);
+    expect(mobileRule).toMatch(/flex:\s*0 0 auto/);
   });
 
   it('right-aligns the desktop collapsed task strip inside the reserved action area', () => {
@@ -1262,7 +1391,7 @@ describe('styles.css regression contracts', () => {
       /\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{([^}]*)\}/,
     )?.[1] ?? '';
     expect(desktopRule).toMatch(/margin:\s*0 0 0 auto/);
-    expect(desktopRule).toMatch(/max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
+    expect(desktopRule).toMatch(/max-width:\s*100%/);
     expect(css).toMatch(/\.chat-titlebar\s*\{[^}]*padding-right:\s*max\(8px, var\(--chat-top-actions-reserve/);
   });
 
@@ -1297,6 +1426,17 @@ describe('styles.css regression contracts', () => {
     expect(ringRule).toMatch(/-webkit-touch-callout:\s*none\s*!important/);
     expect(ringRule).toMatch(/-webkit-user-select:\s*none\s*!important/);
     expect(ringRule).toMatch(/-webkit-user-drag:\s*none/);
+  });
+
+  it('keeps the touch cursor handle inside the stage independently of its remote click point', () => {
+    const ring = css.match(/\.remote-desktop-touch-ring\s*\{[^}]*\}/)?.[0];
+    expect(ring).toBeTruthy();
+    expect(ring).toContain('--touch-ring-radius: 32px');
+    expect(ring).toMatch(/left:\s*clamp\(min\(var\(--touch-ring-radius\),\s*50%\),\s*var\(--touch-ring-x\)/);
+    expect(ring).toMatch(/top:\s*clamp\(min\(var\(--touch-ring-radius\),\s*50%\),\s*var\(--touch-ring-y\)/);
+    expect(ring).toMatch(/max\(50%,\s*calc\(100%\s*-\s*var\(--touch-ring-radius\)\)\)/);
+    expect(ring).toMatch(/width:\s*calc\(var\(--touch-ring-radius\)\s*\*\s*2\)/);
+    expect(ring).toMatch(/height:\s*calc\(var\(--touch-ring-radius\)\s*\*\s*2\)/);
   });
 
   // Transport sessions zero the toolbar's left padding, and they are the only
@@ -1486,5 +1626,255 @@ describe('styles.css regression contracts', () => {
     expect(bodyRule).toBeTruthy();
     expect(bodyRule).toMatch(/font-variant-ligatures:\s*none/);
     expect(bodyRule).toMatch(/font-feature-settings:\s*"calt"\s*0,\s*"liga"\s*0/);
+  });
+
+  it('disables mobile WebKit/Blink text autosizing at root html while preserving html.native-ios-mac 115% scaling and normal chat bubble sizes', () => {
+    const htmlMatch = cssWithoutComments.match(/(?:^|\n)html\s*\{[^}]*\}/);
+    const htmlRule = htmlMatch?.[0];
+    expect(htmlRule, 'base html rule missing').toBeTruthy();
+    expect(htmlRule).toMatch(/-webkit-text-size-adjust:\s*100%/);
+    expect(htmlRule).toMatch(/(?:^|[;\s])text-size-adjust:\s*100%/m);
+
+    const iosMacMatch = cssWithoutComments.match(/(?:^|\n)html\.native-ios-mac\s*\{[^}]*\}/);
+    const iosMacRule = iosMacMatch?.[0];
+    expect(iosMacRule, 'html.native-ios-mac scaling rule missing').toBeTruthy();
+    expect(iosMacRule).toMatch(/-webkit-text-size-adjust:\s*115%/);
+    expect(iosMacRule).toMatch(/(?:^|[;\s])text-size-adjust:\s*115%/m);
+    expect(iosMacMatch!.index!).toBeGreaterThan(htmlMatch!.index!);
+
+    // Inheritance from html ensures descendants stop font boosting on mobile while
+    // still inheriting 115% under html.native-ios-mac; descendant rules must not
+    // re-pin text-size-adjust: 100% or alter base 14px / native-ios-mac 16px chat sizes.
+    const bodyRule = cssWithoutComments.match(/\nbody\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(bodyRule).toMatch(/font-size:\s*14px/);
+    expect(bodyRule).not.toMatch(/text-size-adjust/);
+
+    const iosMacChatRule = cssWithoutComments.match(
+      /html\.native-ios-mac\s+\.chat-user,[\s\S]*?html\.native-ios-mac\s+\.chat-bubble-content\s*\{[^}]*\}/,
+    )?.[0];
+    expect(iosMacChatRule).toMatch(/font-size:\s*var\(--imcodes-chat-font-size,\s*16px\)/);
+
+    const chatUserRule = cssWithoutComments.match(/\n\.chat-user\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(chatUserRule).toMatch(/word-break:\s*break-all/);
+    expect(chatUserRule).toMatch(/overflow-wrap:\s*break-word/);
+    expect(chatUserRule).not.toMatch(/font-size|text-size-adjust/);
+
+    const foldToggleRule = cssWithoutComments.match(/\n\.chat-user-message-fold-toggle\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(foldToggleRule).toMatch(/font-size:\s*11px/);
+
+    const bubbleTimeRule = cssWithoutComments.match(/\n\.chat-bubble-time\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(bubbleTimeRule).toMatch(/font-size:\s*10px/);
+  });
+
+  it('disables compositor backdrop-filter blur under Mac iOS-on-Mac / desktop classes across all blurred selectors without affecting normal browsers or mobile', () => {
+    const blurRuleRe = /([^{}]+)\{([^{}]*backdrop-filter:\s*blur\([^{}]*)\}/g;
+    const blurredSelectors: string[] = [];
+    for (const match of cssWithoutComments.matchAll(blurRuleRe)) {
+      for (const sel of match[1].split(',')) {
+        const trimmed = sel.trim().replace(/\s+/g, ' ');
+        if (trimmed) blurredSelectors.push(trimmed);
+      }
+    }
+    expect(blurredSelectors.length).toBeGreaterThanOrEqual(25);
+
+    const disableBlockMatch = cssWithoutComments.match(
+      /(:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)[^\{]+)\{([^}]*backdrop-filter:\s*none[^}]*)\}/,
+    );
+    expect(disableBlockMatch, 'native-ios-mac / native-mac-desktop backdrop-filter: none block missing').toBeTruthy();
+    expect(disableBlockMatch![2]).toMatch(/-webkit-backdrop-filter:\s*none/);
+    expect(disableBlockMatch![2]).toMatch(/backdrop-filter:\s*none/);
+
+    const overriddenSelectors = new Set(
+      disableBlockMatch![1]
+        .split(/,(?![^()]*\))/)
+        .map((s) => s.trim().replace(/^:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+/, '').replace(/\s+/g, ' ')),
+    );
+    for (const selector of blurredSelectors) {
+      expect(overriddenSelectors.has(selector), `Missing backdrop-filter: none override for ${selector}`).toBe(true);
+    }
+
+    // SharedContextManagementPanel uses inline backdropFilter styles inside .shared-context-shell-tech.
+    expect(cssWithoutComments).toMatch(
+      /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+\.shared-context-shell-tech\s+\*\s*\{[^}]*backdrop-filter:\s*none\s*!important/,
+    );
+
+    // remote-desktop-workspace.css context menu must also disable backdrop-filter under Mac host classes.
+    const rdCss = readFileSync(resolve(__dirname, '../src/components/remote-desktop-workspace.css'), 'utf8');
+    expect(rdCss).toMatch(
+      /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+\.remote-desktop-wall-context-menu\s*\{[^}]*backdrop-filter:\s*none/,
+    );
+
+    // Root background aligns with #080d16 under native-ios-mac / native-mac-desktop only.
+    expect(cssWithoutComments).toMatch(
+      /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\),\s*:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+body,\s*:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+#app\s*\{[^}]*background-color:\s*var\(--chrome-bg\)/,
+    );
+  });
+
+  it('keeps desktop Cloud Docs / ONLYOFFICE chrome intact and compacts <=767px mobile chrome while hiding redundant editor role pill', () => {
+    const media600Idx = cssWithoutComments.indexOf('@media (max-width: 600px)');
+    expect(media600Idx).toBeGreaterThan(-1);
+    const desktopCss = cssWithoutComments.slice(0, media600Idx);
+    expect(desktopCss).not.toContain('.office-preview-toolbar.has-mode-toggle .office-preview-role-pill');
+
+    const media767Blocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*767px\)/);
+    const mobilePreviewBlock = media767Blocks.find((block) => block.includes('.office-preview-toolbar'));
+    expect(mobilePreviewBlock).toBeTruthy();
+
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.cloud-docs-preview-header\s*/)).toMatch(/min-height:\s*30px/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.cloud-docs-preview-header\s*/)).toMatch(/padding:\s*2px 8px/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-toolbar\s*/)).toMatch(/min-height:\s*26px/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-toolbar\s*/)).toMatch(/padding:\s*2px 6px\s*!important/);
+    expect(
+      extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-toolbar\.has-mode-toggle\s+\.office-preview-role-pill\s*/),
+    ).toMatch(/display:\s*none/);
+    expect(extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-role-pill\s*/)).not.toMatch(/display:\s*none/);
+  });
+
+  it('centers the mobile sub-session footer status inline and transfers bottom safe-area inset from .subsession-bar', () => {
+    const mobile640Blocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*640px\)/);
+    const mobileSubBarBlock = mobile640Blocks.find((b) => b.includes('.subsession-bar'));
+    expect(mobileSubBarBlock).toBeTruthy();
+    const mobileSubBarRule = extractDirectStyleRule(mobileSubBarBlock!, /\.subsession-bar\s*/);
+    expect(mobileSubBarRule).not.toMatch(/safe-area-inset-bottom/);
+
+    const footerRule = cssWithoutComments.match(/^\.subcard-mobile-footer-status\s*\{[^}]*\}/m)?.[0];
+    expect(footerRule).toBeTruthy();
+    expect(footerRule).toMatch(/display:\s*flex/);
+    expect(footerRule).toMatch(/align-items:\s*center/);
+    expect(footerRule).toMatch(/justify-content:\s*center/);
+    expect(footerRule).toMatch(/white-space:\s*nowrap/);
+    expect(footerRule).toMatch(/safe-area-inset-bottom/);
+
+    // Expanded mobile cards absorb excess bottom safe-area inset cleanly via --subcard-h + min-height: 0 preview without altering desktop cards
+    const expandedCardRule = cssWithoutComments.match(/\.subcard-bar-mobile-expanded\s+\.subcard\s*\{[^}]*\}/)?.[0];
+    expect(expandedCardRule).toBeTruthy();
+    expect(expandedCardRule).toMatch(/max-height:\s*calc\(var\(--subcard-h,\s*250px\)/);
+    expect(cssWithoutComments).toMatch(/\.subcard-bar-mobile-expanded\s+\.subcard-preview\s*\{\s*min-height:\s*0;\s*\}/);
+    const inlineFooterContainerRule = cssWithoutComments.match(/^\.subcard-bar-mobile-inline-footer\s*\{[^}]*\}/m)?.[0];
+    expect(inlineFooterContainerRule).toBeTruthy();
+    expect(inlineFooterContainerRule).toMatch(/safe-area-inset-bottom/);
+
+    const inlineFooterRule = cssWithoutComments.match(/\.subcard-mobile-footer-status\.subcard-mobile-footer-status-inline\s*\{[^}]*\}/)?.[0];
+    expect(inlineFooterRule).toBeTruthy();
+    expect(inlineFooterRule).toMatch(/left:\s*50%/);
+    expect(inlineFooterRule).toMatch(/transform:\s*translate\(-50%,\s*-50%\)/);
+
+    // Keyboard open / input-focused continues to hide the entire .subcard-bar (including the footer inside it)
+    expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.input-focused\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);
+    expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.kb-open\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);
+  });
+
+  it('upgrades remote-desktop top chrome and toolbar with dark-cyan HUD surfaces, semantic accents, and no backdrop-filter', () => {
+    const rdWorkspaceCss = readFileSync(
+      resolve(__dirname, '../src/components/remote-desktop-workspace.css'),
+      'utf8',
+    ).replace(/\/\*[\s\S]*?\*\//g, '');
+
+    const desktopRdCss = rdWorkspaceCss.slice(0, rdWorkspaceCss.indexOf('@media (max-width: 700px)'));
+    const tabbarRules = Array.from(
+      desktopRdCss.matchAll(/^\.remote-desktop-workspace-tabbar\s*\{[^}]*\}/gm),
+    ).map((m) => m[0]).join('\n');
+    expect(tabbarRules).toMatch(/var\(--chrome-bg\)/);
+    expect(tabbarRules).toMatch(/border-bottom:\s*1px solid rgb\(34 211 238/);
+    expect(desktopRdCss).toMatch(/\.remote-desktop-workspace-host-tab\.is-active\s*\{[^}]*var\(--chrome-panel\)/);
+    expect(desktopRdCss).toMatch(/\.remote-desktop-workspace-host-tab\.is-active::before\s*\{[^}]*var\(--chrome-accent\)/);
+
+    const desktopStylesCss = cssWithoutComments.slice(0, cssWithoutComments.indexOf('@media (max-width: 720px)'));
+    const toolbarRules = Array.from(
+      desktopStylesCss.matchAll(/^\.remote-desktop-toolbar\s*\{[^}]*\}/gm),
+    ).map((m) => m[0]).join('\n');
+    const qualityPopoverRule = desktopStylesCss.match(/^\.remote-desktop-quality-popover\s*\{[^}]*\}/m)?.[0];
+    expect(toolbarRules).toBeTruthy();
+    expect(qualityPopoverRule).toBeTruthy();
+    // Toolbar uses IM.codes cockpit tokens, cyan HUD segmented borders, emerald armed state, and amber unlock accent.
+    expect(toolbarRules).toMatch(/var\(--chrome-panel\)[\s\S]*var\(--chrome-bg\)/);
+    expect(desktopStylesCss).toMatch(
+      /\.remote-desktop-toolbar button\[aria-pressed="true"\],\s*\.remote-desktop-toolbar button\[aria-expanded="true"\],\s*\.remote-desktop-display-tabs button\[aria-selected="true"\]\s*\{[^}]*inset 0 -2px 0 rgb\(34 211 238/,
+    );
+    expect(desktopStylesCss).toMatch(
+      /\.remote-desktop-mode-switch button:last-child\[aria-pressed="true"\]\s*\{[^}]*inset 0 -2px 0 rgb\(52 211 153/,
+    );
+    expect(desktopStylesCss).toMatch(
+      /\.remote-desktop-toolbar \.remote-desktop-unlock-trigger\s*\{[^}]*rgb\(245 158 11/,
+    );
+
+    // Neither toolbar nor workspace tabbar/chrome introduces backdrop-filter compositor blur.
+    expect(tabbarRules).not.toMatch(/backdrop-filter/);
+    expect(toolbarRules).not.toMatch(/backdrop-filter/);
+    expect(qualityPopoverRule).not.toMatch(/backdrop-filter/);
+  });
+
+  it('keeps CloudDocs mini-chat flex wrappers bounded (min-height: 0) and inner .chat-view touch/wheel scrollable', () => {
+    const viewWrapRule = cssWithoutComments.match(/\.chat-view-wrap\s*\{[^}]*\}/)?.[0];
+    const chatMainRule = cssWithoutComments.match(/\.chat-main\s*\{[^}]*\}/)?.[0];
+    const miniMessagesRule = cssWithoutComments.match(/\.cloud-docs-mini-chat-messages\s*\{[^}]*\}/)?.[0];
+    const miniChatViewRule = cssWithoutComments.match(/\.cloud-docs-mini-chat-messages\s+\.chat-view\s*\{[^}]*\}/)?.[0];
+
+    expect(viewWrapRule).toMatch(/min-height:\s*0/);
+    expect(chatMainRule).toMatch(/min-height:\s*0/);
+    expect(miniMessagesRule).toMatch(/min-height:\s*0/);
+    expect(miniMessagesRule).toMatch(/overflow:\s*hidden/);
+    expect(miniChatViewRule).toMatch(/min-height:\s*0/);
+    expect(miniChatViewRule).toMatch(/overflow-y:\s*auto/);
+    expect(miniChatViewRule).toMatch(/overflow-x:\s*hidden/);
+    expect(miniChatViewRule).toMatch(/overscroll-behavior:\s*contain/);
+    expect(miniChatViewRule).toMatch(/-webkit-overflow-scrolling:\s*touch/);
+    expect(miniChatViewRule).toMatch(/touch-action:\s*pan-y/);
+  });
+
+  it('bounds CloudDocs ONLYOFFICE preview flex chain and bottom tabs on mobile without breaking non-ONLYOFFICE scrolling', () => {
+    const previewHeaderRule = cssWithoutComments.match(/\.cloud-docs-preview-header\s*\{[^}]*\}/)?.[0];
+    const previewStageRule = cssWithoutComments.match(/\.cloud-docs-preview-stage\s*\{[^}]*\}/)?.[0];
+    const embeddedStageRule = cssWithoutComments.match(/\.cloud-docs-preview-stage:has\(>\s*\.office-preview-embedded\)\s*\{[^}]*\}/)?.[0];
+    const iframeRule = cssWithoutComments.match(/\.office-preview-editor-wrap\s*>\s*div,\s*\.office-preview-editor-wrap\s+iframe\s*\{[^}]*\}/)?.[0];
+
+    expect(previewHeaderRule).toMatch(/flex-shrink:\s*0/);
+    expect(previewStageRule).toMatch(/min-height:\s*0/);
+    expect(previewStageRule).toMatch(/overflow:\s*auto/);
+    expect(embeddedStageRule).toMatch(/overflow:\s*hidden/);
+    expect(iframeRule).toMatch(/height:\s*100%\s*!important/);
+    expect(iframeRule).toMatch(/max-height:\s*100%\s*!important/);
+
+    for (const mq of [/@media \(max-width:\s*600px\)/, /@media \(max-width:\s*767px\)/]) {
+      const blocks = extractBalancedAtRuleBlocks(cssWithoutComments, mq);
+      expect(blocks.length).toBeGreaterThan(0);
+      const mobileBlock = blocks.join('\n');
+      const mobileStage = extractDirectStyleRule(mobileBlock, /\.cloud-docs-preview-stage:has\(>\s*\.office-preview-embedded\)/);
+      const mobileEmbedded = extractDirectStyleRule(mobileBlock, /\.office-preview-embedded/);
+      const mobileWrap = extractDirectStyleRule(mobileBlock, /\.office-preview-editor-wrap/);
+      expect(mobileStage).toMatch(/overflow:\s*hidden/);
+      expect(mobileStage).toMatch(/env\(safe-area-inset-bottom/);
+      expect(mobileEmbedded).toMatch(/min-height:\s*0\s*!important/);
+      expect(mobileEmbedded).toMatch(/overflow:\s*hidden/);
+      expect(mobileWrap).toMatch(/min-height:\s*0\s*!important/);
+      expect(mobileWrap).toMatch(/overflow:\s*hidden/);
+    }
+  });
+
+  it('keeps .voice-hold-hud-card bottom clearance dynamic above .controls-composer with bounded @container fallbacks', () => {
+    const hudRule = cssWithoutComments.match(/\.voice-hold-hud\s*\{[^}]*\}/)?.[0];
+    const cardRule = cssWithoutComments.match(/\.voice-hold-hud-card\s*\{[^}]*\}/)?.[0];
+    expect(hudRule, '.voice-hold-hud rule missing').toBeTruthy();
+    expect(cardRule, '.voice-hold-hud-card rule missing').toBeTruthy();
+    expect(hudRule).toMatch(/pointer-events:\s*none/);
+    expect(hudRule).toContain('--voice-hud-safe-bottom');
+    expect(cardRule).toContain('var(--voice-hud-bottom-clearance');
+    expect(cardRule).toContain('clamp(');
+
+    const container420 = extractBalancedAtRuleBlocks(cssWithoutComments, /@container\s*\(max-height:\s*420px\)/).join('\n');
+    const container300 = extractBalancedAtRuleBlocks(cssWithoutComments, /@container\s*\(max-height:\s*300px\)/).join('\n');
+    expect(container420).toContain('--voice-hud-bottom-clearance');
+    expect(container420).toContain('--voice-hold-side-zone-offset-y');
+    expect(container420).toContain('100cqh');
+    expect(container300).toContain('--voice-hud-bottom-clearance');
+    expect(container300).toContain('--voice-hold-side-zone-offset-y');
+    expect(container300).toContain('100cqh');
+    const sideZoneRule = cssWithoutComments.match(/\.voice-hold-zone-cancel,\s*\.voice-hold-zone-edit\s*\{[^}]*\}/)?.[0];
+    expect(sideZoneRule, 'side zone vertical offset rule missing').toBeTruthy();
+    expect(sideZoneRule).toMatch(/position:\s*relative/);
+    expect(sideZoneRule).toContain('--voice-hold-side-zone-offset-y');
+    expect(cssWithoutComments).toContain('.voice-hold-starting-spinner');
+    const reducedMotion = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(prefers-reduced-motion:\s*reduce\)/).join('\n');
+    expect(reducedMotion).toContain('.voice-hold-starting-spinner');
   });
 });

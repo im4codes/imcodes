@@ -427,4 +427,94 @@ describe('cron MCP client', () => {
     expect(JSON.stringify(thrownError)).not.toContain('worker.test');
     expect(JSON.stringify(thrownError)).not.toContain('at stack');
   });
+
+  it('retries transient pre-connect network errors for cron_create_self without duplicating side effects', async () => {
+    const connectTimeout = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(
+        new Error('Connect Timeout Error (attempted address: worker.test:443, timeout: 10000ms)'),
+        { name: 'ConnectTimeoutError', code: 'UND_ERR_CONNECT_TIMEOUT' },
+      ),
+    });
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(connectTimeout)
+      .mockResolvedValueOnce(okJson({ id: 'job-retried' }));
+
+    const result = await cronMcpCreateSelf({
+      name: 'Hourly check',
+      cronExpr: '0 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+    }, {
+      ...boundIdentity,
+      fetchImpl,
+      preConnectRetry: { sleep: async () => {} },
+    });
+
+    expect(result).toMatchObject({ status: 'ok', body: { id: 'job-retried' } });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry POST cron_create_self on post-connect ECONNRESET and preserves error cause', async () => {
+    const postConnectReset = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+    const fetchImpl = vi.fn().mockRejectedValue(postConnectReset);
+
+    const result = await cronMcpCreateSelf({
+      name: 'Hourly check',
+      cronExpr: '0 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+    }, {
+      ...boundIdentity,
+      fetchImpl,
+      preConnectRetry: { sleep: async () => {} },
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.INTERNAL_ERROR,
+      message: 'fetch failed: read ECONNRESET',
+    });
+  });
+
+  it('retries idempotent GET cron_list on transient socket reset and 503 gateway errors, surfacing cause if exhausted', async () => {
+    const closedSocket = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    });
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(closedSocket)
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'bad gateway' }), { status: 503 }))
+      .mockResolvedValueOnce(okJson({ jobs: [{ id: 'job-1' }] }));
+
+    const okResult = await cronMcpList({}, {
+      ...boundIdentity,
+      fetchImpl,
+      preConnectRetry: { sleep: async () => {} },
+    });
+    expect(okResult).toMatchObject({ status: 'ok', body: { jobs: [{ id: 'job-1' }] } });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+
+    const failingFetch = vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('Connect Timeout Error (attempted address: https://worker.test:443, timeout: 10000ms)'), {
+        name: 'ConnectTimeoutError',
+        code: 'UND_ERR_CONNECT_TIMEOUT',
+      }),
+    }));
+    const failed = await cronMcpList({}, {
+      ...boundIdentity,
+      fetchImpl: failingFetch,
+      preConnectRetry: { maxAttempts: 2, sleep: async () => {} },
+    });
+    expect(failingFetch).toHaveBeenCalledTimes(2);
+    expect(failed.status).toBe('error');
+    if (failed.status === 'error') {
+      expect(failed.message).toContain('fetch failed: Connect Timeout Error');
+      expect(failed.message).toContain('UND_ERR_CONNECT_TIMEOUT');
+      expect(failed.message).not.toContain('worker.test');
+    }
+  });
 });

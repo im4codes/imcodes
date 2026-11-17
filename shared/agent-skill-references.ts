@@ -1,4 +1,9 @@
-import { isAgentSkillName, type AgentSkillEntry } from './agent-skills.js';
+import {
+  PROJECT_AGENT_SKILL_DISPLAY_ROOTS,
+  USER_AGENT_SKILL_DISPLAY_ROOTS,
+  isAgentSkillName,
+  type AgentSkillEntry,
+} from './agent-skills.js';
 
 /** The composer marker used for a skill reference. */
 export const AGENT_SKILL_REFERENCE_MARKER = '$$(' as const;
@@ -24,7 +29,7 @@ export function isTopLevelAgentSkillEntry(
   const value = skill.displayPath?.trim() || skill.uri?.trim();
   if (!value) return true;
   const normalized = value.replace(/\\/gu, '/');
-  const roots = ['~/.agents/skills', '~/.imcodes/skills', '.agents/skills', '.imc/skills'];
+  const roots = [...USER_AGENT_SKILL_DISPLAY_ROOTS, ...PROJECT_AGENT_SKILL_DISPLAY_ROOTS];
   const root = roots.find((candidate) => normalized === candidate || normalized.startsWith(`${candidate}/`));
   if (root) {
     const relative = normalized.slice(root.length).replace(/^\/+/, '');

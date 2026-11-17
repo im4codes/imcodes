@@ -13,6 +13,9 @@ import {
   validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
+import { bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
+import { buildAuthorizedSendOptions, captureInboundCommandAuthority } from './machine-authority.js';
 import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
@@ -30,23 +33,11 @@ import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { authorizedDelegationCandidates } from './delegation-admission.js';
-import { Cron } from 'croner';
 import { normalizeCronSendActionForInterval } from '../../shared/cron-types.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 
 /** Default retry budget when daemon admission returns `daemon_busy`. */
 const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
-function cronIntervalMs(cronExpr?: string, timezone?: string | null): number | null {
-  if (!cronExpr) return null;
-  try {
-    const schedule = new Cron(cronExpr, timezone ? { timezone } : undefined);
-    const first = schedule.nextRun();
-    const second = first ? schedule.nextRun(first) : null;
-    return first && second ? second.getTime() - first.getTime() : null;
-  } catch {
-    return null;
-  }
-}
 const CRON_DAEMON_BUSY_DEFAULT_DELAY_MS = 5_000;
 const CRON_TRANSIENT_RETRY_DELAY_MS = 60_000;
 const CRON_TRANSIENT_MAX_ATTEMPTS = 3;
@@ -61,6 +52,7 @@ export interface CronSendDispatchInput {
   reply?: boolean;
   broadcast?: boolean;
   idempotencyKey?: string;
+  ownerMachineAuthority?: string;
 }
 
 export interface CronSendDispatchResult {
@@ -166,6 +158,10 @@ async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
 
 export async function executeCronJob(msg: CronDispatchMessage, serverLink: ServerLink): Promise<void> {
   const { jobId, executionId, jobName, projectName, targetRole, targetSessionName } = msg;
+  const cronAuthority = captureInboundCommandAuthority({
+    [OWNER_MACHINE_AUTHORITY_FIELD]: msg[OWNER_MACHINE_AUTHORITY_FIELD],
+  });
+  const ownerMachineAuthority = cronAuthority?.kind === 'owner' ? cronAuthority.ownerMachineAuthority : undefined;
   // The server outbox may resend after a crash between WS delivery and its
   // `dispatched` acknowledgement.  Claim the logical occurrence in the
   // daemon's durable SQLite ledger before resolving a target or invoking any
@@ -182,9 +178,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     });
     return;
   }
-  const action = msg.action.type === 'send'
-    ? normalizeCronSendActionForInterval(msg.action, cronIntervalMs(msg.cronExpr, msg.timezone))
-    : msg.action;
+  const action = normalizeCronSendActionForInterval(msg.action);
 
   // Resolve target session: prefer direct session name, fall back to role-based construction
   let name: string;
@@ -235,9 +229,16 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   // Busy check — skip tmux detection for transport sessions
-  if (session.runtimeType === 'transport') {
-    logger.debug({ jobId, sessionName: name }, 'Cron: transport session, skipping busy check');
-  } else {
+  if (action.type === 'command' && action.onlyWhenIdle === true && session.runtimeType === 'transport') {
+    const status = getTransportRuntime(name)?.getStatus?.();
+    if (status && status !== 'idle') {
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT, jobId, executionId, status: 'skipped_busy',
+        detail: `Cron target session is busy: ${name} (${status})`,
+      });
+      return;
+    }
+  } else if (session.runtimeType !== 'transport' && !(action.type === 'command' && action.onlyWhenIdle === false)) {
     try {
       const status = await detectStatusAsync(name, session.agentType as AgentType);
       if (BUSY_STATES.has(status)) {
@@ -313,8 +314,10 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
           await transportRuntime.send(command, clientMessageId, undefined, undefined, {
             timelineCommitted: true,
-            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
-            ...(managedAgent ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
+            ...buildAuthorizedSendOptions(cronAuthority, {
+              messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+              ...(managedAgent ? { defaultDeliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
+            }),
           });
           if (!timelineProjected && cronRun) {
             timelineEmitter.emit(name, 'user.message', {
@@ -359,6 +362,14 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       }
     } else {
       const collector = collectCommandResult(name, jobId, executionId, serverLink);
+      const ownerBinding = ownerMachineAuthority && session.sessionInstanceId && session.runtimeEpoch
+        ? bindProcessSharedMachineActivity(
+            name,
+            { sessionInstanceId: session.sessionInstanceId, runtimeEpoch: session.runtimeEpoch },
+            { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: ownerMachineAuthority },
+            { sessionRunning: session.state === 'running' },
+          )
+        : null;
       try {
         await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command, {
           userMessageMetadata: {
@@ -368,6 +379,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
             messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
             ...(cronRun ? { cronRun } : {}),
           },
+          ...(ownerBinding ? { onTyped: () => ownerBinding.typed() } : {}),
         });
       } catch (error) {
         collector.cancel();
@@ -380,6 +392,8 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           detail: `Cron process session send failed for ${name}: ${formatErr(error)}`,
         });
         return;
+      } finally {
+        ownerBinding?.settle();
       }
     }
     return;
@@ -410,6 +424,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         ...(action.reply !== undefined ? { reply: action.reply } : {}),
         ...(action.broadcast !== undefined ? { broadcast: action.broadcast } : {}),
         ...(action.idempotencyKey ? { idempotencyKey: action.idempotencyKey } : {}),
+        ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
       });
       logger.info({
         jobId,

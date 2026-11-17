@@ -16,6 +16,16 @@ const authoritativeIdlePayload = {
 };
 
 describe('isRunningTimelineEvent', () => {
+  it('keeps a model-control receipt neutral until the real turn terminal', () => {
+    const running = { type: 'session.state', payload: { state: 'running' } };
+    const receipt = { type: 'assistant.text', payload: { streaming: false, automation: true, memoryExcluded: true } };
+    expect(hasActiveTimelineTurn([running, receipt] as any)).toBe(true);
+    expect(hasActiveTimelineTurn([running, receipt, { type: 'session.state', payload: authoritativeIdlePayload }] as any)).toBe(false);
+    for (const payload of [{ streaming: false }, { streaming: false, automation: true }, { streaming: false, memoryExcluded: true }]) {
+      expect(hasActiveTimelineTurn([running, { type: 'assistant.text', payload }] as any)).toBe(false);
+    }
+  });
+
   it('recognizes only unresolved optimistic user sends as immediate client activity', () => {
     expect(hasPendingUserSend([
       { type: 'session.state', payload: { state: 'idle' } },

@@ -1,3 +1,4 @@
+import type { SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 /**
  * TransportProvider — second-layer abstraction between IM.codes and external agent services.
  *
@@ -312,7 +313,10 @@ export interface ProviderConfig {
 }
 
 /** Parameters for creating a new session on the provider. */
-export interface SessionConfig {
+export interface SessionConfig extends SessionIncognitoConfig {
+  /** Local-only AG lifecycle barrier. Must persist start evidence before a native
+   * process can be spawned; never serialized to a provider protocol. */
+  beforeNativeSessionStart?: () => Promise<void>;
   /** Local session key used by the daemon to identify this session. */
   sessionKey: string;
   /** Exact IM.codes session name whose identity is injected into managed MCP servers. */
@@ -615,6 +619,9 @@ export interface TransportProvider {
    * durable conversation. Codex implements this by resuming the same thread
    * with new baseInstructions before the next turn.
    */
+  /** Read-only provider-native compaction watermark, checked before context
+   * assembly so complete role contracts are restored instead of old refs. */
+  checkSessionCompaction?(sessionId: string): Promise<boolean>;
   refreshSessionSystemText?(sessionId: string): void;
 
   // ── Core methods — all providers must implement ──────────────────────────
@@ -796,6 +803,11 @@ export interface TransportProvider {
    * Used by local-sdk providers that apply model choice on each send.
    */
   setSessionAgentId?(sessionId: string, agentId: string): void;
+
+  /** Confirm native model selection. LIVE means effective now; NEXT_START
+   * includes an ACKed selection pending behind the current captured turn.
+   * Absence keeps the existing next-start setter contract. */
+  applySessionModel?(sessionId: string, agentId: string): Promise<import('../../shared/session-model-control.js').SessionModelApplied>;
 
   /**
    * Update provider-side reasoning/thinking effort for an existing session record.

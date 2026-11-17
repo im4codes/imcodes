@@ -27,8 +27,11 @@ const MAX_CAUSE_DEPTH = 5;
 
 /** True when `err` (or an error in its `cause` chain) proves no request byte was sent. */
 export function isPreConnectNetworkError(err: unknown): boolean {
+  const seen = new Set<unknown>();
   let current: unknown = err;
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && current instanceof Error; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
     const code = (current as { code?: unknown }).code;
     if (typeof code === 'string' && PRE_CONNECT_ERROR_CODES.has(code)) return true;
     if (PRE_CONNECT_ERROR_NAMES.has(current.name)) return true;
@@ -38,11 +41,36 @@ export function isPreConnectNetworkError(err: unknown): boolean {
   return false;
 }
 
+/** Format an Error and its `cause` chain (e.g. Node fetch's `TypeError: fetch failed` + underlying socket reason). */
+export function formatNetworkErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current instanceof Error; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const rawCode = (current as { code?: unknown }).code;
+    const code = typeof rawCode === 'string' ? rawCode : '';
+    const msg = current.message.trim();
+    if (msg) {
+      const text = code && !msg.includes(code) ? `${msg} (${code})` : msg;
+      if (!parts.includes(text)) parts.push(text);
+    } else if (code && !parts.includes(code)) {
+      parts.push(code);
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return parts.length > 0 ? parts.join(': ') : err.name || 'Network error';
+}
+
 export interface PreConnectRetryOptions {
   /** Total attempts, including the first. */
   maxAttempts?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
+  /** Optional predicate overriding `isPreConnectNetworkError` (e.g. for idempotent GET requests). */
+  shouldRetry?: (err: unknown) => boolean;
   /** Test seam; defaults to a real timer. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -66,11 +94,12 @@ export async function withPreConnectRetry<T>(
   const baseDelayMs = options.baseDelayMs ?? FILE_TRANSFER_LIMITS.RELAY_PRE_CONNECT_BASE_DELAY_MS;
   const maxDelayMs = options.maxDelayMs ?? FILE_TRANSFER_LIMITS.RELAY_PRE_CONNECT_MAX_DELAY_MS;
   const sleep = options.sleep ?? realSleep;
+  const shouldRetry = options.shouldRetry ?? isPreConnectNetworkError;
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await op(attempt);
     } catch (err) {
-      if (attempt >= maxAttempts || !isPreConnectNetworkError(err)) throw err;
+      if (attempt >= maxAttempts || !shouldRetry(err)) throw err;
       await sleep(preConnectRetryDelayMs(attempt, baseDelayMs, maxDelayMs));
     }
   }

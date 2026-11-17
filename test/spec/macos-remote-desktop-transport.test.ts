@@ -1,7 +1,7 @@
 import { runNative } from './support/native-exec.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { readSource } from '../helpers/read-source.js';
 
@@ -42,6 +42,18 @@ describe('macOS remote-desktop transport session adapter', () => {
     expect(header).not.toMatch(/#include\s*"(api|pc|rtc_base|media|p2p)\//);
     expect(adapter).not.toMatch(/#include\s*"(api|pc|rtc_base|media|p2p)\//);
     expect(adapter).not.toMatch(/webrtc::/);
+  });
+
+  it('keeps traffic samples independent of JSON and uses SDK overlay include paths on Windows', () => {
+    const sample = read('native/remote-desktop-common/traffic_stats.h');
+    expect(sample).not.toContain('json_protocol.h');
+    expect(sample).not.toContain('Json::');
+    expect(read('native/remote-desktop-common/json_protocol.h')).toContain('inline Json::Value TrafficEnvelope');
+    for (const [file, dependency] of [['peer_session.h', 'traffic_stats.h'], ['peer_session.cc', 'webrtc_traffic_stats.h']]) {
+      const windows = read(`native/windows-remote-desktop/${file}`);
+      expect(windows).toContain(`#include "third_party/imcodes_remote_desktop/common/${dependency}"`);
+      expect(windows).not.toContain('../remote-desktop-common/');
+    }
   });
 
   it('routes the real peer through pinned upstream libwebrtc only', async () => {
@@ -100,6 +112,83 @@ describe('macOS remote-desktop transport session adapter', () => {
       '-I', resolve(ROOT, 'native/remote-desktop-common'),
       resolve(ROOT, 'test/spec/macos-remote-desktop-transport-test.cc'),
       resolve(ROOT, 'native/macos-remote-desktop/macos_transport_session_adapter.cc'),
+      resolve(ROOT, 'native/remote-desktop-common/value_types.cc'),
+      resolve(ROOT, 'native/remote-desktop-common/transport_session_core.cc'),
+      resolve(ROOT, 'native/remote-desktop-common/quality_ladder.cc'),
+      '-o', executable,
+    ], { cwd: directory! });
+    expect(compile.status, `${compile.stdout}\n${compile.stderr}`).toBe(0);
+
+    const run = await runNative(executable, [], { cwd: directory! });
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
+  }, 120_000);
+
+  it('runs the pinned transport teardown regression test under ASan and UBSan', async () => {
+    if (process.platform !== 'darwin') return;
+    const stubRoot = resolve(directory!, 'webrtc-stubs');
+    const stubHeaders = [
+      'api/stats/rtc_stats_collector_callback.h',
+      'api/stats/rtc_stats_report.h',
+      'api/stats/rtcstats_objects.h',
+      'api/audio/audio_device.h',
+      'api/audio_codecs/builtin_audio_decoder_factory.h',
+      'api/audio_codecs/builtin_audio_encoder_factory.h',
+      'api/create_modular_peer_connection_factory.h',
+      'api/enable_media.h',
+      'api/data_channel_interface.h',
+      'api/environment/environment.h',
+      'api/jsep.h',
+      'api/make_ref_counted.h',
+      'api/media_stream_interface.h',
+      'api/peer_connection_interface.h',
+      'api/rtc_error.h',
+      'api/scoped_refptr.h',
+      'api/set_local_description_observer_interface.h',
+      'api/set_remote_description_observer_interface.h',
+      'api/video/color_space.h',
+      'api/video/i420_buffer.h',
+      'api/video/video_frame.h',
+      'api/rtp_parameters.h',
+      'api/rtp_sender_interface.h',
+      'api/rtp_transceiver_interface.h',
+      'api/video_codecs/sdp_video_format.h',
+      'api/video_codecs/video_encoder.h',
+      'api/video_codecs/video_decoder.h',
+      'api/video_codecs/video_decoder_factory.h',
+      'api/video_codecs/video_encoder_factory.h',
+      'rtc_base/time_utils.h',
+      'rtc_base/ref_counted_object.h',
+      'rtc_base/thread.h',
+      'modules/audio_device/include/audio_device_default.h',
+      'modules/video_coding/codecs/vp8/include/vp8.h',
+      'modules/video_coding/codecs/vp9/include/vp9.h',
+      'modules/video_coding/include/video_error_codes.h',
+    ];
+    for (const rel of stubHeaders) {
+      const target = resolve(stubRoot, rel);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, '#include "support/webrtc_teardown_stubs.h"\n');
+    }
+
+    const executable = resolve(directory!, 'transport-teardown-test');
+    const compile = await runNative('xcrun', [
+      'clang++',
+      '-std=c++20',
+      '-Wall', '-Wextra', '-Werror',
+      '-fsanitize=address,undefined',
+      '-fno-omit-frame-pointer',
+      '-pthread',
+      '-mmacosx-version-min=12.3',
+      '-I', resolve(ROOT, 'native/macos-remote-desktop'),
+      '-I', resolve(ROOT, 'native/remote-desktop-common'),
+      '-I', resolve(ROOT, 'test/spec'),
+      '-I', stubRoot,
+      resolve(ROOT, 'test/spec/macos-remote-desktop-transport-teardown-test.cc'),
+      resolve(ROOT, 'native/macos-remote-desktop/pinned_libwebrtc_transport_backend.cc'),
+      resolve(ROOT, 'native/macos-remote-desktop/macos_transport_session_adapter.cc'),
+      resolve(ROOT, 'native/macos-remote-desktop/macos_media_sender_binder.cc'),
+      resolve(ROOT, 'native/macos-remote-desktop/h264_sender_bridge.cc'),
+      resolve(ROOT, 'native/macos-remote-desktop/video_codec_selection.cc'),
       resolve(ROOT, 'native/remote-desktop-common/value_types.cc'),
       resolve(ROOT, 'native/remote-desktop-common/transport_session_core.cc'),
       resolve(ROOT, 'native/remote-desktop-common/quality_ladder.cc'),

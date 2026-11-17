@@ -54,6 +54,8 @@ export const TASK_PAIR_TERMINAL_FLUSH_FIELD = 'taskPairTerminalFlush' as const;
 export const TASK_PAIR_BRIEF_END_TAG = 'IMCODES_TASK_END' as const;
 /** Timeline event carrying every applied or recorded marker event. */
 export const TASK_PAIR_TIMELINE_EVENT = 'task_pair.event' as const;
+/** Browser-local bridge event carrying the current authoritative pair projection. */
+export const TASK_PAIR_SNAPSHOT_EVENT = 'supervision:task-pairs' as const;
 /** Every daemon-authored pair message id starts with this prefix plus the task id. */
 export const TASK_PAIR_NUDGE_ID_PREFIX = 'task-pair-nudge:' as const;
 /** Hook path through which MCP child processes hand legacy supervision tool calls to the daemon. */
@@ -106,6 +108,11 @@ export const TASK_PAIR_NOTICE_VERB = 'NOTICE' as const;
 /** Brain-only: opens the next delivery round on a passed (not yet done) pair. */
 export const TASK_PAIR_NEXT_ROUND_VERB = 'NEXT_ROUND' as const;
 export const TASK_PAIR_CHECKLIST_AUTO_TICK_VERB = 'CHECKLIST_AUTO_TICK' as const;
+/** Recorded daemon/legacy events, not marker commands or lifecycle states. */
+export const TASK_PAIR_RECORDED_EVENT_VERBS = [
+  'SEND', 'IMPORT', 'CORRECT', 'BRIEF_UPDATED', 'BRAIN_RESOLVED', 'DECISION', 'DECISION_REQUEST',
+] as const;
+
 export const TASK_PAIR_CHECKLIST_BOXES = ['implemented', 'audited'] as const;
 export type TaskPairChecklistBox = typeof TASK_PAIR_CHECKLIST_BOXES[number];
 
@@ -289,7 +296,18 @@ export type TaskPairCreatedSessionSource = typeof TASK_PAIR_CREATED_SESSION_SOUR
  * (removed) session frees its slot with nothing to reconcile.
  */
 /** Stable sub-session namespace, shared with legacy-label presentation. */
+export const SUBSESSION_NAME_PREFIX = 'deck_sub_' as const;
 export const TASK_PAIR_SESSION_ID_PREFIX = 'pair_auto_' as const;
+export const SEND_AUTO_SESSION_ID_PREFIX = 'send_auto_' as const;
+export const AUTO_CREATED_SUBSESSION_NAME_PREFIXES: readonly string[] = [
+  `${SUBSESSION_NAME_PREFIX}${TASK_PAIR_SESSION_ID_PREFIX}`,
+  `${SUBSESSION_NAME_PREFIX}${SEND_AUTO_SESSION_ID_PREFIX}`,
+] as const;
+
+/** Sub-sessions auto-provisioned for task pairs or send auto-provision never emit task_complete pushes. */
+export function isAutoCreatedSubSessionName(sessionName: string): boolean {
+  return AUTO_CREATED_SUBSESSION_NAME_PREFIXES.some((prefix) => sessionName.startsWith(prefix));
+}
 export const TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT = 10;
 export const TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT = TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT * 2;
 export const TASK_PAIR_CREATED_SESSION_REASONS = { DEFAULT: 'default_same_vendor_secondary', EXPLICIT: 'explicit_create' } as const;
@@ -711,6 +729,51 @@ export const TASK_PAIR_SCOPE_DECISION_RULE: string =
   + '(pair_task_update), so any current or future auditor audits the same '
   + 'scope; a decision sent only by message does not bind a replaced auditor.';
 
+/**
+ * Owner rule: unrelated tasks must be split rationally into separate task pairs
+ * rather than mixed together, keeping scopes, worktrees, audits and merges
+ * independent and clean.
+ */
+export const TASK_PAIR_SPLIT_UNRELATED_RULE: string =
+  'Split unrelated tasks (Brain): decompose unrelated goals, bugs or features '
+  + 'into separate, independently executed, audited and merged task pairs — never '
+  + 'mix unrelated work into one pair.';
+
+/** Compact snake_case token used by the Brain duty tables in supervision-prompts.ts. */
+export const TASK_PAIR_SPLIT_UNRELATED_TOKEN =
+  'split_unrelated_tasks_into_separate_pairs_never_mix_unrelated_work_in_one_pair' as const;
+
+/**
+ * Built-in rule: single pairs rely on daemon pair heartbeats (never create
+ * per-pair cron_create_self nudges). Brain/AI drives long-cycle and multi-phase
+ * execution continuously via reactive wakeups and pair notifications; the
+ * until_complete cron is strictly a keepalive fallback if Brain stops or stalls
+ * unexpectedly, never a polling loop. Multi-phase tasks require Brain to
+ * automatically schedule it at an interval of at least 20 minutes (shorter only
+ * when the user explicitly requests a special timer), scale/extend that interval
+ * appropriately based on task complexity, and auto-cancel it once all phases complete.
+ */
+export const TASK_PAIR_MULTI_PHASE_CRON_RULE: string =
+  'Multi-phase long-task supervisor cron (Brain): single pairs use the '
+  + 'built-in daemon pair heartbeat (never create per-pair cron_create_self '
+  + 'nudges). For a multi-phase long task spanning multiple phases or dependent '
+  + 'pairs, Brain/AI drives execution continuously via reactive wakeups and '
+  + 'pair notifications; the supervisor cron is strictly a keepalive fallback '
+  + 'to prevent unexpected stopping if Brain stalls, NEVER a polling loop. Brain '
+  + 'MUST automatically create it via '
+  + 'cron_create_self with completionPolicy="until_complete" and an interval of '
+  + 'at least 20 minutes (>= 20 minutes, e.g. */20 * * * * minimum, never more '
+  + 'frequent than every 20 minutes), AND scale/extend the interval '
+  + 'appropriately based on task complexity (e.g. 30m/45m/60m+ for heavy '
+  + 'multi-phase or long-running tasks) to track phase advancement and recover '
+  + 'stalls; a shorter than 20-minute interval is allowed ONLY when the user '
+  + 'explicitly requests a special short timer. Automatically cancel it via '
+  + 'cron_cancel_self once all phases are complete.';
+
+/** Compact snake_case token used by the Brain duty tables in supervision-prompts.ts. */
+export const TASK_PAIR_MULTI_PHASE_CRON_TOKEN =
+  'single_pair_no_cron_multi_phase_long_task_must_cron_create_self_keepalive_fallback_not_polling_min_20m_unless_special_user_request_scaled_by_complexity_completionPolicy_until_complete_auto_cancel_when_all_phases_done' as const;
+
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
   'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';
@@ -731,7 +794,10 @@ export const TASK_PAIR_ASK_DONT_JUST_REPLY_RULE: string =
   + 'never leave the question only in your own reply. Questions for your '
   + 'partner (executor/auditor) go to them by message the same way. If the '
   + 'pair still cannot decide, escalate to Brain with options and a '
-  + 'recommendation instead of looping.';
+  + 'recommendation instead of looping. For a decision blocker, call pair_decision_record kind=request with the task/round, '
+  + 'the exact question, concrete options and recommendation; keep BLOCKED/NEEDS_INPUT or pause/dependency state accurate. '
+  + 'Brain reads the task-bound human feedback and records kind=decision with requestId before using pair_resume, pair_next_round or pair_close. '
+  + 'Human feedback is not an audit PASS and never automatically resumes a paused task.';
 
 /** Shared auditor direction used in contracts and every generated brief. */
 export const TASK_PAIR_AUDITOR_PROPOSAL_RULE: string =
@@ -834,6 +900,20 @@ export const TASK_PAIR_BRAIN_MCP_ONLY_RULE: string =
   + 'Naming executor/auditor (pair_create, pair_reassign) replaces the current holder of that role immediately, ignoring the execution pool role config; executorModel/auditorModel steers the next automatic pick but does not replace a current role; a project with no execution pool configured must name the role models or sessions explicitly.';
 
 /**
+ * Owner rule (2026-11-14): when reporting, listing, summarizing, or asking
+ * the user about any task pair, Brain must use the human-readable `title`,
+ * never raw internal `taskId` strings (`tsk_...`), which stay internal-only.
+ */
+export const TASK_PAIR_USER_FACING_TITLE_RULE: string =
+  'User-facing task reporting (Brain): when reporting, listing, summarizing, or asking the user about any task pair, '
+  + 'ALWAYS refer to the human-readable task name/title (`title`) and NEVER output raw internal task IDs (`tsk_...`) to the user. '
+  + 'Keep `taskId` strictly for internal MCP tool calls (pair_create, pair_task_update, pair_close, etc.), internal protocol markers, and internal logs.';
+
+/** Compact snake_case token used by the Brain duty tables in supervision-prompts.ts. */
+export const TASK_PAIR_USER_FACING_TITLE_TOKEN =
+  'user_facing_replies_use_task_title_never_raw_taskId_keep_taskId_for_internal_mcp_only' as const;
+
+/**
  * Stated in the Brain contract for a project whose supervision is off (owner decisions: 2026-09-26, tsk_cd_pairs_optin - pairs never
  * start by themselves there; tsk_fb01f25f17 - supervision off never stops a MANUAL pair, it only means no daemon heartbeat). Kept as one
  * shared string so the daemon's own auto-start gates can be reviewed against the same text.
@@ -906,6 +986,12 @@ export const TASK_PAIR_VERBS = [
 export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 
 export const TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION = 'awaiting_brain_decision' as const;
+/** Display-only failure status used by task reference projections. */
+export const TASK_PAIR_STATUS_FAILED = 'failed' as const;
+/** Browser-local desktop width, shared by all servers and sessions on this device. */
+export const TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY = 'imcodes.task-pair-panel-width.v1';
+/** Split/sub-window widths must never overwrite the main chat's preference. */
+export const TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY = `${TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY}.secondary`;
 /** Local-storage namespace for the web task-pair status panel (layout suffix is added by the UI). */
 export const TASK_PAIR_STATUS_PANEL_STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed' as const;
 export const TASK_PAIR_STATUSES = [
@@ -1056,6 +1142,9 @@ function knownVerb(verb: string): TaskPairVerb | undefined {
  * code, inline in prose, or inside a QUEUE brief are not protocol.
  */
 export function scanTaskPairMarkers(text: string): TaskPairMarkerScan {
+  // Timeline rendering/snapshots revisit retained text on resume. Ordinary
+  // completions need no line allocation or Markdown-fence walk at all.
+  if (!mayContainTaskPairMarker(text)) return { markers: [], markerLineIndexes: [] };
   const lines = text.split(/\r?\n/u);
   const markers: TaskPairMarker[] = [];
   const markerLineIndexes: number[] = [];
@@ -1248,6 +1337,9 @@ export interface TaskPairState {
   blockingSource?: TaskPairBlockingSource;
   lastVerdict?: TaskPairLastVerdict;
   previousAuditors: string[];
+  previousExecutors?: string[];
+  /** Blocker / decision explanation episode generation. Monotonically advanced on genuine entry or context change. */
+  episodeGeneration?: number;
   /** Auditor explicitly selected by Brain; heartbeat replacement must keep it
    * unless the session is genuinely unavailable. */
   auditorPinned?: string;
@@ -1644,11 +1736,15 @@ export function resolveTaskPairBrainWait(
   now: number,
   resolution?: { writer: string; note?: string },
 ): void {
+  const hadBlocker = pair.flags.includes('blocked') || pair.flags.includes('needs_input') || pair.flagSides.blocked !== undefined || pair.flagSides.needs_input !== undefined;
   removeFlag(pair, 'blocked');
   removeFlag(pair, 'needs_input');
   delete pair.flagSides.blocked;
   delete pair.flagSides.needs_input;
   pair.blockedNote = undefined;
+  if (hadBlocker) {
+    pair.episodeGeneration = (pair.episodeGeneration ?? 0) + 1;
+  }
   if (resolution) {
     pair.lastWaitResolution = {
       writer: resolution.writer,
@@ -1666,6 +1762,7 @@ function clonePair(pair: TaskPairState): TaskPairState {
     flagSides: { ...pair.flagSides },
     blocking: [...pair.blocking],
     previousAuditors: [...pair.previousAuditors],
+    ...(pair.previousExecutors ? { previousExecutors: [...pair.previousExecutors] } : {}),
     capCounts: { ...pair.capCounts },
     lastWaitResolution: pair.lastWaitResolution ? { ...pair.lastWaitResolution } : undefined,
     lastVerdict: pair.lastVerdict ? {
@@ -1692,6 +1789,7 @@ function newPair(taskId: string, brain: string, ctx: TaskPairApplyContext, statu
     blocking: normalizeAuditBlockingSeverities(ctx.projectBlocking),
     blockingSource: 'config',
     previousAuditors: [],
+    previousExecutors: [],
     capCounts: {},
     capRound: 0,
     ...(status !== 'queued' ? { startedAt: ctx.now } : {}),
@@ -1727,7 +1825,15 @@ function resetCaps(pair: TaskPairState): void {
 }
 
 function setRolesFromAttrs(pair: TaskPairState, attrs: Record<string, string>, intents: TaskPairIntent[]): void {
-  if (attrs.executor) pair.executor = attrs.executor;
+  if (attrs.executor) {
+    if (pair.executor && pair.executor !== attrs.executor) {
+      if (!pair.previousExecutors) pair.previousExecutors = [];
+      if (!pair.previousExecutors.includes(pair.executor)) {
+        pair.previousExecutors.push(pair.executor);
+      }
+    }
+    pair.executor = attrs.executor;
+  }
   if (attrs.executormodel) pair.executorModel = attrs.executormodel;
   if (attrs.executorthinking) pair.executorThinking = attrs.executorthinking;
   if (attrs.auditor) {
@@ -1759,12 +1865,19 @@ function namedParticipantIsBusy(attrs: Record<string, string>, busySessions: Rea
 const PROGRESS_VERBS: readonly TaskPairVerb[] = ['DISPATCH', 'STARTED', 'WORKING', 'READY_FOR_AUDIT', 'PASS', 'REWORK', 'DONE'];
 
 function clearSideFlags(pair: TaskPairState, role: TaskPairRole, all = false): void {
+  let cleared = false;
   for (const flag of ['blocked', 'needs_input'] as const) {
     if (all || pair.flagSides[flag] === role) {
+      if (pair.flags.includes(flag) || pair.flagSides[flag] !== undefined) {
+        cleared = true;
+      }
       removeFlag(pair, flag);
       delete pair.flagSides[flag];
       pair.blockedNote = undefined;
     }
+  }
+  if (cleared) {
+    pair.episodeGeneration = (pair.episodeGeneration ?? 0) + 1;
   }
 }
 
@@ -2313,10 +2426,16 @@ export function applyTaskPairMarker(
       if (terminal) return recorded(existing, false);
       if (roleAuthority) return done('brain_resolved');
       const flag = verb === 'BLOCKED' ? 'blocked' : 'needs_input';
+      const priorNote = pair.blockedNote;
+      const nextNote = attrs.note?.trim() || undefined;
       const freshlyFlagged = !pair.flags.includes(flag) || pair.flagSides[flag] !== role;
+      const noteChanged = priorNote !== nextNote;
+      if (freshlyFlagged || noteChanged) {
+        pair.episodeGeneration = (pair.episodeGeneration ?? 0) + 1;
+      }
       addFlag(pair, flag);
       pair.flagSides[flag] = role;
-      pair.blockedNote = attrs.note?.trim() || undefined;
+      pair.blockedNote = nextNote;
       pair.lastWaitResolution = undefined;
       // Owner evidence: an executor's question left only in its own reply,
       // never sent anywhere, stalled a pair until the owner happened to
@@ -2608,6 +2727,8 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
     TASK_PAIR_BRAIN_PAIR_CREATE_RULE,
+    TASK_PAIR_SPLIT_UNRELATED_RULE,
+    TASK_PAIR_MULTI_PHASE_CRON_RULE,
     TASK_PAIR_BRIEF_STRUCTURE_RULE,
     TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
     TASK_PAIR_BOUNDARY_AUDIT_RULE,
@@ -2620,6 +2741,7 @@ export function buildTaskPairMarkerContract(): string {
     'Waiting costs no model turns: use pair_pause mode=manual for a manual hold, or mode=dependencies with same-project dependsOn ids; pair_resume clears only the manual hold. Dependencies wait for Brain-accepted DONE, not PASS. Paused pairs retain their stage/material/workspace; do not keep replying that you are waiting. pair_create also accepts dependsOn.',
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. With an empty or unconfigured pool the daemon uses idle sub-sessions of the Brain in the SAME provider family that run the secondary model of that family (Anthropic Sonnet, OpenAI Sol, DeepSeek Pro; never another vendor, never the flagship, no session is created); executor and auditor are different sessions, and when none is available the daemon tells you how to fix it (create a sub-session, name executor/auditor, or execution_pool_set). Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
     TASK_PAIR_BRAIN_MCP_ONLY_RULE,
+    TASK_PAIR_USER_FACING_TITLE_RULE,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

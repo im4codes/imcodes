@@ -226,7 +226,7 @@ describe('executeCronJob structured send actions', () => {
     }));
   });
 
-  it('preserves ordinary structured-send behavior when onlyWhenIdle is omitted', async () => {
+  it('defaults daily structured sends to skip busy recipients', async () => {
     const dispatchCronSend = vi.fn(async (_input: CronSendDispatchInput) => ({
       dispatchId: 'send_dispatch_default',
       status: 'dispatched' as const,
@@ -239,7 +239,8 @@ describe('executeCronJob structured send actions', () => {
 
     await executeCronJob(makeSendMsg(), mockServerLink);
 
-    expect(dispatchCronSend).toHaveBeenCalledTimes(1);
+    expect(dispatchCronSend).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'skipped_busy' }));
   });
 
   it('defensively defaults omitted idle-only policy for a short schedule', async () => {

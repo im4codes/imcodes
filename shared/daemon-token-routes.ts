@@ -4,12 +4,19 @@ import { ALIAS_API_PATH } from './alias-types.js';
 import { VERIFICATION_MACHINE_API_PATH } from './verification-machine.js';
 import { MESSAGE_PINS_API_PATH } from './message-pins.js';
 import { CAPABILITY_HTTP_PATH } from './capability-management.js';
+import {
+  CLOUD_DOCS_API_PATH,
+  CLOUD_DOCS_CONVERT_SUBPATH,
+  CLOUD_DOCS_DOCBUILDER_SUBPATH,
+  CLOUD_DOCS_FILE_SUBPATH,
+  RECENT_DOCUMENTS_API_PATH,
+} from './cloud-docs.js';
 import { WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT } from './worker-session-snapshot.js';
 import { CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from './controlled-node-artifacts.js';
 import { USAGE_INGEST_ROUTE_SUFFIX } from './usage-analytics.js';
 
 export const DAEMON_TOKEN_ROUTE_NOT_ALLOWED = 'daemon_token_route_not_allowed';
-export type DaemonHttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+export type DaemonHttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export interface DaemonTokenRoute {
   method: DaemonHttpMethod;
   path: string;
@@ -58,6 +65,7 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('POST', '/api/embedding'),
   full('GET', '/api/machines'),
   full('GET', CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH),
+  full('HEAD', CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH),
   full('POST', '/api/machine/exec'),
   full('POST', '/api/machine/computer-use'),
   full('POST', `${server}/machine-direct-upload`),
@@ -79,8 +87,29 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('POST', `${server}/shared-context/resolve-namespace`),
   full('GET', `${server}/supervision/user-defaults/daemon`),
   full('PUT', `${server}/supervision/user-defaults/daemon`),
+  full('GET', `${server}/repo-callbacks/daemon`),
   full('POST', `${server}/${USAGE_INGEST_ROUTE_SUFFIX}`),
   full('POST', '/api/outbound'),
+  full('GET', CLOUD_DOCS_API_PATH),
+  full('GET', `${CLOUD_DOCS_API_PATH}/teams`),
+  full('GET', `${CLOUD_DOCS_API_PATH}/shares/:targetKind/:id`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/shares`),
+  full('DELETE', `${CLOUD_DOCS_API_PATH}/shares/:shareId`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/folders`),
+  full('PATCH', `${CLOUD_DOCS_API_PATH}/folders/:id`),
+  full('DELETE', `${CLOUD_DOCS_API_PATH}/folders/:id`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/blank`),
+  full('POST', `${CLOUD_DOCS_API_PATH}${CLOUD_DOCS_DOCBUILDER_SUBPATH}`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/files`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/:id${CLOUD_DOCS_DOCBUILDER_SUBPATH}`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/:id${CLOUD_DOCS_CONVERT_SUBPATH}`),
+  full('PUT', `${CLOUD_DOCS_API_PATH}/:id${CLOUD_DOCS_FILE_SUBPATH}`),
+  full('GET', `${CLOUD_DOCS_API_PATH}/:id/content`),
+  full('PUT', `${CLOUD_DOCS_API_PATH}/:id/content`),
+  full('GET', `${CLOUD_DOCS_API_PATH}/:id/download`),
+  full('PATCH', `${CLOUD_DOCS_API_PATH}/:id`),
+  full('DELETE', `${CLOUD_DOCS_API_PATH}/:id`),
+  full('GET', RECENT_DOCUMENTS_API_PATH),
   // Current and released clients use the serverId mount for pod affinity.
   ...[`${server}/cron`].flatMap((cron) => [
     full('GET', cron), full('POST', cron),

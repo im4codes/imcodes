@@ -48,6 +48,8 @@
  * unit-testable with no React, no real network, and no real timers.
  */
 
+import { isRecoverableTimelineRequestErrorReason } from '../../../../shared/timeline-history-errors.js';
+
 /** Bounded number of window pages a single catch-up round may fetch. */
 export const CATCHUP_TAIL_MAX_PAGES = 5;
 
@@ -60,6 +62,8 @@ export interface BackfillPage {
    * use it to drive window continuation (that is `events.length >= limit`).
    */
   hasMore: boolean;
+  status?: string;
+  errorReason?: string;
   payloadTruncated?: boolean;
   droppedEvents?: number;
   truncatedEvents?: number;
@@ -143,7 +147,8 @@ export function pageIsIncomplete(page: BackfillPage): boolean {
     || (page.droppedEvents ?? 0) > 0
     || (page.truncatedEvents ?? 0) > 0
     || page.cursorReset === true
-    || page.recoverable === true;
+    || page.recoverable === true
+    || (page.recoverable === undefined && isRecoverableTimelineRequestErrorReason(page.errorReason));
 }
 
 /**

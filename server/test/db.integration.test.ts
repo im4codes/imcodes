@@ -56,6 +56,8 @@ import {
   getSessionTextTailCache,
   upsertSessionTextTailCacheEvent,
   SESSION_TEXT_TAIL_CACHE_LIMIT,
+  SESSION_TEXT_TAIL_TEXT_MAX_CHARS,
+  type SessionTextTailCacheItem,
   upsertOrchestrationRun,
   getOrchestrationRunById,
   getActiveOrchestrationRuns,
@@ -257,6 +259,26 @@ describe('runMigrations', () => {
     );
     expect(idx?.indexname).toBe('idx_session_text_tail_cache_updated_at');
   });
+
+  it('cron_jobs and cron_executions have dispatch scheduler indexes (migration 109)', async () => {
+    const jobsIdx = await db.queryOne<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef FROM pg_indexes
+       WHERE tablename = 'cron_jobs'
+         AND indexname = 'idx_cron_jobs_active_next_run'`,
+      [],
+    );
+    expect(jobsIdx?.indexname).toBe('idx_cron_jobs_active_next_run');
+    expect(jobsIdx?.indexdef).toContain("WHERE (status = 'active'::text)");
+
+    const execIdx = await db.queryOne<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef FROM pg_indexes
+       WHERE tablename = 'cron_executions'
+         AND indexname = 'idx_cron_executions_status_created'`,
+      [],
+    );
+    expect(execIdx?.indexname).toBe('idx_cron_executions_status_created');
+    expect(execIdx?.indexdef).toContain('(status, created_at)');
+  });
 });
 
 // ── 2. Database wrapper ─────────────────────────────────────────────────────
@@ -405,6 +427,335 @@ describe('session_text_tail_cache', () => {
         text: 'rebuilt',
       },
     ]);
+  });
+
+  it('handles concurrent upserts, equal-ts tie-breaks, and updates latest_ts atomically', async () => {
+    const concurrentSession = `${sessionName}-concurrent`;
+    await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, concurrentSession]);
+
+    await Promise.all(
+      Array.from({ length: 12 }, (_, idx) =>
+        upsertSessionTextTailCacheEvent(db, serverId, {
+          eventId: `c-${String(idx).padStart(2, '0')}`,
+          sessionId: concurrentSession,
+          ts: 1000 + Math.floor(idx / 3),
+          type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+          payload: { text: `concurrent ${idx}` },
+        })),
+    );
+
+    const events = await getSessionTextTailCache(db, serverId, concurrentSession);
+    expect(events).toHaveLength(12);
+    expect(events.map((e) => e.eventId)).toEqual(
+      Array.from({ length: 12 }, (_, idx) => `c-${String(idx).padStart(2, '0')}`),
+    );
+
+    // Overwriting the highest-ts event with an earlier ts must lower latest_ts accurately.
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: 'c-11',
+      sessionId: concurrentSession,
+      ts: 500,
+      type: 'assistant.text',
+      payload: { text: 'moved earlier' },
+    });
+    const row = await db.queryOne<{ latest_ts: number }>(
+      'SELECT latest_ts FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2',
+      [serverId, concurrentSession],
+    );
+    expect(row?.latest_ts).toBe(1003);
+  });
+
+  it('matches legacy JS parse+Map+localeCompare+slice merge semantics across differential counterexamples and bounds', async () => {
+    const legacyParse = (raw: unknown): SessionTextTailCacheItem[] => {
+      if (!Array.isArray(raw)) return [];
+      const items: SessionTextTailCacheItem[] = [];
+      for (const entry of raw) {
+        if (!entry || typeof entry !== 'object') return [];
+        const r = entry as Record<string, unknown>;
+        if (
+          typeof r.eventId !== 'string'
+          || typeof r.ts !== 'number'
+          || (r.type !== 'user.message' && r.type !== 'assistant.text')
+          || typeof r.text !== 'string'
+        ) {
+          return [];
+        }
+        const trimmed = r.text.trim();
+        if (!trimmed) return [];
+        const text = trimmed.length > SESSION_TEXT_TAIL_TEXT_MAX_CHARS
+          ? trimmed.slice(0, SESSION_TEXT_TAIL_TEXT_MAX_CHARS)
+          : trimmed;
+        const item: SessionTextTailCacheItem = { eventId: r.eventId, ts: r.ts, type: r.type, text };
+        if (typeof r.source === 'string' && r.source.trim()) item.source = r.source.trim();
+        if (typeof r.confidence === 'string' && r.confidence.trim()) item.confidence = r.confidence.trim();
+        items.push(item);
+      }
+      return items;
+    };
+
+    const legacyMerge = (rawExisting: unknown, rawIncoming: Record<string, unknown>): SessionTextTailCacheItem[] => {
+      const parsedExisting = legacyParse(rawExisting);
+      const classified = classifySessionTextTailEvent(rawIncoming)!;
+      const deduped = new Map<string, SessionTextTailCacheItem>();
+      for (const item of parsedExisting) deduped.set(item.eventId, item);
+      deduped.set(classified.item.eventId, classified.item);
+      const merged = [...deduped.values()].sort((a, b) => {
+        if (a.ts !== b.ts) return a.ts - b.ts;
+        return a.eventId.localeCompare(b.eventId);
+      });
+      return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+        ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+        : merged;
+    };
+
+    const cases: Array<{ name: string; existing: unknown; incoming: Omit<Record<string, unknown>, 'sessionId'> }> = [
+      {
+        name: 'same-ts mixed case and non-ASCII localeCompare ordering',
+        existing: [
+          { eventId: 'A', ts: 100, type: 'assistant.text', text: 'upper A' },
+          { eventId: 'a', ts: 100, type: 'assistant.text', text: 'lower a' },
+          { eventId: 'é', ts: 100, type: 'user.message', text: 'accent e' },
+          { eventId: 'e', ts: 100, type: 'user.message', text: 'plain e' },
+          { eventId: '中', ts: 100, type: 'assistant.text', text: 'cjk' },
+        ],
+        incoming: { eventId: 'z-new', ts: 200, type: 'assistant.text', payload: { text: 'incoming' } },
+      },
+      {
+        name: 'same-ts mixed case cutoff at 50-item limit',
+        existing: [
+          { eventId: 'a', ts: 100, type: 'user.message', text: 'lower-a-first-in-localeCompare' },
+          { eventId: 'A', ts: 100, type: 'user.message', text: 'upper-A-kept' },
+          ...Array.from({ length: 48 }, (_, i) => ({
+            eventId: `keep-${String(i).padStart(2, '0')}`,
+            ts: 200 + i,
+            type: 'assistant.text',
+            text: `msg-${i}`,
+          })),
+        ],
+        incoming: { eventId: 'z-cap', ts: 999, type: 'assistant.text', payload: { text: 'triggers cutoff' } },
+      },
+      {
+        name: 'duplicate eventIds already present inside existing array keep last existing then incoming',
+        existing: [
+          { eventId: 'dup', ts: 10, type: 'assistant.text', text: 'first' },
+          { eventId: 'other', ts: 20, type: 'user.message', text: 'middle' },
+          { eventId: 'dup', ts: 30, type: 'assistant.text', text: 'last' },
+        ],
+        incoming: { eventId: 'z-new', ts: 40, type: 'assistant.text', payload: { text: 'fresh' } },
+      },
+      {
+        name: 'duplicate existing eventIds overwritten by incoming',
+        existing: [
+          { eventId: 'dup', ts: 50, type: 'assistant.text', text: 'first' },
+          { eventId: 'dup', ts: 60, type: 'assistant.text', text: 'second' },
+        ],
+        incoming: { eventId: 'dup', ts: 25, type: 'assistant.text', payload: { text: 'incoming lower ts' } },
+      },
+      {
+        name: 'missing ts in existing array resets corrupt cache cleanly',
+        existing: [{ eventId: 'bad', type: 'assistant.text', text: 'bad old item' }],
+        incoming: { eventId: 'z-recover', ts: 500, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'missing eventId / null type / non-object / float ts in existing resets corrupt cache cleanly',
+        existing: [
+          { eventId: 'ok', ts: 10, type: 'user.message', text: 'ok' },
+          { eventId: null, ts: 11, type: 'user.message', text: 'null id' },
+        ],
+        incoming: { eventId: 'z-recover-null', ts: 501, type: 'user.message', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'float ts in existing element matches legacy number check and preserves item',
+        existing: [
+          { eventId: 'float-ts', ts: 12.5, type: 'assistant.text', text: 'float ts' },
+        ],
+        incoming: { eventId: 'z-after-float', ts: 502, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'unknown type / wrong text type / string ts / non-object array element resets cache cleanly',
+        existing: [
+          { eventId: 'ok', ts: 10, type: 'user.message', text: 'ok' },
+          { eventId: 'bad-type', ts: 11, type: 'tool.call', text: 'bad type' },
+        ],
+        incoming: { eventId: 'z-recover-type', ts: 503, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'wrong text type in existing resets cache cleanly',
+        existing: [
+          { eventId: 'bad-text', ts: 11, type: 'assistant.text', text: 123 },
+        ],
+        incoming: { eventId: 'z-recover-text-type', ts: 504, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'string ts in existing resets cache cleanly',
+        existing: [
+          { eventId: 'bad-ts-str', ts: '11', type: 'assistant.text', text: 'string ts' },
+        ],
+        incoming: { eventId: 'z-recover-ts-str', ts: 505, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'non-object array element in existing resets cache cleanly',
+        existing: [
+          { eventId: 'ok', ts: 10, type: 'user.message', text: 'ok' },
+          null,
+        ],
+        incoming: { eventId: 'z-recover-non-obj', ts: 506, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'unicode whitespace-only existing item resets corrupt cache cleanly',
+        existing: [
+          { eventId: 'ws', ts: 10, type: 'assistant.text', text: '\t\n\u00a0\u3000\ufeff' },
+        ],
+        incoming: { eventId: 'z-recover-ws', ts: 503, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'unicode whitespace trimming, 1024-char truncation, source/confidence normalization, extra field stripping',
+        existing: [
+          {
+            eventId: 'norm-1',
+            ts: 50,
+            type: 'assistant.text',
+            text: `\u00a0\t ${'x'.repeat(1100)} \u3000\n`,
+            source: '  daemon  ',
+            confidence: '   ',
+            extraNoise: 'drop-me',
+          },
+        ],
+        incoming: {
+          eventId: 'norm-2',
+          ts: 60,
+          type: 'user.message',
+          payload: { text: `\ufeff  ${'y'.repeat(1100)} \t` },
+          source: ' web ',
+          confidence: ' high ',
+        },
+      },
+      {
+        name: 'canonical equivalent NFC before NFD at same ts preserves insertion order without deterministic tie-break',
+        existing: [
+          { eventId: '\u00e9', ts: 100, type: 'assistant.text', text: 'nfc-first' },
+          { eventId: 'e\u0301', ts: 100, type: 'assistant.text', text: 'nfd-second' },
+        ],
+        incoming: { eventId: 'z-next', ts: 200, type: 'assistant.text', payload: { text: 'next' } },
+      },
+      {
+        name: 'canonical equivalent NFD before NFC at same ts preserves insertion order without deterministic tie-break',
+        existing: [
+          { eventId: 'e\u0301', ts: 100, type: 'assistant.text', text: 'nfd-first' },
+          { eventId: '\u00e9', ts: 100, type: 'assistant.text', text: 'nfc-second' },
+        ],
+        incoming: { eventId: 'z-next', ts: 200, type: 'assistant.text', payload: { text: 'next' } },
+      },
+      {
+        name: 'canonical equivalent eventIds remain distinct Map keys at 50-item cutoff',
+        existing: [
+          { eventId: '\u00e9', ts: 100, type: 'assistant.text', text: 'nfc-evicted' },
+          { eventId: 'e\u0301', ts: 100, type: 'assistant.text', text: 'nfd-kept' },
+          ...Array.from({ length: 48 }, (_, idx) => ({
+            eventId: `keep-${idx}`,
+            ts: 200 + idx,
+            type: 'assistant.text',
+            text: `msg-${idx}`,
+          })),
+        ],
+        incoming: { eventId: 'keep-48', ts: 300, type: 'assistant.text', payload: { text: 'msg-48' } },
+      },
+      {
+        name: 'combining-mark reordering, angstrom, and zero-weight codepoint equivalence preserve insertion order',
+        existing: [
+          { eventId: 'a\u0323\u0301', ts: 100, type: 'assistant.text', text: 'under-then-acute' },
+          { eventId: 'a\u0301\u0323', ts: 100, type: 'assistant.text', text: 'acute-then-under' },
+          { eventId: '\u212b', ts: 200, type: 'assistant.text', text: 'angstrom-sign' },
+          { eventId: 'A\u030a', ts: 200, type: 'assistant.text', text: 'A-ring-nfd' },
+          { eventId: '\u00c5', ts: 200, type: 'assistant.text', text: 'A-ring-nfc' },
+          { eventId: 'a\u200bb', ts: 300, type: 'assistant.text', text: 'zwsp' },
+          { eventId: 'ab', ts: 300, type: 'assistant.text', text: 'plain' },
+        ],
+        incoming: { eventId: 'z-tail', ts: 400, type: 'assistant.text', payload: { text: 'tail' } },
+      },
+      {
+        name: 'UTF-16 code-unit 1024 truncation on existing astral emoji text (512 emojis = 1024 UTF-16 units)',
+        existing: [
+          { eventId: 'emoji-600', ts: 50, type: 'assistant.text', text: '😀'.repeat(600) },
+          { eventId: 'mixed-emoji', ts: 60, type: 'user.message', text: `${'a'.repeat(10)}${'😀'.repeat(600)}` },
+        ],
+        incoming: { eventId: 'emoji-in', ts: 70, type: 'assistant.text', payload: { text: '😀'.repeat(600) } },
+      },
+    ];
+
+    for (let i = 0; i < cases.length; i++) {
+      const c = cases[i]!;
+      const diffSession = `${sessionName}-diff-${i}`;
+      await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, diffSession]);
+      await db.execute(
+        `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+         VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+        [serverId, diffSession, JSON.stringify(c.existing), 1],
+      );
+
+      const fullIncoming = { ...c.incoming, sessionId: diffSession };
+      const expectedEvents = legacyMerge(c.existing, fullIncoming);
+      const expectedLatestTs = expectedEvents.at(-1)?.ts ?? null;
+
+      await upsertSessionTextTailCacheEvent(db, serverId, fullIncoming);
+
+      const actualEvents = await getSessionTextTailCache(db, serverId, diffSession);
+      const rawRow = await db.queryOne<{ events: unknown; latest_ts: number | null }>(
+        'SELECT events, latest_ts FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2',
+        [serverId, diffSession],
+      );
+
+      expect(actualEvents, `case=${c.name} getSessionTextTailCache`).toEqual(expectedEvents);
+      expect(rawRow?.events, `case=${c.name} stored jsonb`).toEqual(expectedEvents);
+      expect(rawRow?.latest_ts, `case=${c.name} latest_ts`).toBe(expectedLatestTs);
+    }
+
+    // Surrogate-pair boundary on existing element: stops at 1023 UTF-16 units instead of splitting into an invalid lone JSONB surrogate.
+    const surrogateSession = `${sessionName}-surrogate-boundary`;
+    await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, surrogateSession]);
+    await db.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+      [serverId, surrogateSession, JSON.stringify([{ eventId: 'surr-1', ts: 50, type: 'assistant.text', text: `${'a'.repeat(1023)}😀` }]), 50],
+    );
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: 'surr-2',
+      sessionId: surrogateSession,
+      ts: 60,
+      type: 'assistant.text',
+      payload: { text: 'ok' },
+    });
+    const surrogateEvents = await getSessionTextTailCache(db, serverId, surrogateSession);
+    expect(surrogateEvents.map((e) => [e.eventId, e.text.length])).toEqual([
+      ['surr-1', 1023],
+      ['surr-2', 2],
+    ]);
+  });
+
+  it('recovers automatically when session_text_tail_icu collation is missing', async () => {
+    const serverId = 'srv-tail-collation-recover-' + Math.random().toString(36).slice(2);
+    const sessionName = 'recover-session';
+    await db.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+      [serverId, sessionName, JSON.stringify([{ eventId: '\u00e9', ts: 10, type: 'assistant.text', text: 'first' }]), 10],
+    );
+
+    await db.execute('DROP COLLATION IF EXISTS session_text_tail_icu');
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: 'e\u0301',
+      sessionId: sessionName,
+      ts: 10,
+      type: 'assistant.text',
+      payload: { text: 'second' },
+    });
+
+    const events = await getSessionTextTailCache(db, serverId, sessionName);
+    expect(events.map((e) => e.eventId)).toEqual(['\u00e9', 'e\u0301']);
+    const collRow = await db.queryOne<{ collname: string }>(
+      "SELECT collname FROM pg_collation WHERE collname = 'session_text_tail_icu'",
+    );
+    expect(collRow?.collname).toBe('session_text_tail_icu');
   });
 });
 

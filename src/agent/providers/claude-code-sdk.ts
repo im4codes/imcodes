@@ -1,3 +1,4 @@
+import { setSessionIncognito, withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 import { confirmPromiseStop, bindCapturedChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
 import { backpressureYield } from '../../util/event-loop-backpressure.js';
@@ -168,6 +169,7 @@ type ClaudeChecklistInput = {
 };
 
 interface ClaudeSdkSessionState {
+  incognito?: boolean;
   routeId: string;
   sessionName?: string;
   projectName?: string;
@@ -606,6 +608,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
+    setSessionIncognito(routeId, config.incognito === true || existing?.incognito === true);
     const resumeId = config.resumeId ?? existing?.resumeId ?? routeId;
     const authEnv = { ...process.env, ...(config.env ?? existing?.env ?? {}) };
     const localAuthContext = config.authContext
@@ -616,6 +619,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
     this.sessions.set(routeId, {
       routeId,
+      incognito: config.incognito === true || existing?.incognito === true,
       sessionName: config.sessionName ?? existing?.sessionName,
       projectName: config.projectName ?? existing?.projectName,
       serverId: config.serverId ?? existing?.serverId,
@@ -718,11 +722,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const backgroundedSubagentCount = activeSubagentTasks.length - blockingSubagentCount;
     const onlyBackgroundedSubagents = activeSubagentTasks.length > 0 && blockingSubagentCount === 0;
     const waitingForTaskNotification = state.completed && !state.pendingComplete && blockingSubagentCount > 0;
+    const settledIncognitoIdle = Boolean(
+      state.incognito && state.completed && !state.pendingComplete && !state.cancelled,
+    );
     const backgroundActive = Boolean(
       state.resultCompletionTimer
       || state.authRefreshRetryPending
-      || (state.currentQuery && !waitingForTaskNotification && !onlyBackgroundedSubagents)
-      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification && !onlyBackgroundedSubagents),
+      || (state.currentQuery && !waitingForTaskNotification && !onlyBackgroundedSubagents && !settledIncognitoIdle)
+      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification && !onlyBackgroundedSubagents && !settledIncognitoIdle),
     );
     const busyReasons: SessionActivityBusyReason[] = [];
     if (activeToolCount > 0) busyReasons.push('provider_tool_item');
@@ -818,7 +825,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (decision.allow) return {};
       return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.reason } };
     } catch (error) {
-      logger.warn({ provider: this.id, error }, 'Claude SDK tool execution guard failed; allowing the call');
+      logger.warn({ provider: this.id, sessionName: state.sessionName, error }, 'Claude SDK tool execution guard failed; allowing the call');
       return {};
     }
   }
@@ -846,7 +853,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         ...(typeof hookInput.tool_use_id === 'string' ? { toolUseId: hookInput.tool_use_id } : {}),
       });
     } catch (error) {
-      logger.warn({ provider: this.id, error }, 'Claude SDK native collaboration advisory failed');
+      logger.warn({ provider: this.id, sessionName: state.sessionName, error }, 'Claude SDK native collaboration advisory failed');
     }
     return {};
   }
@@ -902,7 +909,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // closeSettledQueryIfNoSubagents). The user sees an idle agent, so a message
       // must get through — delivering it into the live query's streaming input
       // is the only way that does not close the query and kill those subagents.
-      if (state.inputQueue && this.isSubagentOnlyIdle(state)) {
+      if (state.inputQueue && (this.isSubagentOnlyIdle(state) || (state.incognito && state.completed && !state.cancelled))) {
         const queued = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
         state.runtimeActivityGeneration = queued.activityGeneration;
         // This is a new visible foreground turn inside the retained query.
@@ -1068,6 +1075,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const prompt = systemParts.hasSplitSystemText
       ? composeMessageSideProviderPrompt(payload, { includeSessionSystemText: false })
       : payload.assembledMessage;
+    if (state.incognito && state.started) throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
     const startedAsResume = state.started;
     state.currentStartedAsResume = startedAsResume;
     state.currentConnectionClosedRetriesRemaining = connectionClosedRetriesRemaining;
@@ -1079,6 +1087,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       append: baseSystemPrompt,
     } : undefined;
     const options: Record<string, unknown> = {
+      ...(state.incognito ? { persistSession: false, strictMcpConfig: true, debug: false } : {}),
       cwd: payload.turnCwd ?? state.cwd,
       env: buildClaudeAgentEnv({ ...(state.env ?? {}), ...(state.localAuthContext?.env ?? {}) }),
       permissionMode: state.permissionMode,
@@ -1100,7 +1109,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ...(state.model ? { model: state.model } : {}),
       ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
-      mcpServers: getClaudeMcpServers({
+      mcpServers: state.incognito ? {} : getClaudeMcpServers({
         sessionKey: state.routeId,
         sessionName: state.sessionName,
         // `startQuery` rebuilds the MCP configuration on every turn (including
@@ -1153,7 +1162,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         if (state.currentChild === child) state.currentChild = null;
       });
       child.on('error', (err) => {
-        logger.error({ provider: this.id, err }, 'Claude SDK spawn error (suppressed)');
+        logger.error({ provider: this.id, sessionName: state.sessionName, err }, 'Claude SDK spawn error (suppressed)');
       });
       return child;
     };
@@ -1187,7 +1196,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const inputQueue = new SdkInputQueue();
     inputQueue.push(prompt);
     state.inputQueue = inputQueue;
-    const q = query({ prompt: inputQueue, options: options as any });
+    const q = withSessionPrivacy(state.sessionName, state.incognito === true, () => query({ prompt: inputQueue, options: options as any }));
     const turnGeneration = ++state.turnGeneration;
     state.currentQuery = q;
     const settlement = this.consumeQuery(
@@ -2073,6 +2082,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
         return;
       }
+      if (state.incognito) {
+        // Keep the live in-memory query open across turns for incognito sessions.
+        for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
+        return;
+      }
       try { q.close(); } catch {}
       // Sync caller: retained rather than awaited, and drained by disconnect().
       this.trackTeardown(this.terminateChild(state));
@@ -2709,6 +2723,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private closeSettledQueryIfNoSubagents(sessionId: string, state: ClaudeSdkSessionState, reason: string): boolean {
+    // Private multi-turn continuity is this live query, never a disk resume.
+    if (state.incognito) return false;
     if (!state.currentQuery) return false;
     if (!state.completed) return false;
     if (this.activeClaudeSubagentTasks(state).length > 0) return false;

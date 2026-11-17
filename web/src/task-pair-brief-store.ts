@@ -89,7 +89,8 @@ export function requestTaskPairBrief(taskId: string, revision: string): void {
 /** A BRIEF_RESPONSE arrived. `briefRevision`/`brief` are null when the pair has no brief any more. */
 export function receiveTaskPairBrief(taskId: string, briefRevision: string | null, brief: string | null): void {
   const pending = inflight.get(taskId);
-  if (pending) {
+  // A late answer for an older revision must not clear the current request.
+  if (pending && (briefRevision === null || pending.revision === briefRevision)) {
     clearTimeout(pending.timer);
     inflight.delete(taskId);
   }

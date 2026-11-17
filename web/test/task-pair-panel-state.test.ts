@@ -74,6 +74,15 @@ describe('what the panel shows', () => {
     expect(resolveTaskPairPanelCollapsed({ choice: false, mobile: true, phone: true })).toBe(false); // a stored main-chat choice still applies
   });
 
+  it('an explicit split visit starts closed on every layout and honours only its current visit choice', () => {
+    for (const mobile of [false, true]) {
+      const input = { mobile, phone: false, scopeSessionId: 'deck_sub_a', collapsedVisitKey: 'split-A' };
+      expect(usesVisitScopedChoice(input)).toBe(true);
+      expect(resolveTaskPairPanelCollapsed({ ...input, choice: undefined })).toBe(true);
+      expect(resolveTaskPairPanelCollapsed({ ...input, choice: false })).toBe(false);
+    }
+  });
+
   it('only a phone sub-session has a per-visit choice', () => {
     expect(usesVisitScopedChoice({ phone: true, scopeSessionId: 'a' })).toBe(true);
     expect(usesVisitScopedChoice({ phone: false, scopeSessionId: 'a' })).toBe(false);

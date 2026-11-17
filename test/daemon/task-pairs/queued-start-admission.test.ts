@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * A queued pair starts ONLY through the scheduler's admission, which checks
  * capacity, provisions the workspace and delivers the brief that names it
@@ -87,7 +88,7 @@ function brainSends(taskId: string, target: string, eventId: string) {
 }
 /** A started pair whose workspace is missing: what the bare flip (or a failed provisioning) left behind. */
 function startedWithoutWorkspace(taskId: string, status: TaskPairState['status'] = 'working', extra: Partial<TaskPairState> = {}, executor = EXEC, auditor = AUD) {
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     taskId, brain: BRAIN, status, flags: [], flagSides: {}, round: status === 'in_audit' || status === 'rework' ? 1 : 0,
     blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now, startedAt: now,
     executor, auditor, brief: `brief of ${taskId}`, ...extra,
@@ -220,7 +221,7 @@ describe('a queued pair starts only through admission', () => {
     now += 1_000; // (a later instant: the queue's event ids carry the clock)
     sent = [];
     // ...so put it back the way an older daemon might have left it (no drain yet), then message its executor.
-    getTaskPairStore().savePair(PROJECT, { ...pair('Q1'), status: 'queued', startedAt: undefined, workspace: undefined });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('Q1'), status: 'queued', startedAt: undefined, workspace: undefined });
     brainSends('Q1', EXEC, 'brain-send-free');
     await flush();
     expect(pair('Q1').status).toBe('working');
@@ -309,13 +310,13 @@ describe('a queued pair starts only through admission', () => {
     });
 
     it('leaves queued pairs (admission provisions those) and legacy-imported pairs (they keep their own worktrees) alone', async () => {
-      getTaskPairStore().savePair(PROJECT, {
+      putTaskPairFixture(getTaskPairStore(), PROJECT, {
         taskId: 'R5', brain: BRAIN, status: 'queued', flags: [], flagSides: {}, round: 0, blocking: ['P0'], previousAuditors: [],
         capCounts: {}, capRound: 0, createdAt: now, updatedAt: now, executor: EXEC2, auditor: AUD2, brief: 'queued brief',
       } satisfies TaskPairState);
       startedWithoutWorkspace('R6', 'working', {}, EXEC, AUD);
       const stored = getTaskPairStore().getPair(PROJECT, 'R6')!;
-      getTaskPairStore().savePair(PROJECT, stored.state, { legacyTaskId: 'legacy_R6' });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, stored.state, { legacyTaskId: 'legacy_R6' });
       busy.add(EXEC2); // R5 stays queued
       await tick(1);
       expect(pair('R5').workspace).toBeUndefined();

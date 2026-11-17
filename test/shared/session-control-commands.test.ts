@@ -4,6 +4,7 @@ import {
   getSessionControlTimelineFeedback,
   getSessionControlTimelineFeedbackById,
   isDaemonHandledSessionControlSend,
+  isSessionHandoffCommandText,
   isSessionModelSwitchCommandText,
   isSessionControlCommandText,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -88,8 +89,31 @@ describe('session control command abstraction', () => {
 
   it('only matches exact control commands, not slash commands with arguments', () => {
     expect(isSessionControlCommandText('/compact now', 'compact')).toBe(false);
+    expect(isSessionControlCommandText('/handoff now', 'handoff')).toBe(false);
     expect(classifySessionControlCommand('/clear please')).toBeNull();
+    expect(classifySessionControlCommand('/handoff please')).toBeNull();
     expect(shouldResetProcessPreferenceContextForSessionControl('/model gpt-5.4')).toBe(false);
+  });
+
+  it('models /handoff as a daemon-managed command with visible user message and process preference reset', () => {
+    expect(classifySessionControlCommand('  /handoff  ')).toMatchObject({
+      id: 'handoff',
+      handling: 'daemon-managed',
+      timelineUserMessage: 'visible',
+      optimisticUserMessage: 'visible',
+      timelineFeedback: null,
+      daemonHandledReceiptAck: true,
+      resetsProcessPreferenceContext: true,
+      resetsTransportPreferenceContextOnSend: false,
+    });
+    expect(isSessionHandoffCommandText('/handoff')).toBe(true);
+    expect(isSessionHandoffCommandText(' /handoff ')).toBe(true);
+    expect(isSessionHandoffCommandText('/handoff extra')).toBe(false);
+    expect(isDaemonHandledSessionControlSend('/handoff')).toBe(true);
+    expect(shouldHideTimelineUserMessageForSessionControl('/handoff')).toBe(false);
+    expect(shouldHideOptimisticUserMessageForSessionControl('/handoff')).toBe(false);
+    expect(shouldResetProcessPreferenceContextForSessionControl('/handoff')).toBe(true);
+    expect(shouldResetTransportPreferenceContextForSessionControl('/handoff')).toBe(false);
   });
 
   it('recognizes complete model-switch commands without matching ordinary prose', () => {

@@ -29,16 +29,19 @@ export function DeleteAccount({ onDeleted }: Props) {
   };
 
   return (
-    <div style={{ marginTop: 32, padding: 16, border: '1px solid #7f1d1d', borderRadius: 8, background: '#1a0000' }}>
-      <h3 style={{ marginTop: 0, marginBottom: 8, color: '#f87171' }}>{t('account.delete_title')}</h3>
-      <p style={{ fontSize: 14, color: '#94a3b8', marginBottom: 12 }}>{t('account.delete_warning')}</p>
+    <section class="dashboard-card dashboard-card-danger">
+      <div class="dashboard-card-header" style={{ marginBottom: 8 }}>
+        <h2 class="dashboard-card-title">{t('account.delete_title')}</h2>
+      </div>
+      <p class="dashboard-muted" style={{ marginTop: 0, marginBottom: 14 }}>{t('account.delete_warning')}</p>
 
       {error && (
-        <div style={{ color: '#f87171', marginBottom: 12, fontSize: 14 }}>{error}</div>
+        <div class="dashboard-error">{error}</div>
       )}
 
       {!showConfirm ? (
         <button
+          type="button"
           class="btn btn-danger"
           style={{ fontSize: 13 }}
           onClick={() => setShowConfirm(true)}
@@ -47,36 +50,39 @@ export function DeleteAccount({ onDeleted }: Props) {
         </button>
       ) : (
         <div>
-          <p style={{ fontSize: 13, color: '#e2e8f0', marginBottom: 8 }}>
+          <p style={{ fontSize: 13, color: '#e2e8f0', marginTop: 0, marginBottom: 10 }}>
             {t('account.delete_confirm_prompt')}
           </p>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div class="dashboard-inline-form">
             <input
               class="input"
-              style={{ flex: 1 }}
               type="text"
               placeholder="DELETE"
               value={confirmText}
               onInput={(e) => setConfirmText((e.target as HTMLInputElement).value)}
             />
-            <button
-              class="btn btn-danger"
-              style={{ fontSize: 13 }}
-              disabled={confirmText !== 'DELETE' || deleting}
-              onClick={handleDelete}
-            >
-              {deleting ? t('common.loading') : t('account.delete_confirm')}
-            </button>
-            <button
-              class="btn btn-ghost"
-              style={{ fontSize: 13 }}
-              onClick={() => { setShowConfirm(false); setConfirmText(''); }}
-            >
-              {t('common.cancel')}
-            </button>
+            <div class="dashboard-inline-form-actions">
+              <button
+                type="button"
+                class="btn btn-danger"
+                style={{ fontSize: 13 }}
+                disabled={confirmText !== 'DELETE' || deleting}
+                onClick={handleDelete}
+              >
+                {deleting ? t('common.loading') : t('account.delete_confirm')}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost"
+                style={{ fontSize: 13 }}
+                onClick={() => { setShowConfirm(false); setConfirmText(''); }}
+              >
+                {t('common.cancel')}
+              </button>
+            </div>
           </div>
         </div>
       )}
-    </div>
+    </section>
   );
 }

@@ -27,19 +27,24 @@ export function resolvePiExtensionEntry(): string {
 }
 
 export function buildPiRpcArgs(options: {
-  sessionId: string;
+  sessionId?: string;
   sessionName?: string;
   requestedModel?: string;
   effort?: string;
   llm?: PiLlmConfig;
+  incognito?: boolean;
 }): string[] {
-  const args = [
-    '--mode', 'rpc',
-    '--session-id', options.sessionId,
-    '--session-dir', piSessionDir(),
-    '--extension', resolvePiExtensionEntry(),
-  ];
-  if (options.sessionName) args.push('--name', options.sessionName);
+  const args = ['--mode', 'rpc'];
+  if (options.incognito) {
+    args.push('--no-session');
+  } else {
+    if (!options.sessionId) {
+      throw new Error('Pi RPC sessionId is required for non-incognito sessions');
+    }
+    args.push('--session-id', options.sessionId, '--session-dir', piSessionDir());
+  }
+  args.push('--extension', resolvePiExtensionEntry());
+  if (!options.incognito && options.sessionName) args.push('--name', options.sessionName);
   if (options.llm?.provider) args.push('--provider', options.llm.provider);
   const model = options.requestedModel?.trim() || options.llm?.model;
   if (model) args.push('--model', model);

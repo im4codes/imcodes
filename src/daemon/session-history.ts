@@ -7,12 +7,22 @@ import type { SessionRecord } from '../store/session-store.js';
 import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 
 /** The same canonical text-only reader serves MCP and cross-provider handoffs. */
-export async function readSessionTextMessages(sessionName: string, limit = SESSION_TEXT_HISTORY_DEFAULT_LIMIT, through?: TimelineTextTailOptions['through'], redact = true): Promise<SessionTextMessage[]> {
+export async function readSessionTextMessages(
+  sessionName: string,
+  limit = SESSION_TEXT_HISTORY_DEFAULT_LIMIT,
+  through?: TimelineTextTailOptions['through'],
+  redact = true,
+  options?: { excludeDaemonNotices?: boolean; maxChars?: number },
+): Promise<SessionTextMessage[]> {
   if (!Number.isInteger(limit) || limit < 1 || limit > SESSION_TEXT_HISTORY_MAX_LIMIT) throw new Error(`limit must be 1..${SESSION_TEXT_HISTORY_MAX_LIMIT}`);
+  const effectiveMaxChars = typeof options?.maxChars === 'number' && Number.isFinite(options.maxChars) && options.maxChars > 0
+    ? Math.trunc(options.maxChars)
+    : SESSION_TEXT_HISTORY_MAX_CHARS;
   const events = await timelineStore.readCompletedTextTail(sessionName, limit, { visibleOnly: true, ...(through ? { through } : {}) });
-  const budget = Math.floor(SESSION_TEXT_HISTORY_MAX_CHARS / Math.max(1, events.length));
+  const budget = Math.floor(effectiveMaxChars / Math.max(1, events.length));
   return events.filter((event) => event.type === 'user.message' || (event.type === 'assistant.text' && event.payload.streaming !== true))
     .filter((event) => event.hidden !== true && event.payload.hidden !== true)
+    .filter((event) => !options?.excludeDaemonNotices || !(event.type === 'assistant.text' && typeof event.payload.noticeCode === 'string'))
     .map((event) => {
       const raw = event.payload.text ?? event.payload.content ?? event.payload.message;
       const text = typeof raw === 'string' ? (redact ? redactSensitiveText(raw) : raw) : '';
@@ -21,13 +31,22 @@ export async function readSessionTextMessages(sessionName: string, limit = SESSI
 }
 
 /** Reuse the processed-summary store's indexed namespace+session filter. */
-export async function readSessionSummaries(sessionName: string, namespace: ContextNamespace, limit = SESSION_TEXT_HISTORY_DEFAULT_LIMIT, redact = true) {
+export async function readSessionSummaries(
+  sessionName: string,
+  namespace: ContextNamespace,
+  limit = SESSION_TEXT_HISTORY_DEFAULT_LIMIT,
+  redact = true,
+  maxChars = SESSION_TEXT_HISTORY_MAX_CHARS,
+) {
   if (!Number.isInteger(limit) || limit < 1 || limit > SESSION_TEXT_HISTORY_MAX_LIMIT) throw new Error(`limit must be 1..${SESSION_TEXT_HISTORY_MAX_LIMIT}`);
+  const effectiveMaxChars = Number.isFinite(maxChars) && maxChars > 0
+    ? Math.trunc(maxChars)
+    : SESSION_TEXT_HISTORY_MAX_CHARS;
   const groups = await Promise.all(['recent_summary', 'master_summary'].map((kind) =>
     getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, kind, { sessionName, excludeArchived: true, limit }])));
   const rows = groups.flat().filter((row) => row.content?.sessionName === sessionName && row.status !== 'archived' && row.status !== 'archived_dedup')
     .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)).slice(0, limit);
-  const budget = Math.floor(SESSION_TEXT_HISTORY_MAX_CHARS / Math.max(1, rows.length));
+  const budget = Math.floor(effectiveMaxChars / Math.max(1, rows.length));
   return rows.map((row) => {
     const summary = redact ? redactSensitiveText(row.summary) : row.summary;
     return { id: row.id, summary: summary.slice(0, budget), updatedAt: row.updatedAt, truncated: summary.length > budget,

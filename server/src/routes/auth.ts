@@ -3,10 +3,15 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
-import { randomHex, sha256Hex, signJwt, hashPassword, verifyPassword } from '../security/crypto.js';
+import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
 import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
-import { resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
+import { DOC_COLLABORATOR_SCOPE_REFUSAL, requireAuth, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
+import {
+  buildDesktopSetupCallbackRedirectUrl,
+  DESKTOP_SETUP_CALLBACK_QUERY_PARAM,
+  parseDesktopSetupCallbackUrl,
+} from '../../../shared/desktop-setup-auth.js';
 import { isUserActive } from '../security/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
@@ -17,6 +22,7 @@ import logger from '../util/logger.js';
 import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 import { rememberClientTimezone } from '../util/client-timezone.js';
 import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
+import { r2RelayConfig } from '../services/r2-relay.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -28,8 +34,21 @@ let authNonceCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let authNonceStartupCleanupPromise: Promise<void> | null = null;
 
 // Task 5: Cache-Control: no-store on all auth endpoints
-authRoutes.use('/*', async (c, next) => {
+authRoutes.use('/*', async (c, next): Promise<Response | void> => {
   scheduleAuthNonceCleanup(c.env.DB);
+  const path = c.req.path;
+  const method = c.req.method;
+  const isDocCollabAllowedAuthPath =
+    (method === 'GET' && path.endsWith('/user/me')) ||
+    (method === 'POST' && (path.endsWith('/refresh') || path.endsWith('/logout') || path.endsWith('/relay/verify'))) ||
+    path.includes('/github') ||
+    path.includes('/google');
+  if (!isDocCollabAllowedAuthPath) {
+    const resolution = await resolveAuthOutcome(c);
+    if (resolution.auth?.scope === 'doc_collaborator') {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+    }
+  }
   await next();
   c.header('Cache-Control', 'no-store');
   c.header('Pragma', 'no-cache');
@@ -197,14 +216,21 @@ authRoutes.post('/register', async (c) => {
 // GET /api/auth/user/me — get authenticated user (cookie, Bearer API key or JWT)
 // NOTE: must be registered before /user/:id to avoid Hono matching id='me'
 authRoutes.get('/user/me', async (c) => {
-  const userId = await resolveUserId(c);
+  const resolution = await resolveAuthOutcome(c);
+  const userId = resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'not_found' }, 404);
   await rememberClientTimezone(c.env.DB, userId, c.req.header(CLIENT_TIMEZONE_HEADER)).catch((err) => {
     logger.warn({ err, userId }, 'Failed to remember client timezone');
   });
-  return c.json(toClientUser(user));
+  const clientUser = toClientUser(user);
+  const r2RelayEnabled = r2RelayConfig(c.env) !== null;
+  return c.json(
+    resolution.auth?.scope === 'doc_collaborator' && clientUser
+      ? { ...clientUser, scope: 'doc_collaborator' as const, r2RelayEnabled }
+      : { ...clientUser, r2RelayEnabled },
+  );
 });
 
 // GET /api/auth/user/:id — requires auth, only accessible for own user ID
@@ -447,6 +473,49 @@ authRoutes.post('/token-exchange', async (c) => {
   });
 });
 
+// POST /api/auth/desktop/nonce — mint a short-lived nonce for a validated loopback desktop callback
+const desktopNonceSchema = z.object({
+  callbackUrl: z.string().min(1).max(512),
+});
+
+authRoutes.post('/desktop/nonce', requireAuth({ refuseDaemonCredential: true }), async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = desktopNonceSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const validated = parseDesktopSetupCallbackUrl(parsed.data.callbackUrl);
+  if (!validated) return c.json({ error: 'invalid_desktop_callback' }, 400);
+
+  const userId = c.get('userId' as never) as string;
+  if (!await isUserActive(c.env.DB, userId)) {
+    return c.json({ error: 'account_not_active' }, 403);
+  }
+
+  const rawKey = `deck_${randomHex(32)}`;
+  const keyHash = sha256Hex(rawKey);
+  const keyId = randomHex(16);
+  const now = Date.now();
+  await c.env.DB.execute(
+    'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [keyId, userId, keyHash, 'Desktop app', now],
+  );
+
+  const nonce = await issueAuthNonce(c.env.DB, { apiKey: rawKey, userId, keyId });
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAuthAudit(c, {
+    userId,
+    action: 'auth.desktop_nonce',
+    ip,
+    outcomeCode: 'success',
+    details: { keyId, callbackPort: validated.port },
+  }, c.env.DB);
+
+  return c.json({
+    nonce,
+    redirectUrl: buildDesktopSetupCallbackRedirectUrl(validated, nonce),
+  });
+});
+
 // POST /api/auth/refresh — refresh JWT access token (cookie or JSON body)
 const refreshSchema = z.object({ refreshToken: z.string().optional() });
 
@@ -498,7 +567,15 @@ authRoutes.post('/refresh', async (c) => {
   logger.info({ tokenId: row.id }, '[refresh] token consumed, issuing new pair');
 
   // Issue new access (4h) + refresh (30d) tokens
-  const accessToken = signJwt({ sub: row.user_id }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  // Preserve restricted doc_collaborator scope across token rotation
+  const isDocCollabRefresh = typeof row.family_id === 'string' && row.family_id.startsWith('doc_collab:');
+  const accessToken = signJwt(
+    isDocCollabRefresh
+      ? { sub: row.user_id, type: ACCOUNT_SESSION_JWT_TYPE, scope: 'doc_collaborator' }
+      : { sub: row.user_id },
+    c.env.JWT_SIGNING_KEY,
+    4 * 3600,
+  );
   const newRefresh = randomHex(32);
   const newRefreshHash = sha256Hex(newRefresh);
   const newRefreshId = randomHex(16);
@@ -908,4 +985,305 @@ authRoutes.post('/logout', async (c) => {
   }
 
   return c.json({ ok: true });
+});
+
+// ── Keyless Central OAuth Relay for Document Collaborators (GitHub & Google) ──
+
+const DOC_SHARE_RELAY_CALLBACK_PATH = '/api/doc-shares/auth-relay/callback';
+const consumedDocRelayTickets = new Map<string, number>();
+
+function cleanupConsumedDocRelayTickets(now = Date.now()): void {
+  for (const [jti, expiresAt] of consumedDocRelayTickets) {
+    if (expiresAt <= now) consumedDocRelayTickets.delete(jti);
+  }
+}
+
+function isAllowedDocRelayOrigin(
+  env: { SERVER_URL: string; ALLOWED_ORIGINS?: string },
+  rawOrigin: string,
+): string | null {
+  const trimmed = rawOrigin.trim().replace(/\/$/, '');
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  if (parsed.origin !== trimmed) return null;
+
+  const configured = (env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+  if (configured.length > 0) {
+    const allowed = new Set([env.SERVER_URL.replace(/\/$/, ''), ...configured]);
+    if (!allowed.has(trimmed)) return null;
+  }
+  return trimmed;
+}
+
+async function handleCentralDocRelayStart(
+  c: { req: { query(name: string): string | undefined }; env: Env; json(data: unknown, status?: number): Response; redirect(url: string): Response },
+  provider: 'github' | 'google',
+): Promise<Response> {
+  const rawOrigin = c.req.query('origin') ?? '';
+  const callbackPath = c.req.query('callback_path') ?? '';
+  const clientState = (c.req.query('state') ?? '').trim();
+
+  if (callbackPath !== DOC_SHARE_RELAY_CALLBACK_PATH) {
+    return c.json({ error: 'invalid_callback_path' }, 400);
+  }
+  const targetOrigin = isAllowedDocRelayOrigin(c.env, rawOrigin);
+  if (!targetOrigin) {
+    return c.json({ error: 'invalid_origin' }, 400);
+  }
+  if (!clientState) {
+    return c.json({ error: 'missing_state' }, 400);
+  }
+
+  const centralState = signJwt(
+    {
+      type: 'doc-auth-relay-central',
+      provider,
+      origin: targetOrigin,
+      callbackPath: DOC_SHARE_RELAY_CALLBACK_PATH,
+      clientState,
+      nonce: randomHex(16),
+    },
+    c.env.JWT_SIGNING_KEY,
+    600,
+  );
+
+  const centralRedirectUri = `${c.env.SERVER_URL.replace(/\/$/, '')}/api/auth/${provider}/callback`;
+  if (provider === 'github') {
+    const params = new URLSearchParams({
+      client_id: c.env.GITHUB_CLIENT_ID ?? '',
+      redirect_uri: centralRedirectUri,
+      scope: 'read:user user:email',
+      state: centralState,
+    });
+    return c.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
+  }
+
+  const params = new URLSearchParams({
+    client_id: c.env.GOOGLE_CLIENT_ID ?? '',
+    redirect_uri: centralRedirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state: centralState,
+  });
+  return c.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+}
+
+async function handleCentralDocRelayCallback(
+  c: { req: { query(name: string): string | undefined }; env: Env; json(data: unknown, status?: number): Response; redirect(url: string): Response },
+  provider: 'github' | 'google',
+  centralStatePayload: Record<string, unknown>,
+): Promise<Response> {
+  const code = c.req.query('code') ?? '';
+  if (!code) return c.json({ error: 'missing_code' }, 400);
+
+  if (
+    centralStatePayload.provider !== provider ||
+    centralStatePayload.callbackPath !== DOC_SHARE_RELAY_CALLBACK_PATH
+  ) {
+    return c.json({ error: 'invalid_state' }, 400);
+  }
+  const targetOrigin = isAllowedDocRelayOrigin(c.env, String(centralStatePayload.origin ?? ''));
+  if (!targetOrigin) {
+    return c.json({ error: 'invalid_origin' }, 400);
+  }
+  const clientState = String(centralStatePayload.clientState ?? '');
+  if (!clientState) {
+    return c.json({ error: 'missing_client_state' }, 400);
+  }
+
+  let externalId = '';
+  let username = '';
+  let email: string | null = null;
+  let displayName = '';
+
+  if (provider === 'github') {
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        client_id: c.env.GITHUB_CLIENT_ID,
+        client_secret: c.env.GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    });
+    if (!tokenRes.ok) return c.json({ error: 'token_exchange_failed' }, 502);
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenData.access_token) return c.json({ error: 'no_access_token' }, 502);
+
+    const userRes = await fetch('https://api.github.com/user', {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        'User-Agent': 'imcodes',
+        Accept: 'application/vnd.github+json',
+      },
+    });
+    if (!userRes.ok) return c.json({ error: 'github_user_fetch_failed' }, 502);
+    const ghUser = (await userRes.json()) as { id?: number | string; login?: string; name?: string; email?: string };
+    if (!ghUser.id) return c.json({ error: 'invalid_github_user' }, 502);
+    externalId = String(ghUser.id);
+    username = ghUser.login ?? `gh_${externalId}`;
+    email = ghUser.email ?? null;
+    displayName = ghUser.name || username;
+  } else {
+    const centralRedirectUri = `${c.env.SERVER_URL.replace(/\/$/, '')}/api/auth/google/callback`;
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: new URLSearchParams({
+        client_id: c.env.GOOGLE_CLIENT_ID ?? '',
+        client_secret: c.env.GOOGLE_CLIENT_SECRET ?? '',
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: centralRedirectUri,
+      }).toString(),
+    });
+    if (!tokenRes.ok) return c.json({ error: 'token_exchange_failed' }, 502);
+    const tokenData = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenData.access_token) return c.json({ error: 'no_access_token' }, 502);
+
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    if (!userRes.ok) return c.json({ error: 'google_user_fetch_failed' }, 502);
+    const gUser = (await userRes.json()) as { id?: string; sub?: string; email?: string; name?: string };
+    const gid = gUser.id ?? gUser.sub;
+    if (!gid) return c.json({ error: 'invalid_google_user' }, 502);
+    externalId = String(gid);
+    email = gUser.email ?? null;
+    username = email ? email.split('@')[0] : `google_${externalId.slice(0, 8)}`;
+    displayName = gUser.name || email || username;
+  }
+
+  const jti = randomHex(16);
+  const relayToken = signJwt(
+    {
+      type: 'doc-auth-relay-ticket',
+      iss: c.env.SERVER_URL.replace(/\/$/, ''),
+      aud: targetOrigin,
+      jti,
+      provider,
+      sub: `${provider}:${externalId}`,
+      externalId,
+      username,
+      email,
+      displayName,
+      stateHash: sha256Hex(clientState),
+    },
+    c.env.JWT_SIGNING_KEY,
+    120,
+  );
+
+  const callbackUrl = new URL(`${targetOrigin}${DOC_SHARE_RELAY_CALLBACK_PATH}`);
+  callbackUrl.searchParams.set('relay_token', relayToken);
+  callbackUrl.searchParams.set('state', clientState);
+  callbackUrl.searchParams.set('provider', provider);
+  return c.redirect(callbackUrl.toString());
+}
+
+authRoutes.get('/github', async (c, next) => {
+  if (c.req.query('callback_path')) {
+    if (c.req.query(DESKTOP_SETUP_CALLBACK_QUERY_PARAM)) {
+      return c.json({ error: 'invalid_desktop_callback' }, 400);
+    }
+    return handleCentralDocRelayStart(c, 'github');
+  }
+  return next();
+});
+
+authRoutes.get('/github/callback', async (c, next) => {
+  const state = c.req.query('state');
+  if (state && c.env.JWT_SIGNING_KEY) {
+    const payload = verifyJwt(state, c.env.JWT_SIGNING_KEY);
+    if (payload && payload.type === 'doc-auth-relay-central') {
+      return handleCentralDocRelayCallback(c, 'github', payload);
+    }
+  }
+  return next();
+});
+
+authRoutes.get('/google', async (c, next) => {
+  if (c.req.query('callback_path')) {
+    if (c.req.query(DESKTOP_SETUP_CALLBACK_QUERY_PARAM)) {
+      return c.json({ error: 'invalid_desktop_callback' }, 400);
+    }
+    return handleCentralDocRelayStart(c, 'google');
+  }
+  return next();
+});
+
+authRoutes.get('/google/callback', async (c, next) => {
+  const state = c.req.query('state');
+  if (state && c.env.JWT_SIGNING_KEY) {
+    const payload = verifyJwt(state, c.env.JWT_SIGNING_KEY);
+    if (payload && payload.type === 'doc-auth-relay-central') {
+      return handleCentralDocRelayCallback(c, 'google', payload);
+    }
+  }
+  return next();
+});
+
+const verifyRelayTicketSchema = z.object({
+  relayToken: z.string().min(1),
+  expectedAudience: z.string().min(1),
+  expectedProvider: z.enum(['github', 'google']).optional(),
+  expectedStateHash: z.string().min(1).optional(),
+});
+
+authRoutes.post('/relay/verify', async (c) => {
+  cleanupConsumedDocRelayTickets();
+  const body = await c.req.json().catch(() => null);
+  const parsed = verifyRelayTicketSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const payload = verifyJwt(parsed.data.relayToken, c.env.JWT_SIGNING_KEY);
+  if (!payload || payload.type !== 'doc-auth-relay-ticket') {
+    return c.json({ error: 'invalid_relay_token' }, 401);
+  }
+
+  const expectedIssuer = c.env.SERVER_URL.replace(/\/$/, '');
+  if (payload.iss !== expectedIssuer) {
+    return c.json({ error: 'invalid_relay_issuer' }, 401);
+  }
+
+  const expectedAud = parsed.data.expectedAudience.trim().replace(/\/$/, '');
+  if (payload.aud !== expectedAud) {
+    return c.json({ error: 'invalid_relay_audience' }, 401);
+  }
+
+  if (parsed.data.expectedProvider && payload.provider !== parsed.data.expectedProvider) {
+    return c.json({ error: 'invalid_relay_provider' }, 401);
+  }
+
+  if (parsed.data.expectedStateHash && payload.stateHash !== parsed.data.expectedStateHash) {
+    return c.json({ error: 'invalid_relay_state_binding' }, 401);
+  }
+
+  const jti = typeof payload.jti === 'string' ? payload.jti : '';
+  if (!jti || consumedDocRelayTickets.has(jti)) {
+    return c.json({ error: 'relay_token_replayed' }, 401);
+  }
+  consumedDocRelayTickets.set(jti, Date.now() + 5 * 60 * 1000);
+
+  return c.json({
+    ok: true,
+    issuer: expectedIssuer,
+    profile: {
+      provider: payload.provider as 'github' | 'google',
+      externalId: String(payload.externalId ?? ''),
+      username: String(payload.username ?? ''),
+      email: typeof payload.email === 'string' ? payload.email : null,
+      displayName: String(payload.displayName ?? ''),
+    },
+  });
 });

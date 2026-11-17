@@ -50,5 +50,8 @@ describe('daemon route inventory guards', () => {
     expect(isCovered('/api/capabilities/operations', 'GET')).toBe(false);
     expect(isCovered('/api/capabilities/operations', 'GET', true)).toBe(true);
     expect(isCovered('/api/machines', 'DELETE')).toBe(false);
+    // Loopback /api/daemon/logs is admitted only under src/node/, never outside it.
+    expect(isNonDaemonApiUse({ file: 'src/node/local-panel-page.ts', path: '/api/daemon/logs' })).toBe(true);
+    expect(isNonDaemonApiUse({ file: 'src/daemon/other.ts', path: '/api/daemon/logs' })).toBe(false);
   });
 });

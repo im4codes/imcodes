@@ -546,16 +546,14 @@ describe('session-store', () => {
       const detection = new Promise<'idle' | 'running'>((resolve) => {
         releaseDetection = resolve;
       });
-      let observeEmit!: () => void;
-      const emitted = new Promise<void>((resolve) => {
-        observeEmit = resolve;
-      });
-      vi.doMock('../../src/agent/detect.js', () => ({
-        detectStatusAsync: vi.fn(() => detection),
-      }));
-      vi.doMock('../../src/store/session-state-probe-events.js', () => ({
-        emitSessionStateProbeCorrection: vi.fn(() => observeEmit()),
-      }));
+      const detectStatus = vi.fn((name: string) => name === 'deck_probe_brain'
+        ? detection : Promise.resolve('running' as const));
+      vi.doMock('../../src/agent/detect.js', () => ({ detectStatusAsync: detectStatus }));
+      // Use the real leaf event bridge instead of awaiting a mock-factory-local
+      // promise forever. Prove this load's probe is pending before rotating HOME.
+      const { registerSessionStateProbeObserver } = await import('../../src/store/session-state-probe-events.js');
+      const observed = vi.fn();
+      const unregister = registerSessionStateProbeObserver(observed);
       vi.doMock('../../src/daemon/timeline-emitter.js', () => {
         throw new Error('session-store startup probing must not load timeline-emitter');
       });
@@ -571,6 +569,9 @@ describe('session-store', () => {
         });
         const store = await importSessionStore();
         await store.loadStore();
+        expect(store.getSession('deck_probe_brain')?.state).toBe('running');
+        await vi.waitFor(() => expect(detectStatus).toHaveBeenCalledWith('deck_probe_brain', 'claude-code'), { timeout: 5_000 });
+        expect(observed).not.toHaveBeenCalledWith('deck_probe_brain', 'idle');
 
         vi.stubEnv('HOME', secondHome);
         vi.stubEnv('IMCODES_HOME', join(secondHome, '.imcodes'));
@@ -585,19 +586,51 @@ describe('session-store', () => {
         }, secondHome);
 
         releaseDetection('idle');
-        await emitted;
+        await vi.waitFor(() => expect(observed).toHaveBeenCalledWith('deck_probe_brain', 'idle'), { timeout: 5_000 });
         await store.flushStore();
 
         // The second home only ever got its fixture (never migrated: nothing loaded it).
         expect(Object.keys(persistedSessions(secondHome))).toEqual([]);
         expect(persistedSessions(firstHome).deck_probe_brain?.state).toBe('idle');
       } finally {
+        releaseDetection('idle');
+        unregister();
         vi.doUnmock('../../src/agent/detect.js');
-        vi.doUnmock('../../src/store/session-state-probe-events.js');
         vi.doUnmock('../../src/daemon/timeline-emitter.js');
         vi.stubEnv('HOME', firstHome);
         vi.stubEnv('IMCODES_HOME', join(firstHome, '.imcodes'));
         rmSync(secondHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
+    });
+
+    it('does not probe sessions upserted immediately after loadStore on an empty store', async () => {
+      const detectStatus = vi.fn(async () => 'idle' as const);
+      vi.doMock('../../src/agent/detect.js', () => ({ detectStatusAsync: detectStatus }));
+      const { registerSessionStateProbeObserver } = await import('../../src/store/session-state-probe-events.js');
+      const observed = vi.fn();
+      const unregister = registerSessionStateProbeObserver(observed);
+      try {
+        const store = await importSessionStore();
+        await store.loadStore();
+        store.upsertSession({
+          name: 'deck_late_brain',
+          projectName: 'late',
+          role: 'brain',
+          agentType: 'claude-code',
+          projectDir: '/tmp/late',
+          state: 'running',
+          restarts: 0,
+          restartTimestamps: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        expect(detectStatus).not.toHaveBeenCalled();
+        expect(observed).not.toHaveBeenCalled();
+        expect(store.getSession('deck_late_brain')?.state).toBe('running');
+      } finally {
+        unregister();
+        vi.doUnmock('../../src/agent/detect.js');
       }
     });
 

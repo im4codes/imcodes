@@ -360,4 +360,31 @@ describe('pairs engine rows', () => {
       type: SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, subscriptionId: 'sub-1', reason: 'task_pair_changed',
     })]);
   });
+  it('serializes a stale-question conflict code and refreshes through the authorized live subscription', async () => {
+    const { putTaskPairFixture } = await import('../helpers/task-pair-fixture.js');
+    const { getTaskPairStore } = await import('../../src/daemon/task-pairs/store.js');
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    const { taskPairDecisionRevision } = await import('../../src/daemon/task-pairs/decision-context.js');
+    const { TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_ERROR } = await import('../../shared/task-pair-decision.js');
+    const state: any = { taskId: 'decision-live', title: 'Source choice', brain: SCOPE.coordinatorSessionName,
+      executor: 'deck_sub_test_exec', auditor: 'none', status: 'working', round: 0, flags: ['needs_input'],
+      blocking: ['P0'], previousAuditors: [], createdAt: 1, updatedAt: 1 };
+    putTaskPairFixture(getTaskPairStore(), SCOPE.projectName, state);
+    registry.handleFrame(subscribe());
+    const question = taskPairService.recordDecision({ project: SCOPE.projectName, taskId: state.taskId, round: 1,
+      kind: 'request', conclusion: 'Choose', summary: 'New source?', author: state.executor }).record;
+    const send = (type: string, requestId: string, over: Record<string, unknown> = {}) => registry.handleFrame({
+      type, taskId: state.taskId, scope: SCOPE, subscriptionId: 'sub-1', sessionName: SCOPE.coordinatorSessionName, requestId, ...over });
+    send(TASK_PAIR_DECISION_MSG.FEEDBACK, 'stale-live', { round: 1, revision: taskPairDecisionRevision(state), questionId: null, feedback: 'My draft' });
+    await vi.waitFor(() => expect(sent.find(f => f.requestId === 'stale-live')?.result).toMatchObject({ ok: false, code: TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED }));
+    send(TASK_PAIR_DECISION_MSG.HISTORY, 'refresh-live');
+    await vi.waitFor(() => expect(sent.find(f => f.requestId === 'refresh-live')?.result.pair.decisionRequest.id).toBe(question.id));
+    expect(getTaskPairStore().listDecisions(SCOPE.projectName, [state.taskId]).filter(r => r.kind === 'feedback')).toHaveLength(0);
+    // Subscription ownership remains required for the added snapshot field.
+    send(TASK_PAIR_DECISION_MSG.HISTORY, 'stale-sub', { subscriptionId: 'retired-sub' });
+    await flushPending();
+    expect(sent.some(f => f.requestId === 'stale-sub')).toBe(false);
+    await taskPairService.waitForIdle();
+  });
+
 });

@@ -140,7 +140,7 @@ describe('P2pConfigPanel', () => {
   it('keeps the mobile settings sheet inside the visual viewport above browser chrome', () => {
     const source = readFileSync(joinPath(__dirname, '../../src/components/P2pConfigPanel.tsx'), 'utf8');
 
-    expect(source).toContain("const mobilePanelHeight = 'calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px) - 12px)'");
+    expect(source).toContain("const mobilePanelHeight = 'calc(var(--vvh, var(--imcodes-ui-dvh)) - env(safe-area-inset-top, 0px) - 12px)'");
     expect(source).toContain("padding: '12px 20px calc(env(safe-area-inset-bottom, 0px) + 16px)'");
     expect(source).toMatch(/const bodyStyle[\s\S]*?minHeight:\s*0/);
     expect(source).not.toContain("calc(100vh - env(safe-area-inset-top, 0px) - 12px)");

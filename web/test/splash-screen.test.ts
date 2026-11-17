@@ -20,7 +20,7 @@ describe('startup splash screen contract', () => {
     expect(indexHtml).not.toContain('@keyframes typeOut');
   });
 
-  it('runs the splash animation quickly enough for app startup', () => {
+  it('runs the splash animation cleanly for cold startup and preserves exit transitions', () => {
     expect(indexHtml).toMatch(/animation:\s*avatarBoot 0\.34s/);
     expect(indexHtml).toMatch(/animation:\s*glitchIn 0\.45s/);
     expect(indexHtml).toMatch(/animation:\s*revealCodes 0\.32s/);
@@ -28,16 +28,16 @@ describe('startup splash screen contract', () => {
     expect(indexHtml).toMatch(/animation:\s*beamSweep 0\.9s/);
     expect(indexHtml).toMatch(/animation:\s*scanDown 1\.7s/);
     expect(indexHtml).toMatch(/transition:\s*opacity 0\.12s ease,\s*visibility 0\.12s ease/);
-    expect(appSource).toContain('const minMs = fastServerSwitch ? 0 : 1100');
-    expect(appSource).toContain('const exitMs = 120');
+    expect(appSource).toContain('const minMs = 1100;');
+    expect(appSource).toContain('const exitMs = 120;');
   });
 
-  it('distinguishes normal reloads from explicit server switch reloads', () => {
-    expect(appSource).toContain("const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash'");
-    expect(appSource).toMatch(/sessionStorage\.setItem\(FAST_SERVER_SWITCH_SPLASH_KEY,\s*'1'\)/);
-    expect(appSource).toMatch(/sessionStorage\.removeItem\(FAST_SERVER_SWITCH_SPLASH_KEY\)/);
-    expect(appSource).toMatch(/const fastServerSwitch = takeFastServerSwitchSplashFlag\(\)/);
-    expect(appSource).toMatch(/markFastServerSwitchSplash\(\);\s*window\.location\.reload\(\)/);
+  it('switches owned servers in-app without page reloads or splash flags', () => {
+    expect(appSource).not.toContain('imcodes:fast-server-switch-splash');
+    expect(appSource).not.toContain('markFastServerSwitchSplash');
+    const handleSelectServerMatch = appSource.match(/const handleSelectServer = useCallback\([\s\S]*?\n\s*\}, \[/);
+    expect(handleSelectServerMatch?.[0]).toBeTruthy();
+    expect(handleSelectServerMatch?.[0]).not.toContain('window.location.reload()');
   });
 
   it('waits for startup readiness before beginning the splash exit', () => {

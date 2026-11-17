@@ -26,6 +26,7 @@ import {
 } from '../../shared/capability-management.js';
 import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
 export interface ServerCapabilityCredentials {
   serverId: string;
@@ -37,6 +38,7 @@ export interface ServerCapabilityServiceOptions {
   serverId: string;
   fetchImpl?: typeof fetch;
   loadCredentials?: () => Promise<ServerCapabilityCredentials | null>;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
   requestTimeoutMs?: number;
   activateSkill?: (
     capability: CapabilitySummary,
@@ -316,6 +318,14 @@ export class ServerCapabilityService implements CapabilityService {
     if (!credentials || credentials.serverId !== this.options.serverId) {
       return errorResult(CAPABILITY_ERROR.FORBIDDEN, 'Caller server identity does not match daemon credentials');
     }
+    let sharedMachineAuthority: string | null = null;
+    if (this.options.loadSharedMachineAuthority) {
+      try {
+        sharedMachineAuthority = await this.options.loadSharedMachineAuthority();
+      } catch {
+        return errorResult(CAPABILITY_ERROR.FORBIDDEN, 'shared machine authority unavailable');
+      }
+    }
     const controller = new AbortController();
     const timeoutMs = Math.max(1, Math.min(this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, 60_000));
     const timer = setTimeout(() => controller.abort(new Error('Capability server request timed out')), timeoutMs);
@@ -325,6 +335,7 @@ export class ServerCapabilityService implements CapabilityService {
         signal: controller.signal,
         headers: {
           ...daemonServerAuthHeaders(credentials),
+          ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
           ...(init.body ? { 'Content-Type': 'application/json' } : {}),
           ...init.headers,
         },

@@ -226,7 +226,7 @@ describe('memory scope authorization and same-shape citation lookup', () => {
     expect(searchSql).toContain('order by (p.updated_at + case when $7::boolean then least(coalesce(cc.cite_count, 0), 100) else 0 end) desc');
   });
 
-  it('excludes projections produced by the requested current session', async () => {
+  it('returns an empty envelope without querying for an empty search', async () => {
     const { db, queryLog, projections } = makeMockDb();
     projections.set('own-summary', {
       id: 'own-summary',
@@ -263,13 +263,9 @@ describe('memory scope authorization and same-shape citation lookup', () => {
     }, env);
 
     expect(res.status).toBe(200);
-    const json = await res.json() as { sourceSessionExclusionApplied?: boolean; results: Array<{ id: string }> };
-    expect(json.sourceSessionExclusionApplied).toBe(true);
-    expect(json.results.map((item) => item.id)).toContain('sibling-summary');
-    expect(json.results.map((item) => item.id)).not.toContain('own-summary');
-    const search = queryLog.find((entry) => normalize(entry.sql).includes('shared_context_projection_cite_counts'));
-    expect(normalize(search?.sql ?? '')).toContain("content_json->>'sessionname'");
-    expect(search?.params[7]).toBe('deck_proj_brain');
+    const json = await res.json() as { results: Array<{ id: string }> };
+    expect(json.results).toEqual([]);
+    expect(queryLog.some((entry) => normalize(entry.sql).includes('shared_context_projection_cite_counts'))).toBe(false);
   });
 
   it('does not query owner-private memories from generic search when user-private sync is disabled', async () => {

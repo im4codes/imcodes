@@ -1,0 +1,448 @@
+/** @vitest-environment jsdom */
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MobileServerMenu } from '../src/components/MobileServerMenu.js';
+import { MobileServerMenuToolbar } from '../src/components/MobileServerMenuToolbar.js';
+import { MobileSharedEntriesMenu } from '../src/components/MobileSharedEntriesMenu.js';
+import type { SharedEntrySummary } from '../src/api.js';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string, opt?: { defaultValue?: string }) => opt?.defaultValue ?? key }),
+}));
+const require = createRequire(import.meta.url);
+const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
+const entries: SharedEntrySummary[] = Array.from({ length: 36 }, (_, index) => ({
+  id: `shared-${index}`, serverId: `server-${index}`, serverName: `Server ${index}`,
+  targetLabel: index === 0 ? '共享项目 very-long-name-without-spaces-0123456789' : `Shared ${index}`,
+  role: 'participant', status: 'active', target: { kind: 'server', serverId: `server-${index}` },
+}));
+
+afterEach(() => { cleanup(); localStorage.clear(); });
+
+function menu(
+  onOpen = vi.fn(),
+  onSelectServer = vi.fn(),
+  onClose = vi.fn(),
+  options: {
+    isNative?: boolean;
+    onChangeServer?: () => void;
+    onOpenControlledNodes?: () => void;
+    servers?: Array<{ id: string; name: string; online: boolean; isSharedIn?: boolean }>;
+  } = {},
+) {
+  const {
+    isNative = false,
+    onChangeServer = vi.fn(),
+    onOpenControlledNodes = vi.fn(),
+    servers = Array.from({ length: 12 }, (_, index) => ({
+      id: `owned-${index}`,
+      name: `Owned ${index}`,
+      online: true,
+      isSharedIn: false,
+    })),
+  } = options;
+
+  return render(
+    <div class="layout-mobile">
+      <div class="mobile-server-bar">
+        <div class="mobile-server-switcher-wrap">
+          <button class="mobile-server-btn">Servers</button>
+          <MobileServerMenu footer={<button>Language</button>}>
+            <MobileServerMenuToolbar
+              onHome={onClose}
+              onChangeServer={onChangeServer}
+              onOpenControlledNodes={onOpenControlledNodes}
+              isNativeApp={isNative}
+            />
+            {servers.map((s) => {
+              const presence = (s as any).presence ?? (s.online ? 'online' : 'offline');
+              const color = presence === 'online' ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+              const symbol = presence === 'online' ? '●' : presence === 'offline' ? '○' : '◌';
+              return (
+                <button
+                  key={s.id}
+                  class={`mobile-server-menu-item mobile-server-menu-server${s.isSharedIn ? ' mobile-shared-in' : ''}`}
+                  onClick={() => onSelectServer(s.id)}
+                >
+                  <span class={`mobile-server-menu-dot mobile-server-menu-dot-${presence}`} style={{ color }}>{symbol}</span>
+                  <span class="mobile-server-menu-name">{s.name}</span>
+                </button>
+              );
+            })}
+            <MobileSharedEntriesMenu entries={entries} onOpen={onOpen} onRefresh={vi.fn()} />
+          </MobileServerMenu>
+        </div>
+      </div>
+      <div class="mobile-server-backdrop" onClick={onClose} />
+      <div class="main">
+        <div class="chat-container">
+          <p>Main active session behind backdrop</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function desktopMenu(onOpen = vi.fn()) {
+  return render(
+    <div class="layout">
+      <div class="mobile-server-bar">
+        <button class="mobile-server-btn">Hidden Mobile Bar</button>
+      </div>
+      <aside class="sidebar">
+        <div class="sidebar-header">Servers</div>
+        <div class="sidebar-body">
+          <div class="sidebar-servers">
+            {Array.from({ length: 4 }, (_, index) => (
+              <button key={index} class="server-item">
+                <span>●</span><span>{`Desktop Server ${index}`}</span>
+              </button>
+            ))}
+            <MobileSharedEntriesMenu entries={entries.slice(0, 5)} onOpen={onOpen} onRefresh={vi.fn()} />
+          </div>
+        </div>
+      </aside>
+      <main class="main">
+        <div class="chat-container">
+          <p>Desktop main workspace</p>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+describe('mobile server menu shared-entry reachability', () => {
+  it('opens the exact shared server selected at the end of a long list', () => {
+    const onOpen = vi.fn();
+    menu(onOpen);
+    fireEvent.click(screen.getByRole('button', { name: /Shared 35/ }));
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect(onOpen).toHaveBeenCalledWith(entries[35]);
+  });
+
+  it('compresses mobile server menu top-row and places AI Desk on the left with Servers | Remote tabs on the right', () => {
+    const onClose = vi.fn();
+    const onChangeServer = vi.fn();
+    const onOpenControlledNodes = vi.fn();
+    const onTabChange = vi.fn();
+    const view = render(
+      <div class="layout-mobile">
+        <div class="mobile-server-bar">
+          <div class="mobile-server-switcher-wrap">
+            <MobileServerMenu footer={<button>Language</button>}>
+              <MobileServerMenuToolbar
+                onHome={onClose}
+                onChangeServer={onChangeServer}
+                onOpenControlledNodes={onOpenControlledNodes}
+                activeTab="servers"
+                onTabChange={onTabChange}
+                isNativeApp={true}
+              />
+            </MobileServerMenu>
+          </div>
+        </div>
+      </div>,
+    );
+
+    const topRow = view.container.querySelector('.mobile-server-menu-top-row')!;
+    expect(topRow).toBeTruthy();
+    const buttons = topRow.querySelectorAll('button');
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].classList.contains('mobile-server-menu-home')).toBe(true);
+    expect(buttons[0].textContent).toContain('Home');
+    expect(buttons[1].classList.contains('mobile-server-menu-change')).toBe(true);
+    expect(buttons[1].textContent).toContain('Switch Cloud Server');
+
+    const deskRow = view.container.querySelector('.mobile-server-menu-desk-row')!;
+    expect(deskRow).toBeTruthy();
+    expect(deskRow.previousElementSibling).toBe(topRow);
+
+    const aiDesk = deskRow.querySelector('.mobile-server-menu-controlled-nodes')!;
+    expect(aiDesk).toBeTruthy();
+    expect(aiDesk.textContent).toContain('AI Desk');
+
+    const tablist = deskRow.querySelector('[role="tablist"]')!;
+    expect(tablist).toBeTruthy();
+    expect(aiDesk.nextElementSibling).toBe(tablist);
+
+    const serversTab = screen.getByTestId('mobile-menu-tab-servers');
+    const remoteTab = screen.getByTestId('mobile-menu-tab-remote');
+    expect(serversTab.getAttribute('role')).toBe('tab');
+    expect(serversTab.getAttribute('aria-selected')).toBe('true');
+    expect(serversTab.getAttribute('aria-label')).toBe('Servers');
+    expect(serversTab.getAttribute('title')).toBe('Servers');
+    expect(serversTab.querySelector('svg')).toBeTruthy();
+    expect((serversTab.textContent ?? '').trim()).toBe('');
+
+    expect(remoteTab.getAttribute('role')).toBe('tab');
+    expect(remoteTab.getAttribute('aria-selected')).toBe('false');
+    expect(remoteTab.getAttribute('aria-label')).toBe('Remote');
+    expect(remoteTab.getAttribute('title')).toBe('Remote');
+    expect(remoteTab.querySelector('svg')).toBeTruthy();
+    expect((remoteTab.textContent ?? '').trim()).toBe('');
+
+    fireEvent.click(buttons[0]);
+    expect(onClose).toHaveBeenCalledOnce();
+
+    fireEvent.click(buttons[1]);
+    expect(onChangeServer).toHaveBeenCalledOnce();
+
+    fireEvent.click(aiDesk);
+    expect(onOpenControlledNodes).toHaveBeenCalledOnce();
+
+    fireEvent.click(remoteTab);
+    expect(onTabChange).toHaveBeenCalledWith('remote');
+
+    fireEvent.click(serversTab);
+    expect(onTabChange).toHaveBeenCalledWith('servers');
+  });
+
+  it('suppresses Switch Cloud Server button in non-native web mode while retaining Home, AI Desk, and menu tabs', () => {
+    const view = menu(vi.fn(), vi.fn(), vi.fn(), {
+      isNative: false,
+    });
+
+    const topRow = view.container.querySelector('.mobile-server-menu-top-row')!;
+    expect(topRow).toBeTruthy();
+    expect(topRow.querySelector('.mobile-server-menu-home')).toBeTruthy();
+    expect(topRow.querySelector('.mobile-server-menu-change')).toBeNull();
+
+    const deskRow = view.container.querySelector('.mobile-server-menu-desk-row')!;
+    expect(deskRow).toBeTruthy();
+    expect(deskRow.previousElementSibling).toBe(topRow);
+    expect(deskRow.querySelector('.mobile-server-menu-controlled-nodes')).toBeTruthy();
+    expect(deskRow.querySelector('[data-testid="mobile-menu-tab-servers"]')?.getAttribute('aria-selected')).toBe('true');
+    expect(deskRow.querySelector('[data-testid="mobile-menu-tab-remote"]')?.getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('renders authoritative online (●), offline (○), and unknown (◌) dots with consistent color coding across owned and shared servers', () => {
+    const servers = [
+      { id: 'owned-1', name: 'Owned Online', online: true, isSharedIn: false, presence: 'online' },
+      { id: 'owned-2', name: 'Owned Offline', online: false, isSharedIn: false, presence: 'offline' },
+      { id: 'shared-1', name: 'Shared Online', online: true, isSharedIn: true, presence: 'online' },
+      { id: 'shared-2', name: 'Shared Offline', online: false, isSharedIn: true, presence: 'offline' },
+      { id: 'shared-3', name: 'Shared Unknown', online: false, isSharedIn: true, presence: 'unknown' },
+    ];
+    const view = menu(vi.fn(), vi.fn(), vi.fn(), { servers });
+
+    const serverBtns = view.container.querySelectorAll('.mobile-server-menu-server');
+    expect(serverBtns).toHaveLength(5);
+
+    expect(serverBtns[0].textContent).toContain('●');
+    expect(serverBtns[0].textContent).toContain('Owned Online');
+    expect(serverBtns[0].querySelector('span')!.style.color).toBe('rgb(74, 222, 128)'); // #4ade80
+
+    expect(serverBtns[1].textContent).toContain('○');
+    expect(serverBtns[1].textContent).toContain('Owned Offline');
+    expect(serverBtns[1].querySelector('span')!.style.color).toBe('rgb(71, 85, 105)'); // #475569
+
+    expect(serverBtns[2].textContent).toContain('●');
+    expect(serverBtns[2].textContent).toContain('Shared Online');
+    expect(serverBtns[2].classList.contains('mobile-shared-in')).toBe(true);
+    expect(serverBtns[2].querySelector('span')!.style.color).toBe('rgb(74, 222, 128)'); // #4ade80
+
+    expect(serverBtns[3].textContent).toContain('○');
+    expect(serverBtns[3].textContent).toContain('Shared Offline');
+    expect(serverBtns[3].classList.contains('mobile-shared-in')).toBe(true);
+    expect(serverBtns[3].querySelector('span')!.style.color).toBe('rgb(71, 85, 105)'); // #475569
+
+    expect(serverBtns[4].textContent).toContain('◌');
+    expect(serverBtns[4].textContent).toContain('Shared Unknown');
+    expect(serverBtns[4].classList.contains('mobile-shared-in')).toBe(true);
+    expect(serverBtns[4].querySelector('span')!.style.color).toBe('rgb(148, 163, 184)'); // #94a3b8
+  });
+
+  it('runs desktop smoke verifying mobile bar is hidden and sidebar shared entries are interactive', async () => {
+    const browserType = (require('playwright') as typeof import('playwright')).chromium;
+    if (!require('node:fs').existsSync(browserType.executablePath())) {
+      return;
+    }
+    const view = desktopMenu();
+    const browser = await browserType.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      await page.setContent(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>${view.container.innerHTML}</body></html>`);
+      const mobileBarDisplay = await page.locator('.mobile-server-bar').evaluate((el) => getComputedStyle(el).display);
+      expect(mobileBarDisplay).toBe('none');
+      const sidebarDisplay = await page.locator('.sidebar').evaluate((el) => getComputedStyle(el).display);
+      expect(sidebarDisplay).not.toBe('none');
+      const firstShared = page.locator('.shared-entry-row').first();
+      expect(await firstShared.isVisible()).toBe(true);
+      await firstShared.click();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it('bounds mobile server menu top-row and AI Desk + tabs row at 320px and 390px across all 7 locales with zero horizontal overflow in chromium', { timeout: 30000 }, async () => {
+    const browserType = (require('playwright') as typeof import('playwright')).chromium;
+    if (!require('node:fs').existsSync(browserType.executablePath())) {
+      return;
+    }
+    const locales = ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW'];
+    const browser = await browserType.launch({ headless: true });
+    try {
+      for (const loc of locales) {
+        const localeJson = JSON.parse(readFileSync(resolve(__dirname, `../src/i18n/locales/${loc}.json`), 'utf8'));
+        const homeText = localeJson.mobile_menu?.home ?? '← Home';
+        const changeText = localeJson.mobile_menu?.change_server ?? '⇄ Switch Cloud Server';
+        const aiDeskText = localeJson.controlled_nodes?.title ?? 'AI Desk';
+        const tabServersText = localeJson.mobile_menu?.tab_servers ?? 'Servers';
+        const tabRemoteText = localeJson.mobile_menu?.tab_remote ?? 'Remote';
+
+        for (const viewport of [{ width: 320, height: 640 }, { width: 390, height: 844 }]) {
+          const page = await browser.newPage({ viewport, hasTouch: true });
+          const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>
+            <div class="layout-mobile" style="width: ${viewport.width}px;">
+              <div class="mobile-server-bar">
+                <div class="mobile-server-switcher-wrap" style="position: relative;">
+                  <div class="mobile-server-menu" style="display: flex;">
+                    <div class="mobile-server-menu-top-row">
+                      <button type="button" class="mobile-server-menu-item mobile-server-menu-home">${homeText}</button>
+                      <button type="button" class="mobile-server-menu-item mobile-server-menu-change" title="${changeText}">${changeText}</button>
+                    </div>
+                    <div class="mobile-server-menu-desk-row">
+                      <button type="button" class="mobile-server-menu-item mobile-server-menu-controlled-nodes">
+                        <span>🖥</span><span>${aiDeskText}</span>
+                      </button>
+                      <div class="mobile-server-menu-tabs" role="tablist">
+                        <button type="button" role="tab" aria-selected="true" aria-label="${tabServersText}" title="${tabServersText}" class="mobile-server-menu-tab mobile-server-menu-tab-servers active">
+                          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5" /></svg>
+                        </button>
+                        <button type="button" role="tab" aria-selected="false" aria-label="${tabRemoteText}" title="${tabRemoteText}" class="mobile-server-menu-tab mobile-server-menu-tab-remote">
+                          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="2.5" y="3.5" width="19" height="13" rx="2" /></svg>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </body></html>`;
+          await page.setContent(html);
+
+          const metrics = await page.evaluate(() => {
+            const menu = document.querySelector('.mobile-server-menu')!;
+            const topRow = document.querySelector('.mobile-server-menu-top-row')!;
+            const deskRow = document.querySelector('.mobile-server-menu-desk-row')!;
+            const home = document.querySelector('.mobile-server-menu-home')!;
+            const change = document.querySelector('.mobile-server-menu-change')!;
+            const aiDesk = document.querySelector('.mobile-server-menu-controlled-nodes')!;
+            const tabRemote = document.querySelector('.mobile-server-menu-tab-remote')!;
+            return {
+              menuOverflow: menu.scrollWidth - menu.clientWidth,
+              topRowOverflow: topRow.scrollWidth - topRow.clientWidth,
+              deskRowOverflow: deskRow.scrollWidth - deskRow.clientWidth,
+              menuRight: menu.getBoundingClientRect().right,
+              changeRight: change.getBoundingClientRect().right,
+              remoteTabRight: tabRemote.getBoundingClientRect().right,
+              homeVisible: home.getBoundingClientRect().width > 0,
+              changeVisible: change.getBoundingClientRect().width > 0,
+              aiDeskVisible: aiDesk.getBoundingClientRect().width > 0,
+              remoteTabVisible: tabRemote.getBoundingClientRect().width > 0,
+            };
+          });
+
+          expect(metrics.menuOverflow, `${loc} at ${viewport.width}px menu horizontal overflow`).toBeLessThanOrEqual(1);
+          expect(metrics.topRowOverflow, `${loc} at ${viewport.width}px top-row horizontal overflow`).toBeLessThanOrEqual(1);
+          expect(metrics.deskRowOverflow, `${loc} at ${viewport.width}px desk-row horizontal overflow`).toBeLessThanOrEqual(1);
+          expect(metrics.changeRight, `${loc} at ${viewport.width}px change button right edge`).toBeLessThanOrEqual(metrics.menuRight + 1);
+          expect(metrics.remoteTabRight, `${loc} at ${viewport.width}px remote tab right edge`).toBeLessThanOrEqual(metrics.menuRight + 1);
+          expect(metrics.homeVisible).toBe(true);
+          expect(metrics.changeVisible).toBe(true);
+          expect(metrics.aiDeskVisible).toBe(true);
+          expect(metrics.remoteTabVisible).toBe(true);
+
+          await page.close();
+        }
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
+  for (const engine of ['chromium', 'webkit'] as const) {
+    it(`keeps three columns and scrolls the entire shared list up/down with backdrop in ${engine}`, async (context) => {
+      const browserType = (require('playwright') as typeof import('playwright'))[engine];
+      if (!require('node:fs').existsSync(browserType.executablePath())) {
+        context.skip();
+        return;
+      }
+      const view = menu();
+      view.container.querySelector('.mobile-server-menu')!.removeAttribute('style');
+      const browser = await browserType.launch({ headless: true });
+      try {
+        const page = await browser.newPage({ viewport: { width: 375, height: 812 }, hasTouch: true });
+        // Test required mobile viewports: 320 (compact), 393 (iPhone standard), 430 (iPhone Max), and 812x375 (landscape)
+        const viewports = [
+          { width: 320, height: 640 },
+          { width: 393, height: 852 },
+          { width: 430, height: 932 },
+          { width: 812, height: 375 },
+        ];
+        for (const viewport of viewports) {
+          await page.setViewportSize(viewport);
+          await page.setContent(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>${view.container.innerHTML}</body></html>`);
+          const metrics = await page.locator('.mobile-server-menu-body').evaluate((element) => {
+            const shared = element.querySelector('.shared-entries-list')!;
+            return {
+              scrollHeight: element.scrollHeight, height: element.clientHeight,
+              columns: getComputedStyle(element).gridTemplateColumns.split(' ').length,
+              sharedColumns: getComputedStyle(shared).gridTemplateColumns.split(' ').length,
+              horizontalOverflow: element.scrollWidth - element.clientWidth,
+              bottom: element.getBoundingClientRect().bottom,
+            };
+          });
+          expect(metrics.scrollHeight).toBeGreaterThan(metrics.height);
+          expect(metrics.columns).toBe(3);
+          expect(metrics.sharedColumns).toBe(3);
+          expect(metrics.horizontalOverflow).toBeLessThanOrEqual(1);
+          expect(metrics.bottom).toBeLessThanOrEqual(viewport.height);
+
+          const footerBefore = await page.locator('.mobile-server-menu-language').boundingBox();
+          const menuBox = await page.locator('.mobile-server-menu').boundingBox();
+          expect(footerBefore!.y + footerBefore!.height).toBeGreaterThan(menuBox!.y + menuBox!.height - 40);
+          // Verify owned server button is clickable through native tap without backdrop obstruction
+          const ownedBtn = page.getByRole('button', { name: 'Owned 0', exact: false });
+          expect(await ownedBtn.isVisible()).toBe(true);
+          await ownedBtn.tap({ timeout: 2000 });
+
+          const bounds = await page.locator('.mobile-server-menu').boundingBox();
+          await page.mouse.move(bounds!.x + bounds!.width / 2, bounds!.y + bounds!.height / 2);
+          await page.mouse.wheel(0, 10000);
+          await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBeGreaterThan(0));
+
+          // Native hit-testing must reach the actual last entry, not hidden overflow inside a shrunken shared section
+          const last = page.locator('.shared-entry-row').last();
+          await last.tap({ timeout: 2000 });
+          await page.getByRole('button', { name: 'Language', exact: true }).tap();
+          expect(await page.locator('.mobile-server-menu-language').boundingBox()).toEqual(footerBefore);
+
+          if (engine === 'chromium' && viewport.width === 393) {
+            const session = await page.context().newCDPSession(page);
+            const x = bounds!.x + bounds!.width / 2;
+            const y = bounds!.y + 80;
+            const before = await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop);
+            await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+            for (let step = 1; step <= 6; step++) {
+              await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + step * 35 }] });
+              await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+            await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBeLessThan(before));
+            await session.detach();
+          }
+
+          await vi.waitFor(async () => {
+            await page.mouse.wheel(0, -10000);
+            expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBe(0);
+          }, { timeout: 5000, interval: 100 });
+          await page.getByRole('button', { name: 'Owned 0', exact: false }).tap();
+        }
+      } finally { await browser.close(); }
+    }, 45_000);
+  }
+});

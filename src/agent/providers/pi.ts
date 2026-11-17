@@ -79,6 +79,7 @@ import {
 } from './pi/runtime.js';
 import logger from '../../util/logger.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
+import { setSessionIncognito, withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 
 const RPC_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 3_000;
@@ -124,6 +125,8 @@ interface PiSessionState {
   toolNames: Map<string, string>;
   lastStatusSignature: string | null;
   disposed: boolean;
+  incognito?: boolean;
+  hasStartedChild?: boolean;
   memoryMcp?: { command: string; args: readonly string[]; env: Record<string, string> };
 }
 
@@ -210,14 +213,24 @@ export class PiProvider implements TransportProvider {
     const previous = this.sessions.get(routeId);
     if (previous) await this.stopChild(previous);
     const existing = config.fresh ? undefined : previous;
+    const incognito = config.incognito === true || existing?.incognito === true;
+    if (incognito && !config.fresh && (config.resumeId?.trim() || config.skipCreate)) {
+      throw new Error('Incognito conversation cannot be resumed; start a new session instead.');
+    }
+    setSessionIncognito(routeId, incognito);
+    if (config.sessionName) setSessionIncognito(config.sessionName, incognito);
     const requestedModel = config.agentId?.trim() || existing?.requestedModel;
     const effort = config.effort ?? existing?.effort;
-    const piSessionId = config.fresh
-      ? randomUUID()
-      : (config.resumeId?.trim() || existing?.piSessionId || randomUUID());
+    const piSessionId = incognito
+      ? ''
+      : (config.fresh
+        ? randomUUID()
+        : (config.resumeId?.trim() || existing?.piSessionId || randomUUID()));
     const state: PiSessionState = {
       routeId,
       piSessionId,
+      incognito,
+      hasStartedChild: false,
       sessionName: config.sessionName ?? existing?.sessionName,
       resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       projectName: config.projectName ?? existing?.projectName,
@@ -247,7 +260,7 @@ export class PiProvider implements TransportProvider {
     };
     this.sessions.set(routeId, state);
     this.emitInfo(routeId, {
-      resumeId: piSessionId,
+      ...(incognito ? {} : { resumeId: piSessionId }),
       ...(requestedModel ? { model: requestedModel } : {}),
       ...(effort ? { effort } : {}),
     });
@@ -309,27 +322,32 @@ export class PiProvider implements TransportProvider {
     const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
     const message = composeMessageSideProviderPrompt(payload, { includeSessionSystemText });
     if (!message.trim()) return;
-
-    this.emitStatus(sessionId, state, { status: 'working', label: null });
-    state.turnGeneration++;
-    await this.ensureChild(state);
-    this.resetTurn(state);
-    state.currentMessageId = `${state.routeId}:${randomUUID()}`;
-    state.turnActive = true;
-    state.cancelled = false;
-    state.pendingSessionSystemText = includeSessionSystemText ? sessionSystemText : undefined;
-    try {
-      await this.request(state, { type: PI_RPC_COMMAND.PROMPT, message });
-    } catch (error) {
-      state.turnActive = false;
-      this.clearStatus(sessionId, state);
-      this.resetTurn(state);
-      throw this.makeError(
-        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-        error instanceof Error ? error.message : String(error),
-        true,
-      );
+    if (state.incognito && state.hasStartedChild && !state.child) {
+      throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
     }
+
+    return withSessionPrivacy(state.sessionName ?? state.routeId, state.incognito === true, async () => {
+      this.emitStatus(sessionId, state, { status: 'working', label: null });
+      state.turnGeneration++;
+      await this.ensureChild(state);
+      this.resetTurn(state);
+      state.currentMessageId = `${state.routeId}:${randomUUID()}`;
+      state.turnActive = true;
+      state.cancelled = false;
+      state.pendingSessionSystemText = includeSessionSystemText ? sessionSystemText : undefined;
+      try {
+        await this.request(state, { type: PI_RPC_COMMAND.PROMPT, message });
+      } catch (error) {
+        state.turnActive = false;
+        this.clearStatus(sessionId, state);
+        this.resetTurn(state);
+        throw this.makeError(
+          PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+          error instanceof Error ? error.message : String(error),
+          true,
+        );
+      }
+    });
   }
 
   async notifyActiveDelegation(
@@ -370,7 +388,9 @@ export class PiProvider implements TransportProvider {
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
-    return this.sessions.has(sessionId);
+    const state = this.sessions.get(sessionId);
+    if (!state || state.incognito) return false;
+    return true;
   }
 
   setSessionAgentId(sessionId: string, agentId: string): void {
@@ -378,6 +398,23 @@ export class PiProvider implements TransportProvider {
     const model = agentId.trim();
     if (!state || !model || state.requestedModel === model) return;
     state.requestedModel = model;
+    if (state.incognito && state.child) {
+      if (!state.turnActive) {
+        const slash = model.indexOf('/');
+        const provider = slash > 0 ? model.slice(0, slash) : (state.provider ?? state.llmConfig?.provider);
+        const modelId = slash > 0 ? model.slice(slash + 1) : model;
+        if (provider && modelId) {
+          void this.request(state, { type: PI_RPC_COMMAND.SET_MODEL, provider, modelId })
+            .then(() => {
+              state.model = modelId;
+              state.provider = provider;
+              this.emitInfo(sessionId, { model: modelId });
+            })
+            .catch(() => {});
+        }
+      }
+      return;
+    }
     const child = state.child;
     this.detachChild(state);
     void this.stopChild(state, child);
@@ -415,7 +452,8 @@ export class PiProvider implements TransportProvider {
       binary: resolvePiBinary(),
       cwd: state.cwd,
       model: state.model,
-      piSessionId: state.piSessionId,
+      ...(state.incognito ? {} : { piSessionId: state.piSessionId }),
+      incognito: Boolean(state.incognito),
       childRunning: !!state.child,
       turnActive: state.turnActive,
       memoryMcpMounted: !!state.memoryMcp,
@@ -423,6 +461,7 @@ export class PiProvider implements TransportProvider {
   }
 
   private buildMemoryMcp(config: SessionConfig): PiSessionState['memoryMcp'] {
+    if (config.incognito) return undefined;
     const server = getDefaultMcpServers(config, {
       // Pi owns the complete paginated refresh + generation proof and can
       // therefore consume standard tools/list_changed without stale schemas.
@@ -432,12 +471,28 @@ export class PiProvider implements TransportProvider {
   }
 
   private async ensureChild(state: PiSessionState): Promise<void> {
+    if (state.incognito && state.hasStartedChild && !state.child) {
+      throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+    }
     if (state.child && state.startPromise) {
       await state.startPromise;
       return;
     }
+    const privacyKey = state.sessionName ?? state.routeId;
+    const isPrivate = state.incognito === true;
     const executable = resolveExecutableForSpawn(resolvePiBinary());
-    const child = spawn(
+    const childEnv: Record<string, string | undefined> = {
+      ...process.env,
+      ...(state.env ?? {}),
+      ...(state.llmConfig ? { [PI_PROVIDER_CONFIG_ENV]: JSON.stringify(state.llmConfig) } : {}),
+      ...(state.llmConfig?.apiKey ? { [PI_PROVIDER_API_KEY_ENV]: state.llmConfig.apiKey } : {}),
+    };
+    if (state.incognito) {
+      delete childEnv[PI_MCP_CONFIG_ENV];
+    } else if (state.memoryMcp) {
+      childEnv[PI_MCP_CONFIG_ENV] = JSON.stringify(state.memoryMcp);
+    }
+    const child = withSessionPrivacy(privacyKey, isPrivate, () => spawn(
       executable.executable,
       [...executable.prependArgs, ...buildPiRpcArgs({
         sessionId: state.piSessionId,
@@ -445,16 +500,11 @@ export class PiProvider implements TransportProvider {
         requestedModel: state.requestedModel,
         effort: state.effort,
         llm: state.llmConfig,
+        incognito: state.incognito,
       })],
       {
         cwd: state.cwd,
-        env: {
-          ...process.env,
-          ...(state.env ?? {}),
-          ...(state.llmConfig ? { [PI_PROVIDER_CONFIG_ENV]: JSON.stringify(state.llmConfig) } : {}),
-          ...(state.llmConfig?.apiKey ? { [PI_PROVIDER_API_KEY_ENV]: state.llmConfig.apiKey } : {}),
-          ...(state.memoryMcp ? { [PI_MCP_CONFIG_ENV]: JSON.stringify(state.memoryMcp) } : {}),
-        },
+        env: childEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         // Own process group and session on POSIX. A reparented descendant keeps
@@ -463,27 +513,40 @@ export class PiProvider implements TransportProvider {
         // workers of the incident were unreachable on PPID=1.
         detached: process.platform !== 'win32',
       },
-    );
+    ));
     state.child = child;
     // Crash coverage: if the daemon dies without running teardown, the startup
     // sweep reaps this group using the registry's process-start fingerprint.
     state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
     state.decoder = new StringDecoder('utf8');
     state.outputBuffer = '';
-    child.stdin?.on('error', (error) => {
+    child.stdin?.on('error', (error) => withSessionPrivacy(privacyKey, isPrivate, () => {
       logger.debug({ provider: this.id, session: state.sessionName, error }, 'Pi stdin error');
-    });
-    gateChildStream(child.stdout)?.on('data', (chunk: Buffer) => this.handleChunk(state, chunk));
-    child.stderr?.on('data', (chunk: Buffer) => {
+    }));
+    gateChildStream(child.stdout)?.on('data', (chunk: Buffer) => withSessionPrivacy(privacyKey, isPrivate, () => {
+      this.handleChunk(state, chunk);
+    }));
+    child.stderr?.on('data', (chunk: Buffer) => withSessionPrivacy(privacyKey, isPrivate, () => {
       const line = chunk.toString('utf8').trim();
       if (line) logger.debug({ provider: this.id, session: state.sessionName, line: line.slice(0, 500) }, 'Pi stderr');
-    });
-    child.on('error', (error) => this.handleGone(state, child, formatPiLaunchError(error)));
-    child.on('exit', (code, signal) => { this.stopConfirmations.complete(child); this.handleGone(state, child, `Pi exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`); });
-    child.on('close', (code, signal) => { this.stopConfirmations.complete(child); this.handleGone(state, child, `Pi closed (code=${code ?? 'null'} signal=${signal ?? 'null'})`); });
+    }));
+    child.on('error', (error) => withSessionPrivacy(privacyKey, isPrivate, () => {
+      this.handleGone(state, child, formatPiLaunchError(error));
+    }));
+    child.on('exit', (code, signal) => withSessionPrivacy(privacyKey, isPrivate, () => {
+      this.stopConfirmations.complete(child);
+      this.handleGone(state, child, `Pi exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`);
+    }));
+    child.on('close', (code, signal) => withSessionPrivacy(privacyKey, isPrivate, () => {
+      this.stopConfirmations.complete(child);
+      this.handleGone(state, child, `Pi closed (code=${code ?? 'null'} signal=${signal ?? 'null'})`);
+    }));
 
     const startPromise = this.request(state, { type: PI_RPC_COMMAND.GET_STATE })
-      .then((response) => this.applyStateResponse(state, response.data))
+      .then((response) => {
+        state.hasStartedChild = true;
+        this.applyStateResponse(state, response.data);
+      })
       .catch(async (error) => {
         if (state.child === child) this.detachChild(state);
         // Awaited, not discarded: `startPromise` below is awaited, so the full
@@ -727,7 +790,7 @@ export class PiProvider implements TransportProvider {
     const effort = data?.thinkingLevel;
     if (isTransportEffortLevel(effort)) state.effort = effort;
     this.emitInfo(state.routeId, {
-      resumeId: typeof data?.sessionId === 'string' ? data.sessionId : state.piSessionId,
+      ...(state.incognito ? {} : { resumeId: typeof data?.sessionId === 'string' ? data.sessionId : state.piSessionId }),
       ...(model.id ? { model: model.id } : {}),
       ...(isTransportEffortLevel(effort) ? { effort } : {}),
     });

@@ -23,6 +23,7 @@ function buildResendMetadata(
     ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
     ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
     ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
+    ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
     ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
     ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
     ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
@@ -49,6 +50,7 @@ function buildAppendPrivateMetadata(
 ): TransportSendMetadata | undefined {
   const metadata = {
     ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+    ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
     ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
     ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
     ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),

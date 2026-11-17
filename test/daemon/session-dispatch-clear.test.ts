@@ -10,16 +10,23 @@ import type { SessionRecord } from '../../src/store/session-store.js';
 
 const mocks = vi.hoisted(() => ({
   clearTransportConversation: vi.fn(async () => undefined),
+  dispatchHandoffContinuation: vi.fn(async () => undefined),
+  handoffSessionConversation: vi.fn(async () => undefined),
   supportsTransportClear: vi.fn((agentType: string | undefined) => agentType === 'codex-sdk'),
+  supportsProcessClear: vi.fn((agentType: string | undefined) => agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode'),
   switchSessionModelNow: vi.fn(async () => ({ ok: true })),
+  sendProcessSessionMessageForAutomation: vi.fn(async () => undefined),
   runtimeSend: vi.fn(() => 'sent' as const),
 }));
 
 vi.mock('../../src/daemon/command-handler.js', () => ({
   clearTransportConversation: mocks.clearTransportConversation,
+  dispatchHandoffContinuation: mocks.dispatchHandoffContinuation,
+  handoffSessionConversation: mocks.handoffSessionConversation,
   supportsTransportClear: mocks.supportsTransportClear,
+  supportsProcessClear: mocks.supportsProcessClear,
   switchSessionModelNow: mocks.switchSessionModelNow,
-  sendProcessSessionMessageForAutomation: vi.fn(),
+  sendProcessSessionMessageForAutomation: mocks.sendProcessSessionMessageForAutomation,
 }));
 
 vi.mock('../../src/agent/session-manager.js', async (importOriginal) => ({
@@ -47,6 +54,9 @@ function transportSession(patch: Partial<SessionRecord> = {}): SessionRecord {
 describe('daemon-side delivery of /clear', () => {
   beforeEach(() => {
     mocks.clearTransportConversation.mockClear();
+    mocks.dispatchHandoffContinuation.mockClear();
+    mocks.handoffSessionConversation.mockClear();
+    mocks.sendProcessSessionMessageForAutomation.mockClear();
     mocks.runtimeSend.mockClear();
   });
 
@@ -56,6 +66,7 @@ describe('daemon-side delivery of /clear', () => {
     const result = await dispatchSessionMessage(target, ' /clear ', { messageId: 'send_message_1', suppressTimeline: true } as never);
     expect(result).toBe('sent');
     expect(mocks.clearTransportConversation).toHaveBeenCalledWith(target);
+    expect(mocks.dispatchHandoffContinuation).not.toHaveBeenCalled();
     expect(mocks.runtimeSend).not.toHaveBeenCalled();
   });
 
@@ -78,10 +89,57 @@ describe('daemon-side delivery of /clear', () => {
     const { buildSessionDispatchMessage } = await import('../../src/daemon/session-dispatch.js');
     const wrap = { from: 'deck_proj_brain', fromLabel: 'Brain', replyTo: 'deck_proj_brain', contextTail: 'earlier talk' };
     expect(buildSessionDispatchMessage(' /clear ', wrap)).toBe('/clear');
+    expect(buildSessionDispatchMessage(' /handoff ', wrap)).toBe('/handoff');
     expect(buildSessionDispatchMessage('/compact', wrap)).toBe('/compact');
     expect(buildSessionDispatchMessage('/model gpt-5.6-sol', wrap)).toBe('/model gpt-5.6-sol');
     // Ordinary text and /stop keep the envelope (stop has its own priority path).
     expect(buildSessionDispatchMessage('please /clear the cache', wrap)).toContain('deck_proj_brain');
+    expect(buildSessionDispatchMessage('please /handoff the task', wrap)).toContain('deck_proj_brain');
     expect(buildSessionDispatchMessage('/stop', wrap)).not.toBe('/stop');
+  });
+
+  it('handles /handoff via handoffSessionConversation and dispatches continuation for transport and process sessions', async () => {
+    const { dispatchSessionMessage } = await import('../../src/daemon/session-dispatch.js');
+    const transportTarget = transportSession({ sessionInstanceId: 'inst-tr-1' });
+    const processTarget = {
+      ...transportSession({ name: 'deck_sub_cc1', agentType: 'claude-code', runtimeType: 'process', sessionInstanceId: 'inst-pr-1' }),
+    };
+
+    expect(await dispatchSessionMessage(transportTarget, ' /handoff ', { messageId: 'send_message_5', suppressTimeline: true } as never)).toBe('sent');
+    expect(mocks.handoffSessionConversation).toHaveBeenCalledWith(transportTarget);
+    expect(mocks.dispatchHandoffContinuation).toHaveBeenCalledWith('deck_sub_cx8', undefined, 'inst-tr-1');
+    expect(mocks.runtimeSend).not.toHaveBeenCalled();
+
+    mocks.handoffSessionConversation.mockClear();
+    mocks.dispatchHandoffContinuation.mockClear();
+    expect(await dispatchSessionMessage(processTarget, '/handoff', { messageId: 'send_message_6', suppressTimeline: true } as never)).toBe('sent');
+    expect(mocks.handoffSessionConversation).toHaveBeenCalledWith(processTarget);
+    expect(mocks.dispatchHandoffContinuation).toHaveBeenCalledWith('deck_sub_cc1', undefined, 'inst-pr-1');
+    expect(mocks.sendProcessSessionMessageForAutomation).not.toHaveBeenCalled();
+
+    mocks.handoffSessionConversation.mockClear();
+    mocks.dispatchHandoffContinuation.mockClear();
+    await dispatchSessionMessage(transportSession({ agentType: 'some-other-sdk' as never }), '/handoff', { messageId: 'send_message_7', suppressTimeline: true } as never);
+    expect(mocks.handoffSessionConversation).not.toHaveBeenCalled();
+    expect(mocks.dispatchHandoffContinuation).not.toHaveBeenCalled();
+    expect(mocks.runtimeSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles /clear cleanly even when a partial command-handler mock omits /handoff exports', async () => {
+    vi.resetModules();
+    const clearTransportConversation = vi.fn(async () => undefined);
+    vi.doMock('../../src/daemon/command-handler.js', () => ({
+      clearTransportConversation,
+      supportsTransportClear: () => true,
+    }));
+    try {
+      const { dispatchSessionMessage } = await import('../../src/daemon/session-dispatch.js');
+      const target = transportSession();
+      await expect(dispatchSessionMessage(target, '/clear', { messageId: 'send_message_partial', suppressTimeline: true } as never)).resolves.toBe('sent');
+      expect(clearTransportConversation).toHaveBeenCalledWith(target);
+    } finally {
+      vi.doUnmock('../../src/daemon/command-handler.js');
+      vi.resetModules();
+    }
   });
 });

@@ -37,12 +37,15 @@ export function useSupervisionTaskConsole(input: {
     projectName: input.scope.projectName,
     coordinatorSessionName: input.scope.coordinatorSessionName,
   }), [scopeKey]);
-  const initialState = () => (
+  const resolveBaselineState = () => (
     (input.ws ? peekSharedSupervisionTaskConsoleController(input.ws, authority)?.getState() : undefined)
       ?? readSupervisionTaskConsoleCache(authority)
       ?? createSupervisionTaskConsoleState(input.scope)
   );
-  const [state, setState] = useState<SupervisionTaskConsoleReducerState>(initialState);
+  const [tracked, setTracked] = useState<{ scopeKey: string; state: SupervisionTaskConsoleReducerState }>(() => ({
+    scopeKey,
+    state: resolveBaselineState(),
+  }));
   const [lease, setLease] = useState<SupervisionTaskConsoleLease | null>(null);
 
   // One controller (hence one daemon subscription) per page and scope, shared
@@ -50,7 +53,10 @@ export function useSupervisionTaskConsole(input: {
   useEffect(() => {
     if (!input.ws) {
       setLease(null);
-      setState(readSupervisionTaskConsoleCache(authority) ?? createSupervisionTaskConsoleState(input.scope));
+      setTracked({
+        scopeKey,
+        state: readSupervisionTaskConsoleCache(authority) ?? createSupervisionTaskConsoleState(input.scope),
+      });
       return undefined;
     }
     const acquired = leaseSupervisionTaskConsoleController(
@@ -59,7 +65,9 @@ export function useSupervisionTaskConsole(input: {
       input.scope,
       authority,
     );
-    const unsubscribe = acquired.controller.subscribe(setState);
+    const unsubscribe = acquired.controller.subscribe((nextState) => {
+      setTracked({ scopeKey, state: nextState });
+    });
     setLease(acquired);
     return () => {
       unsubscribe();
@@ -72,7 +80,7 @@ export function useSupervisionTaskConsole(input: {
   }, [lease, input.connected]);
 
   return {
-    state,
+    state: tracked.scopeKey === scopeKey ? tracked.state : resolveBaselineState(),
     retry: () => { lease?.controller.retry(); },
   };
 }

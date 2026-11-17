@@ -1,0 +1,30 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'com.imcodes.speech'
+    compileSdk rootProject.ext.compileSdkVersion
+    defaultConfig {
+        minSdk rootProject.ext.minSdkVersion
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+    sourceSets.main.assets.srcDirs = ['../models']
+}
+
+dependencies {
+    implementation project(':capacitor-android')
+    implementation "androidx.appcompat:appcompat:${rootProject.ext.androidxAppCompatVersion}"
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.28.0'
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.1.0'
+    testImplementation "junit:junit:${rootProject.findProperty('junitVersion') ?: '4.13.2'}"
+}
+
+// Do not silently ship an APK missing its offline recognizer/model.
+tasks.register('prepareStreamingSpeech', Exec) {
+    workingDir rootProject.projectDir.parentFile
+    commandLine 'node', 'scripts/prepare-streaming-speech.mjs', '--android'
+}
+preBuild.dependsOn prepareStreamingSpeech

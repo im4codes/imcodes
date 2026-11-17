@@ -1,3 +1,6 @@
+import { setSessionIncognito } from '../../shared/session-incognito-context.js';
+import { isIncognitoSession, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
+import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_SESSION_STATE, type AgyNativeSessionState } from '../../shared/agy-agent.js';
 import { statSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { mkdir, readFile, rename, rm } from 'node:fs/promises';
@@ -113,7 +116,7 @@ export type SessionState = 'running' | 'idle' | 'error' | 'stopped';
 // TODO: import from '../agent/session-runtime.js' when available
 type RuntimeType = 'process' | 'transport';
 
-export interface SessionRecord extends SessionContextBootstrapState {
+export interface SessionRecord extends SessionContextBootstrapState, SessionIncognitoConfig {
   name: string;
   /**
    * Stable identity for this logical session record. It survives daemon and
@@ -236,6 +239,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerSessionId?: string;
   /** Provider-side durable resume/session identifier for shared local-sdk providers. */
   providerResumeId?: string;
+  /** AG lazy-create evidence; absent legacy state is unknown, never implicitly fresh. */
+  agyNativeSessionState?: AgyNativeSessionState;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
   /**
@@ -411,7 +416,7 @@ export function resetSessionStoreAuthorityForTests(): void {
 }
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
-  return !isKnownTestSessionLike({
+  return !isIncognitoSession(record) && !isKnownTestSessionLike({
     name: record.name,
     projectName: record.projectName,
     projectDir: record.projectDir,
@@ -528,7 +533,7 @@ function recordsFromPayloads(payloads: Map<string, string>, blobs: ReadonlyMap<s
   for (const [name, payload] of payloads) {
     try {
       const parsed = JSON.parse(payload) as unknown;
-      if (!isObjectRecord(parsed)) continue;
+      if (!isObjectRecord(parsed) || isIncognitoSession(parsed)) continue;
       const hydrated = hydrateSessionRecord(parsed, lookup, (field, hash) => {
         logger.warn({ session: name, field, hash }, 'Session row refers to a missing blob; the field is left unset');
       });
@@ -552,7 +557,7 @@ function hydrateStore(value: unknown): { store: SessionStore; legacy: boolean } 
   const table = isObjectRecord(value.identityPrompts) ? value.identityPrompts : null;
   const sessions: Record<string, SessionRecord> = {};
   for (const [name, rawRecord] of Object.entries(value.sessions)) {
-    if (!isObjectRecord(rawRecord)) continue;
+    if (!isObjectRecord(rawRecord) || isIncognitoSession(rawRecord)) continue;
     const record: Record<string, unknown> = { ...rawRecord };
     const reference = record[SESSION_IDENTITY_PROMPT_REF_FIELD];
     const inline = record[SESSION_IDENTITY_PROMPT_FIELD];
@@ -899,15 +904,17 @@ function reconcilePersistedSessions(): boolean {
 
 /** After loadStore, detect actual state of each session from terminal and emit corrections. */
 async function probeSessionStates(targetPath: string): Promise<void> {
+  // Snapshot loaded non-transport running sessions before any await so sessions
+  // upserted immediately after `await loadStore()` are never probed by this pass.
+  const candidates = Object.values(store.sessions).filter(
+    (s) => s.state === 'running' && s.runtimeType !== 'transport',
+  );
+  if (candidates.length === 0) return;
   try {
     const { detectStatusAsync } = await import('../agent/detect.js');
     let mutated = false;
-    for (const s of Object.values(store.sessions)) {
-      if (s.state !== 'running') continue;
-      if (s.runtimeType === 'transport') {
-        // Transport sessions don't use tmux — skip terminal-based detection
-        continue;
-      }
+    for (const s of candidates) {
+      if (store.sessions[s.name] !== s || s.state !== 'running') continue;
       let newState: 'idle' | 'running' = 'running';
       try {
         const status = await detectStatusAsync(s.name, s.agentType as import('../agent/detect.js').AgentType);
@@ -916,7 +923,7 @@ async function probeSessionStates(targetPath: string): Promise<void> {
         // tmux session may not exist — mark idle
         newState = 'idle';
       }
-      if (newState !== s.state) {
+      if (store.sessions[s.name] === s && s.state === 'running' && newState !== s.state) {
         s.state = newState;
         s.updatedAt = Date.now();
         mutated = true;
@@ -974,15 +981,21 @@ async function findChangedSessions(): Promise<Set<string>> {
  * an in-place mutation is never lost -- the sweep is what an explicit
  * flushStore() (shutdown) and the periodic full check use.
  */
-async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
+async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forceSweep = false, requireWrite = false): Promise<void> {
   // Outside the best-effort catch on purpose: a test reaching the real store
   // must fail loudly, never be swallowed as a lost write.
-  if (!hasWriteAuthority(targetPath)) return;
+  if (!hasWriteAuthority(targetPath)) {
+    if (requireWrite) throw new Error('session store write authority unavailable');
+    return;
+  }
   const sweep = forceSweep || fullSweepRequested || Date.now() - lastFullSweepAt >= FULL_SWEEP_INTERVAL_MS;
   const drained = new Set<string>();
   try {
     const handle = writerHandle(targetPath);
     const swept = sweep ? await findChangedSessions() : new Set<string>();
+    // A strict native-start barrier must not mistake a queued/skipped write
+    // for a commit. The sweep can yield while the daemon loses its lock.
+    if (requireWrite && !hasWriteAuthority(targetPath)) throw new Error('session store write authority changed before commit');
 
     // From here to the commit nothing awaits: the rows reflect one instant, and a
     // mutation made while the sweep yielded is in `dirtyNames` and is included.
@@ -1042,7 +1055,7 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
   } catch (error) {
     if (error instanceof EmptyStoreRefusal) {
       logger.error({ targetPath, sessions: committedPayloads.size }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
-      return;
+      if (!requireWrite) return;
     }
     // Nothing was committed: keep the rows dirty so the next flush retries them.
     for (const name of drained) dirtyNames.add(name);
@@ -1328,10 +1341,10 @@ async function waitForSessionStoreSnapshot(): Promise<void> {
   while (backupInFlight) await backupInFlight;
 }
 
-function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
+function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false, requireWrite = false): Promise<void> {
   const queued = writeQueue.then(
-    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
-    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep, requireWrite),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep, requireWrite),
   );
   const tracked = queued.finally(() => {
     if (pendingWrite === tracked) pendingWrite = null;
@@ -1450,8 +1463,22 @@ export function upsertSession(record: SessionRecord): void {
   const nativeAgentLaunchFence = [record.nativeAgentLaunchFence, existing?.nativeAgentLaunchFence]
     .find((proof) => proof?.sessionInstanceId === sessionInstanceId && proof.runtimeEpoch === runtimeEpoch);
   const { nativeAgentFenceRequired: _requestedMarker, nativeAgentLaunchFence: _requestedProof, ...incoming } = record;
+  const sameAgyRoute = record.agentType === AGY_SDK_PROVIDER_ID
+    && existing?.agentType === AGY_SDK_PROVIDER_ID
+    && !!record.providerSessionId && record.providerSessionId === existing.providerSessionId;
+  // A metadata rebuild must never resurrect an unused proof after native start
+  // or erase its learned id. A new/fresh route is a different conversation.
+  const agyResumeId = sameAgyRoute ? record.providerResumeId || existing.providerResumeId : record.providerResumeId;
+  const agyNativeSessionState = record.agentType === AGY_SDK_PROVIDER_ID
+    ? agyResumeId || (sameAgyRoute && existing.agyNativeSessionState === AGY_NATIVE_SESSION_STATE.STARTED)
+      ? AGY_NATIVE_SESSION_STATE.STARTED
+      : record.agyNativeSessionState ?? (sameAgyRoute ? existing.agyNativeSessionState : undefined)
+    : undefined;
   store.sessions[record.name] = {
     ...incoming,
+    // Privacy cannot be erased by a metadata rebuild that omits the flag.
+    ...(isIncognitoSession(existing) || isIncognitoSession(record) ? { incognito: true } : {}),
+    ...(record.agentType === AGY_SDK_PROVIDER_ID ? { providerResumeId: agyResumeId, agyNativeSessionState } : {}),
     sessionInstanceId,
     runtimeEpoch,
     ...(nativeAgentFenceRequired ? { nativeAgentFenceRequired } : {}),
@@ -1461,6 +1488,7 @@ export function upsertSession(record: SessionRecord): void {
     ...(pairCreatedMetadata !== undefined ? { pairCreatedMetadata } : {}),
     updatedAt: Date.now(),
   };
+  setSessionIncognito(record.name, isIncognitoSession(store.sessions[record.name]));
   sessionValuesCache = null;
   markDirty(record.name);
   scheduleWrite();
@@ -1587,18 +1615,22 @@ export function updateSessionState(name: string, state: SessionState, error?: st
   scheduleWrite();
 }
 
-export async function flushStore(): Promise<void> {
+export async function flushStore(options: { requireWrite?: boolean } = {}): Promise<void> {
   // A CLI stop/status process can import lifecycle.shutdown without ever
   // loading the daemon store or acquiring its lock. It must not flush the
   // initial empty in-memory value over the live daemon's sessions.
-  if (!storeLoaded && !isUnderTestRunner()) return;
+  if (!storeLoaded && !isUnderTestRunner()) {
+    if (options.requireWrite) throw new Error('session store is not loaded');
+    return;
+  }
   const targetPath = writeTimerPath ?? dbPath();
+  if (options.requireWrite && !hasWriteAuthority(targetPath)) throw new Error('session store write authority unavailable');
   if (writeTimer) {
     clearTimeout(writeTimer);
     writeTimer = null;
     writeTimerPath = null;
   }
-  await enqueueWrite(false, targetPath, true);
+  await enqueueWrite(false, targetPath, true, options.requireWrite);
   await flushCompatExport(targetPath);
   // flushStore() is the explicit lifecycle barrier used by shutdown and test
   // teardown. Do not return while the snapshot started by the write is still

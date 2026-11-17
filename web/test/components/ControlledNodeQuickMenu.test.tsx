@@ -155,6 +155,36 @@ describe('ControlledNodeQuickMenu', () => {
     opened.mockRestore();
   });
 
+  it('hides the open-in-new-window button when allowStandaloneWindow is false (mobile) while preserving row selection', async () => {
+    const online = node({});
+    machines = [
+      online,
+      node({ serverId: 'node-2', refName: 'offline-two', displayName: 'Offline Two', online: false }),
+    ];
+    const onOpenRemoteDesktop = vi.fn();
+    const onWall = vi.fn();
+    render(
+      <ControlledNodeQuickMenu
+        onOpenRemoteDesktop={onOpenRemoteDesktop}
+        onOpenRemoteDesktopWall={onWall}
+        allowStandaloneWindow={false}
+      />,
+    );
+
+    const trigger = screen.getByRole('button', { name: 'controlled_nodes.machines_title' });
+    fireEvent.click(trigger);
+    await screen.findByText('Desktop One');
+
+    expect(screen.queryByRole('menuitem', { name: 'remote_desktop.open_new_window' })).toBeNull();
+    expect(screen.getByRole('menuitem', { name: 'remote_desktop.wall_short_title' })).toBeTruthy();
+
+    const rows = screen.getAllByRole('menuitem').filter((item) => item.classList.contains('controlled-node-quick-row'));
+    expect(rows).toHaveLength(2);
+    fireEvent.click(rows[0]!);
+    expect(onOpenRemoteDesktop).toHaveBeenCalledWith(online);
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
   it('shows no new-window button when the caller does not offer one', async () => {
     machines = [node({})];
     render(
@@ -472,5 +502,27 @@ describe('ControlledNodeQuickMenu group tabs', () => {
     render(<ControlledNodeQuickMenu />);
     open();
     expect(document.querySelector('[data-testid="controlled-node-quick-group-direct"]')).toBeNull();
+  });
+
+  it('invokes onConnectById without window.open and closes the quick menu', async () => {
+    machines = [node({ serverId: 'node-1', displayName: 'Node One', accessRole: 'owner' })];
+    const openSpy = vi.spyOn(window, 'open');
+    const onConnectById = vi.fn();
+    render(
+      <ControlledNodeQuickMenu
+        onOpenRemoteDesktop={() => {}}
+        onOpenRemoteDesktopWall={() => {}}
+        onConnectById={onConnectById}
+        allowStandaloneWindow={false}
+      />,
+    );
+    open();
+    const connectBtn = await screen.findByRole('menuitem', { name: 'remote_desktop.connect_by_id' });
+    fireEvent.click(connectBtn);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(onConnectById).toHaveBeenCalledOnce();
+    expect(onConnectById).toHaveBeenCalledWith();
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    openSpy.mockRestore();
   });
 });

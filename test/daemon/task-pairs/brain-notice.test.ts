@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -41,7 +42,7 @@ describe('daemon notices to Brain: the outcome is recorded, never silent', () =>
     mocks.sessions.set(EXEC, { name: EXEC, projectName: PROJECT });
     mocks.dispatchSessionMessage.mockReset();
     mocks.emit.mockReset();
-    getTaskPairStore().savePair(PROJECT, pairState('N1', 'awaiting_brain_decision'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pairState('N1', 'awaiting_brain_decision'));
   });
   afterEach(() => { setTaskPairDeliveryDepsForTests(undefined); });
 
@@ -82,7 +83,7 @@ describe('daemon notices to Brain: the outcome is recorded, never silent', () =>
 
   it('a notice about another pair, or to another pair\'s Brain, is not attributed to this pair', async () => {
     mocks.dispatchSessionMessage.mockResolvedValue('sent');
-    getTaskPairStore().savePair(PROJECT, pairState('N2', 'awaiting_brain_decision', { brain: 'deck_other_brain' }));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pairState('N2', 'awaiting_brain_decision', { brain: 'deck_other_brain' }));
     await sendTaskPairMessage(BRAIN, 'N2', 'brain-line-done-no-auditor', 'decide');
     expect(noticeEvents('N1')).toHaveLength(0);
     expect(noticeEvents('N2')).toHaveLength(0);
@@ -99,7 +100,7 @@ describe('the card says whether Brain was told', () => {
   function liveness(taskId: string) { return getTaskPairStore().getPair(PROJECT, taskId)!.liveness; }
 
   it('carries the last notice for a pair awaiting Brain, only when it belongs to the current wait', () => {
-    getTaskPairStore().savePair(PROJECT, pairState('C1', 'awaiting_brain_decision'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pairState('C1', 'awaiting_brain_decision'));
     getTaskPairStore().saveLiveness(PROJECT, 'C1', { ...liveness('C1'), phaseStartedAt: 1_000, brainNoticeStatus: 'queued', brainNoticeAt: 2_000, brainNoticeReason: 'brain-line-done-no-auditor' });
     expect(brainNoticeForCard(getTaskPairStore().getPair(PROJECT, 'C1'))).toEqual({ status: 'queued', at: 2_000, reason: 'brain-line-done-no-auditor' });
 
@@ -109,15 +110,15 @@ describe('the card says whether Brain was told', () => {
   });
 
   it('is absent for any other status and for a pair that never had a notice', () => {
-    getTaskPairStore().savePair(PROJECT, pairState('C2', 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pairState('C2', 'working'));
     getTaskPairStore().saveLiveness(PROJECT, 'C2', { ...liveness('C2'), brainNoticeStatus: 'sent', brainNoticeAt: 2_000, brainNoticeReason: 'x' });
     expect(brainNoticeForCard(getTaskPairStore().getPair(PROJECT, 'C2'))).toBeUndefined();
-    getTaskPairStore().savePair(PROJECT, pairState('C3', 'awaiting_brain_decision'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pairState('C3', 'awaiting_brain_decision'));
     expect(brainNoticeForCard(getTaskPairStore().getPair(PROJECT, 'C3'))).toBeUndefined();
   });
 
   it('puts brainNotice on the emitted timeline event, and leaves the payload untouched on a daemon that has none', () => {
-    getTaskPairStore().savePair(PROJECT, pairState('C4', 'awaiting_brain_decision'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pairState('C4', 'awaiting_brain_decision'));
     getTaskPairStore().saveLiveness(PROJECT, 'C4', { ...liveness('C4'), brainNoticeStatus: 'failed', brainNoticeAt: 3_000, brainNoticeReason: 'brain-line-done-no-auditor' });
     const state = getTaskPairStore().getPair(PROJECT, 'C4')!.state;
     emitTaskPairTimelineEvent({ taskId: 'C4', verb: 'DONE', writer: EXEC, role: 'executor', source: 'marker', effect: 'recorded', unusual: true }, state, 'evt-c4');
@@ -125,7 +126,7 @@ describe('the card says whether Brain was told', () => {
     expect(call?.[2]).toMatchObject({ brainNotice: { status: 'failed', at: 3_000, reason: 'brain-line-done-no-auditor' } });
 
     mocks.emit.mockReset();
-    getTaskPairStore().savePair(PROJECT, pairState('C5', 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pairState('C5', 'working'));
     emitTaskPairTimelineEvent({ taskId: 'C5', verb: 'WORKING', writer: EXEC, role: 'executor', source: 'marker', effect: 'applied', unusual: false }, getTaskPairStore().getPair(PROJECT, 'C5')!.state, 'evt-c5');
     expect(mocks.emit.mock.calls[0]?.[2]).not.toHaveProperty('brainNotice');
   });

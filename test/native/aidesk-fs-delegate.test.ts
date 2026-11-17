@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -33,6 +33,30 @@ let root = '';
 let requestDir = '';
 let fixtureDir = '';
 let seq = 0;
+
+function nativeMtimeMs(nanoseconds: bigint): number {
+  // Match MetadataFields' integer truncation before converting to a JS number.
+  // Floating-point Stats.mtimeMs can round up across the next millisecond.
+  return Number(nanoseconds / 1_000_000n);
+}
+
+describe('aidesk fs delegate: metadata timestamp oracle', () => {
+  it.each([
+    [0n, 0],
+    [1_794_295_749_747_000_000n, 1_794_295_749_747],
+    [1_794_295_749_747_999_999n, 1_794_295_749_747],
+    [1_794_295_749_748_000_000n, 1_794_295_749_748],
+    [1_794_295_749_748_000_001n, 1_794_295_749_748],
+  ])('truncates %s ns to exactly %s ms', (nanoseconds, milliseconds) => {
+    expect(nativeMtimeMs(nanoseconds)).toBe(milliseconds);
+  });
+
+  it('does not use the floating-point oracle that rounds up by one millisecond', () => {
+    const nanoseconds = 1_794_295_749_747_999_999n;
+    expect(Math.floor(Number(nanoseconds) / 1_000_000)).toBe(1_794_295_749_748);
+    expect(nativeMtimeMs(nanoseconds)).toBe(1_794_295_749_747);
+  });
+});
 
 function run(requestFile: string, options: { dir?: string; chainStart?: string; trustedUid?: number; now?: number; probe?: string; requireProbe?: boolean } = {}): MacosFsDelegateAnswer {
   const result = spawnSync(binary, [
@@ -216,11 +240,12 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
       if (!meta.ok) return;
       const byName = Object.fromEntries(meta.entries.map((entry) => [entry.name, entry]));
       expect(byName['a.txt']!.meta!.size).toBe(120);
-      expect(Math.abs(byName['a.txt']!.meta!.mtimeMs! - 1_700_000_000_123)).toBeLessThanOrEqual(1); // sub-millisecond is cut, not rounded
+      expect(byName['a.txt']!.meta!.mtimeMs).toBe(nativeMtimeMs(statSync(join(fixtureDir, 'a.txt'), { bigint: true }).mtimeNs));
       expect(byName['empty']!.meta!.size).toBe(0);
+      expect(byName['empty']!.meta!.mtimeMs).toBe(nativeMtimeMs(statSync(join(fixtureDir, 'empty'), { bigint: true }).mtimeNs));
       expect(byName['sub']!.kind).toBe('d');
       expect(byName['sub']!.meta!.size).toBe(0); // a directory's own byte size is not reported
-      expect(byName['sub']!.meta!.mtimeMs).toBe(Math.floor(statSync(join(fixtureDir, 'sub')).mtimeMs));
+      expect(byName['sub']!.meta!.mtimeMs).toBe(nativeMtimeMs(statSync(join(fixtureDir, 'sub'), { bigint: true }).mtimeNs));
       for (const entry of meta.entries) expect(entry.meta, entry.name).toBeDefined();
       const plain = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST }, 'plain.req'));
       expect(plain.ok && plain.entries.every((entry) => entry.meta === undefined)).toBe(true);
@@ -231,6 +256,9 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
       symlinkSync(join(fixtureDir, 'target'), join(fixtureDir, 'link'));
       const meta = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST_META }, 'link.req'));
       expect(meta.ok && meta.entries.find((entry) => entry.name === 'link')!.kind).toBe('o');
+      expect(meta.ok && meta.entries.find((entry) => entry.name === 'link')!.meta!.size).toBe(0);
+      expect(meta.ok && meta.entries.find((entry) => entry.name === 'link')!.meta!.mtimeMs)
+        .toBe(nativeMtimeMs(lstatSync(join(fixtureDir, 'link'), { bigint: true }).mtimeNs));
       expect(meta.ok && meta.entries.find((entry) => entry.name === 'target')!.meta!.size).toBe(3);
     });
   });

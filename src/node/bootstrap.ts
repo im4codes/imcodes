@@ -88,6 +88,8 @@ export async function prepareCredentialDir(credentialPath = defaultCredentialPat
 
 export interface ControlledNodeBootstrapDeps {
   abiProfile?: ControlledNodeAbiProfile;
+  /** Validated enrollment blob supplied via `--enroll-stdin` (no executable trailer required). */
+  enrollmentBlob?: EnrollmentBlob;
   loadCredential: () => Promise<ControlledNodeCredential | null>;
   openVerifiedEnrollmentSource: (executablePath?: string) => Promise<VerifiedEnrollmentSource>;
   loadInstallIdentity: () => Promise<PendingInstallIdentity | null>;
@@ -133,19 +135,31 @@ export interface ControlledNodeBootstrapDeps {
   recoverCorruptInstallJournal?: () => Promise<InstallJournal | null>;
 }
 
-export type BootstrapDisposition = 'handoff_complete' | 'run_runtime';
+export type BootstrapDisposition = 'handoff_complete' | 'pending_setup' | 'run_runtime';
 
-export interface BootstrapResult {
-  credential: ControlledNodeCredential;
-  disposition: BootstrapDisposition;
-  journal: InstallJournal;
-  /**
-   * Set when the release publisher certificate could not be installed. The node
-   * is enrolled and reachable; the native sidecars that require the trust
-   * anchor will refuse to launch until it is.
-   */
-  publisherTrustError?: string;
-}
+export type BootstrapResult =
+  | {
+      credential: ControlledNodeCredential;
+      disposition: 'handoff_complete' | 'run_runtime';
+      journal: InstallJournal;
+      /**
+       * Set when the release publisher certificate could not be installed. The node
+       * is enrolled and reachable; the native sidecars that require the trust
+       * anchor will refuse to launch until it is.
+       */
+      publisherTrustError?: string;
+    }
+  | {
+      credential: null;
+      disposition: 'pending_setup';
+      journal: InstallJournal;
+      /**
+       * Set when the release publisher certificate could not be installed. The node
+       * is enrolled and reachable; the native sidecars that require the trust
+       * anchor will refuse to launch until it is.
+       */
+      publisherTrustError?: string;
+    };
 
 /** Production deps wired to the real enrollment/installer/journal + fs. */
 export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
@@ -374,12 +388,36 @@ async function loadJournalOrThrow(deps: ControlledNodeBootstrapDeps): Promise<In
   }
 }
 
+interface ResolvedEnrollmentSource {
+  blob: EnrollmentBlob;
+  trailerStart: number;
+  windowsAuthenticode?: EnrollmentTrailerRange['windowsAuthenticode'];
+}
+
+async function resolveEnrollmentSource(
+  deps: ControlledNodeBootstrapDeps,
+  source: VerifiedEnrollmentSource,
+): Promise<ResolvedEnrollmentSource | null> {
+  const trailerRange = await source.readEnrollmentBlobWithRange();
+  if (deps.enrollmentBlob) {
+    // Stdin-enrolled installers download an unmodified executable without a trailer;
+    // stage [0..statSize) directly, or [0..trailerStart) if a trailer is also present.
+    const trailerStart = trailerRange ? trailerRange.trailerStart : await source.statSize();
+    return {
+      blob: deps.enrollmentBlob,
+      trailerStart,
+      windowsAuthenticode: trailerRange?.windowsAuthenticode,
+    };
+  }
+  return trailerRange;
+}
+
 async function ensureIdentityPrepared(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
-  trailerRange: EnrollmentTrailerRange,
+  blob: EnrollmentBlob,
 ): Promise<{ journal: InstallJournal; identity: PendingInstallIdentity }> {
-  assertProductionServerUrl(trailerRange.blob.serverUrl);
+  assertProductionServerUrl(blob.serverUrl);
   await deps.prepareCredentialDir();
   let identity = await deps.loadInstallIdentity();
   const identityAlreadyRequired = phaseIndex(journal.phase) >= phaseIndex('credential_prepared');
@@ -468,7 +506,7 @@ async function ensureIdentityPrepared(
 async function ensureExecutableStaged(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
-  trailerRange: EnrollmentTrailerRange,
+  resolved: Pick<ResolvedEnrollmentSource, 'trailerStart' | 'windowsAuthenticode'>,
   source: VerifiedEnrollmentSource,
 ): Promise<InstallJournal> {
   if (phaseIndex(journal.phase) >= phaseIndex('files_staged') && journal.stagedExePath) {
@@ -493,8 +531,8 @@ async function ensureExecutableStaged(
   }
   const stagedReceipt: StagedExecutableReceipt = await source.stageTrailerFreeExecutable(
     deps.stagedExecutablePath,
-    trailerRange.trailerStart,
-    trailerRange.windowsAuthenticode,
+    resolved.trailerStart,
+    resolved.windowsAuthenticode,
   );
   // Record the refreshed receipt at the phase the install is ALREADY in.
   //
@@ -519,7 +557,7 @@ async function ensureExecutableStaged(
 async function ensureEnrolled(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
-  trailerRange: EnrollmentTrailerRange,
+  blob: EnrollmentBlob,
   identity: PendingInstallIdentity,
 ): Promise<{ journal: InstallJournal; credential: ControlledNodeCredential }> {
   const existing = await deps.loadCredential();
@@ -530,7 +568,7 @@ async function ensureEnrolled(
     throw new Error('controlled node install journal is enrolled but install identity is missing; manual recovery required');
   }
 
-  const credential = await deps.redeemEnrollmentV2(trailerRange.blob, identity);
+  const credential = await deps.redeemEnrollmentV2(blob, identity);
   try {
     await deps.persistCredential(credential);
   } catch (err) {
@@ -576,7 +614,9 @@ async function ensureServiceRegistered(
   journal: InstallJournal,
 ): Promise<InstallJournal> {
   if (phaseIndex(journal.phase) >= phaseIndex('files_staged')) {
-    if (!journal.stagedReceipt) throw new Error('controlled node staged executable receipt is missing; manual recovery required');
+    if (!journal.stagedReceipt) {
+      throw new Error('controlled node staged executable receipt is missing; manual recovery required');
+    }
     // Report drift, never refuse on it. This runs on the service's own start
     // path too, so throwing here turns a stale receipt into a crash loop on a
     // machine that is otherwise serving fine -- and the installer, the one
@@ -694,12 +734,12 @@ async function restageFromInstallerPackage(
   let source: VerifiedEnrollmentSource | null = null;
   try {
     source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
-    const trailerRange = await source.readEnrollmentBlobWithRange();
-    if (!trailerRange) return journal;
+    const resolved = await resolveEnrollmentSource(deps, source);
+    if (!resolved) return journal;
     const stagedReceipt = await source.stageTrailerFreeExecutable(
       deps.stagedExecutablePath,
-      trailerRange.trailerStart,
-      trailerRange.windowsAuthenticode,
+      resolved.trailerStart,
+      resolved.windowsAuthenticode,
     );
     // Re-running the same package restages identical bytes. Rewriting the
     // journal for that would churn the phase log and blur the one-phase-at-a-
@@ -753,10 +793,37 @@ async function ensureServiceStartRequested(
  * second instance or kill the current connection); the source path may
  * repair on drift but must NOT lie about persistence.
  */
+function isCredentialAclDriftError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith('windows_credential_acl_insecure:') || message === 'credential_permissions_insecure';
+}
+
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
-  const existing = await deps.loadCredential();
-  let journal = await loadJournalOrThrow(deps);
   const abiProfile = deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  let existing: ControlledNodeCredential | null;
+  let preloadedJournal: InstallJournal | null = null;
+  try {
+    existing = await deps.loadCredential();
+  } catch (error) {
+    if (!isCredentialAclDriftError(error)) throw error;
+    preloadedJournal = await loadJournalOrThrow(deps);
+    if (await deps.isStableRuntime(preloadedJournal)) throw error;
+    if (deps.enrollmentBlob && normalizeControlledNodeAbiProfile(deps.enrollmentBlob.abiProfile) !== abiProfile) {
+      throw new Error('controlled node stdin enrollment ABI profile does not match the executable');
+    }
+    if (phaseIndex(preloadedJournal.phase) >= phaseIndex('credential_prepared')
+      && normalizeControlledNodeAbiProfile(preloadedJournal.abiProfile) !== abiProfile) {
+      throw new Error('controlled node persisted ABI profile does not match the executable');
+    }
+    preloadedJournal = await ensureElevated(deps, preloadedJournal);
+    await deps.prepareCredentialDir();
+    deps.warn('controlled node repaired credential directory ACL after drift during reinstall');
+    existing = await deps.loadCredential();
+  }
+  let journal = preloadedJournal ?? await loadJournalOrThrow(deps);
+  if (deps.enrollmentBlob && normalizeControlledNodeAbiProfile(deps.enrollmentBlob.abiProfile) !== abiProfile) {
+    throw new Error('controlled node stdin enrollment ABI profile does not match the executable');
+  }
   if ((existing && normalizeControlledNodeAbiProfile(existing.abiProfile) !== abiProfile)
     || (phaseIndex(journal.phase) >= phaseIndex('credential_prepared')
       && normalizeControlledNodeAbiProfile(journal.abiProfile) !== abiProfile)) {
@@ -817,7 +884,7 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
     // installer does this; the service must never rewrite the image it is
     // executing from.
     if (!stableRuntime) journal = await restageFromInstallerPackage(deps, journal);
-    journal = await ensureServiceStartRequested(deps, journal);
+    journal = await ensureServiceStartRequested(deps, journal, { startService: !stableRuntime });
     return {
       credential: existing,
       disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
@@ -829,21 +896,25 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
   let source: VerifiedEnrollmentSource | null = null;
   try {
     source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
-    const trailerRange = await source.readEnrollmentBlobWithRange();
-    if (!trailerRange) {
+    const resolved = await resolveEnrollmentSource(deps, source);
+    if (!resolved) {
       if (phaseIndex(journal.phase) >= phaseIndex('enrolled')) {
         throw new Error('controlled node is enrolled but enrollment blob is unavailable; manual recovery required');
       }
-      throw new Error('controlled node is not enrolled');
+      return {
+        credential: null,
+        disposition: 'pending_setup',
+        journal,
+      };
     }
 
-    const identityStep = await ensureIdentityPrepared(deps, journal, trailerRange);
+    const identityStep = await ensureIdentityPrepared(deps, journal, resolved.blob);
     journal = identityStep.journal;
     const identity = identityStep.identity;
 
-    journal = await ensureExecutableStaged(deps, journal, trailerRange, source);
+    journal = await ensureExecutableStaged(deps, journal, resolved, source);
 
-    const enrolled = await ensureEnrolled(deps, journal, trailerRange, identity);
+    const enrolled = await ensureEnrolled(deps, journal, resolved.blob, identity);
     journal = enrolled.journal;
     const credential = enrolled.credential;
 
@@ -856,7 +927,11 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
 }
 
 export async function bootstrapControlledNode(deps: ControlledNodeBootstrapDeps): Promise<ControlledNodeCredential> {
-  return (await bootstrapControlledNodeWithDisposition(deps)).credential;
+  const result = await bootstrapControlledNodeWithDisposition(deps);
+  if (result.disposition === 'pending_setup' || !result.credential) {
+    throw new Error('controlled node is not enrolled');
+  }
+  return result.credential;
 }
 
 /**

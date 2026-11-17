@@ -4,21 +4,25 @@ import { describe, expect, it } from 'vitest';
 
 const WEB_ROOT = resolve(__dirname, '..');
 
-describe('UsageFooter quota and history-refresh integration contract', () => {
-  it('wires the existing timeline refresh into every full and pinned session footer', () => {
+describe('UsageFooter quota and ChatView top-bar integration contract', () => {
+  it('wires manual timeline sync into ChatView top actions and keeps UsageFooter free of duplicate sync/usage buttons', () => {
     const main = readFileSync(resolve(WEB_ROOT, 'src/components/SessionPane.tsx'), 'utf8');
     const standalone = readFileSync(resolve(WEB_ROOT, 'src/components/SubSessionWindow.tsx'), 'utf8');
     const pinned = readFileSync(resolve(WEB_ROOT, 'src/components/pinnedPanelTypes.tsx'), 'utf8');
+    const footer = readFileSync(resolve(WEB_ROOT, 'src/components/UsageFooter.tsx'), 'utf8');
+    const chatView = readFileSync(resolve(WEB_ROOT, 'src/components/ChatView.tsx'), 'utf8');
 
-    expect(main).toContain('onRefreshHistory={timelineForceRefresh}');
-    expect(main).toContain('historyRefreshing={timelineRefreshing}');
-    expect(main).toContain('historyStatus={timelineHistoryStatus}');
-    expect(standalone).toContain('onRefreshHistory={timelineForceRefresh}');
-    expect(standalone).toContain('historyRefreshing={refreshing}');
-    expect(standalone).toContain('historyStatus={timelineHistoryStatus}');
-    expect(pinned).toContain('onRefreshHistory={forceRefresh}');
-    expect(pinned).toContain('historyRefreshing={refreshing}');
-    expect(pinned).toContain('historyStatus={historyStatus}');
+    expect(main).toContain('onForceSync={timelineForceRefresh}');
+    expect(main).not.toContain('onRefreshHistory=');
+    expect(standalone).toContain('onForceSync={timelineForceRefresh}');
+    expect(standalone).not.toContain('onRefreshHistory=');
+    expect(pinned).toContain('onForceSync={forceRefresh}');
+    expect(pinned).not.toContain('onRefreshHistory=');
+
+    expect(footer).not.toContain('shortcut-btn-history-refresh');
+    expect(footer).not.toContain('shortcut-btn-session-usage');
+    expect(chatView).toContain('chat-sync-btn');
+    expect(chatView).toContain('chat-session-usage-btn');
   });
 
   it('keeps one compact quota element readable instead of truncating narrow layouts', () => {

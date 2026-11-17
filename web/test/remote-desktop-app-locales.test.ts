@@ -8,50 +8,38 @@ import ko from '../src/i18n/locales/ko.json';
 import ru from '../src/i18n/locales/ru.json';
 import zhCN from '../src/i18n/locales/zh-CN.json';
 import zhTW from '../src/i18n/locales/zh-TW.json';
-import { INSTALL_GUIDANCE } from '../src/pwa-install.js';
 
 const locales = { en, es, ja, ko, ru, 'zh-CN': zhCN, 'zh-TW': zhTW } as Record<string, { remote_desktop: Record<string, string> }>;
 
-/** One instruction per browser kind the detector can name, plus the fixed labels and the blocked-window notice. */
-const GUIDE_KEYS = Object.values(INSTALL_GUIDANCE).map((kind) => `install_guide_${kind}`);
-const LABEL_KEYS = ['install_app', 'install_app_hint', 'install_guide_close', 'window_blocked', 'window_blocked_dismiss'];
-const REQUIRED = [...GUIDE_KEYS, ...LABEL_KEYS];
+const REQUIRED = ['window_blocked', 'window_blocked_dismiss'];
 
-describe('install-as-app and blocked-window texts', () => {
-  it.each(Object.keys(locales))('%s has every key, as non-empty text', (locale) => {
-    for (const key of REQUIRED) {
-      const value = locales[locale]!.remote_desktop[key];
-      expect(typeof value, `${locale}.remote_desktop.${key}`).toBe('string');
-      expect(value!.trim().length, `${locale}.remote_desktop.${key}`).toBeGreaterThan(0);
-    }
+const NOTICE_TEXT: Record<string, string> = {
+  en: 'Your browser blocked the remote desktop window. Allow pop-ups for this site and try again.',
+  es: 'El navegador bloqueó la ventana del escritorio remoto. Permite las ventanas emergentes de este sitio e inténtalo de nuevo.',
+  ja: 'ブラウザがリモートデスクトップのウィンドウをブロックしました。このサイトのポップアップを許可してもう一度お試しください。',
+  ko: '브라우저가 원격 데스크톱 창을 차단했습니다. 이 사이트의 팝업을 허용한 뒤 다시 시도하세요.',
+  ru: 'Браузер заблокировал окно удалённого рабочего стола. Разрешите всплывающие окна для этого сайта и повторите попытку.',
+  'zh-CN': '浏览器拦截了远程桌面窗口。请允许本站弹出窗口后重试。',
+  'zh-TW': '瀏覽器封鎖了遠端桌面視窗。請允許本網站的彈出視窗後重試。',
+};
+
+describe('blocked-window texts without installation guidance', () => {
+  it.each(Object.keys(locales))('%s keeps translated popup advice and dismissal, not installation guidance', (locale) => {
+    const text = locales[locale]!.remote_desktop;
+    expect(text.window_blocked).toBe(NOTICE_TEXT[locale]);
+    expect(text.window_blocked_dismiss?.trim()).toBeTruthy();
+    expect(Object.keys(text).filter(key => key === 'install_app' || key === 'install_app_hint' || key.startsWith('install_guide_'))).toEqual([]);
   });
 
   it('is translated, not the English text copied into the other six languages', () => {
     for (const locale of Object.keys(locales).filter((name) => name !== 'en')) {
-      for (const key of REQUIRED) {
-        expect(locales[locale]!.remote_desktop[key], `${locale}.${key}`).not.toBe(locales.en!.remote_desktop[key]);
-      }
+      for (const key of REQUIRED) expect(locales[locale]!.remote_desktop[key]).not.toBe(locales.en!.remote_desktop[key]);
     }
   });
 
-  it('keeps each instruction about the right browser', () => {
-    // the Firefox text explains why the address bar cannot go; it must not tell the user to install from a Firefox menu
-    expect(en.remote_desktop.install_guide_firefox).toMatch(/Chrome or Edge/);
-    expect(en.remote_desktop.install_guide_safari_mac).toMatch(/Add to Dock/);
-    expect(en.remote_desktop.install_guide_safari_ios).toMatch(/Add to Home Screen/);
-    expect(en.remote_desktop.install_guide_edge).toMatch(/Edge/);
-    expect(en.remote_desktop.install_guide_chrome).toMatch(/Chrome/);
-  });
-
-  it('is used by the components under exactly these names (no key the UI asks for is missing)', () => {
-    const used = new Set<string>();
-    for (const file of ['components/RemoteDesktopInstallEntry.tsx', 'components/RemoteDesktopWindowBlockedNotice.tsx']) {
-      const source = readFileSync(resolve(__dirname, '../src', file), 'utf8');
-      for (const match of source.matchAll(/t\('remote_desktop\.([a-z_]+)'\)/g)) used.add(match[1]!);
-    }
-    for (const key of used) expect(REQUIRED, key).toContain(key);
-    // the per-browser instruction is built from the detector's kinds
-    const entry = readFileSync(resolve(__dirname, '../src/components/RemoteDesktopInstallEntry.tsx'), 'utf8');
-    expect(entry).toContain('remote_desktop.install_guide_${install.guidance}');
+  it('provides all localized labels used by the remaining blocked-window notice', () => {
+    const source = readFileSync(resolve(__dirname, '../src/components/RemoteDesktopWindowBlockedNotice.tsx'), 'utf8');
+    const used = [...source.matchAll(/t\('remote_desktop\.([a-z_]+)'\)/g)].map(match => match[1]);
+    expect(used.sort()).toEqual([...REQUIRED].sort());
   });
 });

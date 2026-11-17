@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, realpath, writeFile } from 'node:fs/promises';
@@ -129,7 +130,7 @@ describe('send-tool', () => {
     });
     const removedAuditor = session({ name: 'deck_alpha_old_auditor', projectName: 'alpha', role: 'w1' });
     const currentAuditor = session({ name: 'deck_alpha_current_auditor', projectName: 'alpha', role: 'w2' });
-    getTaskPairStore().savePair('alpha', {
+    putTaskPairFixture(getTaskPairStore(), 'alpha', {
       taskId: 'pair-with-removed-auditor', brain: brain.name, executor: 'deck_alpha_executor',
       auditor: currentAuditor.name, status: 'in_audit', flags: [], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [removedAuditor.name], capCounts: {}, capRound: 0,
@@ -161,7 +162,7 @@ describe('send-tool', () => {
       transportConfig: { supervision: { mode: 'supervised_audit' } },
     });
     const executor = session({ name: 'deck_alpha_executor', projectName: 'alpha', role: 'w1' });
-    getTaskPairStore().savePair('alpha', {
+    putTaskPairFixture(getTaskPairStore(), 'alpha', {
       taskId: 'already-done', brain: brain.name, executor: executor.name, auditor: 'none',
       status: 'done', flags: [], flagSides: {}, round: 1, blocking: ['P0'],
       previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,

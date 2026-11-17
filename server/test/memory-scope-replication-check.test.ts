@@ -38,9 +38,12 @@ function normalize(sql: string): string {
 
 function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
   const executeLog: Array<{ sql: string; params: unknown[] }> = [];
+  const queryLog: Array<{ sql: string; params: unknown[] }> = [];
+  const queryOneLog: Array<{ sql: string; params: unknown[] }> = [];
   const tokenHash = sha256Hex('daemon-token');
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      queryOneLog.push({ sql, params });
       { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
       if (s.includes('from user_preferences')) {
@@ -58,6 +61,7 @@ function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
       return null;
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      queryLog.push({ sql, params });
       const s = normalize(sql);
       if (s.includes('from owner_private_memories')) {
         return params[0] === 'owner-1'
@@ -73,7 +77,7 @@ function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
     exec: async () => {},
     close: async () => {},
   } as Database;
-  return { db, executeLog };
+  return { db, executeLog, queryLog, queryOneLog };
 }
 
 describe('below-admission user_private owner-only server replication', () => {
@@ -214,6 +218,28 @@ describe('below-admission user_private owner-only server replication', () => {
       results: [{ id: 'mem-1', scope: 'user_private', kind: 'preference', origin: 'user_note', preview: 'Use pnpm', updatedAt: 123 }],
       nextCursor: null,
     });
+  });
+
+  it('returns the same empty envelope for missing, null, and blank owner-private queries without reading PostgreSQL', async () => {
+    const { db, queryLog, queryOneLog } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    for (const body of [{}, { query: null }, { query: '' }, { query: '   ' }]) {
+      const beforeQueryCount = queryLog.length;
+      const beforeQueryOneCount = queryOneLog.length;
+      const res = await app.request('/api/server/srv-1/shared-context/owner-private/search', {
+        method: 'POST',
+        headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }, makeEnv(db));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ results: [], nextCursor: null });
+      expect(queryLog.length).toBe(beforeQueryCount);
+      expect(queryOneLog.slice(beforeQueryOneCount).some((entry) => normalize(entry.sql).includes('from user_preferences'))).toBe(false);
+    }
+
+    expect(queryLog.some((entry) => normalize(entry.sql).includes('from owner_private_memories'))).toBe(false);
   });
 
   it('persists canonical content_hash on processed projection replication', async () => {

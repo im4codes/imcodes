@@ -183,6 +183,12 @@ export const DAEMON_RUN_STATE = {
 } as const;
 export type DaemonRunState = (typeof DAEMON_RUN_STATE)[keyof typeof DAEMON_RUN_STATE];
 
+/** File (in the daemon state dir) storing one-shot `continue` markers for turns interrupted by daemon restart/crash. */
+export const DAEMON_RESTART_CONTINUATION_FILE = 'restart-continuations.json';
+/** Safety TTL so an unclaimed restart-continuation marker never triggers much later after a session sat offline. */
+export const DAEMON_RESTART_CONTINUATION_TTL_MS = 30 * 60_000;
+export const DAEMON_RESTART_CONTINUATION_COMMAND_PREFIX = 'auto-restart-continue:';
+
 export function isDaemonUpgradeDeferral(value: unknown): value is DaemonUpgradeDeferral {
   return value === DAEMON_UPGRADE_DEFERRAL.STARTING_UP || value === DAEMON_UPGRADE_DEFERRAL.UNCLEAN_SHUTDOWN_RECOVERY;
 }

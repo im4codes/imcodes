@@ -480,6 +480,7 @@ export type WindowsAclCommand = readonly [path: string, ...args: string[]];
  */
 export function windowsCredentialAclCommands(dir: string): WindowsAclCommand[] {
   return [
+    [dir, '/reset'],
     [dir, '/grant:r', `${WINDOWS_SYSTEM_SID}:(OI)(CI)F`],
     [dir, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F`],
     [dir, '/inheritance:r'],
@@ -490,6 +491,7 @@ export function windowsCredentialAclCommands(dir: string): WindowsAclCommand[] {
 /** Explicit protected DACL for each persisted secret file (no inheritance). */
 export function windowsSecretFileAclCommands(path: string): WindowsAclCommand[] {
   return [
+    [path, '/reset'],
     [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
     [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
     [path, '/inheritance:r'],
@@ -505,6 +507,7 @@ export function windowsSecretFileAclCommands(path: string): WindowsAclCommand[] 
  */
 export function windowsExecutableFileAclCommands(path: string): WindowsAclCommand[] {
   return [
+    [path, '/reset'],
     [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
     [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
     [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:RX`],
@@ -518,6 +521,7 @@ export function windowsComputerUseHelperAclCommands(path: string): WindowsAclCom
     // Protect only the helper root. Its children must keep inheriting these
     // explicit root ACEs; recursively stripping inheritance would leave the
     // helper files unreadable even to the intended interactive controller.
+    [path, '/reset'],
     [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:(OI)(CI)F`],
     [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F`],
     [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:(OI)(CI)RX`],
@@ -1328,9 +1332,36 @@ export async function installControlledNodeService(
  * redemption/persistence). No-op guard off Windows. Real `icacls` enforcement is
  * E2E on Windows; the arg construction is unit-tested via `windowsCredentialAclArgs`.
  */
-export async function secureWindowsCredentialDir(dir: string = windowsCredentialDir()): Promise<string> {
-  if (process.platform !== 'win32') throw new Error('secureWindowsCredentialDir is Windows-only');
+const WINDOWS_CREDENTIAL_SECRET_FILES = [
+  'credential.json',
+  'install-identity.json',
+  'pending-daemon-bind.json',
+] as const;
+
+export async function secureWindowsCredentialDir(
+  dir: string = windowsCredentialDir(),
+  options: {
+    platform?: NodeJS.Platform;
+    runCommand?: (file: string, args: readonly string[]) => void;
+    pathExists?: (filePath: string) => Promise<boolean>;
+  } = {},
+): Promise<string> {
+  if ((options.platform ?? process.platform) !== 'win32') throw new Error('secureWindowsCredentialDir is Windows-only');
   await mkdir(dir, { recursive: true });
-  applyWindowsAclCommands(windowsCredentialAclCommands(dir));
+  applyWindowsAclCommands(windowsCredentialAclCommands(dir), options.runCommand);
+  const checkRegularFile = options.pathExists ?? (async (filePath: string) => {
+    try {
+      const st = await lstat(filePath);
+      return st.isFile() && !st.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  });
+  for (const name of WINDOWS_CREDENTIAL_SECRET_FILES) {
+    const filePath = win32.join(dir, name);
+    if (await checkRegularFile(filePath)) {
+      applyWindowsAclCommands(windowsSecretFileAclCommands(filePath), options.runCommand);
+    }
+  }
   return dir;
 }

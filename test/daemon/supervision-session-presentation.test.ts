@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 /**
  * tsk_58c8fb1b73: a pair row kept saying "running" for a session that had gone
  * idle. The live-state memo (1 s TTL, for bulk snapshot passes) was still warm
@@ -175,7 +176,7 @@ describe('end to end: a running -> idle transition reaches the viewer without an
       resolveSessionPresentation: (name, at) => resolver.resolve(name, at),
     });
     registry = new SupervisionConsoleSessionRegistry({ producer, send: (frame) => sent.push(frame), authorize: () => true });
-    store.savePair(PROJECT, {
+    putTaskPairFixture(store, PROJECT, {
       taskId: 'p1', brain: BRAIN, executor: 'deck_sub_x', auditor: 'deck_sub_a', title: 'P1', status: 'working',
       flags: [], flagSides: {}, round: 0, blocking: [], previousAuditors: [], createdAt: 1, updatedAt: 1,
     } as never, { liveness: { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: 1, progressAuditorAt: 1 } as never });

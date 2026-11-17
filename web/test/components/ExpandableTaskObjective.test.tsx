@@ -59,6 +59,19 @@ describe('ExpandableTaskObjective', () => {
     expect(screen.getByTestId('expandable-task-objective-text').textContent).not.toContain('\ufffd');
   });
 
+  it('only makes an overflowing opt-in scrollport focusable and named', () => {
+    const view = render(<ExpandableTaskObjective text="Long copy" scrollLabel="Decision text" measureOverflow={() => true} />);
+    const area = screen.getByRole('region', { name: 'Decision text' });
+    expect(area.tabIndex).toBe(0);
+    expect(screen.getByRole('button', { name: '展开' }).getAttribute('aria-controls')).toBe(area.id);
+    view.rerender(<ExpandableTaskObjective text="Short copy" scrollLabel="Decision text" measureOverflow={() => false} />);
+    expect(screen.queryByRole('region')).toBeNull();
+    expect(screen.getByTestId('expandable-task-objective-text').hasAttribute('tabindex')).toBe(false);
+    view.rerender(<ExpandableTaskObjective text="Default objective" measureOverflow={() => true} />);
+    expect(screen.queryByRole('region')).toBeNull();
+    expect(screen.getByTestId('expandable-task-objective-text').hasAttribute('tabindex')).toBe(false);
+  });
+
   it('remeasures real overflow after container resize and font loading', async () => {
     let resize: (() => void) | undefined;
     globalThis.ResizeObserver = class {

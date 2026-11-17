@@ -339,6 +339,8 @@ class WorkerSession {
   // exactly the cadence Windows' worker_main.cc uses for its own
   // PeerSession::CheckMediaProgress() call.
   void CheckMediaProgress() { session_->CheckMediaProgress(); }
+  auto traffic_stats() const { return session_->traffic_stats(); }
+  const std::string traffic_peer_id = imcodes::rd::NewTrafficPeerId();
 
  private:
   imcodes::rd::Authority authority_;
@@ -472,6 +474,9 @@ class Worker {
         continue;
       }
       it->second->CheckMediaProgress();
+      for (const auto& sample : it->second->traffic_stats()) {
+        WriteLine(imcodes::rd::TrafficEnvelope(it->second->authority(), sample, it->second->traffic_peer_id));
+      }
       const common::TransportDiagnostics diagnostics = it->second->diagnostics();
       Json::Value status = imcodes::rd::BaseEnvelope(
           imcodes::rd::kStatusType, it->second->authority());
@@ -525,6 +530,16 @@ class Worker {
       WriteLine(status);
       ++it;
     }
+  }
+
+  /**
+   * Serve X11 clipboard requests on the signaling sequence.  PasteText owns
+   * the shared Display from that same sequence; keeping the request pump here
+   * avoids a second thread competing with input/capture/disclosure for X11
+   * events while still responding well within a normal paste gesture.
+   */
+  void PumpClipboardSelectionRequests() {
+    adapters_.clipboard().PumpSelectionRequests(32);
   }
 
  private:
@@ -598,9 +613,16 @@ int main() {
   // unsynchronized concurrent-map bug whose corruption surfaced as an
   // unrelated-looking crash inside WebRTC's audio device init.
   std::thread status_thread([&worker, thread = signaling_thread.get()]() {
+    auto next_status = std::chrono::steady_clock::now();
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      thread->PostTask([&worker]() { worker.PublishStatus(); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      const auto now = std::chrono::steady_clock::now();
+      const bool publish_status = now >= next_status;
+      if (publish_status) next_status = now + std::chrono::seconds(1);
+      thread->PostTask([&worker, publish_status]() {
+        worker.PumpClipboardSelectionRequests();
+        if (publish_status) worker.PublishStatus();
+      });
     }
   });
   status_thread.detach();

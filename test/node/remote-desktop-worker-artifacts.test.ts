@@ -21,9 +21,12 @@ import {
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   validateRemoteDesktopWorkerReleaseManifest,
+  REMOTE_DESKTOP_LINUX_MAX_GLIBC_VERSION,
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME as PACKAGING_LINUX_WORKER_FILENAME,
   REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR as PACKAGING_LINUX_PLATFORM_DIR,
   REMOTE_DESKTOP_WORKER_SIDECAR_DIR as PACKAGING_SIDECAR_DIR,
+  assertLinuxElfGlibcCeiling,
+  parseElf64GlibcRequirements,
   verifyLinuxRemoteDesktopWorkerArtifactSet,
   verifyRemoteDesktopWorkerArtifactSet,
 } from '../../scripts/remote-desktop-worker-artifacts.mjs';
@@ -494,6 +497,90 @@ describe('remote desktop worker release artifact verifier', () => {
 
 describe('Linux remote desktop worker release gate', () => {
   const VERSION = '2026.10.5516-dev.5968';
+  const COMPLIANT_VERNEED = [
+    { library: 'libc.so.6', versions: ['GLIBC_2.2.5', 'GLIBC_2.4', 'GLIBC_2.14', 'GLIBC_2.17', 'GLIBC_2.31'] },
+    { library: 'libm.so.6', versions: ['GLIBC_2.2.5'] },
+    { library: 'libpthread.so.0', versions: ['GLIBC_2.2.5', 'GLIBC_2.12'] },
+    { library: 'libdl.so.2', versions: ['GLIBC_2.2.5'] },
+    { library: 'libgcc_s.so.1', versions: ['GCC_3.0'] },
+  ];
+
+  function buildTestElf64(
+    options: { verneed?: Array<{ library: string; versions: string[] }>; machine?: number } = {},
+  ): Buffer {
+    const verneed = options.verneed ?? COMPLIANT_VERNEED;
+    const strChunks: Buffer[] = [Buffer.from([0])];
+    let strLen = 1;
+    const addString = (value: string) => {
+      const offset = strLen;
+      const chunk = Buffer.from(`${value}\0`, 'utf8');
+      strChunks.push(chunk);
+      strLen += chunk.length;
+      return offset;
+    };
+
+    const verneedEntries: Buffer[] = [];
+    for (let entryIdx = 0; entryIdx < verneed.length; entryIdx += 1) {
+      const { library, versions } = verneed[entryIdx];
+      const libOffset = addString(library);
+      const entryBuf = Buffer.alloc(16 + versions.length * 16);
+      const isLastEntry = entryIdx + 1 === verneed.length;
+      entryBuf.writeUInt16LE(1, 0);
+      entryBuf.writeUInt16LE(versions.length, 2);
+      entryBuf.writeUInt32LE(libOffset, 4);
+      entryBuf.writeUInt32LE(versions.length > 0 ? 16 : 0, 8);
+      entryBuf.writeUInt32LE(isLastEntry ? 0 : entryBuf.length, 12);
+      for (let verIdx = 0; verIdx < versions.length; verIdx += 1) {
+        const verOffset = addString(versions[verIdx]);
+        const auxBase = 16 + verIdx * 16;
+        const isLastVer = verIdx + 1 === versions.length;
+        entryBuf.writeUInt32LE(0, auxBase);
+        entryBuf.writeUInt16LE(0, auxBase + 4);
+        entryBuf.writeUInt16LE(verIdx + 2, auxBase + 6);
+        entryBuf.writeUInt32LE(verOffset, auxBase + 8);
+        entryBuf.writeUInt32LE(isLastVer ? 0 : 16, auxBase + 12);
+      }
+      verneedEntries.push(entryBuf);
+    }
+
+    const dynstr = Buffer.concat(strChunks);
+    const verneedBuf = Buffer.concat(verneedEntries);
+    const headerSize = 64;
+    const dynstrOffset = headerSize;
+    const verneedOffset = dynstrOffset + dynstr.length;
+    const shoff = verneedOffset + verneedBuf.length;
+    const sectionHeaders = Buffer.alloc(3 * 64);
+
+    // Section 1: SHT_STRTAB (.dynstr)
+    sectionHeaders.writeUInt32LE(3, 64 + 4);
+    sectionHeaders.writeBigUInt64LE(BigInt(dynstrOffset), 64 + 24);
+    sectionHeaders.writeBigUInt64LE(BigInt(dynstr.length), 64 + 32);
+
+    // Section 2: SHT_GNU_verneed (.gnu.version_r)
+    sectionHeaders.writeUInt32LE(0x6ffffffe, 128 + 4);
+    sectionHeaders.writeBigUInt64LE(BigInt(verneedOffset), 128 + 24);
+    sectionHeaders.writeBigUInt64LE(BigInt(verneedBuf.length), 128 + 32);
+    sectionHeaders.writeUInt32LE(1, 128 + 40);
+    sectionHeaders.writeUInt32LE(verneed.length, 128 + 44);
+
+    const header = Buffer.alloc(headerSize);
+    header[0] = 0x7f;
+    header[1] = 0x45;
+    header[2] = 0x4c;
+    header[3] = 0x46;
+    header[4] = 2; // ELFCLASS64
+    header[5] = 1; // ELFDATA2LSB
+    header[6] = 1; // EV_CURRENT
+    header.writeUInt16LE(3, 16); // ET_DYN
+    header.writeUInt16LE(options.machine ?? 0x3e, 18); // EM_X86_64
+    header.writeUInt32LE(1, 20);
+    header.writeBigUInt64LE(BigInt(shoff), 40);
+    header.writeUInt16LE(64, 52);
+    header.writeUInt16LE(64, 58);
+    header.writeUInt16LE(3, 60);
+
+    return Buffer.concat([header, dynstr, verneedBuf, sectionHeaders]);
+  }
 
   it('names the worker and its directories exactly as the shared contract does', () => {
     expect(PACKAGING_LINUX_WORKER_FILENAME).toBe(REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
@@ -501,12 +588,19 @@ describe('Linux remote desktop worker release gate', () => {
     expect(PACKAGING_SIDECAR_DIR).toBe(REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
   });
 
-  async function linuxSet(options: { version?: string; executable?: boolean } = {}) {
+  async function linuxSet(
+    options: {
+      version?: string;
+      executable?: boolean;
+      bytes?: Buffer;
+      verneed?: Array<{ library: string; versions: string[] }>;
+    } = {},
+  ) {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-linux-worker-gate-'));
     dirs.push(root);
     const platformDir = join(root, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
     await mkdir(platformDir, { recursive: true });
-    const bytes = Buffer.from('linux worker bytes');
+    const bytes = options.bytes ?? buildTestElf64({ verneed: options.verneed });
     const executable = join(platformDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
     const manifest = `${executable}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
     await writeFile(executable, bytes);
@@ -524,11 +618,73 @@ describe('Linux remote desktop worker release gate', () => {
     await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(set.root, VERSION)).resolves.toMatchObject({ sha256: digest(set.bytes) });
   });
 
+  it('rejects non-ELF, wrong-machine, and GLIBC > ceiling Linux worker binaries across all linked libraries', async () => {
+    const nonElf = await linuxSet({ bytes: Buffer.from('linux worker bytes') });
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(nonElf.root, VERSION))
+      .rejects.toThrow(/not a little-endian ELF64 binary/);
+
+    const arm64Elf = await linuxSet({ bytes: buildTestElf64({ machine: 0xb7 }) });
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(arm64Elf.root, VERSION))
+      .rejects.toThrow(/unexpected ELF machine/);
+
+    const libm243 = await linuxSet({
+      verneed: [
+        ...COMPLIANT_VERNEED,
+        { library: 'libm.so.6', versions: ['GLIBC_2.2.5', 'GLIBC_2.43'] },
+      ],
+    });
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(libm243.root, VERSION))
+      .rejects.toThrow(new RegExp(`unsupported GLIBC version.*above ${REMOTE_DESKTOP_LINUX_MAX_GLIBC_VERSION}.*libm\\.so\\.6 \\(GLIBC_2\\.43\\)`));
+
+    for (const [library, version] of [
+      ['libc.so.6', 'GLIBC_2.34'],
+      ['libc.so.6', 'GLIBC_2.39'],
+      ['libpthread.so.0', 'GLIBC_2.34'],
+      ['libdl.so.2', 'GLIBC_2.34'],
+      ['libc.so.6', 'GLIBC_PRIVATE'],
+    ] as const) {
+      const bad = await linuxSet({ verneed: [{ library, versions: [version] }] });
+      await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(bad.root, VERSION))
+        .rejects.toThrow(new RegExp(`${library.replaceAll('.', '\\.')} \\(${version}\\)`));
+    }
+
+    const parsed = await parseElf64GlibcRequirements(buildTestElf64());
+    expect(parsed).toEqual(
+      COMPLIANT_VERNEED.flatMap(({ library, versions }) => versions.map((version) => ({ library, version }))),
+    );
+    expect(() => assertLinuxElfGlibcCeiling(parsed)).not.toThrow();
+  });
+
+  it('keeps non-Linux (Windows PE / macOS Mach-O) artifact verification free of ELF false positives', async () => {
+    const win = await writeWindowsArtifact();
+    await writeFile(win.executable, Buffer.from('MZ\x90\x00not-an-elf-pe-stub'));
+    const winStats = await readFile(win.executable);
+    await writeFile(
+      `${win.executable}.manifest.json`,
+      `${JSON.stringify(windowsManifest(winStats, Buffer.from('signed virtual display archive')))}\n`,
+    );
+    await expect(verifyRemoteDesktopWorkerArtifactSet(win.root, WORKER_VERSION)).resolves.toMatchObject({
+      manifest: { os: 'win32', arch: 'x64' },
+    });
+
+    const mac = await writeMacosArtifact('arm64');
+    await expect(verifyRemoteDesktopWorkerArtifactSet(mac.root, WORKER_VERSION, { os: 'darwin', arch: 'arm64' }))
+      .resolves.toMatchObject({ manifest: { os: 'darwin', arch: 'arm64' } });
+  });
+
+  it('links both worker and qualification binaries in build-worker-from-sdk.sh against the SDK sysroot', async () => {
+    const script = await readFile(join(process.cwd(), 'native/linux-remote-desktop/build-worker-from-sdk.sh'), 'utf8');
+    expect(script).toContain('SYSROOT="$SDK_ROOT/toolchain/sysroot"');
+    expect(script).toContain('--sysroot="$SYSROOT"');
+    expect(script).toContain('link_with_sdk "$WORKER_UNSTRIPPED"');
+    expect(script).toContain('link_with_sdk "$QUAL_BIN"');
+  });
+
   it.each([
     ['the worker is missing', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await unlink(set.executable); }, /incomplete: missing imcodes-linux-remote-desktop-worker$/],
     ['the manifest is missing', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await unlink(set.manifest); }, /incomplete: missing .*manifest\.json$/],
     ['the worker is not executable', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await chmod(set.executable, 0o644); }, /not executable/],
-    ['the worker bytes differ from the manifest', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await writeFile(set.executable, Buffer.from('linux worker bytez')); await chmod(set.executable, 0o755); }, /sha256 mismatch/],
+    ['the worker bytes differ from the manifest', async (set: Awaited<ReturnType<typeof linuxSet>>) => { const flipped = Buffer.from(set.bytes); flipped[flipped.length - 1] ^= 0xff; await writeFile(set.executable, flipped); await chmod(set.executable, 0o755); }, /sha256 mismatch/],
     ['the worker has another size than the manifest says', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await writeFile(set.executable, Buffer.from('short')); await chmod(set.executable, 0o755); }, /size mismatch/],
     ['the worker is a symlink', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await unlink(set.executable); await writeFile(join(set.root, 'elsewhere'), set.bytes, { mode: 0o755 }); await symlink(join(set.root, 'elsewhere'), set.executable); }, /non-regular/],
     ['the manifest is not the strict shape', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await writeFile(set.manifest, JSON.stringify({ schemaVersion: 1, extra: true })); }, /invalid linux remote desktop worker manifest/],
@@ -556,14 +712,24 @@ describe('Linux remote desktop worker release gate', () => {
   it('the command line verifies the Linux target too', async () => {
     const set = await linuxSet();
     const { execFile } = await import('node:child_process');
-    const run = (version: string) => new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
-      execFile(process.execPath, ['scripts/remote-desktop-worker-artifacts.mjs', 'verify', set.root, version, 'linux', 'x64'], (error, stdout, stderr) => {
+    const run = (root: string, version: string) => new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
+      execFile(process.execPath, ['scripts/remote-desktop-worker-artifacts.mjs', 'verify', root, version, 'linux', 'x64'], (error, stdout, stderr) => {
         resolve({ code: error ? (error as NodeJS.ErrnoException & { code?: number }).code as number ?? 1 : 0, stdout, stderr });
       });
     });
-    expect((await run(VERSION)).code).toBe(0);
-    const bad = await run('2026.1.1');
+    expect((await run(set.root, VERSION)).code).toBe(0);
+    const bad = await run(set.root, '2026.1.1');
     expect(bad.code).not.toBe(0);
     expect(bad.stderr).toMatch(/version mismatch/);
+
+    const glibc243 = await linuxSet({
+      verneed: [
+        ...COMPLIANT_VERNEED,
+        { library: 'libm.so.6', versions: ['GLIBC_2.2.5', 'GLIBC_2.43'] },
+      ],
+    });
+    const badGlibc = await run(glibc243.root, VERSION);
+    expect(badGlibc.code).not.toBe(0);
+    expect(badGlibc.stderr).toMatch(/GLIBC_2\.43/);
   });
 });

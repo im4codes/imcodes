@@ -1,5 +1,6 @@
 import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 // Daemon MCP → server channel for user-owned pinned messages. The daemon uses
 // its bound credential; the server derives the owner and re-authorizes every
 // referenced session. Tool callers never supply user/server/session identity.
@@ -28,6 +29,7 @@ export interface MessagePinMcpClientOptions {
   endpoint?: MessagePinServerEndpoint | null;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
 }
 
 export interface MessagePinMcpFailure {
@@ -135,8 +137,17 @@ async function request(
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
+    let sharedMachineAuthority: string | null = null;
+    if (options.loadSharedMachineAuthority) {
+      try {
+        sharedMachineAuthority = await options.loadSharedMachineAuthority();
+      } catch {
+        return failure(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
+      }
+    }
     const headers: Record<string, string> = {
       ...daemonServerAuthHeaders(endpoint),
+      ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const res = await (options.fetchImpl ?? fetch)(pinUrl(endpoint, suffix, params, method), {

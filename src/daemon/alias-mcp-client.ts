@@ -29,6 +29,7 @@ import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const ALIAS_LIST_LIMIT_MAX = 500;
@@ -44,6 +45,7 @@ export interface AliasMcpClientOptions {
   endpoint?: AliasServerEndpoint | null;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
 }
 
 export interface AliasMcpFailure {
@@ -169,10 +171,19 @@ async function requestAliases(
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
+    let sharedMachineAuthority: string | null = null;
+    if (options.loadSharedMachineAuthority) {
+      try {
+        sharedMachineAuthority = await options.loadSharedMachineAuthority();
+      } catch {
+        return failure(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
+      }
+    }
     const res = await fetchImpl(aliasUrl(endpoint, 'GET', query), {
       method: 'GET',
       headers: {
         ...daemonServerAuthHeaders(endpoint),
+        ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
       },
       signal: controller.signal,
     });
@@ -261,8 +272,17 @@ async function aliasWrite(
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
+    let sharedMachineAuthority: string | null = null;
+    if (options.loadSharedMachineAuthority) {
+      try {
+        sharedMachineAuthority = await options.loadSharedMachineAuthority();
+      } catch {
+        return failure(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
+      }
+    }
     const headers: Record<string, string> = {
       ...daemonServerAuthHeaders(endpoint),
+      ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const res = await fetchImpl(aliasUrl(endpoint, method, pathSuffix), {

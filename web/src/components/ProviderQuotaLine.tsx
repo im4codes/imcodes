@@ -5,7 +5,7 @@ import {
   type ProviderQuotaMeta,
 } from '@shared/provider-quota.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
-import { isMobileLayout } from '../mobile-device.js';
+import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 
 export function isCompactProviderQuotaAgent(agentType: string | null | undefined): boolean {
   return agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'muse-code-sdk';
@@ -39,13 +39,7 @@ export function useProviderQuotaLabel({
     if (typeof window === 'undefined') return undefined;
     const update = () => setMobileLayout(isMobileLayout());
     update();
-    const media = window.matchMedia?.('(max-width: 720px)');
-    media?.addEventListener?.('change', update);
-    window.addEventListener('resize', update);
-    return () => {
-      media?.removeEventListener?.('change', update);
-      window.removeEventListener('resize', update);
-    };
+    return subscribeDeviceLayoutChange(update);
   }, []);
 
   useEffect(() => {

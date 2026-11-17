@@ -8,6 +8,10 @@ import type { DbCronJob } from '../db/queries.js';
 import { WsBridge } from '../ws/bridge.js';
 import { logAudit } from '../security/audit.js';
 import { randomHex } from '../security/crypto.js';
+import { listActiveSharesForUser, shareTargetFromSessionName } from '../db/tab-sharing.js';
+import { resolveServerMemberAccessOrShareDeny, resolveHttpShareAccessForCoveredSession } from '../routes/share-http-auth.js';
+import { issueOwnerMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import type { Database } from '../db/client.js';
 import {
   CRON_MSG,
   CRON_STATUS,
@@ -16,6 +20,7 @@ import {
   type CronAction,
   type CronDispatchMessage,
 } from '../../../shared/cron-types.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import logger from '../util/logger.js';
 
 type PreparedCronAction =
@@ -56,8 +61,73 @@ async function prepareCronAction(env: Env, job: DbCronJob): Promise<PreparedCron
   return { ok: true, action: registered.action };
 }
 
+async function verifySharedCronCreatorStillAuthorized(
+  db: Database,
+  job: DbCronJob,
+  now: number,
+): Promise<boolean> {
+  if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') return true;
+  const prov = await db.queryOne<{ creator_user_id: string; shared: boolean }>(
+    'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1',
+    [job.id],
+  ).catch(() => null);
+  if (!prov || !prov.shared || prov.creator_user_id === job.user_id) return true;
+
+  const member = await resolveServerMemberAccessOrShareDeny(db, {
+    serverId: job.server_id,
+    userId: prov.creator_user_id,
+  });
+  if (member.ok) return true;
+
+  if (job.target_session_name) {
+    const target = shareTargetFromSessionName(job.server_id, job.target_session_name);
+    if (target) {
+      const access = await resolveHttpShareAccessForCoveredSession(db, {
+        serverId: job.server_id,
+        userId: prov.creator_user_id,
+        target,
+      });
+      return access.actor.kind === 'share' && access.actor.effectiveActorRole === 'participant';
+    }
+  }
+
+  const shares = await listActiveSharesForUser(db, prov.creator_user_id, now).catch(() => []);
+  return shares.some((s) => s.serverId === job.server_id && s.role === 'participant');
+}
+
+async function issueCronOwnerAuthority(
+  env: Env,
+  job: DbCronJob,
+  executionId: string,
+): Promise<string | undefined> {
+  if (!env.JWT_SIGNING_KEY || typeof (env.DB as { queryOne?: unknown })?.queryOne !== 'function') {
+    return undefined;
+  }
+  const prov = await env.DB.queryOne<{ shared: boolean }>(
+    'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
+    [job.id],
+  ).catch(() => null);
+  if (prov?.shared) return undefined;
+  const targetSessionName = job.target_session_name?.trim()
+    || (job.project_name ? `deck_${job.project_name}_${job.target_role ?? 'brain'}` : '');
+  if (!targetSessionName) return undefined;
+  const token = await issueOwnerMachineAuthorityForSession(env.DB, {
+    actorUserId: job.user_id,
+    sourceServerId: job.server_id,
+    sessionName: targetSessionName,
+    actionId: `cron-${job.id}-${executionId}`,
+    signingKey: env.JWT_SIGNING_KEY,
+  });
+  return token ?? undefined;
+}
+
 /** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
 export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
+  if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, Date.now())) {
+    await env.DB.execute('UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3', [CRON_STATUS.PAUSED, Date.now(), job.id]).catch(() => {});
+    await logExecution(env, randomHex(12), job.id, 'error', 'share_revoked');
+    throw new Error('share_revoked');
+  }
   const prepared = await prepareCronAction(env, job);
   if (!prepared.ok) {
     await logExecution(env, randomHex(12), job.id, 'error', prepared.reason);
@@ -75,6 +145,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     logger.warn({ jobId: job.id }, 'Cron manual trigger: target_role is NULL, defaulting to brain');
   }
   const executionId = randomHex(12);
+  const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId);
   const msg: CronDispatchMessage = {
     type: CRON_MSG.DISPATCH,
     jobId: job.id,
@@ -90,6 +161,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     previousRunAt: job.last_run_at,
     nextRunAt: job.next_run_at,
     ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
+    ...(ownerMachineAuthority ? { [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : {}),
     action,
   };
   bridge.sendToDaemon(JSON.stringify(msg));
@@ -235,6 +307,17 @@ export async function jobDispatchCron(env: Env): Promise<void> {
 
   for (const job of dueJobs) {
     try {
+      if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, now)) {
+        logger.info({ jobId: job.id }, 'Pausing shared cron job because creator access was revoked');
+        await env.DB.execute('UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3', [CRON_STATUS.PAUSED, now, job.id]).catch(() => {});
+        if (job.execution_id) {
+          await env.DB.execute('UPDATE cron_executions SET status = $1, detail = $2 WHERE id = $3 AND status = $4', [
+            'error', 'share_revoked', job.execution_id, 'dispatching',
+          ]);
+        }
+        await logExecution(env, randomHex(12), job.id, 'error', 'share_revoked');
+        continue;
+      }
       const prepared = await prepareCronAction(env, job);
       if (!prepared.ok) {
         logger.error({ jobId: job.id, reason: prepared.reason }, 'Cron job has invalid action/control state, marking as error');
@@ -294,10 +377,12 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       // Use the value written by the claim, rather than recalculating it after
       // the claim, so the payload always describes the durable occurrence.
       const nextRun = job.next_run_at ?? calculateNextRun(job.cron_expr, now, job.timezone);
+      const executionId = job.execution_id ?? randomHex(12);
+      const ownerMachineAuthority = await issueCronOwnerAuthority(env, job, executionId);
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,
-        executionId: job.execution_id ?? randomHex(12),
+        executionId,
         jobName: job.name,
         serverId: job.server_id,
         projectName: job.project_name ?? '',
@@ -311,6 +396,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
           : job.last_run_at,
         nextRunAt: nextRun,
         ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
+        ...(ownerMachineAuthority ? { [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : {}),
         action,
       };
       bridge.sendToDaemon(JSON.stringify(msg));

@@ -412,6 +412,12 @@ vi.mock('../../src/agent/providers/agy-sdk.js', () => ({
   AgySdkProvider: MockAgySdkProvider,
 }));
 
+// Registry lifecycle tests mock selection; native protocol selection is covered
+// by agy-acp-provider and the real-process AG ACP E2E.
+vi.mock('../../src/agent/providers/agy-acp.js', () => ({
+  createAgyProvider: async () => new MockAgySdkProvider(),
+}));
+
 vi.mock('../../src/util/logger.js', () => ({
   default: {
     info: vi.fn(),

@@ -43,6 +43,9 @@ import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-ins
 import { getTransportQueueStore } from './transport-queue-store.js';
 import { endedTaskOfDelegationReply } from './delegation-reply-task-liveness.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
+import { buildAuthorizedSendOptions } from './machine-authority.js';
+import { sendRuntimeWithPreservedAuthority } from './machine-authority-send.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../agent/transport-provider.js';
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
 import { projectOfSession } from './task-pairs/engine.js';
@@ -846,11 +849,11 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
         return { ok: true, delivered: true };
       }
       try {
-        const disposition = runtime.send(
+        const disposition = sendRuntimeWithPreservedAuthority(
+          runtime,
           notificationText(record, currentTargetRecord?.label),
           record.notificationId,
-          undefined,
-          undefined,
+          record.originAuthority,
           {
             timelineCommitted: true,
             historyCommitted: true,
@@ -859,7 +862,8 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
             // it at the provider's next safe boundary so a Brain parked in
             // wait_agent resumes without a human Append click. Unsupported
             // providers retain the ordinary completion-drain fallback.
-            deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+            defaultDeliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
             activeTurnDeliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
             delegationReply: { delegationId: record.delegationId },
           },
@@ -890,11 +894,18 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
 
     let result;
     try {
+      const notificationAuth = buildAuthorizedSendOptions(record.originAuthority, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      });
       result = await runtime.deliverDelegationNotification({
         notificationId: record.notificationId,
         delegationId: record.delegationId,
         sourceSessionName: record.target.sessionName,
         text: notificationText(record, currentTargetRecord?.label),
+        messageOrigin: notificationAuth.messageOrigin,
+        ...(notificationAuth.sharedActor ? { sharedActor: notificationAuth.sharedActor } : {}),
+        ...(notificationAuth.sharedMachineAuthority ? { sharedMachineAuthority: notificationAuth.sharedMachineAuthority } : {}),
+        ...(notificationAuth.ownerMachineAuthority ? { ownerMachineAuthority: notificationAuth.ownerMachineAuthority } : {}),
       });
     } catch (error) {
       logger.warn({ error, delegationId: record.delegationId }, 'delegation reply notification admission failed');

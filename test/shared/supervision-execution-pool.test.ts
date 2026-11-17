@@ -57,6 +57,121 @@ describe('supervision execution pools', () => {
     expect(normalized.primaryDevelopmentPool.configs[0]?.role).toBe('executor');
   });
 
+  it('supersedes legacy process runtime when modern transport runtime exists for the same model, preserving explicit role', () => {
+    const legacySolProcess: SupervisionExecutionConfig = {
+      agentType: 'codex',
+      providerFamily: 'openai',
+      runtimeType: 'process',
+      model: 'gpt-6.1-sol',
+      capabilityId: buildSupervisionExecutionCapabilityId({ agentType: 'codex', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6.1-sol' }),
+    };
+    const modernSolTransport: SupervisionExecutionConfig = {
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+      runtimeType: 'transport',
+      model: 'gpt-6.1-sol',
+      role: 'auditor',
+      capabilityId: buildSupervisionExecutionCapabilityId({ agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-6.1-sol' }),
+    };
+    const normalized = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [legacySolProcess, modernSolTransport] },
+      economyTaskPool: { configs: [] },
+    });
+    expect(normalized.primaryDevelopmentPool.configs).toHaveLength(1);
+    expect(normalized.primaryDevelopmentPool.configs[0]).toMatchObject({
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      model: 'gpt-6.1-sol',
+      role: 'auditor',
+    });
+  });
+
+  it('never widens or clears an explicit modern role across conflicting legacy roles, both orderings and pools (F1)', () => {
+    function makeEntry(agentType: string, runtimeType: 'process' | 'transport', role?: SupervisionExecutionPoolRole, ccPresetId?: string): SupervisionExecutionConfig {
+      const c = { agentType, runtimeType, providerFamily: 'openai', model: 'gpt-6.1-sol', role, ccPresetId };
+      return { ...c, capabilityId: buildSupervisionExecutionCapabilityId(c) };
+    }
+
+    // 1. Conflicting roles: modern role must never be widened to both or erased
+    for (const role of ['executor', 'auditor'] as const) {
+      const oppositeRole = role === 'executor' ? 'auditor' : 'executor';
+      const modern = makeEntry('codex-sdk', 'transport', role);
+      const legacy = makeEntry('codex', 'process', oppositeRole);
+
+      for (const configs of [[modern, legacy], [legacy, modern]]) {
+        const out = normalizeSupervisionExecutionPools({
+          state: 'configured',
+          primaryDevelopmentPool: { configs },
+          economyTaskPool: { configs: [] },
+        }).primaryDevelopmentPool.configs;
+        expect(out).toHaveLength(1);
+        expect(out[0]?.agentType).toBe('codex-sdk');
+        expect(out[0]?.role).toBe(role);
+      }
+    }
+
+    // 2. Modern without role inherits legacy role
+    const modernNoRole = makeEntry('codex-sdk', 'transport', undefined);
+    const legacyExecutor = makeEntry('codex', 'process', 'executor');
+    for (const configs of [[modernNoRole, legacyExecutor], [legacyExecutor, modernNoRole]]) {
+      const out = normalizeSupervisionExecutionPools({
+        state: 'configured',
+        primaryDevelopmentPool: { configs },
+        economyTaskPool: { configs: [] },
+      }).primaryDevelopmentPool.configs;
+      expect(out).toHaveLength(1);
+      expect(out[0]?.role).toBe('executor');
+    }
+
+    // 3. Preset isolation: distinct ccPresetId entries are not collapsed
+    const modernPreset = makeEntry('codex-sdk', 'transport', 'auditor', 'review-preset');
+    const legacyNoPreset = makeEntry('codex', 'process', 'executor');
+    const withPreset = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [modernPreset, legacyNoPreset] },
+      economyTaskPool: { configs: [] },
+    }).primaryDevelopmentPool.configs;
+    expect(withPreset).toHaveLength(2);
+
+    // 4. Multiple legacy entries: conflicting legacy roles leave modern Both role intact, order-independent (F1-R2)
+    const modernBoth = makeEntry('codex-sdk', 'transport', undefined);
+    const legacyExec = makeEntry('codex', 'process', 'executor');
+    const legacyAudit = makeEntry('opencode', 'process', 'auditor');
+
+    for (const poolKind of ['primaryDevelopmentPool', 'economyTaskPool'] as const) {
+      for (const order of [
+        [modernBoth, legacyExec, legacyAudit],
+        [modernBoth, legacyAudit, legacyExec],
+        [legacyExec, modernBoth, legacyAudit],
+        [legacyAudit, legacyExec, modernBoth],
+      ]) {
+        const poolOutput = normalizeSupervisionExecutionPools({
+          state: 'configured',
+          primaryDevelopmentPool: { configs: [] },
+          economyTaskPool: { configs: [] },
+          [poolKind]: { configs: order },
+        })[poolKind].configs;
+
+        expect(poolOutput).toHaveLength(1);
+        const modernResult = poolOutput[0]!;
+        expect(modernResult.agentType).toBe('codex-sdk');
+        expect(supervisionExecutionConfigRole(modernResult)).toBe('both');
+      }
+
+      // If multiple legacy entries agree on the same role, inherit that agreed role
+      const legacyExec2 = makeEntry('opencode', 'process', 'executor');
+      const agreedOutput = normalizeSupervisionExecutionPools({
+        state: 'configured',
+        primaryDevelopmentPool: { configs: [] },
+        economyTaskPool: { configs: [] },
+        [poolKind]: { configs: [modernBoth, legacyExec, legacyExec2] },
+      })[poolKind].configs;
+      expect(agreedOutput).toHaveLength(1);
+      expect(agreedOutput[0]?.role).toBe('executor');
+    }
+  });
+
   it('resolves the ordered Luna/Sol tier before lower-priority families', () => {
     const entries = [
       config('deepseek-sdk', 'deepseek', 'deepseek-pro'),

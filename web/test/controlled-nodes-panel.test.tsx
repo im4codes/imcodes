@@ -134,6 +134,7 @@ const createControlledNodeInstallCommand = vi.fn(async () => ({
   expiresAt: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000,
   ticketId: 'tid-cmd-1',
 }));
+let savedRemoteDevices: Array<{ id: string; publicNodeId: string; displayName: string; savedAt: number }> = [];
 const listSharesForTarget = vi.fn(async () => []);
 const createShare = vi.fn(async () => ({
   id: 'share-1', targetUserId: 'user-2', role: 'viewer' as const, status: 'active' as const,
@@ -142,6 +143,12 @@ vi.mock('../src/api.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/api.js')>();
   return {
     ...actual,
+    apiFetch: async (path: string, init?: RequestInit) => {
+      if (path === '/api/remote-desktop/guest/saved-devices') {
+        return { devices: savedRemoteDevices };
+      }
+      return actual.apiFetch(path, init);
+    },
     downloadControlledNodeExecutable: (...a: unknown[]) => downloadControlledNodeExecutable(...a),
     createControlledNodeRemoteInstallLink: (...a: unknown[]) => createControlledNodeRemoteInstallLink(...a),
     revokeControlledNodeRemoteInstallLink: (...a: unknown[]) => revokeControlledNodeRemoteInstallLink(...a),
@@ -195,6 +202,7 @@ beforeEach(() => {
   // The chosen machine group is remembered in localStorage; start every test
   // from the default rather than from whatever the previous test clicked.
   localStorage.clear();
+  savedRemoteDevices = [];
   listMintableDesks.mockResolvedValue([TEST_DESK]);
   createTeam.mockClear();
   listTeams.mockClear();
@@ -717,6 +725,37 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.usage_step4'));
   });
 
+  it('shows the Windows antivirus and trust-directory notice only when Windows is available', async () => {
+    const { container } = renderInstallTab();
+    const notice = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-win-security-notice"]');
+      if (!el) throw new Error('Windows security notice not found');
+      return el;
+    });
+    expect(notice.textContent).toContain('controlled_nodes.win_security_notice_tag');
+    expect(notice.textContent).toContain('controlled_nodes.win_security_notice');
+
+    const macCard = container.querySelector('.controlled-nodes-usage-os')?.textContent ?? '';
+    expect(macCard).not.toContain('controlled_nodes.win_security_notice');
+  });
+
+  it('omits the Windows antivirus notice when only macOS and Linux executables are available', async () => {
+    listAvailableExecutables.mockResolvedValueOnce({
+      available: ['mac', 'linux'],
+      artifacts: [
+        { os: 'mac', filename: 'imcodes-node-macos', sizeBytes: 22_000_000, sha256: 'abd', arch: 'universal' },
+        { os: 'linux', filename: 'imcodes-node-linux', sizeBytes: 9_876_543, sha256: 'def', arch: 'x64' },
+      ],
+    });
+    const { container } = renderInstallTab();
+    await waitFor(() => {
+      expect(container.querySelector('.controlled-nodes-download-item.is-mac')).toBeTruthy();
+      expect(container.querySelector('.controlled-nodes-download-item.is-linux')).toBeTruthy();
+    });
+    expect(container.querySelector('[data-testid="controlled-nodes-win-security-notice"]')).toBeNull();
+    expect(container.textContent).not.toContain('controlled_nodes.win_security_notice');
+  });
+
   it('maps mint executable_not_built to a specific message', async () => {
     const { ApiError, controlledNodeDownloadErrorKey } = await import('../src/api.js');
     const { container } = renderInstallTab();
@@ -1069,7 +1108,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     opened.mockRestore();
   });
 
-  it('offers installing the remote desktop as an app next to the wall button, and hides it inside the installed app', async () => {
+  it('keeps wall and refresh actions without an install-as-app entry in browser or standalone mode', async () => {
     machines = [
       machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
     ];
@@ -1078,7 +1117,10 @@ describe('ControlledNodesPanel (12.3)', () => {
       const { container, unmount } = render(<ControlledNodesPanel onOpenRemoteDesktopWall={vi.fn()} />);
       await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-rd-split')).toHaveLength(1));
       const actions = container.querySelector('.controlled-nodes-machines-actions') as HTMLElement;
-      expect(actions.querySelector('[data-testid="remote-desktop-install-app"]')).not.toBeNull();
+      expect(actions.querySelector('[data-testid="remote-desktop-install-app"]')).toBeNull();
+      expect(actions.querySelector('[data-testid="remote-desktop-install-guide"]')).toBeNull();
+      expect(actions.querySelector('.controlled-nodes-wall')).not.toBeNull();
+      expect(actions.querySelector('.controlled-nodes-refresh')).not.toBeNull();
       unmount();
       displayMode.set('standalone');
       const inApp = render(<ControlledNodesPanel onOpenRemoteDesktopWall={vi.fn()} />);
@@ -2049,4 +2091,48 @@ it('group admins get a mobile rename-only menu while owner safety actions remain
   const menu = container.querySelector('.controlled-nodes-mobile-menu-panel')!;
   expect(menu.querySelector('.controlled-nodes-rename')).not.toBeNull();
   for (const selector of ['.controlled-nodes-exec-toggle','.controlled-nodes-revoke','.controlled-nodes-auto-unlock','.share-revoke-btn','.controlled-nodes-install-worker']) expect(menu.querySelector(selector)).toBeNull();
+});
+
+it('opens connect-by-id and saved remote devices in-app without window.open on mobile and desktop', async () => {
+  setViewportSize(390, 844);
+  savedRemoteDevices = [
+    { id: 'saved-1', publicNodeId: '5123456789', displayName: 'Office PC', savedAt: 1_700_000_000_000 },
+  ];
+  const openSpy = vi.spyOn(window, 'open');
+  const onConnectById = vi.fn();
+  const { container, unmount } = render(<ControlledNodesPanel onConnectById={onConnectById} />);
+
+  const savedSection = await waitFor(() => {
+    const el = container.querySelector('.controlled-nodes-saved-remote');
+    expect(el).not.toBeNull();
+    return el!;
+  });
+  const headerConnectBtn = container.querySelector('.controlled-nodes-machines-actions button.controlled-nodes-wall') as HTMLButtonElement;
+  fireEvent.click(headerConnectBtn);
+  expect(onConnectById).toHaveBeenCalledWith();
+  expect(openSpy).not.toHaveBeenCalled();
+
+  const savedConnectBtn = savedSection.querySelector('button') as HTMLButtonElement;
+  fireEvent.click(savedConnectBtn);
+  expect(onConnectById).toHaveBeenLastCalledWith('5123456789');
+  expect(openSpy).not.toHaveBeenCalled();
+  unmount();
+
+  // Fallback when rendered standalone without onConnectById still opens in-app overlay with prefilled ID.
+  const fallback = render(<ControlledNodesPanel />);
+  const fallbackSaved = await waitFor(() => {
+    const el = fallback.container.querySelector('.controlled-nodes-saved-remote button');
+    expect(el).not.toBeNull();
+    return el as HTMLButtonElement;
+  });
+  fireEvent.click(fallbackSaved);
+  expect(openSpy).not.toHaveBeenCalled();
+  const overlay = document.body.querySelector('.remote-desktop-guest-overlay') as HTMLElement;
+  expect(overlay).not.toBeNull();
+  const idInput = overlay.querySelector('input[inputmode="numeric"]') as HTMLInputElement;
+  expect(idInput.value).toBe('5123456789');
+
+  fireEvent.click(overlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
+  expect(document.body.querySelector('.remote-desktop-guest-overlay')).toBeNull();
+  openSpy.mockRestore();
 });

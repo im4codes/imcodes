@@ -98,12 +98,26 @@ describe('FULL-only role gate (10.12)', () => {
     expect(isToolAvailableForRole(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, NODE_ROLE.FULL)).toBe(true);
   });
 
-  it("a controlled node's advertised tool list excludes both machine tools", () => {
+  it("a controlled node's advertised tool list excludes all FULL-only machine and cloud-doc tools", () => {
     const controlled = advertisedMcpToolNames(NODE_ROLE.CONTROLLED);
     expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
     expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS);
     // and still advertises the rest
     expect(controlled).toContain(MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY);
+  });
+
+  it('includes cloud_docs in FULL_ONLY_MCP_TOOLS and advertises it only on FULL nodes', () => {
+    const cloudDocTools = [
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+    ] as const;
+    const full = advertisedMcpToolNames(NODE_ROLE.FULL);
+    const controlled = advertisedMcpToolNames(NODE_ROLE.CONTROLLED);
+    for (const tool of cloudDocTools) {
+      expect(FULL_ONLY_MCP_TOOLS).toContain(tool);
+      expect(full).toContain(tool);
+      expect(controlled).not.toContain(tool);
+    }
   });
 
   it('a FULL node advertises the complete list including both machine tools', () => {

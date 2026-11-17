@@ -1,3 +1,4 @@
+import { MachineGroupTabs } from './MachineGroupTabs.js';
 import type { ComponentChildren } from 'preact';
 import { createPortal } from 'preact/compat';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
@@ -6,8 +7,6 @@ import type { MachineListItem } from '../api/machines.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import {
-  MACHINE_GROUP_DIRECT,
-  machineGroupTabs,
   machineGroupsOf,
   machinesInGroup,
   resolveMachineGroup,
@@ -190,19 +189,7 @@ function MachineMenuBody({
           picking one in the machines tab, so it is the same control. */}
       {groups.length > 0 && (
         <div class="controlled-node-quick-groups" role="none">
-          {machineGroupTabs(machines).map(({ id, name, count }) => (
-            <button
-              key={id}
-              type="button"
-              role="none"
-              class={`controlled-nodes-team-chip${group === id ? ' is-active' : ''}`}
-              data-testid={`controlled-node-quick-group-${id}`}
-              onClick={() => setGroup(id)}
-            >
-              {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}
-              <span class="controlled-nodes-team-chip-count">{count}</span>
-            </button>
-          ))}
+          <MachineGroupTabs machines={machines} group={group} onSelect={setGroup} testIdPrefix="controlled-node-quick-group" menu />
         </div>
       )}
       {notice && <div class="controlled-node-quick-notice" role="status">{notice}</div>}

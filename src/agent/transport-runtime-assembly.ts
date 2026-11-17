@@ -38,6 +38,7 @@ import {
 import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
 import { buildTaskPairMarkerContract, type TaskPairEngineState } from '../../shared/task-pair.js';
 import { CRON_CONTROL_PROTOCOL, CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 /** Stable text: rendered once, registered in every managed session's system prompt. */
 const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
@@ -120,6 +121,8 @@ export interface TransportRuntimeAssemblyInput {
   sessionIdentity?: { sessionName: string; label?: string | null; role?: SessionRecord['role'] };
   /** Runtime-minted lifecycle generation for provider active-work attribution. */
   activityGeneration?: ActivityGeneration;
+  /** Provider identity used for provider-scoped runtime guidance. */
+  providerId?: string;
 }
 
 export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
@@ -143,6 +146,7 @@ const AGENT_PROGRESS_SYSTEM_GUIDANCE = [
   'Say at once when a hypothesis is disproven, a plan changes, or you are blocked; skip routine narration and repeated summaries.',
   'Continue without confirmation unless blocked or the user requested a plan.',
 ].join('\n');
+const AGY_WORK_STYLE_GUIDANCE = 'Give brief progress updates during long tool runs; do not stay silent until the end.';
 
 export interface DispatchSharedContextSendOptions {
   flags?: SharedContextCutoverFlags;
@@ -265,6 +269,7 @@ export function buildProviderContextPayload(
   };
   const compiledContextInput = composeTransportMemoryInputs({
     ...input,
+    providerId: provider.id,
     startupMemory: sanitizedRecall.startupMemory,
     memoryRecall: sanitizedRecall.memoryRecall,
   });
@@ -459,6 +464,9 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     ? undefined
     : MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS;
   const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
+  const agyWorkStyleGuidance = input.suppressAgentProgressGuidance || input.providerId !== AGY_SDK_PROVIDER_ID
+    ? undefined
+    : AGY_WORK_STYLE_GUIDANCE;
   const filePathReportingGuidance = input.suppressFilePathReportingGuidance ? undefined : buildFilePathReportingPrompt();
   const realDeviceTestingGuidance = input.suppressMcpMemorySearchGuidance
     ? undefined
@@ -532,6 +540,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     taskPairContract,
     memorySearchGuidance,
     agentProgressGuidance,
+    agyWorkStyleGuidance,
   ], '\n\n');
   const sessionSystemText = composedSessionSystemText?.text;
   const sessionSystemTextIdentity = composedSessionSystemText?.identity;

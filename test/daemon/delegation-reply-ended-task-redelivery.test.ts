@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 /**
  * Production incident (2026-09-25, auto-upgrade restart at 08:01:15Z): four
  * task-bound delegation replies from Cx8/Cx6/Cx4 -- about tasks cancelled or
@@ -264,8 +265,8 @@ describe('task-bound delegation replies across a daemon restart', () => {
   });
 
   it('retires a pairs-engine reply once its pair is done, and delivers it while the pair is open', async () => {
-    pairs.savePair(PROJECT, pairState('tsk_pair_done', 'done'));
-    pairs.savePair(PROJECT, pairState('tsk_pair_open', 'working'));
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_pair_done', 'done'));
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_pair_open', 'working'));
     const done = receivedReply({ taskId: 'tsk_pair_done', assignmentId: taskPairBindingId('tsk_pair_done', 'executor'), result: 'pair done update' });
     const open = receivedReply({ taskId: 'tsk_pair_open', assignmentId: taskPairBindingId('tsk_pair_open', 'executor'), result: 'pair open update' });
 
@@ -280,7 +281,7 @@ describe('task-bound delegation replies across a daemon restart', () => {
 
   it('treats a legacy task imported into a finished pair as ended', async () => {
     const task = legacyTask('tsk_imported');
-    pairs.savePair(PROJECT, pairState('tsk_imported', 'cancelled'), { legacyTaskId: 'tsk_imported' });
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_imported', 'cancelled'), { legacyTaskId: 'tsk_imported' });
     const reply = receivedReply({ taskId: 'tsk_imported', assignmentId: task.workerAssignmentId, coordinatorAssignmentId: task.coordinatorAssignmentId, result: 'imported legacy update' });
 
     await restartAndResume();
@@ -316,8 +317,8 @@ describe('task-bound delegation replies across a daemon restart', () => {
 
   it('drops a queued task-pair nudge after the pair reaches a terminal state', () => {
     mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
-    pairs.savePair(PROJECT, pairState('tsk_nudge_done', 'done'));
-    pairs.savePair(PROJECT, pairState('tsk_nudge_open', 'working'));
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_nudge_done', 'done'));
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_nudge_open', 'working'));
 
     const queued = (taskId: string) => ({
       commandId: `task-pair-nudge:${taskId}:nudge-executor:message-1`,
@@ -335,8 +336,8 @@ describe('task-bound delegation replies across a daemon restart', () => {
     // 215: every `brain-workspace-kept` message waited in Brain's queue and was dropped here as "pair already
     // ended" (60 drops in 3 days) while the timeline had already shown it -- Brain never saw one.
     mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
-    pairs.savePair(PROJECT, pairState('tsk_kept_done', 'done'));
-    pairs.savePair(PROJECT, pairState('tsk_kept_cancelled', 'cancelled'));
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_kept_done', 'done'));
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_kept_cancelled', 'cancelled'));
     for (const taskId of ['tsk_kept_done', 'tsk_kept_cancelled']) {
       for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
         // The id exactly as the sender builds it (same prefix, same reason segment).
@@ -354,13 +355,13 @@ describe('task-bound delegation replies across a daemon restart', () => {
 
   it('drops a queued aggregate integration reminder after every listed pair is integrated or dismissed', () => {
     mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
-    pairs.savePair(PROJECT, pairState('tsk_integrated', 'done'), {
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_integrated', 'done'), {
       liveness: {
         silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: 0, progressAuditorAt: 0, lastTickAt: 0, notified: [],
         integrationIntegratedAt: 123,
       },
     });
-    pairs.savePair(PROJECT, { ...pairState('tsk_dismissed', 'done'), integrationDismissedAt: 123 });
+    putTaskPairFixture(pairs, PROJECT, { ...pairState('tsk_dismissed', 'done'), integrationDismissedAt: 123 });
     const queued = {
       commandId: 'task-pair-nudge:__integration__:integration-drift:message-1',
       text: '- tsk_integrated: head abc123 (1 commit not in dev), worktree /tmp/a, finished 1h ago\n- tsk_dismissed: head def456 (1 commit not in dev), worktree /tmp/b, finished 1h ago',
@@ -370,7 +371,7 @@ describe('task-bound delegation replies across a daemon restart', () => {
     // A still-unintegrated row keeps the aggregate authorized; a transiently
     // missing row is also admitted conservatively rather than losing a live
     // reminder during a store/restart race.
-    pairs.savePair(PROJECT, pairState('tsk_live_integration', 'done'));
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_live_integration', 'done'));
     expect(resolveTransportQueueEntryAdmission(brain.sessionName, {
       ...queued,
       text: '- tsk_live_integration: head ghi789 (1 commit not in dev), worktree /tmp/c, finished 1h ago',

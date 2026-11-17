@@ -12,6 +12,9 @@ import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js
 import { DIRECT_FILE_TRANSFER_ERROR } from '../../../shared/direct-file-transfer.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
 const { mockI18n, directFileTransferMocks, voiceOverlayMock } = vi.hoisted(() => ({
@@ -26,6 +29,7 @@ const { mockI18n, directFileTransferMocks, voiceOverlayMock } = vi.hoisted(() =>
     props: null as null | { draftScope?: string | null; sessionLabel?: string },
     notepad: { instruction: 'Summarize it', transcript: '', onAccepted: (() => {}) as () => void },
     result: null as Promise<'accepted' | 'pending' | 'rejected'> | null,
+    inputAvailable: true,
   },
 }));
 
@@ -122,6 +126,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.send_placeholder') {
         return `Send to ${String(opts?.name ?? 'session')}…`;
       }
+      if (key === 'session.send_placeholder_mobile_voice') {
+        return 'Hold to talk · tap to type';
+      }
       if (key === 'session.send_placeholder_desktop_upload') {
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste or drag upload`;
       }
@@ -164,6 +171,10 @@ vi.mock('react-i18next', () => ({
       if (key === 'upload.long_text_requires_attachment') {
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
+      if (key === 'upload.attachments_expand') return `+${String(opts?.count ?? 0)} more`;
+      if (key === 'upload.attachments_expand_title') return `Show all ${String(opts?.total ?? 0)} attachments`;
+      if (key === 'upload.attachments_collapse') return 'Show fewer';
+      if (key === 'upload.attachments_collapse_title') return `Collapse ${String(opts?.total ?? 0)} attachments`;
       if (key === 'session.stop_plain') return 'Stop';
       if (key === 'session.stop_appended_queue') return 'Queued messages appended; the session is still running.';
       if (key === 'session.restart_plain') return 'Restart';
@@ -251,7 +262,7 @@ vi.mock('../../src/components/VoiceOverlay.js', () => ({
 }));
 
 vi.mock('../../src/components/VoiceInput.js', () => ({
-  isAvailable: () => true,
+  isAvailable: () => voiceOverlayMock.inputAvailable,
 }));
 
 vi.mock('../../src/components/AtPicker.js', () => ({
@@ -375,6 +386,8 @@ import {
   COMPOSER_HEIGHT_STORAGE_KEY,
   OPENSPEC_LIST_REQUEST_TIMEOUT_MS,
   SessionControls,
+  isCaretAtComposerLineBoundary,
+  readComposerElementText,
 } from '../../src/components/SessionControls.js';
 import { DirectFileTransferFailure } from '../../src/direct-file-transfer.js';
 import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
@@ -1069,8 +1082,15 @@ afterEach(() => {
 
   it('keeps the placeholder short on mobile', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
-    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+    const view = render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Hold to talk · tap to type');
+    voiceOverlayMock.inputAvailable = false;
+    try {
+      view.rerender(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+      expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+    } finally {
+      voiceOverlayMock.inputAvailable = true;
+    }
   });
 
   it('shows the current desktop target on focus and tracks session switches', () => {
@@ -1337,6 +1357,130 @@ afterEach(() => {
     fireEvent.click(expandButton);
     expect(container.querySelector('.controls-composer-mobile-expanded')).toBeTruthy();
     expect(container.querySelector('.controls-composer-backdrop')).toBeTruthy();
+  });
+
+  it('keeps embedded attachment and hides expand button when styled 16px mobile single-line variance reaches 44px', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv-mobile-single-line-variance"
+        activeSession={makeTransportSession({ name: 'transport-mobile-single-line-variance' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    // 44px on a 16px mobile composer (23.2px lineHeight + 14px vertical padding) is within
+    // single-line ascender/subpixel variance and must NOT promote to multiline.
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 44 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 44 });
+    input.textContent = '你好世界';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.controls-composer .btn-attachment-embedded')).toBeTruthy();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('restores embedded attachment after sending a multiline message clears the styled mobile composer', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    let scrollHeightValue = 60;
+    const ws = makeWs();
+    const { container } = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv-mobile-clear-recover"
+        activeSession={makeTransportSession({ name: 'transport-mobile-clear-recover' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    Object.defineProperty(input, 'clientHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    input.textContent = 'line 1\nline 2';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeTruthy();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeTruthy();
+
+    // Even if a post-clear layout still reports elevated container height (e.g. 56px flex/font stretch),
+    // an empty styled composer (childNodes.length === 0) recovers embedded attachment.
+    scrollHeightValue = 56;
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(input.textContent).toBe('');
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.controls-composer .btn-attachment-embedded')).toBeTruthy();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('recovers single-line state when clearing text inside expanded fullscreen mobile composer and collapsing', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    let scrollHeightValue = 60;
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv-mobile-expand-collapse"
+        activeSession={makeTransportSession({ name: 'transport-mobile-expand-collapse' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    Object.defineProperty(input, 'clientHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    input.textContent = 'line 1\nline 2';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'expand composer' }));
+    expect(container.querySelector('.controls-composer-mobile-expanded')).toBeTruthy();
+
+    // Fullscreen composer has full-height scrollHeight while user deletes back to empty.
+    scrollHeightValue = 640;
+    input.textContent = '';
+    fireEvent.input(input);
+    scrollHeightValue = 37;
+    fireEvent.click(screen.getByRole('button', { name: 'collapse composer' }));
+
+    expect(container.querySelector('.controls-composer-mobile-expanded')).toBeNull();
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.controls-composer .btn-attachment-embedded')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('keeps mobileComposerMultiline disabled when window.innerWidth > 640', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv-desktop-no-multiline"
+        activeSession={makeTransportSession({ name: 'transport-desktop-no-multiline' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 60 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 60 });
+    input.textContent = 'line 1\nline 2';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
   });
 
   it('renders menu button (⋯)', () => {
@@ -6306,6 +6450,249 @@ afterEach(() => {
     expect(screen.getAllByText('survivor card')).toHaveLength(1);
   });
 
+  it.each(['subsession.created', 'subsession.created.batch'] as const)(
+    'supersedes append rollback when empty queue authority arrives via %s and parent rerenders',
+    async (carrier) => {
+      const ws = makeWs();
+      const view = render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [
+              { clientMessageId: 'ghost-id', text: 'ghost card' },
+            ],
+            transportPendingMessageVersion: 7,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+      const append = ws.send.mock.calls.find(([payload]) => (
+        payload?.type === 'session.append_queued_messages'
+      ))?.[0] as { commandId: string };
+
+      act(() => {
+        const targetItem = {
+          type: 'subsession.created',
+          id: 'qwen',
+          sessionName: 'deck_sub_qwen',
+          sessionType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 9,
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+        };
+        const unrelatedItem = {
+          ...targetItem,
+          id: 'other',
+          sessionName: 'deck_sub_other',
+          pendingMessageEntries: [
+            { clientMessageId: 'other-id', text: 'unrelated card' },
+          ],
+        };
+        ws.emit(
+          carrier === 'subsession.created'
+            ? targetItem
+            : { type: carrier, items: [unrelatedItem, targetItem] },
+        );
+      });
+
+      view.rerender(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [],
+            transportPendingMessageVersion: 9,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      act(() => {
+        ws.emit({
+          type: 'command.ack',
+          session: 'deck_sub_qwen',
+          commandId: append.commandId,
+          status: 'error',
+          error: 'Queued message not found',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 8,
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+          queueReconcilesCommandId: append.commandId,
+        });
+      });
+
+      await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+      expect(screen.queryByText('unrelated card')).toBeNull();
+    },
+  );
+
+  it.each(['subsession.created', 'subsession.created.batch'] as const)(
+    'preserves surviving entries without resurrecting removed ghost across %s',
+    async (carrier) => {
+      const ws = makeWs();
+      const view = render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [
+              { clientMessageId: 'ghost-id', text: 'ghost card' },
+              { clientMessageId: 'survivor-id', text: 'survivor card' },
+            ],
+            transportPendingMessageVersion: 7,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getAllByRole('button', { name: 'transport_queue_append' })[0]);
+      const append = ws.send.mock.calls.find(([payload]) => (
+        payload?.type === 'session.append_queued_messages'
+      ))?.[0] as { commandId: string };
+
+      const survivorEntry = {
+        clientMessageId: 'survivor-id',
+        text: 'survivor card',
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      act(() => {
+        const targetItem = {
+          type: 'subsession.created',
+          id: 'qwen',
+          sessionName: 'deck_sub_qwen',
+          sessionType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 9,
+          pendingMessageEntries: [survivorEntry],
+          failedMessageEntries: [],
+        };
+        ws.emit(
+          carrier === 'subsession.created'
+            ? targetItem
+            : { type: carrier, items: [targetItem] },
+        );
+      });
+
+      view.rerender(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [survivorEntry],
+            transportPendingMessageVersion: 9,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      act(() => {
+        ws.emit({
+          type: 'command.ack',
+          session: 'deck_sub_qwen',
+          commandId: append.commandId,
+          status: 'error',
+          error: 'Queued message not found',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 8,
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+          queueReconcilesCommandId: append.commandId,
+        });
+      });
+
+      await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+      expect(screen.getAllByText('survivor card')).toHaveLength(1);
+    },
+  );
+
+  it('ignores unrelated sessions and stale-version batch items in subsession.created.batch', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_qwen',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'active-id', text: 'active v7 card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-2',
+          queueAuthorityId: 'queue-authority-2',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    act(() => {
+      ws.emit({
+        type: 'subsession.created.batch',
+        items: [
+          {
+            type: 'subsession.created',
+            id: 'other',
+            sessionName: 'deck_sub_other',
+            sessionType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+            queueEpoch: 'queue-epoch-2',
+            queueAuthorityId: 'queue-authority-other',
+            pendingMessageVersion: 10,
+            pendingMessageEntries: [{ clientMessageId: 'other-id', text: 'other session card' }],
+            failedMessageEntries: [],
+          },
+          {
+            type: 'subsession.created',
+            id: 'qwen',
+            sessionName: 'deck_sub_qwen',
+            sessionType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+            queueEpoch: 'queue-epoch-2',
+            queueAuthorityId: 'queue-authority-2',
+            pendingMessageVersion: 6,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText('active v7 card')).toBeTruthy());
+    expect(screen.queryByText('other session card')).toBeNull();
+  });
+
   it('supersedes the append rollback when the newer authority arrived via session_list', async () => {
     // The audit named session_list alongside session.state as a carrier of
     // uncorrelated authority. Supersession must not depend on which frame
@@ -8149,6 +8536,567 @@ afterEach(() => {
     expect(input.textContent).toBe('pin');
   });
 
+  describe('multiline caret boundary and history edit preservation', () => {
+    const placeCollapsedCaret = (node: Node, offset: number) => {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.setStart(node, offset);
+      range.collapse(true);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    };
+
+    const mockRangeClientRects = (impl: (this: Range) => DOMRectList): (() => void) => {
+      const proto = Range.prototype as Range & { getClientRects?: (this: Range) => DOMRectList };
+      const hadOwn = Object.prototype.hasOwnProperty.call(proto, 'getClientRects');
+      const prev = proto.getClientRects;
+      proto.getClientRects = impl;
+      return () => {
+        if (hadOwn && prev) {
+          proto.getClientRects = prev;
+        } else {
+          delete proto.getClientRects;
+        }
+      };
+    };
+
+    const makeRect = (top: number, bottom: number, width = 40): DOMRect => ({
+      x: 10,
+      y: top,
+      top,
+      bottom,
+      left: 10,
+      right: 10 + width,
+      width,
+      height: bottom - top,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    it('detects structural line boundaries across newlines, <br>, <div>/<p>, trailing sentinel <br>, and non-collapsed selection', () => {
+      const root = document.createElement('div');
+      document.body.appendChild(root);
+      try {
+        // Text node with explicit \n
+        root.textContent = 'line1\nline2';
+        placeCollapsedCaret(root.firstChild!, 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+        placeCollapsedCaret(root.firstChild!, 8);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // <div> blocks (Range.toString() lacks '\n')
+        root.innerHTML = '<div>first</div><div>second</div>';
+        placeCollapsedCaret(root.children[0].firstChild!, 3);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+        placeCollapsedCaret(root.children[1].firstChild!, 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // <p> blocks
+        root.innerHTML = '<p>p1</p><p>p2</p>';
+        placeCollapsedCaret(root.children[1].firstChild!, 1);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // <br> separator vs trailing sentinel <br>
+        root.innerHTML = 'alpha<br>beta';
+        placeCollapsedCaret(root.childNodes[0], 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+        placeCollapsedCaret(root.childNodes[2], 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // Single line with trailing sentinel <br> does not trap ArrowDown
+        root.innerHTML = 'single<br>';
+        placeCollapsedCaret(root.childNodes[0], 6);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // Empty trailing <div><br></div> allows ArrowUp to previous line and ArrowDown to exit
+        root.innerHTML = '<div>top</div><div><br></div>';
+        placeCollapsedCaret(root.children[1], 0);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // Non-collapsed selection inside multiline composer prevents unexpected history jump
+        root.textContent = 'first\nsecond';
+        const sel = window.getSelection();
+        const nonCollapsed = document.createRange();
+        nonCollapsed.setStart(root.firstChild!, 0);
+        nonCollapsed.setEnd(root.firstChild!, root.firstChild!.textContent!.length);
+        sel?.removeAllRanges();
+        sel?.addRange(nonCollapsed);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+      } finally {
+        root.remove();
+        window.getSelection()?.removeAllRanges();
+      }
+    });
+
+    it('detects visually wrapped first/middle/last lines using client rects without explicit newlines', () => {
+      const root = document.createElement('div');
+      document.body.appendChild(root);
+      root.textContent = 'word1 word2 word3 wrapped line';
+      const textNode = root.firstChild!;
+      // Simulate 3 visual lines: [0..10] at y=10..26, [10..20] at y=30..46, [20..30] at y=50..66
+      const restoreRects = mockRangeClientRects(function (this: Range) {
+        const len = textNode.textContent?.length ?? 0;
+        const start = this.startContainer === textNode ? this.startOffset : 0;
+        const end = this.endContainer === textNode ? this.endOffset : len;
+        if (this.collapsed) {
+          if (start < 10) return [makeRect(10, 26, 0)] as unknown as DOMRectList;
+          if (start < 20) return [makeRect(30, 46, 0)] as unknown as DOMRectList;
+          return [makeRect(50, 66, 0)] as unknown as DOMRectList;
+        }
+        const rects: DOMRect[] = [];
+        if (start < 10 && end > 0) rects.push(makeRect(10, 26));
+        if (start < 20 && end > 10) rects.push(makeRect(30, 46));
+        if (end > 20) rects.push(makeRect(50, 66));
+        return rects as unknown as DOMRectList;
+      });
+      try {
+        placeCollapsedCaret(textNode, 4);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+
+        placeCollapsedCaret(textNode, 14);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+
+        placeCollapsedCaret(textNode, 25);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+      } finally {
+        restoreRects();
+        root.remove();
+        window.getSelection()?.removeAllRanges();
+      }
+    });
+
+    it('stays in history navigation when moving inside multiline messages and switches only from first/last line', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['newest line 1\nnewest line 2', 'older line 1\nolder line 2'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      input.textContent = 'my draft';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 8);
+
+      // Step up from draft -> loads newest multiline item with caret at end (line 2)
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest line 1\nnewest line 2');
+
+      // ArrowUp while still on line 2 must NOT switch to older item or break history state
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest line 1\nnewest line 2');
+
+      // Simulate browser moving caret up to line 1, then pressing ArrowUp -> switches to older item
+      placeCollapsedCaret(input.firstChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('older line 1\nolder line 2');
+
+      // Simulate moving caret to line 1 of older item: ArrowDown on line 1 stays in older item
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('older line 1\nolder line 2');
+
+      // Move caret to line 2 of older item: ArrowDown returns to newest item, then draft
+      placeCollapsedCaret(input.firstChild!, 'older line 1\nolder line 2'.length - 1);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('newest line 1\nnewest line 2');
+
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('my draft');
+    });
+
+    it('navigates DOM multiline (<div> and <br>) and visually wrapped entries properly', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['latest wrapped long message content', 'previous'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // <div> / <br> DOM structure in composer before leaving draft
+      input.innerHTML = '<div>draft1</div><div>draft2</div>';
+      placeCollapsedCaret(input.children[1].firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.innerHTML).toBe('<div>draft1</div><div>draft2</div>');
+
+      placeCollapsedCaret(input.children[0].firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('latest wrapped long message content');
+
+      // Visually wrapped recalled history entry via mocked client rects
+      const restoreRects = mockRangeClientRects(function (this: Range) {
+        const textNode = input.firstChild;
+        const text = textNode?.textContent ?? '';
+        if (!text.includes('latest wrapped')) return [] as unknown as DOMRectList;
+        const start = this.startContainer === textNode ? this.startOffset : 0;
+        const end = this.endContainer === textNode ? this.endOffset : text.length;
+        if (this.collapsed) {
+          return (start < 15 ? [makeRect(10, 26, 0)] : [makeRect(30, 46, 0)]) as unknown as DOMRectList;
+        }
+        const rects: DOMRect[] = [];
+        if (start < 15 && end > 0) rects.push(makeRect(10, 26));
+        if (end > 15) rects.push(makeRect(30, 46));
+        return rects as unknown as DOMRectList;
+      });
+      try {
+        // Caret on wrapped line 2 -> ArrowUp stays inside entry
+        placeCollapsedCaret(input.firstChild!, 22);
+        fireEvent.keyDown(input, { key: 'ArrowUp' });
+        expect(input.textContent).toBe('latest wrapped long message content');
+
+        // Caret on wrapped line 1 -> ArrowUp moves to older entry
+        placeCollapsedCaret(input.firstChild!, 4);
+        fireEvent.keyDown(input, { key: 'ArrowUp' });
+        expect(input.textContent).toBe('previous');
+      } finally {
+        restoreRects();
+      }
+    });
+
+    it('preserves independent edits on visited history items and keeps original draft and stored history intact', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['msg 0', 'msg 1'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Start with unsent draft
+      input.textContent = 'original draft';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 'original draft'.length);
+
+      // Navigate up to index 0, move caret left, and edit index 0
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 0');
+      fireEvent.keyDown(input, { key: 'ArrowLeft' });
+      input.textContent = 'msg 0 edited';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 2);
+
+      // Navigate up to index 1 and edit index 1
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 1');
+      input.textContent = 'msg 1 edited';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 2);
+
+      // Navigate back down to index 0 -> preserves edit to index 0
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('msg 0 edited');
+
+      // Navigate down to draft -> preserves untouched draft
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('original draft');
+
+      // Navigate back up twice -> preserves BOTH edited index 0 and edited index 1
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 0 edited');
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 1 edited');
+
+      // Underlying stored history was never mutated
+      expect(quickData.data.sessionHistory['my-session']).toEqual(['msg 0', 'msg 1']);
+
+      // Sending clears temporary navigation edits
+      fireEvent.keyDown(input, { key: 'Enter' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith(
+        'send',
+        expect.objectContaining({ sessionName: 'my-session', text: 'msg 1 edited' }),
+      );
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 0');
+    });
+
+    it('preserves trailing empty lines, consecutive blank lines (<br><br>, empty <div><br></div>), and omits sentinel single<br> during lossless edit round-trips', () => {
+      // 1. Unit assertions for preserveEditingLines serializer vs normalized default
+      const probe = document.createElement('div');
+      probe.textContent = 'draft\n\n';
+      expect(readComposerElementText(probe)).toBe('draft');
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('draft\n\n');
+
+      probe.innerHTML = 'a<br><br>b';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n\nb');
+
+      probe.innerHTML = '<div>a</div><div><br></div><div>b</div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n\nb');
+
+      probe.innerHTML = '<div>a</div><div><br></div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n');
+
+      probe.innerHTML = 'single<br>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('single');
+
+      probe.innerHTML = '<br>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('');
+
+      // 2. Counterexample A & B + DOM blank-line & sentinel round-trips in rendered SessionControls
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['newest original', 'older original'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Counterexample B: unsent draft with trailing empty lines ('draft\n\n')
+      input.textContent = 'draft\n\n';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
+
+      // Counterexample A: edit history[0] to have trailing empty lines ('newest edited\n\n')
+      input.textContent = 'newest edited\n\n';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('older original');
+
+      // Also test DOM empty block blank lines on history[1]: <div>x</div><div><br></div><div>y</div>
+      input.innerHTML = '<div>x</div><div><br></div><div>y</div>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.children[0].firstChild!, 1);
+
+      // Step down to 0 -> preserves 'newest edited\n\n'
+      placeCollapsedCaret(input.children[2].firstChild!, 1);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('newest edited\n\n');
+
+      // Step down to -1 -> preserves original draft 'draft\n\n'
+      placeCollapsedCaret(input.firstChild!, 'newest edited\n\n'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('draft\n\n');
+
+      // Step back up to 0, then 1 -> preserves 'newest edited\n\n' and 'x\n\ny'
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest edited\n\n');
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('x\n\ny');
+
+      // Consecutive <br><br> blank line round-trip on history[0]
+      placeCollapsedCaret(input.firstChild!, input.firstChild!.textContent!.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      input.innerHTML = 'a<br><br>b';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.childNodes[0], 1);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('x\n\ny');
+      placeCollapsedCaret(input.firstChild!, input.firstChild!.textContent!.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('a\n\nb');
+
+      // Positive control: single<br> sentinel does NOT inject a fake trailing newline
+      input.innerHTML = 'single<br>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.childNodes[0], 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      placeCollapsedCaret(input.firstChild!, input.firstChild!.textContent!.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('single');
+
+      // Stored history remains untouched and send resets temporary edits
+      expect(quickData.data.sessionHistory['my-session']).toEqual(['newest original', 'older original']);
+      fireEvent.keyDown(input, { key: 'Enter' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith(
+        'send',
+        expect.objectContaining({ sessionName: 'my-session', text: 'single' }),
+      );
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
+    });
+
+    it('treats <br> inside nested inline wrappers as a real line break when followed in the same block while preserving block boundaries and trailing sentinel control', () => {
+      // 1. Serializer parity across inline-wrapped <br> shapes
+      const probe = document.createElement('div');
+      probe.innerHTML = '<span>first<br></span>second';
+      expect(readComposerElementText(probe)).toBe('first\nsecond');
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('first\nsecond');
+
+      probe.innerHTML = '<b><i>first<br></i></b>second';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('first\nsecond');
+
+      probe.innerHTML = '<div><span>a<br></span></div><div>b</div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\nb');
+
+      probe.innerHTML = '<div><b><i>a<br></i></b><span>b</span></div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\nb');
+
+      probe.innerHTML = '<span>a<br></span><br>b';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n\nb');
+
+      probe.innerHTML = '<span>single<br></span>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('single');
+
+      probe.innerHTML = '<span>a<br></span><span></span>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a');
+
+      probe.innerHTML = '<b><i><br></i></b>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('');
+
+      // 2. Rendered SessionControls round-trip + structural caret boundary checks
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['newest original', 'older original'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Recall history[0] and edit to <span>first<br></span>second
+      input.textContent = 'draft';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 5);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
+
+      input.innerHTML = '<span>first<br></span>second';
+      fireEvent.input(input);
+
+      // Caret on line 1 ("first") + ArrowDown stays in composer; caret on line 2 ("second") + ArrowUp stays in composer
+      placeCollapsedCaret(input.querySelector('span')!.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.innerHTML).toContain('<span>first<br></span>second');
+
+      placeCollapsedCaret(input.lastChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.innerHTML).toContain('<span>first<br></span>second');
+
+      // ArrowUp from first line switches to history[1]
+      placeCollapsedCaret(input.querySelector('span')!.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('older original');
+
+      // Edit history[1] with 2-level inline ancestors <b><i>alpha<br></i></b>beta
+      input.innerHTML = '<b><i>alpha<br></i></b>beta';
+      fireEvent.input(input);
+
+      // Caret on last line -> ArrowDown back to history[0] preserves 'first\nsecond'
+      placeCollapsedCaret(input.lastChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('first\nsecond');
+
+      // ArrowUp back to history[1] preserves 'alpha\nbeta'
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('alpha\nbeta');
+
+      // Block-end inline <br> followed by next block does not inject extra blank line
+      placeCollapsedCaret(input.firstChild!, 'alpha\nbeta'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      input.innerHTML = '<div><span>block1<br></span></div><div>block2</div>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.children[0].querySelector('span')!.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('alpha\nbeta');
+      placeCollapsedCaret(input.firstChild!, 'alpha\nbeta'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('block1\nblock2');
+
+      // Positive control: inline-wrapped sentinel <span>single<br></span> still strips sentinel BR
+      input.innerHTML = '<span>single<br></span>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.querySelector('span')!.firstChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      placeCollapsedCaret(input.firstChild!, 'alpha\nbeta'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('single');
+
+      // Stored history remains untouched and send resets temporary edits
+      expect(quickData.data.sessionHistory['my-session']).toEqual(['newest original', 'older original']);
+      fireEvent.keyDown(input, { key: 'Enter' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith(
+        'send',
+        expect.objectContaining({ sessionName: 'my-session', text: 'single' }),
+      );
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
+    });
+
+    it('clears temporary per-entry navigation edits on session switch and respects modifier/picker guards', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'sess-a': ['a0', 'a1'],
+          'sess-b': ['b0', 'b1'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      const { rerender } = render(
+        <SessionControls ws={ws as any} activeSession={makeSession({ name: 'sess-a' })} quickData={quickData as any} />,
+      );
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Modifier keys never hijack history navigation
+      input.textContent = 'draft';
+      fireEvent.input(input);
+      fireEvent.keyDown(input, { key: 'ArrowUp', shiftKey: true });
+      fireEvent.keyDown(input, { key: 'ArrowUp', ctrlKey: true });
+      fireEvent.keyDown(input, { key: 'ArrowUp', metaKey: true });
+      fireEvent.keyDown(input, { key: 'ArrowUp', altKey: true });
+      expect(input.textContent).toBe('draft');
+
+      // Edit sess-a history[0]
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('a0');
+      input.textContent = 'a0 edited';
+      fireEvent.input(input);
+
+      // Switch to sess-b then back to sess-a -> edits were cleared cleanly
+      rerender(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'sess-b' })} quickData={quickData as any} />);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('b0');
+
+      rerender(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'sess-a' })} quickData={quickData as any} />);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('a0');
+    });
+  });
+
   it('keeps the @ picker open and searches files as soon as the user types', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;
@@ -9553,7 +10501,9 @@ afterEach(() => {
       clipboardData: { files: [new File(['x'], 'missing-path.txt', { type: 'text/plain' })], getData: () => '' },
     });
 
-    const failedRow = await screen.findByTestId('composer-upload-row');
+    const retryButton = await screen.findByRole('button', { name: 'retry: missing-path.txt' });
+    const failedRow = retryButton.closest('[data-testid="composer-upload-row"]') as HTMLElement;
+    expect(failedRow).toBeTruthy();
     expect(within(failedRow).getByRole('button', { name: 'retry: missing-path.txt' })).toBeTruthy();
     expect(input.textContent).toBe('keep this text');
     expect(screen.getAllByText('upload_failed').length).toBeGreaterThan(0);
@@ -10865,7 +11815,9 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^2\.5-pro$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-2.5-pro');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: /auto/i }));
 
@@ -10929,7 +11881,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^2\.5-pro$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-2.5-pro');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     expect(within(menu).getByRole('button', { name: /auto/i })).toBeDefined();
     fireEvent.click(within(menu).getByRole('button', { name: /gemini-2.5-flash/i }));
@@ -10978,7 +11932,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^opencode\/pickle$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^pickle$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: opencode/pickle');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: /anthropic\/claude-sonnet-4-5/i }));
 
@@ -11018,7 +11974,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^moonshot-v1-auto$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^v1-auto$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: moonshot-v1-auto');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: /moonshot-v1-auto,thinking/i }));
 
@@ -11189,7 +12147,9 @@ afterEach(() => {
   it('keeps the Antigravity footer dropdown populated when a refresh throws', () => {
     const ws = Object.assign(makeWs(), { requestTransportModels: () => { throw new Error('offline probe'); } });
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'agy-refresh-failed', agentType: AGY_SDK_PROVIDER_ID, runtimeType: 'transport', activeModel: 'gemini-3.8-flash-high' })} quickData={makeQuickData() as any} />);
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-3\.8-flash-high$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^flash$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-3.8-flash-high');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     expect(within(menu).getByRole('button', { name: /gemini-3\.8-flash-high/i })).toBeDefined();
   });
@@ -11224,7 +12184,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-2\.5-pro$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^2\.5-pro$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-2.5-pro');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     expect(within(menu).queryByRole('button', { name: /gemini-4-argon-medium/i })).toBeNull();
     expect(within(menu).getAllByRole('button')).toHaveLength(2);
@@ -11233,6 +12195,54 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'agy-sdk-session',
       text: '/model gemini-2.5-flash',
+    });
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('gemini-2.5-flash');
+    expect(localStorage.getItem('imcodes-agy-model:agy-sdk-session')).toBe('gemini-2.5-flash');
+  });
+
+  it('shortens long multi-segment agy-sdk model labels on the selector pill while keeping full IDs in title and /model commands', async () => {
+    const ws = makeWs();
+    const session = makeSession({
+      name: 'agy-long-model-session',
+      agentType: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      activeModel: 'gemini-4-hydrogen-high',
+      requestedModel: 'gemini-4-hydrogen-high',
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={session}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: request?.requestId,
+      models: [
+        { id: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen High' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon High' },
+      ],
+      defaultModel: 'gemini-4-hydrogen-high',
+      isAuthenticated: true,
+    }));
+
+    const pill = screen.getByRole('button', { name: /^hydrogen-high$/i });
+    expect(pill.getAttribute('title')).toBe('Model: gemini-4-hydrogen-high');
+    expect(session.activeModel).toBe('gemini-4-hydrogen-high');
+    expect(session.requestedModel).toBe('gemini-4-hydrogen-high');
+
+    fireEvent.click(pill);
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    expect(within(menu).getByRole('button', { name: /gemini-4-hydrogen-high/i })).toBeDefined();
+    fireEvent.click(within(menu).getByRole('button', { name: /gemini-4-argon-high/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'agy-long-model-session',
+      text: '/model gemini-4-argon-high',
     });
   });
 
@@ -11301,6 +12311,147 @@ afterEach(() => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  it('keeps <=3 attachments uncollapsed without a toggle (negative control)', async () => {
+    let seq = 0;
+    uploadFileMock.mockImplementation(async () => ({
+      attachment: { daemonPath: `/tmp/att-${++seq}.png`, id: `id-${seq}` },
+    }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'att-threshold-neg' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    for (const name of ['one.png', 'two.png', 'three.png']) {
+      fireEvent.paste(input, {
+        clipboardData: { files: [new File([name], name)], getData: () => '' },
+      });
+    }
+    await waitFor(() => expect(document.querySelectorAll('.attachment-badge-name')).toHaveLength(3));
+    expect(document.querySelector('.attachment-badge-toggle')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Show all/ })).toBeNull();
+  });
+
+  it('collapses >3 attachments (15 images) by default, toggles expand/collapse, and resets on remove/send', async () => {
+    let seq = 0;
+    uploadFileMock.mockImplementation(async () => ({
+      attachment: { daemonPath: `/tmp/shot-${++seq}.png`, id: `id-${seq}` },
+    }));
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'att-collapse-15' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+        quotes={['quote-1']}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+
+    const files = Array.from({ length: 15 }, (_, idx) => new File([`img-${idx + 1}`], `img-${idx + 1}.png`));
+    fireEvent.paste(input, {
+      clipboardData: { files, getData: () => '' },
+    });
+
+    await waitFor(() => {
+      const toggle = document.querySelector('.attachment-badge-toggle') as HTMLButtonElement | null;
+      expect(toggle).toBeTruthy();
+      expect(toggle?.textContent).toBe('+13 more');
+    });
+
+    // Collapsed view renders first 2 attachment badges + 1 toggle pill (+ 1 unaffected quote badge)
+    const badgeList = document.querySelector('.attachment-badges-list')!;
+    expect(badgeList.classList.contains('is-expanded')).toBe(false);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(2);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')[0]?.textContent).toBe('img-1.png');
+    expect(badgeList.querySelectorAll('.attachment-badge-name')[1]?.textContent).toBe('img-2.png');
+    expect(document.querySelectorAll('.quote-badge')).toHaveLength(1);
+
+    // Expanding shows all 15 badges and preserves composer focus
+    const toggle = badgeList.querySelector('.attachment-badge-toggle') as HTMLButtonElement;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-label')).toBe('Show all 15 attachments');
+    const mouseDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    expect(fireEvent(toggle, mouseDown)).toBe(false);
+    fireEvent.click(toggle);
+
+    expect(badgeList.classList.contains('is-expanded')).toBe(true);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(15);
+    expect(toggle.textContent).toBe('Show fewer');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')).toBe('Collapse 15 attachments');
+    expect(document.activeElement).toBe(input);
+
+    // Collapsing folds back cleanly to 2 + "+13 more"
+    fireEvent.click(toggle);
+    expect(badgeList.classList.contains('is-expanded')).toBe(false);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(2);
+    expect(toggle.textContent).toBe('+13 more');
+
+    // Sending clears attachments and resets expanded state for the next batch
+    fireEvent.click(toggle);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(15);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await waitFor(() => expect(document.querySelector('.attachment-badges-list')).toBeNull());
+
+    // Re-attaching >3 items after send starts collapsed again (expanded state did not linger)
+    const nextFiles = Array.from({ length: 4 }, (_, idx) => new File([`next-${idx + 1}`], `next-${idx + 1}.png`));
+    fireEvent.paste(input, {
+      clipboardData: { files: nextFiles, getData: () => '' },
+    });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-toggle')?.textContent).toBe('+2 more'));
+
+    // Expand the 4 items, then remove one so count drops to 3 (<= threshold): toggle vanishes and state resets
+    const nextToggle = document.querySelector('.attachment-badge-toggle') as HTMLButtonElement;
+    fireEvent.click(nextToggle);
+    expect(document.querySelectorAll('.attachment-badges-list .attachment-badge-name')).toHaveLength(4);
+    const fourthRemove = document.querySelectorAll('.attachment-badges-list .attachment-badge-remove')[3] as HTMLButtonElement;
+    fireEvent.click(fourthRemove);
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-toggle')).toBeNull();
+      expect(document.querySelectorAll('.attachment-badges-list .attachment-badge-name')).toHaveLength(3);
+    });
+
+    // Adding one more back to 4 starts collapsed again cleanly
+    fireEvent.paste(input, {
+      clipboardData: { files: [new File(['extra'], 'extra.png')], getData: () => '' },
+    });
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-toggle')?.textContent).toBe('+2 more');
+      expect(document.querySelectorAll('.attachment-badges-list .attachment-badge-name')).toHaveLength(2);
+    });
+    view.unmount();
+  });
+
+  it('defines attachment collapse/expand translations across all 7 locales and bounds .attachment-badges height in CSS', () => {
+    const webRoot = resolve(process.cwd().endsWith('/web') ? process.cwd() : resolve(process.cwd(), 'web'));
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(resolve(webRoot, `src/i18n/locales/${locale}.json`), 'utf8')) as {
+        upload?: Record<string, string>;
+      };
+      expect(messages.upload?.attachments_expand).toBeTruthy();
+      expect(messages.upload?.attachments_expand).toContain('{{count}}');
+      expect(messages.upload?.attachments_expand_title).toContain('{{total}}');
+      expect(messages.upload?.attachments_collapse).toBeTruthy();
+      expect(messages.upload?.attachments_collapse_title).toContain('{{total}}');
+    }
+
+    const css = readFileSync(resolve(webRoot, 'src/styles.css'), 'utf8');
+    expect(css).toMatch(/\.attachment-badges\s*\{[^}]*max-height:\s*112px[^}]*overflow-y:\s*auto/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*640px\)\s*\{\s*\.controls-composer-resize-edge[^}]*\}\s*\.attachment-badges\s*\{\s*max-height:\s*84px;\s*\}/);
+    expect(css).toMatch(/@media\s*\(pointer:\s*coarse\)\s*\{\s*\.attachment-badges\s*\{\s*max-height:\s*84px;\s*\}\s*\}/);
+    expect(css).toMatch(/\.subcard-input-area\s+\.attachment-badges\s*\{\s*max-height:\s*60px;/);
+    expect(css).toMatch(/\.attachment-badge-toggle\s*\{/);
   });
 
 });

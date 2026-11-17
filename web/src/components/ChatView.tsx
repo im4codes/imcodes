@@ -1,8 +1,10 @@
+import { createTimelineDisplayProjectionCache } from '../timeline/display-projection-cache.js';
 import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
 import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker, placeHistoryGapMarker } from './chat-history-gap.js';
 import {
   isNeverRenderedTimelineEventType,
   projectAssistantTextForDisplay,
+  isGuaranteedVisibleTimelineEvent,
 } from '../../../src/shared/timeline/types.js';
 import {
   SUPERVISION_AUTOMATION_KIND_PREFIX,
@@ -23,6 +25,8 @@ import {
 import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import { localizeChatDownloadError } from '../chat-download-error.js';
+import { copyToClipboard } from '../util/clipboard.js';
+import { WEB_UNLOCK_COALESCE_MS } from '@shared/scale-limits.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -43,7 +47,12 @@ import {
   setDownloadTransferRetry,
 } from '../download-transfer-store.js';
 import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
-import { h } from 'preact';
+import {
+  isMobileNavigationGestureActive,
+  MOBILE_NAV_GESTURE_ACTIVE_EVENT,
+  wasMobileNavigationGestureRecentlyActive,
+} from '../mobile-navigation-gestures.js';
+import { h, type ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { memo, createPortal } from 'preact/compat';
@@ -75,10 +84,7 @@ import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-previe
 import { canonicalizeChatFilePath } from '@shared/chat-local-path.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import {
-  ChatLoopbackLink,
-  type ChatLocalWebPreviewOpenHandler,
-} from './ChatLoopbackLink.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
 import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
 import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
@@ -97,14 +103,22 @@ import {
 } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
-import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
+import {
+  isLikelyDomainPath,
+  renderChatPathActions,
+  splitTextWithCloudDocsAndUrls,
+  type ChatPathDownloadHandler,
+} from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
+import { scaledCssFontPx, CHAT_FONT_SIZE_VAR } from '../global-font.js';
+const CHAT_FONT_FAMILY_VAR = '--imcodes-chat-font-family';
+import { shouldUseIosMacTextScale } from '../native-platform.js';
+import { subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_MESSAGE_PIN_PREVIEW_MODE, PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
-import { splitTextByHttpUrls } from '../link-detection.js';
 import {
   CHAT_INITIAL_RENDER_ITEM_LIMIT,
   CHAT_RENDER_ITEM_INCREMENT,
@@ -142,6 +156,7 @@ import {
 } from '@shared/message-pins.js';
 import { useMessagePins } from '../hooks/useMessagePins.js';
 import { MessagePinsBar, type MessagePinPreviewMode } from './MessagePinsBar.js';
+import { SessionUsagePanel } from './SessionUsagePanel.js';
 import {
   clearPendingMessagePin,
   getPendingMessagePin,
@@ -192,6 +207,8 @@ interface Props {
   visible?: boolean;
   /** When provided, clicking file paths opens the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** When provided, clicking Cloud Doc links/chips opens that document in Cloud Docs. */
+  onCloudDocClick?: (docId: string) => void;
   /** When provided, the right-side file panel is available. */
   ws?: WsClient | null;
   /** Called when user inserts a path via the FileBrowser opened from a chat message */
@@ -211,6 +228,8 @@ interface Props {
   readOnlyFiles?: boolean;
   /** Constrain file operations to this session's canonical project root. */
   scopeFilesToSession?: boolean;
+  /** Allow opening DocShare controls from the embedded file panel (false for shared-in callers). */
+  canManageFileShares?: boolean;
   /** Retry a failed optimistic send — called with the original commandId and text. */
   onResendFailed?: (commandId: string, text: string) => void;
   /** Load the bounded timeline window around an old PostgreSQL-backed pin. */
@@ -219,11 +238,19 @@ interface Props {
   messagePinsEnabled?: boolean;
   /** Sub-session windows scope the task-pair panel to their own assignments. */
   scopeTaskPairs?: boolean;
+  /** Isolated split-executor visit; independent of the canonical session filter. */
+  taskPairPanelVisitKey?: string;
+  /** Compact floating panels hide the split file-panel toggle so narrow views stay unobstructed. */
+  hideFilePanel?: boolean;
 }
 
 function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
   return raw === 'rendered' || raw === 'text' ? raw : null;
 }
+
+const { projectAssistantEventForDisplay } = createTimelineDisplayProjectionCache(
+  projectAssistantTextForDisplay, isGuaranteedVisibleTimelineEvent,
+);
 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {
@@ -281,6 +308,7 @@ interface AssistantBlockProps {
    *  break a `===` comparison between consecutive taps. */
   eventId?: string;
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -289,6 +317,7 @@ interface AssistantBlockProps {
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
+const AGENT_MESSAGE_COLLAPSE_LINE_LIMIT = 7;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
 /**
  * tsk_5rf R2: a streamed preview caches a download-handle URL, and that handle
@@ -1027,24 +1056,24 @@ const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, T
 // Stable source identities let the incremental view-model preserve unaffected
 // items across an append/update. The expensive group is rebuilt only when one
 // of its source event objects changes; Preact then skips those unchanged rows.
-const timelineObjectIds = new WeakMap<object, number>();
-let nextTimelineObjectId = 1;
-const incrementalViewItemCache = new Map<string, { signature: string; item: ViewItem }>();
-function timelineObjectId(value: object): number {
-  const hit = timelineObjectIds.get(value);
-  if (hit) return hit;
-  const id = nextTimelineObjectId++;
-  timelineObjectIds.set(value, id);
-  return id;
+const incrementalViewItemCache = new Map<string, ViewItem>();
+function sameViewItem(left: ViewItem, right: ViewItem): boolean {
+  const keys = Object.keys(left) as Array<keyof ViewItem>;
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => {
+    const a = left[key];
+    const b = right[key];
+    // Compare source references/small id lists without copying a potentially
+    // megabyte-sized text into a new signature on every unrelated update.
+    return a === b || (Array.isArray(a) && Array.isArray(b)
+      && a.length === b.length && a.every((value, index) => value === b[index]));
+  });
 }
 function stabilizeViewItems(items: ViewItem[]): ViewItem[] {
   const next = items.map((item) => {
-    const sources = item.toolEvents ?? (item.event ? [item.event] : []);
-    const sourceIds = sources.map((event) => timelineObjectId(event)).join(',');
-    const signature = [item.type, item.text ?? '', item.lastTs ?? item.ts ?? '', item.executionState ?? '', item.eventIds?.join(',') ?? '', sourceIds, item.heartbeatCount ?? ''].join('|');
     const cached = incrementalViewItemCache.get(item.key);
-    if (cached?.signature === signature) return cached.item;
-    incrementalViewItemCache.set(item.key, { signature, item });
+    if (cached && sameViewItem(cached, item)) return cached;
+    incrementalViewItemCache.set(item.key, item);
     return item;
   });
   while (incrementalViewItemCache.size > 4096) {
@@ -1229,6 +1258,18 @@ function deduplicateTaskPairViewItems(items: ViewItem[]): ViewItem[] {
     }
   }
   return result;
+}
+
+const taskNoticeProjectionCache = new WeakMap<object, {
+  text: unknown; value: ReturnType<typeof parseTaskPairNotification>;
+}>();
+function parseTaskPairEventNotification(event: TimelineEvent) {
+  const text = event.payload.text;
+  const cached = taskNoticeProjectionCache.get(event.payload);
+  if (cached && cached.text === text) return cached.value;
+  const value = parseTaskPairNotification(text);
+  taskNoticeProjectionCache.set(event.payload, { text, value });
+  return value;
 }
 
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
@@ -1502,8 +1543,8 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const rawNotification = parseTaskPairNotification(event.payload.text);
-      const projection = projectAssistantTextForDisplay(event.payload.text);
+      const rawNotification = parseTaskPairEventNotification(event);
+      const projection = projectAssistantEventForDisplay(event);
       const text = projection.text;
       const executionState = event.payload.streaming === true || event.payload.pending === true
         ? null
@@ -2471,6 +2512,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // resume, rather than letting the old virtual range point at empty space.
   useEffect(() => {
     if (!enabled) return undefined;
+    let lastResumeAt = 0;
     const capture = () => {
       if (document.visibilityState !== 'hidden') return;
       resumeSnapshotRef.current = {
@@ -2478,8 +2520,15 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
         atBottom: wasAtBottomRef.current,
       };
     };
-    const resume = () => {
+    const resume = (ev?: Event) => {
       if (document.visibilityState === 'hidden') return;
+      // Ignore non-persisted initial pageshow when we never captured a hidden snapshot.
+      if (ev && ev.type === 'pageshow' && 'persisted' in ev && !(ev as PageTransitionEvent).persisted && !resumeSnapshotRef.current) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastResumeAt < WEB_UNLOCK_COALESCE_MS) return;
+      lastResumeAt = now;
       if (!resumeSnapshotRef.current) {
         const root = scrollRef.current;
         if (root) resumeSnapshotRef.current = {
@@ -2588,11 +2637,54 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // paint, re-rendered in a later task and never re-pinned after that render:
   // that frame showed a 15-42px gap/reverse jump.
   const lastCommitSignatureRef = useRef('');
+  const lastExternalSignatureRef = useRef('');
   const lastCommitClientHeightRef = useRef(0);
+  const syncLayoutPassCountRef = useRef(0);
+  const rafRetryCountRef = useRef(0);
+  const pendingLayoutRafRef = useRef<number | null>(null);
+  const MAX_VIRTUAL_LAYOUT_RAF_RETRIES = 2;
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const observedNodesRef = useRef<Set<HTMLElement>>(new Set());
+  const latestLayoutHandlersRef = useRef({
+    commitMeasuredRows,
+    captureViewportAnchor,
+    onMeasuredLayout,
+  });
+  latestLayoutHandlersRef.current = {
+    commitMeasuredRows,
+    captureViewportAnchor,
+    onMeasuredLayout,
+  };
+
+  useEffect(() => {
+    return () => {
+      if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingLayoutRafRef.current);
+        pendingLayoutRafRef.current = null;
+      }
+    };
+  }, [enabled]);
+
   useLayoutEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      lastExternalSignatureRef.current = '';
+      if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingLayoutRafRef.current);
+        pendingLayoutRafRef.current = null;
+      }
+      return;
+    }
     const root = scrollRef.current;
     if (!root) return;
+    const clientHeight = root.clientHeight;
+    const externalSignature = `${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}:${clientHeight}:${resetKey ?? ''}:${resumeGeneration}:${revealKey ?? ''}`;
+    if (externalSignature !== lastExternalSignatureRef.current) {
+      lastExternalSignatureRef.current = externalSignature;
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+    }
     const wasAtBottom = wasAtBottomRef.current;
     const changed = commitMeasuredRows(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
     // Only a commit that can have changed the scroll range acts: a row height
@@ -2601,42 +2693,93 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     // this render was our own layout re-render. A render that changed nothing
     // visible (a non-rendered status/usage update) must leave the viewport alone.
     // (A 0 -> N height is a pane becoming measurable, not a resize.)
-    const clientHeight = root.clientHeight;
     const viewportResized = lastCommitClientHeightRef.current > 0 && clientHeight !== lastCommitClientHeightRef.current;
     lastCommitClientHeightRef.current = clientHeight;
     const signature = `${layoutVersion}:${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}`;
     const layoutMayHaveChanged = changed || viewportResized || signature !== lastCommitSignatureRef.current;
     lastCommitSignatureRef.current = signature;
-    if (!layoutMayHaveChanged) return;
+    if (!layoutMayHaveChanged) {
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      return;
+    }
     onMeasuredLayout?.(root, wasAtBottom);
     scrollTopRef.current = root.scrollTop;
     captureViewportAnchor();
-    // A measurement change alters the spacers: re-render (still before paint,
-    // Preact flushes it in a microtask) so the pin below runs on final geometry.
-    if (changed) setLayoutVersion((v) => v + 1);
+    if (!changed) {
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      return;
+    }
+    // Bound both synchronous pre-paint re-renders and cross-frame rAF retries so
+    // oscillating row heights cannot lock the main thread in a tight loop or a
+    // 60Hz rAF spin; budgets replenish when external inputs/viewport change or settle.
+    syncLayoutPassCountRef.current += 1;
+    if (syncLayoutPassCountRef.current <= 3) {
+      setLayoutVersion((v) => v + 1);
+      return;
+    }
+    if (rafRetryCountRef.current < MAX_VIRTUAL_LAYOUT_RAF_RETRIES && pendingLayoutRafRef.current === null) {
+      if (typeof requestAnimationFrame === 'function') {
+        rafRetryCountRef.current += 1;
+        pendingLayoutRafRef.current = requestAnimationFrame(() => {
+          pendingLayoutRafRef.current = null;
+          syncLayoutPassCountRef.current = 0;
+          setLayoutVersion((v) => v + 1);
+        });
+      }
+    }
   });
 
   useEffect(() => {
     if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
     const root = scrollRef.current;
     if (!root) return undefined;
+    const observed = observedNodesRef.current;
+    observed.clear();
     const observer = new ResizeObserver((entries) => {
+      const { commitMeasuredRows: commitRows, captureViewportAnchor: captureAnchor, onMeasuredLayout: handleMeasured } =
+        latestLayoutHandlersRef.current;
       const wasAtBottom = wasAtBottomRef.current;
-      const changed = commitMeasuredRows(entries.map((entry) => entry.target as HTMLElement));
+      const changed = commitRows(entries.map((entry) => entry.target as HTMLElement));
       // Do not infer pin state from the post-growth geometry: with
       // `overflow-anchor: none`, a row growing at the bottom makes the current
       // distance non-zero even though the user was pinned immediately before
       // the measurement. That used to classify a pinned stream as a reader
       // anchor, then fight ChatView's follow pass on the next frame.
       if (!changed) return;
-      onMeasuredLayout?.(root, wasAtBottom);
+      handleMeasured?.(root, wasAtBottom);
       scrollTopRef.current = root.scrollTop;
-      captureViewportAnchor();
+      captureAnchor();
       setLayoutVersion((v) => v + 1);
     });
-    root.querySelectorAll<HTMLElement>('[data-virtual-key]').forEach((node) => observer.observe(node));
-    return () => observer.disconnect();
-  }, [enabled, items, layoutVersion, onMeasuredLayout, scrollRef]);
+    resizeObserverRef.current = observer;
+    return () => {
+      observer.disconnect();
+      if (resizeObserverRef.current === observer) resizeObserverRef.current = null;
+      observed.clear();
+    };
+  }, [enabled, scrollRef]);
+
+  useEffect(() => {
+    const observer = resizeObserverRef.current;
+    const root = scrollRef.current;
+    if (!enabled || !observer || !root) return;
+    const observed = observedNodesRef.current;
+    const current = new Set(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
+    for (const node of observed) {
+      if (!node.isConnected || !current.has(node)) {
+        observer.unobserve(node);
+        observed.delete(node);
+      }
+    }
+    for (const node of current) {
+      if (!observed.has(node)) {
+        observer.observe(node);
+        observed.add(node);
+      }
+    }
+  }, [enabled, items, layoutVersion, scrollRef]);
 
   // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
   // real viewport exists, preserving deterministic rendering and accessibility.
@@ -2684,7 +2827,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
-function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, canManageFileShares = true, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -2725,6 +2868,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [copiedExternalUrl, setCopiedExternalUrl] = useState<string | null>(null);
   const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<ChatHtmlFullscreenPreviewState | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const highlightElRef = useRef(highlightEl);
@@ -2754,6 +2898,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // the portion they want to copy.
   const [zoomText, setZoomText] = useState<string | null>(null);
   const [renderItemLimit, setRenderItemLimit] = useState(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+  const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
+  useEffect(() => {
+    setSessionUsageOpen(false);
+  }, [sessionId, preview]);
   const pinsEnabled = messagePinsEnabled && !preview && !!serverId && !!sessionId;
   const messagePins = useMessagePins(serverId, sessionId, pinsEnabled);
 
@@ -2763,6 +2911,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // Y of the active touch's start, for detecting an explicit finger-down
   // (content scrolls up) gesture that should pause follow-mode immediately.
   const touchStartYRef = useRef(0);
+  const touchNavSuppressedRef = useRef(false);
   // Epoch ms of the last "LAST SENT" pin-banner show/hide. The banner is a
   // flow sibling of `.chat-view`, so toggling it resizes the scroll area by
   // ~60px and fires the ResizeObserver — which must NOT re-pin to bottom (the
@@ -2859,6 +3008,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const [filePanelWidth, setFilePanelWidth] = useState(() => readPanelWidth(sessionId));
   // GLOBAL toggle (not per-session): defaults open, synced across windows/tabs.
   const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(readSdkAgentsOpen);
+  // Explicit manual inspection of recent terminal/diagnostic rows when runningCount === 0.
+  const [inspectRecentAgentsOpen, setInspectRecentAgentsOpen] = useState(false);
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const filePanelWidthRef = useRef(filePanelWidth);
   filePanelWidthRef.current = filePanelWidth;
@@ -2881,6 +3032,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     prevSessionIdRef.current = sessionId;
     setShowFilePanel(readPanelOpen(sessionId));
     setFilePanelWidth(readPanelWidth(sessionId));
+    setInspectRecentAgentsOpen(false);
   }, [sessionId]);
 
   const toggleFilePanel = useCallback(() => {
@@ -2895,10 +3047,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     // Persist + broadcast; every window's listener (incl. this one) updates state.
     writeSdkAgentsOpen(next);
   }, []);
-
-  const toggleAgentsPanel = useCallback(() => {
-    setDesiredAgentsPanelOpen(!desiredAgentsOpen);
-  }, [desiredAgentsOpen, setDesiredAgentsPanelOpen]);
 
   const onDragStart = useCallback((e: MouseEvent) => {
     e.preventDefault();
@@ -2999,6 +3147,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   }, [t, ws]);
 
   const handleUrlClick = useCallback((url: string) => {
+    setCopiedExternalUrl(null);
     setPendingUrl(url);
   }, []);
 
@@ -3178,6 +3327,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
+  const cloudDocClickHandler = onCloudDocClick;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
   const imagePreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleImagePreview : undefined;
   const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
@@ -3203,6 +3353,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     <ChatMarkdown
       text={parseTimelineDisplayText(text)}
       onPathClick={pathClickHandler}
+      onCloudDocClick={cloudDocClickHandler ? (docId) => {
+        closePreview();
+        cloudDocClickHandler(docId);
+      } : undefined}
       onUrlClick={urlClickHandler ? (url) => {
         closePreview();
         urlClickHandler(url);
@@ -3215,7 +3369,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         onOpenLocalWebPreview(target);
       } : undefined}
     />
-  ), [downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, urlClickHandler]);
+  ), [cloudDocClickHandler, downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, urlClickHandler]);
 
   // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
   //   value === true  → developer view, show tool/file/thinking rows
@@ -3255,27 +3409,44 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   useEffect(() => {
     if (!hasSdkAgentEvents) return;
     setSdkAgentsNow(Date.now());
-  }, [hasSdkAgentEvents, events]);
+  }, [hasSdkAgentEvents, events, visible]);
   const sdkAgentsStatus = useMemo(
     () => deriveSdkSubagentStatusRows(events, sdkAgentsNow),
     [events, sdkAgentsNow],
   );
+  const runningAgentsCount = sdkAgentsStatus.runningCount;
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
   useEffect(() => {
     if (!visible || !hasAgentsStatusRows) return undefined;
     const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [hasAgentsStatusRows, visible]);
+  useEffect(() => {
+    // Any transition back to active work or empty history clears manual idle peek
+    // so finishing sub-agents always auto-close cleanly once runningCount hits 0.
+    if ((runningAgentsCount > 0 || !hasAgentsStatusRows) && inspectRecentAgentsOpen) {
+      setInspectRecentAgentsOpen(false);
+    }
+  }, [hasAgentsStatusRows, inspectRecentAgentsOpen, runningAgentsCount]);
+  const toggleAgentsPanel = useCallback(() => {
+    if (runningAgentsCount === 0 && hasAgentsStatusRows) {
+      setInspectRecentAgentsOpen((open) => !open);
+      return;
+    }
+    setInspectRecentAgentsOpen(false);
+    setDesiredAgentsPanelOpen(!desiredAgentsOpen);
+  }, [desiredAgentsOpen, hasAgentsStatusRows, runningAgentsCount, setDesiredAgentsPanelOpen]);
   // Preview cards reuse the existing Agents panel when background work exists.
   // The aggregator only accepts sdkSubagent events, so ordinary Bash tool calls
   // never make this control or panel appear.
   const canShowAgentsControl = !preview || hasAgentsStatusRows;
-  // Keep the panel mounted for every retained sub-agent row, not only while at
-  // least one child is currently running. Otherwise a just-finished child (or
-  // a provider diagnostic) makes the entire list disappear even though the
-  // aggregator still has authoritative status to show.
-  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
-  const canShowFilePanel = !preview && !!ws;
+  // Auto-open while runningCount > 0 (honoring desiredAgentsOpen). Once runningCount
+  // reaches 0, auto-close immediately instead of leaving "0 running" + retained rows
+  // open for minutes; users can still click the toolbar toggle to inspect recent rows.
+  const showAgentsPane = canShowAgentsControl
+    && hasAgentsStatusRows
+    && (runningAgentsCount > 0 ? desiredAgentsOpen : inspectRecentAgentsOpen);
+  const canShowFilePanel = !preview && !hideFilePanel && !!ws;
   useLayoutEffect(() => {
     const titlebar = chatTitlebarRef.current;
     const actions = chatTopActionsRef.current;
@@ -3999,13 +4170,34 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (e.deltaY < 0) handleUserScrollUpIntent();
   };
   const handleTouchStart = (e: TouchEvent) => {
-    touchStartYRef.current = e.touches[0]?.clientY ?? 0;
+    const doc = scrollRef.current?.ownerDocument;
+    if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+      touchNavSuppressedRef.current = true;
+      touchStartYRef.current = 0;
+      return;
+    }
+    if (e.touches.length === 1) {
+      touchNavSuppressedRef.current = false;
+      touchStartYRef.current = e.touches[0]?.clientY ?? 0;
+    }
   };
   const handleTouchMove = (e: TouchEvent) => {
+    const doc = scrollRef.current?.ownerDocument;
+    if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+      touchNavSuppressedRef.current = true;
+      return;
+    }
+    if (touchNavSuppressedRef.current) return;
+    if (highlightElRef.current || ctxMenu) return;
     const y = e.touches[0]?.clientY ?? 0;
     // Finger moving DOWN (clientY increases) drags content UP toward older
     // history. 6px deadzone avoids reacting to taps / micro-jitter.
     if (y - touchStartYRef.current > 6) handleUserScrollUpIntent();
+  };
+  const handleTouchEndOrCancel = (e: TouchEvent) => {
+    if (e.touches.length === 0) {
+      touchNavSuppressedRef.current = false;
+    }
   };
 
   const handleScroll = () => {
@@ -4122,6 +4314,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const el = scrollRef.current;
     if (!el || typeof MutationObserver === 'undefined') return undefined;
     const observer = new MutationObserver(() => {
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
       if (loadingOlderRef.current || scrollAnchorRef.current) return;
       // A reader's anchor row is re-aligned; only a follower is pinned.
       if (!autoScrollRef.current) { restoreReaderAnchor(); return; }
@@ -4164,6 +4357,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const deadline = Date.now() + CHAT_MOUNT_SETTLE_MS;
     const timer = setInterval(() => {
       if (Date.now() > deadline) { clearInterval(timer); return; }
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
       const following = preview || autoScrollRef.current;
       if (!following) { clearInterval(timer); return; }
       if (loadingOlderRef.current || scrollAnchorRef.current) return;
@@ -4280,6 +4474,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const openCtxMenu = useCallback((target: HTMLElement, clientX: number, clientY: number) => {
     if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
     target.classList.add('chat-highlight');
+    highlightElRef.current = target;
     setHighlightEl(target);
     const text = extractChatEventText(target);
     if (!text) return;
@@ -4329,6 +4524,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
     if (!container) return;
+    const doc = container.ownerDocument;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let startX = 0, startY = 0;
     let startTarget: HTMLElement | null = null;
@@ -4338,17 +4534,46 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     // Telegram pattern: eat the touchend + subsequent click after menu opens
     const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
 
+    const clearPendingLongPress = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const dismissTouchHighlightAndMenu = () => {
+      if (highlightElRef.current) {
+        highlightElRef.current.classList.remove('chat-highlight');
+        highlightElRef.current = null;
+      }
+      container.querySelectorAll('.chat-highlight').forEach((el) => el.classList.remove('chat-highlight'));
+      setHighlightEl(null);
+      setCtxMenu(null);
+    };
+
+    const onNavGestureActive = (e: Event) => {
+      const active = Boolean((e as CustomEvent<{ active?: boolean }>).detail?.active);
+      if (!active) return;
+      clearPendingLongPress();
+      container.removeEventListener('touchend', cancelEvent, { capture: true } as EventListenerOptions);
+      lastTapEventId = '';
+      lastTapTs = 0;
+      dismissTouchHighlightAndMenu();
+    };
+
     const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length > 1) {
-        // multi-touch → cancel any in-flight tap tracking; this is a pinch/scroll
-        if (timer) { clearTimeout(timer); timer = null; }
+      if (e.touches.length > 1 || isMobileNavigationGestureActive(doc)) {
+        // multi-touch or active mobile nav gesture → cancel any in-flight tap/long-press tracking
+        clearPendingLongPress();
         return;
       }
       const t = e.touches[0];
       startX = t.clientX; startY = t.clientY;
       startTarget = e.target as HTMLElement;
+      clearPendingLongPress();
       timer = setTimeout(() => {
         timer = null;
+        if (isMobileNavigationGestureActive(doc)) return;
         const chatEvent = startTarget?.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
         openCtxMenu(chatEvent, startX, startY);
@@ -4358,20 +4583,28 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     };
 
     const onTouchMove = (e: TouchEvent) => {
+      if (isMobileNavigationGestureActive(doc)) {
+        clearPendingLongPress();
+        return;
+      }
       if (!timer) return;
       const t = e.touches[0];
       if (Math.abs(t.clientX - startX) > TAP_MOVE_TOLERANCE_PX || Math.abs(t.clientY - startY) > TAP_MOVE_TOLERANCE_PX) {
-        clearTimeout(timer); timer = null;
+        clearPendingLongPress();
       }
     };
 
     const onTouchEnd = () => {
       // Long-press fired or finger moved? clear timer; double-tap pairing
       // is handled in onClick (which won't fire if cancelEvent ran).
-      if (timer) { clearTimeout(timer); timer = null; }
+      clearPendingLongPress();
     };
 
     const onClick = (e: MouseEvent) => {
+      if (isMobileNavigationGestureActive(doc) || wasMobileNavigationGestureRecentlyActive(doc)) {
+        lastTapEventId = ''; lastTapTs = 0;
+        return;
+      }
       const target = e.target as HTMLElement | null;
       const bubble = target?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
       if (!bubble) {
@@ -4392,13 +4625,15 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       }
     };
 
+    doc.addEventListener(MOBILE_NAV_GESTURE_ACTIVE_EVENT, onNavGestureActive);
     container.addEventListener('touchstart', onTouchStart, { passive: true });
     container.addEventListener('touchmove', onTouchMove, { passive: true });
     container.addEventListener('touchend', onTouchEnd, { passive: true });
     container.addEventListener('touchcancel', onTouchEnd, { passive: true });
     container.addEventListener('click', onClick);
     return () => {
-      if (timer) clearTimeout(timer);
+      clearPendingLongPress();
+      doc.removeEventListener(MOBILE_NAV_GESTURE_ACTIVE_EVENT, onNavGestureActive);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
       container.removeEventListener('touchend', onTouchEnd);
@@ -4414,9 +4649,25 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // because each machine's display, OS font availability, and viewing
   // distance differ. Surfaced via the title-bar dropdown on every platform
   // — phones included — so users can pick the font that reads best for them.
-  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  const [iosMacTextScale, setIosMacTextScale] = useState(() => shouldUseIosMacTextScale());
+  useEffect(() => {
+    const sync = () => setIosMacTextScale(shouldUseIosMacTextScale());
+    sync();
+    return subscribeDeviceLayoutChange(sync, { includeResize: false });
+  }, []);
+  const effectiveDefaultChatFont = useMemo(
+    () => (iosMacTextScale ? { ...DEFAULT_CHAT_FONT, size: 16 } : DEFAULT_CHAT_FONT),
+    [iosMacTextScale],
+  );
+  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', effectiveDefaultChatFont);
+  const scaledChatFontSize = scaledCssFontPx(chatFontPrefs.size);
   const chatFontStyle = !preview
-    ? { fontSize: `${chatFontPrefs.size}px`, fontFamily: chatFontPrefs.family }
+    ? ({
+        fontSize: scaledChatFontSize,
+        fontFamily: chatFontPrefs.family,
+        [CHAT_FONT_SIZE_VAR]: scaledChatFontSize,
+        [CHAT_FONT_FAMILY_VAR]: chatFontPrefs.family,
+      } as h.JSX.CSSProperties)
     : undefined;
   const historySteps = useMemo(() => {
     if (!historyStatus || historyStatus.phase === 'idle') return [];
@@ -4497,7 +4748,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           {canShowAgentsControl && (
             <button
               type="button"
-              class={`chat-panel-toggle chat-sdk-agents-toggle${desiredAgentsOpen ? ' active' : ''}`}
+              class={`chat-panel-toggle chat-sdk-agents-toggle${(desiredAgentsOpen || showAgentsPane) ? ' active' : ''}`}
               onClick={toggleAgentsPanel}
               title={t('chat.sdk_agents_toggle')}
               aria-label={t('chat.sdk_agents_toggle_aria', { count: sdkAgentsStatus.runningCount })}
@@ -4578,9 +4829,20 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                 }}
               />
             )}
+            {sessionId && (
+              <button
+                type="button"
+                class="chat-session-usage-btn"
+                title={t('sessionUsage.open')}
+                aria-label={t('sessionUsage.open')}
+                onClick={() => setSessionUsageOpen(true)}
+              >
+                📊
+              </button>
+            )}
           </div>
         )}
-        {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} mobileAnchorRef={chatTitlebarRef} />}
+        {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} />}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
@@ -4653,6 +4915,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           onWheel={preview ? undefined : handleWheel}
           onTouchStart={preview ? undefined : handleTouchStart}
           onTouchMove={preview ? undefined : handleTouchMove}
+          onTouchEnd={preview ? undefined : handleTouchEndOrCancel}
+          onTouchCancel={preview ? undefined : handleTouchEndOrCancel}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.
@@ -4808,6 +5072,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
+                  onCloudDocClick={cloudDocClickHandler}
                   onUrlClick={urlClickHandler}
                   onDownload={downloadHandler}
                   onHtmlPreview={htmlPreviewHandler}
@@ -4817,18 +5082,18 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             if (item.type === 'tool-activity') {
-              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} chatFontSize={!preview ? scaledChatFontSize : undefined} chatFontFamily={!preview ? chatFontPrefs.family : undefined} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -4836,6 +5101,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                     sessionName={sessionId ?? undefined}
                     sessions={sessions}
                     onPathClick={pathClickHandler}
+                    onCloudDocClick={cloudDocClickHandler}
                     onUrlClick={urlClickHandler}
                     onFileChangeOpen={fileChangeOpenHandler}
                     onDownload={downloadHandler}
@@ -5001,7 +5267,14 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           diagnostics={sdkAgentsStatus.diagnostics}
           runningCount={sdkAgentsStatus.runningCount}
           now={sdkAgentsNow}
-          onClose={() => setDesiredAgentsPanelOpen(false)}
+          onClose={() => {
+            if (runningAgentsCount === 0) {
+              setInspectRecentAgentsOpen(false);
+            } else {
+              setInspectRecentAgentsOpen(false);
+              setDesiredAgentsPanelOpen(false);
+            }
+          }}
         />
       )}
       {canShowFilePanel && showFilePanel && ws && (
@@ -5018,6 +5291,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               sessionName={sessionId ?? undefined}
               scopeToSessionRoot={scopeFilesToSession}
               readOnly={readOnlyFiles}
+              canShare={canManageFileShares}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}
@@ -5043,6 +5317,9 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       {zoomText && (
         <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
       )}
+      {!preview && sessionId && sessionUsageOpen && (
+        <SessionUsagePanel targetSessionName={sessionId} onClose={() => setSessionUsageOpen(false)} />
+      )}
       <HtmlFullscreenPreview preview={htmlFullscreenPreview} onClose={closeHtmlFullscreenPreview} />
       {/* External link confirm dialog */}
       {pendingUrl && (
@@ -5058,7 +5335,25 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               <span class="external-link-icon" aria-hidden="true">↗</span>
               <div class="external-link-title" id="external-link-dialog-title">{t('chat.external_link_title')}</div>
             </div>
-            <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+            <div class="external-link-url-row">
+              <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+              <button
+                type="button"
+                class={`external-link-copy${copiedExternalUrl === pendingUrl ? ' copied' : ''}`}
+                title={t(copiedExternalUrl === pendingUrl ? 'common.copied' : 'common.copy')}
+                aria-label={t(copiedExternalUrl === pendingUrl ? 'common.copied' : 'common.copy')}
+                onClick={() => {
+                  const url = pendingUrl;
+                  copyToClipboard(url, () => setCopiedExternalUrl(url));
+                }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                  {copiedExternalUrl === pendingUrl
+                    ? <path d="m5 12 4 4L19 6" />
+                    : <><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>}
+                </svg>
+              </button>
+            </div>
             <div class="external-link-warning">{t('chat.external_link_warning')}</div>
             <div class="external-link-actions">
               <button class="external-link-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>
@@ -5193,6 +5488,7 @@ function getToolActivityCounts(events: TimelineEvent[]) {
  * finished one reports how long it took.
  */
 function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
+  startedAt: number | null;
   running: boolean;
   failed: boolean;
   durationMs: number | null;
@@ -5214,7 +5510,7 @@ function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
 
   const { toolName, toolInput } = deriveToolCallDisplay(call);
 
-  const startedAt = typeof call.ts === 'number' ? call.ts : null;
+  const startedAt = typeof call.ts === 'number' && Number.isFinite(call.ts) ? call.ts : null;
   // Merging is what pairs a call with its result, so a merged event is finished
   // and carries the result's timestamp; anything unmerged is still in flight.
   // (An explicit "look for a trailing result" branch was tried here and removed:
@@ -5245,7 +5541,7 @@ function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
       || formatToolOutputPreview(call.payload._resultPayloadOutput)
       || null;
 
-  return { running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
+  return { startedAt, running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
 }
 
 let toolPeekIdCounter = 0;
@@ -5269,6 +5565,10 @@ function ToolActivityPeek({
   running,
   failed,
   duration,
+  startTime,
+  chatContainerRect,
+  chatFontSize,
+  chatFontFamily,
 }: {
   anchor: DOMRect;
   peekId: string;
@@ -5279,27 +5579,59 @@ function ToolActivityPeek({
   running: boolean;
   failed: boolean;
   duration: string | null;
+  startTime?: string | null;
+  chatContainerRect?: DOMRect | null;
+  chatFontSize?: string;
+  chatFontFamily?: string;
 }) {
   const { t } = useTranslation();
   if (typeof document === 'undefined') return null;
 
   const margin = 8;
-  const width = Math.min(560, Math.max(280, window.innerWidth - margin * 2));
+  const BASE_WIDTH = 560;
+
+  const viewportWidth = (typeof window !== 'undefined' && window.innerWidth > 0)
+    ? window.innerWidth
+    : 1024;
+  const hasContainer = Boolean(chatContainerRect && chatContainerRect.width > 0);
+  const containerLeft = hasContainer ? chatContainerRect!.left : 0;
+  const containerRight = hasContainer ? chatContainerRect!.right : viewportWidth;
+  const containerWidth = hasContainer ? chatContainerRect!.width : viewportWidth;
+
+  const minLeft = Math.max(margin, containerLeft + margin);
+  const maxRight = Math.min(viewportWidth - margin, containerRight - margin);
+  const maxAvailableWidth = Math.max(0, maxRight - minLeft);
+
+  const targetWidth = Math.round(containerWidth * 0.6);
+  // When chat container is narrow or 60% of chat width is less than base 560px,
+  // adapt to full available width (leaving safe margins); otherwise use >=60% of chat width.
+  const computedWidth = targetWidth < BASE_WIDTH
+    ? maxAvailableWidth
+    : Math.min(targetWidth, maxAvailableWidth);
+
+  const minWidth = Math.min(280, maxAvailableWidth);
+  const width = Math.min(maxAvailableWidth, Math.max(minWidth, computedWidth));
+
+  const maxLeft = maxRight - width;
+  const left = Math.min(
+    Math.max(minLeft, anchor.left),
+    Math.max(minLeft, maxLeft),
+  );
+
   // Prefer above the chip (the chip sits under the reply text, so upward keeps
   // the message readable); flip below only when there is not enough room.
   const spaceAbove = anchor.top;
-  const placeBelow = spaceAbove < 220 && window.innerHeight - anchor.bottom > spaceAbove;
-  const left = Math.min(
-    Math.max(margin, anchor.left),
-    Math.max(margin, window.innerWidth - width - margin),
-  );
-  const maxHeight = Math.max(
-    140,
-    (placeBelow ? window.innerHeight - anchor.bottom : anchor.top) - margin * 2,
-  );
+  const viewportHeight = (typeof window !== 'undefined' && window.innerHeight > 0)
+    ? window.innerHeight
+    : 768;
+  const spaceBelow = viewportHeight - anchor.bottom;
+  const placeBelow = spaceAbove < 280 && spaceBelow > spaceAbove;
+  const availableSpace = (placeBelow ? spaceBelow : anchor.top) - margin * 2;
+  if (availableSpace <= 0) return null;
+  const maxHeight = availableSpace;
   const position = placeBelow
     ? { top: `${anchor.bottom + margin}px` }
-    : { bottom: `${window.innerHeight - anchor.top + margin}px` };
+    : { bottom: `${viewportHeight - anchor.top + margin}px` };
 
   const status = running
     ? t('chat.tool_peek_running')
@@ -5311,7 +5643,7 @@ function ToolActivityPeek({
     <div
       id={peekId}
       class={`chat-tool-peek${running ? ' is-running' : ''}${failed ? ' is-failed' : ''}`}
-      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
+      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position, [CHAT_FONT_SIZE_VAR]: chatFontSize, [CHAT_FONT_FAMILY_VAR]: chatFontFamily }}
       role="tooltip"
     >
       <div class="chat-tool-peek-frame" aria-hidden="true" />
@@ -5319,6 +5651,7 @@ function ToolActivityPeek({
         <span class="chat-tool-peek-dot" aria-hidden="true" />
         <span class="chat-tool-peek-tool">{toolName}</span>
         <span class="chat-tool-peek-status">{status}</span>
+        {startTime && <span class="chat-tool-peek-start-time">{startTime}</span>}
         {duration && <span class="chat-tool-peek-duration">{duration}</span>}
       </div>
       <div class="chat-tool-peek-body">
@@ -5349,29 +5682,37 @@ function ToolActivitySummary({
   events,
   visible = true,
   onPathClick,
+  onCloudDocClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
   onImagePreview,
   onOpenLocalWebPreview,
   serverId,
+  chatFontSize,
+  chatFontFamily,
 }: {
   events: TimelineEvent[];
   visible?: boolean;
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
+  chatFontSize?: string;
+  chatFontFamily?: string;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   const [expanded, setExpanded] = useState(false);
   // Anchor rect, not a boolean: the peek is portalled out of the scroller, so it
   // needs the chip's viewport position. Re-measured on every open so scrolling
   // between hovers cannot leave it stranded.
   const [peekAnchor, setPeekAnchor] = useState<DOMRect | null>(null);
+  const [chatContainerRect, setChatContainerRect] = useState<DOMRect | null>(null);
   // The element the peek is anchored to, kept so scroll/resize can re-measure it
   // rather than leaving the panel at a rect that is now wrong.
   const peekTriggerRef = useRef<HTMLElement | null>(null);
@@ -5385,6 +5726,9 @@ function ToolActivitySummary({
   // a timer alive, and the shared ticker stops once its last listener leaves.
   const nowMs = useNowTicker(visible && counts.running > 0);
   const last = getLastToolActivity(events, nowMs);
+  // A completed group stops its elapsed ticker. Calendar labels must still
+  // use the current day whenever rendering again (e.g. opening a peek tomorrow).
+  const lastStartTime = last?.startedAt != null ? formatChatDateTime(last.startedAt, Date.now(), locale) : null;
   const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
   // Same one-line preview the full row shows, so this reads as a miniature of it
   // rather than a different rendering of the same data.
@@ -5397,10 +5741,13 @@ function ToolActivitySummary({
     if (!last || !element) return;
     peekTriggerRef.current = element;
     setPeekAnchor(element.getBoundingClientRect());
+    const container = (element.closest('.chat-view') ?? element.closest('.chat-view-wrap')) as HTMLElement | null;
+    setChatContainerRect(container ? container.getBoundingClientRect() : null);
   };
   const closePeek = () => {
     peekTriggerRef.current = null;
     setPeekAnchor(null);
+    setChatContainerRect(null);
   };
   // Pointer only. Touch clients report no hover, and opening the peek on a tap
   // would fight the expand toggle. Keyboard focus deliberately does NOT go
@@ -5425,6 +5772,8 @@ function ToolActivitySummary({
         || rect.right < 0 || rect.left > window.innerWidth;
       if (offscreen) { closePeek(); return; }
       setPeekAnchor(rect);
+      const container = (element.closest('.chat-view') ?? element.closest('.chat-view-wrap')) as HTMLElement | null;
+      setChatContainerRect(container ? container.getBoundingClientRect() : null);
     };
     // Capture phase so nested scrollers (the chat list itself) are observed too;
     // `scroll` does not bubble.
@@ -5473,6 +5822,7 @@ function ToolActivitySummary({
             {lastInput && <span class="chat-tool-activity-last-input">{lastInput}</span>}
           </span>
         )}
+        {lastStartTime && <span class="chat-tool-activity-start-time" aria-hidden="true">{lastStartTime}</span>}
         {lastDuration && (
           <span
             class={`chat-tool-activity-time${last?.running ? ' is-running' : ''}`}
@@ -5502,7 +5852,11 @@ function ToolActivitySummary({
           error={last.toolError}
           running={last.running}
           failed={last.failed}
+          startTime={lastStartTime}
           duration={lastDuration}
+          chatContainerRect={chatContainerRect}
+          chatFontSize={chatFontSize}
+          chatFontFamily={chatFontFamily}
         />
       )}
       <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
@@ -5514,6 +5868,7 @@ function ToolActivitySummary({
                 key={event.eventId}
                 event={event}
                 onPathClick={onPathClick}
+                onCloudDocClick={onCloudDocClick}
                 onUrlClick={onUrlClick}
                 onDownload={onDownload}
                 onHtmlPreview={onHtmlPreview}
@@ -5547,6 +5902,7 @@ function ToolActivitySummary({
 function ToolCallGroup({
   events,
   onPathClick,
+  onCloudDocClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -5556,6 +5912,7 @@ function ToolCallGroup({
 }: {
   events: TimelineEvent[];
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -5575,18 +5932,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />
+      <ChatEvent event={first} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -5612,6 +5969,7 @@ const AssistantBlock = memo(function AssistantBlock({
   sessions,
   liveAssignmentStatuses,
   onPathClick,
+  onCloudDocClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -5633,7 +5991,7 @@ const AssistantBlock = memo(function AssistantBlock({
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
       {status && (
         <span
           class={`chat-execution-status-chip ${status.className}`}
@@ -5884,6 +6242,7 @@ const ChatEvent = memo(function ChatEvent({
   sessionName,
   sessions,
   onPathClick,
+  onCloudDocClick,
   onUrlClick,
   onFileChangeOpen,
   onDownload,
@@ -5898,6 +6257,7 @@ const ChatEvent = memo(function ChatEvent({
   sessionName?: string;
   sessions?: readonly { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: ChatPathDownloadHandler;
@@ -5965,30 +6325,11 @@ const ChatEvent = memo(function ChatEvent({
       const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
-      return (
-        // data-event-id lets the pinned-last-message banner target this bubble
-        // with an IntersectionObserver so the banner only shows when the real
-        // bubble has scrolled off the top of the viewport.
-        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
-          {sharedActorLabel && (
-            <div class="chat-shared-actor-label" title={sharedActorLabel}>
-              {sharedActorLabel}
-            </div>
-          )}
-          {attachments && serverId && attachments.map((att) => (
-            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
-          ))}
-          {userText && (
-            <UserMessageText
-              text={userText}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              onOpenLocalWebPreview={onOpenLocalWebPreview}
-            />
-          )}
+      const isAgent = origin === CHAT_MESSAGE_ORIGINS.AGENT;
+      const hasTime = showTime !== false && typeof event.ts === 'number' && Number.isFinite(event.ts) && event.ts > 0;
+      const hasStatusOrTime = isPending || isQueued || isFailed || (!isPending && !isFailed && hasTime);
+      const timeAndStatus = hasStatusOrTime ? (
+        <>
           {isPending && (
             <span
               class="chat-user-status chat-user-status-pending"
@@ -6021,7 +6362,37 @@ const ChatEvent = memo(function ChatEvent({
               )}
             </div>
           )}
-          {!isPending && !isFailed && <ChatTime ts={event.ts} />}
+          {!isPending && !isFailed && hasTime && <ChatTime ts={event.ts} />}
+        </>
+      ) : null;
+      return (
+        // data-event-id lets the pinned-last-message banner target this bubble
+        // with an IntersectionObserver so the banner only shows when the real
+        // bubble has scrolled off the top of the viewport.
+        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+          {sharedActorLabel && (
+            <div class="chat-shared-actor-label" title={sharedActorLabel}>
+              {sharedActorLabel}
+            </div>
+          )}
+          {attachments && serverId && attachments.map((att) => (
+            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
+          ))}
+          {userText && (
+            <UserMessageText
+              text={userText}
+              onPathClick={onPathClick}
+              onCloudDocClick={onCloudDocClick}
+              onUrlClick={onUrlClick}
+              onDownload={onDownload}
+              onHtmlPreview={onHtmlPreview}
+              onImagePreview={onImagePreview}
+              onOpenLocalWebPreview={onOpenLocalWebPreview}
+              isAgent={isAgent}
+              footerRight={timeAndStatus}
+            />
+          )}
+          {!userText && timeAndStatus}
         </div>
       );
     }
@@ -6081,7 +6452,7 @@ const ChatEvent = memo(function ChatEvent({
           {findingsPreview && (
             <details>
               <summary>{t('peerAuditResult.findingsPreview')}</summary>
-              <ChatMarkdown text={findingsPreview} onUrlClick={onUrlClick} onOpenLocalWebPreview={onOpenLocalWebPreview} />
+              <ChatMarkdown text={findingsPreview} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onOpenLocalWebPreview={onOpenLocalWebPreview} />
             </details>
           )}
           <ChatTime ts={event.ts} />
@@ -6162,6 +6533,7 @@ const ChatEvent = memo(function ChatEvent({
                   <ChatMarkdown
                     text={result}
                     onPathClick={onPathClick}
+                    onCloudDocClick={onCloudDocClick}
                     onUrlClick={onUrlClick}
                     onDownload={onDownload}
                     onHtmlPreview={onHtmlPreview}
@@ -6175,6 +6547,7 @@ const ChatEvent = memo(function ChatEvent({
                 <ChatMarkdown
                   text={result}
                   onPathClick={onPathClick}
+                  onCloudDocClick={onCloudDocClick}
                   onUrlClick={onUrlClick}
                   onDownload={onDownload}
                   onHtmlPreview={onHtmlPreview}
@@ -6222,18 +6595,18 @@ const ChatEvent = memo(function ChatEvent({
                     <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                   </button>
                   <span class="chat-tool-name">{toolName}</span>
-                  {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>}
+                  {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>}
                   {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
                   {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
                 </div>
                 {toolInputRemainingLines !== null && (
                   <div class="chat-event chat-tool chat-tool-fold-continuation">
-                    <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
+                    <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
                   </div>
                 )}
                 {toolOutput && (
                   <div class="chat-event chat-tool chat-tool-result-preview">
-                    <span class="chat-tool-output">{splitPathsAndUrls(toolFoldDisplayText(toolOutput, expanded), onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
+                    <span class="chat-tool-output">{splitPathsAndUrls(toolFoldDisplayText(toolOutput, expanded), onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
                   </div>
                 )}
                 {expanded && (
@@ -6283,12 +6656,12 @@ const ChatEvent = memo(function ChatEvent({
                   >
                     <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                   </button>
-                  <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
+                  <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
                   {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
                 </div>
                 {resultRemainingLines !== null && (
                   <div class="chat-event chat-tool chat-tool-fold-continuation">
-                    <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
+                    <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}</span>
                   </div>
                 )}
                 {expanded && <ToolResultDetailPanel detail={detail} payloadOutput={event.payload.output} />}
@@ -6834,24 +7207,31 @@ export function renderedUserMessageExceedsLineLimit(
 function UserMessageText({
   text,
   onPathClick,
+  onCloudDocClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
   onImagePreview,
   onOpenLocalWebPreview,
+  isAgent,
+  footerRight,
 }: {
   text: string;
   onPathClick?: (p: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  isAgent?: boolean;
+  footerRight?: ComponentChildren;
 }) {
   const { t } = useTranslation();
   const contentRef = useRef<HTMLDivElement>(null);
   const { prose, leadingSender, trailingReply } = parseDelegationProtocolMessage(text);
-  const hardLineOverflow = countHardLines(prose) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const lineLimit = isAgent ? AGENT_MESSAGE_COLLAPSE_LINE_LIMIT : USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const hardLineOverflow = countHardLines(prose) > lineLimit;
   const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
     hardLineOverflow ? true : null,
   );
@@ -6865,7 +7245,7 @@ function UserMessageText({
     if (!content) return;
     let active = true;
     const measure = () => {
-      const measured = renderedUserMessageExceedsLineLimit(content);
+      const measured = renderedUserMessageExceedsLineLimit(content, lineLimit);
       const next = hardLineOverflow || measured;
       if (!active || next === null) return;
       setRenderedOverflow((current) => current === next ? current : next);
@@ -6889,29 +7269,38 @@ function UserMessageText({
       window.removeEventListener('resize', measure);
       fonts?.removeEventListener?.('loadingdone', measure);
     };
-  }, [hardLineOverflow, prose]);
+  }, [hardLineOverflow, prose, lineLimit]);
 
   return (
-    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
-      {leadingSender && <DelegationSenderCardView card={leadingSender} />}
-      <div
-        ref={contentRef}
-        class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
-      >
-        {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
-      </div>
-      {shouldFold && (
-        <button
-          type="button"
-          class="chat-user-message-fold-toggle"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((value) => !value)}
+    <>
+      <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+        {leadingSender && <DelegationSenderCardView card={leadingSender} />}
+        <div
+          ref={contentRef}
+          class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
         >
-          {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
-        </button>
-      )}
-      {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
-    </div>
+          {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick)}
+        </div>
+        {(isAgent || shouldFold) && (shouldFold || footerRight) && (
+          <div class="chat-user-footer">
+            {shouldFold && (
+              <button
+                type="button"
+                class="chat-user-message-fold-toggle"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((value) => !value)}
+              >
+                {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
+              </button>
+            )}
+            {footerRight && <span class="chat-user-footer-right">{footerRight}</span>}
+          </div>
+        )}
+        {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
+      </div>
+      {/* Keep the non-foldable, non-Agent timestamp/status DOM and height unchanged. */}
+      {!isAgent && !shouldFold && footerRight}
+    </>
   );
 }
 
@@ -6930,7 +7319,7 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
 const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
-/** Split a plain-text segment into URL tokens, path tokens, and plain text. */
+/** Split a plain-text segment into CloudDoc, URL, path, and plain-text tokens. */
 function splitPathsAndUrls(
   text: string,
   onPathClick?: (p: string) => void,
@@ -6941,52 +7330,43 @@ function splitPathsAndUrls(
   downloadLabel = '',
   htmlPreviewLabel = '',
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler,
+  onCloudDocClick?: (docId: string) => void,
 ): h.JSX.Element[] {
-  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview && !onOpenLocalWebPreview) return [<span>{text}</span>];
+  const hasCloudDocText = text.includes('[CloudDoc:') || text.includes('cdoc_');
+  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview && !onOpenLocalWebPreview && !onCloudDocClick && !hasCloudDocText) {
+    return [<span>{text}</span>];
+  }
   if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
 
-  // Step 1: Split by URLs first (URLs take priority over path detection)
-  const parts: preact.JSX.Element[] = [];
-  const chunks = splitTextByHttpUrls(text);
-
-  // Step 2: For text chunks, apply path detection. URL chunks render as links.
-  for (const chunk of chunks) {
-    if (chunk.type === 'url') {
-      parts.push(
-        <ChatLoopbackLink
-          key={`u${chunk.start}`}
-          href={chunk.value}
-          onOpenLocalWebPreview={onOpenLocalWebPreview}
-          onUrlClick={onUrlClick}
-        >
-          {chunk.value}
-        </ChatLoopbackLink>,
-      );
-    } else if (onPathClick || onImagePreview) {
-      // Apply path detection only on non-URL text
+  return splitTextWithCloudDocsAndUrls(text, {
+    onCloudDocClick,
+    onUrlClick,
+    onOpenLocalWebPreview,
+    renderPlainText: (chunkText, baseOffset) => {
+      if (!onPathClick && !onImagePreview) {
+        return [<span key={`t${baseOffset}`}>{chunkText}</span>];
+      }
+      const parts: h.JSX.Element[] = [];
       let pathLast = 0;
       PATH_REGEX.lastIndex = 0;
       let pm: RegExpExecArray | null;
-      while ((pm = PATH_REGEX.exec(chunk.value)) !== null) {
+      while ((pm = PATH_REGEX.exec(chunkText)) !== null) {
         const path = pm[1];
         if (path.length < 3) continue;
         if (isLikelyDomainPath(path)) continue;
-        if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
+        if (pm.index > pathLast) parts.push(<span key={`t${baseOffset + pathLast}`}>{chunkText.slice(pathLast, pm.index)}</span>);
         parts.push(renderChatPathActions({
-          key: `p${chunk.start + pm.index}`,
+          key: `p${baseOffset + pm.index}`,
           path,
           labels: { download: downloadLabel, htmlPreview: htmlPreviewLabel },
           handlers: { onPathClick, onDownload, onHtmlPreview, onImagePreview },
         }));
         pathLast = pm.index + pm[0].length;
       }
-      if (pathLast < chunk.value.length) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast)}</span>);
-    } else {
-      parts.push(<span key={`t${chunk.start}`}>{chunk.value}</span>);
-    }
-  }
-
-  return parts.length ? parts : [<span>{text}</span>];
+      if (pathLast < chunkText.length) parts.push(<span key={`t${baseOffset + pathLast}`}>{chunkText.slice(pathLast)}</span>);
+      return parts.length ? parts : [<span key={`t${baseOffset}`}>{chunkText}</span>];
+    },
+  });
 }
 
 /**
@@ -6995,3 +7375,4 @@ function splitPathsAndUrls(
  * Same convention as `__buildViewItemsForTests` above.
  */
 export const __ChatEventForTests = ChatEvent;
+export const __ToolActivityPeekForTests = ToolActivityPeek;

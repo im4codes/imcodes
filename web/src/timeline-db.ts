@@ -1,3 +1,4 @@
+import { isIncognitoSession } from '@shared/session-incognito-types.js';
 /**
  * IndexedDB persistence for timeline events.
  * Database: imcodes-timeline
@@ -26,6 +27,65 @@ import type { TimelineEvent } from './ws-client.js';
 import { preferLastValueSignal, preferTimelineEvent } from '../../src/shared/timeline/merge.js';
 import { isLastValueTimelineEventType } from '../../src/shared/timeline/types.js';
 import { MESSAGE_PIN_EVENT_TYPES } from '../../shared/message-pins.js';
+import { IDB_OPEN_TIMEOUT_MS, IDB_TX_TIMEOUT_MS } from '../../shared/scale-limits.js';
+
+export class IdbTimeoutError extends Error {
+  constructor(op: string) {
+    super(op);
+    this.name = 'IdbTimeoutError';
+  }
+}
+
+export function runIdbTx<T>(
+  startTx: (resolve: (v: T) => void, reject: (err: unknown) => void, touch: () => void) => IDBTransaction,
+  op = 'idb_tx_timeout',
+  timeoutMs = IDB_TX_TIMEOUT_MS,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let tx: IDBTransaction | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const clearTimer = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const armTimer = (): void => {
+      clearTimer();
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        timer = null;
+        try { tx?.abort(); } catch { /* ignore */ }
+        reject(new IdbTimeoutError(op));
+      }, timeoutMs);
+      timer.unref?.();
+    };
+    const touch = (): void => {
+      if (settled) return;
+      armTimer();
+    };
+    const settleResolve = (value: T): void => {
+      if (settled) return;
+      settled = true;
+      clearTimer();
+      resolve(value);
+    };
+    const settleReject = (err: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimer();
+      reject(err);
+    };
+    armTimer();
+    try {
+      tx = startTx(settleResolve, settleReject, touch);
+    } catch (err) {
+      settleReject(err);
+    }
+  });
+}
 
 const DB_NAME = 'imcodes-timeline';
 const DB_VERSION = 2;
@@ -190,7 +250,9 @@ export class TimelineDB {
         return;
       }
 
+      let touchOpenTimer: (() => void) | null = null;
       req.onupgradeneeded = () => {
+        touchOpenTimer?.();
         const db = req.result;
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           const store = db.createObjectStore(STORE_NAME, { keyPath: 'eventId' });
@@ -211,6 +273,11 @@ export class TimelineDB {
       // #2/B5), and the blocked timer is always cleared on success/error.
       let settled = false;
       let blockedTimer: ReturnType<typeof setTimeout> | null = null;
+      let openTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearTimers = (): void => {
+        if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+        if (openTimer) { clearTimeout(openTimer); openTimer = null; }
+      };
       const finishSuccess = (db: IDBDatabase): void => {
         if (settled) {
           // Holder released after we already timed out → close the orphan so it
@@ -219,15 +286,25 @@ export class TimelineDB {
           return;
         }
         settled = true;
-        if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+        clearTimers();
         resolve(db);
       };
       const finishError = (err: unknown): void => {
         if (settled) return;
         settled = true;
-        if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+        clearTimers();
         reject(err);
       };
+      // Bound silent open stalls (e.g. WebKit suspend interrupting IDB without
+      // firing onsuccess/onerror/onblocked).
+      const armOpenTimer = (): void => {
+        if (settled) return;
+        if (openTimer) clearTimeout(openTimer);
+        openTimer = setTimeout(() => finishError(new IdbTimeoutError('idb_open_timeout')), IDB_OPEN_TIMEOUT_MS);
+        openTimer.unref?.();
+      };
+      touchOpenTimer = armOpenTimer;
+      armOpenTimer();
 
       req.onsuccess = () => {
         const db = req.result;
@@ -254,7 +331,7 @@ export class TimelineDB {
         // the next read must reopen instead of returning an empty memory map
         // forever. `close` is supported by WebKit; addEventListener keeps this
         // harmless on implementations that never emit it.
-        db.addEventListener('close', () => {
+        db.addEventListener?.('close', () => {
           if (this.db === db) {
             this.db = null;
             this.openPromise = null;
@@ -303,6 +380,9 @@ export class TimelineDB {
   }
 
   async putEvents(events: TimelineEvent[]): Promise<void> {
+    // Live private events stay in useTimeline's in-memory cache, not IndexedDB
+    // or its retry fallback (which may flush to disk after a reconnect).
+    events = events.filter(event => !isIncognitoSession(event.payload));
     if (events.length === 0) return;
 
     const db = await this.ensureOpen();
@@ -323,13 +403,12 @@ export class TimelineDB {
       if (signals.length > 0) await txPutSignals(db, signals);
     } catch (error) {
       for (const e of events) this.memPut(e);
-      if (this.isClosedConnectionError(error)) {
+      if (this.handleDbFailure(db, error) === 'reopen') {
         // The browser closed this handle between ensureOpen() and transaction
         // creation. Keep the just-written rows in the fallback, drop the dead
         // handle, and reopen now: ensureOpen() flushes the fallback before it
         // resolves, so a page reload cannot lose the live events that arrived
         // during the connection transition.
-        this.invalidateConnection(db);
         await this.ensureOpen();
       }
     }
@@ -349,7 +428,7 @@ export class TimelineDB {
       const afterSeq = opts?.afterSeq ?? -1;
       const limit = opts?.limit ?? Infinity;
 
-      return await new Promise<TimelineEvent[]>((resolve, reject) => {
+      return await runIdbTx<TimelineEvent[]>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('session_epoch_seq');
@@ -366,8 +445,10 @@ export class TimelineDB {
         const req = Number.isFinite(limit) ? index.getAll(range, limit) : index.getAll(range);
         req.onsuccess = () => resolve(req.result as TimelineEvent[]);
         req.onerror = () => reject(req.error);
-      });
-    } catch {
+        return tx;
+      }, 'idb_get_events_timeout');
+    } catch (error) {
+      this.handleDbFailure(db, error);
       return this.memGet(sessionId, epoch, opts);
     }
   }
@@ -388,13 +469,14 @@ export class TimelineDB {
     try {
       return await this.readRecentEventsFromDb(db, sessionId, opts);
     } catch (error) {
-      if (!this.isClosedConnectionError(error)) return this.memGetByTime(sessionId, opts);
-      this.invalidateConnection(db);
+      const action = this.handleDbFailure(db, error);
+      if (action !== 'reopen') return this.memGetByTime(sessionId, opts);
       const reopened = await this.ensureOpen();
       if (!reopened) return this.memGetByTime(sessionId, opts);
       try {
         return await this.readRecentEventsFromDb(reopened, sessionId, opts);
-      } catch {
+      } catch (retryError) {
+        this.handleDbFailure(reopened, retryError);
         return this.memGetByTime(sessionId, opts);
       }
     }
@@ -420,6 +502,20 @@ export class TimelineDB {
     return error instanceof DOMException && error.name === 'InvalidStateError';
   }
 
+  private handleDbFailure(db: IDBDatabase, error: unknown): 'reopen' | 'memory' | 'none' {
+    if (error instanceof IdbTimeoutError) {
+      this.invalidateConnection(db);
+      this._memoryOnly = true;
+      this.lastOpenFailureAt = Date.now();
+      return 'memory';
+    }
+    if (this.isClosedConnectionError(error)) {
+      this.invalidateConnection(db);
+      return 'reopen';
+    }
+    return 'none';
+  }
+
   private invalidateConnection(db: IDBDatabase): void {
     if (this.db !== db) return;
     try { db.close(); } catch { /* ignore */ }
@@ -433,7 +529,7 @@ export class TimelineDB {
     opts?: { limit?: number },
   ): Promise<TimelineEvent[]> {
     const limit = opts?.limit ?? Infinity;
-    return new Promise<TimelineEvent[]>((resolve, reject) => {
+    return runIdbTx<TimelineEvent[]>((resolve, reject, touch) => {
       const tx = db.transaction(STORE_NAME, 'readonly');
       const store = tx.objectStore(STORE_NAME);
       const index = store.index('session_ts');
@@ -447,7 +543,7 @@ export class TimelineDB {
         const req = index.getAll(range);
         req.onsuccess = () => resolve(req.result as TimelineEvent[]);
         req.onerror = () => reject(req.error);
-        return;
+        return tx;
       }
 
       // Bounded read: walk newest-first and stop at `limit`.
@@ -486,6 +582,7 @@ export class TimelineDB {
       };
       const req = index.openCursor(range, 'prev');
       req.onsuccess = () => {
+        touch();
         const cursor = req.result;
         if (!cursor) { finish(); return; }
         const event = cursor.value as TimelineEvent;
@@ -502,7 +599,8 @@ export class TimelineDB {
         cursor.continue();
       };
       req.onerror = () => reject(req.error);
-    });
+      return tx;
+    }, 'idb_get_recent_timeout');
   }
 
   /**
@@ -540,26 +638,30 @@ export class TimelineDB {
       for (const event of rawEvents) this.memPut({ ...event, sessionId: scopedKey });
       return;
     }
-    await new Promise<void>((resolve, reject) => {
-      try {
+    try {
+      await runIdbTx<void>((resolve, reject, touch) => {
         const tx = db.transaction(STORE_NAME, 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         for (const event of rawEvents) {
           const getReq = store.get(event.eventId);
           getReq.onsuccess = () => {
+            touch();
             const existing = getReq.result as TimelineEvent | undefined;
             const preferred = existing ? preferTimelineEvent(existing, event) : event;
-            store.put({ ...preferred, sessionId: scopedKey });
+            const putReq = store.put({ ...preferred, sessionId: scopedKey });
+            putReq.onsuccess = () => touch();
           };
           getReq.onerror = () => reject(getReq.error);
         }
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
         tx.onabort = () => reject(tx.error);
-      } catch (err) {
-        reject(err);
-      }
-    });
+        return tx;
+      }, 'idb_migrate_timeout');
+    } catch (error) {
+      this.handleDbFailure(db, error);
+      for (const event of rawEvents) this.memPut({ ...event, sessionId: scopedKey });
+    }
   }
 
   async getLastSeqAndEpoch(sessionId: string): Promise<{ seq: number; epoch: number } | null> {
@@ -569,7 +671,7 @@ export class TimelineDB {
     }
 
     try {
-      return await new Promise<{ seq: number; epoch: number } | null>((resolve, reject) => {
+      return await runIdbTx<{ seq: number; epoch: number } | null>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('session_epoch_seq');
@@ -590,8 +692,10 @@ export class TimelineDB {
           }
         };
         req.onerror = () => reject(req.error);
-      });
-    } catch {
+        return tx;
+      }, 'idb_last_seq_timeout');
+    } catch (error) {
+      this.handleDbFailure(db, error);
       return this.memLastSeqEpoch(sessionId);
     }
   }
@@ -609,8 +713,8 @@ export class TimelineDB {
 
     try {
       const events = await this.getEvents(sessionId, epoch);
-      await txWrite(db, STORE_NAME, (store) => {
-        for (const e of events) store.delete(e.eventId);
+      await txWrite(db, STORE_NAME, (store, touch) => {
+        deleteWithHeartbeat(store, events.map((e) => e.eventId), touch);
       });
     } catch {
       // best-effort
@@ -660,11 +764,11 @@ export class TimelineDB {
       //    the window that has to be unblocked. Draining oldest-first can spend
       //    an entire page session's budget without freeing a single row the
       //    user would have seen.
-      const { batch, scannedToEnd, resumeFrom } = await new Promise<{
+      const { batch, scannedToEnd, resumeFrom } = await runIdbTx<{
         batch: TimelineEvent[];
         scannedToEnd: boolean;
         resumeFrom: DrainCursor | undefined;
-      }>((resolve, reject) => {
+      }>((resolve, reject, touch) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('session_ts');
@@ -687,6 +791,7 @@ export class TimelineDB {
         let scanned = 0;
         let last: DrainCursor | undefined;
         req.onsuccess = () => {
+          touch();
           const cursor = req.result;
           if (!cursor) { resolve({ batch: collected, scannedToEnd: true, resumeFrom: last }); return; }
           const pending = cursor.value as TimelineEvent;
@@ -709,7 +814,8 @@ export class TimelineDB {
           cursor.continue();
         };
         req.onerror = () => reject(req.error);
-      });
+        return tx;
+      }, 'idb_drain_scan_timeout');
 
       if (batch.length === 0) {
         return {
@@ -735,8 +841,8 @@ export class TimelineDB {
       }
       await txPutSignals(db, [...newestByType.values()]);
 
-      await txWrite(db, STORE_NAME, (store) => {
-        for (const event of batch) store.delete(event.eventId);
+      await txWrite(db, STORE_NAME, (store, touch) => {
+        deleteWithHeartbeat(store, batch.map((event) => event.eventId), touch);
       });
 
       return {
@@ -749,7 +855,8 @@ export class TimelineDB {
         deletedIds: batch.map((event) => event.eventId),
         ...(resumeFrom !== undefined ? { nextBefore: resumeFrom } : {}),
       };
-    } catch {
+    } catch (error) {
+      this.handleDbFailure(db, error);
       return null;
     }
   }
@@ -773,7 +880,7 @@ export class TimelineDB {
       // else, so `getAllKeys` avoids structured-cloning payloads we are about
       // to throw away — the old `getAll` made pruning cost as much as the
       // unbounded read it exists to prevent.
-      const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+      const keys = await runIdbTx<IDBValidKey[]>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('session_ts');
@@ -783,7 +890,8 @@ export class TimelineDB {
         const req = index.getAllKeys(range);
         req.onsuccess = () => resolve(req.result as IDBValidKey[]);
         req.onerror = () => reject(req.error);
-      });
+        return tx;
+      }, 'idb_prune_keys_timeout');
 
       if (keys.length <= keepCount) return { deleted: 0, done: true };
 
@@ -794,11 +902,12 @@ export class TimelineDB {
       const overflow = keys.slice(0, keys.length - keepCount);
       const budget = Math.max(1, opts?.maxDeletions ?? overflow.length);
       const toDelete = overflow.slice(0, budget);
-      await txWrite(db, STORE_NAME, (store) => {
-        for (const key of toDelete) store.delete(key);
+      await txWrite(db, STORE_NAME, (store, touch) => {
+        deleteWithHeartbeat(store, toDelete, touch);
       });
       return { deleted: toDelete.length, done: toDelete.length === overflow.length };
-    } catch {
+    } catch (error) {
+      this.handleDbFailure(db, error);
       return null;
     }
   }
@@ -869,21 +978,24 @@ function txPutEventsPreservingCompleteness(
   db: IDBDatabase,
   events: TimelineEvent[],
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return runIdbTx((resolve, reject, touch) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
     for (const event of events) {
       const getReq = store.get(event.eventId);
       getReq.onsuccess = () => {
+        touch();
         const existing = getReq.result as TimelineEvent | undefined;
-        store.put(existing ? preferTimelineEvent(existing, event) : event);
+        const putReq = store.put(existing ? preferTimelineEvent(existing, event) : event);
+        putReq.onsuccess = () => touch();
       };
       getReq.onerror = () => reject(getReq.error);
     }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
-  });
+    return tx;
+  }, 'idb_put_events_timeout');
 }
 
 /**
@@ -899,27 +1011,32 @@ function txPutEventsPreservingCompleteness(
  * drain deletes the row it just replayed, which made that loss permanent.
  */
 function txPutSignals(db: IDBDatabase, events: TimelineEvent[]): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return runIdbTx((resolve, reject, touch) => {
     const tx = db.transaction(SIGNAL_STORE_NAME, 'readwrite');
     const store = tx.objectStore(SIGNAL_STORE_NAME);
     for (const event of events) {
       const getReq = store.get([event.sessionId, event.type]);
       getReq.onsuccess = () => {
+        touch();
         const existing = getReq.result as TimelineEvent | undefined;
         const winner = existing ? preferLastValueSignal(existing, event) : event;
-        if (!existing || winner !== existing) store.put(winner);
+        if (!existing || winner !== existing) {
+          const putReq = store.put(winner);
+          putReq.onsuccess = () => touch();
+        }
       };
       getReq.onerror = () => reject(getReq.error);
     }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
-  });
+    return tx;
+  }, 'idb_put_signals_timeout');
 }
 
 /** Every stored signal for one session. Bounded by the number of signal types. */
 function txReadSignals(db: IDBDatabase, sessionId: string): Promise<TimelineEvent[]> {
-  return new Promise((resolve, reject) => {
+  return runIdbTx((resolve, reject) => {
     const tx = db.transaction(SIGNAL_STORE_NAME, 'readonly');
     const store = tx.objectStore(SIGNAL_STORE_NAME);
     // Primary-key range over `[sessionId, type]`; no index needed because the
@@ -927,7 +1044,8 @@ function txReadSignals(db: IDBDatabase, sessionId: string): Promise<TimelineEven
     const req = store.getAll(IDBKeyRange.bound([sessionId, ''], [sessionId, '\uffff']));
     req.onsuccess = () => resolve((req.result as TimelineEvent[]) ?? []);
     req.onerror = () => reject(req.error);
-  });
+    return tx;
+  }, 'idb_read_signals_timeout');
 }
 
 /**
@@ -952,16 +1070,29 @@ function mergeStoredByTimestamp(
 
 // ── IDB transaction helper ─────────────────────────────────────────────────
 
+function deleteWithHeartbeat(
+  store: IDBObjectStore,
+  keys: Iterable<IDBValidKey>,
+  touch: () => void,
+): void {
+  for (const key of keys) {
+    const req = store.delete(key);
+    req.onsuccess = () => touch();
+  }
+}
+
 function txWrite(
   db: IDBDatabase,
   storeName: string,
-  fn: (store: IDBObjectStore) => void,
+  fn: (store: IDBObjectStore, touch: () => void) => void,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return runIdbTx((resolve, reject, touch) => {
     const tx = db.transaction(storeName, 'readwrite');
     const store = tx.objectStore(storeName);
-    fn(store);
+    fn(store, touch);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
-  });
+    tx.onabort = () => reject(tx.error);
+    return tx;
+  }, 'idb_write_timeout');
 }

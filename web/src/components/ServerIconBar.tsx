@@ -1,8 +1,10 @@
 import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { isServerOnline } from '../server-selection.js';
+import { getServerPresence } from '../unified-server-projection.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import type { SharedEntrySummary } from '../api.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
+import { PushStatusBadge } from './PushStatusBadge.js';
 import { isDaemonUpgradeAvailable } from '@shared/daemon-upgrade.js';
 import { buildServerIconLabels } from '@shared/server-icon-label.js';
 
@@ -13,13 +15,16 @@ interface ServerInfo {
   lastHeartbeatAt: number | null;
   daemonVersion?: string | null;
   latestDaemonVersion?: string | null;
-  createdAt: number;
+  createdAt?: number;
+  isSharedIn?: boolean;
+  sharedEntry?: SharedEntrySummary;
 }
 
 interface Props {
   servers: ServerInfo[];
   activeServerId: string | null;
   onSelectServer: (id: string, name: string) => void;
+  onOpenSharedEntry?: (entry: SharedEntrySummary) => void;
   onServerContextMenu?: (server: ServerInfo, x: number, y: number) => void;
   sidebarCollapsed?: boolean;
   onToggleSidebar?: () => void;
@@ -30,9 +35,26 @@ interface Props {
   sharedServerStates?: ReadonlyMap<string, SharedStateSummary>;
   returnHintServerId?: string | null;
   pinnedServerIds?: ReadonlySet<string>;
+  pushEnabledServerIds?: ReadonlySet<string>;
 }
 
-export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin, sharedServerStates, returnHintServerId = null, pinnedServerIds }: Props) {
+export function ServerIconBar({
+  servers,
+  activeServerId,
+  onSelectServer,
+  onOpenSharedEntry,
+  onServerContextMenu,
+  sidebarCollapsed,
+  onToggleSidebar,
+  onSettings,
+  onHome,
+  isAdmin,
+  onAdmin,
+  sharedServerStates,
+  returnHintServerId = null,
+  pinnedServerIds,
+  pushEnabledServerIds,
+}: Props) {
   const { t } = useTranslation();
   // One short label per server, unique across the list; recomputed when a server is added, renamed or removed.
   const namesKey = servers.map((server) => server.name).join('\u0000');
@@ -53,21 +75,55 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
       {servers.map((server, index) => {
         const label = labels[index]!;
         const isActive = server.id === activeServerId;
-        const isOnline = isServerOnline(server);
+        const presence = getServerPresence(server);
+        const presenceColor = presence === 'online' ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+        const presenceLabel = presence === 'online'
+          ? t('server.online', { defaultValue: 'Online' })
+          : presence === 'offline'
+            ? t('server.offline', { defaultValue: 'Offline' })
+            : t('server.status_unknown', { defaultValue: 'Status unknown' });
         const sharedState = sharedServerStates?.get(server.id) ?? null;
         const isPinned = pinnedServerIds?.has(server.id) ?? false;
+        const isSharedIn = Boolean(server.isSharedIn);
         return (
           <button
             key={server.id}
-            class={`server-icon server-icon-server${isActive ? ' server-icon-active' : ''}${server.id === returnHintServerId ? ' server-icon-return-hint' : ''}`}
+            class={`server-icon server-icon-server${isActive ? ' server-icon-active' : ''}${server.id === returnHintServerId ? ' server-icon-return-hint' : ''}${isSharedIn ? ' server-icon-shared-in' : ''}`}
             title={server.name}
             aria-label={server.name}
             aria-pressed={isActive}
-            onClick={() => onSelectServer(server.id, server.name)}
-            onContextMenu={(e: MouseEvent) => { e.preventDefault(); onServerContextMenu?.(server, e.clientX, e.clientY); }}
+            onClick={() => {
+              if (isSharedIn) {
+                if (server.sharedEntry && onOpenSharedEntry) {
+                  onOpenSharedEntry(server.sharedEntry);
+                }
+                return;
+              }
+              onSelectServer(server.id, server.name);
+            }}
+            onContextMenu={(e: MouseEvent) => {
+              e.preventDefault();
+              onServerContextMenu?.(server, e.clientX, e.clientY);
+            }}
           >
             <span class={`server-icon-letter server-icon-label-${label.size}`} aria-hidden="true">
               {label.lines.map((line, lineIndex) => <span key={lineIndex} class="server-icon-line">{line}</span>)}
+            </span>
+            <span
+              class="server-icon-accessible-name"
+              style={{
+                position: 'absolute',
+                width: 1,
+                height: 1,
+                padding: 0,
+                margin: -1,
+                overflow: 'hidden',
+                clip: 'rect(0,0,0,0)',
+                whiteSpace: 'nowrap',
+                border: 0,
+              }}
+            >
+              {server.name}
             </span>
             {isPinned && (
               <span
@@ -78,14 +134,22 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
                 📌
               </span>
             )}
-            <SharedStateIndicator state={sharedState} iconOnly variant="shared-out" />
-            {isDaemonUpgradeAvailable(server.daemonVersion, server.latestDaemonVersion) && (
+            {isSharedIn ? (
+              <SharedStateIndicator variant="shared-in" iconOnly />
+            ) : (
+              <SharedStateIndicator state={sharedState} iconOnly variant="shared-out" />
+            )}
+            {!isSharedIn && isDaemonUpgradeAvailable(server.daemonVersion, server.latestDaemonVersion) && (
               <span class="server-icon-upgrade" aria-label={t('server.daemon_upgrade_available')} title={t('server.daemon_upgrade_available')}>↥</span>
             )}
+            {!isSharedIn && pushEnabledServerIds && (
+              <PushStatusBadge enabled={pushEnabledServerIds.has(server.id)} />
+            )}
             <span
-              class="server-icon-dot"
-              style={{ background: isOnline ? '#4ade80' : '#475569' }}
-              aria-hidden="true"
+              class={`server-icon-dot server-icon-dot-${presence}`}
+              style={{ background: presenceColor }}
+              title={presenceLabel}
+              aria-label={presenceLabel}
             />
           </button>
         );

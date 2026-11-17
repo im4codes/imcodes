@@ -1,15 +1,15 @@
+import { normalizeTaskPairEventVerb, taskPairEventAction } from '../task-pair-event-action.js';
+import { TaskPairEventDecisions } from './TaskPairEventDecisions.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { isMobileLayout } from '../mobile-device.js';
+import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_NOTICE_VERB,
   TASK_PAIR_STATUSES,
-  TASK_PAIR_VERBS,
-  TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   type TaskPairEventPayload,
   type TaskPairStatus,
@@ -24,11 +24,6 @@ let hoverPreviewSequence = 0;
 
 function isStatus(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
-}
-
-function verbKey(verb: unknown): string {
-  if (verb === TASK_PAIR_NOTICE_VERB) return 'notice';
-  return typeof verb === 'string' && (TASK_PAIR_VERBS as readonly string[]).includes(verb) ? verb.toLowerCase() : 'other';
 }
 
 // Diagnostic text is still a display surface; protocol IDs and role runtime
@@ -61,20 +56,6 @@ function safePayloadValue(value: unknown, key?: string): unknown {
   return value;
 }
 
-/** Text of a daemon workspace event: where a kept deliverable went, or what happened to the workspace. */
-function workspaceText(t: (key: string, options?: Record<string, unknown>) => string, event: Partial<TaskPairEventPayload>): string {
-  switch (event.effect) {
-    case TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED:
-      return t('taskPair.output_saved', { path: event.outputPath ?? '' });
-    case TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED:
-      return t('taskPair.output_failed', { reason: event.outputError ?? '' });
-    case TASK_PAIR_WORKSPACE_EFFECTS.KEPT:
-      return t('taskPair.workspace_kept');
-    default:
-      return t('taskPair.workspace_removed');
-  }
-}
-
 /** Compact chat chip for one task-pair marker event (it replaces the hidden marker line). */
 export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { eventId: string; payload: Record<string, unknown>; timestamp?: number; sessions?: readonly SessionModelEntry[] }) {
   const { t, i18n } = useTranslation();
@@ -92,18 +73,15 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     return () => window.removeEventListener('deck:pair-split-state', handler);
   }, []);
   useEffect(() => {
-    const media = window.matchMedia?.('(max-width: 720px)');
-    if (!media) return undefined;
     const onChange = () => setIsMobile(isMobileLayout());
-    media.addEventListener?.('change', onChange);
-    window.addEventListener('resize', onChange);
-    return () => {
-      media.removeEventListener?.('change', onChange);
-      window.removeEventListener('resize', onChange);
-    };
+    onChange();
+    return subscribeDeviceLayoutChange(onChange);
   }, []);
   const [hoverPreviewAnchor, setHoverPreviewAnchor] = useState<DOMRect | null>(null);
   const cardRef = useRef<HTMLElement | null>(null);
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const keyboardPreviewRef = useRef(false);
+  const focusPreviewRef = useRef(false);
   const hoverOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewIdRef = useRef<string | null>(null);
@@ -111,7 +89,11 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const hoverPreviewId = hoverPreviewIdRef.current;
   const event = payload as Partial<TaskPairEventPayload>;
   const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
-  const writer = typeof event.writer === 'string' ? event.writer : '';
+  const canOpenSplit = !isMobile
+    && typeof event.executor === 'string' && !!event.executor && event.executor !== 'none'
+    && typeof event.auditor === 'string' && !!event.auditor && event.auditor !== 'none'
+    && activeSplitTaskId !== String(taskId);
+  const writer = typeof event.writer === 'string' ? event.writer.trim() : '';
   const isCancelledEvent = event.toStatus === 'cancelled';
   const cancelActor = typeof event.cancelActor === 'string' && event.cancelActor.trim()
     ? event.cancelActor.trim()
@@ -122,11 +104,13 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const cancelReason = typeof event.cancelReason === 'string' && event.cancelReason.trim()
     ? event.cancelReason.trim()
     : t('taskPair.card_cancel_reason_unknown');
-  const verb = t(`taskPair.verb.${verbKey(event.verb)}`);
+  const normalizedVerb = normalizeTaskPairEventVerb(event.verb);
+  const action = taskPairEventAction(t, event);
+  const verb = action?.label;
   // A notice that states no lifecycle shows a neutral badge, never a guessed status.
   const status = isStatus(event.toStatus)
     ? t(`taskPair.status.${event.toStatus}`)
-    : event.verb === TASK_PAIR_NOTICE_VERB ? t('taskPair.card_notice_status') : t('taskPair.card_unknown_status');
+    : normalizedVerb === TASK_PAIR_NOTICE_VERB ? t('taskPair.card_notice_status') : t('taskPair.card_unknown_status');
   const counts = event.severityCounts
     ? AUDIT_SEVERITY_LEVELS
       .filter((level) => (event.severityCounts?.[level] ?? 0) > 0)
@@ -187,6 +171,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     && findings.length === 0
     && (event.severityCounts ? blockingLevels.every((level) => (event.severityCounts?.[level] ?? 0) === 0) : true);
   const previewNoticeText = safeDetailText(noticeText).slice(0, 320);
+  const overviewNoticeText = writer === 'daemon' && (normalizedVerb === 'DISPATCH' || normalizedVerb === 'QUEUE') ? safeDetailText(auditDetails?.reason).slice(0, 320) : previewNoticeText;
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
@@ -198,16 +183,19 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   };
   const closeHoverPreview = () => {
     clearHoverTimers();
+    keyboardPreviewRef.current = false;
+    focusPreviewRef.current = false;
     setHoverPreviewAnchor(null);
   };
   const supportsDesktopHover = () => typeof window !== 'undefined'
     && typeof window.matchMedia === 'function'
     && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
   const scheduleHoverPreview = (pointerType?: string) => {
-    // Pointer hover is deliberately restricted to a fine hover-capable device;
-    // focus still calls this without a pointer type for keyboard accessibility.
+    // Only the shrink-wrapped title/icon calls this. Keyboard preview is an
+    // explicit shortcut, never a side effect of mouse/touch focus.
     if (pointerType && pointerType !== 'mouse' && pointerType !== 'pen') return;
-    if (pointerType && !supportsDesktopHover()) return;
+    if (!supportsDesktopHover()) return;
+    keyboardPreviewRef.current = false;
     if (!cardRef.current || expanded) return;
     if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
     hoverCloseTimerRef.current = null;
@@ -225,32 +213,46 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
     hoverCloseTimerRef.current = setTimeout(() => {
       hoverCloseTimerRef.current = null;
+      if (keyboardPreviewRef.current && document.getElementById(hoverPreviewId)?.contains(document.activeElement)) return;
       setHoverPreviewAnchor(null);
     }, HOVER_PREVIEW_CLOSE_DELAY_MS);
   };
-  const showHoverPreviewForFocus = () => {
+  const showHoverPreviewForKeyboard = () => {
     if (!cardRef.current || expanded) return;
     clearHoverTimers();
+    keyboardPreviewRef.current = true;
+    focusPreviewRef.current = true;
     setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
   };
   useEffect(() => () => clearHoverTimers(), []);
+  useEffect(() => { closeHoverPreview(); }, [eventId, taskId, expanded]);
+  useEffect(() => {
+    if (hoverPreviewAnchor && focusPreviewRef.current) {
+      focusPreviewRef.current = false;
+      document.getElementById(hoverPreviewId)?.focus({ preventScroll: true });
+    }
+  }, [hoverPreviewAnchor]);
   useEffect(() => {
     if (!hoverPreviewAnchor) return;
     const syncAnchor = () => {
       if (cardRef.current) setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
     };
+    const onEscape = (key: KeyboardEvent) => { if (key.key === 'Escape') closeHoverPreview(); };
+    window.addEventListener('keydown', onEscape);
     window.addEventListener('scroll', syncAnchor, true);
     window.addEventListener('resize', syncAnchor);
     return () => {
+      window.removeEventListener('keydown', onEscape);
       window.removeEventListener('scroll', syncAnchor, true);
       window.removeEventListener('resize', syncAnchor);
     };
   }, [Boolean(hoverPreviewAnchor)]);
-  const sessionLabel = (id: unknown, label: unknown) => {
+  const sessionLabel = (id: unknown, label: unknown, compact = false) => {
     if (typeof id !== 'string' || !id || id === 'none') return null;
     const name = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id));
-    const text = name ? `${name} (${id})` : id;
-    return <button type="button" class="task-pair-chip-session" onClick={(click) => {
+    const fullName = name ? `${name} (${id})` : id;
+    const text = compact && name ? name : fullName;
+    return <button type="button" class="task-pair-chip-session" title={fullName} aria-label={fullName} onClick={(click) => {
       click.stopPropagation();
       window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
     }}>{text}</button>;
@@ -261,13 +263,13 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     const session = sessions?.find((entry) => entry.name === id);
     return session?.activeModel?.trim() || session?.requestedModel?.trim() || undefined;
   };
-  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
-    const session = sessionLabel(id, label);
+  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor', compact = false) => {
+    const session = sessionLabel(id, label, compact);
     const model = resolveModel(id, modelValue);
     return <span class="task-pair-card-role">
       <span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>
       {session ?? <span class="task-pair-card-unassigned">{t(id === 'none' ? 'taskPair.panel_no_audit' : 'taskPair.card_unassigned')}</span>}
-      {session && model && <span class="task-pair-card-role-model">{t('taskPair.card_model', { value: model })}</span>}
+      {session && model && <span class="task-pair-card-role-model" title={model}>{t('taskPair.card_model', { value: model })}</span>}
     </span>;
   };
   const previewRole = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
@@ -282,7 +284,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const renderHoverPreview = () => {
     if (!hoverPreviewAnchor || typeof document === 'undefined' || expanded) return null;
     const margin = 10;
-    const width = Math.min(440, Math.max(180, window.innerWidth - margin * 2));
+    const width = Math.min(960, Math.max(180, window.innerWidth - margin * 2));
     const spaceAbove = hoverPreviewAnchor.top;
     const placeBelow = spaceAbove < 250 && window.innerHeight - hoverPreviewAnchor.bottom > spaceAbove;
     const maxHeight = Math.max(150, (placeBelow ? window.innerHeight - hoverPreviewAnchor.bottom : hoverPreviewAnchor.top) - margin * 2);
@@ -293,9 +295,14 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     return createPortal(<div
       id={hoverPreviewId}
       class="task-pair-card-hover-preview"
-      role="tooltip"
+      role="dialog"
+      tabIndex={-1}
+      aria-label={title}
+      onFocusIn={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
+      onFocusOut={(focus) => { if (!focus.currentTarget.contains(focus.relatedTarget as Node | null)) scheduleHoverPreviewClose(); }}
+      onKeyDown={(key) => { if (key.key === 'Escape') { key.preventDefault(); closeHoverPreview(); toggleRef.current?.focus({ preventScroll: true }); } }}
       style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
-      onPointerEnter={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
+      onPointerEnter={() => { keyboardPreviewRef.current = false; if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
       onPointerLeave={scheduleHoverPreviewClose}
     >
       <div class="task-pair-card-hover-preview-head">
@@ -304,15 +311,16 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         {eventTime && <time dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
       </div>
       <div class="task-pair-card-hover-preview-body">
-        <span class="task-pair-card-hover-preview-event">{verb}</span>
+        {verb && <span class="task-pair-card-hover-preview-event">{verb}</span>}
         {previewRole(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
         {previewRole(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
         {previewNoticeText && <p>{previewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
         {isCancelledEvent && <p>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
+        {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} scheduling={event.scheduling as never} />}
       </div>
     </div>, document.body);
   };
-  const isVerdictEvent = event.verb === 'PASS' || event.verb === 'REWORK';
+  const isVerdictEvent = normalizedVerb === 'PASS' || normalizedVerb === 'REWORK';
   const renderAuditDetails = () => {
     if (!hasAuditDetails && !noBlockingFindings && !isVerdictEvent) return null;
     return <section class="task-pair-card-audit-details" aria-label={t('taskPair.card_audit_details')}>
@@ -344,19 +352,22 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       data-task-status={isStatus(event.toStatus) ? event.toStatus : undefined}
       data-event-id={eventId}
       data-task-id={taskId}
-      onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)}
-      onPointerLeave={scheduleHoverPreviewClose}
     >
-      <header class="task-pair-card-head">
+      <header class={`task-pair-card-head${canOpenSplit ? ' has-split' : ''}`}>
         <button
+          ref={toggleRef}
           type="button"
           class="task-pair-card-toggle"
           aria-label={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
           title={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
           aria-expanded={expanded}
           aria-describedby={hoverPreviewAnchor ? hoverPreviewId : undefined}
-          onFocus={showHoverPreviewForFocus}
-          onFocusIn={showHoverPreviewForFocus}
+          aria-description={`${title}. ${t('taskPair.card_preview_hint')}`}
+          aria-keyshortcuts="ArrowDown"
+          onKeyDown={(key) => {
+            if (key.key === 'ArrowDown' && !expanded) { key.preventDefault(); showHoverPreviewForKeyboard(); }
+            else if (key.key === 'Escape') closeHoverPreview();
+          }}
           onBlur={scheduleHoverPreviewClose}
           onFocusOut={scheduleHoverPreviewClose}
           onClick={() => { closeHoverPreview(); setExpanded((value) => !value); }}
@@ -369,50 +380,53 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
             {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
             <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
           </span>
-          <span class="task-pair-chip-task">
-            <strong>{title}</strong>
+          <span class="task-pair-chip-task" title={title}>
+            <svg class="task-pair-title-preview-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)} onPointerLeave={scheduleHoverPreviewClose}>
+              <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" />
+            </svg>
+            <strong class="task-pair-title-preview-trigger"
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)} onPointerLeave={scheduleHoverPreviewClose}>{title}</strong>
           </span>
           {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
         </button>
+        {canOpenSplit && <button
+          type="button"
+          class="task-pair-split-btn"
+          title={t('taskPair.panel_open_split')}
+          aria-label={t('taskPair.panel_open_split')}
+          onPointerEnter={closeHoverPreview}
+          onFocus={closeHoverPreview}
+          onClick={(e) => {
+            e.stopPropagation();
+            closeHoverPreview();
+            window.dispatchEvent(new CustomEvent('deck:pair-split', {
+              detail: { taskId: String(taskId), title: typeof event.title === 'string' ? event.title : undefined, executor: event.executor, auditor: event.auditor, action: 'open' },
+            }));
+          }}
+        ><span class="task-pair-split-icon" aria-hidden="true">◫</span></button>}
       </header>
+      {!isMobile && <div class="task-pair-card-overview">
+        {verb && <span class="task-pair-card-event-meta">{verb}</span>}
+        <div class="task-pair-card-overview-roles">
+          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor', !expanded)}
+          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor', !expanded)}
+        </div>
+        {!expanded && overviewNoticeText && <p class="task-pair-card-overview-note" title={overviewNoticeText}>{overviewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
+        {!expanded && isCancelledEvent && <p class="task-pair-card-overview-note" title={cancelReason}>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
+      </div>}
       {expanded && <>
         <div class="task-pair-card-body">
-          <span class="task-pair-chip-text">
-            {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
-              ? workspaceText(t, event)
-              : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
-          </span>
+          {verb && <span class="task-pair-chip-text">
+            {normalizedVerb === TASK_PAIR_WORKSPACE_EVENT_VERB ? (action?.detail ?? verb)
+              : writer ? t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb }) : verb}
+          </span>}
           {renderAuditDetails()}
           {noticeText && <pre class="task-pair-card-notice">{safeDetailText(noticeText)}</pre>}
-          <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
-          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
-          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
-          {!isMobile && typeof event.executor === 'string' && event.executor && event.executor !== 'none' && typeof event.auditor === 'string' && event.auditor && event.auditor !== 'none' && (() => {
-            const taskIdStr = String(taskId);
-            const isSplitOpen = activeSplitTaskId === taskIdStr;
-            return (
-              <button
-                type="button"
-                class={`task-pair-split-btn${isSplitOpen ? ' is-active' : ''}`}
-                title={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
-                aria-label={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  window.dispatchEvent(new CustomEvent('deck:pair-split', {
-                    detail: {
-                      taskId: taskIdStr,
-                      executor: event.executor,
-                      auditor: event.auditor,
-                      action: isSplitOpen ? 'close' : 'open',
-                    },
-                  }));
-                }}
-              >
-                <span class="task-pair-split-icon" aria-hidden="true">◫</span>
-                <span class="task-pair-split-text">{isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}</span>
-              </button>
-            );
-          })()}
+          {verb && <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>}
+          {isMobile && roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
+          {isMobile && roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+          {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} scheduling={event.scheduling as never} />}
           {isCancelledEvent && <div class="task-pair-card-cancel-meta" data-cancel-provenance="true">
             <span>{t('taskPair.card_cancel_actor', { value: cancelActor || t('taskPair.card_cancel_unknown') })}</span>
             <span>{t('taskPair.card_cancel_source', { value: cancelSource ? t(`taskPair.cancel_source.${cancelSource}`, { defaultValue: cancelSource }) : t('taskPair.card_cancel_unknown') })}</span>

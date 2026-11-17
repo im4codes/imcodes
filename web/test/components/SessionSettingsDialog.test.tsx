@@ -1,6 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testing-library/preact';
@@ -9,8 +10,13 @@ import {
   CODEX_MODEL_IDS,
   DEFAULT_CODEX_AUTOMATION_MODEL,
 } from '../../../src/shared/models/options.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
 import { DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS } from '../../../shared/supervision-execution-pool.js';
-import { hasInvalidSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
+import {
+  buildTransportConfigWithSupervision,
+  hasInvalidSessionSupervisionSnapshot,
+} from '../../../shared/supervision-config.js';
 
 const patchSessionMock = vi.fn();
 const patchSubSessionMock = vi.fn();
@@ -89,21 +95,6 @@ function changeSelect(select: HTMLElement, value: string): void {
   fireEvent.change(element);
 }
 
-function changeSupervisionMode(value: string): void {
-  changeSelect(screen.getByLabelText('supervision-session:mode'), value);
-}
-
-function changeRuntimeBackend(idPrefix: 'supervision-defaults' | 'supervision-defaults-backup', value: string): void {
-  changeSelect(screen.getByLabelText(`${idPrefix}:backend`), value);
-}
-
-function selectRuntimeModel(
-  idPrefix: 'supervision-defaults' | 'supervision-defaults-backup',
-  model: string,
-): void {
-  changeSelect(screen.getByLabelText(`${idPrefix}:model`), model);
-}
-
 function makePeerAuditSession(overrides: Record<string, unknown> = {}) {
   return {
     sessionName: 'deck_sub_peer',
@@ -147,7 +138,9 @@ function makeIdentityAckWs() {
 describe('SessionSettingsDialog supervision', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    fetchSupervisorDefaultsMock.mockRejectedValue(new Error('no defaults'));
+    localStorage.clear();
+    __clearTransportModelCacheForTests();
+    fetchSupervisorDefaultsMock.mockResolvedValue(null);
     fetchExecutionPoolCatalogMock.mockResolvedValue([]);
     saveSupervisorDefaultsMock.mockResolvedValue(undefined);
     fetchSessionIdentityProfileMock.mockResolvedValue(null);
@@ -165,6 +158,48 @@ describe('SessionSettingsDialog supervision', () => {
     cleanup();
   });
 
+  it.each([
+    { type: 'codex-sdk', hiddenLabel: null },
+    { type: CLAUDE_CODE_CLI_SDK_AGENT_TYPE, hiddenLabel: 'cc_cli_sdk' },
+    { type: 'gemini-sdk', hiddenLabel: 'gemini-sdk' },
+    { type: 'gemini', hiddenLabel: 'gemini' },
+  ])('does not offer unavailable types ($type) while preserving historical type display', ({ type, hiddenLabel }) => {
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain"
+      description="" cwd="/proj" type={type} surface="session" onClose={vi.fn()} onSaved={vi.fn()} />);
+    const select = screen.getByTestId('session-agent-type') as HTMLSelectElement;
+    expect(select.value).toBe(type);
+    expect(screen.queryByRole('option', { name: 'cc_cli_sdk' })).toBeNull();
+    expect(screen.queryByRole('option', { name: 'gemini-sdk' })).toBeNull();
+    expect(screen.queryByRole('option', { name: 'gemini' })).toBeNull();
+    for (const unavailableType of [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'gemini-sdk', 'gemini']) {
+      const legacy = select.querySelector<HTMLOptionElement>(`option[value="${unavailableType}"]`);
+      if (type === unavailableType) {
+        expect(legacy?.disabled).toBe(true);
+        expect(legacy?.hidden).toBe(true);
+        expect(legacy?.textContent).toBe(hiddenLabel);
+      } else {
+        expect(legacy).toBeNull();
+      }
+    }
+    for (const allowed of ['claude-code-sdk', 'claude-code']) {
+      expect(select.querySelector<HTMLOptionElement>(`option[value="${allowed}"]`)?.disabled).toBe(false);
+    }
+  });
+
+  it('excludes unavailable types (CC CLI SDK, Gemini SDK, Gemini CLI) from new execution-pool choices without removing usable backends', () => {
+    const candidates = buildSupervisionExecutionPoolCandidates({
+      sessionName: 'deck_proj_brain',
+      sessions: [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'gemini-sdk', 'gemini', 'claude-code-sdk', 'claude-code'].map((type, index) => ({
+        sessionName: `deck_proj_worker_${index}`, parentSession: 'deck_proj_brain', type,
+        state: 'idle', activeModel: 'claude-sonnet-4-6', providerId: 'anthropic',
+      })),
+    });
+    expect(candidates.map(candidate => candidate.config.agentType)).toEqual(expect.arrayContaining(['claude-code-sdk', 'claude-code']));
+    expect(candidates.some(candidate => candidate.config.agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE)).toBe(false);
+    expect(candidates.some(candidate => candidate.config.agentType === 'gemini-sdk')).toBe(false);
+    expect(candidates.some(candidate => candidate.config.agentType === 'gemini')).toBe(false);
+  });
+
   it('keeps session and supervision fields on independent production surfaces', () => {
     const common = {
       serverId: 'srv-1', sessionName: 'deck_proj_brain', label: 'Brain', description: '',
@@ -173,11 +208,16 @@ describe('SessionSettingsDialog supervision', () => {
     };
     const { unmount } = render(<SessionSettingsDialog {...common} surface="session" />);
     expect(screen.getByTestId('session-model-settings')).toBeTruthy();
-    expect(screen.queryByLabelText('supervision-session:mode')).toBeNull();
+    expect(screen.queryByTestId('supervision-execution-pool-primary')).toBeNull();
+    expect(screen.queryByTestId('audit-blocking-severities')).toBeNull();
+    expect(screen.queryByTestId('task-pair-settings')).toBeNull();
     unmount();
 
-    render(<SupervisionSettingsDialog {...common} />);
-    expect(screen.getByLabelText('supervision-session:mode')).toBeTruthy();
+    render(<SupervisionSettingsDialog {...common} canControlAutomaticSupervision />);
+    expect(screen.getByTestId('supervision-execution-pool-primary')).toBeTruthy();
+    expect(screen.getByTestId('supervision-execution-pool-economy')).toBeTruthy();
+    expect(screen.getByTestId('audit-blocking-severities')).toBeTruthy();
+    expect(screen.getByTestId('task-pair-settings')).toBeTruthy();
     expect(screen.queryByTestId('session-model-settings')).toBeNull();
     expect(screen.queryByLabelText('session-identity-content')).toBeNull();
   });
@@ -201,7 +241,7 @@ describe('SessionSettingsDialog supervision', () => {
       executionPools: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS,
     });
     render(<SupervisionSettingsDialog {...common} canControlAutomaticSupervision />);
-    changeSupervisionMode('supervised_audit');
+    fireEvent.click(screen.getByTestId('audit-blocking-severity-P1'));
     await waitFor(() => expect((screen.getByRole('button', { name: 'save' }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole('button', { name: 'save' }));
     await waitFor(() => expect(patchSessionMock).toHaveBeenCalled());
@@ -457,17 +497,19 @@ describe('SessionSettingsDialog supervision', () => {
     }), { serverId: 'srv-1', sessionName: 'deck_proj_brain' }));
   });
 
-  it('renders authoritative supervision read-only without forcing it off', () => {
+  it('renders authoritative supervision read-only for non-Brain sessions without unauthorized writes', () => {
     render(
       <SessionSettingsDialog
         surface="supervision"
         canControlAutomaticSupervision={false}
         serverId="srv-1"
         sessionName="deck_proj_worker"
+        parentSession="deck_proj_brain"
         label="Worker"
         description=""
         cwd="/proj"
         type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
         transportConfig={{
           supervision: {
             mode: 'supervised_audit',
@@ -484,14 +526,18 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    const mode = screen.getByLabelText('supervision-session:mode') as HTMLSelectElement;
-    expect(mode.disabled).toBe(true);
-    expect(mode.value).toBe('supervised_audit');
     expect(screen.getByText('brainOnly')).toBeDefined();
+    expect(screen.queryByTestId('audit-blocking-severities')).toBeNull();
+    expect(screen.queryByTestId('task-pair-settings')).toBeNull();
+    const poolCheckbox = within(screen.getByTestId('supervision-execution-pool-primary'))
+      .getByLabelText('primary:deck_sub_peer') as HTMLInputElement;
+    expect(poolCheckbox.disabled).toBe(true);
+    const save = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
   });
 
-  it('uses the minimal shared projection and never writes supervision from a read-only dialog', async () => {
-    const view = render(
+  it('never writes supervision or execution pools from a shared-viewer read-only dialog', async () => {
+    render(
       <SessionSettingsDialog
         surface="supervision"
         canControlAutomaticSupervision={false}
@@ -501,40 +547,32 @@ describe('SessionSettingsDialog supervision', () => {
         description=""
         cwd="/proj"
         type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
         transportConfig={null}
         supervisionMode="supervised_audit"
+        peerAuditSessions={[makePeerAuditSession()] as any}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
     );
 
-    const mode = screen.getByLabelText('supervision-session:mode') as HTMLSelectElement;
-    expect(mode.disabled).toBe(true);
-    expect(mode.value).toBe('supervised_audit');
-
-    view.rerender(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision={false}
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Shared Brain"
-        description=""
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        supervisionMode="supervised"
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-    await waitFor(() => expect(mode.value).toBe('supervised'));
-
+    expect(screen.getByText('brainOnly')).toBeDefined();
     expect(screen.queryByTestId('session-model-settings')).toBeNull();
+    expect(screen.queryByTestId('audit-blocking-severities')).toBeNull();
+    expect(screen.queryByTestId('task-pair-settings')).toBeNull();
+
+    const poolCheckbox = within(screen.getByTestId('supervision-execution-pool-primary'))
+      .getByLabelText('primary:deck_sub_peer') as HTMLInputElement;
+    expect(poolCheckbox.disabled).toBe(true);
+    fireEvent.click(poolCheckbox);
+
     const save = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     fireEvent.click(save);
+    await Promise.resolve();
     expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(patchSubSessionMock).not.toHaveBeenCalled();
+    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
   });
 
   it('shows the working directory as read-only and omits cwd when saving a main session', async () => {
@@ -611,8 +649,7 @@ describe('SessionSettingsDialog supervision', () => {
     expect(patchSubSessionMock.mock.calls[0]?.[2]).not.toHaveProperty('cwd');
   });
 
-  it('uses global runtime selection and exposes no session-level model controls', async () => {
-    const onSaved = vi.fn();
+  it('renders only the 3 active supervision groups and retires all obsolete controls', () => {
     render(
       <SessionSettingsDialog
         surface="supervision"
@@ -623,41 +660,48 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="codex-sdk"
-        transportConfig={null}
+        activeModel={CODEX_MODEL_IDS[0]}
+        transportConfig={{ supervision: { mode: 'supervised_audit', backend: 'codex-sdk', model: CODEX_MODEL_IDS[0], timeoutMs: 30_000, promptVersion: 'supervision_decision_v1' } }}
         onClose={vi.fn()}
-        onSaved={onSaved}
+        onSaved={vi.fn()}
       />,
     );
 
-    changeSupervisionMode('supervised');
-    expect(screen.getAllByText('backend')).toHaveLength(2);
-    expect(screen.queryByTestId('supervision-session-runtime-model-preset-selector')).toBeNull();
-    expect(screen.getByText('usesGlobalRuntime')).toBeDefined();
-    expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    // 3 active groups rendered
+    expect(screen.getByTestId('supervision-execution-pool-primary')).toBeTruthy();
+    expect(screen.getByTestId('supervision-execution-pool-economy')).toBeTruthy();
+    expect(screen.getByTestId('audit-blocking-severities')).toBeTruthy();
+    expect(screen.getByTestId('task-pair-max-concurrency')).toBeTruthy();
 
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised',
-            backend: 'codex-sdk',
-            model: DEFAULT_CODEX_AUTOMATION_MODEL,
-          }),
-        }),
-      }));
-    });
-    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
-    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({
-      transportConfig: expect.objectContaining({
-        supervision: expect.objectContaining({
-          mode: 'supervised',
-        }),
-      }),
-    }));
+    // Retired controls absent
+    expect(screen.queryByTestId('supervision-intro-toggle')).toBeNull();
+    expect(screen.queryByLabelText('supervision-defaults:backend')).toBeNull();
+    expect(screen.queryByLabelText('supervision-defaults-backup:backend')).toBeNull();
+    expect(screen.queryByLabelText('supervision-defaults:timeout')).toBeNull();
+    expect(screen.queryByLabelText('supervision-session:mode')).toBeNull();
+    expect(screen.queryByTestId('supervision-merged-preview')).toBeNull();
+    expect(screen.queryByTestId('audit-blocking-summary')).toBeNull();
+    expect(screen.queryByTestId('task-pair-engine')).toBeNull();
+    expect(screen.queryByText('maxAutoContinueStreak')).toBeNull();
+    expect(screen.queryByText('maxAutoContinueTotal')).toBeNull();
+    expect(screen.queryByText('globalCustomInstructionsLabel')).toBeNull();
+    expect(screen.queryByText('customInstructionsLabel')).toBeNull();
+    expect(screen.queryByText('maxAuditLoops')).toBeNull();
+    expect(screen.queryByText('usesGlobalRuntime')).toBeNull();
+    expect(document.querySelector('.session-settings-summary')).toBeNull();
   });
 
-  it('defaults Auto and audit settings to Codex 5.3 Spark while keeping GPT-5.6 selectable', async () => {
+  it('does not block pool saves when stored legacy runtime defaults are empty', async () => {
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: '',
+      model: '',
+      timeoutMs: 0,
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: { configs: [], controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.primary },
+        economyTaskPool: { configs: [], controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.economy },
+      },
+    });
     render(
       <SessionSettingsDialog
         surface="supervision"
@@ -668,19 +712,375 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession()]}
         transportConfig={null}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
     );
 
-    const backendSelect = screen.getByLabelText('supervision-defaults:backend') as HTMLSelectElement;
+    const primaryCheckbox = await within(screen.getByTestId('supervision-execution-pool-primary'))
+      .findByLabelText('primary:deck_sub_peer') as HTMLInputElement;
+    fireEvent.click(primaryCheckbox);
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    expect(saveButton.disabled).toBe(false);
+    fireEvent.click(saveButton);
+
     await waitFor(() => {
-      expect(backendSelect.value).toBe('codex-sdk');
-      const modelSelect = screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement;
-      expect(modelSelect.value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
-      expect([...modelSelect.options].some((option) => option.value === 'gpt-5.6')).toBe(true);
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        executionPools: expect.objectContaining({
+          state: 'configured',
+          primaryDevelopmentPool: expect.objectContaining({
+            configs: expect.arrayContaining([
+              expect.objectContaining({ agentType: 'codex-sdk', model: 'gpt-5.6' }),
+            ]),
+          }),
+        }),
+      }));
     });
+  });
+
+  for (const storedMode of ['off', 'supervised', 'supervised_audit'] as const) {
+    it(`shows and saves blocking severities and max parallel pairs and preserves hidden snapshot fields when mode=${storedMode}`, async () => {
+      const hiddenSnapshot = {
+        mode: storedMode,
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        preset: 'custom-qwen-preset',
+        backupBackend: 'claude-code-sdk',
+        backupModel: 'claude-sonnet-4-6',
+        timeoutMs: 45_000,
+        promptVersion: 'supervision_decision_v1',
+        customInstructions: 'session-note',
+        customInstructionsOverride: true,
+        globalCustomInstructions: 'global-note',
+        maxParseRetries: 3,
+        maxAutoContinueStreak: 4,
+        maxAutoContinueTotal: 12,
+        maxAuditLoops: 6,
+        pairEngine: 'pairs',
+        pairMaxConcurrency: 2,
+        taskRunPromptVersion: 'task_run_status_v1',
+      };
+      render(
+        <SessionSettingsDialog
+          surface="supervision"
+          canControlAutomaticSupervision
+          serverId="srv-1"
+          sessionName="deck_proj_brain"
+          label="Brain"
+          description="desc"
+          cwd="/proj"
+          type="codex-sdk"
+          activeModel={CODEX_MODEL_IDS[0]}
+          transportConfig={{ supervision: hiddenSnapshot }}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByTestId('audit-blocking-severities')).toBeTruthy();
+      expect(screen.getByTestId('audit-non-finding-policy')).toBeTruthy();
+      expect((screen.getByTestId('task-pair-max-concurrency') as HTMLInputElement).value).toBe('2');
+
+      fireEvent.click(screen.getByTestId('audit-blocking-severity-P1'));
+      fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '7' } });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(patchSessionMock).toHaveBeenCalled());
+      const saved = patchSessionMock.mock.calls.at(-1)?.[2] as { transportConfig?: { supervision?: Record<string, unknown> } };
+      expect(saved.transportConfig?.supervision).toEqual(expect.objectContaining({
+        mode: storedMode,
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        backupBackend: 'claude-code-sdk',
+        backupModel: 'claude-sonnet-4-6',
+        timeoutMs: 45_000,
+        promptVersion: 'supervision_decision_v1',
+        customInstructions: 'session-note',
+        customInstructionsOverride: true,
+        globalCustomInstructions: 'global-note',
+        maxParseRetries: 3,
+        maxAutoContinueStreak: 4,
+        maxAutoContinueTotal: 12,
+        maxAuditLoops: 6,
+        pairEngine: 'pairs',
+        pairMaxConcurrency: 7,
+        auditBlockingSeverities: ['P0', 'P1'],
+        taskRunPromptVersion: 'task_run_status_v1',
+      }));
+    });
+  }
+
+  it('keeps hidden account defaults when a pool edit precedes defaults hydration', async () => {
+    let resolveDefaults!: (value: unknown) => void;
+    fetchSupervisorDefaultsMock.mockReturnValue(new Promise((resolve) => {
+      resolveDefaults = resolve;
+    }));
+    render(
+      <SessionSettingsDialog
+        surface="supervision"
+        canControlAutomaticSupervision
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession()]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const primaryPeer = within(screen.getByTestId('supervision-execution-pool-primary'))
+      .getByLabelText('primary:deck_sub_peer') as HTMLInputElement;
+    fireEvent.click(primaryPeer);
+    expect(primaryPeer.checked).toBe(true);
+
+    // Save stays blocked while the authoritative defaults read is still pending.
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    expect(saveButton.disabled).toBe(true);
+    fireEvent.click(saveButton);
+    await Promise.resolve();
+    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
+
+    // Hydrate with hidden legacy global fields: they must all survive alongside the earlier pool edit.
+    await act(async () => {
+      resolveDefaults({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        backupBackend: 'claude-code-sdk',
+        backupModel: 'claude-sonnet-4-6',
+        timeoutMs: 45_000,
+        maxAutoContinueStreak: 4,
+        maxAutoContinueTotal: 12,
+        customInstructions: 'KEEP-HIDDEN-GLOBAL',
+      });
+    });
+
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        backupBackend: 'claude-code-sdk',
+        backupModel: 'claude-sonnet-4-6',
+        timeoutMs: 45_000,
+        maxAutoContinueStreak: 4,
+        maxAutoContinueTotal: 12,
+        customInstructions: 'KEEP-HIDDEN-GLOBAL',
+        executionPools: expect.objectContaining({
+          state: 'configured',
+          primaryDevelopmentPool: expect.objectContaining({
+            configs: expect.arrayContaining([
+              expect.objectContaining({ agentType: 'codex-sdk', model: 'gpt-5.6' }),
+            ]),
+          }),
+        }),
+      }));
+    });
+  });
+
+  it('blocks pool saves when defaults fetch fails, preserves session-only saves, and recovers after refresh', async () => {
+    fetchSupervisorDefaultsMock
+      .mockRejectedValueOnce(new Error('network timeout'))
+      .mockResolvedValueOnce({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        customInstructions: 'PRESERVED-AFTER-RETRY',
+        timeoutMs: 45_000,
+      });
+
+    const existingSessionPoolConfig = {
+      state: 'configured' as const,
+      primaryDevelopmentPool: {
+        configs: [{
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport' as const,
+          providerFamily: 'openai',
+          model: 'gpt-5.6',
+        }],
+      },
+      economyTaskPool: { configs: [] },
+    };
+
+    render(
+      <SessionSettingsDialog
+        surface="supervision"
+        canControlAutomaticSupervision
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession({ sessionName: 'deck_sub_other', activeModel: 'gpt-5.5', requestedModel: 'gpt-5.5' })]}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+            executionPools: existingSessionPoolConfig,
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('defaultsLoadFailed');
+
+    // Session-only changes still save without touching global defaults or wiping existing session pools.
+    fireEvent.click(screen.getByTestId('audit-blocking-severity-P1'));
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    expect(saveButton.disabled).toBe(false);
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalled());
+    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
+    expect((patchSessionMock.mock.calls.at(-1)?.[2] as {
+      transportConfig?: { supervision?: { executionPools?: { primaryDevelopmentPool?: { configs?: unknown[] } } } };
+    }).transportConfig?.supervision?.executionPools?.primaryDevelopmentPool?.configs).toEqual(
+      existingSessionPoolConfig.primaryDevelopmentPool.configs,
+    );
+
+    // Editing pools while defaults read is failed must stay blocked from overwriting global defaults.
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary')).getByLabelText('primary:deck_sub_other'));
+    expect(saveButton.disabled).toBe(true);
+    fireEvent.click(saveButton);
+    await Promise.resolve();
+    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
+
+    // Refresh loads authoritative defaults cleanly, merges the user's pool selection, and preserves hidden fields.
+    fireEvent.click(within(alert).getByRole('button', { name: 'refresh' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        customInstructions: 'PRESERVED-AFTER-RETRY',
+        timeoutMs: 45_000,
+        executionPools: expect.objectContaining({
+          primaryDevelopmentPool: expect.objectContaining({
+            configs: expect.arrayContaining([
+              expect.objectContaining({ model: 'gpt-5.5' }),
+            ]),
+          }),
+        }),
+      }));
+    });
+  });
+
+  it('isolates pre-hydration pool drafts and hidden defaults when switching session scope', async () => {
+    let resolveScopeOne!: (value: unknown) => void;
+    fetchSupervisorDefaultsMock.mockImplementation((_serverId: string, targetSessionName: string) => {
+      if (targetSessionName === 'deck_proj_one') {
+        return new Promise((resolve) => {
+          resolveScopeOne = resolve;
+        });
+      }
+      return Promise.resolve({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        customInstructions: 'SCOPE-2-HIDDEN',
+        timeoutMs: 33_000,
+      });
+    });
+
+    const view = render(
+      <SessionSettingsDialog
+        surface="supervision"
+        canControlAutomaticSupervision
+        serverId="srv-1"
+        sessionName="deck_proj_one"
+        label="One"
+        description=""
+        cwd="/proj1"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession({ sessionName: 'deck_sub_one', parentSession: 'deck_proj_one', activeModel: 'gpt-5.5', requestedModel: 'gpt-5.5' })]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary')).getByLabelText('primary:deck_sub_one'));
+    expect((within(screen.getByTestId('supervision-execution-pool-primary')).getByLabelText('primary:deck_sub_one') as HTMLInputElement).checked).toBe(true);
+
+    view.rerender(
+      <SessionSettingsDialog
+        surface="supervision"
+        canControlAutomaticSupervision
+        serverId="srv-2"
+        sessionName="deck_proj_two"
+        label="Two"
+        description=""
+        cwd="/proj2"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession({ sessionName: 'deck_sub_two', parentSession: 'deck_proj_two', activeModel: 'gpt-5.6', requestedModel: 'gpt-5.6' })]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const peerTwo = await within(screen.getByTestId('supervision-execution-pool-primary'))
+      .findByLabelText('primary:deck_sub_two') as HTMLInputElement;
+    expect(peerTwo.checked).toBe(false);
+
+    // Late scope-1 resolution must not pollute scope-2 hidden defaults or pool draft.
+    await act(async () => {
+      resolveScopeOne({
+        backend: 'claude-code-sdk',
+        customInstructions: 'STALE-SCOPE-1',
+      });
+    });
+
+    fireEvent.click(peerTwo);
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        customInstructions: 'SCOPE-2-HIDDEN',
+        timeoutMs: 33_000,
+      }));
+    });
+    const savedScopeTwo = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0] as {
+      executionPools?: { primaryDevelopmentPool?: { configs?: Array<{ model?: string }> } };
+    };
+    expect(savedScopeTwo.executionPools?.primaryDevelopmentPool?.configs?.map((entry) => entry.model)).not.toContain('gpt-5.5');
+    expect(savedScopeTwo.executionPools?.primaryDevelopmentPool?.configs?.map((entry) => entry.model)).toContain('gpt-5.6');
+  });
+
+  it('shared builder preserves supervision when mode=off has explicit auditBlockingSeverities without configured pools', () => {
+    const built = buildTransportConfigWithSupervision(null, {
+      mode: 'off',
+      auditBlockingSeverities: ['P0', 'P1'],
+    });
+    expect(built).toEqual(expect.objectContaining({
+      supervision: expect.objectContaining({
+        mode: 'off',
+        auditBlockingSeverities: ['P0', 'P1'],
+      }),
+    }));
   });
 
   it('quick-opens supervised_audit settings without showing or requiring a manual auditor', async () => {
@@ -849,7 +1249,6 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByTestId('audit-non-finding-policy').textContent).toBe(
       'auditNonFindingTitleauditNonFindingHelp',
     );
-    expect(screen.getByTestId('audit-blocking-summary').textContent).toBe('summaryAuditBlocking:P0');
   });
 
   it('persists the selected blocking severities and keeps at least one selected', async () => {
@@ -875,7 +1274,6 @@ describe('SessionSettingsDialog supervision', () => {
     expect(severityBox('P0').checked).toBe(true);
     expect(severityBox('P1').checked).toBe(true);
     expect(severityBox('P2').checked).toBe(false);
-    expect(screen.getByTestId('audit-blocking-summary').textContent).toBe('summaryAuditBlocking:P0, P1');
   });
 
   it('persists the default Brain model to account defaults without another pool interaction', async () => {
@@ -902,7 +1300,9 @@ describe('SessionSettingsDialog supervision', () => {
     expect(within(primary).getByTestId('supervision-execution-pool-primary-empty')).toBeDefined();
     expect(within(economy).getByTestId('supervision-execution-pool-economy-empty')).toBeDefined();
 
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
 
     await waitFor(() => {
       expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -955,7 +1355,9 @@ describe('SessionSettingsDialog supervision', () => {
     expect(within(primary).queryByLabelText('primary:deck_sub_spark')).toBeNull();
     const economySpark = within(economy).getByLabelText('economy:deck_sub_spark');
     fireEvent.click(economySpark);
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
 
     await waitFor(() => {
       expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -1137,7 +1539,9 @@ describe('SessionSettingsDialog supervision', () => {
       roleSelect.value = 'executor';
       roleSelect.dispatchEvent(new Event('change', { bubbles: true }));
     });
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
 
     await waitFor(() => expect(saveSupervisorDefaultsMock).toHaveBeenCalled());
     const saved = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0] as {
@@ -1145,6 +1549,56 @@ describe('SessionSettingsDialog supervision', () => {
     };
     const config = saved.executionPools?.primaryDevelopmentPool?.configs?.find((entry) => entry.capabilityId === capabilityId);
     expect(config).toMatchObject({ role: 'executor' });
+  });
+
+  it.each(['executor', 'auditor', 'both'] as const)('reopens the live grouped candidate with the saved %s role', async (role) => {
+    const props = {
+      surface: 'supervision' as const, canControlAutomaticSupervision: true,
+      serverId: 'srv-1', sessionName: 'deck_proj_brain', label: 'Brain', description: '', cwd: '/proj',
+      type: 'codex-sdk', activeModel: CODEX_MODEL_IDS[0], transportConfig: null,
+      peerAuditSessions: [makePeerAuditSession(), makePeerAuditSession({ sessionName: 'deck_sub_peer2' })],
+      onClose: vi.fn(), onSaved: vi.fn(),
+    };
+    const capabilityId = 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6';
+    const { unmount } = render(<SessionSettingsDialog {...props} />);
+    const primary = screen.getByTestId('supervision-execution-pool-primary');
+    fireEvent.click(within(primary).getByLabelText('primary:deck_sub_peer,deck_sub_peer2'));
+    act(() => {
+      const select = within(primary).getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement;
+      select.value = role;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(saveSupervisorDefaultsMock).toHaveBeenCalled());
+    const saved = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0];
+    unmount();
+    fetchSupervisorDefaultsMock.mockResolvedValue(saved);
+    render(<SessionSettingsDialog {...props} />);
+    await waitFor(() => expect((screen.getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement).value).toBe(role));
+    const economy = screen.getByTestId('supervision-execution-pool-economy');
+    fireEvent.click(within(economy).getByLabelText('economy:deck_sub_peer,deck_sub_peer2'));
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary')).getByLabelText('primary:deck_sub_peer,deck_sub_peer2'));
+    expect((screen.getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement).value).toBe(role);
+  });
+
+  it.each(['executor', 'auditor', 'both'] as const)('renders a configured-only %s entry without fabricating a live candidate', async (role) => {
+    const capabilityId = 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6';
+    fetchSupervisorDefaultsMock.mockResolvedValue({ executionPools: {
+      state: 'configured', primaryDevelopmentPool: { configs: [{
+        capabilityId, agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai', model: 'gpt-5.6', role,
+      }] }, economyTaskPool: { configs: [{
+        capabilityId, agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai', model: 'gpt-5.6', role: 'both',
+      }] },
+    } });
+    render(<SupervisionSettingsDialog canControlAutomaticSupervision serverId="srv-1" sessionName="deck_proj_brain" label="" description="" cwd="/proj"
+      type="codex-sdk" activeModel={CODEX_MODEL_IDS[0]} transportConfig={null} onClose={vi.fn()} onSaved={vi.fn()} />);
+    await waitFor(() => expect((screen.getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement).value).toBe(role));
+    const checkbox = screen.getByLabelText('primary:configured:codex-sdk:gpt-5.6');
+    expect((checkbox as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(checkbox);
+    expect(screen.queryByTestId(`supervision-execution-pool-role-${capabilityId}`)).toBeNull();
   });
 
   it('persists a CC preset constraint without binding it to a live session', async () => {
@@ -1176,7 +1630,9 @@ describe('SessionSettingsDialog supervision', () => {
 
     fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary'))
       .getByLabelText('primary:deck_sub_cc_preset'));
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
 
     await waitFor(() => expect(saveSupervisorDefaultsMock).toHaveBeenCalled());
     const saved = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0] as {
@@ -1414,648 +1870,13 @@ describe('SessionSettingsDialog supervision', () => {
     expect(dialog?.querySelector('.session-settings-body')).toBeTruthy();
     expect(dialog?.querySelector('.session-settings-footer')).toBeTruthy();
     expect(dialog?.querySelectorAll('.session-settings-card')).toHaveLength(2);
-    expect(dialog?.querySelectorAll('.session-settings-field').length).toBeGreaterThanOrEqual(5);
+    expect(dialog?.querySelector('.session-settings-audit-severities')).toBeTruthy();
+    expect(dialog?.querySelector('.session-settings-task-pairs')).toBeTruthy();
+    expect(dialog?.querySelectorAll('.session-settings-subsection').length).toBeGreaterThanOrEqual(2);
 
     const close = screen.getByRole('button', { name: /^close$/i });
     expect(close.classList.contains('session-settings-close')).toBe(true);
     expect(close.textContent).toContain('×');
-  });
-
-  it('prefills from saved supervisor defaults when available', async () => {
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'codex-sdk',
-      model: CODEX_MODEL_IDS[0],
-      timeoutMs: 18_000,
-      promptVersion: 'supervision_decision_v1',
-      maxAutoContinueStreak: 4,
-      maxAutoContinueTotal: 9,
-    });
-
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(fetchSupervisorDefaultsMock).toHaveBeenCalledTimes(1);
-    });
-
-    changeSupervisionMode('supervised');
-    expect(screen.getAllByDisplayValue('30')).toHaveLength(1);
-    expect(screen.getAllByDisplayValue('4').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByDisplayValue('9').length).toBeGreaterThanOrEqual(2);
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised',
-            backend: 'codex-sdk',
-            model: CODEX_MODEL_IDS[0],
-            timeoutMs: 30_000,
-          }),
-        }),
-      }));
-    });
-  });
-
-  it('renders persisted supervision snapshot in the summary', () => {
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={{
-          supervision: {
-            mode: 'supervised_audit',
-            backend: 'codex-sdk',
-            model: CODEX_MODEL_IDS[0],
-            timeoutMs: 9000,
-            promptVersion: 'supervision_decision_v1',
-            customInstructions: 'Always prefer adding tests before claiming completion.',
-            maxParseRetries: 1,
-            maxAutoContinueStreak: 2,
-            maxAutoContinueTotal: 8,
-            auditTargetSessionName: 'deck_sub_peer',
-            auditTargetFingerprint: {
-              sessionInstanceId: 'peer-instance-1',
-              normalizedModelId: 'claude-opus-4-7',
-              providerFamily: 'anthropic',
-            },
-            peerAuditPromptVersion: 'supervision_peer_audit_v1',
-            maxAuditLoops: 3,
-            taskRunPromptVersion: 'task_run_status_v1',
-          },
-        }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByText('summaryMode:supervised_audit')).toBeDefined();
-    expect(screen.getByText(`summaryBackendModel:codex_sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`)).toBeDefined();
-    expect(screen.getByText('summaryTimeout:30 s')).toBeDefined();
-    expect(screen.getByText('summaryContinueLimits:2:8')).toBeDefined();
-    expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
-    expect(screen.getByText('summaryAudit:3')).toBeDefined();
-    expect(document.body.textContent).not.toContain('deck_sub_peer');
-    expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
-  });
-
-  it('saves global auto-continue defaults together with the session override', async () => {
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'codex-sdk',
-      model: CODEX_MODEL_IDS[0],
-      timeoutMs: 12_000,
-      promptVersion: 'supervision_decision_v1',
-      maxAutoContinueStreak: 2,
-      maxAutoContinueTotal: 8,
-    });
-
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(fetchSupervisorDefaultsMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain');
-    });
-
-    fireEvent.input(inputForLabel('maxAutoContinueStreak', 0), { target: { value: '5' } });
-    fireEvent.input(inputForLabel('maxAutoContinueTotal', 0), { target: { value: '11' } });
-    changeSupervisionMode('supervised');
-    fireEvent.input(inputForLabel('maxAutoContinueStreak', 1), { target: { value: '3' } });
-    fireEvent.input(inputForLabel('maxAutoContinueTotal', 1), { target: { value: '6' } });
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
-        maxAutoContinueStreak: 5,
-        maxAutoContinueTotal: 11,
-      }));
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            maxAutoContinueStreak: 3,
-            maxAutoContinueTotal: 6,
-          }),
-        }),
-      }));
-    });
-  });
-
-  it('shows and persists a third-party preset in the unified supervision runtime selector', async () => {
-    // Stub ws that records sent messages and lets the test dispatch a preset list.
-    // Pattern (Set of handlers + `act`-wrapped dispatch) mirrors the existing
-    // SharedContextManagementPanel test, which the supervision picker reuses.
-    const sent: Array<Record<string, unknown>> = [];
-    const handlers = new Set<(message: unknown) => void>();
-    const wsStub = {
-      connected: true,
-      send(message: Record<string, unknown>) { sent.push(message); },
-      onMessage(handler: (message: unknown) => void) {
-        handlers.add(handler);
-        return () => { handlers.delete(handler); };
-      },
-    };
-
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'qwen',
-      model: 'qwen3-coder-plus',
-      timeoutMs: 12_000,
-      promptVersion: 'supervision_decision_v1',
-    });
-
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="qwen"
-        transportConfig={null}
-        ws={wsStub as unknown as import('../../src/ws-client.js').WsClient}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
-      expect(sent).toContainEqual(expect.objectContaining({
-        type: 'cc.presets.list',
-        requestId: expect.any(String),
-        sessionName: 'deck_proj_brain',
-      }));
-      expect(sent).toContainEqual(expect.objectContaining({
-        type: 'transport.list_models',
-        agentType: 'qwen',
-        sessionName: 'deck_proj_brain',
-      }));
-    });
-
-    // Dispatch the preset list inside `act` so preact flushes the state update
-    // before subsequent assertions. Without this wrapping `setCcPresets` is
-    // batched past the next query, and the picker is never found.
-    await act(async () => {
-      for (const h of handlers) {
-        h({
-          type: 'cc.presets.list_response',
-          presets: [
-            { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.5' } },
-            { name: 'Kimi', env: { ANTHROPIC_MODEL: 'kimi-k2.5' } },
-          ],
-        });
-      }
-    });
-
-    // Defaults backend is already `qwen` via fetchSupervisorDefaults, so the
-    // unified runtime selector must expose the third-party preset alongside
-    // the built-in models.
-    await waitFor(() => expect(screen.getByTestId('supervision-defaults-runtime-model-preset-selector')).toBeDefined());
-    expect(screen.getByLabelText('supervision-defaults:preset')).toBeDefined();
-
-    // Enable supervised mode and choose the global preset-pinned model.
-    changeSupervisionMode('supervised');
-    changeSelect(screen.getByLabelText('supervision-defaults:preset'), 'MiniMax');
-    await waitFor(() => {
-      expect((screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement).value).toBe('MiniMax');
-      expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe('MiniMax-M2.5');
-    });
-
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
-        backend: 'qwen',
-        model: 'MiniMax-M2.5',
-        preset: 'MiniMax',
-      }));
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised',
-            backend: 'qwen',
-            model: 'MiniMax-M2.5',
-            preset: 'MiniMax',
-          }),
-        }),
-      }));
-    });
-  });
-
-  it('re-requests the owner preset catalogue when the initial shared socket send was dropped', async () => {
-    const sent: Array<Record<string, unknown>> = [];
-    const handlers = new Set<(message: unknown) => void>();
-    const wsStub = {
-      connected: false,
-      send(message: Record<string, unknown>) {
-        if (this.connected) sent.push(message);
-      },
-      onMessage(handler: (message: unknown) => void) {
-        handlers.add(handler);
-        return () => { handlers.delete(handler); };
-      },
-    };
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'claude-code-sdk',
-      model: 'sonnet',
-      timeoutMs: 50_000,
-      promptVersion: 'supervision_decision_v1',
-    });
-
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="claude-code-sdk"
-        transportConfig={null}
-        ws={wsStub as unknown as import('../../src/ws-client.js').WsClient}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-    await waitFor(() => expect(fetchSupervisorDefaultsMock).toHaveBeenCalled());
-    expect(sent).toEqual([]);
-
-    wsStub.connected = true;
-    await act(async () => {
-      for (const handler of handlers) handler({ type: 'daemon.reconnected' });
-    });
-    const request = sent.find((message) => message.type === 'cc.presets.list');
-    expect(request).toEqual(expect.objectContaining({
-      sessionName: 'deck_proj_brain',
-      requestId: expect.any(String),
-    }));
-
-    await act(async () => {
-      for (const handler of handlers) {
-        handler({
-          type: 'cc.presets.list_response',
-          requestId: request?.requestId,
-          sessionName: 'deck_proj_brain',
-          presets: [{
-            name: 'Owner MiniMax',
-            env: {},
-            defaultModel: 'MiniMax-M2.7',
-            availableModels: [{ id: 'MiniMax-M2.7' }],
-          }],
-        });
-      }
-    });
-    await waitFor(() => {
-      const presetSelect = screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement;
-      expect([...presetSelect.options].map((option) => option.value)).toContain('Owner MiniMax');
-    });
-  });
-
-  it('syncs the global qwen preset model list and selects the preset default model', async () => {
-    const sent: Array<Record<string, unknown>> = [];
-    const handlers = new Set<(message: unknown) => void>();
-    const wsStub = {
-      connected: true,
-      send(message: Record<string, unknown>) { sent.push(message); },
-      onMessage(handler: (message: unknown) => void) {
-        handlers.add(handler);
-        return () => { handlers.delete(handler); };
-      },
-    };
-
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'qwen',
-      model: 'qwen3-coder-plus',
-      preset: 'MiniMax',
-      timeoutMs: 12_000,
-      promptVersion: 'supervision_decision_v1',
-    });
-
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="qwen"
-        transportConfig={null}
-        ws={wsStub as unknown as import('../../src/ws-client.js').WsClient}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
-      expect(sent).toContainEqual(expect.objectContaining({
-        type: 'cc.presets.list',
-        requestId: expect.any(String),
-        sessionName: 'deck_proj_brain',
-      }));
-    });
-
-    await act(async () => {
-      for (const h of handlers) {
-        h({
-          type: 'cc.presets.list_response',
-          presets: [
-            {
-              name: 'MiniMax',
-              env: {},
-              defaultModel: 'MiniMax-M2.5',
-              availableModels: [
-                { id: 'MiniMax-M2.5' },
-                { id: 'MiniMax-M2.7' },
-              ],
-            },
-          ],
-        });
-      }
-    });
-
-    await waitFor(() => {
-      expect((screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement).value).toBe('MiniMax');
-    });
-    const globalSelector = within(screen.getByTestId('supervision-defaults-runtime-model-preset-selector'));
-    const modelSelect = globalSelector.getByLabelText('supervision-defaults:model') as HTMLSelectElement;
-    expect(modelSelect.value).toBe('MiniMax-M2.5');
-    expect(modelSelect.disabled).toBe(false);
-    expect([...modelSelect.options].some((option) => option.value === 'MiniMax-M2.7')).toBe(true);
-    expect([...modelSelect.options].some((option) => option.value === 'qwen3-coder-plus')).toBe(false);
-
-    const modelRequest = await waitFor(() => {
-      const request = sent.find((message) => (
-        message.type === 'transport.list_models'
-        && message.agentType === 'qwen'
-        && message.ccPreset === 'MiniMax'
-      ));
-      expect(request).toBeDefined();
-      return request!;
-    });
-    expect(modelRequest.sessionName).toBe('deck_proj_brain');
-    await act(async () => {
-      for (const handler of handlers) {
-        handler({
-          type: 'transport.models_response',
-          requestId: modelRequest.requestId,
-          agentType: 'qwen',
-          ccPreset: 'MiniMax',
-          models: [
-            { id: 'MiniMax-M2.5' },
-            { id: 'MiniMax-M2.7' },
-            { id: 'MiniMax-M2.8' },
-          ],
-          defaultModel: 'MiniMax-M2.5',
-        });
-      }
-    });
-    await waitFor(() => {
-      expect([...modelSelect.options].some((option) => option.value === 'MiniMax-M2.8')).toBe(true);
-    });
-    changeSelect(modelSelect, 'MiniMax-M2.8');
-    expect((screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement).value).toBe('MiniMax');
-
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
-        backend: 'qwen',
-        model: 'MiniMax-M2.8',
-        preset: 'MiniMax',
-      }));
-    });
-  });
-
-  it('persists customInstructionsOverride=true when user checks the override checkbox, and drops the global cache for that session', async () => {
-    // Simulate a user who already has global custom instructions saved.
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'codex-sdk',
-      model: CODEX_MODEL_IDS[0],
-      timeoutMs: 12_000,
-      promptVersion: 'supervision_decision_v1',
-      customInstructions: 'GLOBAL: always prefer tests',
-    });
-
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    // Wait for the async fetchSupervisorDefaults to resolve and the global
-    // textarea to pre-populate. Both the "merged preview" gate and the
-    // `globalCustomInstructions` cache-mirror field depend on this.
-    await waitFor(() => {
-      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
-    });
-
-    // Turn on supervised mode and the session body must become editable.
-    changeSupervisionMode('supervised');
-
-    // Session-level custom instructions — different text so we can confirm
-    // the session layer vs global layer are kept distinct in the payload.
-    fireEvent.input(screen.getByPlaceholderText('customInstructionsPlaceholder'), {
-      target: { value: 'SESSION: block commits on failing tests' },
-    });
-
-    // The override checkbox must be present and initially unchecked.
-    const overrideCheckbox = screen.getByLabelText(/customInstructionsOverrideLabel/i) as HTMLInputElement;
-    expect(overrideCheckbox.checked).toBe(false);
-
-    // With override=false AND both layers non-empty, the merged preview is
-    // shown — this proves the UI reads both layers.
-    expect(screen.getByTestId('supervision-merged-preview')).toBeDefined();
-
-    // Check override → session replaces global for this session.
-    fireEvent.click(overrideCheckbox);
-    expect(overrideCheckbox.checked).toBe(true);
-
-    // Preview must hide when override is active (no ambiguity to preview).
-    expect(screen.queryByTestId('supervision-merged-preview')).toBeNull();
-
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised',
-            customInstructions: 'SESSION: block commits on failing tests',
-            customInstructionsOverride: true,
-            // Cache mirror of the current global value is still written to the
-            // snapshot so the daemon can re-read it next time override flips
-            // back to false without needing another defaults fetch.
-            globalCustomInstructions: 'GLOBAL: always prefer tests',
-          }),
-        }),
-      }));
-    });
-
-    // User did not edit the global region → defaults endpoint must not be
-    // hit. This proves the save-split handles override-only changes cleanly.
-    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
-  });
-
-  it('persists custom supervision instructions in the session snapshot', async () => {
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    changeSupervisionMode('supervised');
-    fireEvent.input(screen.getByPlaceholderText('customInstructionsPlaceholder'), {
-      target: { value: 'Always require tests and clean verification before complete.' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised',
-            customInstructions: 'Always require tests and clean verification before complete.',
-          }),
-        }),
-      }));
-    });
-  });
-
-  it('shows supervision intro copy for supported transport sessions when expanded', () => {
-    // The intro card is collapsed by default to save dialog real estate.
-    // Expanding it via the toggle reveals the three detail sections.
-    // Previous render may have persisted a collapsed preference in localStorage —
-    // clear it so this test starts in a deterministic (default collapsed) state.
-    try { window.localStorage.removeItem('imcodes:supervision-intro-collapsed'); } catch { /* noop */ }
-
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    // Collapsed by default: detail bodies are hidden until expanded.
-    expect(screen.queryByText('howToUseTitle')).toBeNull();
-
-    // The two region titles (global defaults / session config) stay visible.
-    expect(screen.getByText('globalDefaultsTitle')).toBeDefined();
-    expect(screen.getByText('sessionConfigTitle')).toBeDefined();
-
-    // Clicking the toggle expands the intro card and exposes the three sections.
-    fireEvent.click(screen.getByTestId('supervision-intro-toggle'));
-    expect(screen.getByText('howToUseTitle')).toBeDefined();
-    expect(screen.getByText('purposeTitle')).toBeDefined();
-    expect(screen.getByText('howItWorksTitle')).toBeDefined();
-  });
-
-  it('persists intro collapse state in localStorage', () => {
-    try { window.localStorage.removeItem('imcodes:supervision-intro-collapsed'); } catch { /* noop */ }
-
-    const { unmount } = render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    // Expand the card; the pref should flip to "0" (not collapsed).
-    fireEvent.click(screen.getByTestId('supervision-intro-toggle'));
-    expect(window.localStorage.getItem('imcodes:supervision-intro-collapsed')).toBe('0');
-    unmount();
-
-    // Remount: state is read from localStorage so the detail body is visible immediately.
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-    expect(screen.getByText('howToUseTitle')).toBeDefined();
   });
 
   it('shows unsupported copy for process sessions', () => {
@@ -2107,7 +1928,7 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('invalidStoredConfig')).toBeDefined();
   });
 
-  it('submits sub-session supervision updates through patchSubSession', async () => {
+  it('submits sub-session supervision updates through patchSubSession without task-pair fields', async () => {
     const onSaved = vi.fn();
     render(
       <SessionSettingsDialog
@@ -2121,44 +1942,45 @@ describe('SessionSettingsDialog supervision', () => {
         cwd="/proj"
         type="codex-sdk"
         parentSession="deck_proj_brain"
-        transportConfig={null}
+        peerAuditSessions={[makePeerAuditSession()]}
+        transportConfig={{ supervision: { mode: 'supervised', backend: 'codex-sdk', model: CODEX_MODEL_IDS[0], timeoutMs: 30_000, promptVersion: 'supervision_decision_v1' } }}
         onClose={vi.fn()}
         onSaved={onSaved}
       />,
     );
 
-    changeSupervisionMode('supervised');
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    expect(screen.queryByTestId('task-pair-settings')).toBeNull();
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary')).getByLabelText('primary:deck_sub_peer'));
+    fireEvent.click(screen.getByTestId('audit-blocking-severity-P1'));
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
 
     await waitFor(() => {
       expect(patchSubSessionMock).toHaveBeenCalledWith('srv-1', 'abcd1234', expect.objectContaining({
         transportConfig: expect.objectContaining({
           supervision: expect.objectContaining({
             mode: 'supervised',
+            auditBlockingSeverities: ['P0', 'P1'],
           }),
         }),
       }));
     });
+    const patchedSupervision = (patchSubSessionMock.mock.calls.at(-1)?.[2] as {
+      transportConfig?: { supervision?: Record<string, unknown> };
+    })?.transportConfig?.supervision;
+    expect(patchedSupervision).not.toHaveProperty('pairEngine');
+    expect(patchedSupervision).not.toHaveProperty('pairMaxConcurrency');
     expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({
       transportConfig: expect.objectContaining({
         supervision: expect.objectContaining({
-          mode: 'supervised',
+          auditBlockingSeverities: ['P0', 'P1'],
         }),
       }),
     }));
   });
 
-  it('saves global supervisor defaults and carries the auto-derived execution pool onto this session even while automatic-supervision mode stays off', async () => {
-    // Regression coverage for a real production incident: a Brain that
-    // dispatches manually via send_message (mode stays 'off') configured its
-    // execution pool through this exact "global defaults" flow, "Save"
-    // reported success, but the daemon's routing check kept reading
-    // legacy_unconfigured from sessions.json because buildTransportConfigWithSupervision
-    // deleted the whole `supervision` key -- pool included -- whenever mode
-    // was off. The account-level default alone can never fix this: the
-    // daemon's manual task-dispatch eligibility check only ever reads this
-    // session's own persisted transportConfig, never the server-side
-    // account preference.
+  it('persists execution pool updates onto the session snapshot even while stored mode stays off', async () => {
     render(
       <SessionSettingsDialog
         surface="supervision"
@@ -2169,31 +1991,29 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="codex-sdk"
-        transportConfig={null}
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession()]}
+        transportConfig={{ supervision: { mode: 'off' } }}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
     );
 
-    changeRuntimeBackend('supervision-defaults', 'claude-code-sdk');
-    await waitFor(() => {
-      expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe('sonnet');
-    });
-    selectRuntimeModel('supervision-defaults', CLAUDE_CODE_MODEL_IDS[0]);
-    await waitFor(() => {
-      expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe(CLAUDE_CODE_MODEL_IDS[0]);
-    });
-    const timeoutInput = screen.getByLabelText('supervision-defaults:timeout');
-    expect(timeoutInput.getAttribute('min')).toBe('30');
-    fireEvent.input(timeoutInput, { target: { value: '5' } });
-    expect((screen.getByLabelText('supervision-defaults:timeout') as HTMLInputElement).value).toBe('30');
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary')).getByLabelText('primary:deck_sub_peer'));
+    const saveButton = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    await waitFor(() => expect(saveButton.disabled).toBe(false));
+    fireEvent.click(saveButton);
 
     await waitFor(() => {
       expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
-        backend: 'claude-code-sdk',
-        model: CLAUDE_CODE_MODEL_IDS[0],
-        timeoutMs: 30_000,
+        executionPools: expect.objectContaining({
+          state: 'configured',
+          primaryDevelopmentPool: expect.objectContaining({
+            configs: expect.arrayContaining([
+              expect.objectContaining({ agentType: 'codex-sdk', model: 'gpt-5.6' }),
+            ]),
+          }),
+        }),
       }));
     });
     await waitFor(() => {
@@ -2204,10 +2024,9 @@ describe('SessionSettingsDialog supervision', () => {
             executionPools: expect.objectContaining({
               state: 'configured',
               primaryDevelopmentPool: expect.objectContaining({
-                configs: [expect.objectContaining({
-                  agentType: 'claude-code-sdk',
-                  model: CLAUDE_CODE_MODEL_IDS[0],
-                })],
+                configs: expect.arrayContaining([
+                  expect.objectContaining({ agentType: 'codex-sdk', model: 'gpt-5.6' }),
+                ]),
               }),
             }),
           }),
@@ -2215,145 +2034,6 @@ describe('SessionSettingsDialog supervision', () => {
       }));
     });
     expect(patchSubSessionMock).not.toHaveBeenCalled();
-  });
-
-  it('leaves the session untouched when only a global default with no derivable pool changes', async () => {
-    // Changing a field that never feeds withBrainPrimaryPoolDefault (here,
-    // just a backup runtime with no primary backend/model picked) must not
-    // fabricate a pool or patch the session -- the fix above is specifically
-    // about a GENUINELY configured pool, not every unrelated defaults edit.
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    const timeoutInput = screen.getByLabelText('supervision-defaults:timeout');
-    fireEvent.input(timeoutInput, { target: { value: '45' } });
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(saveSupervisorDefaultsMock).toHaveBeenCalled();
-    });
-    expect(patchSessionMock).not.toHaveBeenCalled();
-    expect(patchSubSessionMock).not.toHaveBeenCalled();
-  });
-
-  it('keeps an already-configured execution pool when the user turns automatic supervision off', async () => {
-    // Turning Auto off for one session must not silently strip the pool that
-    // manual task{objective,acceptance} dispatch still depends on -- Auto and
-    // the execution pool are independent switches.
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'claude-code-sdk',
-      model: CLAUDE_CODE_MODEL_IDS[0],
-      executionPools: {
-        state: 'configured',
-        primaryDevelopmentPool: {
-          configs: [{
-            capabilityId: `supervision-exec-v1:transport:claude-code-sdk:anthropic:${CLAUDE_CODE_MODEL_IDS[0]}`,
-            agentType: 'claude-code-sdk',
-            providerFamily: 'anthropic',
-            runtimeType: 'transport',
-            model: CLAUDE_CODE_MODEL_IDS[0],
-          }],
-          controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.primary,
-        },
-        economyTaskPool: { configs: [], controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.economy },
-      },
-    });
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={{
-          supervision: {
-            mode: 'supervised',
-            backend: 'claude-code-sdk',
-            model: CLAUDE_CODE_MODEL_IDS[0],
-            timeoutMs: 1_800_000,
-            promptVersion: 'supervision_decision_v1',
-            maxParseRetries: 1,
-            maxAutoContinueStreak: 2,
-            maxAutoContinueTotal: 0,
-            maxAuditLoops: 2,
-            taskRunPromptVersion: 'task_run_status_v1',
-          },
-        }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      expect((screen.getByLabelText('supervision-session:mode') as HTMLSelectElement).value).toBe('supervised');
-    });
-    changeSupervisionMode('off');
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'off',
-            executionPools: expect.objectContaining({
-              state: 'configured',
-              primaryDevelopmentPool: expect.objectContaining({
-                configs: [expect.objectContaining({ agentType: 'claude-code-sdk', model: CLAUDE_CODE_MODEL_IDS[0] })],
-              }),
-            }),
-          }),
-        }),
-      }));
-    });
-  });
-
-  it('persists an optional global backup runtime from the shared dropdown selector', async () => {
-    render(
-      <SessionSettingsDialog
-        surface="supervision"
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        transportConfig={null}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    changeRuntimeBackend('supervision-defaults-backup', 'qwen');
-    await waitFor(() => {
-      expect((screen.getByLabelText('supervision-defaults-backup:model') as HTMLSelectElement).value)
-        .toBe('qwen3-coder-plus');
-    });
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
-        backupBackend: 'qwen',
-        backupModel: 'qwen3-coder-plus',
-      }));
-    });
-    expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
   it('syncs model list and resets model when provider is switched', async () => {
@@ -2398,15 +2078,105 @@ describe('SessionSettingsDialog supervision', () => {
       expect(CLAUDE_CODE_MODEL_IDS.includes(modelSelect.value as typeof CLAUDE_CODE_MODEL_IDS[number])).toBe(true);
     });
 
-    // Apply must dispatch the /model command using the new Claude model (not a Codex model)
+    // A provider switch is committed by Save, not a separate /model command.
     const applyButton = await screen.findByRole('button', { name: 'apply' });
-    expect((applyButton as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(applyButton);
-    await waitFor(() =>
-      expect(ws.sendSessionMessage).toHaveBeenCalledWith(
-        'deck_proj_brain',
-        `/model ${CLAUDE_CODE_MODEL_IDS[0]}`,
-      ),
-    );
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: 'claude-code-sdk', requestedModel: CLAUDE_CODE_MODEL_IDS[0], activeModel: null,
+    }));
+    expect(ws.sendSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'sub-1'])('saves Codex to AGY once for %s and clears the old active display', async (subSessionId) => {
+    const onSaved = vi.fn();
+    const onClose = vi.fn();
+    render(<SessionSettingsDialog
+      serverId="srv-1" sessionName="deck_proj_brain" subSessionId={subSessionId}
+      label="Brain" description="" cwd="/proj" type="codex-sdk"
+      activeModel={CODEX_MODEL_IDS[0]} requestedModel={CODEX_MODEL_IDS[0]} modelDisplay={CODEX_MODEL_IDS[0]}
+      transportConfig={null} surface="session" onClose={onClose} onSaved={onSaved}
+    />);
+    changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+    expect(onSaved).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    const patch = subSessionId ? patchSubSessionMock : patchSessionMock;
+    await waitFor(() => expect(patch).toHaveBeenCalledWith('srv-1', subSessionId ?? 'deck_proj_brain', {
+      [subSessionId ? 'type' : 'agentType']: AGY_SDK_PROVIDER_ID,
+      requestedModel: AGY_DEFAULT_MODEL_ID,
+      activeModel: null,
+    }));
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({
+      type: AGY_SDK_PROVIDER_ID, requestedModel: AGY_DEFAULT_MODEL_ID, activeModel: null, modelDisplay: null,
+    }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('keeps gemini-4-hydrogen-high over upstream carbon-medium default, adopts a live default only when hydrogen-high is absent, and remembers manual AGY choices', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = { connected: true, onMessage: (cb: (message: unknown) => void) => { handlers.add(cb); return () => handlers.delete(cb); }, requestTransportModels: () => 'agy-switch' };
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+      type="codex-sdk" activeModel={CODEX_MODEL_IDS[0]} requestedModel={CODEX_MODEL_IDS[0]}
+      transportConfig={null} surface="session" ws={ws as any} onClose={vi.fn()} onSaved={vi.fn()} />);
+    changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+
+    // Upstream carbon-medium must NOT override gemini-4-hydrogen-high when hydrogen-high is in the catalog.
+    act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
+      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: AGY_DEFAULT_MODEL_ID }, { id: 'gemini-4-carbon-medium' }, { id: 'manual-choice' }], defaultModel: 'gemini-4-carbon-medium' })));
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+
+    // When a catalog genuinely lacks gemini-4-hydrogen-high, fall back to its defaultModel unless manually overridden.
+    act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
+      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: 'live-default' }, { id: 'manual-choice' }], defaultModel: 'live-default' })));
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe('live-default'));
+
+    changeSelect(screen.getByLabelText('label'), 'manual-choice');
+    act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
+      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: AGY_DEFAULT_MODEL_ID }, { id: 'manual-choice' }, { id: 'later-default' }], defaultModel: 'later-default' })));
+    expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe('manual-choice');
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: AGY_SDK_PROVIDER_ID, requestedModel: 'manual-choice', activeModel: null,
+    }));
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('manual-choice');
+  });
+
+  it.each([
+    { from: AGY_SDK_PROVIDER_ID, to: 'codex-sdk', expected: CODEX_MODEL_IDS[0] },
+    { from: 'codex-sdk', to: 'shell', expected: null },
+  ])('uses the target default or clears models for $from to $to', async ({ from, to, expected }) => {
+    const oldModel = from === AGY_SDK_PROVIDER_ID ? AGY_DEFAULT_MODEL_ID : CODEX_MODEL_IDS[0];
+    const onSaved = vi.fn();
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+      type={from} activeModel={oldModel} requestedModel={oldModel} transportConfig={null}
+      surface="session" onClose={vi.fn()} onSaved={onSaved} />);
+    changeSelect(screen.getByTestId('session-agent-type'), to);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: to, requestedModel: expected, activeModel: null,
+    }));
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: expected, activeModel: null, modelDisplay: null,
+    }));
+  });
+
+  it('does not change model for metadata-only saves or publish a failed provider save', async () => {
+    const onSaved = vi.fn();
+    const onClose = vi.fn();
+    patchSessionMock.mockRejectedValueOnce(new Error('offline'));
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+      type="codex-sdk" activeModel={CODEX_MODEL_IDS[0]} requestedModel={CODEX_MODEL_IDS[0]}
+      transportConfig={null} surface="session" onClose={onClose} onSaved={onSaved} />);
+    changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(document.querySelector('.session-settings-error')?.textContent).toContain('offline'));
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    changeSelect(screen.getByTestId('session-agent-type'), 'codex-sdk');
+    fireEvent.input(inputForLabel('label'), { target: { value: 'New Brain' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenLastCalledWith('srv-1', 'deck_proj_brain', { label: 'New Brain' }));
   });
 });

@@ -183,6 +183,10 @@ export function requestSharedChanges(ws: WsClient, repoPath: string, force = fal
       return;
     }
   }
+  if (ws.connected === false) {
+    entry.queued = true;
+    return;
+  }
   let requestId: string;
   try {
     requestId = ws.fsGitStatus(repoPath, sessionName ? { includeStats: true, sessionName } : { includeStats: true });
@@ -248,6 +252,15 @@ export function settleSharedChangesRequest(requestId: string, files: ChangeFile[
 function ensureWsBridge(ws: WsClient): void {
   if (wsBridges.has(ws)) return;
   const unsub = ws.onMessage((msg: ServerMessage) => {
+    if (msg.type === 'session.event' && (msg as { event?: string }).event === 'connected') {
+      for (const entry of sharedChangesByKey.values()) {
+        if (entry.ws === ws && entry.queued && !entry.inFlightRequestId && entry.repoPath) {
+          entry.queued = false;
+          requestSharedChanges(ws, entry.repoPath, false, entry.sessionName);
+        }
+      }
+      return;
+    }
     if (msg.type !== 'fs.git_status_response') return;
     const requestId = (msg as { requestId?: string }).requestId;
     if (!requestId) return;

@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Real-daemon stall benchmark. Boots the ACTUAL daemon (`startup()` from
  * src/daemon/lifecycle.ts: every timeline subscriber, the task-pairs and
@@ -77,7 +78,7 @@ registry.updateTask({ taskId: 'tsk_perfliveonly', status: 'implementing', curren
 registry.updateAssignment({ assignmentId: 'asg_perfliveonly', identity: workerIdentity, status: 'implementing', now: Date.now() - 58_000 });
 const store = getTaskPairStore();
 for (let i = 0; i < 320; i += 1) {
-  store.savePair(PROJECT, {
+  putTaskPairFixture(store, PROJECT, {
     taskId: `tsk_perfpair${String(i).padStart(4, '0')}`, brain: BRAIN, executor: WORKER, auditor: WORKER,
     status: i < 20 ? 'working' : 'done', flags: [], flagSides: {}, round: 1, blocking: ['P0'], previousAuditors: [],
     capCounts: {}, capRound: 1, createdAt: 1_000 + i, updatedAt: 1_000 + i, title: `Task ${i}`,

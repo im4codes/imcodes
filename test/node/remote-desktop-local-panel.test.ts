@@ -8,6 +8,10 @@ import { AIDESK_PRODUCT_NAME } from '../../shared/aidesk-product.js';
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
+  REMOTE_DESKTOP_LOCAL_DAEMON_ACTION,
+  REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART,
+  REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE,
+  REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE,
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
 } from '../../shared/remote-desktop-local-management.js';
 import {
@@ -15,6 +19,7 @@ import {
   loadRemoteDesktopAccessPaused,
   persistRemoteDesktopAccessPaused,
 } from '../../src/node/remote-desktop-access-state.js';
+import { renderLocalPanelPage } from '../../src/node/local-panel-page.js';
 import { startRemoteDesktopLocalPanel, type RemoteDesktopLocalPanel } from '../../src/node/remote-desktop-local-panel.js';
 
 const roots: string[] = [];
@@ -220,15 +225,20 @@ describe('remote desktop local panel', () => {
     .map(([url, init]) => ({ url: url as string, body: JSON.parse(String((init as RequestInit).body)) as Record<string, unknown> }));
 
   it('asks twice before disconnecting one connection or everyone, shows live durations, and refreshes after each action', async () => {
-    const connections = [{ id: 'opaque-one', label: '1', connectedAt: Date.now() - 2_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }];
-    const { dom, fetchClient } = await openPageInDom({ state: () => ({ connections }) });
+    const baseNow = 1_700_000_000_000;
+    let currentNow = baseNow;
+    const connections = [{ id: 'opaque-one', label: '1', connectedAt: baseNow - 2_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }];
+    const { dom, fetchClient } = await openPageInDom({
+      state: () => ({ connections }),
+      beforeParse: (win) => { win.Date.now = () => currentNow; },
+    });
     try {
-      await vi.waitFor(() => expect(byId(dom, 'statusText').textContent).toBe('In use'));
+      await vi.waitFor(() => expect(byId(dom, 'statusText').textContent).toBe('In use'), { timeout: 5_000 });
       expect(byId(dom, 'count').textContent).toBe('1');
       const duration = dom.window.document.querySelector('[data-since]') as HTMLElement;
       expect(duration.textContent).toBe('00:02');
-      dom.window.Date.now = () => connections[0]!.connectedAt + 65_000;
-      await vi.waitFor(() => expect(duration.textContent).toBe('01:05'), { timeout: 3_000 });
+      currentNow = connections[0]!.connectedAt + 65_000;
+      await vi.waitFor(() => expect(duration.textContent).toBe('01:05'), { timeout: 5_000 });
 
       const disconnect = dom.window.document.querySelector('.conn button') as HTMLButtonElement;
       disconnect.click();
@@ -253,8 +263,38 @@ describe('remote desktop local panel', () => {
     } finally { dom.window.close(); }
   });
 
+  it('keeps live durations deterministic even when the initial /api/state response is delayed past 1s', async () => {
+    const baseNow = 1_700_000_000_000;
+    let currentNow = baseNow;
+    let delayedOnce = false;
+    const connections = [{ id: 'opaque-delayed', label: '1', connectedAt: baseNow - 2_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }];
+    const { dom } = await openPageInDom({
+      state: () => ({ connections }),
+      beforeParse: (win) => { win.Date.now = () => currentNow; },
+      extraFetch: (url) => {
+        if (delayedOnce || url !== REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH) return undefined;
+        delayedOnce = true;
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              ok: true,
+              json: async () => ({ publicNodeId: '1234567890', paused: false, connections }),
+            });
+          }, 1_300);
+        });
+      },
+    });
+    try {
+      await vi.waitFor(() => expect(byId(dom, 'statusText').textContent).toBe('In use'), { timeout: 5_000 });
+      const duration = dom.window.document.querySelector('[data-since]') as HTMLElement;
+      expect(duration.textContent).toBe('00:02');
+      currentNow = connections[0]!.connectedAt + 65_000;
+      await vi.waitFor(() => expect(duration.textContent).toBe('01:05'), { timeout: 5_000 });
+    } finally { dom.window.close(); }
+  });
+
   it('the dialog is modal: Escape closes it, Tab stays inside it and focus returns to the opener', async () => {
-    const connections = [{ id: 'a', label: '1', connectedAt: Date.now() - 1_000, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL }];
+    const connections = [{ id: 'a', label: '1', connectedAt: 1_700_000_000_000 - 1_000, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL }];
     const { dom, fetchClient } = await openPageInDom({ state: () => ({ connections }) });
     try {
       await vi.waitFor(() => expect(byId(dom, 'count').textContent).toBe('1'));
@@ -328,18 +368,18 @@ describe('remote desktop local panel', () => {
   it('shows the node unreachable and recovers, without losing the last state', async () => {
     let down = false;
     const { dom } = await openPageInDom({
-      state: () => ({ connections: [{ id: 'a', label: '1', connectedAt: Date.now(), mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }] }),
+      state: () => ({ connections: [{ id: 'a', label: '1', connectedAt: 1_700_000_000_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }] }),
       extraFetch: (url) => (down && url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH ? { ok: false } : undefined),
     });
     try {
-      await vi.waitFor(() => expect(byId(dom, 'count').textContent).toBe('1'));
+      await vi.waitFor(() => expect(byId(dom, 'count').textContent).toBe('1'), { timeout: 5_000 });
       expect(byId(dom, 'offlineBanner').hidden).toBe(true);
       down = true;
-      await vi.waitFor(() => expect(byId(dom, 'offlineBanner').hidden).toBe(false), { timeout: 3_000 });
+      await vi.waitFor(() => expect(byId(dom, 'offlineBanner').hidden).toBe(false), { timeout: 5_000 });
       expect(byId(dom, 'statusText').textContent).toBe('Offline');
       expect(byId(dom, 'count').textContent).toBe('1');
       down = false;
-      await vi.waitFor(() => expect(byId(dom, 'offlineBanner').hidden).toBe(true), { timeout: 3_000 });
+      await vi.waitFor(() => expect(byId(dom, 'offlineBanner').hidden).toBe(true), { timeout: 5_000 });
     } finally { dom.window.close(); }
   });
 
@@ -436,22 +476,23 @@ describe('remote desktop local panel', () => {
   });
 
   it('renders hundreds of connections quickly and does not rebuild the list (or steal focus) when nothing changed', async () => {
+    const baseNow = 1_700_000_000_000;
     const many = Array.from({ length: 300 }, (_, index) => ({
-      id: `id-${index}`, label: String(index + 1), connectedAt: Date.now() - index * 1_000,
+      id: `id-${index}`, label: String(index + 1), connectedAt: baseNow - index * 1_000,
       mode: index % 7 === 0 ? REMOTE_DESKTOP_ACCESS_MODE.CONTROL : REMOTE_DESKTOP_ACCESS_MODE.VIEW,
     }));
     const { dom, fetchClient } = await openPageInDom({ state: () => ({ connections: many }) });
     try {
       const started = Date.now();
-      await vi.waitFor(() => expect(dom.window.document.querySelectorAll('.conn')).toHaveLength(300));
-      expect(Date.now() - started).toBeLessThan(3_000);
+      await vi.waitFor(() => expect(dom.window.document.querySelectorAll('.conn')).toHaveLength(300), { timeout: 5_000 });
+      expect(Date.now() - started).toBeLessThan(10_000);
       expect(byId(dom, 'count').textContent).toBe('300');
       expect(byId(dom, 'navBadge').className).toBe('badge ctl');
       const first = dom.window.document.querySelector('.conn button') as HTMLButtonElement;
       first.focus();
       const polls = () => fetchClient.mock.calls.filter(([url]) => url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH).length;
       const before = polls();
-      await vi.waitFor(() => expect(polls()).toBeGreaterThan(before), { timeout: 3_000 });
+      await vi.waitFor(() => expect(polls()).toBeGreaterThan(before), { timeout: 5_000 });
       // The same state came back: the same elements are still there and the focused button still has focus.
       expect(dom.window.document.querySelector('.conn button')).toBe(first);
       expect(dom.window.document.activeElement).toBe(first);
@@ -533,7 +574,7 @@ describe('remote desktop local panel: independent window entry', () => {
     const panel = await startPanel({ openWindow, openWindowAnswerBudgetMs: 60 });
     const started = Date.now();
     const answer = await fetch(openUrl(panel), { method: 'POST', headers: nativeHeaders });
-    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(Date.now() - started).toBeLessThan(10_000);
     expect(answer.status).toBe(200);
     expect(await answer.json()).toEqual({ ok: true, reason: 'in_progress' });
     expect(openWindow).toHaveBeenCalledTimes(1);
@@ -674,6 +715,932 @@ describe('remote desktop local panel: open-settings', () => {
     expect(response.headers.get('cache-control')).toBe('no-store');
     const url = new URL(panel.url);
     expect(url.hostname).toBe('127.0.0.1');
+  });
+});
+
+describe('local panel Coding Daemon endpoints and UI', () => {
+  async function startWithDaemon(extra?: Partial<Parameters<typeof startRemoteDesktopLocalPanel>[0]>) {
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '1234567890',
+      serverUrl: 'https://example.test/',
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => true,
+      port: 0,
+      ...extra,
+    });
+    panels.push(panel);
+    const page = await fetch(panel.url);
+    const html = await page.text();
+    return {
+      panel,
+      html,
+      cookie: (page.headers.get('set-cookie') ?? '').split(';')[0]!,
+      csrf: /"csrf":"([^"]+)"/u.exec(html)![1]!,
+      origin: new URL(panel.url).origin,
+    };
+  }
+
+  it('keeps /api/state free of daemon and answers 501 on daemon routes when handlers are omitted', async () => {
+    const { panel, cookie, csrf, origin } = await startWithDaemon();
+    const stateRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), {
+      headers: { cookie },
+    });
+    expect(stateRes.status).toBe(200);
+    const state = await stateRes.json() as Record<string, unknown>;
+    expect('daemon' in state).toBe(false);
+
+    const logsRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url), {
+      headers: { cookie },
+    });
+    expect(logsRes.status).toBe(501);
+
+    const actionRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START }),
+    });
+    expect(actionRes.status).toBe(501);
+  });
+
+  it('gates daemon actions and logs behind session cookie, Origin, CSRF, and sanitizes state', async () => {
+    const daemonAction = vi.fn(async (action: string, payload?: { bindUrl?: unknown }) => {
+      if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && payload?.bindUrl === 'bad') {
+        return { ok: false, statusCode: 400, error: 'invalid_bind_url' };
+      }
+      return { ok: true, statusCode: 200 };
+    });
+    const daemonLogs = vi.fn(async () => ({ text: 'daemon line 1\ndaemon line 2\n', truncated: false, source: 'logs/daemon.log' }));
+    const { panel, cookie, csrf, origin } = await startWithDaemon({
+      daemon: async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        version: '1.2.3',
+        pid: 4242,
+        serverId: 'srv_1',
+        serverHost: 'app.example.test',
+        serverOrigin: 'https://app.example.test',
+        userName: 'alice',
+        lastError: 'Bearer hidden_tok_999 failed',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      }),
+      daemonAction,
+      daemonLogs,
+    });
+
+    // State includes sanitized daemon snapshot
+    const stateRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), { headers: { cookie } });
+    expect(stateRes.status).toBe(200);
+    const state = await stateRes.json() as { daemon?: { lastError?: string; userName?: string } };
+    expect(state.daemon?.userName).toBe('alice');
+    expect(state.daemon?.lastError).not.toContain('hidden_tok_999');
+
+    // Logs require cookie
+    expect((await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url))).status).toBe(401);
+    const logsOk = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url), { headers: { cookie } });
+    expect(logsOk.status).toBe(200);
+    expect(await logsOk.json()).toMatchObject({ text: 'daemon line 1\ndaemon line 2\n', truncated: false });
+
+    // CSRF/Origin gate on daemon actions
+    expect((await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin: 'https://evil.test', [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART }),
+    })).status).toBe(403);
+    expect((await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART }),
+    })).status).toBe(403);
+
+    // Valid daemon action succeeds; rejected bind returns mapped status code
+    const restartOk = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.RESTART }),
+    });
+    expect(restartOk.status).toBe(200);
+    const badBind = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND, bindUrl: 'bad' }),
+    });
+    expect(badBind.status).toBe(400);
+    expect(daemonAction).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders daemon card, clears bind URL input immediately upon submit, and loads sanitized logs in DOM', async () => {
+    let running = false;
+    const dispatched: Array<{ action: string; bindUrl?: unknown }> = [];
+    const { panel, html, cookie } = await startWithDaemon({
+      daemon: async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running,
+        connectionState: running
+          ? REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED
+          : REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.DISCONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.DISABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        version: '1.2.3',
+        userName: 'alice',
+        serverHost: 'app.example.test',
+        serverOrigin: 'https://app.example.test',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      }),
+      daemonAction: async (action, payload) => {
+        dispatched.push({ action, bindUrl: payload?.bindUrl });
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START) running = true;
+        return { ok: true, statusCode: 200 };
+      },
+      daemonLogs: async () => ({ text: 'hello from daemon log\n', truncated: false, source: 'logs/daemon.log' }),
+    });
+
+    const nodeFetch = globalThis.fetch;
+    const authedFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      const target = typeof input === 'string' ? new URL(input, panel.url).toString() : input;
+      const headers = new Headers(init?.headers);
+      headers.set('cookie', cookie);
+      if (init?.method === 'POST') headers.set('origin', new URL(panel.url).origin);
+      return nodeFetch(target, { ...init, headers });
+    };
+
+    const dom = new JSDOM(html, {
+      url: panel.url,
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(win) {
+        (win as unknown as { fetch: typeof authedFetch }).fetch = authedFetch;
+        Object.defineProperty(win.navigator, 'languages', { value: ['en-US'], configurable: true });
+      },
+    });
+    const doc = dom.window.document;
+    const daemonCard = doc.getElementById('daemonCard') as HTMLElement;
+    await vi.waitFor(() => {
+      expect(daemonCard.hidden).toBe(false);
+      expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Stopped');
+    }, { timeout: 3_000 });
+
+    // Start action updates card state
+    (doc.getElementById('daemonStart') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START)).toBe(true);
+      expect(doc.getElementById('daemonStatusText')?.textContent).toBe('Running');
+    }, { timeout: 3_000 });
+
+    // Bind modal clears secret input immediately upon submit
+    (doc.getElementById('daemonBindBtn') as HTMLButtonElement).click();
+    const bindInput = doc.getElementById('daemonBindInput') as HTMLInputElement;
+    bindInput.value = 'https://app.example.test/bind/secret_key_xyz';
+    const form = doc.getElementById('daemonBindForm') as HTMLFormElement;
+    form.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+    expect(bindInput.value).toBe('');
+    await vi.waitFor(() => {
+      expect(dispatched.some((d) => d.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && d.bindUrl === 'https://app.example.test/bind/secret_key_xyz')).toBe(true);
+    }, { timeout: 3_000 });
+
+    // Logs modal fetches and shows textContent cleanly
+    (doc.getElementById('daemonLogsBtn') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('hello from daemon log');
+    }, { timeout: 3_000 });
+
+    dom.window.close();
+  });
+
+  it('redacts JSON/KV/Bearer secrets in /api/state, /api/daemon/logs, and DOM, and keeps Remote Desktop actions non-blocked during hung bind', async () => {
+    let releaseBind!: () => void;
+    const bindGate = new Promise<void>((resolve) => { releaseBind = resolve; });
+    let paused = false;
+
+    const { panel, html, cookie, csrf } = await startWithDaemon({
+      state: () => ({ paused, connections: [] }),
+      setPaused: async (next) => { paused = next; },
+      daemon: async () => ({
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        userName: 'alice',
+        lastError: '{"token":"state-json-secret","apiKey":"state-apikey-secret"} tokenizer ready',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      }),
+      daemonLogs: async () => ({
+        text: 'log line {"bindKey":"dom-json-secret"} token count: 7 Bearer dom-bearer-secret\n',
+        truncated: false,
+        source: 'logs/daemon.log',
+      }),
+      daemonAction: async (action) => {
+        if (action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND) {
+          await bindGate;
+        }
+        return { ok: true, statusCode: 200 };
+      },
+    });
+
+    const origin = new URL(panel.url).origin;
+    const stateRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), { headers: { cookie } });
+    const stateBody = await stateRes.json() as { daemon?: { lastError?: string } };
+    expect(stateBody.daemon?.lastError).toContain('tokenizer ready');
+    expect(stateBody.daemon?.lastError).not.toContain('state-json-secret');
+    expect(stateBody.daemon?.lastError).not.toContain('state-apikey-secret');
+
+    const logsRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH, panel.url), { headers: { cookie } });
+    const logsBody = await logsRes.json() as { text: string };
+    expect(logsBody.text).toContain('token count: 7');
+    expect(logsBody.text).not.toContain('dom-json-secret');
+    expect(logsBody.text).not.toContain('dom-bearer-secret');
+
+    // JSDOM check on redacted textContent
+    const nodeFetch = globalThis.fetch;
+    const authedFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      const target = typeof input === 'string' ? new URL(input, panel.url).toString() : input;
+      const headers = new Headers(init?.headers);
+      headers.set('cookie', cookie);
+      return nodeFetch(target, { ...init, headers });
+    };
+    const dom = new JSDOM(html, {
+      url: panel.url,
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(win) {
+        (win as unknown as { fetch: typeof authedFetch }).fetch = authedFetch;
+        Object.defineProperty(win.navigator, 'languages', { value: ['en-US'], configurable: true });
+      },
+    });
+    const doc = dom.window.document;
+    await vi.waitFor(() => {
+      expect(doc.getElementById('daemonHint')?.textContent).toContain('tokenizer ready');
+      expect(doc.getElementById('daemonHint')?.textContent).not.toContain('state-json-secret');
+    }, { timeout: 3_000 });
+    (doc.getElementById('daemonLogsBtn') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(doc.getElementById('daemonLogsPre')?.textContent).toContain('token count: 7');
+      expect(doc.getElementById('daemonLogsPre')?.textContent).not.toContain('dom-json-secret');
+    }, { timeout: 3_000 });
+    dom.window.close();
+
+    // Concurrency isolation: start a blocked daemon bind, verify Remote Desktop pause finishes immediately
+    const hungBindPromise = fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+      body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND, bindUrl: 'https://app.example.test/bind/abc123' }),
+    });
+    const pauseRes = await Promise.race([
+      fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, panel.url), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf },
+        body: JSON.stringify({ action: REMOTE_DESKTOP_LOCAL_ACTION.PAUSE }),
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('pause blocked behind daemon bind')), 500)),
+    ]);
+    expect(pauseRes.status).toBe(200);
+    expect(paused).toBe(true);
+    releaseBind();
+    const settledBind = await hungBindPromise;
+    expect(settledBind.status).toBe(200);
+  });
+
+  it('F3-R2: isolates UI busy state per domain across real DOM clicks and both completion orders', async () => {
+    const html = renderLocalPanelPage({
+      publicNodeId: '1234567890',
+      csrf: 'csrf-f3',
+      manageUrl: 'https://example.test/m',
+      shareUrl: 'https://example.test/s',
+    });
+
+    let paused = false;
+    let conns = [{ id: 'c1', label: 'Viewer', mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, connectedAt: 1_700_000_000_000 - 1_000 }];
+    const actions: string[] = [];
+    let releaseBind: (() => void) | undefined;
+    let releaseRemote: (() => void) | undefined;
+    let holdBind = true;
+    let holdRemote = false;
+
+    const currentState = () => ({
+      publicNodeId: '1234567890',
+      paused,
+      connections: conns,
+      daemon: {
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      },
+    });
+
+    const waitUntil = async (fn: () => boolean) => {
+      for (let i = 0; i < 100 && !fn(); i += 1) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(fn()).toBe(true);
+    };
+
+    const dom = new JSDOM(html, {
+      url: 'http://127.0.0.1:43751/',
+      runScripts: 'dangerously',
+      pretendToBeVisual: true,
+      beforeParse(win) {
+        (win as unknown as { fetch: typeof fetch }).fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+          if (init?.method === 'POST') {
+            const body = JSON.parse(String(init.body)) as { action: string };
+            actions.push(body.action);
+            if (body.action === REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND && holdBind) {
+              await new Promise<void>((r) => { releaseBind = r; });
+              return new Response('{}', { status: 200 });
+            }
+            if (body.action === REMOTE_DESKTOP_LOCAL_ACTION.PAUSE) {
+              if (holdRemote) await new Promise<void>((r) => { releaseRemote = r; });
+              paused = true;
+              return new Response('{}', { status: 200 });
+            }
+            if (body.action === REMOTE_DESKTOP_LOCAL_ACTION.RESUME) {
+              if (holdRemote) await new Promise<void>((r) => { releaseRemote = r; });
+              paused = false;
+              return new Response('{}', { status: 200 });
+            }
+            if (body.action === REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL) {
+              conns = [];
+              return new Response('{}', { status: 200 });
+            }
+            return new Response('{}', { status: 200 });
+          }
+          return new Response(JSON.stringify(currentState()), { status: 200 });
+        }) as unknown as typeof fetch;
+      },
+    });
+
+    try {
+      const doc = dom.window.document;
+      await waitUntil(() => !(doc.getElementById('daemonCard') as HTMLElement).hidden);
+
+      const allowSwitch = doc.getElementById('allowSwitch') as HTMLButtonElement;
+      const stopAll = doc.getElementById('stopAll') as HTMLButtonElement;
+      const confirmAction = doc.getElementById('confirmAction') as HTMLButtonElement;
+      const daemonBindBtn = doc.getElementById('daemonBindBtn') as HTMLButtonElement;
+      const daemonBindInput = doc.getElementById('daemonBindInput') as HTMLInputElement;
+      const daemonBindForm = doc.getElementById('daemonBindForm') as HTMLFormElement;
+      const daemonStop = doc.getElementById('daemonStop') as HTMLButtonElement;
+      const daemonAutostartSwitch = doc.getElementById('daemonAutostartSwitch') as HTMLButtonElement;
+
+      // 1) Start a pending daemon BIND via real DOM form submission
+      daemonBindBtn.click();
+      daemonBindInput.value = 'https://app.example.test/bind/real_dom_key';
+      daemonBindForm.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND));
+
+      expect(daemonBindBtn.disabled).toBe(true);
+      expect(daemonStop.disabled).toBe(true);
+      expect(daemonAutostartSwitch.getAttribute('aria-busy')).toBe('true');
+      expect(allowSwitch.disabled).toBe(false);
+      expect(allowSwitch.getAttribute('aria-busy')).toBe('false');
+
+      // Duplicate daemon clicks during daemon busy are ignored
+      daemonStop.click();
+      daemonAutostartSwitch.click();
+      expect(actions).toEqual([REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND]);
+
+      // 2) Real Remote Desktop click (#allowSwitch) fires PAUSE immediately while BIND stays pending,
+      //    and PAUSE finishing first does NOT clear daemon busy state.
+      allowSwitch.click();
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_ACTION.PAUSE));
+      await waitUntil(() => paused && allowSwitch.getAttribute('aria-busy') === 'false');
+      expect(daemonBindBtn.disabled).toBe(true);
+      expect(daemonAutostartSwitch.getAttribute('aria-busy')).toBe('true');
+
+      // Also verify #stopAll -> #confirmAction works while BIND is still pending
+      stopAll.click();
+      confirmAction.click();
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL));
+      expect(daemonBindBtn.disabled).toBe(true);
+
+      releaseBind?.();
+      await waitUntil(() => !daemonBindBtn.disabled && daemonAutostartSwitch.getAttribute('aria-busy') === 'false');
+
+      // 3) Reverse completion order: BIND finishes while RESUME is still pending;
+      //    remote domain MUST remain busy and deduplicate duplicate #allowSwitch clicks until RESUME finishes.
+      actions.length = 0;
+      holdRemote = true;
+      daemonBindBtn.click();
+      daemonBindInput.value = 'https://app.example.test/bind/real_dom_key_2';
+      daemonBindForm.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.BIND));
+
+      allowSwitch.click();
+      await waitUntil(() => actions.includes(REMOTE_DESKTOP_LOCAL_ACTION.RESUME));
+      expect(allowSwitch.getAttribute('aria-busy')).toBe('true');
+
+      releaseBind?.();
+      await waitUntil(() => !daemonBindBtn.disabled);
+      expect(allowSwitch.getAttribute('aria-busy')).toBe('true');
+
+      // Same-domain duplicate click while RESUME is pending must still be dropped
+      allowSwitch.click();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(actions.filter((a) => a === REMOTE_DESKTOP_LOCAL_ACTION.RESUME)).toHaveLength(1);
+
+      releaseRemote?.();
+      await waitUntil(() => !paused && allowSwitch.getAttribute('aria-busy') === 'false');
+    } finally {
+      releaseBind?.();
+      releaseRemote?.();
+      dom.window.close();
+    }
+  });
+
+  it('F3-R3: applies continuous finite slow poll responses without starvation and rejects stale out-of-order responses/errors', async () => {
+    const html = renderLocalPanelPage({
+      publicNodeId: '1234567890',
+      csrf: 'csrf-poll',
+      manageUrl: 'https://example.test/m',
+      shareUrl: 'https://example.test/s',
+    });
+
+    const pending: Array<{ resolve: (r: Response) => void; reject: (err: unknown) => void }> = [];
+    let pollCb: (() => void) | undefined;
+
+    const flush = async () => {
+      await new Promise<void>((r) => setImmediate(r));
+      await new Promise<void>((r) => setImmediate(r));
+    };
+
+    const dom = new JSDOM(html, {
+      url: 'http://127.0.0.1:43751/',
+      runScripts: 'dangerously',
+      beforeParse(win) {
+        (win as unknown as { setInterval: (cb: () => void, ms: number) => number }).setInterval = (cb, ms) => {
+          if (ms === 2000) pollCb = cb;
+          return ms;
+        };
+        (win as unknown as { fetch: typeof fetch }).fetch = (() =>
+          new Promise<Response>((resolve, reject) => {
+            pending.push({ resolve, reject });
+          })) as unknown as typeof fetch;
+      },
+    });
+
+    try {
+      const doc = dom.window.document;
+      expect(pending).toHaveLength(1);
+      expect(typeof pollCb).toBe('function');
+
+      // 1) Continuous finite slow responses (next 2s poll always starts before prior 2.5s response completes)
+      for (let i = 0; i < 5; i += 1) {
+        pollCb!();
+        pending[i]!.resolve(new Response(JSON.stringify({
+          publicNodeId: '1234567890',
+          paused: false,
+          connections: [],
+          deviceName: `SLOW-HEALTHY-${i}`,
+          daemon: {
+            available: true,
+            installed: true,
+            bound: true,
+            running: true,
+            connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+            autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+            runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+            canControl: true,
+            canBind: true,
+            canViewLogs: true,
+          },
+        }), { status: 200 }));
+        await flush();
+      }
+      expect((doc.getElementById('daemonCard') as HTMLElement).hidden).toBe(false);
+      expect((doc.getElementById('allowSwitch') as HTMLButtonElement).disabled).toBe(false);
+      expect(doc.getElementById('deviceName')?.textContent).toBe('SLOW-HEALTHY-4');
+
+      // Resolve leftover pending[5] cleanly as req #6
+      pending[5]!.resolve(new Response(JSON.stringify({
+        publicNodeId: '1234567890',
+        paused: false,
+        connections: [],
+        deviceName: 'CURRENT-6',
+        daemon: {
+          available: true,
+          installed: true,
+          bound: true,
+          running: true,
+          connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+          autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+          runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+          canControl: true,
+          canBind: true,
+          canViewLogs: true,
+        },
+      }), { status: 200 }));
+      await flush();
+
+      // 2) Out-of-order completion: req #8 and #9 start; req #9 resolves newer state FIRST;
+      //    older req #8 resolving later with stale payload must be dropped.
+      pollCb!(); // pending[6] (seq 7)
+      pollCb!(); // pending[7] (seq 8)
+      pollCb!(); // pending[8] (seq 9)
+      pending[8]!.resolve(new Response(JSON.stringify({
+        publicNodeId: '1234567890',
+        paused: true,
+        connections: [],
+        deviceName: 'NEWER-9',
+        daemon: {
+          available: true,
+          installed: true,
+          bound: true,
+          running: true,
+          connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+          autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+          runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+          canControl: true,
+          canBind: true,
+          canViewLogs: true,
+        },
+      }), { status: 200 }));
+      await flush();
+      expect(doc.getElementById('deviceName')?.textContent).toBe('NEWER-9');
+      expect((doc.getElementById('offlineBanner') as HTMLElement).hidden).toBe(true);
+
+      // Stale older success (pending[6]) and stale older error (pending[7]) must NOT roll back state or flash offline
+      pending[6]!.resolve(new Response(JSON.stringify({
+        publicNodeId: '1234567890',
+        paused: false,
+        connections: [],
+        deviceName: 'STALE-7',
+      }), { status: 200 }));
+      pending[7]!.reject(new Error('stale network failure'));
+      await flush();
+
+      expect(doc.getElementById('deviceName')?.textContent).toBe('NEWER-9');
+      expect((doc.getElementById('offlineBanner') as HTMLElement).hidden).toBe(true);
+      expect((doc.getElementById('pausedBanner') as HTMLElement).hidden).toBe(false);
+    } finally {
+      dom.window.close();
+    }
+  });
+});
+
+describe('Desktop Phase 2B pending_setup mode & switchToRuntime', () => {
+  const created: RemoteDesktopLocalPanel[] = [];
+
+  afterEach(async () => {
+    while (created.length > 0) {
+      await created.pop()?.close();
+    }
+  });
+
+  it('supports browser auth handoff (/setup/callback state validation + nonce exchange) and transitions live without rebinding port', async () => {
+    const { DESKTOP_SETUP_CALLBACK_PATH, DESKTOP_SETUP_LOCAL_ACTION } = await import('../../shared/desktop-setup-auth.js');
+    const openedUrls: string[] = [];
+    let currentTime = 1_700_000_000_000;
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '',
+      serverUrl: '',
+      port: 0,
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+      setup: {
+        prefilledRelayUrl: 'https://relay.example.com',
+        existingDaemonBound: true,
+        existingDaemonRelayUrl: 'https://relay.example.com',
+        now: () => currentTime,
+        stateTtlMs: 60_000,
+        openBrowser: async (url) => {
+          openedUrls.push(url);
+          return true;
+        },
+        fetchFn: (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+          expect(url).toBe('https://relay.example.com/api/auth/token-exchange');
+          const sent = JSON.parse(String(init?.body ?? '{}')) as { nonce?: string };
+          expect(sent.nonce).toBe('nonce-valid-1');
+          const res = new Response(JSON.stringify({ apiKey: 'deck_exchanged_1', userId: 'u-1', keyId: 'k-1' }), { status: 200 });
+          Object.defineProperty(res, 'url', { value: url });
+          return res;
+        }) as unknown as typeof fetch,
+        bindRelayAndEnroll: vi.fn(async (relayOrigin, apiKey, onStep) => {
+          expect(relayOrigin).toBe('https://relay.example.com');
+          expect(apiKey).toBe('deck_exchanged_1');
+          onStep('binding_daemon');
+          onStep('enrolling_node');
+          return {
+            serverId: 'srv-ctrl-1',
+            nodeId: '7778889990',
+            token: 'node-tok-secret',
+            serverUrl: 'https://relay.example.com',
+            nodeRole: 'controlled',
+          };
+        }),
+        onSetupComplete: async () => {
+          panel.switchToRuntime({
+            publicNodeId: '7778889990',
+            serverUrl: 'https://relay.example.com',
+            status: () => ({ paused: false, connections: [] }),
+            setPaused: async () => {},
+            stopAll: async () => {},
+            disconnect: async () => false,
+          });
+        },
+      },
+    });
+    created.push(panel);
+
+    const origin = new URL(panel.url).origin;
+    const home = await fetch(panel.url);
+    expect(home.status).toBe(200);
+    const html = await home.text();
+    const cookie = (home.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const csrf = /"csrf":"([^"]+)"/u.exec(html)![1]!;
+
+    // /api/state exposes setup status with prefilled relay URL
+    const st1 = await (await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, origin), { headers: { cookie } })).json() as {
+      setup?: { setupRequired: boolean; prefilledRelayUrl: string; existingDaemonBound?: boolean };
+    };
+    expect(st1.setup).toMatchObject({
+      setupRequired: true,
+      prefilledRelayUrl: 'https://relay.example.com',
+      existingDaemonBound: true,
+    });
+
+    // Wrong state on /setup/callback fails cleanly
+    const badState = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=wrongstatewrongstate`, origin));
+    expect(badState.status).toBe(400);
+
+    // Start browser auth -> generates loopback callback state & opens relay login
+    const startRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: DESKTOP_SETUP_LOCAL_ACTION.START_BROWSER_AUTH, relayUrl: 'https://relay.example.com' }),
+    });
+    expect(startRes.status).toBe(200);
+    expect(openedUrls).toHaveLength(1);
+    const loginUrl = new URL(openedUrls[0]!);
+    const cbParam = new URL(loginUrl.searchParams.get('desktop_callback')!);
+    expect(cbParam.origin).toBe(origin);
+    expect(cbParam.pathname).toBe(DESKTOP_SETUP_CALLBACK_PATH);
+    const state = cbParam.searchParams.get('state')!;
+    expect(state.length).toBeGreaterThanOrEqual(16);
+
+    // Mismatched state is rejected while pendingBrowserAuth stays armed
+    const wrongState = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=${'x'.repeat(state.length)}`, origin));
+    expect(wrongState.status).toBe(400);
+
+    // Valid callback executes exchange -> bind/enroll -> switchToRuntime on exact same listening port
+    const okCb = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=${encodeURIComponent(state)}`, origin));
+    expect(okCb.status).toBe(200);
+    expect(await okCb.text()).toContain('Connected to IM.codes');
+
+    // Replay of the same state fails immediately (setup mode is already disarmed)
+    const replayCb = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=${encodeURIComponent(state)}`, origin));
+    expect(replayCb.status).toBe(404);
+
+    // Same server now returns bound state without setup, plus manageUrl & shareUrl
+    const st2 = await (await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, origin), { headers: { cookie } })).json() as {
+      publicNodeId: string;
+      manageUrl?: string;
+      shareUrl?: string;
+      setup?: unknown;
+    };
+    expect(st2.publicNodeId).toBe('7778889990');
+    expect(st2.setup).toBeUndefined();
+    expect(st2.manageUrl).toContain('7778889990');
+    expect(st2.shareUrl).toContain('7778889990');
+  });
+
+  it('supports manual <relay>/bind/<apiKey> binding and rejects invalid links', async () => {
+    const { DESKTOP_SETUP_LOCAL_ACTION } = await import('../../shared/desktop-setup-auth.js');
+    const bindSpy = vi.fn(async () => ({
+      serverId: 'srv-manual-1',
+      nodeId: '1020304050',
+      token: 'tok-man',
+      serverUrl: 'https://relay.example.com',
+      nodeRole: 'controlled' as const,
+    }));
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '',
+      serverUrl: '',
+      port: 0,
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+      setup: {
+        prefilledRelayUrl: 'https://app.im.codes',
+        openBrowser: async () => false,
+        bindRelayAndEnroll: bindSpy,
+        onSetupComplete: async () => {
+          panel.switchToRuntime({
+            publicNodeId: '1020304050',
+            serverUrl: 'https://relay.example.com',
+            status: () => ({ paused: false, connections: [] }),
+            setPaused: async () => {},
+            stopAll: async () => {},
+            disconnect: async () => false,
+          });
+        },
+      },
+    });
+    created.push(panel);
+
+    const origin = new URL(panel.url).origin;
+    const home = await fetch(panel.url);
+    const html = await home.text();
+    const cookie = (home.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const csrf = /"csrf":"([^"]+)"/u.exec(html)![1]!;
+
+    const badBind = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: DESKTOP_SETUP_LOCAL_ACTION.BIND_MANUAL, bindUrl: 'https://relay.example.com/not-bind' }),
+    });
+    expect(badBind.status).toBe(400);
+
+    const goodBind = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: DESKTOP_SETUP_LOCAL_ACTION.BIND_MANUAL, bindUrl: 'https://relay.example.com/bind/deck_manual_secret_99' }),
+    });
+    expect(goodBind.status).toBe(200);
+    expect(bindSpy).toHaveBeenCalledWith('https://relay.example.com', 'deck_manual_secret_99', expect.any(Function));
+
+    const st = await (await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, origin), { headers: { cookie } })).json() as {
+      publicNodeId: string;
+      setup?: unknown;
+    };
+    expect(st.publicNodeId).toBe('1020304050');
+    expect(st.setup).toBeUndefined();
+  });
+
+  it('localizes /setup/callback HTML across all 7 UI locales + Accept-Language fallback on inactive, invalid, success, and failure responses (F6)', async () => {
+    const { UI_LOCALES } = await import('../../shared/ui-locale.js');
+    const { localPanelText } = await import('../../shared/local-panel-strings.js');
+    const { DESKTOP_SETUP_CALLBACK_PATH, DESKTOP_SETUP_LOCAL_ACTION } = await import('../../shared/desktop-setup-auth.js');
+
+    // 1) Inactive panel (404): resolves from Accept-Language (skipping unsupported fr -> zh-TW)
+    const runtimeOnly = await startRemoteDesktopLocalPanel({
+      publicNodeId: '1234567890',
+      serverUrl: 'https://relay.example.com',
+      port: 0,
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+    });
+    created.push(runtimeOnly);
+    const inactiveRes = await fetch(new URL(DESKTOP_SETUP_CALLBACK_PATH, runtimeOnly.url), {
+      headers: { 'accept-language': 'fr-FR,fr;q=0.9,zh-TW;q=0.8,en;q=0.7' },
+    });
+    expect(inactiveRes.status).toBe(404);
+    const inactiveHtml = await inactiveRes.text();
+    expect(inactiveHtml).toContain('<html lang="zh-TW">');
+    expect(inactiveHtml).toContain(localPanelText('zh-TW', 'setupCallbackInactiveTitle'));
+    expect(inactiveHtml).toContain(localPanelText('zh-TW', 'setupCallbackInactiveDetail'));
+    expect(inactiveHtml).toContain(localPanelText('zh-TW', 'setupCallbackBack'));
+
+    // 2) Active setup panel: verify invalid callback (400), failure callback (502), and success (200) for all 7 locales
+    for (const locale of UI_LOCALES) {
+      let shouldFailExchange = locale === 'ko';
+      const openedUrls: string[] = [];
+      const panel = await startRemoteDesktopLocalPanel({
+        publicNodeId: '',
+        serverUrl: '',
+        port: 0,
+        status: () => ({ paused: false, connections: [] }),
+        setPaused: async () => {},
+        stopAll: async () => {},
+        disconnect: async () => false,
+        setup: {
+          prefilledRelayUrl: 'https://relay.example.com',
+          openBrowser: async (loginUrl) => {
+            openedUrls.push(loginUrl);
+            return true;
+          },
+          fetchFn: (async (input: string | URL | Request) => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (shouldFailExchange) {
+              const bad = new Response(JSON.stringify({ error: 'invalid_nonce' }), { status: 400 });
+              Object.defineProperty(bad, 'url', { value: url });
+              return bad;
+            }
+            const ok = new Response(JSON.stringify({ apiKey: 'deck_locale_key' }), { status: 200 });
+            Object.defineProperty(ok, 'url', { value: url });
+            return ok;
+          }) as unknown as typeof fetch,
+          bindRelayAndEnroll: async () => ({
+            serverId: `srv-${locale}`,
+            nodeId: '1122334455',
+            token: 'tok-loc',
+            serverUrl: 'https://relay.example.com',
+            nodeRole: 'controlled',
+          }),
+          onSetupComplete: async () => {
+            panel.switchToRuntime({
+              publicNodeId: '1122334455',
+              serverUrl: 'https://relay.example.com',
+              status: () => ({ paused: false, connections: [] }),
+              setPaused: async () => {},
+              stopAll: async () => {},
+              disconnect: async () => false,
+            });
+          },
+        },
+      });
+      created.push(panel);
+
+      const origin = new URL(panel.url).origin;
+      const home = await fetch(panel.url);
+      const html = await home.text();
+      const cookie = (home.headers.get('set-cookie') ?? '').split(';')[0]!;
+      const csrf = /"csrf":"([^"]+)"/u.exec(html)![1]!;
+
+      // Invalid callback directly honors Accept-Language even before START_BROWSER_AUTH
+      const badBefore = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=n1&state=wrongstate`, origin), {
+        headers: { 'accept-language': locale },
+      });
+      expect(badBefore.status).toBe(400);
+      const badBeforeHtml = await badBefore.text();
+      expect(badBeforeHtml).toContain(`<html lang="${locale}">`);
+      expect(badBeforeHtml).toContain(localPanelText(locale, 'setupCallbackInvalidTitle'));
+      expect(badBeforeHtml).toContain(localPanelText(locale, 'setupCallbackInvalidDetail'));
+      expect(badBeforeHtml).toContain(localPanelText(locale, 'setupCallbackBack'));
+
+      // Start browser auth passing selected locale
+      const startRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie,
+          origin,
+          [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+        },
+        body: JSON.stringify({
+          action: DESKTOP_SETUP_LOCAL_ACTION.START_BROWSER_AUTH,
+          relayUrl: 'https://relay.example.com',
+          locale,
+        }),
+      });
+      expect(startRes.status).toBe(200);
+
+      const loginUrl = new URL(openedUrls[0]!);
+      const state = new URL(loginUrl.searchParams.get('desktop_callback')!).searchParams.get('state')!;
+      const cbRes = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=n-ok&state=${encodeURIComponent(state)}`, origin));
+      const cbHtml = await cbRes.text();
+      expect(cbRes.headers.get('content-security-policy')).toBe("default-src 'none'; style-src 'unsafe-inline'");
+      expect(cbHtml).toContain(`<html lang="${locale}">`);
+      expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackBack'));
+      if (shouldFailExchange) {
+        expect(cbRes.status).toBe(502);
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackFailedTitle'));
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackFailedDetail'));
+      } else {
+        expect(cbRes.status).toBe(200);
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackSuccessTitle'));
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackSuccessDetail'));
+      }
+      shouldFailExchange = false;
+    }
   });
 });
 

@@ -336,6 +336,24 @@ describe('CronManager', () => {
     expect((screen.getByLabelText('cron.send_reply') as HTMLInputElement).checked).toBe(true);
   });
 
+  it.each([undefined, false, true])('exposes and saves manual-command idle policy when editing %s', async (onlyWhenIdle) => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob({ action: JSON.stringify({ type: 'command', command: 'check', onlyWhenIdle }) })] })
+      .mockResolvedValue({ jobs: [] });
+    render(<CronManager serverId="srv-current" projectName="cd" sessions={sessions} onBack={vi.fn()} />);
+    await screen.findByText('Current job');
+    fireEvent.click(screen.getByText('✎'));
+    const option = screen.getByLabelText(/cron.send_only_when_idle/) as HTMLInputElement;
+    expect(option.checked).toBe(onlyWhenIdle !== false);
+    fireEvent.click(option);
+    fireEvent.click(screen.getByText('cron.mode_advanced'));
+    fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: '0 11 * * *' } });
+    expect(option.checked).toBe(onlyWhenIdle === false);
+    fireEvent.click(screen.getByText('cron.save'));
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron/job-1', expect.objectContaining({ method: 'PUT' })));
+    const call = apiFetch.mock.calls.find(([, init]) => init?.method === 'PUT');
+    expect(JSON.parse(String(call?.[1]?.body)).action).toMatchObject({ type: 'command', onlyWhenIdle: onlyWhenIdle === false });
+  });
+
   it('creates a direct-message cron for the active session without a second recipient', async () => {
     apiFetch
       .mockResolvedValueOnce({ jobs: [] })
@@ -360,6 +378,7 @@ describe('CronManager', () => {
     fireEvent.input(screen.getByPlaceholderText('cron.name_placeholder'), { target: { value: 'Direct check' } });
     fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: '0 11 * * *' } });
     fireEvent.input(screen.getByPlaceholderText('cron.send_message_placeholder'), { target: { value: 'Please check this task' } });
+    expect((screen.getByLabelText(/cron.send_only_when_idle/) as HTMLInputElement).checked).toBe(true);
     fireEvent.click(screen.getByText('cron.save'));
 
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron', expect.objectContaining({ method: 'POST' })));
@@ -375,6 +394,7 @@ describe('CronManager', () => {
       action: {
         type: 'command',
         command: 'Please check this task',
+        onlyWhenIdle: true,
       },
     });
     expect(screen.queryByPlaceholderText('cron.send_target_placeholder')).toBeNull();

@@ -1,3 +1,8 @@
+import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { SESSION_INCOGNITO_MEMORY_DISABLED } from '../../shared/session-incognito-types.js';
+import { TASK_PAIR_DECISION_LIMITS, validateTaskPairDecisionDetails, type TaskPairDecisionDetails } from '../../shared/task-pair-decision.js';
+import { splitCliArgs } from '../cli/cloud-docs.js';
+import type { CloudDocsToolDeps } from './cloud-docs-mcp-deps.js';
 import { readSessionTextMessages, readSessionSummaries, readSessionToolEvents, resolveHistorySession, canReadSessionHistory } from './session-history.js';
 import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from '../../shared/session-history.js';
 import { pausePair, resumePair, initialPairWait, validatePairDependencies } from './task-pairs/suspension.js';
@@ -7,6 +12,7 @@ import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
+import { captureCallerPairAuthority } from './machine-authority-send.js';
 import { isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency, taskPairSupervisionStatus } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { describeExecutionSelection } from './task-pairs/pool.js';
@@ -159,7 +165,7 @@ import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
 import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
-import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
+import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchOptions, type MemoryMcpSearchResult } from './memory-mcp-search.js';
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
@@ -217,6 +223,19 @@ import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import type { StoredTaskPair } from './task-pairs/store.js';
 import { compareQueuedTaskPairs, type TaskPairState } from '../../shared/task-pair.js';
+import { getCallbackTaskStore, type CallbackTaskStore } from './callback-task-store.js';
+import {
+  CALLBACK_MAX_METADATA_BYTES,
+  CALLBACK_MAX_RELATED_TASK_ID_CHARS,
+  CALLBACK_MAX_SOURCE_CHARS,
+  CALLBACK_MAX_SUMMARY_CHARS,
+  CALLBACK_UPDATE_STATUSES,
+  isCallbackUpdateStatus,
+  isValidCallbackId,
+  normalizeCallbackSource,
+  validateCallbackMetadata,
+  type CallbackTaskRecord,
+} from '../../shared/callback-types.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -266,6 +285,7 @@ import {
   recordVerificationMachineProfileStatus,
   removeVerificationMachineProfile,
   setVerificationMachineProfile,
+  type VerificationMachineClientOptions,
 } from './verification-machine-mcp-client.js';
 import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
@@ -362,11 +382,17 @@ export interface MemoryMcpToolDeps {
   ) => Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Registered-node AI-managed MCP/Skill service. Capability tools are absent when unavailable. */
   capabilityService?: CapabilityService;
+  /** Override lightweight callback store (tests inject an isolated :memory: store). */
+  callbackStore?: CallbackTaskStore;
   /** Caller context resolver used only when activating binding-scoped Skill instructions. */
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
   /** Installs a Skill into this machine's `~/.agents/skills`; tests replace it. */
   runAgentSkills?: CapabilityMcpToolDeps['runAgentSkills'];
-  /** Adds an MCP server to this machine's agent configs; tests replace it. */
+  /** Lists installed MCP servers across agent configs on this machine. */
+  listAgentMcp?: CapabilityMcpToolDeps['listAgentMcp'];
+  /** Searches the official MCP Registry directly. */
+  searchAgentMcpRegistry?: CapabilityMcpToolDeps['searchAgentMcpRegistry'];
+  /** Adds/removes an MCP server in this machine's agent configs; tests replace it. */
   runAgentMcp?: CapabilityMcpToolDeps['runAgentMcp'];
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
@@ -404,6 +430,9 @@ export interface MemoryMcpToolDeps {
   removeVerificationMachine?: typeof removeVerificationMachineProfile;
   recordVerificationMachineStatus?: typeof recordVerificationMachineProfileStatus;
   listVerificationAliases?: typeof aliasMcpList;
+  verificationClientOptions?: VerificationMachineClientOptions;
+  aliasClientOptions?: AliasMcpClientOptions;
+  memorySearchOptions?: MemoryMcpSearchOptions;
   applyEffectiveIdentity?: (
     sessionName: string,
     prompt: string | undefined,
@@ -471,6 +500,8 @@ export interface MemoryMcpToolDeps {
    * wired in `mergeDefaultToolDeps` (relays via the daemon's own credential).
    */
   machineDeps?: MachineToolDeps;
+  /** FULL-node Cloud Docs / ONLYOFFICE document tools with frontend & delegated-turn actor parity. */
+  cloudDocsDeps?: CloudDocsToolDeps;
   /**
    * The node's own role. Only FULL nodes advertise the machine tools; a
    * controlled node excludes them from its tool surface (10.12). Defaults to
@@ -1631,6 +1662,8 @@ function pairChecklistAccess(caller: McpRuntimeCaller, sessions: readonly Sessio
   const record = sessions.find((session) => session.name === caller.sessionName);
   const project = (record ? resolveEffectiveProjectName(record, sessions) : undefined)
     ?? projectOfSession(caller.sessionName ?? '')
+    ?? caller.projectName
+    ?? caller.namespace?.projectId
     ?? undefined;
   const stored = project ? getTaskPairStore().getPair(project, taskId.trim()) : undefined;
   return stored ? { status: 'forbidden', pair: stored } : { status: 'missing' };
@@ -1644,16 +1677,62 @@ function refreshPairChecklistAccess(caller: McpRuntimeCaller, previous: NonNulla
   return role === 'other' || role === 'daemon' ? { status: 'forbidden', pair } : { status: 'ok', pair };
 }
 
-function pairAccessError(access: PairChecklistAccess): ToolResult {
-  return access.status === 'forbidden'
-    ? error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair')
-    : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+function pairAccessError(access: PairChecklistAccess, caller?: McpRuntimeCaller): ToolResult {
+  if (access.status === 'forbidden') {
+    const pair = access.pair.state;
+    const callerName = caller?.sessionName;
+    const isReassigned = callerName && (
+      pair.previousAuditors?.includes(callerName)
+      || pair.previousExecutors?.includes(callerName)
+    );
+    if (isReassigned) {
+      return error(
+        MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+        `session ${callerName} was reassigned from task pair ${pair.taskId} and is no longer an active participant (current executor: ${pair.executor}, auditor: ${pair.auditor})`,
+      );
+    }
+    return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair');
+  }
+  return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+}
+
+function isCallbackCallerAuthorized(
+  caller: McpRuntimeCaller,
+  record: CallbackTaskRecord,
+  sessions: readonly SessionRecord[],
+): boolean {
+  const callerName = caller.sessionName?.trim();
+  if (!callerName) return false;
+  if (callerName === record.targetSession) {
+    return true;
+  }
+  const callerRecord = sessions.find((s) => s.name === callerName);
+  const targetRecord = sessions.find((s) => s.name === record.targetSession);
+  const callerProject = callerRecord
+    ? resolveEffectiveProjectName(callerRecord, sessions)
+    : (caller.projectName ?? projectOfSession(callerName));
+  const targetProject = targetRecord
+    ? resolveEffectiveProjectName(targetRecord, sessions)
+    : projectOfSession(record.targetSession);
+  const isBrain = callerRecord?.role === 'brain'
+    || (!callerRecord && !!callerProject && callerName === projectBrainSession(callerProject));
+  if (!isBrain) return false;
+  if (callerRecord?.projectDir && callerRecord.projectDir === record.scopeKey) {
+    return true;
+  }
+  if (callerProject && callerProject === record.scopeKey) {
+    return true;
+  }
+  if (callerProject && targetProject && callerProject === targetProject) {
+    return true;
+  }
+  return false;
 }
 
 function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
-  return { taskId: pair.state.taskId, scheduling: pair.state.scheduling ?? null, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
+  return { taskId: pair.state.taskId, scheduling: pair.state.scheduling ?? null, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, previousExecutors: pair.state.previousExecutors ?? [], capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
 }
 
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
@@ -1670,8 +1749,10 @@ function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>
 }
 
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
-  const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
-  const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
+  const searchMemory: MemoryMcpSearch = deps.searchMemory
+    ?? ((q) => searchMcpMemoryRecall(q, deps.memorySearchOptions));
+  const listMemorySummaries: MemoryMcpListSummaries = deps.listMemorySummaries
+    ?? ((q) => listMcpMemorySummaries(q, deps.memorySearchOptions));
   let lastGoodSendSessions: SessionRecord[] | null = null;
   const sendSessions = async (): Promise<SessionRecord[]> => {
     // Keep the in-memory directory before disk refresh. A valid but stale
@@ -1744,6 +1825,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     attrs: Record<string, string>;
     idempotencyKey?: string;
     turnText?: string;
+    allowOwnerOverride?: boolean;
     authorize: (pair: StoredTaskPair) => ToolResult | undefined;
   }): Promise<ToolResult> => {
     const store = getTaskPairStore();
@@ -1753,6 +1835,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     if (authorization) return authorization;
     const eventId = structuredPairLifecycleEventId(input.project, input.taskId, input.verb, input.attrs, input.idempotencyKey);
     const replay = store.hasEvent(eventId);
+    const authority = captureCallerPairAuthority(caller.sessionName);
     const transition = taskPairService.applyMarker({
       project: input.project,
       writer: caller.sessionName!,
@@ -1761,6 +1844,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       eventId,
       suppressAutomaticBrief: false,
       ...(input.turnText ? { turnText: input.turnText } : {}),
+      ...(authority ? { authority } : {}),
+      ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
     });
     await taskPairService.waitForIdle();
     const after = store.getPair(input.project, input.taskId);
@@ -1959,11 +2044,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const identityGetEffective = deps.getEffectiveIdentityProfiles ?? getEffectiveSessionIdentityProfiles;
   const identitySet = deps.setIdentityProfile ?? setSessionIdentityProfile;
   const identityClear = deps.clearIdentityProfile ?? clearSessionIdentityProfile;
-  const verificationList = deps.listVerificationMachines ?? listVerificationMachineProfiles;
-  const verificationSet = deps.setVerificationMachine ?? setVerificationMachineProfile;
-  const verificationRemove = deps.removeVerificationMachine ?? removeVerificationMachineProfile;
-  const verificationRecordStatus = deps.recordVerificationMachineStatus ?? recordVerificationMachineProfileStatus;
-  const verificationAliasList = deps.listVerificationAliases ?? aliasMcpList;
+  const verificationList: typeof listVerificationMachineProfiles = deps.listVerificationMachines
+    ?? ((projectKey, opts) => listVerificationMachineProfiles(projectKey, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationSet: typeof setVerificationMachineProfile = deps.setVerificationMachine
+    ?? ((input, opts) => setVerificationMachineProfile(input, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationRemove: typeof removeVerificationMachineProfile = deps.removeVerificationMachine
+    ?? ((id, expectedRevision, opts) => removeVerificationMachineProfile(id, expectedRevision, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationRecordStatus: typeof recordVerificationMachineProfileStatus = deps.recordVerificationMachineStatus
+    ?? ((id, status, opts) => recordVerificationMachineProfileStatus(id, status, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationAliasList: typeof aliasMcpList = deps.listVerificationAliases
+    ?? ((opts, query) => aliasMcpList({ ...(deps.aliasClientOptions ?? {}), ...(opts ?? {}) }, query));
   const identityApply = deps.applyEffectiveIdentity ?? (async (sessionName, prompt, options) => {
     const { applyEffectiveSessionIdentity } = await import('../agent/session-manager.js');
     return applyEffectiveSessionIdentity(sessionName, prompt, options);
@@ -2228,9 +2318,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: async (input) => {
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const current = refreshPairChecklistAccess(caller, access.pair);
-      if (current.status !== 'ok') return pairAccessError(current);
+      if (current.status !== 'ok') return pairAccessError(current, caller);
       const view = pairChecklistView(current.pair)!;
       const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(access.pair.state.taskId)).catch(() => null);
       return {
@@ -2246,10 +2336,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (viewers !== undefined && (!Array.isArray(viewers) || viewers.length === 0 || viewers.length > TASK_PAIR_TITLE_ACCESS_MAX_USERS || viewers.some((id) => typeof id !== 'string' || !id.trim() || id.length > TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS))) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'titleViewerUserIds must contain 1..64 non-empty user ids');
       if (markdown === undefined && !title && viewers === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown, title or titleViewerUserIds is required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const current = refreshPairChecklistAccess(caller, access.pair);
-      if (current.status !== 'ok') return pairAccessError(current);
+      if (current.status !== 'ok') return pairAccessError(current, caller);
       const pair = current.pair;
+      if (pair.state.brain === caller.sessionName) {
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+        if (callerAuthority?.kind === 'owner') {
+          getTaskPairStore().savePairAuthority(pair.project, pair.state.taskId, callerAuthority);
+        }
+      }
       if (viewers !== undefined) {
         if (!caller.serverId || pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may update legacy title viewer metadata');
         if (!taskPairService.grantTaskPairTitle(pair.project, pair.state.taskId, caller.serverId, viewers as string[], caller.sessionName, title)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid title or title viewer grant');
@@ -2259,7 +2355,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const latest = getTaskPairStore().getPair(pair.project, pair.state.taskId);
       const saved = markdown !== undefined && latest ? savePairBrief(latest, markdown, caller.sessionName ?? 'unknown') : latest;
-      if (!saved) return pairAccessError({ status: 'forbidden', pair });
+      if (!saved) return pairAccessError({ status: 'forbidden', pair }, caller);
       return pairChecklistView(saved)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: async (input) => {
@@ -2268,13 +2364,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const box = args.box === 'implemented' || args.box === 'audited' ? args.box : undefined;
       if (!items || !box || typeof args.checked !== 'boolean') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'items, box and checked are required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const current = refreshPairChecklistAccess(caller, access.pair);
-      if (current.status !== 'ok') return pairAccessError(current);
+      if (current.status !== 'ok') return pairAccessError(current, caller);
       const pair = current.pair;
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       const saved = savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
-      if (!saved) return pairAccessError({ status: 'forbidden', pair });
+      if (!saved) return pairAccessError({ status: 'forbidden', pair }, caller);
       return pairChecklistView(saved)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: async (input) => {
@@ -2288,6 +2384,70 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const result = taskPairService.claimResource({ project: pair.project, taskId: pair.state.taskId, owner: caller.sessionName ?? 'unknown', resource, mode, ttlMs });
       if (!result.ok) return { status: 'error', reason: 'resource_conflict', message: 'resource is already held', conflict: result.conflict };
       return { status: 'ok', claimed: true, claim: result.claim, claims: result.pair.resourceClaims ?? [] };
+    },
+    [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['callbackId', 'status', 'summary', 'source', 'relatedTaskId', 'metadata']);
+      const callbackId = typeof args.callbackId === 'string' ? args.callbackId.trim() : '';
+      if (!isValidCallbackId(callbackId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'valid callbackId (cb_...) is required');
+      }
+      if (!isCallbackUpdateStatus(args.status)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `status must be one of: ${CALLBACK_UPDATE_STATUSES.join(', ')}`);
+      }
+      const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+      if (!summary || summary.length > CALLBACK_MAX_SUMMARY_CHARS) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `summary is required and must be <= ${CALLBACK_MAX_SUMMARY_CHARS} chars`);
+      }
+      let sourceFilter: string | undefined;
+      if (args.source !== undefined) {
+        const normalizedSource = normalizeCallbackSource(args.source);
+        if (!normalizedSource) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid callback source');
+        }
+        sourceFilter = normalizedSource;
+      }
+      let relatedTaskId: string | undefined;
+      if (args.relatedTaskId !== undefined) {
+        if (typeof args.relatedTaskId !== 'string' || !args.relatedTaskId.trim() || args.relatedTaskId.trim().length > CALLBACK_MAX_RELATED_TASK_ID_CHARS) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `relatedTaskId must be a non-empty string <= ${CALLBACK_MAX_RELATED_TASK_ID_CHARS} chars`);
+        }
+        relatedTaskId = args.relatedTaskId.trim();
+      }
+      const metaCheck = validateCallbackMetadata(args.metadata);
+      if (!metaCheck.ok) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, metaCheck.error);
+      }
+      const callbackStore = deps.callbackStore ?? getCallbackTaskStore();
+      const record = callbackStore.getCallback(callbackId);
+      if (!record) {
+        return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'callback not found');
+      }
+      if (sourceFilter && record.source !== sourceFilter) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, `callback source mismatch: expected ${record.source}`);
+      }
+      const sessions = await sendSessions();
+      if (!isCallbackCallerAuthorized(caller, record, sessions)) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the matching project Brain or assigned callback targetSession may update this callback');
+      }
+      const updated = callbackStore.updateCallback({
+        callbackId,
+        status: args.status,
+        summary,
+        ...(sourceFilter ? { source: sourceFilter } : {}),
+        ...(relatedTaskId !== undefined ? { relatedTaskId } : {}),
+        ...(metaCheck.value !== undefined ? { metadata: metaCheck.value } : {}),
+      });
+      if (!updated.ok) {
+        return error(
+          updated.reason === 'not_found'
+            ? MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE
+            : updated.reason === 'source_mismatch'
+              ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
+              : MCP_ERROR_REASONS.VALIDATION_FAILED,
+          updated.error,
+        );
+      }
+      return { status: 'ok', callback: updated.record };
     },
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
@@ -3363,7 +3523,20 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const isParticipant = stored.state.brain === caller.sessionName
         || stored.state.executor === caller.sessionName
         || stored.state.auditor === caller.sessionName;
-      if (!isParticipant) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair');
+      if (!isParticipant) {
+        const callerName = caller.sessionName;
+        const isReassigned = callerName && (
+          stored.state.previousAuditors?.includes(callerName)
+          || stored.state.previousExecutors?.includes(callerName)
+        );
+        if (isReassigned) {
+          return error(
+            MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+            `session ${callerName} was reassigned from task pair ${taskId} and is no longer an active participant (current executor: ${stored.state.executor}, auditor: ${stored.state.auditor})`,
+          );
+        }
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair');
+      }
       const eventLimit = Math.min(200, Math.max(1, Math.floor(numberArg(args, 'eventLimit') ?? 50)));
       const queuePositions = stored.state.status === 'queued'
         ? queuePositionsOf(getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, false, 500))
@@ -3446,7 +3619,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: async (input) => {
       const context = await pairCallerContext();
       if (context.status === 'error') return context.result;
-      const args = pickAllowedMcpArgs(input, ['taskId', 'kind', 'round', 'conclusion', 'summary', 'related', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['taskId', 'kind', 'round', 'conclusion', 'summary', 'related', 'idempotencyKey', 'question', 'options', 'recommendation', 'requestId', 'selectedOptionId', 'deliveryRound']);
       const taskId = stringArg(args, 'taskId')?.trim();
       if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
       const stored = getTaskPairStore().getPair(context.project, taskId);
@@ -3466,12 +3639,22 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!conclusion || !summary) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion and summary are required');
       if (conclusion.length > 500 || summary.length > 4000) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion or summary is too long');
       const related = Array.isArray(args.related) ? args.related.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim()).slice(0, 20) : undefined;
-      const result = taskPairService.recordDecision({
-        project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
-        ...(related && related.length > 0 ? { related } : {}),
-        ...(stringArg(args, 'idempotencyKey')?.trim() ? { idempotencyKey: stringArg(args, 'idempotencyKey')!.trim() } : {}),
-      });
-      return { status: 'ok', created: result.created, decision: result.record, notified: result.notified };
+      const details = Object.fromEntries(['question', 'options', 'recommendation', 'requestId', 'selectedOptionId', 'deliveryRound']
+        .filter((key) => args[key] !== undefined).map((key) => [key, args[key]])) as TaskPairDecisionDetails;
+      try { validateTaskPairDecisionDetails(details); } catch (cause) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, String(cause));
+      }
+      try {
+        const authority = captureCallerPairAuthority(caller.sessionName);
+        const result = taskPairService.recordDecision({
+          ...details,
+          project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
+          ...(related && related.length > 0 ? { related } : {}),
+          ...(stringArg(args, 'idempotencyKey')?.trim() ? { idempotencyKey: stringArg(args, 'idempotencyKey')!.trim() } : {}),
+          ...(authority ? { authority } : {}),
+        });
+        return { status: 'ok', created: result.created, decision: result.record, notified: result.notified };
+      } catch (cause) { return error(MCP_ERROR_REASONS.VALIDATION_FAILED, String(cause)); }
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: async (input) => {
       const context = await pairCallerContext();
@@ -3582,6 +3765,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         }
         const busyTarget = executorRecord?.state === 'running'
           || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && byName.get(auditor)?.state === 'running');
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
         const transition = dependencies.length > 0 || busyTarget || !executor
           ? taskPairService.applyMarker({
               project: context.project,
@@ -3601,6 +3785,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
                 brief,
               },
               source: 'mcp', eventId,
+              ...(callerAuthority ? { authority: callerAuthority } : {}),
             })
           : taskPairService.implicitDispatch({
               project: context.project,
@@ -3619,6 +3804,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               structuredPairCreate: true,
               eventId,
               suppressAutomaticBrief: true,
+              ...(callerAuthority ? { authority: callerAuthority } : {}),
             });
         // A pair with no named executor starts through the queue right away (the daemon picks from the pool, or the no-pool default).
         if (dependencies.length) await taskPairAutomation.reconcileSuspensions();
@@ -3670,6 +3856,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, ...supervisionFields(context.project), deliveries };
       }
       if (stored.state.status !== 'queued') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair is not queued (${stored.state.status})`);
+      const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+      if (callerAuthority) store.savePairAuthority(context.project, taskId, callerAuthority, { allowOwnerOverride: true });
       await taskPairAutomation.runQueue(context.project, caller.sessionName);
       const after = store.getPair(context.project, taskId);
       if (!after) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair disappeared during dispatch');
@@ -3691,10 +3879,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['taskId', 'mode', 'dependsOn', 'note']);
       const taskId = stringArg(args, 'taskId');
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const mode = stringArg(args, 'mode') ?? TASK_PAIR_PAUSE_MODES[0];
       if (!(TASK_PAIR_PAUSE_MODES as readonly string[]).includes(mode)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'unknown pause mode');
       try {
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+        if (callerAuthority?.kind === 'owner') {
+          getTaskPairStore().savePairAuthority(access.pair.project, access.pair.state.taskId, callerAuthority);
+        }
         pausePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '', mode as 'manual' | 'dependencies', args.dependsOn, stringArg(args, 'note'));
         await taskPairAutomation.reconcileSuspensions();
         taskPairAutomation.publishBadges();
@@ -3705,8 +3897,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['taskId']);
       const access = pairChecklistAccess(caller, await sendSessions(), stringArg(args, 'taskId'));
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       try {
+        const callerAuthority = captureCallerPairAuthority(caller.sessionName);
+        if (callerAuthority && caller.sessionName === access.pair.state.brain) {
+          getTaskPairStore().savePairAuthority(access.pair.project, access.pair.state.taskId, callerAuthority, { allowOwnerOverride: true });
+        }
         resumePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '');
         await taskPairAutomation.reconcileSuspensions();
         taskPairAutomation.publishBadges();
@@ -3777,6 +3973,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (namedProblems.length > 0) return sessionNotLiveError(taskId, namedProblems, { nothingChanged: true });
       const reassigned = await applyStructuredPairLifecycle({
         project: context.project, taskId, verb: 'REASSIGN', attrs, idempotencyKey,
+        allowOwnerOverride: true,
         authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_reassign requires the pair Brain'),
       });
       // A reassignment by model may have provisioned or picked a session: report a result whose sessions are not live as the failure it is.
@@ -3807,6 +4004,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (stored && isTerminalTaskPairStatus(stored.state.status) && !replay) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot open a round on terminal pair (${stored.state.status})`);
       return applyStructuredPairLifecycle({
         project: context.project, taskId, verb: 'NEXT_ROUND', attrs, idempotencyKey,
+        allowOwnerOverride: true,
         authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_next_round requires the pair Brain'),
       });
     },
@@ -4990,16 +5188,60 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ? { status: 'ok', outcome: result.outcome }
         : { status: 'ok', outcome: result.outcome, result: result.result };
     },
+    [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS]: async (input, context) => {
+      if (!deps.cloudDocsDeps?.runCli) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'cloud docs tool is not available on this node');
+      const argsObj = pickAllowedMcpArgs(input, ['args', 'command']);
+      const rawArgs = argsObj.args;
+      const rawCommand = argsObj.command;
+      if (rawArgs !== undefined && rawCommand !== undefined) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'provide either args or command, not both');
+      }
+      let argv: string[];
+      if (rawArgs !== undefined) {
+        if (!Array.isArray(rawArgs) || !rawArgs.every((entry) => typeof entry === 'string')) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'args must be an array of strings');
+        }
+        argv = rawArgs;
+      } else if (rawCommand !== undefined) {
+        if (typeof rawCommand !== 'string') {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'command must be a string');
+        }
+        try {
+          argv = splitCliArgs(rawCommand);
+        } catch (err) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'invalid command string');
+        }
+      } else {
+        argv = ['--help'];
+      }
+      if (argv.length === 0) {
+        argv = ['--help'];
+      }
+      const result = await deps.cloudDocsDeps.runCli(argv, {
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (result.exitCode !== 0) {
+        const message = result.stderr.trim() || result.stdout.trim() || `imcodes cloud-docs failed with exit code ${result.exitCode}`;
+        return error(result.errorReason ?? MCP_ERROR_REASONS.VALIDATION_FAILED, message);
+      }
+      return {
+        status: 'ok',
+        exitCode: 0,
+        stdout: result.stdout,
+        ...(result.stderr ? { stderr: result.stderr } : {}),
+        ...(result.data !== undefined ? { data: result.data } : {}),
+      };
+    },
   };
   if (deps.invokeDaemonMemoryTool) {
     for (const name of MEMORY_MCP_DAEMON_TOOL_NAMES) {
       handlers[name] = (input) => deps.invokeDaemonMemoryTool!(name, input);
     }
   }
-  return wrapHandlers(handlers);
+  return wrapHandlers(handlers, caller.sessionName);
 }
 
-function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
+function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>, sessionName: string | null): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const wrapped = {} as Record<MemoryMcpToolName, MemoryMcpToolHandler>;
   // Keep retired handlers available to the daemon-side direct-call seam so an
   // old client receives the explicit retirement guidance. They are still
@@ -5011,6 +5253,7 @@ function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>)
   for (const name of names as Set<MemoryMcpToolName>) {
     wrapped[name] = async (input?: unknown, context?: MemoryMcpToolContext) => {
       try {
+        if (isIncognitoSessionName(sessionName)) throw new Error(SESSION_INCOGNITO_MEMORY_DISABLED);
         return await handlers[name](input, context);
       } catch (err) {
         return sanitizeCaughtError(err);
@@ -5072,6 +5315,14 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().optional().describe('Complete Markdown brief.'), title: z.string().min(1).optional().describe('Short specific title in the owner UI language; Brain only.'), titleViewerUserIds: z.array(z.string().min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS)).min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USERS).optional().describe('Brain only: update legacy title viewer metadata. Not required for Pair access or display.') }).refine((value) => value.markdown !== undefined || value.title !== undefined || value.titleViewerUserIds !== undefined, { message: 'markdown, title or titleViewerUserIds is required' }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: z.object({ taskId: z.string().optional().describe('Pair task id.'), items: z.array(z.number().int().positive()).describe('1-based checklist item numbers.'), box: z.enum(['implemented', 'audited']).describe('Box to update.'), checked: z.boolean().describe('New state.') }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: z.object({ taskId: z.string().optional(), resource: z.string().min(1).max(500), mode: z.enum(['exclusive', 'shared']), ttlMs: z.number().int().min(60000).max(86400000).optional(), renew: z.boolean().optional() }),
+  [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: z.object({
+    callbackId: z.string().min(1).describe('Callback id (cb_...).'),
+    status: z.enum(CALLBACK_UPDATE_STATUSES).describe('New callback status.'),
+    summary: z.string().min(1).max(CALLBACK_MAX_SUMMARY_CHARS).describe('Concise handling summary.'),
+    source: z.string().min(1).max(CALLBACK_MAX_SOURCE_CHARS).optional().describe('Optional callback source guard (e.g. repo, webhook).'),
+    relatedTaskId: z.string().min(1).max(CALLBACK_MAX_RELATED_TASK_ID_CHARS).optional().describe('Optional related taskId (e.g. tsk_...).'),
+    metadata: z.record(z.string(), z.unknown()).optional().describe(`Optional bounded JSON metadata (max ${CALLBACK_MAX_METADATA_BYTES} bytes).`),
+  }),
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
     query: z.string().describe('Text query; hits include sourceLookup for expansion.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum hits.'),
@@ -5249,6 +5500,15 @@ const schemas = {
     taskId: z.string().trim().min(1),
     kind: z.enum(['request', 'decision']).optional(),
     round: z.number().int().positive(),
+    deliveryRound: z.number().int().positive().optional(),
+    question: z.string().max(TASK_PAIR_DECISION_LIMITS.QUESTION).optional(),
+    options: z.array(z.object({
+      id: z.string().min(1).max(100),
+      label: z.string().min(1).max(TASK_PAIR_DECISION_LIMITS.LABEL),
+    }).strict()).max(TASK_PAIR_DECISION_LIMITS.OPTIONS).optional(),
+    recommendation: z.string().max(TASK_PAIR_DECISION_LIMITS.QUESTION).optional(),
+    requestId: z.string().min(1).max(300).optional(),
+    selectedOptionId: z.string().min(1).max(100).optional(),
     conclusion: z.string().trim().min(1).max(500),
     summary: z.string().trim().min(1).max(4000),
     related: z.array(z.string().trim().min(1).max(200)).max(20).optional(),
@@ -5439,7 +5699,7 @@ const schemas = {
     projectName: z.string().optional().describe('Project; defaults to caller project.'),
     targetRole: z.string().optional().describe('Source role; defaults to project brain.'),
     targetSessionName: z.string().nullable().optional().describe('Source session; target resolves among its siblings and cannot be itself.'),
-    action: z.record(z.string(), z.unknown()).describe('Send action {type:"send", ...} with optional onlyWhenIdle; omitted defaults true for intervals <=15m.'),
+    action: z.record(z.string(), z.unknown()).describe('Send action {type:"send", ...} with optional onlyWhenIdle; omitted defaults true at every frequency.'),
     timezone: z.string().optional(),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/offset-ISO, ≤90 days; affects future sends only.'),
     completionPolicy: z.enum([
@@ -5458,7 +5718,7 @@ const schemas = {
     projectName: z.string().optional().describe('Replacement project.'),
     targetRole: z.string().optional().describe('Replacement source role.'),
     targetSessionName: z.string().nullable().optional().describe('Replacement source session; target resolves among its siblings.'),
-    action: z.record(z.string(), z.unknown()).optional().describe('Replacement send action; onlyWhenIdle skips busy recipients; omitted defaults true for intervals <=15m.'),
+    action: z.record(z.string(), z.unknown()).optional().describe('Replacement send action; onlyWhenIdle skips busy recipients; omitted defaults true at every frequency.'),
     timezone: z.string().optional().describe('Replacement schedule timezone only.'),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO; affects future sends only.'),
     completionPolicy: z.enum([
@@ -5504,6 +5764,10 @@ const schemas = {
     if (value.timeoutMs !== undefined && value.timeoutMs > computerUseMaxTimeoutMs(value.tool)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['timeoutMs'], message: `timeoutMs exceeds the maximum for ${value.tool}` });
     }
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS]: z.strictObject({
+    args: z.array(z.string()).optional(),
+    command: z.string().optional(),
   }),
 } as const;
 

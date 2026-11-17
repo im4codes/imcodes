@@ -19,10 +19,13 @@ import {
   isEnrollmentNodeTokenHash,
   type EnrollRedeemV2Request,
   type EnrollRedeemV2Response,
+  ENROLL_DIRECT_V2_PATH,
+  type EnrollDirectV2Request,
   type EnrollmentBlob,
   type EnrollmentTrailerRange,
 } from '../../shared/remote-exec.js';
 import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
+import { isControlledNodeArch } from '../../shared/controlled-node-artifacts.js';
 import { normalizeControlledNodeEndpointOrigin } from '../../shared/controlled-node-endpoints.js';
 import {
   inspectWindowsAuthenticodeEnrollmentContainer,
@@ -539,6 +542,28 @@ export function defaultInstallIdentityPath(credentialPath = defaultCredentialPat
   return join(dirname(credentialPath), 'install-identity.json');
 }
 
+export function defaultPendingDaemonBindPath(credentialPath = defaultCredentialPath()): string {
+  return join(dirname(credentialPath), 'pending-daemon-bind.json');
+}
+
+export interface PendingDaemonBindPrepared {
+  workerUrl: string;
+  serverId: string;
+  token: string;
+  serverName: string;
+  activeUserKey?: string;
+}
+
+export interface PendingDaemonBindRecord {
+  version: 1;
+  relayOrigin: string;
+  installId: string;
+  nodeTokenHash: string;
+  activeUserKey?: string;
+  prepared: PendingDaemonBindPrepared;
+  createdAt: number;
+}
+
 /** Stable trailer-free executable path used by boot autostart (distinct from download path). */
 export function defaultStagedExecutablePath(platform: NodeJS.Platform = process.platform): string {
   if (platform === 'win32') return join(windowsCredentialDir(), 'imcodes-node.exe');
@@ -581,7 +606,7 @@ export interface ProtectedSecretLoadOptions {
   assertCredentialDirSecured?: (dir: string) => void | Promise<void>;
 }
 
-async function assertSecretPathProtected(path: string, label: 'credential' | 'install_identity', options: ProtectedSecretLoadOptions): Promise<void> {
+async function assertSecretPathProtected(path: string, label: 'credential' | 'install_identity' | 'pending_bind', options: ProtectedSecretLoadOptions): Promise<void> {
   const platform = options.platform ?? process.platform;
   if (platform === 'win32') {
     const st = await lstat(path);
@@ -594,6 +619,65 @@ async function assertSecretPathProtected(path: string, label: 'credential' | 'in
   const st = await lstat(path);
   if (st.isSymbolicLink()) throw new Error(`${label}_path_is_symlink`);
   if ((st.mode & 0o077) !== 0) throw new Error(`${label}_permissions_insecure`);
+}
+
+function isValidPendingDaemonBindRecord(value: unknown): value is PendingDaemonBindRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const r = value as Partial<PendingDaemonBindRecord>;
+  if (r.version !== 1) return false;
+  if (typeof r.relayOrigin !== 'string' || !r.relayOrigin) return false;
+  if (typeof r.installId !== 'string' || !r.installId) return false;
+  if (typeof r.nodeTokenHash !== 'string' || !isEnrollmentNodeTokenHash(r.nodeTokenHash)) return false;
+  if (r.activeUserKey !== undefined && (typeof r.activeUserKey !== 'string' || !r.activeUserKey)) return false;
+  if (typeof r.createdAt !== 'number' || !Number.isFinite(r.createdAt) || r.createdAt < 0) return false;
+  if (!r.prepared || typeof r.prepared !== 'object' || Array.isArray(r.prepared)) return false;
+  const p = r.prepared as Partial<PendingDaemonBindPrepared>;
+  if (typeof p.workerUrl !== 'string' || !p.workerUrl) return false;
+  if (typeof p.serverId !== 'string' || !p.serverId) return false;
+  if (typeof p.token !== 'string' || !p.token) return false;
+  if (typeof p.serverName !== 'string') return false;
+  if (p.activeUserKey !== undefined && (typeof p.activeUserKey !== 'string' || !p.activeUserKey)) return false;
+  return true;
+}
+
+export async function loadPendingDaemonBind(
+  path = defaultPendingDaemonBindPath(),
+  options: ProtectedSecretLoadOptions = {},
+): Promise<PendingDaemonBindRecord | null> {
+  try {
+    await assertSecretPathProtected(path, 'pending_bind', options);
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!isValidPendingDaemonBindRecord(parsed)) {
+      throw new Error('pending_bind_invalid');
+    }
+    return parsed;
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+export async function persistPendingDaemonBind(
+  record: PendingDaemonBindRecord,
+  path = defaultPendingDaemonBindPath(),
+): Promise<void> {
+  if (!isValidPendingDaemonBindRecord(record)) {
+    throw new Error('pending_bind_invalid');
+  }
+  await assertWritablePathIsNotSymlink(path, 'pending_bind_path_is_symlink');
+  await writeProtectedJson(path, record);
+}
+
+export async function removePendingDaemonBind(
+  path = defaultPendingDaemonBindPath(),
+): Promise<void> {
+  try {
+    await assertWritablePathIsNotSymlink(path, 'pending_bind_path_is_symlink');
+    await unlink(path);
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
 }
 
 export async function loadInstallIdentity(
@@ -784,6 +868,112 @@ export async function burnEnrollmentBlob(executablePath = process.execPath): Pro
   if (status === 'failed') throw new Error('enrollment_burn_failed');
 }
 
+export interface EnrollDirectV2Options {
+  relayUrl: string;
+  apiKey: string;
+  identity: InstallIdentity;
+  hostServerId?: string;
+  abiProfile?: ControlledNodeAbiProfile;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  hostname?: string;
+  fetchFn?: typeof fetch;
+}
+
+export class EnrollDirectUnsupportedError extends Error {
+  readonly status: number;
+  constructor(status: number, code?: string) {
+    super(`enroll_direct_unsupported:${status}${code ? `:${code}` : ''}`);
+    this.name = 'EnrollDirectUnsupportedError';
+    this.status = status;
+  }
+}
+
+export async function enrollDirectV2(options: EnrollDirectV2Options): Promise<ControlledNodeCredential> {
+  const expectedOrigin = allowedEnrollmentServerOrigin(options.relayUrl);
+  const fetchImpl = options.fetchFn ?? fetch;
+  const platform = options.platform ?? process.platform;
+  const targetOs = enrollmentOsFromNodePlatform(platform);
+  if (!targetOs) throw new Error(`direct_enroll_unsupported_platform:${platform}`);
+  const arch = options.arch ?? process.arch;
+  if (!isControlledNodeArch(arch)) throw new Error(`direct_enroll_unsupported_arch:${arch}`);
+  const abiProfile = options.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  const hostname = options.hostname ?? os.hostname();
+
+  const body: EnrollDirectV2Request = {
+    installId: options.identity.installId,
+    nodeTokenHash: options.identity.nodeTokenHash,
+    hostname,
+    os: targetOs,
+    arch,
+    abiProfile,
+    ...(options.hostServerId ? { hostServerId: options.hostServerId } : {}),
+  };
+
+  const targetUrl = `${expectedOrigin}${ENROLL_DIRECT_V2_PATH}`;
+  const response = await fetchImpl(targetUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${options.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    redirect: 'error',
+  });
+
+  if (response.redirected) {
+    throw new Error('direct_enroll_redirect_rejected');
+  }
+  if (!response.url) {
+    throw new Error('direct_enroll_response_url_invalid');
+  }
+  let responseOrigin: string;
+  try {
+    responseOrigin = new URL(response.url).origin;
+  } catch {
+    throw new Error('direct_enroll_response_url_invalid');
+  }
+  if (responseOrigin !== expectedOrigin) {
+    throw new Error(`direct_enroll_origin_mismatch:${responseOrigin}`);
+  }
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => null) as { error?: unknown } | null;
+    const errCode = typeof errBody?.error === 'string' ? errBody.error : undefined;
+    if (response.status === 404 || response.status === 405 || response.status === 501) {
+      throw new EnrollDirectUnsupportedError(response.status, errCode);
+    }
+    throw new Error(`direct_enroll_failed:${response.status}${errCode ? `:${errCode}` : ''}`);
+  }
+
+  const parsed = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('direct_enroll_invalid_response');
+  }
+  if ('token' in parsed && parsed.token !== undefined) {
+    throw new Error('direct_enroll_raw_token_rejected');
+  }
+  if (
+    parsed.ok !== true
+    || typeof parsed.serverId !== 'string'
+    || parsed.serverId.length === 0
+    || !isControlledNodeId(parsed.nodeId)
+    || parsed.nodeRole !== NODE_ROLE.CONTROLLED
+  ) {
+    throw new Error('direct_enroll_invalid_response');
+  }
+
+  return {
+    nodeRole: NODE_ROLE.CONTROLLED,
+    serverId: parsed.serverId,
+    nodeId: parsed.nodeId,
+    token: options.identity.nodeToken,
+    serverUrl: expectedOrigin,
+    abiProfile,
+    ...(typeof parsed.displayName === 'string' && parsed.displayName ? { displayName: parsed.displayName } : {}),
+  };
+}
+
 export function assertProductionServerUrl(serverUrl: string): void {
   allowedEnrollmentServerOrigin(serverUrl);
 }
@@ -814,4 +1004,65 @@ export function allowedEnrollmentServerOrigin(serverUrl: string): string {
 
 export function isValidNodeTokenHash(value: string): boolean {
   return isEnrollmentNodeTokenHash(value) && value.length === ENROLLMENT_NODE_TOKEN_HASH_HEX_LEN;
+}
+
+/**
+ * Inspect an already-staged regular non-symlink executable and compute a real
+ * `StagedExecutableReceipt` (size, streaming SHA-256, and POSIX identity).
+ */
+export async function inspectExecutableReceipt(
+  executablePath: string,
+  sourceExecutablePath?: string,
+): Promise<StagedExecutableReceipt> {
+  const before = await lstat(executablePath);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error('staged_executable_not_regular');
+  }
+  const beforeIdentity = fileIdentityFromStat(before);
+  const handle = await openNoFollow(executablePath, false);
+  try {
+    const after = await handle.stat();
+    if (!after.isFile()) {
+      throw new Error('staged_executable_not_regular');
+    }
+    const stagedIdentity = fileIdentityFromStat(after);
+    if (!sameFileIdentity(beforeIdentity, stagedIdentity)) {
+      throw new Error('staged_executable_identity_changed');
+    }
+
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    while (position < after.size) {
+      const toRead = Math.min(buffer.length, after.size - position);
+      const { bytesRead } = await handle.read(buffer, 0, toRead, position);
+      if (bytesRead <= 0) {
+        throw new Error('staged_executable_read_ended_early');
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+
+    let sourceIdentity = stagedIdentity;
+    if (sourceExecutablePath && sourceExecutablePath !== executablePath) {
+      try {
+        const srcStat = await lstat(sourceExecutablePath);
+        if (!srcStat.isSymbolicLink() && srcStat.isFile()) {
+          sourceIdentity = fileIdentityFromStat(srcStat);
+        }
+      } catch {
+        // Fall back to stagedIdentity when optional source path is unavailable.
+      }
+    }
+
+    return {
+      path: executablePath,
+      size: after.size,
+      sha256: hash.digest('hex'),
+      sourceIdentity,
+      stagedIdentity,
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }

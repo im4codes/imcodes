@@ -8,7 +8,10 @@
  */
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
+import { AMBIGUOUS_PARTICIPANT_ACTOR } from './machine-authority.js';
 import { readProcessSharedMachineAuthority, readProcessSharedMachineParticipants } from './shared-machine-authority-context.js';
+
+export { AMBIGUOUS_PARTICIPANT_ACTOR };
 
 export interface SenderParticipantTurn {
   /** The participant that started the turn; a placeholder when several users fed it. */
@@ -16,8 +19,6 @@ export interface SenderParticipantTurn {
   /** The server-minted token of the single participant; null when there is none or several (the receiver then fails closed). */
   authority: string | null;
 }
-
-export const AMBIGUOUS_PARTICIPANT_ACTOR = 'participant';
 
 /** Null when the sender is not in a participant turn (an owner turn, or no such session). Synchronous: in-memory registries only. */
 export function readSenderParticipantTurn(senderSessionName: string | null | undefined): SenderParticipantTurn | null {
@@ -52,4 +53,27 @@ export function readSenderParticipantTurn(senderSessionName: string | null | und
     actorUserId: actors.length === 1 ? actors[0]! : AMBIGUOUS_PARTICIPANT_ACTOR,
     authority: process.authority,
   };
+}
+
+/**
+ * Returns the active owner-turn machine authority token when the sender session is running an
+ * authenticated owner turn (never participant or mixed). Synchronous: in-memory registries only.
+ */
+export function readSenderOwnerMachineAuthority(senderSessionName: string | null | undefined): string | null {
+  if (!senderSessionName) return null;
+  if (readSenderParticipantTurn(senderSessionName)) return null;
+  const record = getSession(senderSessionName);
+  if (!record) return null;
+  const runtime = getTransportRuntime(senderSessionName);
+  if (runtime) {
+    return runtime.getActiveOwnerMachineAuthority?.() ?? null;
+  }
+  if (!record.sessionInstanceId || !record.runtimeEpoch) return null;
+  const process = readProcessSharedMachineAuthority(
+    senderSessionName,
+    { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch },
+    Date.now(),
+    record.state === 'running',
+  );
+  return !process.required ? process.authority : null;
 }

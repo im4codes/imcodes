@@ -54,6 +54,7 @@
     "prepare": "husky",
     "bench:memory": "tsx bench/memory-pipeline.bench.ts",
     "build:node-exe": "node scripts/build-node-exe.mjs",
+    "build:daemon-runtime": "node scripts/build-daemon-runtime.mjs",
     "package:macos-remote-desktop": "node --import tsx scripts/macos-remote-desktop-release-guard.ts package",
     "check:node-exe-deps": "node scripts/check-node-exe-deps.mjs"
   },
@@ -91,7 +92,7 @@
     "husky": "^9.1.7",
     "jsdom": "^28.1.0",
     "lint-staged": "^16.3.4",
-    "open-computer-use": "0.3.3",
+    "open-computer-use": "1.1.4",
     "postject": "1.0.0-alpha.6",
     "tsx": "^4.23.15",
     "typescript": "npm:@typescript/typescript6@^6.0.2",

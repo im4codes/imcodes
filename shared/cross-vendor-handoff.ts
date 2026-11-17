@@ -1,9 +1,17 @@
 /** Shared cross-vendor handoff contract and bounded configuration. */
+export const CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS = {
+  recentTurns: { min: 0, max: 200 },
+  summaryLimit: { min: 0, max: 200 },
+  maxChars: { min: 500, max: 500_000 },
+} as const;
+
 export const CROSS_VENDOR_HANDOFF_DEFAULTS = {
   enabled: true,
-  maxTokens: 9000,
-  hardMaxTokens: 18000,
-  recentTurns: 30,
+  maxTokens: 50000,
+  hardMaxTokens: 50000,
+  recentTurns: 100,
+  summaryLimit: 20,
+  maxChars: 128_000,
   maxTextChars: 1200,
   timeoutMs: 3000,
   providerWaitMs: 2000,
@@ -15,6 +23,7 @@ export const CROSS_VENDOR_HANDOFF_HEADINGS = {
   notice: 'Non-authoritative prior context; verify against the worktree and current tools.',
   goal: 'Goal and open TODOs',
   facts: 'Facts, decisions and constraints',
+  summaries: 'Recent session summaries',
   turns: 'Recent completed turns',
   tools: 'Tool activity',
   work: 'Work state pointers',
@@ -25,6 +34,8 @@ export interface CrossVendorHandoffConfig {
   enabled: boolean;
   maxTokens: number;
   recentTurns: number;
+  summaryLimit: number;
+  maxChars: number;
   timeoutMs: number;
   /** Maximum time the first target turn waits for the async pack. */
   providerWaitMs: number;
@@ -81,12 +92,34 @@ export function isCrossVendorHandoffLaunchCurrent(input: {
     && input.currentAgentType === input.targetAgentType;
 }
 
+function clampInt(raw: number | undefined, fallback: number, min: number, max: number): number {
+  const n = typeof raw === 'number' && Number.isFinite(raw) ? Math.trunc(raw) : fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
 export function normalizeCrossVendorHandoffConfig(input?: Partial<CrossVendorHandoffConfig> | null): CrossVendorHandoffConfig {
   const maxTokens = Number.isFinite(input?.maxTokens) ? Math.trunc(input!.maxTokens!) : CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens;
   return {
     enabled: input?.enabled !== false,
     maxTokens: Math.max(1, Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens, maxTokens)),
-    recentTurns: Math.max(CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns, Math.min(100, Math.trunc(input?.recentTurns ?? CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns))),
+    recentTurns: clampInt(
+      input?.recentTurns,
+      CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns,
+      CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.recentTurns.min,
+      CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.recentTurns.max,
+    ),
+    summaryLimit: clampInt(
+      input?.summaryLimit,
+      CROSS_VENDOR_HANDOFF_DEFAULTS.summaryLimit,
+      CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.summaryLimit.min,
+      CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.summaryLimit.max,
+    ),
+    maxChars: clampInt(
+      input?.maxChars,
+      CROSS_VENDOR_HANDOFF_DEFAULTS.maxChars,
+      CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.maxChars.min,
+      CROSS_VENDOR_HANDOFF_LIMIT_BOUNDS.maxChars.max,
+    ),
     timeoutMs: Math.max(250, Math.min(30_000, Math.trunc(input?.timeoutMs ?? CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs))),
     providerWaitMs: Math.max(0, Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs, Math.trunc(input?.providerWaitMs ?? CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs))),
     includeToolPreviews: input?.includeToolPreviews === true,

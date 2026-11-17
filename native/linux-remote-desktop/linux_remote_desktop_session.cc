@@ -1,3 +1,4 @@
+#include "../remote-desktop-common/webrtc_traffic_stats.h"
 #include "linux_remote_desktop_session.h"
 
 #include <chrono>
@@ -261,7 +262,8 @@ class LinuxMediaStatsObserver : public webrtc::RTCStatsCollectorCallback {
       }
     }
     if (auto session = session_.lock()) {
-      session->HandleMediaStats(has_outbound_video, outbound_bytes);
+      session->HandleMediaStats(has_outbound_video, outbound_bytes,
+          report ? imcodes::rd::ReadTrafficStats(*report) : std::vector<imcodes::rd::TrafficSample>{});
     }
   }
 
@@ -283,7 +285,9 @@ void LinuxRemoteDesktopSession::CheckMediaProgress() {
 }
 
 void LinuxRemoteDesktopSession::HandleMediaStats(
-    bool has_outbound_video, std::uint64_t outbound_bytes) {
+    bool has_outbound_video, std::uint64_t outbound_bytes,
+    std::vector<imcodes::rd::TrafficSample> traffic) {
+  { std::lock_guard lock(traffic_mutex_); traffic_stats_ = std::move(traffic); }
   media_stats_in_flight_ = false;
   if (closed_ || !has_outbound_video || !video_lease_) return;
   const std::uint64_t source_frames = video_lease_->captured_frames();

@@ -1,3 +1,4 @@
+import { FILE_RELAY_MODE, R2_RELAY_MSG } from '../../shared/r2-relay.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -74,6 +75,47 @@ describe('file-transfer local handle hardening', () => {
     vi.unstubAllEnvs();
     vi.resetModules();
     await rm(rootDir, { recursive: true, force: true });
+  });
+
+  it('R2 fetched uploads retain server-side content sniffing instead of trusting declared MIME', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(bytes, { headers: { 'content-length': String(bytes.length) } })));
+    const link = createServerLinkMock();
+    await transfer.handleFileUploadFetch({ type: FILE_TRANSFER_MSG.UPLOAD_FETCH, uploadId: 'r2-image',
+      filename: 'a'.repeat(32) + '.png', originalName: 'image.png', size: bytes.length,
+      mime: 'text/html', relayMode: FILE_RELAY_MODE.R2, downloadUrl: 'https://r2.example/signed-get' }, link.serverLink as never);
+    expect(link.sent.at(-1)).toMatchObject({ type: FILE_TRANSFER_MSG.UPLOAD_DONE, attachment: { mime: 'image/png' } });
+  });
+
+  it.each([false, true])('R2 PUT streams exact bytes and only reports ready after successful PUT (reject=%s)', async (reject) => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const filePath = path.join(fakeHome, 'r2-small.bin');
+    const content = Buffer.from([0, 255, 128, 9]);
+    await writeFile(filePath, content);
+    const handle = transfer.createProjectFileHandle(filePath, 'r2-small.bin', 'application/octet-stream', content.length);
+    const link = createServerLinkMock();
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      expect(link.sent.some((msg: any) => msg.type === R2_RELAY_MSG.PROGRESS)).toBe(true);
+      expect(link.sent.some((msg: any) => msg.type === R2_RELAY_MSG.DONE)).toBe(false);
+      const chunks: Buffer[] = [];
+      for await (const chunk of init.body as AsyncIterable<Buffer>) chunks.push(Buffer.from(chunk));
+      expect(Buffer.concat(chunks)).toEqual(content);
+      return new Response(null, { status: reject ? 403 : 200 });
+    });
+    vi.stubGlobal('fetch', fetch);
+    await transfer.handleFileDownloadStream({ type: R2_RELAY_MSG.DOWNLOAD, downloadId: 'r2-test',
+      attachmentId: handle.id, uploadUrl: 'https://r2.example/signed-put' }, link.serverLink as never);
+    expect(fetch).toHaveBeenCalledTimes(1); // even small files must use R2, never inline/base64
+    const events = link.sent as Array<Record<string, unknown>>;
+    expect(events.some((msg) => msg.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY)).toBe(false);
+    if (reject) {
+      expect(events.at(-1)?.type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_ERROR);
+      expect(events.some((msg) => msg.type === R2_RELAY_MSG.DONE)).toBe(false);
+    } else {
+      expect(events.at(-1)).toMatchObject({ type: R2_RELAY_MSG.DONE, size: content.length });
+      expect(events.at(-2)).toMatchObject({ type: R2_RELAY_MSG.PROGRESS, loadedBytes: content.length, etaSeconds: 0 });
+    }
   });
 
   it.runIf(process.env.IMC_BIG_TRANSFER === '1')('real-stream 15KiB and 500MiB repeat/relay transfers preserve bytes', async () => {
@@ -680,10 +722,11 @@ describe('file-transfer local handle hardening', () => {
 
   it('resumes a broken relay upload fetch from the bytes already written', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
+    let breakConnection!: () => void;
     const broken = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode('he'));
-        setTimeout(() => controller.error(new TypeError('link_lost')), 20);
+        breakConnection = () => controller.error(new TypeError('link_lost'));
       },
     });
     const fetchMock = vi.fn()
@@ -695,7 +738,7 @@ describe('file-transfer local handle hardening', () => {
     vi.stubGlobal('fetch', fetchMock);
     const done = createServerLinkMock();
 
-    await transfer.handleFileUploadFetch({
+    const upload = transfer.handleFileUploadFetch({
       type: 'file.upload_fetch',
       uploadId: 'upload-fetch-resume',
       filename: 'resume.txt',
@@ -704,6 +747,18 @@ describe('file-transfer local handle hardening', () => {
       size: 5,
       downloadUrl: 'https://relay.example/upload-staged/upload-fetch-resume?token=reusable',
     }, done.serverLink as never);
+
+    // Break only after the prefix really reached disk. A wall-clock delay
+    // races initialization/IO on a loaded runner and can discard the queued
+    // stream chunk before the handler has even attached its reader.
+    try {
+      await vi.waitFor(async () => {
+        await expect(readFile(path.join(fakeHome, '.imcodes', 'uploads', 'resume.txt'), 'utf8')).resolves.toBe('he');
+      });
+    } finally {
+      breakConnection();
+      await upload;
+    }
 
     expect(fetchMock).toHaveBeenNthCalledWith(2, expect.any(String), expect.objectContaining({
       headers: { Range: 'bytes=2-' },

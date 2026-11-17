@@ -1,3 +1,5 @@
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { tryAcquireCompactHijackSlot, finishCompactHijackSlot } from '../agent/session-manager.js';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { taskPairService } from './task-pairs/service.js';
@@ -5,13 +7,24 @@ import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './ta
 import { setTransportToolExecutionEvaluator } from './transport-relay.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import {
+  captureRuntimeOwnerAuthorityBeforeInterrupt,
+  sendRuntimeWithPreservedAuthority,
+} from './machine-authority-send.js';
+import { isAutoCreatedSubSessionName, isTerminalTaskPairStatus } from '../../shared/task-pair.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { isSessionWorking } from './session-working.js';
 import { createSupervisionSessionPresentationResolver } from './supervision-session-presentation.js';
 import { createSupervisionPairRefreshScheduler } from './supervision-pair-refresh.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { markDaemonProcess } from './process-role.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
+import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
+import {
+  captureRestartContinuationsBeforeShutdownDetailed,
+  captureUncleanRestartContinuations,
+  hasPendingRestartContinuation,
+} from './restart-continuation.js';
 import { DAEMON_STARTUP_PHASE } from '../../shared/daemon-upgrade.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession, createTmuxHealthProbe, type TmuxHealthProbe } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
@@ -19,7 +32,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions, triggerCompactHijackForSession, consumeManualCompactProcessTurn } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -30,7 +43,7 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { releaseProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import { releaseProcessSharedMachineAuthority, readProcessSharedMachineParticipants } from './shared-machine-authority-context.js';
 import { isDuplicateTimelineForward } from './timeline-forward-dedup.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -183,6 +196,27 @@ export function createSupervisionHeartbeatProjectionSyncHandler(deps: {
   };
 }
 
+/**
+ * Create the ServerLink disconnect security handler used during daemon startup.
+ * Incognito sessions live in RAM only and must stay open across transient
+ * server WS disconnects/reconnects until manually closed — only capability
+ * authorization trust anchors are cleared on link drop.
+ */
+export function createServerLinkDisconnectSecurityHandler(deps: {
+  serverId: string;
+  capabilityServicesByOwner: Pick<Map<string, unknown>, 'keys'>;
+  capabilitySyncServicesByOwner: Pick<Map<string, unknown>, 'keys'>;
+}): () => void {
+  return () => {
+    for (const ownerId of new Set([
+      ...deps.capabilityServicesByOwner.keys(),
+      ...deps.capabilitySyncServicesByOwner.keys(),
+    ])) {
+      clearCapabilityAuthorizationKeys(ownerId, deps.serverId);
+    }
+  };
+}
+
 let supervisionConsole: SupervisionConsoleBinding | undefined;
 
 /** Exposed for diagnostics/tests; undefined until the link is bound. */
@@ -255,6 +289,33 @@ export function resolvePushDisplayContext(sessionName: string, sessions: Session
     ...(label ? { label } : {}),
     ...(parentLabel ? { parentLabel } : {}),
   };
+}
+
+/**
+ * Suppress `task_complete` push notifications when a session is a daemon/internal
+ * worker: auto-provisioned pair/send sub-sessions, execution clones, or active
+ * non-terminal Task Pair executors/auditors (while keeping Brain and manual
+ * interactive sessions firing normally).
+ */
+export function shouldSuppressSessionIdlePush(
+  sessionName: string,
+  record?: Pick<SessionRecord, 'pairCreatedMetadata' | 'executionCloneMetadata'> | null,
+): boolean {
+  if (record?.pairCreatedMetadata?.autoCreated === true) return true;
+  if (record?.executionCloneMetadata != null) return true;
+  if (isAutoCreatedSubSessionName(sessionName)) return true;
+  try {
+    const pairs = getTaskPairStore().pairsForSession(sessionName);
+    if (pairs.some((pair) => (
+      !isTerminalTaskPairStatus(pair.state.status)
+      && (pair.state.executor === sessionName || pair.state.auditor === sessionName)
+    ))) {
+      return true;
+    }
+  } catch {
+    // Store may be uninitialized in lightweight unit tests.
+  }
+  return false;
 }
 
 export interface DaemonContext {
@@ -634,7 +695,7 @@ export async function startup(): Promise<DaemonContext> {
   configureSessionStoreWriteAuthority(lockServer.identity, lockServer.metadataPath);
   // Only the process that owns the lock records its start and reads how its predecessor ended: a server-driven
   // upgrade is held back while this process is new or recovering from a crash (see upgrade-readiness.ts).
-  beginUpgradeReadinessTracking();
+  const { uncleanPreviousExit } = beginUpgradeReadinessTracking();
   markDaemonProcess();
   cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
@@ -650,6 +711,21 @@ export async function startup(): Promise<DaemonContext> {
   // not replace it with a disk snapshot.
   markSessionStoreAuthoritative();
   logger.info('Session store loaded');
+  try {
+    const uncleanCaptured = captureUncleanRestartContinuations({
+      uncleanPreviousExit,
+      sessions: listSessions(),
+      activeDispatchSessions: new Set(getTransportQueueStore().listActiveDispatchSessionNames()),
+    });
+    if (uncleanCaptured.length > 0) {
+      logger.info(
+        { count: uncleanCaptured.length, sessions: uncleanCaptured.map((c) => c.sessionName) },
+        'Captured interrupted active sessions after unclean exit for auto-continue',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Unclean-exit restart-continuation capture failed');
+  }
   updateInstanceLockDiagnostics(lockServer, {
     sessionIds: listSessions().map((session) => session.name),
     residualResources: [
@@ -701,6 +777,10 @@ export async function startup(): Promise<DaemonContext> {
     const loaded = await loadMemoryShortRefsFromStore();
     if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed');
   })().catch(() => { /* non-fatal: handles are a pure function of the id */ });
+
+  // Independent opt-in SQLite policy. The writer owns its timer and durable daily progress.
+  const { timelineProjection: retentionProjection } = await import('./timeline-projection.js');
+  retentionProjection.startRetention();
 
   // Clean up old timeline files (>7 days) and truncate oversized ones.
   //
@@ -854,11 +934,11 @@ export async function startup(): Promise<DaemonContext> {
     const capabilitySourceConvergenceStore = new CapabilitySourceConvergenceStore();
     const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
     const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
-    setServerLinkDisconnectSecurityHandler(() => {
-      for (const ownerId of new Set([...capabilityServicesByOwner.keys(), ...capabilitySyncServicesByOwner.keys()])) {
-        clearCapabilityAuthorizationKeys(ownerId, serverId);
-      }
-    });
+    setServerLinkDisconnectSecurityHandler(createServerLinkDisconnectSecurityHandler({
+      serverId,
+      capabilityServicesByOwner,
+      capabilitySyncServicesByOwner,
+    }));
     const capabilitySyncServiceForOwner = (ownerId: string): CapabilitySyncService => {
       let service = capabilitySyncServicesByOwner.get(ownerId);
       if (!service) {
@@ -1052,11 +1132,13 @@ export async function startup(): Promise<DaemonContext> {
             continue;
           }
           const id = session.name.slice('deck_sub_'.length);
+          const incognito = isIncognitoSession(session);
           const transportRuntime = getTransportRuntime(session.name);
           try {
             serverLink.send({
               type: 'subsession.sync',
               id,
+              ...(incognito ? { incognito: true } : {}),
               sessionInstanceId: session.sessionInstanceId ?? null,
               runtimeEpoch: session.runtimeEpoch ?? null,
               // Including state here fixes "sidebar sub-session dot stuck
@@ -1066,14 +1148,14 @@ export async function startup(): Promise<DaemonContext> {
               sessionType,
               cwd: session.projectDir || null,
               label: session.label ?? null,
-              ccSessionId: session.ccSessionId ?? null,
-              geminiSessionId: session.geminiSessionId ?? null,
+              ccSessionId: incognito ? null : (session.ccSessionId ?? null),
+              geminiSessionId: incognito ? null : (session.geminiSessionId ?? null),
               parentSession: session.parentSession ?? null,
               ccPresetId: session.ccPreset ?? null,
               description: session.description ?? null,
               runtimeType: session.runtimeType ?? null,
               providerId: session.providerId ?? null,
-              providerSessionId: session.providerSessionId ?? null,
+              providerSessionId: incognito ? null : (session.providerSessionId ?? null),
               qwenModel: session.qwenModel ?? null,
               qwenAuthType: session.qwenAuthType ?? null,
               qwenAvailableModels: session.qwenAvailableModels ?? null,
@@ -1147,6 +1229,20 @@ export async function startup(): Promise<DaemonContext> {
     // the event; local listeners must ignore it.
     if (e.type === 'session.state' && isServerLinkResyncStatePayload(e.payload)) return;
     liveContextIngestion.handleTimelineEvent(e);
+    if (e.type === 'agent.status' && (e.payload as Record<string, unknown>).status === 'compacting') {
+      const rec = getSession(e.sessionId);
+      if (rec && rec.runtimeType !== 'transport' && !isTransportAgent(rec.agentType ?? '')) {
+        if (
+          readProcessSharedMachineParticipants(e.sessionId).length === 0
+          && !consumeManualCompactProcessTurn(e.sessionId)
+          && tryAcquireCompactHijackSlot(e.sessionId)
+        ) {
+          void triggerCompactHijackForSession(e.sessionId, serverLink ?? undefined, { reason: 'status' })
+            .then(() => finishCompactHijackSlot(e.sessionId, true))
+            .catch(() => finishCompactHijackSlot(e.sessionId, false));
+        }
+      }
+    }
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);
       // The turn is over: a participant's machine-authority window on a process session ends here.
@@ -1337,10 +1433,13 @@ export async function startup(): Promise<DaemonContext> {
       if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
         const rec = listSessions().find((s) => s.name === event.sessionId);
         if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
+        const outgoingEvent = shouldSuppressSessionIdlePush(event.sessionId, rec)
+          ? { ...event, payload: { ...event.payload, [TIMELINE_SUPPRESS_PUSH_FIELD]: true } }
+          : event;
         void getLastAssistantText(event.sessionId).then((lastText) => {
-          serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
+          serverLink!.send({ type: 'timeline.event', event: outgoingEvent, ...(lastText ? { lastText } : {}) });
         }).catch(() => {
-          serverLink!.send({ type: 'timeline.event', event });
+          serverLink!.send({ type: 'timeline.event', event: outgoingEvent });
         });
         return;
       }
@@ -1429,6 +1528,7 @@ export async function startup(): Promise<DaemonContext> {
         void reconcileDurableTransportQueues();
         // Shell/script sessions are always "idle" — skip to avoid noise
         if (record?.agentType === 'shell' || record?.agentType === 'script') return;
+        if (shouldSuppressSessionIdlePush(payload.session, record)) return;
         // notifySessionIdle is handled by the unified timeline listener below
         // Include last assistant text for push notification context
         void getLastAssistantText(payload.session).then((lastText) => {
@@ -1503,6 +1603,15 @@ export async function startup(): Promise<DaemonContext> {
   });
   taskPairService.setScheduler(taskPairAutomation);
   taskPairAutomation.start();
+  if (creds && serverLink) {
+    void import('./repo-callback-monitor.js')
+      .then(({ startRepoCallbackMonitor }) => {
+        startRepoCallbackMonitor(serverLink);
+      })
+      .catch((err) => {
+        logger.debug({ err }, 'repo-callback-monitor: startup prime failed');
+      });
+  }
   // In-flight legacy tasks of `pairs` projects are imported once; off the startup path.
   setImmediate(() => {
     void (async () => {
@@ -1765,7 +1874,8 @@ function hasRestorableLocalTransportSessions(
     if (!s.providerSessionId) return false;
     if (options.onlyWithPendingResend
       && getResendCount(s.name) === 0
-      && !getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === s.name)) return false;
+      && !getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === s.name)
+      && !hasPendingRestartContinuation(s.name)) return false;
     if (options.onlyMissingRuntime && getTransportRuntime(s.name)?.providerSessionId) return false;
     return true;
   });
@@ -1875,11 +1985,42 @@ export function shutdown(exitCode = 0): Promise<void> {
   return shutdownInFlight;
 }
 
+export function captureShutdownRestartContinuationsAndMarkExit(opts?: { filePath?: string }): { persisted: boolean; count: number } {
+  let continuationsPersisted = false;
+  let capturedCount = 0;
+  try {
+    const activeDispatchSessions = new Set(getTransportQueueStore().listActiveDispatchSessionNames());
+    const result = captureRestartContinuationsBeforeShutdownDetailed({
+      sessions: listSessions(),
+      getRuntime: (name) => getTransportRuntime(name),
+      activeDispatchSessions,
+      ...(opts?.filePath ? { filePath: opts.filePath } : {}),
+    });
+    continuationsPersisted = result.persisted;
+    capturedCount = result.captured.length;
+    if (result.captured.length > 0) {
+      logger.info(
+        { count: result.captured.length, sessions: result.captured.map((c) => c.sessionName) },
+        'Captured active sessions before daemon shutdown for auto-continue',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Pre-shutdown restart-continuation capture failed');
+  }
+  if (continuationsPersisted) {
+    markGracefulShutdownStarted();
+  } else {
+    logger.warn('Leaving daemon run-state unclean because restart-continuation persistence failed');
+  }
+  return { persisted: continuationsPersisted, count: capturedCount };
+}
+
 async function performShutdown(exitCode: number): Promise<void> {
   logger.info('Daemon shutting down');
-  // First thing, before any teardown can be slow or fail: this exit is on purpose (SIGTERM from `systemctl restart`,
-  // which the upgrade script itself uses, included), so the next process is not "recovering from a crash".
-  markGracefulShutdownStarted();
+  // Capture active sessions BEFORE marking graceful shutdown and BEFORE any teardown:
+  // if continuation persistence fails, keep run-state as `running` so the next startup
+  // triggers unclean-exit recovery instead of silently dropping interrupted turns.
+  captureShutdownRestartContinuationsAndMarkExit();
   const orderedShutdown = await runOrderedDaemonShutdown({
     session: async () => {
       logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session started');
@@ -2084,6 +2225,8 @@ async function performShutdown(exitCode: number): Promise<void> {
     configureSharedContextRuntime(null);
     const { stopSupervisorDefaultsCacheRefresh } = await import('./supervisor-defaults-cache.js');
     stopSupervisorDefaultsCacheRefresh();
+    const { stopRepoCallbackMonitor } = await import('./repo-callback-monitor.js');
+    stopRepoCallbackMonitor();
     await flushStore();
     logger.info('Store flushed');
   } catch (e) {
@@ -2119,7 +2262,7 @@ const HEALTH_POLL_MS = 30_000;
 // finalize miss leaves the UI "working" for a whole operator session. Active
 // tool calls still use the runtime's longer tool-aware floor.
 const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 12 * 60_000;
-const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 6 * 60_000;
+const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
@@ -2546,7 +2689,8 @@ export async function recoverCodexStalledSession(
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
-  const sendResult = runtime.send('continue', commandId, undefined, undefined, {
+  const ownerAuthority = captureRuntimeOwnerAuthorityBeforeInterrupt(runtime);
+  const sendResult = sendRuntimeWithPreservedAuthority(runtime, 'continue', commandId, ownerAuthority, {
     queuePlacement: 'front',
     timelineCommitted: true,
     messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
@@ -2596,7 +2740,7 @@ export async function recoverMemoryCompressionStalledSession(
     {
       ...attachDaemonUserNotice(
         DAEMON_USER_NOTICE_CODE.MEMORY_WATCHDOG_RECOVERED,
-        '⚠️ Memory compression watchdog stopped a stale turn after 6 minutes and sent `continue`.',
+        '⚠️ Memory compression watchdog stopped a stale turn after 12 minutes and sent `continue`.',
         { minutes: MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS / 60_000 },
       ),
       streaming: false,
@@ -2618,7 +2762,8 @@ export async function recoverMemoryCompressionStalledSession(
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
-  const sendResult = runtime.send('continue', commandId, undefined, undefined, {
+  const ownerAuthority = captureRuntimeOwnerAuthorityBeforeInterrupt(runtime);
+  const sendResult = sendRuntimeWithPreservedAuthority(runtime, 'continue', commandId, ownerAuthority, {
     queuePlacement: 'front',
     timelineCommitted: true,
     messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,

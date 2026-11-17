@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { h } from 'preact';
+import { h, type ComponentProps } from 'preact';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const { probeDirectConnectivityMock, directFileStatusListeners } = vi.hoisted(() => ({
@@ -76,11 +76,15 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/SubSessionCard.js', () => ({
-  SubSessionCard: ({ sub, accentColor }: { sub: SubSession; accentColor?: string }) => (
+  SubSessionCard: ({ sub, accentColor, sequenceNumber }: { sub: SubSession; accentColor?: string; sequenceNumber?: number }) => (
     <div
       data-testid={`subsession-preview-${sub.id}`}
       style={{ '--subsession-accent-color': accentColor } as any}
-    />
+    >
+      {typeof sequenceNumber === 'number' && sequenceNumber > 0 ? (
+        <sup class="subcard-seq" data-testid={`subsession-seq-${sub.id}`}>{sequenceNumber}</sup>
+      ) : null}
+    </div>
   ),
 }));
 
@@ -115,7 +119,7 @@ vi.mock('../../src/direct-file-transfer.js', () => ({
   }),
 }));
 
-import { SubSessionBar } from '../../src/components/SubSessionBar.js';
+import { SubSessionBar as DefaultSubSessionBar } from '../../src/components/SubSessionBar.js';
 import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
@@ -127,6 +131,11 @@ import {
 import { TEAM_DISCUSSION_LAYOUT } from '../../src/team-discussion-layout-preference.js';
 
 const LOCALE_DIR = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/i18n/locales');
+
+// Existing interaction fixtures explicitly exercise horizontal/expanded mode.
+function SubSessionBar(props: ComponentProps<typeof DefaultSubSessionBar>) {
+  return <DefaultSubSessionBar desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL} {...props} />;
+}
 
 function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   return {
@@ -182,6 +191,7 @@ const daemonStatsMessage = {
 describe('SubSessionBar', () => {
   beforeEach(() => {
     localStorage.clear();
+    localStorage.setItem('rcc_subcard_collapsed', 'false');
     vi.clearAllMocks();
     directFileStatusListeners.clear();
     probeDirectConnectivityMock.mockResolvedValue({
@@ -190,6 +200,74 @@ describe('SubSessionBar', () => {
       localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
       remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
     });
+  });
+
+  it('defaults to left-docked vertical pills while preserving explicit expanded preference', () => {
+    localStorage.removeItem('rcc_subcard_collapsed');
+    const host = document.createElement('aside');
+    document.body.appendChild(host);
+    const props = {
+      subSessions: [makeSubSession()], openIds: new Set<string>(),
+      onOpen: vi.fn(), onClose: vi.fn(), onRestart: vi.fn(),
+      ws: null, connected: true, onDiff: vi.fn(), onHistory: vi.fn(),
+      verticalRailHost: host, onDesktopDockSideChange: vi.fn(),
+    };
+    try {
+      const view = render(<DefaultSubSessionBar {...props} />);
+      expect(host.querySelector('.subsession-card-rail')).toBeTruthy();
+      expect(host.querySelector('[data-testid="subsession-vertical-rail-dock-left"]')?.getAttribute('aria-pressed')).toBe('true');
+      expect(JSON.parse(localStorage.getItem('rcc_subcard_collapsed')!)).toBe(true);
+      view.unmount();
+      localStorage.setItem('rcc_subcard_collapsed', 'false');
+      const expanded = render(<DefaultSubSessionBar {...props} />);
+      expect(expanded.getByTestId('subsession-preview-sub-1')).toBeTruthy();
+      expect(JSON.parse(localStorage.getItem('rcc_subcard_collapsed')!)).toBe(false);
+      expanded.unmount();
+    } finally { host.remove(); }
+  });
+
+  it('caps compact model labels without shortening the identity or context', () => {
+    const sub = makeSubSession({ type: 'gemini', activeModel: 'gemini-4-argon-high' });
+    const props = {
+      subSessions: [sub], openIds: new Set<string>(), collapsed: true,
+      desktopLayoutCapable: false, onOpen: vi.fn(), onClose: vi.fn(),
+      onRestart: vi.fn(), onNew: vi.fn(), ws: null, connected: true,
+      onDiff: vi.fn(), onHistory: vi.fn(),
+      subUsages: new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gemini-4-argon-high' }]]),
+    };
+    const view = render(<SubSessionBar {...props} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('ar.n-high');
+    expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toContain('gemini-4-argon-high');
+    expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('gemini-4-argon-high');
+    expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('ctx 10%');
+    expect(sub.activeModel).toBe('gemini-4-argon-high');
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: 'gpt-6.1-sol' }]} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('6.1-sol');
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: 'opus[1M]' }]} subUsages={new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'claude-opus-4-8' }]])} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('opus-4.8');
+    expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toContain('claude-opus-4-8');
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: null }]} subUsages={undefined} />);
+    expect(view.container.querySelector('.subsession-card-model')).toBeNull();
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: null }]} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('ar.n-high');
+    view.rerender(
+      <SubSessionBar
+        {...props}
+        subSessions={[{ ...sub, requestedModel: 'gemini-4-hydrogen-high', activeModel: 'gemini-4-hydrogen-high' }]}
+        subUsages={new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gemini-2.5-pro' }]])}
+      />,
+    );
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('hy.n-high');
+    expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toBe('gemini-4-hydrogen-high · gemini-2.5-pro');
+    expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('gemini-4-hydrogen-high · gemini-2.5-pro');
+
+    const cssPath = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/styles.css');
+    const css = readFileSync(cssPath, 'utf8');
+    const cardModelRule = /^\.subsession-card-model \{([^}]*)\}/m.exec(css)?.[1] ?? '';
+    expect(cardModelRule).toMatch(/white-space:\s*nowrap/);
+    expect(cardModelRule).toMatch(/overflow:\s*hidden/);
+    expect(cardModelRule).toMatch(/max-width:\s*100%/);
+    expect(cardModelRule).toMatch(/margin-left:\s*0/);
   });
 
   it('shows gray, green, and yellow daemon-bar connection states from the live broker', async () => {
@@ -1199,6 +1277,174 @@ describe('SubSessionBar', () => {
     });
   });
 
+
+  function touchReorderSessions() {
+    return [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+  }
+
+  function renderTouchReorderBar(subSessions = touchReorderSessions()) {
+    const onOpen = vi.fn();
+    const props = {
+      subSessions, openIds: new Set<string>(), collapsed: true, desktopLayoutCapable: false,
+      serverId: 'srv-1', onOpen, onClose: vi.fn(), onRestart: vi.fn(), onNew: vi.fn(),
+      ws: null, connected: true, onDiff: vi.fn(), onHistory: vi.fn(),
+    };
+    const view = render(<SubSessionBar {...props} />);
+    return {
+      ...view, onOpen,
+      updateSessions: (next: SubSession[], serverId = props.serverId) =>
+        view.rerender(<SubSessionBar {...props} subSessions={next} serverId={serverId} />),
+      first: view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement,
+      bar: view.container.querySelector('.subsession-bar') as HTMLElement,
+    };
+  }
+
+  it.each([true, false])('binds long-press reorder when the compact bar mounts after loading or removal (initially empty: %s)', (initiallyEmpty) => {
+    vi.useFakeTimers();
+    const view = renderTouchReorderBar(initiallyEmpty ? [] : touchReorderSessions());
+    if (!initiallyEmpty) {
+      fireEvent.touchStart(view.first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(200); });
+      view.updateSessions([]);
+    }
+    act(() => { vi.advanceTimersByTime(500); });
+    if (view.first) expect(view.first.style.transform).toBe('');
+
+    view.updateSessions(touchReorderSessions());
+    const first = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    const second = view.container.querySelector('[data-sub-id="sub-b"]') as HTMLElement;
+    const bar = view.container.querySelector('.subsession-bar') as HTMLElement;
+    if (view.bar) expect(bar).not.toBe(view.bar);
+    Object.defineProperty(bar, 'scrollWidth', { configurable: true, value: 600 });
+    Object.defineProperty(bar, 'clientWidth', { configurable: true, value: 200 });
+    bar.scrollLeft = 200;
+
+    // A newly mounted bar must still allow an ordinary swipe, never reorder it.
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    const swipe = new Event('touchmove', { bubbles: true, cancelable: true });
+    Object.defineProperty(swipe, 'touches', { value: [{ clientX: 60, clientY: 10 }] });
+    fireEvent(first, swipe);
+    expect(swipe.defaultPrevented).toBe(false);
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(first.style.transform).toBe('');
+    fireEvent.touchEnd(first);
+    fireEvent.click(first);
+    expect(view.onOpen).not.toHaveBeenCalled();
+
+    const originalElementFromPoint = document.elementFromPoint;
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: vi.fn(() => second) });
+    try {
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(399); });
+      expect(first.style.transform).toBe('');
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(first.style.transform).toBe('scale(1.18)');
+      expect(first.style.borderColor).toBe('rgb(245, 158, 11)');
+      expect(bar.style.overflowX).toBe('hidden');
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
+      expect(Array.from(bar.querySelectorAll<HTMLElement>('[data-sub-id]')).map((el) => el.dataset.subId))
+        .toEqual(['sub-b', 'sub-a']);
+      fireEvent.touchEnd(first);
+      fireEvent.click(first);
+      act(() => { vi.advanceTimersByTime(151); });
+      expect(vi.mocked(reorderSubSessions)).toHaveBeenCalledExactlyOnceWith('srv-1', ['sub-b', 'sub-a']);
+      expect(view.onOpen).not.toHaveBeenCalled();
+      expect(first.style.transform).toBe('');
+      expect(bar.style.overflowX).toBe('');
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: originalElementFromPoint });
+    }
+  });
+
+  it('keeps a pending hold across status updates but cancels it when switching server', () => {
+    vi.useFakeTimers();
+    const view = renderTouchReorderBar();
+    fireEvent.touchStart(view.first, { touches: [{ clientX: 10, clientY: 10 }] });
+    act(() => { vi.advanceTimersByTime(200); });
+    view.updateSessions(touchReorderSessions().map((sub) => ({ ...sub, state: 'running' })));
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(view.first.style.transform).toBe('scale(1.18)');
+    view.updateSessions(touchReorderSessions(), 'srv-2');
+    expect(view.first.style.transform).toBe('');
+    expect(view.bar.style.overflowX).toBe('');
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(view.first.style.transform).toBe('');
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
+  it.each([[70, 10], [-70, 10], [10, 70]])('keeps a pre-hold swipe scrollable without reorder or a ghost click (%s,%s)', (x, y) => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen, container } = renderTouchReorderBar();
+    Object.defineProperty(bar, 'scrollWidth', { configurable: true, value: 600 });
+    Object.defineProperty(bar, 'clientWidth', { configurable: true, value: 200 });
+    bar.scrollLeft = 200; // Neither edge: the separate overscroll guard must not intercept.
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    const move = new Event('touchmove', { bubbles: true, cancelable: true });
+    Object.defineProperty(move, 'touches', { value: [{ clientX: x, clientY: y }] });
+    fireEvent(first, move);
+    expect(move.defaultPrevented).toBe(false);
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(bar.style.overflowX).toBe('');
+    expect(first.style.transform).toBe('');
+    fireEvent.touchEnd(first);
+    fireEvent.click(first);
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(Array.from(container.querySelectorAll('.subsession-card')).map((el) => (el as HTMLElement).dataset.subId))
+      .toEqual(['sub-a', 'sub-b']);
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
+  it('arms reorder only after a stationary hold and tolerates small finger jitter', () => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen } = renderTouchReorderBar();
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchMove(first, { touches: [{ clientX: 12, clientY: 12 }] });
+    act(() => { vi.advanceTimersByTime(399); });
+    expect(bar.style.overflowX).toBe('');
+    act(() => { vi.advanceTimersByTime(1); });
+    expect(bar.style.overflowX).toBe('hidden');
+    fireEvent.touchEnd(first);
+    act(() => { vi.advanceTimersByTime(1); });
+    fireEvent.click(first);
+    expect(bar.style.overflowX).toBe('');
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancel', 'scroll', 'unmount', 'multitouch'])('cancels pending reorder on %s', (reason) => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen, unmount } = renderTouchReorderBar();
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    act(() => { vi.advanceTimersByTime(200); });
+    if (reason === 'cancel') fireEvent.touchCancel(first);
+    if (reason === 'scroll') fireEvent.scroll(bar);
+    if (reason === 'unmount') unmount();
+    if (reason === 'multitouch') fireEvent.touchStart(first, { touches: [
+      { clientX: 10, clientY: 10 }, { clientX: 20, clientY: 20 },
+    ] });
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(bar.style.overflowX).toBe('');
+    expect(first.style.transform).toBe('');
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
+  it('keeps a short tap opening the sub-session and clears its hold timer', () => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen } = renderTouchReorderBar();
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    act(() => { vi.advanceTimersByTime(150); });
+    fireEvent.touchEnd(first);
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect(onOpen).toHaveBeenCalledWith('sub-a');
+    expect(bar.style.overflowX).toBe('');
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
   it('keeps mobile long-press drag reorder working without opening the sub-session', async () => {
     vi.useFakeTimers();
     const onOpen = vi.fn();
@@ -1237,10 +1483,8 @@ describe('SubSessionBar', () => {
 
     try {
       fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
       fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
-      act(() => {
-        vi.advanceTimersByTime(401);
-      });
 
       await act(async () => { await Promise.resolve(); });
       expect(Array.from(view.container.querySelectorAll('.subsession-card')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
@@ -1292,8 +1536,8 @@ describe('SubSessionBar', () => {
     Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: undefined });
     try {
       fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
-      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
       act(() => { vi.advanceTimersByTime(401); });
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
       await act(async () => { await Promise.resolve(); });
       fireEvent.touchEnd(first);
       act(() => { vi.advanceTimersByTime(151); });
@@ -1333,7 +1577,8 @@ describe('SubSessionBar', () => {
     act(() => { vi.advanceTimersByTime(401); });
     expect(document.body.querySelector('[data-testid="subsession-context-menu"]')).toBeNull();
     fireEvent.touchEnd(button);
-    expect(onOpen).toHaveBeenCalledWith('sub-a');
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
   });
 
   it('does not open a mobile context menu from a contextmenu event', () => {
@@ -1656,6 +1901,58 @@ describe('SubSessionBar', () => {
       const view = renderBarWithBadge(2);
       const button = view.container.querySelector('[data-onboarding="discussion-history"]') as HTMLButtonElement;
       expect(button.getAttribute('data-running-discussions')).toBe('2');
+    });
+  });
+
+  describe('cronJobCount corner superscript badge on Cron button', () => {
+    const renderBarWithCron = (cronJobCount?: number, desktopLayoutCapable = true) => render(
+      <SubSessionBar
+        subSessions={[]}
+        openIds={new Set()}
+        desktopLayoutCapable={desktopLayoutCapable}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        onViewCron={vi.fn()}
+        cronJobCount={cronJobCount}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    it('hides the corner badge when cronJobCount is omitted, 0, or invalid', () => {
+      for (const value of [undefined, 0, -2, Number.NaN]) {
+        const view = renderBarWithCron(value);
+        expect(view.container.querySelector('[data-testid="cron-jobs-count-badge"]')).toBeNull();
+        const btn = view.container.querySelector('[data-onboarding="cron-manager"]') as HTMLButtonElement;
+        expect(btn.getAttribute('data-cron-count')).toBe('0');
+        expect(btn.getAttribute('title')).toBe('Scheduled Tasks');
+        view.unmount();
+      }
+    });
+
+    it('renders 1, 3, 99, and caps 100+ at 99+ on top-right corner with zero layout height impact', () => {
+      for (const [count, expectedText] of [[1, '1'], [3, '3'], [99, '99'], [100, '99+'], [120, '99+']] as const) {
+        for (const desktopLayoutCapable of [true, false]) {
+          const view = renderBarWithCron(count, desktopLayoutCapable);
+          const btn = view.container.querySelector('[data-onboarding="cron-manager"]') as HTMLButtonElement;
+          const badge = view.container.querySelector('[data-testid="cron-jobs-count-badge"]') as HTMLElement | null;
+          expect(badge).not.toBeNull();
+          expect(badge?.textContent).toBe(expectedText);
+          expect(btn.getAttribute('data-cron-count')).toBe(String(count));
+          expect(btn.style.position).toBe('relative');
+          expect(btn.style.overflow).toBe('visible');
+          expect(badge?.style.position).toBe('absolute');
+          expect(badge?.style.top).toBe('-4px');
+          expect(badge?.style.right).toBe('-4px');
+          expect(badge?.style.height).toBe('14px');
+          expect(badge?.style.pointerEvents).toBe('none');
+          view.unmount();
+        }
+      }
     });
   });
 
@@ -2026,7 +2323,7 @@ describe('SubSessionBar', () => {
 
   it('ships desktop layout labels in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
-      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
+      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, any>;
       for (const key of [
         'switch_to_vertical',
         'switch_to_horizontal',
@@ -2041,6 +2338,468 @@ describe('SubSessionBar', () => {
       ]) {
         expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
       }
+      for (const key of [
+        'title',
+        'desc',
+        'open_label',
+        'modifiers_aria',
+        'min_one_hint',
+        'reset_aria',
+      ]) {
+        expect(raw.settings?.shortcuts?.subsession_quick?.[key], `${locale}: settings.shortcuts.subsession_quick.${key}`).toBeTruthy();
+      }
+      expect(raw.settings?.shortcuts?.actions?.subsession_close_all?.title, `${locale}: settings.shortcuts.actions.subsession_close_all.title`).toBeTruthy();
+      expect(raw.settings?.shortcuts?.actions?.subsession_close_all?.desc, `${locale}: settings.shortcuts.actions.subsession_close_all.desc`).toBeTruthy();
     }
+  });
+
+  it('renders 1-based sequence badges across collapsed pills, vertical rail, overflow pills, expanded cards, and drag-reorder', () => {
+    const twentySixSubs = Array.from({ length: 26 }, (_, idx) => makeSubSession({
+      id: `seq-${idx + 1}`,
+      sessionName: `deck_sub_seq_${idx + 1}`,
+      label: `Sub ${idx + 1}`,
+    }));
+    const eightSubs = twentySixSubs.slice(0, 8);
+
+    // Collapsed horizontal bar: 1..8
+    const collapsedView = render(
+      <SubSessionBar
+        subSessions={eightSubs}
+        openIds={new Set()}
+        collapsed
+        desktopLayoutCapable
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    eightSubs.forEach((sub, idx) => {
+      const badge = collapsedView.getByTestId(`subsession-seq-${sub.id}`);
+      expect(badge.tagName).toBe('SUP');
+      expect(badge.classList.contains('subsession-card-seq')).toBe(true);
+      expect(badge.textContent).toBe(String(idx + 1));
+    });
+
+    // Drag-reorder swaps seq-1 and seq-2 immediately -> badges update 1<->2
+    const btn1 = collapsedView.container.querySelector('[data-sub-id="seq-1"]')!;
+    const btn2 = collapsedView.container.querySelector('[data-sub-id="seq-2"]')!;
+    fireEvent.dragStart(btn1);
+    fireEvent.dragOver(btn2);
+    expect(collapsedView.getByTestId('subsession-seq-seq-2').textContent).toBe('1');
+    expect(collapsedView.getByTestId('subsession-seq-seq-1').textContent).toBe('2');
+    collapsedView.unmount();
+
+    // Vertical rail: 1..8
+    const host = document.createElement('aside');
+    document.body.append(host);
+    try {
+      const railView = render(
+        <SubSessionBar
+          subSessions={eightSubs}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          verticalRailHost={host}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      eightSubs.forEach((sub, idx) => {
+        expect(host.querySelector(`[data-testid="subsession-seq-${sub.id}"]`)?.textContent).toBe(String(idx + 1));
+      });
+      railView.unmount();
+    } finally {
+      host.remove();
+    }
+
+    // Expanded mode with 26 sessions (> SUBSESSION_BAR_MAX_EXPANDED_CARDS=24): cards (1..24) + overflow pills (25, 26)
+    const expandedView = render(
+      <SubSessionBar
+        subSessions={twentySixSubs}
+        openIds={new Set()}
+        collapsed={false}
+        desktopLayoutCapable
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    twentySixSubs.forEach((sub, idx) => {
+      const badge = expandedView.getByTestId(`subsession-seq-${sub.id}`);
+      expect(badge.textContent).toBe(String(idx + 1));
+    });
+    expect(expandedView.getByTestId('subsession-overflow-pills').querySelector('[data-testid="subsession-seq-seq-25"]')?.textContent).toBe('25');
+    expect(expandedView.getByTestId('subsession-overflow-pills').querySelector('[data-testid="subsession-seq-seq-26"]')?.textContent).toBe('26');
+    expandedView.unmount();
+  });
+
+  it('renders a bottom-right T subscript on compact sub-session buttons for Team members without flowing p2p-tag', () => {
+    const teamSub = makeSubSession({ id: 'team-1', sessionName: 'deck_sub_team-1', label: 'coder', activeModel: 'gpt-6.1-sol' });
+    const soloSub = makeSubSession({ id: 'solo-2', sessionName: 'deck_sub_solo-2', label: 'helper', activeModel: 'gpt-6.1-sol' });
+    const usageMap = new Map([
+      ['deck_sub_team-1', { inputTokens: 120_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gpt-6.1-sol' }],
+      ['deck_sub_solo-2', { inputTokens: 120_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gpt-6.1-sol' }],
+    ]);
+    const p2pSet = new Set([teamSub.sessionName]);
+
+    const cssPath = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/styles.css');
+    const css = readFileSync(cssPath, 'utf8');
+    const cardCssRules = [
+      css.match(/\.subsession-card\s*\{[^}]*\}/)?.[0],
+      css.match(/\.subsession-card-seq\s*\{[^}]*\}/)?.[0],
+      css.match(/\.subsession-card-team\s*\{[^}]*\}/)?.[0],
+      css.match(/\.subsession-card-rail\s*\{[^}]*\}/)?.[0],
+    ].filter(Boolean).join('\n');
+    const styleEl = document.createElement('style');
+    styleEl.textContent = cardCssRules;
+    document.head.appendChild(styleEl);
+    try {
+      // 1. Collapsed bottom bar (includes mobile class, seq badge, and ctx bar)
+      const collapsedView = render(
+        <SubSessionBar
+          subSessions={[teamSub, soloSub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          p2pSessionLabels={p2pSet}
+          subUsages={usageMap}
+          sharedSubSessionStates={new Map([[teamSub.id, 'running' as any]])}
+        />,
+      );
+
+      const teamBtn = collapsedView.container.querySelector('[data-sub-id="team-1"]') as HTMLButtonElement;
+      const soloBtn = collapsedView.container.querySelector('[data-sub-id="solo-2"]') as HTMLButtonElement;
+      expect(teamBtn).toBeTruthy();
+      expect(soloBtn).toBeTruthy();
+
+      // Team subscript replaces in-flow .p2p-tag on the button while keeping seq + ctx + accessibility labels
+      expect(teamBtn.querySelector('.p2p-tag')).toBeNull();
+      expect(soloBtn.querySelector('.p2p-tag')).toBeNull();
+      const teamBadge = teamBtn.querySelector('[data-testid="subsession-team-team-1"]') as HTMLElement;
+      expect(teamBadge).toBeTruthy();
+      expect(teamBadge.tagName).toBe('SUB');
+      expect(teamBadge.classList.contains('subsession-card-team')).toBe(true);
+      expect(teamBadge.textContent?.trim()).toBe('T');
+      expect(teamBadge.getAttribute('aria-hidden')).toBe('true');
+      expect(soloBtn.querySelector('[data-testid="subsession-team-solo-2"]')).toBeNull();
+      expect(teamBtn.querySelector('[data-testid="subsession-seq-team-1"]')?.textContent).toBe('1');
+      expect(teamBtn.querySelector('.subsession-card-ctx')).toBeTruthy();
+      expect(teamBtn.title).toContain('session.p2p_tag');
+      expect(teamBtn.getAttribute('aria-label')).toContain('session.p2p_tag');
+      expect(soloBtn.title).not.toContain('session.p2p_tag');
+
+      // Computed style parity: Team subscript is out-of-flow (position: absolute) with zero card minHeight/padding delta
+      const teamComputed = window.getComputedStyle(teamBtn);
+      const soloComputed = window.getComputedStyle(soloBtn);
+      const teamBadgeComputed = window.getComputedStyle(teamBadge);
+      expect(teamBadgeComputed.position).toBe('absolute');
+      expect(teamBadgeComputed.bottom).toBe('-4px');
+      expect(teamBadgeComputed.right).toBe('-3px');
+      expect(teamComputed.minHeight).toBe('54px');
+      expect(teamComputed.minHeight).toBe(soloComputed.minHeight);
+      expect(teamComputed.paddingTop).toBe(soloComputed.paddingTop);
+      expect(teamComputed.paddingBottom).toBe(soloComputed.paddingBottom);
+      expect(teamBtn.style.height).toBe('');
+      expect(teamBtn.style.minHeight).toBe('');
+      expect(teamBtn.style.padding).toBe('');
+      expect(teamBtn.getAttribute('style')).toMatch(/^--subsession-accent-color:\s*#[0-9a-f]+;$/i);
+      expect(soloBtn.getAttribute('style')).toMatch(/^--subsession-accent-color:\s*#[0-9a-f]+;$/i);
+      expect(teamBtn.className).toBe(soloBtn.className);
+
+      // Rerendering without p2p membership removes the T badge cleanly
+      collapsedView.rerender(
+        <SubSessionBar
+          subSessions={[teamSub, soloSub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          p2pSessionLabels={new Set()}
+          subUsages={usageMap}
+        />,
+      );
+      expect(teamBtn.querySelector('[data-testid="subsession-team-team-1"]')).toBeNull();
+      expect(teamBtn.getAttribute('aria-label')).toBeNull();
+      collapsedView.unmount();
+
+      // 2. Desktop vertical rail reuses CollapsedSubSessionButtonImpl (.subsession-card-rail)
+      const railHost = document.createElement('aside');
+      document.body.append(railHost);
+      try {
+        const railView = render(
+          <SubSessionBar
+            subSessions={[teamSub, soloSub]}
+            openIds={new Set()}
+            collapsed
+            desktopLayoutCapable
+            desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+            verticalRailHost={railHost}
+            onOpen={vi.fn()}
+            onClose={vi.fn()}
+            onRestart={vi.fn()}
+            ws={null}
+            connected
+            onDiff={vi.fn()}
+            onHistory={vi.fn()}
+            p2pSessionLabels={p2pSet}
+            subUsages={usageMap}
+          />,
+        );
+        const railTeamBtn = railHost.querySelector('[data-sub-id="team-1"]') as HTMLButtonElement;
+        const railSoloBtn = railHost.querySelector('[data-sub-id="solo-2"]') as HTMLButtonElement;
+        expect(railTeamBtn.classList.contains('subsession-card-rail')).toBe(true);
+        expect(railTeamBtn.querySelector('.p2p-tag')).toBeNull();
+        expect(railTeamBtn.querySelector('.subsession-card-team')?.textContent?.trim()).toBe('T');
+        expect(railSoloBtn.querySelector('.subsession-card-team')).toBeNull();
+        expect(railTeamBtn.className).toBe(railSoloBtn.className);
+        const railTeamComputed = window.getComputedStyle(railTeamBtn);
+        const railSoloComputed = window.getComputedStyle(railSoloBtn);
+        expect(railTeamComputed.minHeight).toBe('48px');
+        expect(railTeamComputed.minHeight).toBe(railSoloComputed.minHeight);
+        expect(railTeamComputed.paddingTop).toBe(railSoloComputed.paddingTop);
+        expect(railTeamComputed.paddingBottom).toBe(railSoloComputed.paddingBottom);
+        railView.unmount();
+      } finally {
+        railHost.remove();
+      }
+
+      // 3. Expanded mode keeps overflow pill button compact with T, while placeholder cards retain .p2p-tag
+      const twentySixSubs = Array.from({ length: 26 }, (_, idx) => makeSubSession({
+        id: `exp-${idx + 1}`,
+        sessionName: `deck_sub_exp-${idx + 1}`,
+        label: `w-${idx + 1}`,
+      }));
+      const expandedView = render(
+        <SubSessionBar
+          subSessions={twentySixSubs}
+          openIds={new Set(['exp-1'])}
+          collapsed={false}
+          desktopLayoutCapable
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          p2pSessionLabels={new Set(['deck_sub_exp-24', 'deck_sub_exp-25'])}
+        />,
+      );
+      const overflowBar = expandedView.getByTestId('subsession-overflow-pills');
+      const overflowTeamBtn = overflowBar.querySelector('[data-sub-id="exp-25"]') as HTMLButtonElement;
+      expect(overflowTeamBtn.querySelector('.p2p-tag')).toBeNull();
+      expect(overflowTeamBtn.querySelector('.subsession-card-team')?.textContent?.trim()).toBe('T');
+      expect(overflowBar.querySelector('[data-sub-id="exp-26"] .subsession-card-team')).toBeNull();
+      // Placeholder card (non-button, unhydrated slot #24) still uses .p2p-tag
+      const placeholder = expandedView.container.querySelector('.subcard-preview-placeholder .p2p-tag');
+      expect(placeholder?.textContent).toBe('session.p2p_tag');
+      expandedView.unmount();
+    } finally {
+      styleEl.remove();
+    }
+  });
+
+  it('renders centered mobile footer status + build version below sub-sessions on mobile only and hides on desktop', () => {
+    const prevBuildTime = (globalThis as { __BUILD_TIME__?: string }).__BUILD_TIME__;
+    const sampleDate = new Date(2026, 10, 14, 22, 5, 0);
+    Object.defineProperty(globalThis, '__BUILD_TIME__', {
+      configurable: true,
+      writable: true,
+      value: sampleDate.toISOString(),
+    });
+    const sub = makeSubSession({ id: 'sub-footer', sessionName: 'deck_sub_footer', label: 'worker' });
+
+    try {
+      // 1. Mobile collapsed with sub-sessions -> footer renders after .subsession-row-with-close
+      const collapsedMobile = render(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="online"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      const mobileBar = collapsedMobile.container.querySelector('.subcard-bar')!;
+      expect(mobileBar.classList.contains('subcard-bar-mobile')).toBe(true);
+      const row = mobileBar.querySelector('.subsession-row-with-close')!;
+      const footer = collapsedMobile.getByTestId('mobile-subsession-footer-status');
+      expect(footer.classList.contains('subcard-mobile-footer-status-inline')).toBe(false);
+      expect(row.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const badge = collapsedMobile.getByTestId('mobile-subsession-footer-badge');
+      expect(badge.classList.contains('badge-online')).toBe(true);
+      expect(badge.textContent).toBe('● Online');
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-version').textContent).toBe('v11/14 22:05');
+
+      // Connecting & offline state transitions; collapsed empty embeds inline inside .subcard-toolbar
+      collapsedMobile.rerender(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="connecting"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').classList.contains('badge-connecting')).toBe(true);
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').textContent).toContain('Connecting');
+
+      collapsedMobile.rerender(
+        <SubSessionBar
+          subSessions={[]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="offline"
+          onNew={vi.fn()}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      const emptyCollapsedFooter = collapsedMobile.getByTestId('mobile-subsession-footer-status');
+      expect(emptyCollapsedFooter.classList.contains('subcard-mobile-footer-status-inline')).toBe(true);
+      expect(collapsedMobile.container.querySelector('.subcard-toolbar')?.contains(emptyCollapsedFooter)).toBe(true);
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').classList.contains('badge-offline')).toBe(true);
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').textContent).toContain('Daemon Offline');
+
+      // Expanded empty with onNew keeps .subcard-empty-state and renders centered bottom footer below it
+      collapsedMobile.rerender(
+        <SubSessionBar
+          subSessions={[]}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable={false}
+          daemonBadgeState="offline"
+          onNew={vi.fn()}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      const emptyExpandedFooter = collapsedMobile.getByTestId('mobile-subsession-footer-status');
+      expect(emptyExpandedFooter.classList.contains('subcard-mobile-footer-status-inline')).toBe(false);
+      const emptyHint = collapsedMobile.container.querySelector('.subcard-empty-state')!;
+      expect(emptyHint.compareDocumentPosition(emptyExpandedFooter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      collapsedMobile.unmount();
+
+      // 2. Desktop horizontal & vertical rail -> never renders mobile footer status
+      const desktopView = render(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL}
+          daemonBadgeState="online"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      expect(desktopView.container.querySelector('.subcard-bar-mobile')).toBeNull();
+      expect(desktopView.queryByTestId('mobile-subsession-footer-status')).toBeNull();
+      desktopView.unmount();
+    } finally {
+      if (prevBuildTime === undefined) {
+        delete (globalThis as { __BUILD_TIME__?: string }).__BUILD_TIME__;
+      } else {
+        Object.defineProperty(globalThis, '__BUILD_TIME__', {
+          configurable: true,
+          writable: true,
+          value: prevBuildTime,
+        });
+      }
+    }
+  });
+
+  it('adds .incognito class on SubSessionBar buttons and applies dashed border + distinct incognito control styles in CSS', () => {
+    const cssPath = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/styles.css');
+    const css = readFileSync(cssPath, 'utf8');
+    expect(css).toContain('.tab.incognito');
+    expect(css).toContain('border-style: dashed');
+    expect(css).toContain('.subsession-card.incognito');
+    expect(css).toContain('.subsession-window.incognito');
+    expect(css).toContain('.incognito-toggle-btn');
+    expect(css).toContain('.incognito-launch-btn');
+
+    const subs = [
+      makeSubSession({ id: 'priv-bar', sessionName: 'deck_sub_priv-bar', label: 'priv-bar', incognito: true }),
+      makeSubSession({ id: 'norm-bar', sessionName: 'deck_sub_norm-bar', label: 'norm-bar', incognito: false }),
+    ];
+    const view = render(
+      <SubSessionBar
+        subSessions={subs}
+        openIds={new Set(['priv-bar'])}
+        focusedSubId="priv-bar"
+        collapsed={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const privBtn = view.container.querySelector('.subsession-card[data-sub-id="priv-bar"]');
+    const normBtn = view.container.querySelector('.subsession-card[data-sub-id="norm-bar"]');
+    expect(privBtn?.classList.contains('incognito')).toBe(true);
+    expect(privBtn?.classList.contains('open')).toBe(true);
+    expect(privBtn?.classList.contains('focused')).toBe(true);
+    expect(normBtn?.classList.contains('incognito')).toBe(false);
   });
 });

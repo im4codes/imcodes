@@ -264,7 +264,7 @@ describe('ComposerAttachmentBadge', () => {
       // The lightbox shares `.fb-lightbox` (z-index 9999 for the file browser); the chip's layer class overrides it.
       expect(ruleOf('.fb-lightbox.attachment-preview-layer')).toContain('z-index: var(--layer-attachment-preview)');
       // A phone's soft keyboard shrinks the visual viewport, not the layout one: the cover takes --vvh like the other full-screen layers.
-      expect(css).toMatch(/\.fb-lightbox\.attachment-preview-layer[^{]*\{[^}]*height: var\(--vvh, 100dvh\)/);
+      expect(css).toMatch(/\.fb-lightbox\.attachment-preview-layer[^{]*\{[^}]*height: var\(--vvh, var\(--imcodes-ui-dvh\)\)/);
     });
   });
 

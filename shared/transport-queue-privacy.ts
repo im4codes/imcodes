@@ -1,4 +1,5 @@
 import { readQueueDeliveryPolicy } from './session-send-delivery.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from './shared-machine-authority.js';
 import type {
   QueueAttachmentProjection,
   QueueProjectionEntry,
@@ -82,7 +83,8 @@ export function containsProhibitedQueueProjectionField(value: unknown): boolean 
     'rawSessionHistory',
     'rawSharedActorEnvelope',
     'sharedActorEnvelope',
-    'sharedMachineAuthority',
+    SHARED_MACHINE_AUTHORITY_FIELD,
+    OWNER_MACHINE_AUTHORITY_FIELD,
     'fullChildTranscript',
     'timelineCommitted',
     'historyCommitted',

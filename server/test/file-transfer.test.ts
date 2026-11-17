@@ -1,3 +1,4 @@
+import { R2_RELAY_MSG, R2_RELAY_CAPABILITY, R2_RELAY_PHASE } from '../../shared/r2-relay.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
@@ -103,6 +104,20 @@ describe('WsBridge file transfer', () => {
     const daemon = new MockWs();
     await authDaemon(bridge, daemon, makeDb('valid-hash'));
     expect(bridge.isDaemonConnected()).toBe(true);
+  });
+
+  it('routes R2 progress to its pending HTTP request, then settles only the matching done event', async () => {
+    const bridge = WsBridge.get(serverId); const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash'), [R2_RELAY_CAPABILITY]);
+    const progress = vi.fn();
+    const promise = bridge.sendFileTransferRequest('r2-1', { type: R2_RELAY_MSG.DOWNLOAD }, 5000, progress);
+    let settled = false; void promise.then(() => { settled = true; });
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: R2_RELAY_MSG.PROGRESS, downloadId: 'someone-else', loadedBytes: 99 })));
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: R2_RELAY_MSG.PROGRESS, downloadId: 'r2-1', phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 10, totalBytes: 20, etaSeconds: 1 })));
+    await flushAsync();
+    expect(progress).toHaveBeenCalledTimes(1); expect(settled).toBe(false);
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: R2_RELAY_MSG.DONE, downloadId: 'r2-1', size: 20, filename: 'a.txt' })));
+    await expect(promise).resolves.toMatchObject({ type: R2_RELAY_MSG.DONE, size: 20 });
   });
 
   it('sendFileTransferRequest rejects when daemon offline', async () => {

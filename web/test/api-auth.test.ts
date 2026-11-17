@@ -85,6 +85,7 @@ describe('auth nonce exchange API', () => {
     }));
 
     const { exchangeNonce } = await import('../src/api.js');
+    expect((globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor?.getPlatform?.()).toBe('android');
     const result = await exchangeNonce('https://server.example', 'nonce-123');
 
     expect(result).toEqual({
@@ -719,6 +720,16 @@ describe('auth nonce exchange API', () => {
     expect(JSON.parse(String(requests[4].body))).toEqual({ ids: ['sub-2', 'sub-1'] });
   });
 
+  it('distinguishes failed preference reads from missing values for strict reconciliation', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'unavailable' }, 503));
+    const { getUserPref } = await import('../src/api.js');
+    await expect(getUserPref('server_pinned')).resolves.toBeNull();
+    await expect(getUserPref('server_pinned', { strict: true })).rejects.toMatchObject({ status: 503 });
+    fetchMock.mockResolvedValue(jsonResponse({ value: null }));
+    await expect(getUserPref('server_pinned', { strict: true })).resolves.toBeNull();
+  });
+
   it('keeps current user, admin, and preference wrappers on stable contracts', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock
@@ -907,5 +918,28 @@ describe('auth nonce exchange API', () => {
     onAuthExpired(expired);
     await expect(apiFetch('/api/aliases')).rejects.toBeInstanceOf(ApiError);
     expect(expired).not.toHaveBeenCalled();
+  });
+
+  it('preserves stubbed global Capacitor and avoids duplicate FileTransferKeepAlive registration warnings across module resets', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const capStub = { getPlatform: () => 'android' };
+    vi.stubGlobal('Capacitor', capStub);
+
+    await import('../src/api.js');
+    expect((globalThis as { Capacitor?: unknown }).Capacitor).toBe(capStub);
+
+    for (let i = 0; i < 2; i += 1) {
+      vi.resetModules();
+      vi.stubGlobal('Capacitor', { getPlatform: () => 'web', isNativePlatform: () => false });
+      const keepalive = await import('../src/background-transfer-keepalive.js');
+      keepalive.setBackgroundTransferKeepAliveLabels({ title: 'Uploading', text: 'Working' });
+      const release = keepalive.acquireBackgroundTransferKeepAlive();
+      release();
+      await keepalive.withBackgroundTransferKeepAlive(async () => 'ok');
+    }
+
+    const warnings = [...warnSpy.mock.calls, ...errorSpy.mock.calls].flat().map(String);
+    expect(warnings.some((line) => line.includes('FileTransferKeepAlive') && line.includes('already registered'))).toBe(false);
   });
 });

@@ -38,7 +38,7 @@ import {
   TASK_PAIR_WORKSPACE_REQUESTS,
   TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY,
 } from './task-pair-workspace.js';
-import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE } from './task-pair.js';
+import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE, TASK_PAIR_SPLIT_UNRELATED_RULE } from './task-pair.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import { TRANSPORT_EFFORT_LEVELS } from './effort-levels.js';
 import {
@@ -93,6 +93,14 @@ import {
   VERIFICATION_MACHINE_MCP_TOOLS,
   VERIFICATION_MACHINE_SCOPE_LIST,
 } from './verification-machine.js';
+import {
+  CALLBACK_MAX_METADATA_BYTES,
+  CALLBACK_MAX_RELATED_TASK_ID_CHARS,
+  CALLBACK_MAX_SOURCE_CHARS,
+  CALLBACK_MAX_SUMMARY_CHARS,
+  CALLBACK_MCP_TOOLS,
+  CALLBACK_UPDATE_STATUSES,
+} from './callback-types.js';
 export {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
@@ -154,6 +162,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_TASK_UPDATE: 'pair_task_update',
   PAIR_TASK_CHECK: 'pair_task_check',
   PAIR_RESOURCE_CLAIM: 'pair_resource_claim',
+  CALLBACK_UPDATE: CALLBACK_MCP_TOOLS.UPDATE,
   SEND_STOP: 'send_stop',
   DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
   CRON_CREATE_SELF: 'cron_create_self',
@@ -174,6 +183,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   FETCH_FILE_FROM_MACHINE: 'fetch_file_from_machine',
   COMPUTER_USE_DOCS: 'computer_use_docs',
   COMPUTER_USE_CALL: 'computer_use_call',
+  CLOUD_DOCS: 'cloud_docs',
 } as const;
 
 /** Structured pair close actions; lifecycle semantics are delegated to the marker state machine. */
@@ -234,6 +244,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
   MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
+  MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
@@ -253,6 +264,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+  MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
 ] as const satisfies readonly MemoryMcpToolName[];
 
 /**
@@ -309,6 +321,7 @@ export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
   MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+  MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
 ]);
 
 /** Whether a tool is available to a node of the given role. */
@@ -836,6 +849,12 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       taskId: stringSchema('Exact task-pair id.'),
       kind: { type: 'string', enum: ['request', 'decision'], description: 'request from executor/auditor, or final decision from Brain; defaults to decision.' },
       round: numberSchema('Audit/decision round (positive integer).'),
+      deliveryRound: { type: 'integer', minimum: 1, description: 'Delivery round; defaults to the current delivery round. Separate from the audit round.' },
+      question: { type: 'string', maxLength: 2000, description: 'Exact blocking question for the task card.' },
+      options: { type: 'array', maxItems: 8, items: objectSchema({ id: { type: 'string', minLength: 1, maxLength: 100 }, label: { type: 'string', minLength: 1, maxLength: 300 } }, ['id', 'label']), description: 'Concrete choices the user can select; free-text feedback is always available.' },
+      recommendation: { type: 'string', maxLength: 2000, description: 'Recommended option and trade-off.' },
+      requestId: stringSchema('Exact question record id this ruling answers; does not resume or close the pair.'),
+      selectedOptionId: stringSchema('Selected option id, if answering a structured question.'),
       conclusion: stringSchema('Short decision conclusion.'),
       summary: stringSchema('Bounded decision summary; do not include the full brief or logs.'),
       related: { type: 'array', maxItems: 20, items: stringSchema('Optional related task or artifact reference.') },
@@ -856,7 +875,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
-    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_SPLIT_UNRELATED_RULE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),
@@ -1151,6 +1170,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), resource: stringSchema('Canonical external resource.'), mode: { type: 'string', enum: ['exclusive', 'shared'] }, ttlMs: { type: 'integer', minimum: 60000, maximum: 86400000 }, renew: { type: 'boolean' } }, ['resource', 'mode']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
+    description: 'Update status and summary for a callback item (in_progress, done, ignored, failed), optionally linking relatedTaskId or metadata.',
+    inputSchema: objectSchema({
+      callbackId: stringSchema('Callback id (cb_...).'),
+      status: stringSchema('New callback status.', { enum: [...CALLBACK_UPDATE_STATUSES] }),
+      summary: { type: 'string', maxLength: CALLBACK_MAX_SUMMARY_CHARS, description: 'Concise handling summary.' },
+      source: { type: 'string', maxLength: CALLBACK_MAX_SOURCE_CHARS, description: 'Optional callback source guard (e.g. repo, webhook).' },
+      relatedTaskId: { type: 'string', maxLength: CALLBACK_MAX_RELATED_TASK_ID_CHARS, description: 'Optional related taskId (e.g. tsk_...).' },
+      metadata: { type: 'object', additionalProperties: true, description: `Optional bounded JSON metadata (max ${CALLBACK_MAX_METADATA_BYTES} bytes).` },
+    }, ['callbackId', 'status', 'summary']),
+    outputSchema: statusSchema,
+  },
 
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
@@ -1289,9 +1321,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
-    description: `Preferred self-wakeup for the current session; Identity is automatic. Recurring is default, until_complete is bounded; minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`,
+    description: `Preferred self-wakeup for the current session; Identity is automatic. Recurring is default, until_complete is bounded; technical minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. Task/execution supervision keepalive crons are fallback-only, never polling, and MUST be >=20 minutes unless the user explicitly requests shorter.`,
     inputSchema: objectSchema({
-      cronExpr: stringSchema(`Cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
+      cronExpr: stringSchema(`Cron expression; technical minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. For task/supervision keepalive with until_complete, use >=20 minutes (*/20 * * * * minimum) unless the user explicitly requests shorter; keepalive is never polling.`),
       message: stringSchema('Message delivered to the current session.'),
       name: stringSchema('Optional job name; derived from message when omitted.'),
       timezone: stringSchema('Optional cron timezone.'),
@@ -1307,7 +1339,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     description: 'Update current-session self-wakeup by id.',
     inputSchema: objectSchema({
       id: stringSchema('Current-session cron job id.'),
-      cronExpr: stringSchema(`Optional cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
+      cronExpr: stringSchema(`Optional cron expression; technical minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. Task/supervision keepalive with until_complete must be >=20 minutes unless the user explicitly requests shorter; never use it for polling.`),
       message: stringSchema('Optional replacement message.'),
       name: stringSchema('Optional replacement name.'),
       timezone: stringSchema('Optional replacement timezone.'),
@@ -1497,6 +1529,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       outcome: stringSchema(`Discriminated outcome: ${COMPUTER_USE_OUTCOMES.join(' | ')}.`, { enum: [...COMPUTER_USE_OUTCOMES] }),
       result: { type: 'object', description: 'Bounded Computer Use result content when the target method returned.', additionalProperties: true },
     }, ['status', 'outcome']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS]: {
+    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+    description: 'Run the unified Cloud Docs & ONLYOFFICE CLI (`imcodes cloud-docs`). Quick start: `["list"]`, `["list","--search","q"]`, `["read","<docId>"]`, `["docs"]`. Load full ONLYOFFICE DocBuilder/convert/upload/share manuals on demand via `["docs","--topic","quickstart|docx|xlsx|pptx|edit|convert|share|troubleshooting"]`. Mandatory in EVERY chat reply turn (turn 1, turn 2+, after rename/edit) and EVERY mention in a reply: cite `[CloudDoc: <name> | id=<docId>]` using latest name and `id=<docId>`; NEVER use bare filenames, `` `<name>` ``, `<name> (id=...)`, or `[<name>](/path)`. FULL-node only.',
+    inputSchema: objectSchema({
+      args: {
+        type: 'array',
+        description: 'Preferred CLI argv array (preserves Windows backslashes & spaces cleanly), e.g. ["list"] or ["builder","--type","docx","--name","Spec.docx","--script-file","C:\\work\\s.js"].',
+        items: { type: 'string' },
+      },
+      command: stringSchema('Single CLI command string split cleanly (quotes & Windows backslashes preserved), e.g. "read doc_123 --max-chars 4000". Defaults to "--help" when both args and command are omitted.'),
+    }),
+    outputSchema: statusSchema,
   },
 };
 

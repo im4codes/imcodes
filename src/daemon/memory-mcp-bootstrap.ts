@@ -5,7 +5,9 @@ import {
   RETIRED_SUPERVISION_MCP_MESSAGE,
   RETIRED_SUPERVISION_MCP_TOOL_SET,
 } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_MCP_SERVER_INSTRUCTIONS } from '../../shared/mcp-tool-distribution.js';
 import {
+  MCP_RESOURCE_PREFIX,
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
   SESSION_RESOURCE_OWNER_ENV,
@@ -100,6 +102,7 @@ function serverInfo(protocolVersion: unknown): JsonRpcMessage {
       protocolVersion: typeof protocolVersion === 'string' ? protocolVersion : '2024-11-05',
       capabilities: { tools: { listChanged: true } },
       serverInfo: { name: 'imcodes-memory', version: '0.1.0' },
+      instructions: MEMORY_MCP_SERVER_INSTRUCTIONS,
     },
   };
 }
@@ -168,7 +171,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       : null;
   })();
   const resourceRegistry = owner ? new SessionResourceRegistry() : null;
-  const resourceId = owner ? `mcp-bootstrap:${owner.runtimeEpoch}:${process.pid}` : null;
+  const resourceId = owner ? `${MCP_RESOURCE_PREFIX.BOOTSTRAP}:${owner.runtimeEpoch}:${process.pid}` : null;
   const lifetime = sessionResourceLifetimeFromEnv(process.env);
   const lifecycleFields = {
     session: owner?.sessionName ?? process.env.IMCODES_SESSION?.trim() ?? process.env.IMCODES_DAEMON_SESSION_NAME?.trim(),
@@ -565,6 +568,14 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       } else {
         writeMessage({ jsonrpc: '2.0', id, result: { tools: cachedTools } });
       }
+      return;
+    }
+    // Newer clients may probe an unsupported protocol before initialize
+    // (e.g. server/discover). Reply immediately so they can negotiate MCP's
+    // supported initialize path instead of timing out on the heavy backend.
+    // Known tools/call retains its existing queued-startup contract.
+    if (!clientInitialized && id !== undefined && message.method !== 'tools/call') {
+      writeMessage(errorResponse(id, -32601, 'Method not found'));
       return;
     }
     const child = backend;

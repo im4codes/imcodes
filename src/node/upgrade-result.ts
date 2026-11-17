@@ -41,7 +41,8 @@ export function upgradeResultPathFor(journalPath: string): string {
 
 export async function readUpgradeResult(journalPath: string): Promise<UpgradeResultRecord | null> {
   try {
-    const raw = JSON.parse(await readFile(upgradeResultPathFor(journalPath), 'utf8')) as unknown;
+    const rawText = await readFile(upgradeResultPathFor(journalPath), 'utf8');
+    const raw = JSON.parse(rawText.charCodeAt(0) === 0xfeff ? rawText.slice(1) : rawText) as unknown;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const record = raw as UpgradeResultRecord;
     return typeof record.status === 'string' ? record : null;

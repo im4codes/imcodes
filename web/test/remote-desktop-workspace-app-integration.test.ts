@@ -31,4 +31,18 @@ describe('remote desktop workspace App integration', () => {
   it('lets native foreground recovery revive only manager-owned exhausted connections', () => {
     expect(appSource).toMatch(/installNativeAppResumeRefresh\(true, \(force\) => \{[\s\S]*ws\.resumeConnection\(force\);[\s\S]*remoteDesktopConnectionManager\.resumeExhaustedConnections\(\);[\s\S]*\}, App\)/);
   });
+
+  it('hides standalone new-window triggers in the mobile quick menu while preserving them on desktop', () => {
+    const desktopGroupStart = appSource.indexOf('<div class="controlled-nodes-shortcut-group">');
+    const desktopGroupEnd = appSource.indexOf('</div>', desktopGroupStart);
+    const desktopQuickMenu = appSource.slice(desktopGroupStart, desktopGroupEnd);
+    expect(desktopQuickMenu).toContain('<ControlledNodeQuickMenu');
+    expect(desktopQuickMenu).not.toContain('allowStandaloneWindow={false}');
+
+    const mobileGroupStart = appSource.indexOf('<div class="mobile-remote-desktop-group"');
+    const mobileGroupEnd = appSource.indexOf('</div>', mobileGroupStart);
+    const mobileQuickMenu = appSource.slice(mobileGroupStart, mobileGroupEnd);
+    expect(mobileQuickMenu).toContain('<ControlledNodeQuickMenu');
+    expect(mobileQuickMenu).toContain('allowStandaloneWindow={false}');
+  });
 });

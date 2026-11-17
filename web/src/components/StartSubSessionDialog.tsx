@@ -1,14 +1,14 @@
 /**
  * StartSubSessionDialog — choose type (cc/cc-sdk/codex/codex-sdk/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
  */
-import { useState, useEffect, useMemo } from 'preact/hooks';
+import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
-import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
+import { getSessionAgentGroups, getSessionAgentLabel, isSessionAgentTypeSelectable, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
@@ -36,6 +36,7 @@ import {
 } from '@shared/cc-presets.js';
 import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
+import { loadAgyModelPreference, saveAgyModelPreference } from '../agy-model-preference.js';
 import {
   CODEBUDDY_CHINA_DEFAULT_MODEL,
   CODEBUDDY_CHINA_MODEL_FALLBACK,
@@ -44,8 +45,9 @@ import {
   isCodeBuddyProviderId,
 } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
-import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
+import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
 
 /** Upper bound on how many identical sub-sessions one launch can request at once. */
 const MAX_SUB_SESSION_LAUNCH_COUNT = 20;
@@ -59,7 +61,7 @@ const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
   // which clips the custom-provider help text into one-character columns.
-  width: 'calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)',
+  width: 'calc(var(--imcodes-ui-vw, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)',
   maxWidth: 660,
   minWidth: 0,
   boxSizing: 'border-box',
@@ -100,6 +102,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
   const [detectingShells, setDetectingShells] = useState(false);
   const [thinking, setThinking] = useState<TransportEffortLevel>('high');
   const [requestedModel, setRequestedModel] = useState('');
+  const [incognito, setIncognito] = useState(false);
+  const canIncognito = !!ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(SESSION_INCOGNITO_CAPABILITY) && !ws?.isDaemonCapabilityStale?.();
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -156,7 +160,9 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     return preset;
   };
   const selectType = (nextType: string) => {
+    if (!isSessionAgentTypeSelectable(nextType)) return;
     if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextType)) return;
+    if (incognito && !supportsSessionIncognito(nextType)) return;
     setType(nextType);
     if (!customProviderSdk) setLastUnlockedType(nextType);
     setPresetError('');
@@ -213,13 +219,13 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
 
   const agentGroups = getSessionAgentGroups('sub-session');
   const allowedAgentTypeSet = useMemo(
-    () => allowedAgentTypes ? new Set(allowedAgentTypes) : null,
+    () => allowedAgentTypes ? new Set(allowedAgentTypes.filter(isSessionAgentTypeSelectable)) : null,
     [allowedAgentTypes],
   );
 
   useEffect(() => {
     if (!allowedAgentTypeSet || allowedAgentTypeSet.has(type)) return;
-    const fallback = allowedAgentTypes?.[0];
+    const fallback = allowedAgentTypeSet.values().next().value;
     if (fallback) setType(fallback);
   }, [allowedAgentTypeSet, allowedAgentTypes, type]);
 
@@ -294,7 +300,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     ? Math.min(MAX_SUB_SESSION_LAUNCH_COUNT, Math.max(1, parseInt(countInput, 10) || 1))
     : 1;
 
+  const canStartType = isSessionAgentTypeSelectable(type) && (!allowedAgentTypeSet || allowedAgentTypeSet.has(type));
+  const incognitoBlocked = incognito && (!canIncognito || !supportsSessionIncognito(type));
   const handleStart = () => {
+    if (!canStartType || incognitoBlocked) return;
     const desc = description.trim() || undefined;
     if (customProviderSdk && !ccPreset) {
       setPresetError(t('new_session.custom_provider_preset_required'));
@@ -331,8 +340,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) {
+      extra.requestedModel = requestedModel.trim();
+      if (type === AGY_SDK_PROVIDER_ID) {
+        saveAgyModelPreference(requestedModel.trim());
+      }
+    }
     if (type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'muse-code-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
+    if (incognito) extra.incognito = true;
     if (launchCount > 1) extra.launchCount = launchCount;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -460,12 +475,22 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 
+  const agyModelManuallySelectedRef = useRef(false);
   useEffect(() => {
-    if (type !== AGY_SDK_PROVIDER_ID) return;
+    if (type !== AGY_SDK_PROVIDER_ID) {
+      agyModelManuallySelectedRef.current = false;
+      return;
+    }
     setRequestedModel((current) => {
       const trimmed = current.trim();
-      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
-      const fallback = transportModels.defaultModel ?? AGY_SDK_MODEL_SUGGESTIONS[0];
+      const stored = loadAgyModelPreference();
+      if (agyModelManuallySelectedRef.current && trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) {
+        return trimmed;
+      }
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) {
+        return stored;
+      }
+      const fallback = transportModels.defaultModel ?? AGY_DEFAULT_MODEL_ID;
       if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       return modelSuggestions[0] ?? fallback;
     });
@@ -511,9 +536,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                           // allow-listed via allowedAgentTypes (e.g. the
                           // supervision-pool worker-type picker, which still
                           // legitimately offers qwen as a backend) is a
-                          // deliberate exception and renders normally.
-                          style={(choice.hidden && !allowedAgentTypeSet?.has(choice.id)) ? { display: 'none' } : undefined}
-                          disabled={customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)}
+                          // deliberate exception and renders normally. Unavailable Claude CLI SDK
+                          // is never restored by an allow-list.
+                          style={(choice.hidden && (!isSessionAgentTypeSelectable(choice.id) || !allowedAgentTypeSet?.has(choice.id))) ? { display: 'none' } : undefined}
+                          disabled={!isSessionAgentTypeSelectable(choice.id) || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
                           aria-pressed={type === choice.id}
                           onClick={() => selectType(choice.id)}
                         >
@@ -924,7 +950,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                 <select
                   class="input"
                   value={requestedModel}
-                  onInput={(e) => setRequestedModel((e.target as HTMLSelectElement).value)}
+                  onInput={(e) => {
+                    if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                    setRequestedModel((e.target as HTMLSelectElement).value);
+                  }}
                   style={{ width: '100%' }}
                 >
                   {modelSuggestions.map((model) => (
@@ -938,7 +967,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                   options={modelSuggestions}
                   placeholder={t('session.supervision.selectModel')}
                   value={requestedModel}
-                  onChange={setRequestedModel}
+                  onChange={(val) => {
+                    if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                    setRequestedModel(val);
+                  }}
                   style={{ width: '100%' }}
                 />
               )}
@@ -1026,9 +1058,23 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
           </div>
         </div>
 
+        <div class={`incognito-create-option${incognito ? ' is-active' : ''}`}>
+          <label class={`incognito-toggle-btn${incognito ? ' is-active' : ''}`}>
+            <input
+              type="checkbox"
+              checked={incognito}
+              disabled={!canIncognito}
+              onChange={(event) => setIncognito(event.currentTarget.checked)}
+            />
+            <span>🕶️ {t('session.incognito')}</span>
+          </label>
+          <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
+          {(!canIncognito || (incognito && !supportsSessionIncognito(type))) && <p role="status">{t('session.incognito_unsupported')}</p>}
+        </div>
+
         <div class="dialog-footer">
           <button class="btn btn-secondary" onClick={onClose}>Cancel</button>
-          <button class="btn btn-primary" onClick={handleStart}>Launch</button>
+          <button class={`btn btn-primary${incognito ? ' incognito-launch-btn' : ''}`} onClick={handleStart} disabled={!canStartType || incognitoBlocked}>Launch</button>
         </div>
       </div>
     </div>

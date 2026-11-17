@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Causal tests for tsk_cd_limit_failover: a rate/usage-limited pair
  * participant fails over to a different provider family at once; a mere
@@ -36,7 +37,7 @@ const NOW = 1_000_000;
 // the auditor role, so an auditor replacement can land on either family.
 const EXEC_MODEL = 'gpt-6-luna';
 const ANTHROPIC_AUDITOR_MODEL = 'opus';
-const OPENAI_AUDITOR_MODEL = 'gpt-5.6-sol';
+const OPENAI_AUDITOR_MODEL = 'gpt-5-audit';
 
 function poolConfig(agentType: string, providerFamily: string, model: string, role: SupervisionExecutionConfig['role']): SupervisionExecutionConfig {
   const canonical = normalizeSupervisionExecutionModel(agentType, model);
@@ -220,7 +221,7 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
     // auditor is assigned, but needs_auditor is ALSO set (however it got
     // there -- an import, a race, ...).
     const stale = { ...pair('T3'), flags: [...pair('T3').flags, 'needs_auditor' as const] };
-    getTaskPairStore().savePair(PROJECT, stale);
+    putTaskPairFixture(getTaskPairStore(), PROJECT, stale);
     expect(pair('T3').flags).toContain('needs_auditor');
     sent = [];
 

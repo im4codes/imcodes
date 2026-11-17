@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -496,7 +497,7 @@ describe('pair identity in MCP tools', () => {
 
   beforeEach(() => {
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'task-pair-1',
       brain: BRAIN,
       executor: EXEC,

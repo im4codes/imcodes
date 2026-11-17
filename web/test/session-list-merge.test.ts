@@ -67,6 +67,14 @@ function makeExisting(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 describe('mergeSessionListEntry — supervision preservation', () => {
+  it('does not resurrect the old provider model from a sparse restart projection', () => {
+    const merged = mergeSessionListEntry({ ...BASE_INCOMING, agentType: 'agy-sdk' }, makeExisting({
+      requestedModel: 'gpt-6.1-sol', activeModel: 'gpt-6.1-sol', modelDisplay: 'gpt-6.1-sol',
+    }));
+    expect(merged.requestedModel).toBeUndefined();
+    expect(merged.activeModel).toBeUndefined();
+    expect(merged.modelDisplay).toBeUndefined();
+  });
   it('accepts a new authoritative shared mode and preserves it when an older sparse snapshot omits it', () => {
     const projected = mergeSessionListEntry({
       ...BASE_INCOMING,

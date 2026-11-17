@@ -1,13 +1,16 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { randomHex } from '../security/crypto.js';
 import {
   deleteVerificationMachine,
   getVerificationMachine,
   listVerificationMachines,
+  listVerificationMachinesPage,
   recordVerificationMachineStatus,
   upsertVerificationMachine,
+  type VerificationMachineCursor,
 } from '../db/verification-machine-queries.js';
 import { listControlledMachines } from './machines.js';
 import { getAliasById } from '../db/alias-queries.js';
@@ -34,15 +37,92 @@ export const verificationMachineRoutes = new Hono<{
 }>();
 
 verificationMachineRoutes.use('/*', requireAuth());
+verificationMachineRoutes.use('/*', async (c, next) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  await next();
+  return;
+});
 
 function normalizedScopeKey(scope: VerificationMachineScope, value: unknown): string | null {
   if (verificationMachineScopeKeyError(scope, value) !== null) return null;
   return scope === VERIFICATION_MACHINE_SCOPES.USER ? '' : String(value).trim();
 }
 
+// Worst-case unpadded base64url cursor size for legal values:
+// 77-byte JSON envelope + 4 UTF-8 bytes per code point for scopeKey (512) and alias (80).
+const CURSOR_JSON_OVERHEAD_BYTES = 80;
+const MAX_CURSOR_JSON_BYTES = CURSOR_JSON_OVERHEAD_BYTES
+  + VERIFICATION_MACHINE_LIMITS.SCOPE_KEY_MAX_CHARS * 4
+  + VERIFICATION_MACHINE_LIMITS.ALIAS_MAX_CHARS * 4;
+const MAX_CURSOR_ENCODED_CHARS = Math.ceil((MAX_CURSOR_JSON_BYTES * 4) / 3);
+
+function encodeCursor(cursor: VerificationMachineCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+function decodeCursor(raw: string): VerificationMachineCursor | null {
+  if (!raw || raw.length > MAX_CURSOR_ENCODED_CHARS || !/^[A-Za-z0-9_-]+$/u.test(raw)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.bucket !== 'number' || !Number.isInteger(parsed.bucket) || parsed.bucket < 0 || parsed.bucket > 2) {
+      return null;
+    }
+    if (typeof parsed.scopeKey !== 'string'
+      || Array.from(parsed.scopeKey).length > VERIFICATION_MACHINE_LIMITS.SCOPE_KEY_MAX_CHARS) {
+      return null;
+    }
+    if (typeof parsed.alias !== 'string'
+      || Array.from(parsed.alias).length > VERIFICATION_MACHINE_LIMITS.ALIAS_MAX_CHARS) {
+      return null;
+    }
+    if (!isVerificationMachineId(parsed.id)) return null;
+    return {
+      bucket: parsed.bucket,
+      scopeKey: parsed.scopeKey,
+      alias: parsed.alias,
+      id: parsed.id,
+    };
+  } catch {
+    return null;
+  }
+}
+
 verificationMachineRoutes.get('/', async (c) => {
   const projectKey = c.req.query('projectKey')?.trim() || undefined;
-  const profiles = await listVerificationMachines(c.env.DB, c.get('userId' as never) as string, projectKey);
+  const includeAllProjects = c.req.query('includeAllProjects') === '1'
+    || c.req.query('includeAllProjects') === 'true';
+  const userId = c.get('userId' as never) as string;
+  if (includeAllProjects) {
+    const rawCursor = c.req.query('cursor');
+    const cursor = rawCursor === undefined ? null : decodeCursor(rawCursor);
+    if (rawCursor !== undefined && !cursor) {
+      return c.json({ error: 'verification_machine_cursor_invalid' }, 400);
+    }
+    const rawLimit = c.req.query('limit');
+    let limit: number = VERIFICATION_MACHINE_LIMITS.MAX_ITEMS;
+    if (rawLimit !== undefined) {
+      if (!/^\d+$/u.test(rawLimit)) {
+        return c.json({ error: 'verification_machine_limit_invalid' }, 400);
+      }
+      const parsed = Number(rawLimit);
+      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > VERIFICATION_MACHINE_LIMITS.MAX_ITEMS) {
+        return c.json({ error: 'verification_machine_limit_invalid' }, 400);
+      }
+      limit = parsed;
+    }
+    const page = await listVerificationMachinesPage(c.env.DB, userId, {
+      projectKey,
+      limit,
+      cursor,
+    });
+    return c.json({
+      profiles: page.profiles,
+      ...(page.nextCursor ? { nextCursor: encodeCursor(page.nextCursor) } : {}),
+    });
+  }
+  const profiles = await listVerificationMachines(c.env.DB, userId, projectKey);
   if (profiles.length > VERIFICATION_MACHINE_LIMITS.MAX_ITEMS) {
     return c.json({ error: 'verification_machine_list_over_limit' }, 413);
   }
@@ -97,6 +177,9 @@ verificationMachineRoutes.put('/', async (c) => {
     source: c.req.header(SERVER_ID_HEADER) ? 'mcp' : 'web',
     expectedRevision,
   });
+  if (result === 'not_found') {
+    return c.json({ error: 'verification_machine_not_found' }, 404);
+  }
   if (result === 'revision_conflict' || result === 'alias_conflict') {
     return c.json({ error: result }, 409);
   }

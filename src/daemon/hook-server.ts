@@ -84,9 +84,12 @@ import {
 import { normalizeDaemonLocalMemoryNamespace, LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import {
+  SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { readSenderParticipantTurn } from './sender-participant-turn.js';
 import { readProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 
 export { DEFAULT_HOOK_PORT };
@@ -166,6 +169,12 @@ export interface QueuedMessage {
 
 /** In-memory queue: target session name → queued messages (FIFO) */
 const messageQueue = new Map<string, QueuedMessage[]>();
+type ProcessQueueDrainer = (sessionName: string) => Promise<void> | void;
+let processQueueDrainer: ProcessQueueDrainer | null = null;
+
+export function registerProcessQueueDrainer(drainer: ProcessQueueDrainer | null): void {
+  processQueueDrainer = drainer;
+}
 
 /** Rate limiter: source session → timestamps of recent sends */
 const rateLimiter = new Map<string, number[]>();
@@ -562,9 +571,15 @@ function preflightLifecycleBatch(
  */
 export async function drainQueue(sessionName: string): Promise<void> {
   const queue = messageQueue.get(sessionName);
-  if (!queue || queue.length === 0) return;
+  if (!queue || queue.length === 0) {
+    if (processQueueDrainer) {
+      await processQueueDrainer(sessionName);
+    }
+    return;
+  }
 
   const now = Date.now();
+  let deliveredFromHookQueue = false;
 
   // Drain ONE message at a time. After sending, the session goes running → idle,
   // which triggers drainQueue again for the next message. This prevents burst-injecting
@@ -584,11 +599,15 @@ export async function drainQueue(sessionName: string): Promise<void> {
     } catch (err) {
       logger.warn({ err, target: sessionName, from: msg.from }, 'Failed to deliver queued message');
     }
+    deliveredFromHookQueue = true;
     // Stop after one delivery — next idle transition will drain the next message
     break;
   }
   // Clean up empty queue entry
   if (queue.length === 0) messageQueue.delete(sessionName);
+  if (!deliveredFromHookQueue && processQueueDrainer) {
+    await processQueueDrainer(sessionName);
+  }
 }
 
 /** Get current queue for a target (for testing) */
@@ -698,6 +717,9 @@ async function handleSend(
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
+  if (readSenderParticipantTurn(from) && result.targets.some((target) => target.name !== from)) {
+    return { status: 403, body: { ok: false, error: 'shared_participant_forbidden' } };
+  }
   if (body.supervision && result.targets.length !== 1) {
     return { status: 400, body: { ok: false, error: 'supervision binding requires one exact target' } };
   }
@@ -711,6 +733,9 @@ async function handleSend(
   // this environment." while its running turn kept going). Exact-match only:
   // messages that merely contain "/stop" stay ordinary text.
   if (message.trim() === '/stop') {
+    if (readSenderParticipantTurn(from) && result.targets.some((target) => target.name !== from)) {
+      return { status: 403, body: { ok: false, error: 'shared_participant_forbidden' } };
+    }
     // Lazy import — same heavy-module-cycle rationale as handleStop below.
     const { stopSessionNow } = await import('./command-handler.js');
     const stopped: string[] = [];
@@ -831,6 +856,9 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
+  }
+  if (readSenderParticipantTurn(from) && result.targets.some((target) => target.name !== from)) {
+    return { status: 403, body: { ok: false, error: 'shared_participant_forbidden' } };
   }
   // Lazy import: command-handler pulls in the whole daemon graph, so importing
   // it eagerly here would create a heavy module cycle (and broke hook-server's
@@ -1090,6 +1118,18 @@ export async function startHookServer(
           providerId: session.providerId ?? session.agentType,
           transport: 'in_process',
         });
+        if (readSenderParticipantTurn(session.name)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            result: {
+              status: 'error',
+              reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+              message: 'personal memory tools are not available during a shared-session participant turn',
+            },
+          }));
+          return;
+        }
         const invoke = options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool;
         const result = await invoke(caller, body.tool, body.input);
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1166,15 +1206,23 @@ export async function startHookServer(
           sessionInstanceId: session.sessionInstanceId,
           runtimeEpoch: session.runtimeEpoch,
         }, Date.now(), session.state === 'running');
-        const required = runtime?.requiresSharedMachineAuthority() ?? processContext.required;
-        const authority = runtime?.getActiveSharedMachineAuthority() ?? processContext.authority;
+        const required = runtime ? runtime.requiresSharedMachineAuthority() : processContext.required;
+        const authority = runtime
+          ? (required ? runtime.getActiveSharedMachineAuthority() : (runtime.getActiveOwnerMachineAuthority?.() ?? null))
+          : processContext.authority;
         if (required && !authority) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_unavailable' }));
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, required, authority }));
+        res.end(JSON.stringify(
+          required
+            ? { ok: true, required: true, authority }
+            : authority
+              ? { ok: true, required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority }
+              : { ok: true, required: false, authority: null },
+        ));
       } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'malformed' }));
@@ -1431,6 +1479,11 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'session model caller identity is unavailable' }));
           return;
         }
+        if (readSenderParticipantTurn(from) && (isSet || to !== from)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shared_participant_forbidden' }));
+          return;
+        }
         const { listSessionModelsNow, switchSessionModelNow } = await import('./command-handler.js');
         let result;
         if (isSet) {
@@ -1517,6 +1570,11 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'session restart caller identity is unavailable' }));
           return;
         }
+        if (readSenderParticipantTurn(from) && items.some((item) => item!.target !== from || item!.reset === true)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shared_participant_forbidden' }));
+          return;
+        }
         const targetRecords: SessionRecord[] = [];
         for (const item of items) {
           const targetRecord = getSession(item!.target);
@@ -1596,6 +1654,11 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'invalid exact-session close request' }));
           return;
         }
+        if (readSenderParticipantTurn(from)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shared_participant_forbidden' }));
+          return;
+        }
         const close = options.closeSession ?? (async (callerName, request) => {
           const { closeSessionOnBehalf } = await import('./session-close.js');
           return closeSessionOnBehalf(callerName, request);
@@ -1626,6 +1689,7 @@ export async function startHookServer(
       try {
         const body = await readBody(req);
         const parsed = JSON.parse(body) as StopRequest;
+        if (rejectUnverifiedClaim(typeof parsed.from === 'string' ? parsed.from : undefined)) return;
         const result = await handleStop(parsed);
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
@@ -1652,7 +1716,16 @@ export async function startHookServer(
         // Lazy import — session-manager pulls in the whole daemon graph (same
         // heavy-module-cycle rationale as the command-handler import above).
         const { getTransportRuntime } = await import('../agent/session-manager.js');
-        const sessions = listSessions().map((record) => {
+        const senderHeader = req.headers['x-imcodes-session'];
+        const callerSession = typeof (Array.isArray(senderHeader) ? senderHeader[0] : senderHeader) === 'string'
+          ? (Array.isArray(senderHeader) ? senderHeader[0] : senderHeader)!.trim()
+          : '';
+        const callerRecord = callerSession ? getSession(callerSession) : null;
+        const visibleRecords = listSessions().filter((record) => {
+          if (callerRecord) return record.projectName === callerRecord.projectName;
+          return true;
+        });
+        const sessions = visibleRecords.map((record) => {
           const runtime = getTransportRuntime(record.name);
           if (!runtime) {
             return { name: record.name, state: record.state, live: false };

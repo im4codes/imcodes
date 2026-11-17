@@ -6,6 +6,7 @@ import type { Database } from '../db/client.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { mutateAndRevalidateMachineGroupAccess } from '../ws/machine-group-revalidation.js';
+import { pauseRevokedSharedCronJobs } from '../security/server-share-boundary.js';
 
 /** A group name is a label, never a paragraph. */
 const GROUP_NAME_MAX_CHARS = 120;
@@ -328,6 +329,7 @@ teamRoutes.delete('/:id/member/:memberId', requireAuth(), async (c) => {
     'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
     [teamId, memberId],
   ));
+  await pauseRevokedSharedCronJobs(c.env.DB, { teamId, userId: memberId });
   await logAudit({ userId, action: 'team.member_removed', details: { teamId, memberId } }, c.env.DB);
   return c.json({ ok: true });
 });

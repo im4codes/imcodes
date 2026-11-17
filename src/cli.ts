@@ -329,6 +329,7 @@ export function createProgram(): Command {
 const program = new Command()
   .name('imcodes')
   .description('Remote AI coding agent controller')
+  .enablePositionalOptions()
   .version(version);
 
 program.exitOverride();
@@ -872,8 +873,10 @@ program
 program
   .command('setup')
   .description('Deploy IM.codes server + daemon on this machine (Docker required)')
-  .requiredOption('--domain <domain>', 'Domain name for HTTPS (e.g. imc.example.com)')
+  .option('--domain <domain>', 'Domain name for HTTPS (e.g. imc.example.com; auto-detected from .env when running --onlyoffice)')
   .option('--force', 'Overwrite existing setup')
+  .option('--onlyoffice', 'Enable ONLYOFFICE Document Server (default on fresh install, or add non-destructively to an existing deployment)')
+  .option('--no-onlyoffice', 'Disable ONLYOFFICE Document Server')
   .option('--turn', 'Enable an authenticated coturn relay for WebRTC file transfer')
   .option('--no-turn', 'Disable a previously configured TURN relay')
   .option('--turn-host <host>', 'Separate DNS-only TURN hostname (default: turn.<domain>; never orange-cloud proxied)')
@@ -887,8 +890,9 @@ program
   .option('--turn-relay-max-port <port>', 'Last TURN relay UDP port (explicit override; needs --turn-relay-min-port)')
   .option('--turn-dns-only', 'Confirm the TURN hostname is not proxied by Cloudflare or another HTTP proxy')
   .action(async (opts: {
-    domain: string;
+    domain?: string;
     force?: boolean;
+    onlyoffice?: boolean;
     turn?: boolean;
     turnHost?: string;
     turnPort?: string;
@@ -897,11 +901,21 @@ program
     turnRelayMinPort?: string;
     turnRelayMaxPort?: string;
     turnDnsOnly?: boolean;
-  }) => {
-    const { setupFlow } = await import('./setup/setup-flow.js');
-    await setupFlow(opts.domain, {
+  }, cmd: Command) => {
+    const { setupFlow, recoverDomainFromEnv } = await import('./setup/setup-flow.js');
+    const onlyofficeSource = cmd.getOptionValueSource('onlyoffice');
+    const onlyoffice = onlyofficeSource === 'cli' ? opts.onlyoffice : undefined;
+    const turnSource = cmd.getOptionValueSource('turn');
+    const turn = turnSource === 'cli' ? opts.turn : undefined;
+    const resolvedDomain = opts.domain?.trim() || (onlyoffice === true ? recoverDomainFromEnv(process.cwd()) : undefined);
+    if (!resolvedDomain) {
+      console.error("error: required option '--domain <domain>' not specified (or run 'imcodes setup --onlyoffice' in a directory with an existing .env containing DOMAIN)");
+      process.exit(1);
+    }
+    await setupFlow(resolvedDomain, {
       force: opts.force,
-      turn: opts.turn,
+      onlyoffice,
+      turn,
       turnHost: opts.turnHost,
       turnPort: opts.turnPort,
       turnExternalIp: opts.turnExternalIp,
@@ -1014,16 +1028,80 @@ program
       registry = normalizeRegistryBase((JSON.parse(raw) as { npmRegistry?: unknown }).npmRegistry);
     } catch { /* no install.json — use npm's ambient/default registry */ }
 
-    // Detect package manager: npm global or from a git clone?
+    // Detect package manager / runtime mode: bundled daemon-runtime, npm global, or git clone
+    const {
+      inspectDaemonRuntimeMode,
+      resolveLegacyNpmCliFallback,
+      upgradeBundledDaemonRuntime,
+    } = await import('./daemon/daemon-runtime-upgrade.js');
+    const { isPathInsideGitCheckout } = await import('./node/desktop-installer-probe.js');
+    const runtimeMode = inspectDaemonRuntimeMode({ entryScriptPath: process.argv[1] });
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
+    let fallbackNodeBin: string | undefined;
+    let fallbackPrefixDir: string | undefined;
+
+    if (runtimeMode.mode === 'bundled') {
+      console.log(`Checking bundled daemon-runtime upgrade (target: ${/^\d/.test(pkgTag) ? pkgTag : 'latest'})...`);
+      const res = await upgradeBundledDaemonRuntime({
+        currentVersion: version,
+        targetVersion: /^\d/.test(pkgTag) ? pkgTag : 'latest',
+        entryScriptPath: process.argv[1],
+        allowLegacyCliFallback: true,
+        detachedHandoff: true,
+      });
+      if (res.status === 'upgraded' || res.status === 'handoff_uncertain') {
+        if (res.status === 'handoff_uncertain') {
+          console.error(res.message);
+        }
+        if (res.detachedScriptDir) {
+          const { followDetachedDaemonRuntimeSwitch } = await import('./cli/upgrade-detached.js');
+          const exitCode = await followDetachedDaemonRuntimeSwitch({
+            scriptDir: res.detachedScriptDir,
+            targetVersion: res.targetVersion,
+            runtimeRoot: res.runtimeRoot,
+            writableRootKind: res.writableRootKind,
+            ...(res.status === 'handoff_uncertain' ? { handoffUncertain: true } : {}),
+          });
+          process.exit(exitCode);
+        }
+        console.log(`Upgraded daemon-runtime to v${res.targetVersion} (${res.writableRootKind}: ${res.runtimeRoot})`);
+        process.exit(0);
+      }
+      if (res.status === 'up_to_date') {
+        console.log(`Already at daemon-runtime v${res.currentVersion}.`);
+        process.exit(0);
+      }
+      if (res.status === 'blocked') {
+        console.error(res.message);
+        process.exit(1);
+      }
+      if (res.status === 'rolled_back') {
+        console.error(`daemon-runtime upgrade failed health check (${res.reason}); rolled back to previous version.`);
+        process.exit(1);
+      }
+      const fallback = resolveLegacyNpmCliFallback({
+        platform,
+        env: process.env,
+        execPath: process.execPath,
+        userHome: homedir(),
+        stateDir: imcodesStateDir(),
+      });
+      if (!fallback.eligible) {
+        console.error(`Bundled daemon-runtime upgrade unavailable (${res.reason}) and legacy CLI fallback blocked (${fallback.reason}): ${fallback.message}`);
+        process.exit(1);
+      }
+      fallbackNodeBin = fallback.nodeBin;
+      fallbackPrefixDir = fallback.prefixDir;
+      console.log(`Bundled daemon-runtime feed unavailable (${res.reason}); falling back to legacy CLI upgrade (${fallback.prefixDir})...`);
+    }
 
     console.log(`Upgrading to ${pkg}  (${channelLabel})${registry ? `  via ${registry}` : ''}...`);
 
     // Step 1: Install new version (do NOT kill daemon — upgrade may be running from
     // a daemon-managed session, so killing it would kill ourselves).
     let installedEntryScript: string | null = null;
-    if (isGlobal && (platform === 'linux' || platform === 'darwin')) {
+    if ((isGlobal || Boolean(fallbackNodeBin)) && (platform === 'linux' || platform === 'darwin')) {
       // Linux/macOS: the install, the verification, the switch and the restart all
       // run in the detached upgrade script (the one the daemon's own upgrade uses),
       // so nothing below depends on this process or its terminal surviving.
@@ -1037,10 +1115,12 @@ program
         platform,
         stateDir: imcodesStateDir(),
         home: homedir(),
+        ...(fallbackNodeBin ? { nodeBin: fallbackNodeBin } : {}),
+        ...(fallbackPrefixDir ? { npmPrefix: fallbackPrefixDir } : {}),
       });
       process.exit(code);
     }
-    if (isGlobal && platform === 'win32') {
+    if ((isGlobal || Boolean(fallbackNodeBin)) && platform === 'win32') {
       // Windows: the existing upgrade runner does the install and the restart, detached;
       // this process only follows its log, so a dropped session cannot interrupt it.
       const { runDetachedWindowsUpgrade } = await import('./cli/upgrade-detached.js');
@@ -1048,14 +1128,16 @@ program
         pkgSpec: pkg,
         targetVer: /^\d/.test(pkgTag) ? pkgTag : 'latest',
         registry,
+        ...(fallbackPrefixDir ? { npmPrefix: fallbackPrefixDir } : {}),
+        ...(fallbackNodeBin ? { nodeBin: fallbackNodeBin } : {}),
       }));
     }
-    if (isGlobal) {
+    if (isGlobal || Boolean(fallbackNodeBin)) {
       // linux, darwin and win32 returned above. There is no in-place `npm install -g`
       // here any more: that is the path that left 215 half-installed.
       console.error(`Upgrading a global install is not supported on ${platform}.`);
       process.exit(1);
-    } else {
+    } else if (runtimeMode.mode === 'dev_exempt' || isPathInsideGitCheckout(selfPath)) {
       const projectRoot = PROJECT_ROOT;
       try {
         if (platform === 'win32') {
@@ -1068,6 +1150,9 @@ program
         console.error('Git pull / build failed.');
         process.exit(1);
       }
+    } else {
+      console.error(`Refusing unsupported CLI upgrade outside bundled runtime, npm global install, or git checkout (${selfPath}).`);
+      process.exit(1);
     }
 
     // Show new version
@@ -1298,6 +1383,23 @@ program
     console.log(JSON.stringify(outcome));
   });
 
+// SQLite chat retention only. JSONL/native CLI history keep their existing policies.
+program.command('history').description('Manage local SQLite chat history')
+  .command('keep [days-or-off]')
+  .description('Show retention, keep N days, or turn daily SQLite cleanup off')
+  .allowExcessArguments(false)
+  .addHelpText('after', '\nExamples: imcodes history keep 3 | imcodes history keep | imcodes history keep off\n' +
+    'Default: off. Cleanup runs at 03:00 in the daemon server local timezone; first enable waits until the next 03:00.\n' +
+    'JSONL cleanup is unchanged. Purged ranges are not restored from JSONL, even after off.\n' +
+    'Invalid/missing event timestamps are kept conservatively. No VACUUM is run.')
+  .action(async (value?: string) => {
+    const { getHistoryKeep, setHistoryKeep } = await import('./store/history-retention.js');
+    const keepDays = value === undefined ? getHistoryKeep() : setHistoryKeep(value);
+    console.log(JSON.stringify({ keepDays, note: value === undefined
+      ? 'SQLite chat retention; null means off. JSONL cleanup is unchanged.'
+      : 'Saved. A running daemon applies the schedule automatically; otherwise at next start. Cleanup is at server-local 03:00; purged ranges are not restored.' }));
+  });
+
 // ── Memory search CLI ────────────────────────────────────────────────────────
 
 const memoryCmd = program
@@ -1386,6 +1488,33 @@ memoryCmd
       console.log(`Recent summaries:   ${stats.recentSummaryCount}`);
       console.log(`Durable candidates: ${stats.durableCandidateCount}`);
       console.log(`Projects:           ${stats.projectCount}`);
+    }
+  });
+
+program
+  .command('cloud-docs [args...]')
+  .description('Unified Cloud Docs & ONLYOFFICE Document Builder CLI (`imcodes cloud-docs docs` for guide)')
+  .helpOption(false)
+  .passThroughOptions()
+  .allowUnknownOption(true)
+  .allowExcessArguments(true)
+  .action(async (args: string[], _opts: Record<string, unknown>, cmd: Command) => {
+    const { runCloudDocsCli } = await import('./cli/cloud-docs.js');
+    const rawArgs = (cmd.parent as { rawArgs?: string[] } | undefined)?.rawArgs;
+    let forwarded = args;
+    if (Array.isArray(rawArgs)) {
+      const idx = rawArgs.indexOf('cloud-docs');
+      if (idx >= 0) {
+        forwarded = rawArgs.slice(idx + 1);
+      }
+    }
+    const result = await runCloudDocsCli(forwarded);
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.exitCode !== 0) {
+      const err = new Error(result.stderr.trim() || `cloud-docs exited with code ${result.exitCode}`) as Error & { exitCode?: number };
+      err.exitCode = result.exitCode;
+      throw err;
     }
   });
 

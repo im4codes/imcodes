@@ -17,6 +17,8 @@ export interface ControlledMachineAccessRow {
   last_heartbeat_at: number | null;
   exec_enabled: boolean;
   os: string | null;
+  arch: string | null;
+  abi_profile: unknown;
   daemon_version: string | null;
   auto_unlock_configured: boolean;
   revoked_at: number | null;
@@ -126,7 +128,7 @@ const ACTIVE_ACCOUNTS_ACCESS_PREDICATE = `${activeUserExistsSql('$1')} AND ${act
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.node_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
-         s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
+         s.last_heartbeat_at, s.exec_enabled, s.os, s.arch, s.abi_profile, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
          s.controlled_upgrade_status, s.controlled_upgrade_target_version, s.controlled_upgrade_reason,
          s.controlled_worker_refresh_attempt_id, s.controlled_worker_refresh_phase,

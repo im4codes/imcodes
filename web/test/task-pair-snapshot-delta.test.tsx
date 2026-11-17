@@ -1,3 +1,9 @@
+import { putTaskPairFixture } from '../../test/helpers/task-pair-fixture.js';
+// Daemon modules are exercised below: isolate all import-time logs and state.
+import '../../test/setup/isolated-home.js';
+import { taskPairService } from '../../src/daemon/task-pairs/service.js';
+import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
+import { TaskPairDecisionPanel } from '../src/components/TaskPairDecisionPanel.js';
 /**
  * @vitest-environment jsdom
  *
@@ -68,7 +74,7 @@ function newStore(): TaskPairStore {
 
 function save(store: TaskPairStore, taskId: string, over: Record<string, unknown> = {}) {
   clock += 1;
-  return store.savePair(PROJECT, {
+  return putTaskPairFixture(store, PROJECT, {
     taskId, brain: BRAIN, executor: `deck_sub_${taskId}_x`, auditor: `deck_sub_${taskId}_a`,
     title: `Pair ${taskId}`, status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
     previousAuditors: [], createdAt: 1, updatedAt: 1_000 + clock, brief: BRIEF(taskId), executorPool: 'primary',
@@ -384,14 +390,15 @@ describe('TaskPairBrief (lazy)', () => {
     const requests: string[] = [];
     setTaskPairBriefRequester((taskId) => requests.push(taskId));
     const view = render(<TaskPairBrief taskId="t1" briefRevision="rev-a" checklist={counts} />);
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/2');
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/2 :');
     expect(requests).toEqual([]); // collapsed: nothing fetched
     fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
     expect(requests).toEqual(['t1']);
     expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('taskPair.brief_loading');
     receiveTaskPairBrief('t1', 'rev-a', BRIEF('t1'));
     await waitFor(() => expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter for t1.'));
-    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Implement t1');
+    fireEvent.click(screen.getByRole('button', { name: /^taskPair\.checklist_toggle/ }));
+    expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Implement t1');
     expect(view.container.querySelectorAll('.task-pair-brief-checklist-row')).toHaveLength(2);
     // Collapse/expand again: served from cache, no second request.
     fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_collapse' }));
@@ -402,12 +409,13 @@ describe('TaskPairBrief (lazy)', () => {
   it('renders exactly what the inline (legacy) brief renders once the text is fetched', async () => {
     setTaskPairBriefRequester(() => {});
     const inline = render(<TaskPairBrief taskId="t1" brief={BRIEF('t1')} defaultOpen />);
-    const inlineHtml = inline.container.querySelector('.task-pair-brief')!.innerHTML;
+    const withoutIds = (html: string) => html.replace(/\s(?:id|aria-controls)="[^"]*"/gu, '');
+    const inlineHtml = withoutIds(inline.container.querySelector('.task-pair-brief')!.innerHTML);
     inline.unmount();
     receiveTaskPairBrief('t1', 'rev-a', BRIEF('t1'));
     const lazy = render(<TaskPairBrief taskId="t1" briefRevision="rev-a" checklist={{ total: 2, implemented: 1, audited: 0 }} defaultOpen />);
     await waitFor(() => expect(lazy.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter'));
-    expect(lazy.container.querySelector('.task-pair-brief')!.innerHTML).toBe(inlineHtml);
+    expect(withoutIds(lazy.container.querySelector('.task-pair-brief')!.innerHTML)).toBe(inlineHtml);
   });
 
   it('copies after fetching when the copy button is used before the text arrived', async () => {
@@ -450,10 +458,42 @@ describe('TaskPairStatusPanel with revision-only briefs', () => {
       assignments: [],
     };
     const view = render(<TaskPairStatusPanel events={[]} serverId="lazy-panel" scopeSessionId="sub-window" />);
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :');
     await waitFor(() => expect(requests).toEqual(['mine']));
     receiveTaskPairBrief('mine', 'rev-m', '- [x][ ] Mine it');
-    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Mine it'));
+    fireEvent.click(screen.getByRole('button', { name: /^taskPair\.checklist_toggle/ }));
+    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Mine it'));
     delete (window as any).__imcodesTaskPairSnapshot;
+  });
+});
+
+describe('task-bound human decision round trip', () => {
+  it('carries a card choice through the real controller/registry, persists it, and notifies the paused task Brain only', async () => {
+    const store = newStore(); setTaskPairStoreForTests(store);
+    save(store, 'decision-ui', { round: 1, flags: ['needs_input'], blockedNote: 'Which data source?',
+      scheduling: { epoch: 1, manual: true, dependsOn: ['predecessor'], writer: BRAIN, since: 1 } });
+    const notices: Array<{ target: string; text: string }> = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target, text) => { notices.push({ target, text }); } });
+    const request = taskPairService.recordDecision({ project: PROJECT, taskId: 'decision-ui', round: 1,
+      kind: 'request', conclusion: 'Choose source', summary: 'Need approval', question: 'Which data source?',
+      options: [{ id: 'test', label: 'Approved test fixture' }], author: 'deck_sub_decision-ui_x' }).record;
+    const daemon = newDaemon(); const controller = viewer(daemon);
+    try {
+      const pair = controller.getState().tasks['decision-ui']!.pair!;
+      expect(pair.decisionRequest?.id).toBe(request.id);
+      render(<TaskPairDecisionPanel taskId="decision-ui" pair={pair} />);
+      fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Test data only; do not touch real data' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Approved test fixture' }));
+      await waitFor(() => expect(screen.getByRole('status')).toBeTruthy());
+      await taskPairService.waitForIdle();
+      expect(store.listDecisions(PROJECT, ['decision-ui'])[0]).toMatchObject({ kind: 'feedback', requestId: request.id,
+        selectedOptionId: 'test', summary: 'Test data only; do not touch real data' });
+      expect(notices.filter((notice) => notice.text.includes('Human feedback'))).toEqual([
+        expect.objectContaining({ target: BRAIN, text: expect.stringContaining('Which data source?') }),
+      ]);
+      expect(store.getPair(PROJECT, 'decision-ui')!.state.scheduling).toMatchObject({ manual: true, dependsOn: ['predecessor'] });
+    } finally {
+      controller.stop(); await taskPairService.waitForIdle(); setTaskPairDeliveryDepsForTests(undefined); daemon.db.close();
+    }
   });
 });

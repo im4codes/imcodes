@@ -33,7 +33,7 @@ describe('the node executable build keeps the embedded page code intact', () => 
     expect(html).toMatch(/function localPanelText\(/u);
 
     const errors: unknown[] = [];
-    const fetchStub = vi.fn(async () => ({ ok: true, json: async () => ({ publicNodeId: '1234567890', paused: false, connections: [] }) }));
+    const fetchStub = vi.fn(async () => ({ ok: true, json: async () => ({ publicNodeId: '1234567890', paused: false, connections: [], traffic: { total: { bytesSent: 2048, bytesReceived: 4096 }, connections: [] } }) }));
     const dom = new JSDOM(html, {
       url: 'http://127.0.0.1:43751/', runScripts: 'dangerously',
       beforeParse(window) {
@@ -45,6 +45,7 @@ describe('the node executable build keeps the embedded page code intact', () => 
     try {
       await vi.waitFor(() => expect(dom.window.document.getElementById('statusText')?.textContent).toBe('上線'));
       expect(dom.window.document.documentElement.lang).toBe('zh-TW');
+      await vi.waitFor(() => expect(dom.window.document.getElementById('trafficTotal')?.textContent).toContain('2.0 KiB'));
       expect(errors).toEqual([]);
     } finally { dom.window.close(); }
   });

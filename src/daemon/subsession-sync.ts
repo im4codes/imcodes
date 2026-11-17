@@ -15,6 +15,8 @@ import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -48,8 +50,24 @@ export interface SubSessionSyncTransportQueueSnapshot {
   failedMessageEntries?: QueueSnapshot['failedMessageEntries'];
 }
 
+export interface SubSessionSyncSharedCache {
+  claudeRuntimeConfig?: Promise<Awaited<ReturnType<typeof getClaudeSdkRuntimeConfig>>>;
+  codexRuntimeConfig?: Promise<Awaited<ReturnType<typeof getCodexRuntimeConfig>>>;
+  grokRuntimeConfig?: Promise<Awaited<ReturnType<typeof getGrokSdkRuntimeConfig>>>;
+  claudeUsageQuota?: Promise<Awaited<ReturnType<typeof getClaudeUsageQuota>>>;
+  agyUsageQuota?: Promise<Awaited<ReturnType<typeof fetchAgyUsageQuota>>>;
+  grokUsageQuota?: Promise<Awaited<ReturnType<typeof getGrokUsageQuota>>>;
+  museUsageQuota?: Promise<Awaited<ReturnType<typeof getMuseUsageQuota>>>;
+  presetModels?: Map<string, Promise<string[] | undefined>>;
+}
+
+export function createSubSessionSyncSharedCache(): SubSessionSyncSharedCache {
+  return { presetModels: new Map() };
+}
+
 export interface SubSessionSyncOptions {
   transportQueue?: SubSessionSyncTransportQueueSnapshot | null;
+  sharedCache?: SubSessionSyncSharedCache;
 }
 
 function isQwenSession(agentType: string | null | undefined): boolean {
@@ -77,20 +95,42 @@ export async function buildSubSessionSyncPayload(
   const sessionName = `deck_sub_${id}`;
   const record = getSession(sessionName);
   const r = { ...record, ...overrides };
+  if (isIncognitoSessionName(sessionName) || isIncognitoSession(r)) {
+    return null;
+  }
   if (!r?.agentType) {
     logger.warn({ id, sessionName }, 'Skipping subsession.sync without agentType');
     return null;
   }
 
+  const cache = options?.sharedCache;
+
   let codexAvailableModels: string[] | undefined = r.codexAvailableModels;
   if (isCodexFamilySession(r.agentType) && r.ccPreset) {
-    const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
-    const preset = await getPreset(r.ccPreset);
-    if (preset) {
-      const models = getPresetAvailableModelIds(preset);
-      if (models.length > 0) codexAvailableModels = models;
+    let modelsPromise = cache?.presetModels?.get(r.ccPreset);
+    if (!modelsPromise) {
+      modelsPromise = (async () => {
+        const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+        const preset = await getPreset(r.ccPreset!);
+        if (!preset) return undefined;
+        const models = getPresetAvailableModelIds(preset);
+        return models.length > 0 ? models : undefined;
+      })();
+      if (cache) (cache.presetModels ??= new Map()).set(r.ccPreset, modelsPromise);
     }
+    const models = await modelsPromise;
+    if (models) codexAvailableModels = models;
   }
+
+  const readClaudeRuntime = () => (cache
+    ? (cache.claudeRuntimeConfig ??= getClaudeSdkRuntimeConfig().catch(() => ({})))
+    : getClaudeSdkRuntimeConfig().catch(() => ({})));
+  const readCodexRuntime = () => (cache
+    ? (cache.codexRuntimeConfig ??= getCodexRuntimeConfig({ probe: false }).catch(() => ({})))
+    : getCodexRuntimeConfig({ probe: false }).catch(() => ({})));
+  const readGrokRuntime = () => (cache
+    ? (cache.grokRuntimeConfig ??= getGrokSdkRuntimeConfig().catch(() => ({})))
+    : getGrokSdkRuntimeConfig().catch(() => ({})));
 
   const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta' | 'codexCreditsBalance' | 'codexCreditsHasCredits' | 'codexCreditsUnlimited'>> = isQwenSession(r.agentType)
     ? getQwenDisplayMetadata({
@@ -100,23 +140,30 @@ export async function buildSubSessionSyncPayload(
         quotaUsageLabel: r.qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
       })
     : isClaudeSdkSession(r.agentType)
-      ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
+      ? await readClaudeRuntime()
       : isCodexFamilySession(r.agentType)
         ? {
-            ...mergeCodexDisplayMetadata(await getCodexRuntimeConfig({ probe: false }).catch(() => ({})), r),
+            ...mergeCodexDisplayMetadata(await readCodexRuntime(), r),
             ...(codexAvailableModels?.length ? { codexAvailableModels } : {}),
           }
         : r.agentType === 'grok-sdk'
-          ? await getGrokSdkRuntimeConfig().catch(() => ({}))
+          ? await readGrokRuntime()
           : {};
 
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota for a
   // claude-code-sdk sub-session. null → fall back to the rate_limit_event quota.
-  const usageQuota = isClaudeSdkSession(r.agentType) ? await getClaudeUsageQuota().catch(() => null) : null;
-  const agyUsageQuota = r.agentType === 'agy-sdk' ? await fetchAgyUsageQuota().catch(() => null) : null;
-  const grokUsageQuota = r.agentType === 'grok-sdk' ? await getGrokUsageQuota().catch(() => null) : null;
-  const museUsageQuota = r.agentType === 'muse-code-sdk' ? await getMuseUsageQuota().catch(() => null) : null;
-  void options;
+  const usageQuota = isClaudeSdkSession(r.agentType)
+    ? await (cache ? (cache.claudeUsageQuota ??= getClaudeUsageQuota().catch(() => null)) : getClaudeUsageQuota().catch(() => null))
+    : null;
+  const agyUsageQuota = r.agentType === 'agy-sdk'
+    ? await (cache ? (cache.agyUsageQuota ??= fetchAgyUsageQuota().catch(() => null)) : fetchAgyUsageQuota().catch(() => null))
+    : null;
+  const grokUsageQuota = r.agentType === 'grok-sdk'
+    ? await (cache ? (cache.grokUsageQuota ??= getGrokUsageQuota().catch(() => null)) : getGrokUsageQuota().catch(() => null))
+    : null;
+  const museUsageQuota = r.agentType === 'muse-code-sdk'
+    ? await (cache ? (cache.museUsageQuota ??= getMuseUsageQuota().catch(() => null)) : getMuseUsageQuota().catch(() => null))
+    : null;
   let transportQueue: TransportQueueSnapshotPayload | null = null;
   if (r.runtimeType === 'transport') {
     transportQueue = buildTransportQueueSnapshotPayload(sessionName, 'subsession_sync');
@@ -146,6 +193,7 @@ export async function buildSubSessionSyncPayload(
     ccSessionId: identity('ccSessionId'),
     geminiSessionId: identity('geminiSessionId'),
     executionCloneMetadata: cloneMetadata,
+    ...(r.pairCreatedMetadata ? { pairCreatedMetadata: r.pairCreatedMetadata } : {}),
     parentSession: r.parentSession ?? null,
     ccPresetId: r.ccPreset ?? null,
     description: r.description ?? null,

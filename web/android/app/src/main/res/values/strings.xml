@@ -4,4 +4,7 @@
     <string name="title_activity_main">IM.codes</string>
     <string name="package_name">com.im.codes</string>
     <string name="custom_url_scheme">com.im.codes</string>
+    <string name="bg_upload_channel_name">File uploads</string>
+    <string name="bg_upload_notification_title">Uploading files</string>
+    <string name="bg_upload_notification_text">Transferring files in the background</string>
 </resources>

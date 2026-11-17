@@ -256,6 +256,7 @@ describe('managed provider MCP registration helpers', () => {
     // hide native collaboration from analysis and non-Brain sessions too; Brain
     // task participation is enforced by the daemon relay instead.
     const args = getCodexAppServerArgs();
+    expect(args).toContain('features.default_mode_request_user_input=true');
     expect(args, 'no process-wide feature may be disabled').not.toContain('--disable');
     expect(JSON.stringify(args)).not.toContain('multi_agent');
     expect(args.at(-1)).toBe('app-server');

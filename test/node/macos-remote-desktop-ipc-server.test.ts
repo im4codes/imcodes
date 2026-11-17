@@ -1,3 +1,5 @@
+import type { MacosRemoteDesktopWorkerMessage } from '../../src/node/macos-remote-desktop-ipc.js';
+import { REMOTE_DESKTOP_TRAFFIC } from '../../shared/remote-desktop-traffic.js';
 import { once } from 'node:events';
 import { lstat, mkdir, mkdtemp, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import net, { type Socket } from 'node:net';
@@ -178,7 +180,7 @@ async function createFixture(
   runtimeRoot: string;
   authenticated: ReturnType<typeof deferred<MacosRemoteDesktopIpcLaunch>>;
   disconnected: ReturnType<typeof deferred<MacosRemoteDesktopIpcDisconnectReason>>;
-  workerMessages: RemoteDesktopDaemonMessage[];
+  workerMessages: MacosRemoteDesktopWorkerMessage[];
 }> {
   const user = currentUser();
   const runtimeRoot = await temporaryRoot();
@@ -196,7 +198,7 @@ async function createFixture(
   });
   const authenticated = deferred<MacosRemoteDesktopIpcLaunch>();
   const disconnected = deferred<MacosRemoteDesktopIpcDisconnectReason>();
-  const workerMessages: RemoteDesktopDaemonMessage[] = [];
+  const workerMessages: MacosRemoteDesktopWorkerMessage[] = [];
   const server = new MacosRemoteDesktopIpcServer({
     authority,
     user,
@@ -625,6 +627,45 @@ describe('macOS remote-desktop bounded Unix IPC transport', () => {
     socket.destroy();
     await expect(fixture.disconnected.promise).resolves.toBe('peer_disconnected');
   });
+
+  it.each(['valid', 'invalid', 'consumer throws', 'consumer rejects', 'consumer stalls'])(
+    'keeps the authenticated media/control socket alive for optional traffic: %s', async (fault) => {
+      const delivered: unknown[] = [];
+      const fixture = await createFixture({ callbackTimeoutMs: 60_000, onWorkerMessage: (message) => {
+        if (message.type === REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE) {
+          if (fault === 'consumer throws') throw new Error('statistics unavailable');
+          if (fault === 'consumer rejects') return Promise.reject(new Error('statistics unavailable'));
+          if (fault === 'consumer stalls') return new Promise<void>(() => {});
+        }
+        delivered.push(message);
+      } });
+      const launch = await fixture.server.start();
+      const socket = await authenticate(fixture.server, fixture.authenticated, launch);
+      const commandLine = readLine(socket);
+      await fixture.server.sendCommand(prepare());
+      await commandLine;
+      const traffic = {
+        type: REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE,
+        requestId: REQUEST_ID, sessionId: SESSION_ID, capability: CAPABILITY,
+        transportId: 'peer:T01', bytesSent: fault === 'invalid' ? -1 : 1234, bytesReceived: 567,
+      };
+      const trafficFrame = JSON.stringify({
+        type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE,
+        ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+        workerGeneration: launch.workerGeneration, message: traffic,
+      });
+      socket.write(`${trafficFrame}\n${workerFrame(launch, modeState())}\n`);
+      await expect.poll(() => delivered).toEqual(fault === 'valid' ? [traffic, modeState()] : [modeState()]);
+      expect(socket.destroyed).toBe(false);
+      const stopLine = readLine(socket);
+      await fixture.server.sendCommand({
+        type: REMOTE_DESKTOP_MSG.STOP,
+        requestId: REQUEST_ID, sessionId: SESSION_ID, capability: CAPABILITY,
+      });
+      expect(JSON.parse(await stopLine).command.type).toBe(REMOTE_DESKTOP_MSG.STOP);
+      socket.destroy();
+    },
+  );
 
   it('takes uid and signing identity only from the injected OS/Security.framework seams', async () => {
     let uidChecks = 0;

@@ -191,4 +191,24 @@ describe('getTailSessionState', () => {
       { type: 'session.state', ts: 2, payload: { state: 'started' } },
     ] as any)).toBe(null);
   });
+
+  it('clears open tool calls and thinking after stopping (user_cancel) + command_handler_cancel_idle', () => {
+    const events = [
+      { type: 'assistant.thinking', ts: 100, payload: { text: 'thinking' } },
+      { type: 'tool.call', ts: 200, payload: { toolCallId: 'tool-1', tool: 'Read' } },
+      { type: 'session.state', ts: 300, payload: { state: 'stopping', reason: 'user_cancel' } },
+      {
+        type: 'session.state',
+        ts: 310,
+        payload: {
+          state: 'idle',
+          pendingCount: 0,
+          queueSnapshot: { source: 'command_handler_cancel_idle' },
+        },
+      },
+    ];
+    expect(hasActiveToolCall(events as any)).toBe(false);
+    expect(getActiveThinkingTs(events as any)).toBeNull();
+    expect(getTailSessionState(events as any)).toBe('idle');
+  });
 });

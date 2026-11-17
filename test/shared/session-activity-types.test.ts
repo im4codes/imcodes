@@ -336,4 +336,60 @@ describe('session activity shared contract', () => {
       { scope: 'session', sessionName: 'deck_sub_child', generation: 2 },
     )).toBe(false);
   });
+
+  it('clears open tool calls when idle follows user_cancel stopping or carries command_handler_cancel_idle even across generation mismatch', () => {
+    const preRestartRunning = {
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_aip_brain', generation: 5 },
+    };
+    const openTool = { toolCallId: 'tool-open-1', tool: 'Read' };
+    const stoppingCancel = { state: 'stopping', reason: 'user_cancel' };
+    const weakCancelIdle = {
+      state: 'idle',
+      pendingCount: 0,
+      queueSnapshot: { source: 'command_handler_cancel_idle' },
+    };
+    const mismatchedGenCancelIdle = {
+      state: 'idle',
+      authoritative: true,
+      activityGeneration: { scope: 'session', sessionName: 'deck_aip_brain', generation: 0 },
+      blockingWorkCount: 0,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      pendingCount: 0,
+      pendingVersion: 1,
+      decisionReason: 'command_handler_cancel_idle',
+      clearInputs: [{ source: 'command_handler', reason: 'clear', count: 0 }],
+    };
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: preRestartRunning },
+      { type: 'tool.call', payload: openTool },
+      { type: 'session.state', payload: stoppingCancel },
+      { type: 'session.state', payload: weakCancelIdle },
+    ])).toMatchObject({
+      active: false,
+      openToolCount: 0,
+    });
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: preRestartRunning },
+      { type: 'tool.call', payload: openTool },
+      { type: 'session.state', payload: stoppingCancel },
+      { type: 'session.state', payload: mismatchedGenCancelIdle },
+    ])).toMatchObject({
+      active: false,
+      openToolCount: 0,
+    });
+
+    // Generic weak idle without user cancel must continue preserving open keyed tool calls.
+    expect(reduceTimelineActivity([
+      { type: 'tool.call', payload: openTool },
+      { type: 'session.state', payload: { state: 'idle' } },
+    ])).toMatchObject({
+      active: true,
+      openToolCount: 1,
+      degradedReasons: ['weak_idle_with_open_work'],
+    });
+  });
 });

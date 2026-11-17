@@ -5,7 +5,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/preact';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
-import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 
@@ -35,6 +36,7 @@ const makeWs = () => ({
 describe('StartSubSessionDialog', () => {
   afterEach(() => {
     localStorage.clear();
+    __clearTransportModelCacheForTests();
     cleanup();
   });
 
@@ -60,25 +62,57 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /hermes_agent/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /^pi$/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /cc_cli_sdk/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini cli/i })).toBeNull();
   });
 
-  it('launches the CC CLI SDK choice as its independent agent type', () => {
+  it.each([
+    { allowedAgentTypes: undefined },
+    { allowedAgentTypes: [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'gemini-sdk', 'gemini', 'claude-code-sdk', 'claude-code'] },
+  ])('never restores unavailable CC CLI SDK, Gemini SDK, or Gemini CLI via an allow-list (%j)', async ({ allowedAgentTypes }) => {
     const onStart = vi.fn();
-    render(
-      <StartSubSessionDialog
-        ws={makeWs() as any}
-        defaultCwd="/tmp"
-        isProviderConnected={() => false}
-        getRemoteSessions={() => []}
-        refreshSessions={vi.fn()}
-        onStart={onStart}
-        onClose={vi.fn()}
-      />,
+    const { container } = render(
+      <StartSubSessionDialog ws={makeWs() as any} defaultCwd="/tmp" allowedAgentTypes={allowedAgentTypes}
+        isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()}
+        onStart={onStart} onClose={vi.fn()} />,
     );
-    fireEvent.click(screen.getByRole('button', { name: /cc_cli_sdk/i }));
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini cli/i })).toBeNull();
+    for (const hiddenType of [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'gemini-sdk', 'gemini']) {
+      const unavailable = container.querySelector<HTMLButtonElement>(`[data-agent-type="${hiddenType}"]`);
+      if (unavailable) {
+        expect(unavailable.style.display).toBe('none');
+        expect(unavailable.disabled).toBe(true);
+        fireEvent.click(unavailable);
+      }
+    }
+    await waitFor(() => expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('claude-code-sdk'));
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
-    expect(onStart).toHaveBeenCalledWith(CLAUDE_CODE_CLI_SDK_AGENT_TYPE, undefined, '/tmp', undefined, expect.anything());
+    expect(onStart).toHaveBeenLastCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.anything());
+    fireEvent.click(screen.getByRole('button', { name: /claude_code_cli/i }));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenLastCalledWith('claude-code', undefined, '/tmp', undefined, undefined);
+  });
+
+  it.each([
+    [CLAUDE_CODE_CLI_SDK_AGENT_TYPE],
+    ['gemini-sdk'],
+    ['gemini'],
+    ['gemini-sdk', 'gemini'],
+  ])('cannot launch when the only allowed types are unavailable (%j)', (...allowedAgentTypes) => {
+    const onStart = vi.fn();
+    render(<StartSubSessionDialog ws={makeWs() as any} defaultCwd="/tmp"
+      allowedAgentTypes={allowedAgentTypes} isProviderConnected={() => false}
+      getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={onStart} onClose={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini cli/i })).toBeNull();
+    const launch = screen.getByRole('button', { name: /launch/i }) as HTMLButtonElement;
+    expect(launch.disabled).toBe(true);
+    fireEvent.click(launch);
+    expect(onStart).not.toHaveBeenCalled();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
@@ -797,30 +831,6 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('passes requestedModel for gemini-sdk sub-sessions', () => {
-    const onStart = vi.fn();
-    render(
-      <StartSubSessionDialog
-        ws={makeWs() as any}
-        defaultCwd="/tmp"
-        isProviderConnected={() => false}
-        getRemoteSessions={() => []}
-        refreshSessions={vi.fn()}
-        onStart={onStart}
-        onClose={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /gemini_sdk/i }));
-    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[0], { target: { value: 'auto' } });
-    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
-
-    expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'auto',
-    });
-  });
-
   it('passes requestedModel for kimi-sdk sub-sessions', () => {
     const onStart = vi.fn();
     render(
@@ -919,8 +929,8 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
     const input = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
     act(() => input.focus());
-    await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined());
-    expect(input.value).toBe('gemini-3.8-flash-high');
+    await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-4-hydrogen-high' })).toBeDefined());
+    expect(input.value).toBe('gemini-4-hydrogen-high');
   });
 
   it('replaces Antigravity sub-session fallback options with the refreshed catalog', async () => {
@@ -982,8 +992,57 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('passes requestedModel for gemini-sdk sub-sessions', () => {
-    const onStart = vi.fn();
+  it('defaults agy-sdk sub-sessions to gemini-4-hydrogen-high over upstream carbon-medium and remembers user-selected AGY models on reopen', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws1 = {
+      ...makeWs(),
+      connected: true,
+      onMessage: (cb: (message: unknown) => void) => {
+        handlers.add(cb);
+        return () => handlers.delete(cb);
+      },
+    };
+    const onStart1 = vi.fn();
+    const first = render(
+      <StartSubSessionDialog
+        ws={ws1 as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart1}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const req1 = ws1.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === AGY_SDK_PROVIDER_ID)?.[0];
+    act(() => handlers.forEach((cb) => cb({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: req1?.requestId,
+      models: [
+        { id: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+        { id: AGY_DEFAULT_MODEL_ID, name: 'Gemini 4 Hydrogen (High)' },
+        { id: 'claude-opus-5-5-high', name: 'Claude Opus 5.5 (High)' },
+      ],
+      defaultModel: 'gemini-4-carbon-medium',
+      isAuthenticated: true,
+    })));
+
+    const input1 = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    await waitFor(() => expect(input1.value).toBe(AGY_DEFAULT_MODEL_ID));
+
+    fireEvent.input(input1, { target: { value: 'claude-opus-5-5-high' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart1).toHaveBeenCalledWith(AGY_SDK_PROVIDER_ID, undefined, '/tmp', undefined, {
+      requestedModel: 'claude-opus-5-5-high',
+    });
+    expect(localStorage.getItem('imcodes-agy-model')).toBe('claude-opus-5-5-high');
+
+    first.unmount();
+
+    // Reopening StartSubSessionDialog pre-fills the remembered claude-opus-5-5-high model:
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -991,17 +1050,12 @@ describe('StartSubSessionDialog', () => {
         isProviderConnected={() => false}
         getRemoteSessions={() => []}
         refreshSessions={vi.fn()}
-        onStart={onStart}
+        onStart={vi.fn()}
         onClose={vi.fn()}
       />,
     );
-
-    fireEvent.click(screen.getByRole('button', { name: /gemini_sdk/i }));
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gemini-2.5-pro' } });
-    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
-
-    expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'gemini-2.5-pro',
-    });
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const input2 = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    await waitFor(() => expect(input2.value).toBe('claude-opus-5-5-high'));
   });
 });

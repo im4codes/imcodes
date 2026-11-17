@@ -56,7 +56,7 @@ describe('daemon credentials are admitted only on explicitly called routes', () 
 
   it.each(DAEMON_TOKEN_ROUTES)('$method $path passes real credential middleware', async (route) => {
     const app = new Hono<{ Bindings: Env }>();
-    app.on(route.method, route.path, requireAuth(), c => c.json({ ok: true }));
+    app.on(route.method === 'HEAD' ? ['GET', 'HEAD'] : route.method, route.path, requireAuth(), c => c.json({ ok: true }));
     const response = await app.request(concretize(route.path), { method: route.method, headers }, environment());
     expect(response.status).toBe(200);
   });

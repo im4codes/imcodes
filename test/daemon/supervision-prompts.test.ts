@@ -40,25 +40,35 @@ import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
 import { LOAD_VALIDATION_SAFETY_BY_LOCALE } from '../../shared/load-validation-safety.js';
 import {
+  CLOUD_DOC_OUTPUT_CONTRACT,
+  CLOUD_DOC_OUTPUT_CONTRACT_ID,
   FILE_OUTPUT_CONTRACT,
   FILE_OUTPUT_CONTRACT_ID,
+  buildCloudDocOutputContract,
   buildFileOutputContract,
 } from '../../shared/file-output-contract.js';
 
 describe('supervision prompts', () => {
-  it('keeps the canonical file-output body in shared system context and only its id in execution preambles', () => {
+  it('keeps the canonical file-output and cloud-doc-output bodies in shared system context and only their ids in execution preambles', () => {
     expect(JSON.parse(buildFileOutputContract())).toEqual(FILE_OUTPUT_CONTRACT);
+    expect(JSON.parse(buildCloudDocOutputContract())).toEqual(CLOUD_DOC_OUTPUT_CONTRACT);
     expect(SUPERVISION_CONTRACT_IDS.FILE_OUTPUT).toBe(FILE_OUTPUT_CONTRACT_ID);
+    expect(SUPERVISION_CONTRACT_IDS.CLOUD_DOC_OUTPUT).toBe(CLOUD_DOC_OUTPUT_CONTRACT_ID);
     expect(SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS).toContain(FILE_OUTPUT_CONTRACT_ID);
+    expect(SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS).toContain(CLOUD_DOC_OUTPUT_CONTRACT_ID);
     expect(buildFileOutputContract()).toContain('"repoRelative":"resolve_against_workspace_if_only_known"');
+    expect(buildFileOutputContract()).toContain('"scope":"local_files_only_never_cloud_docs"');
+    expect(buildCloudDocOutputContract()).toContain('[CloudDoc: <name> | id=<docId>]');
 
     for (const preamble of [
       buildSupervisionExecutionPreamble('en'),
       buildSupervisedAuditExecutionPreamble('en'),
     ]) {
       expect(preamble.match(/file_output_v1/g)).toHaveLength(1);
+      expect(preamble.match(/cloud_doc_output_v1/g)).toHaveLength(1);
       expect(preamble).not.toContain('"files":"produced_or_referenced"');
       expect(preamble).not.toContain('[display name](/absolute/full/path)');
+      expect(preamble).not.toContain('[CloudDoc: <name> | id=<docId>]');
     }
   });
 

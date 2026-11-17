@@ -256,3 +256,96 @@ export interface AgentMcpRegistryServer {
   /** An npm package run with npx, when the server offers one. */
   npm?: { identifier: string; version?: string; env: AgentMcpRegistryInput[] };
 }
+
+const REGISTRY_TEXT_CHARS = 400;
+const REGISTRY_INPUT_NAME = /^[A-Za-z0-9_.!#$%&'*+^`|~-]{1,128}$/u;
+const REGISTRY_NPM_PACKAGE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u;
+const REGISTRY_VERSION = /^[A-Za-z0-9._+-]{1,64}$/u;
+
+function registryText(value: unknown, max = REGISTRY_TEXT_CHARS): string | undefined {
+  return typeof value === 'string' && value.trim()
+    ? value.replace(/[\u0000-\u001f\u007f]/gu, ' ').trim().slice(0, max)
+    : undefined;
+}
+
+function registryHttpsUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > AGENT_MCP_LIMITS.URL_CHARS) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function registryInputs(value: unknown): AgentMcpRegistryInput[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, AGENT_MCP_LIMITS.ENTRIES).flatMap((raw): AgentMcpRegistryInput[] => {
+    const record = raw as Record<string, unknown> | null;
+    const name = record?.name;
+    if (typeof name !== 'string' || !REGISTRY_INPUT_NAME.test(name)) return [];
+    const description = registryText(record?.description);
+    const template = registryText(record?.value, 200);
+    return [{
+      name,
+      ...(description ? { description } : {}),
+      required: record?.isRequired === true,
+      secret: record?.isSecret === true,
+      ...(template ? { template } : {}),
+    }];
+  });
+}
+
+export function parseAgentMcpRegistryServer(raw: unknown): AgentMcpRegistryServer | null {
+  const entry = raw as { server?: Record<string, unknown>; _meta?: Record<string, unknown> } | null;
+  const server = entry?.server;
+  const id = registryText(server?.name, 200);
+  if (!server || !id) return null;
+  const official = entry?._meta?.['io.modelcontextprotocol.registry/official'] as Record<string, unknown> | undefined;
+  if (official && official.status !== undefined && official.status !== 'active') return null;
+
+  const remotes = Array.isArray(server.remotes) ? server.remotes : [];
+  let remote: AgentMcpRegistryServer['remote'];
+  for (const candidate of remotes as Array<Record<string, unknown>>) {
+    const url = registryHttpsUrl(candidate?.url);
+    const transport = candidate?.type === 'sse' ? AGENT_MCP_TRANSPORT.SSE
+      : candidate?.type === 'streamable-http' || candidate?.type === 'http' ? AGENT_MCP_TRANSPORT.HTTP : undefined;
+    if (url && transport) {
+      remote = { transport, url, headers: registryInputs(candidate.headers) };
+      break;
+    }
+  }
+
+  const packages = Array.isArray(server.packages) ? server.packages : [];
+  let npm: AgentMcpRegistryServer['npm'];
+  for (const candidate of packages as Array<Record<string, unknown>>) {
+    const identifier = candidate?.identifier;
+    const transport = (candidate?.transport as Record<string, unknown> | undefined)?.type;
+    if (candidate?.registryType === 'npm' && transport === 'stdio'
+      && typeof identifier === 'string' && REGISTRY_NPM_PACKAGE.test(identifier)) {
+      const version = typeof candidate.version === 'string' && REGISTRY_VERSION.test(candidate.version) ? candidate.version : undefined;
+      npm = { identifier, ...(version ? { version } : {}), env: registryInputs(candidate.environmentVariables) };
+      break;
+    }
+  }
+  if (!remote && !npm) return null;
+
+  const version = typeof server.version === 'string' && REGISTRY_VERSION.test(server.version) ? server.version : undefined;
+  const repositoryUrl = registryHttpsUrl((server.repository as Record<string, unknown> | undefined)?.url);
+  return {
+    id,
+    description: registryText(server.description) ?? '',
+    ...(version ? { version } : {}),
+    ...(repositoryUrl ? { repositoryUrl } : {}),
+    ...(remote ? { remote } : {}),
+    ...(npm ? { npm } : {}),
+  };
+}
+
+export function parseAgentMcpRegistryServers(body: unknown): AgentMcpRegistryServer[] {
+  const servers = (body as { servers?: unknown } | null)?.servers;
+  if (!Array.isArray(servers)) throw new Error('registry_shape');
+  return servers
+    .map(parseAgentMcpRegistryServer)
+    .filter((server): server is AgentMcpRegistryServer => server !== null);
+}

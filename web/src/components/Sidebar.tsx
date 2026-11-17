@@ -3,6 +3,7 @@ import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
 import type { PinnedPanel } from '../app.js';
 import { LanguageSwitcher } from './LanguageSwitcher.js';
+import { VoiceLanguageSwitcher } from './VoiceLanguageSwitcher.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 const LS_COLLAPSED = 'sidebar_collapsed';
@@ -185,6 +186,7 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
       {!collapsed && (
         <div class="sidebar-footer">
           <LanguageSwitcher />
+          <VoiceLanguageSwitcher />
           <span class="sidebar-build-time">
             {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
           </span>

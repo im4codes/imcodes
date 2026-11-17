@@ -13,11 +13,39 @@ import { constants as fsConstants } from 'node:fs';
 import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
+  CONTROLLED_NODE_ARCH_ARM64,
+  CONTROLLED_NODE_ARCH_X64,
+  CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
+  CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_VARIANTS,
+  CONTROLLED_NODE_OS_LINUX,
+  CONTROLLED_NODE_OS_MAC,
+  CONTROLLED_NODE_OS_WIN,
   controlledNodeArtifactKey,
+  controlledNodeDaemonRuntimeTarget,
+  normalizeControlledNodeArtifactPair,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+  REMOTE_DESKTOP_WORKER_FILENAME,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+  validateRemoteDesktopWorkerManifest,
+} from '../../../shared/remote-desktop-worker.js';
+import {
+  DESKTOP_RELEASE_MANIFEST_FILENAME,
+  daemonRuntimeManifestFilename,
+  desktopReleaseTargetManifestFilename,
+  validateDaemonRuntimeManifest,
+  validateDesktopReleaseManifest,
+  verifyDesktopReleaseComponentIdentity,
+  type DaemonRuntimeManifest,
+  type DesktopReleaseManifest,
+  type DesktopReleaseTarget,
+} from '../../../shared/desktop-release-manifest.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../../shared/daemon-upgrade.js';
 import {
   CONTROLLED_NODE_ABI_MODERN,
@@ -414,8 +442,514 @@ export function makeSafeCloseOnce(handle: FileHandle, onClosed?: () => void): ()
       await handle.close();
     } catch {
       // Closing an already-closed/erroring descriptor must not hide the primary error.
-    } finally {
+      } finally {
       onClosed?.();
     }
   };
+}
+
+const RELEASE_MANIFEST_MAX_BYTES = 2 * 1024 * 1024;
+const DAEMON_RUNTIME_MANIFEST_MAX_BYTES = 4 * 1024 * 1024;
+
+export type OpenedCatalogReleaseManifest =
+  | {
+      status: 'ok';
+      bytes: Buffer;
+      close: () => Promise<void>;
+      filename: string;
+      sizeBytes: number;
+      sha256: string;
+      version: string;
+      manifest: DesktopReleaseManifest;
+    }
+  | { status: 'not_published' }
+  | { status: 'invalid'; reason: string };
+
+export type OpenedCatalogDaemonRuntime =
+  | {
+      status: 'ok';
+      handle?: FileHandle;
+      bytes?: Buffer;
+      close: () => Promise<void>;
+      filename: string;
+      sizeBytes: number;
+      sha256: string;
+      version: string;
+      releaseManifestSha256?: string;
+      authenticodeSignerSha256?: string;
+    }
+  | { status: 'not_published' }
+  | { status: 'invalid'; reason: string };
+
+function isEnoent(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'ENOENT');
+}
+
+async function readPinnedRegularFile(
+  filePath: string,
+  maxBytes: number,
+): Promise<{ ok: true; bytes: Buffer; sha256: string } | { ok: false; kind: 'not_published' | 'invalid'; reason: string }> {
+  let handle: FileHandle | null = null;
+  try {
+    const pathStat = await lstat(filePath);
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.size <= 0 || pathStat.size > maxBytes) {
+      return { ok: false, kind: 'invalid', reason: 'invalid_file_stat' };
+    }
+    handle = await openReadNoFollow(filePath);
+    const fdStat = await handle.stat();
+    if (!fdStat.isFile() || !sameIdentity(fileIdentity(pathStat), fileIdentity(fdStat))) {
+      return { ok: false, kind: 'invalid', reason: 'file_identity_changed' };
+    }
+    const bytes = await handle.readFile();
+    if (bytes.length !== fdStat.size) {
+      return { ok: false, kind: 'invalid', reason: 'short_read' };
+    }
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return { ok: true, bytes, sha256 };
+  } catch (error) {
+    if (isEnoent(error)) return { ok: false, kind: 'not_published', reason: 'not_found' };
+    return { ok: false, kind: 'invalid', reason: 'read_failed' };
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+export async function openDesktopReleaseManifestArtifact(
+  dir: string,
+  target: DesktopReleaseTarget | null,
+): Promise<OpenedCatalogReleaseManifest> {
+  const candidates = target
+    ? [desktopReleaseTargetManifestFilename(target), DESKTOP_RELEASE_MANIFEST_FILENAME]
+    : [DESKTOP_RELEASE_MANIFEST_FILENAME];
+
+  for (const filename of candidates) {
+    const filePath = join(dir, filename);
+    const read = await readPinnedRegularFile(filePath, RELEASE_MANIFEST_MAX_BYTES);
+    if (!read.ok) {
+      if (read.kind === 'not_published') continue;
+      return { status: 'invalid', reason: read.reason };
+    }
+    let manifest: DesktopReleaseManifest;
+    try {
+      manifest = validateDesktopReleaseManifest(JSON.parse(read.bytes.toString('utf8')));
+    } catch (error) {
+      return { status: 'invalid', reason: error instanceof Error ? error.message : 'invalid_manifest' };
+    }
+    if (target && !manifest.targets[target]) {
+      return { status: 'invalid', reason: `missing_target_${target}` };
+    }
+    return {
+      status: 'ok',
+      bytes: read.bytes,
+      close: async () => {},
+      filename,
+      sizeBytes: read.bytes.length,
+      sha256: read.sha256,
+      version: manifest.releaseVersion,
+      manifest,
+    };
+  }
+  return { status: 'not_published' };
+}
+
+export async function openDaemonRuntimeArtifact(
+  dir: string,
+  target: DesktopReleaseTarget,
+  wantManifest: boolean,
+): Promise<OpenedCatalogDaemonRuntime> {
+  const runtimeDir = join(dir, 'daemon-runtime');
+  const manifestFilename = daemonRuntimeManifestFilename(target);
+  const manifestPath = join(runtimeDir, manifestFilename);
+  const readManifest = await readPinnedRegularFile(manifestPath, DAEMON_RUNTIME_MANIFEST_MAX_BYTES);
+  if (!readManifest.ok) {
+    return readManifest.kind === 'not_published'
+      ? { status: 'not_published' }
+      : { status: 'invalid', reason: readManifest.reason };
+  }
+
+  let rawJson: unknown;
+  try {
+    rawJson = JSON.parse(readManifest.bytes.toString('utf8'));
+  } catch {
+    return { status: 'invalid', reason: 'malformed_daemon_runtime_manifest' };
+  }
+
+  let parsedManifest: DaemonRuntimeManifest;
+  try {
+    parsedManifest = validateDaemonRuntimeManifest(rawJson, target);
+  } catch (error) {
+    return {
+      status: 'invalid',
+      reason: error instanceof Error ? error.message : 'invalid_daemon_runtime_manifest',
+    };
+  }
+
+  // Always verify the archive itself exists and matches the manifest before serving either manifest or archive.
+  const archiveFileName = parsedManifest.artifact.fileName;
+  const archiveSize = parsedManifest.artifact.size;
+  const archiveSha256 = parsedManifest.artifact.sha256;
+  const archiveSigner = parsedManifest.artifact.authenticodeSignerSha256;
+  const buildVersion = parsedManifest.build.version;
+  const archivePath = join(runtimeDir, archiveFileName);
+  let archiveHandle: FileHandle | null = null;
+  try {
+    const archivePathStat = await lstat(archivePath);
+    if (!archivePathStat.isFile() || archivePathStat.isSymbolicLink() || archivePathStat.size !== archiveSize) {
+      return { status: 'invalid', reason: 'daemon_runtime_archive_stat_mismatch' };
+    }
+    archiveHandle = await openReadNoFollow(archivePath);
+    const fdStat = await archiveHandle.stat();
+    if (!fdStat.isFile() || !sameIdentity(fileIdentity(archivePathStat), fileIdentity(fdStat))) {
+      await archiveHandle.close().catch(() => {});
+      return { status: 'invalid', reason: 'daemon_runtime_archive_identity_changed' };
+    }
+    const hash = createHash('sha256');
+    const buf = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
+    let position = 0;
+    while (position < archiveSize) {
+      const { bytesRead } = await archiveHandle.read(buf, 0, Math.min(buf.length, archiveSize - position), position);
+      if (bytesRead <= 0) {
+        await archiveHandle.close().catch(() => {});
+        return { status: 'invalid', reason: 'daemon_runtime_archive_short_read' };
+      }
+      hash.update(buf.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const actualSha = hash.digest('hex');
+    if (actualSha !== archiveSha256) {
+      await archiveHandle.close().catch(() => {});
+      return { status: 'invalid', reason: 'daemon_runtime_archive_sha256_mismatch' };
+    }
+
+    // Cross-check unified release manifest when published alongside artifacts.
+    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, target);
+    if (releaseCheck.status === 'invalid') {
+      await archiveHandle.close().catch(() => {});
+      return { status: 'invalid', reason: `release_manifest_invalid:${releaseCheck.reason}` };
+    }
+    if (releaseCheck.status === 'ok') {
+      const check = verifyDesktopReleaseComponentIdentity(releaseCheck.manifest, target, 'daemon-runtime', {
+        version: buildVersion,
+        fileName: archiveFileName,
+        sha256: archiveSha256,
+        sizeBytes: archiveSize,
+        ...(archiveSigner ? { authenticodeSignerSha256: archiveSigner } : {}),
+      });
+      await releaseCheck.close();
+      if (!check.ok) {
+        await archiveHandle.close().catch(() => {});
+        return { status: 'invalid', reason: check.reason };
+      }
+    }
+
+    if (wantManifest) {
+      await archiveHandle.close().catch(() => {});
+      return {
+        status: 'ok',
+        bytes: readManifest.bytes,
+        close: async () => {},
+        filename: manifestFilename,
+        sizeBytes: readManifest.bytes.length,
+        sha256: readManifest.sha256,
+        version: buildVersion,
+        ...(archiveSigner ? { authenticodeSignerSha256: archiveSigner } : {}),
+      };
+    }
+
+    const pinned = archiveHandle;
+    archiveHandle = null;
+    return {
+      status: 'ok',
+      handle: pinned,
+      close: makeSafeCloseOnce(pinned),
+      filename: archiveFileName,
+      sizeBytes: archiveSize,
+      sha256: archiveSha256,
+      version: buildVersion,
+      ...(releaseCheck.status === 'ok' ? { releaseManifestSha256: releaseCheck.sha256 } : {}),
+      ...(archiveSigner ? { authenticodeSignerSha256: archiveSigner } : {}),
+    };
+  } catch (error) {
+    await archiveHandle?.close().catch(() => {});
+    if (isEnoent(error)) return { status: 'not_published' };
+    return { status: 'invalid', reason: 'daemon_runtime_open_failed' };
+  }
+}
+
+export async function openRemoteDesktopWorkerArtifact(
+  dir: string,
+  asset: typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
+  legacyManifest = false,
+): Promise<{
+  handle?: FileHandle;
+  bytes?: Buffer;
+  close: () => Promise<void>;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+  version: string;
+} | null> {
+  const workerDir = join(dir, 'remote-desktop-worker', 'win32-x64');
+  const executablePath = join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME);
+  const manifestFilename = `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+  const manifestPath = join(workerDir, manifestFilename);
+  const virtualDisplayPath = join(workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME);
+  let executable: FileHandle | null = null;
+  let manifestHandle: FileHandle | null = null;
+  let virtualDisplayHandle: FileHandle | null = null;
+  let requested: FileHandle | null = null;
+  try {
+    const [executablePathStat, manifestPathStat, virtualDisplayPathStat] = await Promise.all([
+      lstat(executablePath),
+      lstat(manifestPath),
+      lstat(virtualDisplayPath),
+    ]);
+    if (!executablePathStat.isFile() || executablePathStat.isSymbolicLink()
+      || !manifestPathStat.isFile() || manifestPathStat.isSymbolicLink()
+      || !virtualDisplayPathStat.isFile() || virtualDisplayPathStat.isSymbolicLink()
+      || manifestPathStat.size <= 0 || manifestPathStat.size > 64 * 1024) return null;
+    manifestHandle = await open(manifestPath, 'r');
+    const manifestStat = await manifestHandle.stat();
+    if (!manifestStat.isFile() || manifestStat.size !== manifestPathStat.size
+      || manifestStat.mtimeMs !== manifestPathStat.mtimeMs
+      || manifestStat.ctimeMs !== manifestPathStat.ctimeMs) return null;
+    // Keep the exact bytes used for the HTTP digest. Decoding and re-encoding
+    // would make the advertised SHA-256 differ from the bytes held by this
+    // pinned descriptor if a malformed UTF-8 sequence ever reached disk.
+    const rawManifest = await manifestHandle.readFile();
+    await manifestHandle.close();
+    manifestHandle = null;
+    const manifest = validateRemoteDesktopWorkerManifest(JSON.parse(rawManifest.toString('utf8')));
+    if (!manifest || manifest.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+      || manifest.size !== executablePathStat.size
+      || manifest.virtualDisplay.size !== virtualDisplayPathStat.size) return null;
+
+    executable = await open(executablePath, 'r');
+    const executableStat = await executable.stat();
+    if (!executableStat.isFile() || executableStat.size !== executablePathStat.size
+      || executableStat.mtimeMs !== executablePathStat.mtimeMs
+      || executableStat.ctimeMs !== executablePathStat.ctimeMs) return null;
+    const executableHash = createHash('sha256');
+    const executableBuffer = Buffer.alloc(64 * 1024);
+    let executablePosition = 0;
+    while (executablePosition < executableStat.size) {
+      const { bytesRead } = await executable.read(
+        executableBuffer,
+        0,
+        Math.min(executableBuffer.length, executableStat.size - executablePosition),
+        executablePosition,
+      );
+      if (bytesRead <= 0) return null;
+      executableHash.update(executableBuffer.subarray(0, bytesRead));
+      executablePosition += bytesRead;
+    }
+    if (executableHash.digest('hex') !== manifest.sha256) return null;
+
+    virtualDisplayHandle = await open(virtualDisplayPath, 'r');
+    const virtualDisplayStat = await virtualDisplayHandle.stat();
+    if (!virtualDisplayStat.isFile()
+      || virtualDisplayStat.size !== virtualDisplayPathStat.size
+      || virtualDisplayStat.mtimeMs !== virtualDisplayPathStat.mtimeMs
+      || virtualDisplayStat.ctimeMs !== virtualDisplayPathStat.ctimeMs) {
+      return null;
+    }
+    const virtualDisplayHash = createHash('sha256');
+    const virtualDisplayBuffer = Buffer.alloc(64 * 1024);
+    let virtualDisplayPosition = 0;
+    while (virtualDisplayPosition < virtualDisplayStat.size) {
+      const { bytesRead } = await virtualDisplayHandle.read(
+        virtualDisplayBuffer,
+        0,
+        Math.min(virtualDisplayBuffer.length, virtualDisplayStat.size - virtualDisplayPosition),
+        virtualDisplayPosition,
+      );
+      if (bytesRead <= 0) {
+        return null;
+      }
+      virtualDisplayHash.update(virtualDisplayBuffer.subarray(0, bytesRead));
+      virtualDisplayPosition += bytesRead;
+    }
+    if (virtualDisplayHash.digest('hex') !== manifest.virtualDisplay.sha256) {
+      return null;
+    }
+
+    if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+      && legacyManifest) {
+      const bytes = Buffer.from(JSON.stringify({
+        ...manifest,
+        protocolVersion: REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+      }));
+      await executable.close();
+      executable = null;
+      await virtualDisplayHandle.close();
+      virtualDisplayHandle = null;
+      return {
+        bytes,
+        close: async () => {},
+        filename: manifestFilename,
+        sizeBytes: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        version: manifest.workerVersion,
+      };
+    }
+
+    const requestedPath = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePath
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+        ? manifestPath : virtualDisplayPath;
+    const requestedPathStat = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePathStat
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+        ? manifestPathStat : virtualDisplayPathStat;
+    requested = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executable
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY
+        ? virtualDisplayHandle : await open(requestedPath, 'r');
+    if (requested === executable) executable = null;
+    if (requested === virtualDisplayHandle) virtualDisplayHandle = null;
+    else {
+      await virtualDisplayHandle.close();
+      virtualDisplayHandle = null;
+    }
+    const requestedStat = await requested.stat();
+    if (!requestedStat.isFile() || requestedStat.size !== requestedPathStat.size
+      || requestedStat.mtimeMs !== requestedPathStat.mtimeMs
+      || requestedStat.ctimeMs !== requestedPathStat.ctimeMs) return null;
+    const requestedHash = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? manifest.sha256
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+        ? createHash('sha256').update(rawManifest).digest('hex')
+        : manifest.virtualDisplay.sha256;
+    let closed = false;
+    const pinned = requested;
+    requested = null;
+    return {
+      handle: pinned,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await pinned.close().catch(() => {});
+      },
+      filename: asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+        ? REMOTE_DESKTOP_WORKER_FILENAME
+        : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+          ? manifestFilename : REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+      sizeBytes: requestedStat.size,
+      sha256: requestedHash,
+      version: manifest.workerVersion,
+    };
+  } catch {
+    return null;
+  } finally {
+    await executable?.close().catch(() => {});
+    await manifestHandle?.close().catch(() => {});
+    await virtualDisplayHandle?.close().catch(() => {});
+    await requested?.close().catch(() => {});
+  }
+}
+
+export type ControlledNodeUpgradeArtifactUnavailableReason =
+  | 'executable_not_built'
+  | 'remote_desktop_worker_not_built'
+  | 'windows_release_version_mismatch'
+  | 'desktop_release_manifest_invalid'
+  | 'desktop_release_manifest_mismatch';
+
+export interface ControlledNodeUpgradeArtifactAvailability {
+  /** False when IMCODES_NODE_EXE_DIR is unset/empty (artifact catalog not configured). */
+  configured: boolean;
+  available: boolean;
+  reason?: ControlledNodeUpgradeArtifactUnavailableReason;
+}
+
+/**
+ * Determine whether the running server image bundles a verified controlled-node
+ * upgrade release unit for the target platform `(os, arch, abiProfile)`.
+ * Mirrors `/api/enroll/v2/node-artifact` gating so UI discovery, auto-upgrade,
+ * and manual upgrade endpoints stay aligned when an image intentionally omits
+ * a platform (e.g. Windows artifacts on `:dev` builds).
+ */
+export async function checkControlledNodeUpgradeArtifactAvailability(input: {
+  os?: string | null;
+  arch?: string | null;
+  abiProfile?: unknown;
+  artifactDir?: string | null;
+  artifactCatalog?: ArtifactCatalog;
+}): Promise<ControlledNodeUpgradeArtifactAvailability> {
+  const dir = (input.artifactDir ?? process.env.IMCODES_NODE_EXE_DIR)?.trim();
+  if (!dir) {
+    return { configured: false, available: true };
+  }
+
+  const rawOs = typeof input.os === 'string' ? input.os.trim().toLowerCase() : '';
+  const os: ControlledNodeOs | null = rawOs === 'win32' || rawOs === CONTROLLED_NODE_OS_WIN
+    ? CONTROLLED_NODE_OS_WIN
+    : rawOs === 'darwin' || rawOs === CONTROLLED_NODE_OS_MAC
+      ? CONTROLLED_NODE_OS_MAC
+      : rawOs === CONTROLLED_NODE_OS_LINUX
+        ? CONTROLLED_NODE_OS_LINUX
+        : null;
+  if (!os) {
+    return { configured: true, available: false, reason: 'executable_not_built' };
+  }
+
+  const rawArch = typeof input.arch === 'string' && input.arch.trim() ? input.arch.trim().toLowerCase() : null;
+  const fallbackArch = os === CONTROLLED_NODE_OS_MAC
+    ? CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL
+    : CONTROLLED_NODE_ARCH_X64;
+  const profile = input.abiProfile === undefined || input.abiProfile === null
+    ? CONTROLLED_NODE_ABI_MODERN
+    : normalizeControlledNodeAbiProfile(input.abiProfile);
+  if (!profile) {
+    return { configured: true, available: false, reason: 'executable_not_built' };
+  }
+  const artifactTarget = normalizeControlledNodeArtifactPair(os, rawArch ?? fallbackArch, profile);
+  if (!artifactTarget) {
+    return { configured: true, available: false, reason: 'executable_not_built' };
+  }
+  const targetAbi = artifactTarget.abiProfile ?? profile;
+  const catalog = input.artifactCatalog ?? defaultArtifactCatalog;
+  const v = await catalog.ensureVerified(dir, artifactTarget.os, artifactTarget.arch, targetAbi);
+  if (!v.ok) {
+    return { configured: true, available: false, reason: 'executable_not_built' };
+  }
+
+  if (artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === CONTROLLED_NODE_ARCH_X64) {
+    const workerRelease = await openRemoteDesktopWorkerArtifact(
+      dir,
+      CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+    );
+    if (!workerRelease) {
+      return { configured: true, available: false, reason: 'remote_desktop_worker_not_built' };
+    }
+    const workerVersionMatches = workerRelease.version === v.descriptor.version;
+    await workerRelease.close();
+    if (!workerVersionMatches) {
+      return { configured: true, available: false, reason: 'windows_release_version_mismatch' };
+    }
+  }
+
+  if (targetAbi === CONTROLLED_NODE_ABI_MODERN) {
+    const nodeReleaseTarget = controlledNodeDaemonRuntimeTarget(
+      artifactTarget.os,
+      artifactTarget.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL ? CONTROLLED_NODE_ARCH_ARM64 : artifactTarget.arch,
+    );
+    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, nodeReleaseTarget);
+    if (releaseCheck.status === 'invalid') {
+      return { configured: true, available: false, reason: 'desktop_release_manifest_invalid' };
+    }
+    if (releaseCheck.status === 'ok') {
+      await releaseCheck.close();
+      const entry = nodeReleaseTarget
+        ? releaseCheck.manifest.targets[nodeReleaseTarget]?.components['imcodes-node']
+        : undefined;
+      if (entry && (entry.sha256 !== v.descriptor.sha256 || entry.sizeBytes !== v.descriptor.sizeBytes || entry.version !== v.descriptor.version)) {
+        return { configured: true, available: false, reason: 'desktop_release_manifest_mismatch' };
+      }
+    }
+  }
+
+  return { configured: true, available: true };
 }

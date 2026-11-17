@@ -27,7 +27,10 @@ import {
 } from '../../shared/transport-queue-wire.js';
 import {
   isAuthoritativeCleanIdlePayload,
+  isCancelIdlePayload,
   isOlderActivityGeneration,
+  isUserCancelStoppingPayload,
+  isWorkingSessionState,
   normalizeActivityGeneration,
   type ActivityGenerationLike,
 } from '../../shared/session-activity-types.js';
@@ -420,6 +423,7 @@ export class WatchProjectionStore {
   private assistantTextBySession = new Map<string, string>();
   private openToolCountBySession = new Map<string, number>();
   private openToolKeysBySession = new Map<string, Set<string>>();
+  private pendingUserCancelStopBySession = new Set<string>();
   private activityGenerationBySession = new Map<string, string>();
   private previewBySession = new Map<string, { previewText: string; previewUpdatedAt: number }>();
   private baseStateBySession = new Map<string, WatchSessionState>();
@@ -483,6 +487,7 @@ export class WatchProjectionStore {
       this.assistantTextBySession.clear();
       this.openToolCountBySession.clear();
       this.openToolKeysBySession.clear();
+      this.pendingUserCancelStopBySession.clear();
       this.activityGenerationBySession.clear();
       this.previewBySession.clear();
       this.baseStateBySession.clear();
@@ -576,6 +581,7 @@ export class WatchProjectionStore {
     this.assistantTextBySession.delete(sessionName);
     this.openToolCountBySession.delete(sessionName);
     this.openToolKeysBySession.delete(sessionName);
+    this.pendingUserCancelStopBySession.delete(sessionName);
     this.activityGenerationBySession.delete(sessionName);
     this.previewBySession.delete(sessionName);
     this.maybePush();
@@ -640,6 +646,9 @@ export class WatchProjectionStore {
     if (event.type === 'command.ack') {
       changed = this.trackCommandReceipt(event) || changed;
     }
+    if (event.type === 'user.message') {
+      this.pendingUserCancelStopBySession.delete(event.sessionId);
+    }
     if (event.type === 'tool.call') {
       if (isSdkSubagentTimelineEvent(event)) return changed;
       const key = readToolActivityKey(event.payload);
@@ -667,14 +676,21 @@ export class WatchProjectionStore {
       if (state !== 'idle' && eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
       if (state === 'idle') {
         const expectedGeneration = this.activityGenerationBySession.get(event.sessionId);
+        const userCancelIdle = this.pendingUserCancelStopBySession.delete(event.sessionId)
+          || isCancelIdlePayload(event.payload);
         if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)
-          || isAuthoritativeCleanIdlePayload(event.payload)) {
+          || isAuthoritativeCleanIdlePayload(event.payload)
+          || userCancelIdle) {
           this.openToolCountBySession.delete(event.sessionId);
           this.openToolKeysBySession.delete(event.sessionId);
           if (eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
         } else {
           this.openToolCountBySession.delete(event.sessionId);
         }
+      } else if (isUserCancelStoppingPayload(event.payload)) {
+        this.pendingUserCancelStopBySession.add(event.sessionId);
+      } else if (isWorkingSessionState(state)) {
+        this.pendingUserCancelStopBySession.delete(event.sessionId);
       }
       if (state) {
         changed = this.updateSessionState(event.sessionId, state) || changed;
@@ -880,6 +896,9 @@ export class WatchProjectionStore {
     }
     for (const key of [...this.activityGenerationBySession.keys()]) {
       if (!nextSessions.has(key)) this.activityGenerationBySession.delete(key);
+    }
+    for (const key of [...this.pendingUserCancelStopBySession]) {
+      if (!nextSessions.has(key)) this.pendingUserCancelStopBySession.delete(key);
     }
     for (const key of [...this.baseStateBySession.keys()]) {
       if (!nextSessions.has(key)) this.baseStateBySession.delete(key);

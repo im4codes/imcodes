@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Integration drift (tsk_cd_pair_integration_drift): a finished pair whose head never reached the integration branch is reminded
  * to Brain, and a head on a base far behind that branch draws a rebase warning. Everything here runs real git (a bare origin, a
@@ -101,7 +102,7 @@ function addWorktree(name: string, base: string): string {
 }
 
 function savePair(taskId: string, over: Partial<TaskPairState> & { status?: TaskPairStatus } = {}, live: Record<string, unknown> = {}): void {
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     taskId, status: 'done', brain: BRAIN, executor: EXEC, auditor: AUD, round: 1, blocking: ['P0'],
     flags: [], flagSides: {}, previousAuditors: [], capCounts: {}, capRound: 1, createdAt: T0 - 60 * MIN, updatedAt: T0, title: taskId,
     ...over,
@@ -360,7 +361,7 @@ describe('integration drift', () => {
       expect(digests()).toHaveLength(1);
       const lines = digests()[0]!.text.split('\n').filter((entry) => entry.startsWith('- '));
       expect(lines).toHaveLength(3);
-      for (const id of ['u1', 'u2', 'u3']) expect(digests()[0]!.text).toContain(`- ${id}:`);
+      for (const id of ['u1', 'u2', 'u3']) expect(digests()[0]!.text).toContain(`- ${id} "${id}":`);
     });
 
     it('a busy Brain (message not accepted) is retried on the next heartbeat with no state advanced', async () => {

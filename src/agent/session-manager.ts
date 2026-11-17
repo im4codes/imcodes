@@ -1,3 +1,8 @@
+import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
+import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
+import { reclaimOrphanedAgyIncognitoHomes } from './agy-incognito-isolation.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
 import { RESTORE_PACING_MIN_GAP_MS, RESTORE_PACING_TOTAL_WAIT_BUDGET_MS } from '../../shared/event-loop-backpressure.js';
@@ -85,8 +90,54 @@ import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { getSessionRuntimeType, isClaudeCodeFamily, isClaudeCodeSdkAgentType, isCodexFamily } from '../../shared/agent-types.js';
+import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '../../shared/cc-presets.js';
 import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
+import {
+  COMPACT_HIJACK_COOLDOWN_MS,
+  extractSessionCompactHijackMode,
+  resolveCompactHijackEnabled,
+  resolveEffectiveHandoffLimits,
+} from '../../shared/compact-hijack.js';
+import {
+  getPersistedCompactHijackGlobalConfig,
+  isGlobalCompactHijackEnabled,
+} from '../store/compact-hijack-config-store.js';
+
+const compactHijackInFlight = new Set<string>();
+const compactHijackLastTriggeredAt = new Map<string, number>();
+
+export function canTriggerCompactHijackForSession(sessionName: string, now = Date.now()): boolean {
+  const rec = getSession(sessionName);
+  if (!rec || isIncognitoSession(rec)) return false;
+  const enabled = resolveCompactHijackEnabled(
+    extractSessionCompactHijackMode(rec.transportConfig),
+    isGlobalCompactHijackEnabled(),
+  );
+  if (!enabled) return false;
+  if (compactHijackInFlight.has(sessionName)) return false;
+  const lastAt = compactHijackLastTriggeredAt.get(sessionName);
+  if (typeof lastAt === 'number' && now - lastAt < COMPACT_HIJACK_COOLDOWN_MS) return false;
+  return true;
+}
+
+export function tryAcquireCompactHijackSlot(sessionName: string, now = Date.now()): boolean {
+  if (!canTriggerCompactHijackForSession(sessionName, now)) return false;
+  compactHijackInFlight.add(sessionName);
+  return true;
+}
+
+export function finishCompactHijackSlot(sessionName: string, succeeded: boolean, now = Date.now()): void {
+  compactHijackInFlight.delete(sessionName);
+  if (succeeded) {
+    compactHijackLastTriggeredAt.set(sessionName, now);
+  }
+}
+
+export function resetCompactHijackStateForTests(): void {
+  compactHijackInFlight.clear();
+  compactHijackLastTriggeredAt.clear();
+}
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import {
   resolveTransportContextBootstrap,
@@ -121,6 +172,7 @@ import { resolveTransportQueueEntryAdmission } from '../daemon/delegation-reply-
 import { isNativeAgentFenceRequiredForLaunch } from '../daemon/native-collaboration-guard.js';
 import { processLaunchFence } from './native-agent-fence.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
+import { getDefaultTimelineDetailStore } from '../daemon/timeline-detail-store.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
@@ -138,6 +190,32 @@ import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { resolveEffectiveIdentityPrompt } from '../daemon/session-identity-resolver.js';
 import { identityPromptHash } from '../util/identity-prompt-hash.js';
+import {
+  claimProcessRestartContinuationRecovery,
+  clearSessionRestartContinuation,
+  consumeRestartContinuation,
+  dispatchProcessRestartContinuation,
+  dispatchTransportRestartContinuation,
+  emitSystemContinueUserMessage,
+  hasActiveProcessRestartContinuationRecovery,
+  hasPendingRestartContinuation,
+  retireRestartContinuation,
+  shouldAutoRespawnDeadProcessSubSession,
+} from '../daemon/restart-continuation.js';
+
+function maybeDispatchProcessRestartContinuation(
+  sessionName: string,
+  preRestoreSession?: SessionRecord,
+): Promise<{ dispatched: boolean; reason: string; commandId?: string }> {
+  return dispatchProcessRestartContinuation({
+    sessionName,
+    preRestoreSession,
+    currentSession: getSession(sessionName),
+    sendKeys: (name, keys) => sendKeys(name, keys),
+    emitUserMessage: (name, commandId) =>
+      emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'process'),
+  });
+}
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -214,6 +292,37 @@ function sanitizeCodexSdkStartupModel(value: string | null | undefined): string 
   return isClaudeModel ? DEFAULT_CODEX_SESSION_MODEL : trimmed;
 }
 
+async function resolveCodexPresetSessionOverrides(
+  ccPreset: string,
+  requestedModel: string | undefined,
+  existingSettings: string | Record<string, unknown> | undefined,
+): Promise<{
+  env: Record<string, string>;
+  model?: string;
+  contextWindow?: number;
+  systemPrompt?: string;
+  availableModels?: string[];
+  settings?: string | Record<string, unknown>;
+}> {
+  const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
+  const presetConfig = await getCodexPresetTransportConfig(ccPreset, requestedModel);
+  return {
+    env: presetConfig.env,
+    ...(presetConfig.model ? { model: presetConfig.model } : {}),
+    ...(presetConfig.contextWindow !== undefined ? { contextWindow: presetConfig.contextWindow } : {}),
+    ...(presetConfig.systemPrompt ? { systemPrompt: presetConfig.systemPrompt } : {}),
+    ...(presetConfig.availableModels?.length ? { availableModels: presetConfig.availableModels } : {}),
+    ...(presetConfig.codexModelProvider
+      ? {
+          settings: {
+            ...(typeof existingSettings === 'object' && existingSettings ? existingSettings : {}),
+            codexModelProvider: presetConfig.codexModelProvider,
+          },
+        }
+      : {}),
+  };
+}
+
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
   if (ccSessionId) {
@@ -235,7 +344,9 @@ function startStructuredWatcher(
   ids?: { ccSessionId?: string; codexSessionId?: string; geminiSessionId?: string; opencodeSessionId?: string },
 ): void {
   if (agentType === 'claude-code') {
-    startCCWatcher(name, projectDir, ids?.ccSessionId);
+    if (!name.startsWith('deck_sub_') || ids?.ccSessionId) {
+      startCCWatcher(name, projectDir, ids?.ccSessionId);
+    }
   } else if (agentType === 'codex') {
     if (ids?.codexSessionId) {
       findRolloutPathByUuid(ids.codexSessionId).then((rolloutPath) => {
@@ -439,7 +550,7 @@ export async function stopProject(
           timelineEmitter.emit(record.name, 'session.state', { state: 'stopped' });
           return;
         }
-        if (shouldMaterializeMasterOnSessionStop(record)) {
+        if (!isIncognitoSession(record) && shouldMaterializeMasterOnSessionStop(record)) {
           const registration = registerMasterCompaction(
             () => materializeMasterSummary(record.name, record.contextNamespace),
             {
@@ -468,7 +579,13 @@ export async function stopProject(
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
         timelineEmitter.forgetSession(record.name);
+        notifySessionTeardown(record.name);
         clearResend(record.name, 'session_removed');
+        clearSessionRestartContinuation(record.name);
+        if (isIncognitoSession(record)) {
+          getTransportQueueStore().discardSessionQueueState(record.name);
+          getDefaultTimelineDetailStore().forgetSession(record.name);
+        }
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
           invalidatedDirs.add(record.projectDir);
@@ -535,6 +652,11 @@ export async function initOnStartup(): Promise<void> {
     await cleanupOrphanFifos();
   } catch (err) {
     logger.warn({ err }, 'cleanupOrphanFifos failed — daemon continues');
+  }
+  try {
+    await reclaimOrphanedAgyIncognitoHomes();
+  } catch (err) {
+    logger.warn({ err }, 'reclaimOrphanedAgyIncognitoHomes failed — daemon continues');
   }
   try {
     await cleanupKnownTestTerminalSessions();
@@ -686,6 +808,7 @@ export async function restoreFromStore(): Promise<void> {
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
     if (isStoredTransportSession(s)) {
+      healPersistedAgySessionModel(s);
       // Transport sessions are normally handed to restoreTransportSessions,
       // but that path intentionally assumes providers validate cwd later.
       // Mark a missing persisted directory here so an invalid transport cannot
@@ -713,6 +836,20 @@ export async function restoreFromStore(): Promise<void> {
         // Mark dead sub-sessions as stopped so the health poller doesn't restart them
         upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
         continue;
+      }
+      if (!(await isPaneAlive(s.name))) {
+        if (shouldAutoRespawnDeadProcessSubSession(s)) {
+          logger.info({ session: s.name, agentType: s.agentType }, 'Sub-session pane dead on restore with pending continuation, respawning');
+          try {
+            await respawnSession(s);
+          } catch (err) {
+            logger.warn({ err, session: s.name }, 'Failed to respawn dead-pane sub-session on restore');
+          }
+        }
+        continue;
+      }
+      if (!hasActiveProcessRestartContinuationRecovery(s.name)) {
+        consumeRestartContinuation(s.name);
       }
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
         startCCWatcher(s.name, s.projectDir, s.ccSessionId);
@@ -823,7 +960,12 @@ export async function restoreFromStore(): Promise<void> {
         updateSessionState(hydrated.name, 'error', message);
         emitSessionEvent('error', hydrated.name, message);
       }
-    } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
+    } else {
+      // Live CLI process survived daemon restart intact — discard any captured marker so it is never nudged.
+      if (!hasActiveProcessRestartContinuationRecovery(hydrated.name)) {
+        consumeRestartContinuation(hydrated.name);
+      }
+      if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
         startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);
       } else {
@@ -879,6 +1021,7 @@ export async function restoreFromStore(): Promise<void> {
       startOpenCodeWatching(hydrated.name, hydrated.projectDir, hydrated.opencodeSessionId).catch((e) =>
         logger.warn({ err: e, session: hydrated.name }, 'opencode-watcher start failed (restore)'),
       );
+    }
     }
   }
 
@@ -990,6 +1133,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
       codexSessionId: effectiveRecord.codexSessionId,
       geminiSessionId: effectiveRecord.geminiSessionId,
       opencodeSessionId: effectiveRecord.opencodeSessionId,
+      onPostLaunchReady: () => maybeDispatchProcessRestartContinuation(effectiveRecord.name, record),
     });
     } catch (error) {
       throw markLaunchFailure(record, error);
@@ -1089,79 +1233,98 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
   }
+  const releaseRecovery = (record.agentType !== 'shell' && record.agentType !== 'script')
+    ? claimProcessRestartContinuationRecovery(record.name, resourceRuntimeEpoch)
+    : undefined;
+  let recoveryHandedOff = false;
   try {
-    if (BACKEND === 'conpty') {
-      await respawnPane(record.name, cmd, { env: mergedEnv });
-    } else {
-      const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-      const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
-      await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+    try {
+      if (BACKEND === 'conpty') {
+        await respawnPane(record.name, cmd, { env: mergedEnv });
+      } else {
+        const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+        const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
+        await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+      }
+    } catch (error) {
+      throw markLaunchFailure(record, error);
     }
-  } catch (error) {
-    throw markLaunchFailure(record, error);
-  }
 
-  // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
-  const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
-  void terminalStreamer.rebindSession(record.name);
+    // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
+    const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
+    void terminalStreamer.rebindSession(record.name);
 
-  const updated: SessionRecord = {
-    ...effectiveRecord,
-    restarts: record.restarts + 1,
-    restartTimestamps: [...recentRestarts, now],
-    state: 'idle',
-    sessionInstanceId: resourceSessionInstanceId,
-    runtimeEpoch: resourceRuntimeEpoch,
-    hookCredential,
-    // The proof names exactly the instance and epoch this process was launched for.
-    nativeAgentLaunchFence: {
-      fence: processLaunchFence(effectiveRecord.agentType, { nativeAgentsFenced, resumesExistingConversation: true }),
+    const updated: SessionRecord = {
+      ...effectiveRecord,
+      restarts: record.restarts + 1,
+      restartTimestamps: [...recentRestarts, now],
+      state: 'idle',
       sessionInstanceId: resourceSessionInstanceId,
       runtimeEpoch: resourceRuntimeEpoch,
-      decidedAt: now,
-    },
-    updatedAt: now,
-  };
-  upsertSession(updated);
-  const persistedRecord = getSession(record.name);
-  if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
+      hookCredential,
+      // The proof names exactly the instance and epoch this process was launched for.
+      nativeAgentLaunchFence: {
+        fence: processLaunchFence(effectiveRecord.agentType, { nativeAgentsFenced, resumesExistingConversation: true }),
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
+        decidedAt: now,
+      },
+      updatedAt: now,
+    };
+    upsertSession(updated);
+    const persistedRecord = getSession(record.name);
+    if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
 
-  startStructuredWatcher(record.name, effectiveRecord.agentType as AgentType, projectDir, {
-    ccSessionId,
-    codexSessionId: effectiveRecord.codexSessionId,
-    geminiSessionId: effectiveRecord.geminiSessionId,
-    opencodeSessionId: effectiveRecord.opencodeSessionId,
-  });
+    startStructuredWatcher(record.name, effectiveRecord.agentType as AgentType, projectDir, {
+      ccSessionId,
+      codexSessionId: effectiveRecord.codexSessionId,
+      geminiSessionId: effectiveRecord.geminiSessionId,
+      opencodeSessionId: effectiveRecord.opencodeSessionId,
+    });
 
-  // postLaunch (auto-dismiss startup prompts) + init message injection
-  const injectInit = async () => {
-    if (driver.postLaunch) {
-      await driver.postLaunch(
-        () => capturePane(record.name),
-        (key: string) => sendKey(record.name, key),
-      ).catch(() => {});
-    }
-    const initParts: string[] = [];
-    if (record.description) initParts.push(record.description);
-    const identityPrompt = await resolveEffectiveIdentityPrompt(record);
-    if (identityPrompt) initParts.push(identityPrompt);
-    if (record.ccPreset && record.agentType === 'claude-code') {
-      const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
-      const preset = await getPreset(record.ccPreset);
-      if (preset) initParts.push(getPresetInitMessage(preset));
-    }
-    if (initParts.length > 0) {
-      const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
-      try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
-    }
-  };
-  void injectInit();
+    // postLaunch (auto-dismiss startup prompts) + init message injection
+    const injectInit = async () => {
+      try {
+        if (driver.postLaunch) {
+          await driver.postLaunch(
+            () => capturePane(record.name),
+            (key: string) => sendKey(record.name, key),
+          ).catch(() => {});
+        }
+        const initParts: string[] = [];
+        if (record.description) initParts.push(record.description);
+        const identityPrompt = await resolveEffectiveIdentityPrompt(record);
+        if (identityPrompt) initParts.push(identityPrompt);
+        if (record.ccPreset && record.agentType === 'claude-code') {
+          const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
+          const preset = await getPreset(record.ccPreset);
+          if (preset) initParts.push(getPresetInitMessage(preset));
+        }
+        if (initParts.length > 0) {
+          const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
+          try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
+        }
+        try {
+          await maybeDispatchProcessRestartContinuation(record.name, record);
+        } catch (err) {
+          logger.warn({ err, session: record.name }, 'Process respawn restart continuation failed');
+        }
+      } finally {
+        releaseRecovery?.();
+      }
+    };
+    recoveryHandedOff = true;
+    void injectInit();
+  } catch (error) {
+    if (!recoveryHandedOff) releaseRecovery?.();
+    throw error;
+  }
 
   logger.info({ session: record.name, agentType: record.agentType, ccPreset: record.ccPreset }, 'Respawned session');
   return true;
 }
 
-export interface LaunchOpts {
+export interface LaunchOpts extends SessionIncognitoConfig {
   name: string;
   projectName: string;
   role: 'brain' | `w${number}`;
@@ -1205,11 +1368,16 @@ export interface LaunchOpts {
   parentSession?: string;
   /** Mark as user-created (not auto-synced from provider). Protected from sync/health cleanup. */
   userCreated?: boolean;
+  /** Internal: launch generation already allocated by `relaunchSessionWithSettings`. */
+  handoffLaunchGeneration?: number;
+  /** Internal: invoked after `postLaunch` and initial context injection finish. */
+  onPostLaunchReady?: () => Promise<unknown> | unknown;
 }
 
 export interface SessionRelaunchOverrides {
   agentType?: AgentType;
   fresh?: boolean | null;
+  handoff?: boolean;
   projectDir?: string;
   label?: string | null;
   description?: string | null;
@@ -1239,11 +1407,25 @@ function stopStructuredWatchers(sessionName: string): void {
   stopOpenCodeWatching(sessionName);
 }
 
+const cancelledTransportStarts = new WeakSet<Promise<void>>();
+
 export async function stopTransportRuntimeSession(
   sessionName: string,
   options: { preserveTransportQueue?: boolean } = {},
 ): Promise<void> {
+  // Stop must also fence a launch/restore whose provider id has not bound yet.
+  for (const pending of [transportLaunchInFlight.get(sessionName), transportSessionRestoreInFlight.get(sessionName)]) {
+    if (pending) cancelledTransportStarts.add(pending);
+  }
+  await detachTransportRuntimeSession(sessionName, options);
+}
+
+async function detachTransportRuntimeSession(
+  sessionName: string,
+  options: { preserveTransportQueue?: boolean } = {},
+): Promise<void> {
   clearTransportResendAuthorityRetry(sessionName);
+  notifySessionTeardown(sessionName);
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
@@ -1264,38 +1446,105 @@ async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
 
 const crossVendorHandoffLaunchGenerations = new Map<string, number>();
 
+function advanceCrossVendorHandoffLaunchGeneration(sessionName: string): number {
+  const next = (crossVendorHandoffLaunchGenerations.get(sessionName) ?? 0) + 1;
+  crossVendorHandoffLaunchGenerations.set(sessionName, next);
+  return next;
+}
+
+function stripPendingCrossVendorHandoff(
+  state: SessionRecord['crossVendorHandoff'],
+  fresh: boolean | undefined,
+): SessionRecord['crossVendorHandoff'] {
+  if (!state) return undefined;
+  return fresh && state.pending ? { ...state, pending: undefined } : state;
+}
+
+function invalidateFreshCrossVendorHandoff(sessionName: string): void {
+  advanceCrossVendorHandoffLaunchGeneration(sessionName);
+  const stored = getSession(sessionName);
+  if (stored?.crossVendorHandoff?.pending) {
+    upsertSession({
+      ...stored,
+      crossVendorHandoff: { ...stored.crossVendorHandoff, pending: undefined },
+      updatedAt: Date.now(),
+    });
+  }
+}
+
+function isPresetCompatibleAgentSwitch(sourceAgentType: string, targetAgentType: string): boolean {
+  if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType)) return false;
+  if (sourceAgentType === targetAgentType) return true;
+  if (isClaudeCodeFamily(sourceAgentType) && isClaudeCodeFamily(targetAgentType)) return true;
+  if (isCodexFamily(sourceAgentType) && isCodexFamily(targetAgentType)) return true;
+  return false;
+}
+
 export async function relaunchSessionWithSettings(
   record: SessionRecord,
   overrides: SessionRelaunchOverrides = {},
 ): Promise<void> {
-  const launchGeneration = (crossVendorHandoffLaunchGenerations.get(record.name) ?? 0) + 1;
-  crossVendorHandoffLaunchGenerations.set(record.name, launchGeneration);
+  const launchGeneration = advanceCrossVendorHandoffLaunchGeneration(record.name);
+  const existedAtStart = Boolean(getSession(record.name));
+  const isGenerationCurrent = (): boolean => crossVendorHandoffLaunchGenerations.get(record.name) === launchGeneration;
+  const assertSessionOwnership = (): void => {
+    if (!isGenerationCurrent()) {
+      throw new Error(`Session ${record.name} relaunch superseded by a newer launch`);
+    }
+    const latest = getSession(record.name);
+    if (existedAtStart && !latest) {
+      throw new Error(`Session ${record.name} deleted during relaunch`);
+    }
+    if (latest && record.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId) {
+      throw new Error(`Session ${record.name} ownership changed during relaunch`);
+    }
+  };
   const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
   const targetFresh = overrides.fresh === true;
+  const isPrivate = isIncognitoSession(record);
+  if (isPrivate && !targetFresh) {
+    throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+  }
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
-  const targetIdentityPrompt = overrides.identityPrompt !== undefined ? overrides.identityPrompt : ((await resolveEffectiveIdentityPrompt(record)) ?? null);
-  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel : (record.requestedModel ?? null);
+  // A model id is provider-scoped. An AG switch without an explicit choice
+  // must use AG's default, not the previous provider's (possibly invalid) id.
+  const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
+  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
+    : enteringAgy ? null : (record.requestedModel ?? null);
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
-  const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
+  const targetCcPreset = overrides.ccPreset !== undefined
+    ? (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType) ? (overrides.ccPreset ?? null) : null)
+    : (isPresetCompatibleAgentSwitch(record.agentType, targetAgentType) ? (record.ccPreset ?? null) : null);
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
   const targetRuntimeType = getSessionRuntimeType(targetAgentType);
-  const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
+  const forceHandoff = overrides.handoff === true;
+  const effectiveLimits = resolveEffectiveHandoffLimits(
+    targetTransportConfig,
+    getPersistedCompactHijackGlobalConfig(),
+  );
+  const handoffConfig = normalizeCrossVendorHandoffConfig({
+    ...(record.crossVendorHandoff?.config ?? {}),
+    ...effectiveLimits,
+  });
+  const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
+  const wantsHandoff = !isPrivate && shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
+  const [resolvedIdentityPrompt, cutoffEvents] = await Promise.all([
+    overrides.identityPrompt !== undefined ? Promise.resolve(overrides.identityPrompt) : resolveEffectiveIdentityPrompt(record),
+    wantsHandoff ? timelineStore.readPreferred(record.name, { limit: 1 }).catch(() => []) : Promise.resolve([]),
+  ]);
+  assertSessionOwnership();
+  const targetIdentityPrompt = resolvedIdentityPrompt ?? null;
   let handoffPromise: Promise<import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack | undefined> | undefined;
   let handoffCutoff: CrossVendorHandoffCutoff | undefined;
-  if (shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh) && handoffConfig.enabled) {
-    try {
-      const events = await timelineStore.readPreferred(record.name, { limit: 1 });
-      const last = events.at(-1);
-      handoffCutoff = last
-        ? { epoch: last.epoch, seq: last.seq, ts: last.ts }
-        : { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
-    } catch {
-      handoffCutoff = { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
-    }
-    const cutoff = handoffCutoff ?? { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+  if (wantsHandoff) {
+    const last = cutoffEvents.at(-1);
+    handoffCutoff = last
+      ? { epoch: last.epoch, seq: last.seq, ts: last.ts }
+      : { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+    const cutoff = handoffCutoff;
     const providerKey = targetAgentType;
     const priorCutoff = record.crossVendorHandoff?.cutoffs?.[providerKey];
     const persistedState = beginCrossVendorHandoffState(
@@ -1306,17 +1555,27 @@ export async function relaunchSessionWithSettings(
     );
     upsertSession({ ...record, crossVendorHandoff: persistedState, updatedAt: Date.now() });
     const build = buildCrossVendorHandoffPack(record, cutoff, targetAgentType, targetRuntimeType, {
-      ...handoffConfig,
+      enabled: effectiveHandoffConfig.enabled,
+      recentTurns: effectiveHandoffConfig.recentTurns,
+      summaryLimit: effectiveHandoffConfig.summaryLimit,
+      maxChars: effectiveHandoffConfig.maxChars,
+      timeoutMs: effectiveHandoffConfig.timeoutMs,
+      providerWaitMs: effectiveHandoffConfig.providerWaitMs,
+      includeToolPreviews: effectiveHandoffConfig.includeToolPreviews,
+      ...(record.crossVendorHandoff?.config?.maxTokens !== undefined
+        ? { maxTokens: record.crossVendorHandoff.config.maxTokens }
+        : {}),
       // A previous cutoff means this is a switch-back; the pack builder still
       // uses the authoritative timeline and the target runtime receives it once.
-      ...(priorCutoff ? { recentTurns: handoffConfig.recentTurns } : {}),
+      ...(priorCutoff ? { recentTurns: effectiveHandoffConfig.recentTurns } : {}),
     }, priorCutoff);
-    handoffPromise = resolveCrossVendorHandoffPack(build, handoffConfig.timeoutMs);
+    handoffPromise = resolveCrossVendorHandoffPack(build, effectiveHandoffConfig.timeoutMs);
   }
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
+    && (!targetFresh || targetAgentType === 'openclaw')
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
-    // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
+    // preserve it (unless fresh conversation requested). Claude/Codex SDKs keep their provider continuity in ccSessionId /
     // codexSessionId; Kimi/Grok use providerResumeId, so these providers use a fresh
     // local route key on relaunch.
     && !isClaudeCodeSdkAgentType(targetAgentType)
@@ -1327,47 +1586,65 @@ export async function relaunchSessionWithSettings(
     && record.providerSessionId.length > 0;
 
   await teardownSessionRuntime(record);
+  assertSessionOwnership();
 
-  await launchSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role,
-    agentType: targetAgentType,
-    projectDir: targetProjectDir,
-    label: targetLabel ?? undefined,
-    description: targetDescription ?? undefined,
-    identityPrompt: targetIdentityPrompt ?? undefined,
-    requestedModel: targetRequestedModel ?? undefined,
-    effort: targetEffort ?? undefined,
-    transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || isClaudeCodeSdkAgentType(targetAgentType) || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness' || targetAgentType === 'pi')
-      ? (targetCcPreset ?? undefined)
-      : undefined,
-    ...(preserveTransportBinding ? {
-      bindExistingKey: record.providerSessionId,
-      skipCreate: true,
-    } : {}),
-    ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
-      ? { providerResumeId: record.providerResumeId }
-      : {}),
-    ...compatibleIds,
-    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
-    ...(record.userCreated ? { userCreated: true } : {}),
-    ...(targetFresh ? { fresh: true } : {}),
-  });
-  if (handoffPromise) {
-    const launchedTransport = targetRuntimeType === RUNTIME_TYPES.TRANSPORT
-      ? transportRuntimes.get(record.name)
-      : undefined;
-    const isCurrentLaunch = (): boolean => {
-      const current = getSession(record.name);
-      return isCrossVendorHandoffLaunchCurrent({
-        expectedGeneration: launchGeneration,
-        currentGeneration: crossVendorHandoffLaunchGenerations.get(record.name),
-        currentAgentType: current?.agentType,
-        targetAgentType,
-      });
-    };
+  try {
+    await launchSession({
+      name: record.name,
+      projectName: record.projectName,
+      role: record.role,
+      agentType: targetAgentType,
+      projectDir: targetProjectDir,
+      label: targetLabel ?? undefined,
+      description: targetDescription ?? undefined,
+      identityPrompt: targetIdentityPrompt ?? undefined,
+      requestedModel: targetRequestedModel ?? undefined,
+      effort: targetEffort ?? undefined,
+      transportConfig: targetTransportConfig ?? undefined,
+      ccPreset: targetCcPreset ?? undefined,
+      ...(preserveTransportBinding ? {
+        bindExistingKey: record.providerSessionId,
+        ...(!targetFresh ? { skipCreate: true } : {}),
+      } : {}),
+      ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
+        ? { providerResumeId: record.providerResumeId }
+        : {}),
+      ...compatibleIds,
+      ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+      ...(record.userCreated ? { userCreated: true } : {}),
+      ...(targetFresh ? { fresh: true } : {}),
+      ...(isPrivate ? { incognito: true } : {}),
+      handoffLaunchGeneration: launchGeneration,
+    });
+  } catch (err) {
+    if (isGenerationCurrent()) advanceCrossVendorHandoffLaunchGeneration(record.name);
+    throw err;
+  }
+  const launchedTransport = targetRuntimeType === RUNTIME_TYPES.TRANSPORT
+    ? transportRuntimes.get(record.name)
+    : undefined;
+  const launchedRecord = getSession(record.name);
+  const launchedRuntimeEpoch = launchedRecord?.runtimeEpoch;
+  const launchedSessionInstanceId = launchedRecord?.sessionInstanceId;
+  const isCurrentLaunch = (): boolean => {
+    const current = getSession(record.name);
+    if (!isCrossVendorHandoffLaunchCurrent({
+      expectedGeneration: launchGeneration,
+      currentGeneration: crossVendorHandoffLaunchGenerations.get(record.name),
+      currentAgentType: current?.agentType,
+      targetAgentType,
+    })) {
+      return false;
+    }
+    if (launchedRuntimeEpoch && (current?.runtimeEpoch !== launchedRuntimeEpoch || current?.sessionInstanceId !== launchedSessionInstanceId)) {
+      return false;
+    }
+    if (launchedTransport && transportRuntimes.get(record.name) !== launchedTransport) {
+      return false;
+    }
+    return true;
+  };
+  if (handoffPromise && isCurrentLaunch()) {
     const persistPending = (pack: import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack): void => {
       if (!isCurrentLaunch()) return;
       const current = getSession(record.name);
@@ -1399,7 +1676,7 @@ export async function relaunchSessionWithSettings(
         const pending = current?.crossVendorHandoff?.pending;
         if (pending) markConsumed(pending);
       });
-      launchedTransport.setPendingHandoffReady(guardedPromise, handoffConfig.providerWaitMs);
+      launchedTransport.setPendingHandoffReady(guardedPromise, effectiveHandoffConfig.providerWaitMs);
     }
     void guardedPromise.then(async (pack) => {
       if (!pack || !isCurrentLaunch()) return;
@@ -2012,13 +2289,17 @@ function buildTransportSessionStatePayload(
   // During running/streaming, command-handler's 'queued' event is the sole queue-update
   // authority. This keeps queued messages visible in the UI until the drained turn completes.
   const activity = runtime.getDiagnosticSnapshot();
-  const effectiveState = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
+  const effectiveState = mapped === 'idle' && (activity.blockingWorkCount > 0 || activity.backgroundKeepsSessionRunning)
+    ? 'running'
+    : mapped;
   const providerError = runtime.lastProviderError;
   const payload: Record<string, unknown> = { state: effectiveState };
   if (effectiveState === 'running') {
     payload.activityGeneration = activity.activityGeneration;
     payload.blockingWorkCount = activity.blockingWorkCount;
-    payload.activeWorkCount = activity.blockingWorkCount;
+    payload.activeWorkCount = activity.blockingWorkCount > 0
+      ? activity.blockingWorkCount
+      : (activity.backgroundKeepsSessionRunning ? activity.backgroundWorkCount : 0);
     payload.activeToolCount = activity.activeToolCount;
     payload.busyReasons = activity.busyReasons;
     if (activity.capacityRetry) payload.capacityRetry = activity.capacityRetry;
@@ -2147,6 +2428,20 @@ function wireTransportCallbacks(
   runtime.setSupervisionSnapshotResolver(
     () => extractSessionSupervisionSnapshot(getSession(sessionName)?.transportConfig ?? null),
   );
+  runtime.canTriggerCompactHijack = () => canTriggerCompactHijackForSession(sessionName);
+  runtime.onCompactHijack = async (info) => {
+    if (!tryAcquireCompactHijackSlot(sessionName)) return;
+    let succeeded = false;
+    try {
+      const { triggerCompactHijackForSession } = await import('../daemon/command-handler.js');
+      await triggerCompactHijackForSession(sessionName, undefined, info);
+      succeeded = true;
+    } catch (err) {
+      logger.warn({ err, sessionName, reason: info.reason }, 'compact hijack trigger failed');
+    } finally {
+      finishCompactHijackSlot(sessionName, succeeded);
+    }
+  };
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const persistTransportState = (state: unknown, error?: string): void => {
     if (state !== 'running' && state !== 'idle' && state !== 'error') return;
@@ -2192,6 +2487,7 @@ function wireTransportCallbacks(
     timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (messages, merged, count, metadata) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
     // The post-drain queue version. Stamped on the per-entry user.message
     // events AND the cleared session.state below so the UI advances its
     // baseline even if one of those events is lost on a weak network — a
@@ -2234,9 +2530,11 @@ function wireTransportCallbacks(
       }),
       { source: 'daemon', confidence: 'high' },
     );
+    });
   };
   runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);
   runtime.onActiveAppend = (messages, snapshot) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
     const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);
     for (const entry of messages) {
       // Avoid a static cycle: supervision-automation owns runtimes through this
@@ -2271,6 +2569,7 @@ function wireTransportCallbacks(
       state: runtime.pendingCount > 0 ? 'queued' : 'running',
       ...transportQueueSnapshotToPayload(snapshot),
     }, { source: 'daemon', confidence: 'high' });
+    });
   };
   if (!options.deferProviderReadyDrain) wireTransportProviderReadyDrain(runtime, sessionName);
   runtime.onStartupMemoryInjected = () => {
@@ -2327,6 +2626,23 @@ function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpda
   return changed;
 }
 
+function agyNativeStartBarrier(runtime: TransportSessionRuntime, sessionName: string): () => Promise<void> {
+  return async () => {
+    const record = getSession(sessionName);
+    const owner = runtime.recipientIdentity;
+    if (!record || (owner && (record.sessionInstanceId !== owner.sessionInstanceId || record.runtimeEpoch !== owner.runtimeEpoch))
+      || record.providerSessionId !== runtime.providerSessionId) {
+      logger.warn({ session: sessionName, recordPresent: !!record,
+        instanceMatches: !!record && (!owner || record.sessionInstanceId === owner.sessionInstanceId),
+        epochMatches: !!record && (!owner || record.runtimeEpoch === owner.runtimeEpoch),
+        routeMatches: !!record && record.providerSessionId === runtime.providerSessionId,
+      }, 'AG native start owner guard rejected before native start');
+      throw agyNativeStartNotAttemptedError('AG start owner changed', PROVIDER_ERROR_CODES.CANCELLED);
+    }
+    await persistAgyNativeSessionStart(sessionName, { ...record }, () => transportRuntimes.get(sessionName) === runtime);
+  };
+}
+
 function wireTransportSessionInfo(
   runtime: TransportSessionRuntime,
   sessionName: string,
@@ -2342,6 +2658,12 @@ function wireTransportSessionInfo(
     if (persistence && (!existing || !persistence.canPersist(existing))) return;
     latestInfo = { ...(latestInfo ?? {}), ...info };
     if (!existing) return;
+    if (!persistence) {
+      const owner = runtime.recipientIdentity;
+      if (owner && (existing.sessionInstanceId !== owner.sessionInstanceId || existing.runtimeEpoch !== owner.runtimeEpoch)) return;
+      if (existing.agentType !== agentType) return;
+      if (runtime.providerSessionId && existing.providerSessionId !== runtime.providerSessionId) return;
+    }
     const next: SessionRecord = { ...existing };
     let changed = false;
 
@@ -2351,11 +2673,11 @@ function wireTransportSessionInfo(
         next.ccSessionId = info.resumeId;
         changed = true;
       }
-      if (agentType === 'codex-sdk' && next.codexSessionId !== info.resumeId) {
+      if (agentType === 'codex-sdk' && !isIncognitoSession(next) && next.codexSessionId !== info.resumeId) {
         next.codexSessionId = info.resumeId;
         changed = true;
       }
-      if (usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
+      if (!isIncognitoSession(next) && usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
         next.providerResumeId = info.resumeId;
         changed = true;
       }
@@ -2751,6 +3073,33 @@ async function reconcileTimelineRestoreOrphanSdkSubagents(sessionName: string, r
  */
 const transportSessionRestoreInFlight = new Map<string, Promise<void>>();
 
+function healPersistedAgySessionModel(record: SessionRecord): SessionRecord {
+  if (!isStoredTransportSession(record)
+    || (record.providerId ?? record.agentType) !== AGY_SDK_PROVIDER_ID
+    || isIncognitoSession(record)
+    || transportRuntimes.has(record.name)) {
+    return record;
+  }
+  const explicitModel = record.requestedModel?.trim() || undefined;
+  const targetActiveModel = explicitModel
+    ?? (record.activeModel === 'gemini-4-carbon-medium' || record.modelDisplay === 'gemini-4-carbon-medium'
+      ? AGY_DEFAULT_MODEL_ID
+      : undefined);
+  if (!targetActiveModel
+    || (record.activeModel === targetActiveModel && record.modelDisplay === targetActiveModel)) {
+    return record;
+  }
+  const healed: SessionRecord = {
+    ...record,
+    activeModel: targetActiveModel,
+    modelDisplay: targetActiveModel,
+  };
+  upsertSession(healed);
+  const persisted = getSession(healed.name) ?? healed;
+  emitSessionPersist(persisted, healed.name);
+  return persisted;
+}
+
 export async function restoreTransportSessions(
   providerId: string,
   options: {
@@ -2768,6 +3117,12 @@ export async function restoreTransportSessions(
   if (isNonDaemonProcess()) {
     logger.warn({ providerId, sessionName: options.sessionName }, 'restoreTransportSessions refused: this process is not the daemon');
     return;
+  }
+  if (providerId === AGY_SDK_PROVIDER_ID) {
+    for (const record of storeSessions()) {
+      if (options.sessionName && record.name !== options.sessionName) continue;
+      healPersistedAgySessionModel(record);
+    }
   }
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
@@ -2792,6 +3147,7 @@ export async function restoreTransportSessions(
   // the main thread anyway; every store write is keyed by session name.
   type Restorable = SessionRecord & { providerId: string; providerSessionId: string };
   type RestoreAuthority = {
+    agyNativeSessionState: string;
     sessionInstanceId: string;
     createdAt: number;
     runtimeEpoch: string;
@@ -2810,6 +3166,7 @@ export async function restoreTransportSessions(
     transportConfig: string;
   };
   const buildRestoreAuthority = (record: SessionRecord): RestoreAuthority => ({
+    agyNativeSessionState: record.agyNativeSessionState ?? '',
     sessionInstanceId: record.sessionInstanceId?.trim() ?? '',
     createdAt: record.createdAt,
     runtimeEpoch: record.runtimeEpoch?.trim() ?? '',
@@ -2841,6 +3198,7 @@ export async function restoreTransportSessions(
       && actual.agentType === expected.agentType
       && actual.providerSessionId === expected.providerSessionId
       && actual.providerResumeId === expected.providerResumeId
+      && actual.agyNativeSessionState === expected.agyNativeSessionState
       && actual.projectDirectory === expected.projectDirectory
       && actual.label === expected.label
       && actual.requestedModel === expected.requestedModel
@@ -2868,10 +3226,14 @@ export async function restoreTransportSessions(
   };
   const pending = all.filter((s) =>
     isStoredTransportSession(s)
+    && !isIncognitoSession(s)
     && (s.providerId ?? s.agentType) === providerId
     && !!s.providerSessionId
     && (!options.sessionName || s.name === options.sessionName)
-    && (!options.onlyWithPendingResend || getResendCount(s.name) > 0 || hasDurableTransportQueueEntries(s.name)),
+    && (!options.onlyWithPendingResend
+      || getResendCount(s.name) > 0
+      || hasDurableTransportQueueEntries(s.name)
+      || hasPendingRestartContinuation(s.name)),
   ).map((s) => ({ ...s, providerId, providerSessionId: s.providerSessionId! } as Restorable));
   // A permanent-by-construction failure (see transport-restore-backoff.ts):
   // recorded so on-demand callers stop retrying it every few seconds, and
@@ -2897,7 +3259,9 @@ export async function restoreTransportSessions(
     };
     const rejectStaleRestoreInstance = (stage: string): boolean => {
       const current = getSession(s.name);
-      if (current && matchesRestoreAuthority(current, expectedAuthority)) return false;
+      const pending = transportSessionRestoreInFlight.get(s.name);
+      if (current && matchesRestoreAuthority(current, expectedAuthority)
+        && !(s.providerId === AGY_SDK_PROVIDER_ID && pending && cancelledTransportStarts.has(pending))) return false;
       logger.warn({
         session: s.name,
         providerId: s.providerId,
@@ -2928,7 +3292,7 @@ export async function restoreTransportSessions(
       if (preservation.preservedCount > 0) {
         logger.info({ sessionName: s.name, ...preservation }, 'preserved unbound transport runtime queues before restore');
       }
-      await stopTransportRuntimeSession(s.name, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
+      await detachTransportRuntimeSession(s.name, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
         logger.warn({ err, session: s.name }, 'Failed to stop unbound transport runtime before restore');
       });
       if (rejectStaleRestoreInstance('after_existing_runtime_stop')) return;
@@ -2936,7 +3300,9 @@ export async function restoreTransportSessions(
     try {
       const provider = getProvider(s.providerId);
       if (!provider) return;
-      if (usesProviderResumeId(s.providerId) && !s.providerResumeId) {
+      const unusedAgy = s.providerId === AGY_SDK_PROVIDER_ID
+        && s.agyNativeSessionState === AGY_NATIVE_SESSION_STATE.UNSTARTED;
+      if (usesProviderResumeId(s.providerId) && !s.providerResumeId && !unusedAgy) {
         if (!provider.listSessions) {
           noteUnboundRestore(s, 'provider_cannot_list_sessions', 'Transport restore requires a durable provider id but the provider cannot list sessions');
           return;
@@ -3066,7 +3432,7 @@ export async function restoreTransportSessions(
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
-      if (s.providerId === 'codex-sdk') {
+      if (s.providerId === 'codex-sdk' && !s.ccPreset) {
         requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
       } else if (isClaudeCodeSdkAgentType(s.providerId) && requestedTransportModel) {
         // Resolve the picker alias (e.g. "fable") to the documented API id before the
@@ -3086,11 +3452,16 @@ export async function restoreTransportSessions(
       // until the runtime is committed below.
       wireTransportCallbacks(runtime, s.name, { deferProviderReadyDrain: true });
       const getLatestSessionInfo = wireTransportSessionInfo(runtime, s.name, s.agentType, {
-        canPersist: (record) => (
-          restoreCommitted
+        canPersist: (record) => {
+          if (s.providerId === AGY_SDK_PROVIDER_ID) {
+            const pending = transportSessionRestoreInFlight.get(s.name);
+            if ((pending && cancelledTransportStarts.has(pending))
+              || (restoreCommitted && transportRuntimes.get(s.name) !== runtime)) return false;
+          }
+          return restoreCommitted
             ? matchesRestoreRuntimeIdentity(record, expectedAuthority)
-            : matchesRestoreAuthority(record, expectedAuthority)
-        ),
+            : matchesRestoreAuthority(record, expectedAuthority);
+        },
         onPersisted: refreshRestoreAuthority,
       });
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
@@ -3128,6 +3499,7 @@ export async function restoreTransportSessions(
       let effectiveRequestedModel = requestedTransportModel;
       let restoredPresetContextWindow = s.presetContextWindow;
       let qwenPresetUsesApiKey = false;
+      let availableCodexModels: string[] | undefined;
       let dshLlmConfig: DshLlmConfig | undefined;
       let piLlmConfig: PiLlmConfig | undefined;
       const boundServerId = await loadBoundServerIdForManagedMcp();
@@ -3193,6 +3565,14 @@ export async function restoreTransportSessions(
         if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
         restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'codex-sdk' && s.ccPreset) {
+        const presetOverrides = await resolveCodexPresetSessionOverrides(s.ccPreset, effectiveRequestedModel, transportSettings);
+        extraEnv = { ...(extraEnv ?? {}), ...presetOverrides.env };
+        if (presetOverrides.model) effectiveRequestedModel = presetOverrides.model;
+        restoredPresetContextWindow = presetOverrides.contextWindow ?? restoredPresetContextWindow;
+        if (presetOverrides.systemPrompt) systemPrompt = presetOverrides.systemPrompt;
+        if (presetOverrides.availableModels?.length) availableCodexModels = presetOverrides.availableModels;
+        if (presetOverrides.settings) transportSettings = presetOverrides.settings;
       }
       if (s.providerId === 'qwen'
         && !s.ccPreset
@@ -3216,7 +3596,8 @@ export async function restoreTransportSessions(
       // process we are about to start.
       const restoreIdentity = getSession(s.name) ?? s;
       const restoredSessionInstanceId = restoreIdentity.sessionInstanceId?.trim();
-      const restoredRuntimeEpoch = restoreIdentity.runtimeEpoch?.trim();
+      const restoredRuntimeEpoch = s.providerId === AGY_SDK_PROVIDER_ID
+        ? randomUUID() : restoreIdentity.runtimeEpoch?.trim();
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         sessionName: s.name,
@@ -3255,6 +3636,7 @@ export async function restoreTransportSessions(
         ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
         ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
         resumeId,
+        ...(s.providerId === AGY_SDK_PROVIDER_ID ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, s.name) } : {}),
         effort: s.effort,
         // Restore path: only re-inject startup memory if the prior run hadn't
         // yet delivered it (e.g. daemon crashed mid-first-turn). Otherwise the
@@ -3280,11 +3662,18 @@ export async function restoreTransportSessions(
       runtime.setSessionIdentity(s.name, currentForFinalize.label, currentForFinalize.role);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
       if (currentForFinalize.effort) runtime.setEffort(currentForFinalize.effort);
+      // AG's first native spawn is fenced by the persisted epoch. Bind the
+      // old queue owner before rotating, then move it to the committed epoch.
+      if (s.providerId === AGY_SDK_PROVIDER_ID && runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) {
+        await runtime.kill({ detachProviderSession: true, preserveTransportQueue: true });
+        return;
+      }
       transportRuntimes.set(s.name, runtime);
       const actualProviderSid = runtime.providerSessionId ?? effectiveSessionKey;
       registerProviderRoute(actualProviderSid, s.name);
       const restoredRecord: SessionRecord = {
         ...currentForFinalize,
+        ...(s.providerId === AGY_SDK_PROVIDER_ID ? { runtimeEpoch: restoredRuntimeEpoch } : {}),
         state: 'idle',
         updatedAt: Date.now(),
         ...(freshOnRestore ? { summarySyncFingerprints: undefined } : {}),
@@ -3321,6 +3710,7 @@ export async function restoreTransportSessions(
           ? undefined
           : (qwenRuntime?.authLimit ?? currentForFinalize.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
         ...(restoredPresetContextWindow ? { presetContextWindow: restoredPresetContextWindow } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
@@ -3337,6 +3727,14 @@ export async function restoreTransportSessions(
       };
       upsertSession(restoredRecord);
       const persistedRestoredRecord = getSession(s.name) ?? restoredRecord;
+      const oldRecipient = runtime.recipientIdentity;
+      const newRecipient = recipientFromSessionRecord(persistedRestoredRecord);
+      if (s.providerId === AGY_SDK_PROVIDER_ID && oldRecipient && newRecipient
+        && !runtime.rebindQueueRecipient(oldRecipient, newRecipient)) {
+        transportRuntimes.delete(s.name); unregisterProviderRoute(actualProviderSid);
+        await runtime.kill({ detachProviderSession: true, preserveTransportQueue: true });
+        return;
+      }
       refreshRestoreAuthority(persistedRestoredRecord);
       restoreCommitted = true;
       emitTransportSessionRestored(s.name);
@@ -3388,6 +3786,25 @@ export async function restoreTransportSessions(
         await recoverPersistedTransportQueue(runtime, s.name, 'reconnect');
       } catch (err) {
         logger.warn({ err, session: s.name }, 'Failed to recover transport queue after restart');
+      }
+      try {
+        const cont = await dispatchTransportRestartContinuation({
+          preRestoreSession: s,
+          currentSession: getSession(s.name) ?? persistedRestoredRecord,
+          runtime,
+          getResendCount,
+          hasQueuedDurableEntries: (name) => getTransportQueueStore().hasQueuedEntries(name),
+          emitUserMessage: (name, commandId) =>
+            emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'transport'),
+        });
+        if (cont.dispatched) {
+          logger.info(
+            { session: s.name, commandId: cont.commandId, reason: cont.reason },
+            'Dispatched automatic restart continue for transport session',
+          );
+        }
+      } catch (err) {
+        logger.warn({ err, session: s.name }, 'Failed to dispatch restart continuation after restore');
       }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
@@ -3450,6 +3867,11 @@ export function getTransportLaunchInFlightWaitMs(): number {
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name } = opts;
+  // Every fresh launch outside an owning relaunchSessionWithSettings supersedes
+  // any in-flight async handoff pack so `/clear` never resurrects stale context.
+  if (opts.fresh && opts.handoffLaunchGeneration === undefined) {
+    invalidateFreshCrossVendorHandoff(name);
+  }
   // A (re)launch is an explicit session change: forget any restore backoff.
   clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
@@ -3468,7 +3890,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     // intentionally tears down + recreates).
     if (!opts.fresh && transportRuntimes.has(name)) return;
   }
-  const launch = launchTransportSessionInner(opts);
+  const incognito = opts.incognito === true || (!opts.fresh && isIncognitoSession(getSession(name)));
+  if (incognito && !supportsSessionIncognito(opts.agentType)) throw new Error(SESSION_INCOGNITO_UNSUPPORTED);
+  if (incognito && !opts.fresh && getSession(name)) throw new Error('Incognito session cannot be restored; start a fresh session.');
+  opts = { ...opts, ...(incognito ? { incognito: true } : {}) };
+  setSessionIncognito(name, incognito);
+  const launch = withSessionPrivacy(name, incognito, () => launchTransportSessionInner(opts));
   const tracked = launch.then(() => {}, () => {});
   transportLaunchInFlight.set(name, tracked);
   try {
@@ -3536,8 +3963,23 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     launchRecipient,
     launchRecord ? { sessionCreatedAt: launchRecord.createdAt } : undefined,
   );
-  wireTransportCallbacks(runtime, name);
-  const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType);
+  wireTransportCallbacks(runtime, name, { deferProviderReadyDrain: agentType === AGY_SDK_PROVIDER_ID });
+  let agyLaunchCommitted = false;
+  const ownsAgyLaunch = (record: SessionRecord | null | undefined): boolean => {
+    const pending = transportLaunchInFlight.get(name);
+    if (pending && cancelledTransportStarts.has(pending)) return false;
+    if (agyLaunchCommitted) {
+      const owner = runtime.recipientIdentity;
+      return !!record && transportRuntimes.get(name) === runtime && record.providerSessionId === runtime.providerSessionId
+        && (!owner || (record.sessionInstanceId === owner.sessionInstanceId && record.runtimeEpoch === owner.runtimeEpoch));
+    }
+    return existing ? !!record && record.sessionInstanceId === existing.sessionInstanceId
+      && record.runtimeEpoch === existing.runtimeEpoch && record.providerSessionId === existing.providerSessionId
+      && record.providerResumeId === existing.providerResumeId && record.createdAt === existing.createdAt
+      && record.agentType === existing.agentType : !record;
+  };
+  const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType,
+    agentType === AGY_SDK_PROVIDER_ID ? { canPersist: record => agyLaunchCommitted && ownsAgyLaunch(record) } : undefined);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
@@ -3549,7 +3991,18 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let transportSettings: string | Record<string, unknown> | undefined;
   let dshLlmConfig: DshLlmConfig | undefined;
   let piLlmConfig: PiLlmConfig | undefined;
-  const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
+  if (agentType === AGY_SDK_PROVIDER_ID && existing?.agentType === AGY_SDK_PROVIDER_ID
+    && !opts.fresh && !opts.providerResumeId && !existing.providerResumeId
+    && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
+    throw new Error('AG conversation requires a trusted resume id; refusing an implicit fresh launch. Use Start over (session_restart reset=true) to explicitly create a new conversation. Restart cannot safely resume this session.');
+  }
+  // Session model choice is session configuration (not conversation history):
+  // preserve existing.requestedModel across fresh/reset ("Start over" / 重启新建)
+  // whenever the provider stays the same, while never inheriting a foreign
+  // provider's model ID on cross-provider switches.
+  const storedRequestedModel = (existing?.providerId ?? existing?.agentType) === agentType
+    ? existing?.requestedModel
+    : undefined;
   const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
     ? existing?.providerResumeId
     : undefined;
@@ -3573,7 +4026,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // back to the OAuth `coder-model` placeholder. `opts.fresh` (from /clear or
   // explicit reset) still wins — same rule applied to transportConfig above.
   const effectiveCcPreset: string | undefined =
-    opts.ccPreset ?? (!opts.fresh ? existing?.ccPreset : undefined);
+    opts.ccPreset ?? (!opts.fresh && existing?.ccPreset && isPresetCompatibleAgentSwitch(existing.agentType, agentType) ? existing.ccPreset : undefined);
   const effectiveUserCreated: boolean | undefined =
     opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
   const effectiveParentSession: string | undefined =
@@ -3614,8 +4067,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
     ...(onNamespaceResolved ? { onNamespaceResolved } : {}),
   });
-  const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = await resolveLaunchContextBootstrap(name, resolveRuntimeContextBootstrap);
-  runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
+  const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = opts.incognito
+    ? { bootstrap: {}, deferred: undefined }
+    : await resolveLaunchContextBootstrap(name, resolveRuntimeContextBootstrap);
+  if (!opts.incognito) runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
   if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
     if (agentType === 'qwen') {
       const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
@@ -3689,27 +4144,21 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   } else if (agentType === 'codex-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
-    if (!opts.fresh && transportResumeId) {
+    transportResumeId = opts.incognito
+      ? undefined
+      : (opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined));
+    if (!opts.fresh && !opts.incognito && transportResumeId) {
       effectiveSkipCreate = true;
     }
     let availableCodexModels: string[] | undefined;
     if (effectiveCcPreset) {
-      const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
-      const presetConfig = await getCodexPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
-      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
-      if (presetConfig.model) requestedTransportModel = presetConfig.model;
-      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
-      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
-      if (presetConfig.availableModels?.length) {
-        availableCodexModels = presetConfig.availableModels;
-      }
-      if (presetConfig.codexModelProvider) {
-        transportSettings = {
-          ...(typeof transportSettings === 'object' && transportSettings ? transportSettings : {}),
-          codexModelProvider: presetConfig.codexModelProvider,
-        };
-      }
+      const presetOverrides = await resolveCodexPresetSessionOverrides(effectiveCcPreset, requestedTransportModel, transportSettings);
+      transportEnv = { ...(transportEnv ?? {}), ...presetOverrides.env };
+      if (presetOverrides.model) requestedTransportModel = presetOverrides.model;
+      presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
+      if (presetOverrides.systemPrompt) transportSystemPrompt = presetOverrides.systemPrompt;
+      if (presetOverrides.availableModels?.length) availableCodexModels = presetOverrides.availableModels;
+      if (presetOverrides.settings) transportSettings = presetOverrides.settings;
     }
     const rawSdkDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
@@ -3736,7 +4185,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
     effectiveSkipCreate = !!transportResumeId;
   } else if (agentType === 'pi') {
     if (effectiveCcPreset) {
@@ -3750,12 +4199,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
     effectiveSkipCreate = !!transportResumeId;
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    transportResumeId = opts.incognito || (agentType === AGY_SDK_PROVIDER_ID && opts.fresh)
+      ? undefined : opts.providerResumeId ?? storedProviderResumeId;
     // providerSessionId is only an IM.codes route key for this family. Durable
     // continuity comes exclusively from providerResumeId, so a stale route key
     // must never make us skip session creation without a real resume target.
@@ -3797,6 +4247,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // Create session on provider
   const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
+    ...(opts.incognito ? { incognito: true } : {}),
     sessionKey: effectiveSessionKey,
     sessionName: name,
     sessionInstanceId: resourceSessionInstanceId,
@@ -3830,12 +4281,17 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
+    ...(agentType === AGY_SDK_PROVIDER_ID && !opts.incognito && (!skipStore || existing) ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, name) } : {}),
     effort: effectiveEffort,
     ...(existing?.crossVendorHandoff?.pending && !opts.fresh
       ? { pendingHandoff: existing.crossVendorHandoff.pending }
       : {}),
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
   });
+  if (agentType === AGY_SDK_PROVIDER_ID && !ownsAgyLaunch(getSession(name))) {
+    await runtime.kill({ detachProviderSession: true });
+    throw Object.assign(new Error('AG launch owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
+  }
   const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
@@ -3845,6 +4301,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   try {
     if (!skipStore) {
       const record = markSessionLaunchIdentity<SessionRecord>({
+        ...(opts.incognito ? { incognito: true } : {}),
         name,
         sessionInstanceId: resourceSessionInstanceId,
         runtimeEpoch: resourceRuntimeEpoch,
@@ -3860,11 +4317,15 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...(usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
+        ...(agentType === AGY_SDK_PROVIDER_ID && !opts.incognito ? {
+          agyNativeSessionState: transportResumeId || latestSessionInfo?.resumeId
+            ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED,
+        } : {}),
+        ...(!opts.incognito && usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
           ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
         ...(isClaudeCodeSdkAgentType(agentType) && transportResumeId ? { ccSessionId: transportResumeId } : {}),
-        ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
+        ...(agentType === 'codex-sdk' && transportResumeId && !opts.incognito ? { codexSessionId: transportResumeId } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,
         contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
@@ -3910,7 +4371,12 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(preservedSummarySyncFingerprints && preservedSummarySyncFingerprints.length > 0
           ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
           : {}),
-        ...(existing?.crossVendorHandoff ? { crossVendorHandoff: existing.crossVendorHandoff } : {}),
+        ...(existing?.crossVendorHandoff ? {
+          crossVendorHandoff: stripPendingCrossVendorHandoff(
+            (getSession(name) ?? existing)?.crossVendorHandoff,
+            opts.fresh,
+          ),
+        } : {}),
       });
       const launchGapEntries = getResendEntries(name);
       if (launchGapEntries.length > 0 && launchGapEntries.every((entry) => !entry.recipient)) {
@@ -3952,6 +4418,18 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       emitSessionPersist(persistedRecord ?? record, name);
     }
 
+    if (skipStore && agentType === AGY_SDK_PROVIDER_ID && existing && !opts.incognito) {
+      const current = getSession(name);
+      if (!current || current.sessionInstanceId !== existing.sessionInstanceId) throw new Error('AG launch owner changed');
+      upsertSession({ ...current, providerSessionId: providerSid ?? undefined,
+        providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId,
+        agyNativeSessionState: latestSessionInfo?.resumeId || transportResumeId
+          ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED });
+      const recipient = recipientFromSessionRecord(getSession(name));
+      if (recipient && runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) throw new Error('AG launch recipient changed');
+    }
+    agyLaunchCommitted = true;
+    if (agentType === AGY_SDK_PROVIDER_ID) wireTransportProviderReadyDrain(runtime, name);
     emitSessionEvent('started', name, 'idle');
     logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
   } catch (err) {
@@ -4012,7 +4490,7 @@ export async function ensureTransportRuntimeAvailable(
   if (!recovery) {
     recovery = (async () => {
       const record = getSession(sessionName);
-      if (!record || !isTransportAgent(record.agentType as AgentType)) return;
+      if (!record || !isTransportAgent(record.agentType as AgentType) || isIncognitoSession(record)) return;
       const runtime = getTransportRuntime(sessionName);
       if (runtime?.providerSessionId) return;
       if (runtime) {
@@ -4107,6 +4585,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     await launchTransportSession(opts);
     return;
   }
+  if (opts.fresh && opts.handoffLaunchGeneration === undefined) {
+    invalidateFreshCrossVendorHandoff(opts.name);
+  }
 
   const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh, label } = opts;
   const driver = getDriver(agentType);
@@ -4176,9 +4657,14 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     geminiSessionId,
   }));
 
+  const releaseRecovery = (!fresh && !exists && opts.onPostLaunchReady && agentType !== 'shell' && agentType !== 'script')
+    ? claimProcessRestartContinuationRecovery(name, resourceRuntimeEpoch)
+    : undefined;
+  let recoveryHandedOff = false;
   let nativeAgentsFenced = false;
   let launchedNativeAgentFence: SessionRecord['nativeAgentLaunchFence'];
-  if (!exists) {
+  try {
+    if (!exists) {
     if (storedBeforeLaunch) {
       const previousResources = await releaseSessionResources(storedBeforeLaunch);
       if (previousResources.failed > 0) {
@@ -4290,7 +4776,12 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
-      ...(existing?.crossVendorHandoff ? { crossVendorHandoff: existing.crossVendorHandoff } : {}),
+      ...(existing?.crossVendorHandoff ? {
+        crossVendorHandoff: stripPendingCrossVendorHandoff(
+          (getSession(name) ?? existing)?.crossVendorHandoff,
+          fresh,
+        ),
+      } : {}),
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
       ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
@@ -4321,6 +4812,10 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
+        ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+        ...(existing.crossVendorHandoff ? {
+          crossVendorHandoff: stripPendingCrossVendorHandoff(existing.crossVendorHandoff, fresh),
+        } : {}),
         ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
         updatedAt: Date.now(),
       };
@@ -4336,56 +4831,79 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   // Start structured-event watchers for supported agent types
   startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
 
-  // Auto-dismiss startup prompts before delivering the initial context. A
-  // selected identity file has already been resolved to bytes by the UI/MCP;
-  // process agents must receive those same bytes on their first launch rather
-  // than only after a later respawn.
-  void (async () => {
-    if (driver.postLaunch) {
-      await driver.postLaunch(
-        () => capturePane(name),
-        (key) => sendKey(name, key),
-      ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
+    if (fresh) {
+      retireRestartContinuation(name);
     }
-    if (pendingHandoffOnRestart) {
+    // Auto-dismiss startup prompts before delivering the initial context. A
+    // selected identity file has already been resolved to bytes by the UI/MCP;
+    // process agents must receive those same bytes on their first launch rather
+    // than only after a later respawn.
+    recoveryHandedOff = true;
+    void (async () => {
       try {
-        const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
-        let injected = false;
-        await runWithProcessSessionSendLock(name, async () => {
-          const current = getSession(name);
-          if (!current?.crossVendorHandoff?.pending
-            || current.crossVendorHandoff.pending.cutoff.epoch !== pendingHandoffOnRestart.cutoff.epoch
-            || current.crossVendorHandoff.pending.cutoff.seq !== pendingHandoffOnRestart.cutoff.seq) return;
-          const writePrivate = await prepareProcessSessionPrivateWriter(name);
-          writePrivate(pendingHandoffOnRestart.text);
-          injected = true;
-        });
-        if (injected) {
-          const current = getSession(name);
-          if (current?.crossVendorHandoff?.pending?.cutoff.epoch === pendingHandoffOnRestart.cutoff.epoch
-            && current.crossVendorHandoff.pending.cutoff.seq === pendingHandoffOnRestart.cutoff.seq) {
-            const state = current.crossVendorHandoff;
-            upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: pendingHandoffOnRestart.cutoff } }, updatedAt: Date.now() });
-          }
-          incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+        if (driver.postLaunch) {
+          await driver.postLaunch(
+            () => capturePane(name),
+            (key) => sendKey(name, key),
+          ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
         }
-      } catch (error) {
-        logger.warn({ err: error, session: name }, 'Persisted cross-vendor handoff restore failed');
-        incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+        if (pendingHandoffOnRestart) {
+          try {
+            const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
+            let injected = false;
+            await runWithProcessSessionSendLock(name, async () => {
+              const current = getSession(name);
+              if (!current?.crossVendorHandoff?.pending
+                || current.crossVendorHandoff.pending.cutoff.epoch !== pendingHandoffOnRestart.cutoff.epoch
+                || current.crossVendorHandoff.pending.cutoff.seq !== pendingHandoffOnRestart.cutoff.seq) return;
+              const writePrivate = await prepareProcessSessionPrivateWriter(name);
+              writePrivate(pendingHandoffOnRestart.text);
+              injected = true;
+            });
+            if (injected) {
+              const current = getSession(name);
+              if (current?.crossVendorHandoff?.pending?.cutoff.epoch === pendingHandoffOnRestart.cutoff.epoch
+                && current.crossVendorHandoff.pending.cutoff.seq === pendingHandoffOnRestart.cutoff.seq) {
+                const state = current.crossVendorHandoff;
+                upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: pendingHandoffOnRestart.cutoff } }, updatedAt: Date.now() });
+              }
+              incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+            }
+          } catch (error) {
+            logger.warn({ err: error, session: name }, 'Persisted cross-vendor handoff restore failed');
+            incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+          }
+        }
+        if (agentType === 'shell' || agentType === 'script') return;
+        if (fresh) {
+          retireRestartContinuation(name);
+        }
+        // The same session reference as a restore uses: its PROJECT-scope identity is keyed by the context namespace's project id
+        // when the session has one, so leaving it out would look up the project NAME and miss that profile.
+        const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: storedBeforeLaunch?.contextNamespace });
+        const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
+        if (initialContext) {
+          try {
+            await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
+          } catch (error) {
+            logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
+          }
+        }
+        if (!fresh && opts.onPostLaunchReady) {
+          try {
+            await opts.onPostLaunchReady();
+          } catch (err) {
+            logger.warn({ err, session: name }, 'Post-launch continuation hook failed');
+          }
+        }
+      } finally {
+        releaseRecovery?.();
       }
-    }
-    if (agentType === 'shell' || agentType === 'script') return;
-    // The same session reference as a restore uses: its PROJECT-scope identity is keyed by the context namespace's project id
-    // when the session has one, so leaving it out would look up the project NAME and miss that profile.
-    const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: storedBeforeLaunch?.contextNamespace });
-    const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
-    if (!initialContext) return;
-    try {
-      await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
-    } catch (error) {
-      logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
-    }
-  })();
+    })();
+  } catch (error) {
+    if (!recoveryHandedOff) releaseRecovery?.();
+    throw error;
+  }
 }
 
 /** Bound ops for a session (used by status poller / response collector). */

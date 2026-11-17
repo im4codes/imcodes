@@ -28,6 +28,7 @@ import {
   saveFileBrowserSortPreference,
 } from '../file-browser-list-view.js';
 import { FileBrowserListHeader, FileBrowserListToolbar } from './FileBrowserListChrome.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -45,6 +46,7 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, memo, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+import { isInternalUploadTempFilePath, isMarkdownFilePath } from '@shared/cloud-docs.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
@@ -54,7 +56,17 @@ const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { ImageLightbox } from './ImageLightbox.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
-import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
+import {
+  browseSharedDocFolder,
+  buildAttachmentDownloadUrl,
+  createSharedDocItem,
+  downloadAttachment,
+  listDocsSharedWithMe,
+  recordRecentDocumentApi,
+  type DocShareBrowseEntry,
+  type SharedWithMeDocItem,
+} from '../api.js';
+import { DocShareDialog, ExternalDocShareSpace } from './DocShareDialog.js';
 import {
   downloadPreviewWithDirectFallback,
   isDirectFileTransferStaleHandleError,
@@ -82,6 +94,7 @@ import {
 import { filePreviewStatesEqual } from '../file-preview-state.js';
 import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
 import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 const PREF_KEY = 'fb_prefer_editor';
@@ -178,6 +191,8 @@ export interface FileBrowserProps {
   scopeToSessionRoot?: boolean;
   /** Hide mutation controls while preserving browse, preview, and download. */
   readOnly?: boolean;
+  /** Allow opening DocShare controls for files/folders on this server (false for shared-in callers). */
+  canShare?: boolean;
   /** Report the current single-selection to an embedded host control. */
   onSelectedPathChange?: (path: string | null, isDirectory: boolean) => void;
   /** Report directory navigation so an embedded uploader can target it. */
@@ -204,7 +219,10 @@ export interface FileBrowserProps {
    * listing before cutting it to its entry limit). Only meaningful with
    * `listView`; without it the browser sorts and filters what it has.
    */
+  /** Enable live filename filter query input above the file list. */
   directoryQuery?: boolean;
+  /** Open Controlled Nodes → Groups management from the share dialog. */
+  onOpenNodeGroups?: () => void;
   /** The second argument exposes the already-loaded single-file preview so a
    * host can consume explicitly selected text without issuing a duplicate read. */
   onConfirm: (paths: string[], preview?: FileBrowserPreviewState) => void;
@@ -245,6 +263,8 @@ type FsNode = {
   size?: number;
   mtimeMs?: number;
   birthtimeMs?: number;
+  /** Controlled download handle ID when supplied by ls metadata. */
+  downloadId?: string;
   /**
    * How the children of this directory were obtained. `complete`: every entry
    * of the directory is here (an unfiltered listing that was not cut), so the
@@ -347,7 +367,7 @@ export type FileBrowserPreviewState =
   // event, so a slow or never-loading handle can never look like a rendered
   // (but empty) image.
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string; settling?: boolean }
-  | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string }
+  | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string; verified?: boolean }
   | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'audio'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
@@ -409,16 +429,44 @@ export function mergePreviewState(
   return filePreviewStatesEqual(current, incoming) ? current : incoming;
 }
 
-/** File extensions that can be previewed with office document libraries. */
+/** File extensions that can be previewed with office document libraries or ONLYOFFICE. */
 const OFFICE_EXTENSIONS: Record<string, string> = {
   '.pdf': 'application/pdf',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.csv': 'text/csv',
+  '.doc': 'application/msword',
+  '.xls': 'application/vnd.ms-excel',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.odt': 'application/vnd.oasis.opendocument.text',
+  '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
+  '.odp': 'application/vnd.oasis.opendocument.presentation',
 };
 
 function getOfficeType(path: string): string | null {
   const ext = path.match(/\.[a-zA-Z0-9]+$/i)?.[0]?.toLowerCase();
   return ext ? (OFFICE_EXTENSIONS[ext] ?? null) : null;
+}
+
+/** Keep `.csv` as plain text on automatic `fs.read_response` entry paths; ONLYOFFICE stays explicit opt-in. */
+function getAutoOfficePreviewType(path: string): string | null {
+  const mimeType = getOfficeType(path);
+  return mimeType && mimeType !== 'text/csv' ? mimeType : null;
+}
+
+function detectExternalDocShareToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = params.get('docShare')?.trim();
+    if (fromQuery) return fromQuery;
+    const pathMatch = window.location.pathname.match(/^\/doc-share\/([^/?#]+)/);
+    if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
+  } catch {
+    /* ignore */
+  }
+  return null;
 }
 
 /** File extensions playable in the browser <video> element. Mirrored from
@@ -479,6 +527,17 @@ function findNodePath(nodes: FsNode[], targetId: string): string[] | null {
     }
   }
   return null;
+}
+
+function findNodeById(nodes: readonly FsNode[], targetId: string): FsNode | undefined {
+  for (const node of nodes) {
+    if (node.id === targetId) return node;
+    if (node.children?.length) {
+      const found = findNodeById(node.children, targetId);
+      if (found) return found;
+    }
+  }
+  return undefined;
 }
 
 type PendingPreviewReason = 'interactive' | 'refresh';
@@ -566,14 +625,17 @@ export function FileBrowser({
   sessionName,
   scopeToSessionRoot = false,
   readOnly = false,
+  canShare = true,
   onSelectedPathChange,
   onCurrentPathChange,
   hideBreadcrumbConfirm = false,
   quickAccess = false,
   listView = false,
   directoryQuery = false,
+  onOpenNodeGroups,
 }: FileBrowserProps) {
   const { t, i18n } = useTranslation();
+  const resolvedOnOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
   // react-i18next may provide a new `t` function after every render. Keep
   // preview callbacks stable: auto-preview effects depend on them, and a
   // changing callback would re-dispatch the same chat preview indefinitely.
@@ -688,6 +750,25 @@ export function FileBrowser({
 
   const [newEntry, setNewEntry] = useState<{ kind: NewEntryKind; parentPath: string } | null>(null);
   const [newEntryName, setNewEntryName] = useState('');
+  const [newDocType, setNewDocType] = useState<'' | '.docx' | '.xlsx' | '.pptx' | '.md'>('');
+  const [shareDialogTarget, setShareDialogTarget] = useState<{ path: string; kind: 'file' | 'folder' } | null>(null);
+  const [showSharedDocs, setShowSharedDocs] = useState(false);
+  const [sharedDocs, setSharedDocs] = useState<SharedWithMeDocItem[]>([]);
+  const [sharedDocsLoading, setSharedDocsLoading] = useState(false);
+  const [sharedFolderView, setSharedFolderView] = useState<{
+    serverId: string;
+    rootPath: string;
+    currentPath: string;
+    role: 'viewer' | 'editor';
+    entries: DocShareBrowseEntry[];
+  } | null>(null);
+  const [activeSharedDocServerId, setActiveSharedDocServerId] = useState<string | undefined>(undefined);
+  const [activeSharedDocReadOnly, setActiveSharedDocReadOnly] = useState<boolean | undefined>(undefined);
+  const [sharedNewName, setSharedNewName] = useState('');
+  const [sharedNewKind, setSharedNewKind] = useState<'docx' | 'xlsx' | 'pptx' | 'md' | 'folder'>('docx');
+  const [sharedShowCreate, setSharedShowCreate] = useState(false);
+  const sharedFolderEpochRef = useRef(0);
+  const externalShareToken = useMemo(() => detectExternalDocShareToken(), []);
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
@@ -749,6 +830,13 @@ export function FileBrowser({
   const historyRef = useRef<string[]>([startPath]);
   const historyIdxRef = useRef(0);
   const [canGoBack, setCanGoBack] = useState(false);
+
+  useEffect(() => {
+    if (externalShareToken || mode === 'dir-only' || (!serverId && !activeSharedDocServerId)) {
+      return;
+    }
+    void prewarmOnlyOfficeComponents();
+  }, [externalShareToken, mode, serverId, activeSharedDocServerId]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -880,6 +968,10 @@ export function FileBrowser({
   }, [clearPendingPreviewRequest, handlePreviewRequestTimeout]);
 
   const fetchDir = useCallback((nodePath: string, fetchOptions?: { skipGitStatus?: boolean }) => {
+    if (ws.connected === false) {
+      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+      return;
+    }
     if (loadedRef.current.has(nodePath)) return;
     const inFlight = [...pendingRef.current.values()].includes(nodePath);
     if (inFlight) return;
@@ -963,6 +1055,8 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
+        for (const timer of timersRef.current.values()) clearTimeout(timer);
+        timersRef.current.clear();
         clearAllPendingPreviewRequests();
         pendingCreateFileRef.current.clear();
         pendingRenameRef.current.clear();
@@ -1032,6 +1126,7 @@ export function FileBrowser({
             ...(typeof e.size === 'number' ? { size: e.size } : {}),
             ...(typeof e.mtimeMs === 'number' ? { mtimeMs: e.mtimeMs } : {}),
             ...(typeof e.birthtimeMs === 'number' ? { birthtimeMs: e.birthtimeMs } : {}),
+            ...(typeof e.downloadId === 'string' && e.downloadId ? { downloadId: e.downloadId } : {}),
           }));
         const truncated = msg.truncated === true && typeof msg.total === 'number' ? { total: msg.total } : undefined;
         const partial = msg.partial === true;
@@ -1093,7 +1188,7 @@ export function FileBrowser({
 
         if (!mountedRef.current) return;
 
-        const dlId = msg.downloadId;
+        const fallbackNodeDownloadId = findNodeById(dataRef.current, filePath)?.downloadId;
 
         if (msg.status === 'error') {
           if (msg.error === FS_READ_ERROR_CODES.IS_DIRECTORY) {
@@ -1115,12 +1210,42 @@ export function FileBrowser({
             previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
             return;
           }
+          const officeErrorFallbackType = getAutoOfficePreviewType(filePath);
+          const errorCodeOrMessage = String(msg.error ?? '');
+          const isMissingFileError = msg.error === FS_READ_ERROR_CODES.PARENT_NOT_FOUND
+            || /not[_ -]?found|enoent|no such file/i.test(errorCodeOrMessage);
+          const errDlId = msg.downloadId
+            || (!isMissingFileError && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH ? fallbackNodeDownloadId : undefined);
+          if (
+            officeErrorFallbackType
+            && serverId
+            && errDlId
+            && !isMissingFileError
+            && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH
+            && msg.error !== FS_READ_ERROR_CODES.FILE_TOO_LARGE
+          ) {
+            void buildAttachmentDownloadUrl(serverId, errDlId, sessionName)
+              .then((streamUrl) => {
+                if (!mountedRef.current) return;
+                const stillActive = getActivePreviewCycle(filePath);
+                if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+                setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType: officeErrorFallbackType, downloadId: errDlId, verified: false });
+              })
+              .catch(() => {
+                if (!mountedRef.current) return;
+                const stillActive = getActivePreviewCycle(filePath);
+                if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+                finishPreviewError(filePath, t('file_browser.preview_error'), errDlId);
+              });
+            return;
+          }
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
             : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
-          finishPreviewError(filePath, t(errKey), dlId);
+          finishPreviewError(filePath, t(errKey), errDlId);
           return;
         }
+        const dlId = msg.downloadId || fallbackNodeDownloadId;
         previewRefreshBackoffUntilRef.current = 0;
 
         // Media preview — daemon signals stream-mode (no inline content) and
@@ -1178,7 +1303,7 @@ export function FileBrowser({
         // Office/image preview — same stream contract as video/audio: the daemon
         // sends metadata only and the bytes come over the chunked HTTP download
         // channel, so a large file can never monopolise the WebSocket.
-        const officeType = getOfficeType(filePath);
+        const officeType = getAutoOfficePreviewType(filePath);
         if (officeType && (msg as { previewMode?: string }).previewMode === 'stream' && dlId && serverId) {
           const mimeType = (msg.mimeType as string | undefined) ?? officeType;
           void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
@@ -1186,7 +1311,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType, downloadId: dlId });
+              setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType, downloadId: dlId, verified: true });
             })
             .catch(() => {
               if (!mountedRef.current) return;
@@ -1194,6 +1319,11 @@ export function FileBrowser({
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
               finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
+          return;
+        }
+        if (officeType && serverId && typeof msg.content === 'string') {
+          const inlineSrcUrl = `data:${officeType};charset=utf-8,${encodeURIComponent(msg.content)}`;
+          setPreview({ status: 'office', path: filePath, srcUrl: inlineSrcUrl, mimeType: officeType, downloadId: dlId, verified: true });
           return;
         }
 
@@ -1419,6 +1549,8 @@ export function FileBrowser({
     requestedViewMode?: HtmlPreviewViewMode,
   ) => {
     const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
+    setActiveSharedDocServerId(undefined);
+    setActiveSharedDocReadOnly(undefined);
     previewErrorPathRef.current = null;
     const shouldFetchDiff = nextViewMode !== 'html-render';
     if (editDirtyRef.current) {
@@ -1479,7 +1611,12 @@ export function FileBrowser({
       preview: loadingPreview,
     });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
-      const requestId = scopedSessionName ? ws.fsReadFile(filePath, scopedSessionName) : ws.fsReadFile(filePath);
+      const isAutoPreview = filePath === autoPreviewPath;
+      const requestId = scopedSessionName
+        ? (isAutoPreview
+            ? ws.fsReadFile(filePath, scopedSessionName, { chatFileReference: true })
+            : ws.fsReadFile(filePath, scopedSessionName))
+        : ws.fsReadFile(filePath);
       trackPendingPreviewRequest('read', requestId, { path: filePath, cycleId, reason: 'interactive' });
     }
     if (shouldFetchDiff && !hasPendingPreviewWork('diff', filePath, cycleId)) {
@@ -1505,15 +1642,69 @@ export function FileBrowser({
     setNewEntryName('');
   }, [buildChildPath, scopedSessionName, ws]);
 
-  const requestCreateFile = useCallback((parentPath: string, fileName: string) => {
-    const trimmed = fileName.trim();
-    if (!trimmed) return;
+  const requestCreateFile = useCallback((parentPath: string, fileName: string, docExt: '' | '.docx' | '.xlsx' | '.pptx' | '.md' = '') => {
+    const rawTrimmed = fileName.trim();
+    if (!rawTrimmed) return;
+    const trimmed = docExt && !rawTrimmed.toLowerCase().endsWith(docExt)
+      ? `${rawTrimmed}${docExt}`
+      : rawTrimmed;
     const fullPath = buildChildPath(parentPath, trimmed);
-    const requestId = ws.fsWriteFile(fullPath, '', scopedSessionName ? { createOnly: true, sessionName: scopedSessionName } : { createOnly: true });
-    pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+    const isOfficeDoc = Boolean(docExt) || /\.(docx|xlsx|pptx)$/i.test(trimmed);
+
     setNewEntry(null);
     setNewEntryName('');
-  }, [buildChildPath, scopedSessionName, ws]);
+    setNewDocType('');
+
+    if (serverId && isOfficeDoc) {
+      void createSharedDocItem(serverId, {
+        parentDir: parentPath,
+        name: trimmed,
+        kind: 'file',
+      })
+        .then((res) => {
+          if (!mountedRef.current) return;
+          loadedRef.current.delete(parentPath);
+          setError(null);
+          fetchDir(parentPath);
+          if (includeFiles) {
+            setPanelView('files');
+            setSelectedPaths(new Set([res.path]));
+            fetchPreview(res.path);
+          }
+        })
+        .catch(() => {
+          if (!mountedRef.current) return;
+          const requestId = ws.fsWriteFile(fullPath, '', scopedSessionName ? { createOnly: true, sessionName: scopedSessionName } : { createOnly: true });
+          pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+        });
+      return;
+    }
+
+    const requestId = ws.fsWriteFile(fullPath, '', scopedSessionName ? { createOnly: true, sessionName: scopedSessionName } : { createOnly: true });
+    pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+  }, [buildChildPath, fetchDir, fetchPreview, includeFiles, scopedSessionName, serverId, ws]);
+
+  const loadSharedDocsList = useCallback(() => {
+    setSharedDocsLoading(true);
+    void listDocsSharedWithMe(serverId)
+      .then((res) => {
+        if (!mountedRef.current) return;
+        setSharedDocs(res.shares ?? []);
+      })
+      .catch(() => {
+        if (!mountedRef.current) return;
+        setSharedDocs([]);
+      })
+      .finally(() => {
+        if (mountedRef.current) setSharedDocsLoading(false);
+      });
+  }, [serverId]);
+
+  useEffect(() => {
+    if (showSharedDocs) {
+      loadSharedDocsList();
+    }
+  }, [showSharedDocs, loadSharedDocsList]);
 
   const requestRename = useCallback((node: FsNode) => {
     const parentPath = getParentDir(node.id);
@@ -1547,8 +1738,8 @@ export function FileBrowser({
       requestMkdir(newEntry.parentPath, newEntryName);
       return;
     }
-    requestCreateFile(newEntry.parentPath, newEntryName);
-  }, [newEntry, newEntryName, requestCreateFile, requestMkdir]);
+    requestCreateFile(newEntry.parentPath, newEntryName, newDocType);
+  }, [newDocType, newEntry, newEntryName, requestCreateFile, requestMkdir]);
 
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
@@ -1718,6 +1909,57 @@ export function FileBrowser({
       preview,
     });
   }, [onPreviewStateChange, preview, previewViewMode, showDiff]);
+
+  const lastRecordedRecentOfficeKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    // Only record non-temp Office/PDF/Cloud Docs previews into Recent; plain text/code
+    // previews (`status === 'ok'`) and internal daemon uploads (`~/.imcodes/uploads/...`)
+    // must never auto-enter Cloud Docs Recent.
+    // Markdown (.md) files must NOT record merely on preview.status === 'office' (ONLYOFFICE
+    // might be disabled or fail & fall back locally); they record only inside handleOnlyOfficeOpened.
+    if (preview.status !== 'office' || !preview.verified || isInternalUploadTempFilePath(preview.path)) {
+      lastRecordedRecentOfficeKeyRef.current = null;
+      return;
+    }
+    if (isMarkdownFilePath(preview.path, preview.mimeType)) {
+      lastRecordedRecentOfficeKeyRef.current = null;
+      return;
+    }
+    const targetServerId = activeSharedDocServerId || serverId;
+    if (!targetServerId || typeof recordRecentDocumentApi !== 'function') return;
+    const key = `${targetServerId}:${preview.path}`;
+    if (lastRecordedRecentOfficeKeyRef.current === key) return;
+    lastRecordedRecentOfficeKeyRef.current = key;
+    void recordRecentDocumentApi({
+      sourceKind: 'server_file',
+      serverId: targetServerId,
+      sessionName: scopedSessionName,
+      filePath: preview.path,
+      mimeType: preview.mimeType,
+      title: preview.path.split(/[/\\]/).pop() || preview.path,
+      openMode: (activeSharedDocReadOnly ?? readOnly) ? 'view' : 'edit',
+    }).catch(() => {});
+  }, [preview, activeSharedDocServerId, serverId, scopedSessionName, activeSharedDocReadOnly, readOnly]);
+
+  const handleOnlyOfficeOpened = useCallback((info: { mode: 'view' | 'edit' }) => {
+    if (preview.status !== 'office' || isInternalUploadTempFilePath(preview.path)) return;
+    if (preview.verified && !isMarkdownFilePath(preview.path, preview.mimeType)) return;
+    const targetServerId = activeSharedDocServerId || serverId;
+    if (!targetServerId || typeof recordRecentDocumentApi !== 'function') return;
+    const key = `${targetServerId}:${preview.path}`;
+    if (lastRecordedRecentOfficeKeyRef.current === key) return;
+    lastRecordedRecentOfficeKeyRef.current = key;
+    void recordRecentDocumentApi({
+      sourceKind: 'server_file',
+      serverId: targetServerId,
+      sessionName: scopedSessionName,
+      filePath: preview.path,
+      mimeType: preview.mimeType,
+      title: preview.path.split(/[/\\]/).pop() || preview.path,
+      openMode: info.mode,
+      openedWithOnlyOffice: true,
+    }).catch(() => {});
+  }, [preview, activeSharedDocServerId, serverId, scopedSessionName]);
 
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
@@ -1937,6 +2179,20 @@ export function FileBrowser({
         event.stopPropagation();
       }}
     >
+      {serverId && canShare && (
+        <button
+          type="button"
+          onClick={() => {
+            setShareDialogTarget({
+              path: contextMenu.node.id,
+              kind: contextMenu.node.isDir ? 'folder' : 'file',
+            });
+            setContextMenu(null);
+          }}
+        >
+          {t('doc_share.share_btn', 'Share')}
+        </button>
+      )}
       <button type="button" onClick={() => requestRename(contextMenu.node)}>{t('common.rename')}</button>
       <button type="button" class="danger" onClick={() => requestDelete(contextMenu.node)}>{t('common.delete')}</button>
     </div>
@@ -2308,6 +2564,42 @@ export function FileBrowser({
             try { localStorage.setItem(PREF_KEY, '1'); } catch {}
           }}>{t('fileBrowser.edit')}</button>
         )}
+        {preview.status === 'ok' && !isEditing && serverId && /\.(csv|md|txt|rtf)$/i.test(preview.path) && (
+          <button
+            class="fb-diff-toggle"
+            data-testid="fb-open-csv-office-btn"
+            onClick={() => {
+              const lower = preview.path.toLowerCase();
+              const mime = lower.endsWith('.csv')
+                ? 'text/csv'
+                : lower.endsWith('.md')
+                  ? 'text/markdown'
+                  : lower.endsWith('.rtf')
+                    ? 'application/rtf'
+                    : 'text/plain';
+              setPreview({
+                status: 'office',
+                path: preview.path,
+                srcUrl: '',
+                mimeType: mime,
+                downloadId: preview.downloadId,
+                verified: true,
+              });
+            }}
+          >
+            {t('office_preview.open_in_onlyoffice', 'ONLYOFFICE')}
+          </button>
+        )}
+        {serverId && !readOnly && canShare && 'path' in preview && (
+          <button
+            class="fb-diff-toggle"
+            data-testid="fb-preview-share-btn"
+            onClick={() => setShareDialogTarget({ path: preview.path, kind: 'file' })}
+            title={t('doc_share.share_btn', 'Share')}
+          >
+            {t('doc_share.share_btn', 'Share')}
+          </button>
+        )}
         {isEditing && preview.status === 'ok' && (
           <Suspense fallback={null}>
             <FileEditor
@@ -2466,7 +2758,17 @@ export function FileBrowser({
         )}
         {preview.status === 'office' && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
-            <OfficePreview srcUrl={preview.srcUrl} mimeType={preview.mimeType} path={preview.path} />
+            <OfficePreview
+              srcUrl={preview.srcUrl}
+              mimeType={preview.mimeType}
+              path={preview.path}
+              serverId={activeSharedDocServerId || serverId}
+              sessionName={scopedSessionName}
+              readOnly={activeSharedDocReadOnly ?? readOnly}
+              initialMode={(activeSharedDocReadOnly ?? readOnly) ? 'view' : undefined}
+              onOpenShare={serverId && !readOnly ? () => setShareDialogTarget({ path: preview.path, kind: 'file' }) : undefined}
+              onOnlyOfficeOpened={handleOnlyOfficeOpened}
+            />
           </Suspense>
         )}
         {preview.status === 'video' && (
@@ -2774,7 +3076,7 @@ export function FileBrowser({
             class="fb-create-btn fb-create-file-btn"
             title={t('chat.new_file')}
             aria-label={t('chat.new_file')}
-            onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
+            onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); setNewDocType(''); }}
           >
             <span class="fb-create-icon fb-create-icon-file" aria-hidden="true" />
             <span class="fb-create-plus" aria-hidden="true">+</span>
@@ -2784,11 +3086,42 @@ export function FileBrowser({
           class="fb-create-btn fb-create-folder-btn"
           title={t('chat.new_folder')}
           aria-label={t('chat.new_folder')}
-          onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
+          onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); setNewDocType(''); }}
         >
           <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
           <span class="fb-create-plus" aria-hidden="true">+</span>
         </button>}
+        {serverId && !readOnly && canShare && (
+          <button
+            type="button"
+            class="fb-nav-btn"
+            data-testid="fb-toolbar-share-btn"
+            title={t('doc_share.share_btn', 'Share')}
+            aria-label={t('doc_share.share_btn', 'Share')}
+            onClick={() => {
+              const sel = selectedPaths.size === 1 ? [...selectedPaths][0] : null;
+              if (sel && preview.status !== 'idle' && 'path' in preview && preview.path === sel) {
+                setShareDialogTarget({ path: sel, kind: 'file' });
+              } else {
+                setShareDialogTarget({ path: currentLabel, kind: 'folder' });
+              }
+            }}
+          >
+            🔗
+          </button>
+        )}
+        {serverId && (
+          <button
+            type="button"
+            class={`fb-nav-btn${showSharedDocs ? ' active' : ''}`}
+            data-testid="fb-toolbar-shared-docs-btn"
+            title={t('doc_share.shared_docs_tab', 'Shared Docs')}
+            aria-label={t('doc_share.shared_docs_tab', 'Shared Docs')}
+            onClick={() => setShowSharedDocs((v) => !v)}
+          >
+            🤝
+          </button>
+        )}
       </div>
       <div class="fb-breadcrumb-row" title={currentLabel}>
         <div class="fb-breadcrumb-segments">
@@ -2831,6 +3164,27 @@ export function FileBrowser({
 
   const newEntryDialog = newEntry !== null ? (
     <div class="fb-new-folder-bar">
+      {newEntry.kind === 'file' && serverId && (
+        <select
+          data-testid="fb-new-doc-type-select"
+          value={newDocType}
+          onChange={(e) => setNewDocType((e.target as HTMLSelectElement).value as '' | '.docx' | '.xlsx' | '.pptx' | '.md')}
+          style={{
+            background: '#0f172a',
+            color: '#e2e8f0',
+            border: '1px solid #334155',
+            borderRadius: 4,
+            padding: '3px 6px',
+            fontSize: 12,
+          }}
+        >
+          <option value="">{t('doc_share.new_file_plain', 'Plain File')}</option>
+          <option value=".docx">{t('doc_share.new_doc_docx', 'Word (.docx)')}</option>
+          <option value=".xlsx">{t('doc_share.new_doc_xlsx', 'Excel (.xlsx)')}</option>
+          <option value=".pptx">{t('doc_share.new_doc_pptx', 'PowerPoint (.pptx)')}</option>
+          <option value=".md">{t('doc_share.new_doc_md', 'Markdown (.md)')}</option>
+        </select>
+      )}
       <input
         type="text"
         placeholder={newEntry.kind === 'folder' ? t('chat.new_folder_name') : t('chat.new_file_name')}
@@ -2852,6 +3206,257 @@ export function FileBrowser({
     </div>
   ) : null;
 
+  const sharedDocsBanner = showSharedDocs && serverId ? (
+    <div
+      data-testid="fb-shared-docs-panel"
+      style={{
+        padding: '8px 12px',
+        background: '#0f172a',
+        borderBottom: '1px solid #334155',
+        maxHeight: 180,
+        overflowY: 'auto',
+        fontSize: 12,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <strong style={{ color: '#e2e8f0' }}>{t('doc_share.shared_docs_title', 'Team Shared Documents & Folders')}</strong>
+        <button
+          type="button"
+          class="fb-close"
+          onClick={() => setShowSharedDocs(false)}
+          style={{ fontSize: 12 }}
+        >
+          ✕
+        </button>
+      </div>
+      {sharedDocsLoading ? (
+        <div style={{ color: '#64748b' }}>…</div>
+      ) : sharedDocs.length === 0 ? (
+        <div style={{ color: '#64748b' }}>{t('doc_share.no_shared_docs', 'No shared documents or folders yet.')}</div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {sharedDocs.map((item) => (
+            <div
+              key={item.id}
+              data-testid={`shared-doc-item-${item.id}`}
+              onClick={() => {
+                const targetSrv = item.serverId || serverId || '';
+                if (!targetSrv) return;
+                if (item.targetKind === 'folder') {
+                  const epoch = ++sharedFolderEpochRef.current;
+                  void browseSharedDocFolder(targetSrv, item.targetPath)
+                    .then((res) => {
+                      if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                      setSharedFolderView({
+                        serverId: targetSrv,
+                        rootPath: item.targetPath,
+                        currentPath: res.path,
+                        role: res.role,
+                        entries: res.entries,
+                      });
+                    })
+                    .catch((err: unknown) => {
+                      if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                      setError(err instanceof Error ? err.message : String(err));
+                    });
+                } else {
+                  setActiveSharedDocServerId(targetSrv);
+                  setActiveSharedDocReadOnly(item.role === 'viewer');
+                  setPreview({
+                    status: 'office',
+                    path: item.targetPath,
+                    srcUrl: '',
+                    mimeType: getOfficeType(item.targetPath) || 'text/markdown',
+                  });
+                }
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '4px 8px',
+                borderRadius: 4,
+                background: '#1e293b',
+                cursor: 'pointer',
+                color: '#e2e8f0',
+              }}
+            >
+              <span>
+                {item.targetKind === 'folder' ? '📁 ' : '📄 '}
+                {item.label || item.targetPath.split('/').pop() || item.targetPath}
+              </span>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                {item.role === 'editor' ? t('doc_share.role_editor', 'Editor') : t('doc_share.role_viewer', 'Viewer')}
+              </span>
+            </div>
+          ))}
+          {sharedFolderView && (
+            <div
+              data-testid="shared-doc-folder-entries"
+              style={{
+                marginTop: 6,
+                padding: 8,
+                background: '#020617',
+                border: '1px solid #334155',
+                borderRadius: 4,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 4,
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: '#94a3b8' }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 160 }}>{sharedFolderView.currentPath}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                  {sharedFolderView.role === 'editor' && (
+                    <button
+                      type="button"
+                      data-testid="shared-folder-create-toggle"
+                      onClick={() => setSharedShowCreate((prev) => !prev)}
+                      style={{ background: 'transparent', border: 'none', color: '#38bdf8', cursor: 'pointer', fontSize: 11, fontWeight: 600 }}
+                      title={t('doc_share.new_doc_btn')}
+                    >
+                      +
+                    </button>
+                  )}
+                  {sharedFolderView.currentPath !== sharedFolderView.rootPath && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const epoch = ++sharedFolderEpochRef.current;
+                        const targetServer = sharedFolderView.serverId;
+                        const parent = sharedFolderView.currentPath.split('/').slice(0, -1).join('/') || sharedFolderView.rootPath;
+                        const safeParent = parent.startsWith(sharedFolderView.rootPath) ? parent : sharedFolderView.rootPath;
+                        void browseSharedDocFolder(targetServer, safeParent).then((res) => {
+                          if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                          setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, currentPath: res.path, entries: res.entries } : null);
+                        });
+                      }}
+                      style={{ background: 'transparent', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: 11 }}
+                    >
+                      ↑ {t('doc_share.up_dir', 'Up')}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {sharedShowCreate && sharedFolderView.role === 'editor' && (
+                <form
+                  data-testid="shared-folder-create-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!sharedNewName.trim()) return;
+                    const epoch = ++sharedFolderEpochRef.current;
+                    const targetServer = sharedFolderView.serverId;
+                    const targetPath = sharedFolderView.currentPath;
+                    const base = sharedNewName.trim();
+                    const ext = sharedNewKind === 'folder' ? '' : `.${sharedNewKind}`;
+                    const finalName = ext && base.toLowerCase().endsWith(ext) ? base : `${base}${ext}`;
+                    void createSharedDocItem(targetServer, {
+                      parentDir: targetPath,
+                      name: finalName,
+                      kind: sharedNewKind === 'folder' ? 'folder' : 'file',
+                    }).then((created) => {
+                      setSharedNewName('');
+                      setSharedShowCreate(false);
+                      return browseSharedDocFolder(targetServer, targetPath).then((res) => {
+                        if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                        setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, entries: res.entries } : null);
+                        if (created.kind === 'file') {
+                          setActiveSharedDocServerId(targetServer);
+                          setActiveSharedDocReadOnly(false);
+                          setPreview({
+                            status: 'office',
+                            path: created.path,
+                            srcUrl: '',
+                            mimeType: getOfficeType(created.path) || 'text/markdown',
+                          });
+                        }
+                      });
+                    });
+                  }}
+                  style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}
+                >
+                  <input
+                    type="text"
+                    data-testid="shared-folder-new-name-input"
+                    value={sharedNewName}
+                    onInput={(e) => setSharedNewName((e.target as HTMLInputElement).value)}
+                    placeholder={t('doc_share.new_file_name', 'Name...')}
+                    style={{ flex: 1, minWidth: 80, padding: '3px 6px', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, fontSize: 11 }}
+                  />
+                  <select
+                    value={sharedNewKind}
+                    onChange={(e) => setSharedNewKind((e.target as HTMLSelectElement).value as any)}
+                    style={{ padding: '3px', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, fontSize: 11 }}
+                  >
+                    <option value="docx">.docx</option>
+                    <option value="xlsx">.xlsx</option>
+                    <option value="pptx">.pptx</option>
+                    <option value="md">.md</option>
+                    <option value="folder">{t('doc_share.kind_folder')}</option>
+                  </select>
+                  <button
+                    type="submit"
+                    data-testid="shared-folder-create-submit"
+                    style={{ padding: '3px 8px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
+                  >
+                    {t('common.confirm')}
+                  </button>
+                </form>
+              )}
+              {sharedFolderView.entries.map((entry) => (
+                <div
+                  key={entry.path}
+                  data-testid={`shared-folder-entry-${entry.name}`}
+                  onClick={() => {
+                    if (entry.isDir) {
+                      const epoch = ++sharedFolderEpochRef.current;
+                      const targetServer = sharedFolderView.serverId;
+                      void browseSharedDocFolder(targetServer, entry.path).then((res) => {
+                        if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                        setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, currentPath: res.path, entries: res.entries } : null);
+                      });
+                    } else {
+                      setActiveSharedDocServerId(sharedFolderView.serverId);
+                      setActiveSharedDocReadOnly((entry.role ?? sharedFolderView.role) === 'viewer');
+                      setPreview({
+                        status: 'office',
+                        path: entry.path,
+                        srcUrl: '',
+                        mimeType: getOfficeType(entry.path) || 'text/markdown',
+                      });
+                    }
+                  }}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    padding: '3px 6px',
+                    borderRadius: 3,
+                    background: '#1e293b',
+                    cursor: 'pointer',
+                    color: '#e2e8f0',
+                  }}
+                >
+                  <span>{entry.isDir ? `📁 ${entry.name}` : `📄 ${entry.name}`}</span>
+                  <span style={{ fontSize: 10, color: '#94a3b8' }}>{entry.role ?? sharedFolderView.role}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  const shareDialogOverlay = shareDialogTarget && serverId && canShare ? (
+    <DocShareDialog
+      serverId={serverId}
+      targetPath={shareDialogTarget.path}
+      targetKind={shareDialogTarget.kind}
+      onClose={() => setShareDialogTarget(null)}
+      onOpenNodeGroups={resolvedOnOpenNodeGroups}
+    />
+  ) : null;
+
   const lightboxOverlay = lightbox ? (
     <ImageLightbox
       src={lightbox.src}
@@ -2860,6 +3465,10 @@ export function FileBrowser({
       onClose={() => setLightbox(null)}
     />
   ) : null;
+
+  if (externalShareToken) {
+    return <ExternalDocShareSpace token={externalShareToken} />;
+  }
 
   if (layout === 'panel') {
     const tabs = changesRootPath ? (
@@ -2876,6 +3485,7 @@ export function FileBrowser({
       return (
         <>
           {lightboxOverlay}
+          {shareDialogOverlay}
           {contextMenuView}
           <div class="fb-panel">
             {tabs}
@@ -2895,11 +3505,13 @@ export function FileBrowser({
     return (
       <>
         {lightboxOverlay}
+        {shareDialogOverlay}
         {contextMenuView}
         <div class="fb-panel">
           {tabs}
           {breadcrumb}
           {newEntryDialog}
+          {sharedDocsBanner}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
@@ -2930,6 +3542,7 @@ export function FileBrowser({
   return (
     <>
       {lightboxOverlay}
+      {shareDialogOverlay}
       {contextMenuView}
       <div class="fb-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
         <div class={`fb-modal${hasPreview ? ' fb-modal-wide' : ''}`} onClick={(e) => e.stopPropagation()}>
@@ -2939,6 +3552,7 @@ export function FileBrowser({
           </div>
           {breadcrumb}
           {newEntryDialog}
+          {sharedDocsBanner}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             {tree}
             {previewPane}

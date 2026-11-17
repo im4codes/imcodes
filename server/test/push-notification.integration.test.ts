@@ -103,6 +103,7 @@ describe('push notification content', () => {
     expect(payload.title).toContain('my-project');
     expect(payload.title).toContain('claude-code');
     expect(payload.userId).toBe(userId);
+    expect(payload.serverId).toBe(serverId);
   });
 
   it('uses lastText as push body when provided', async () => {

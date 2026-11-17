@@ -140,3 +140,63 @@ function execCommandCopy(text: string, onSuccess: () => void, onFailure: () => v
     if (activeElement?.isConnected) activeElement.focus({ preventScroll: true });
   }
 }
+
+export type ClipboardReadResult =
+  | { ok: true; text: string }
+  | { ok: false; reason: 'empty' | 'unavailable' };
+
+type NativeClipboardPlugin = {
+  readText(): Promise<{ text?: string }>;
+};
+
+let nativeClipboardPlugin: NativeClipboardPlugin | null | undefined;
+
+async function getNativeClipboard(): Promise<NativeClipboardPlugin | null> {
+  const cap = (globalThis as {
+    Capacitor?: {
+      isNativePlatform?: () => boolean;
+      isPluginAvailable?: (name: string) => boolean;
+    };
+  }).Capacitor;
+  if (!cap || typeof cap.isNativePlatform !== 'function' || !cap.isNativePlatform()) {
+    return null;
+  }
+  if (typeof cap.isPluginAvailable === 'function' && !cap.isPluginAvailable('NativeClipboard')) {
+    return null;
+  }
+  if (nativeClipboardPlugin !== undefined) return nativeClipboardPlugin;
+  try {
+    const { registerPlugin } = await import('@capacitor/core');
+    const plugin = registerPlugin<NativeClipboardPlugin>('NativeClipboard');
+    // Wrap Capacitor's Proxy so async return does not probe `.then()` as a native method.
+    nativeClipboardPlugin = { readText: () => plugin.readText() };
+    return nativeClipboardPlugin;
+  } catch {
+    nativeClipboardPlugin = null;
+    return null;
+  }
+}
+
+/** Read trimmed plain text from native Android clipboard bridge or Web Clipboard API. */
+export async function readFromClipboard(): Promise<ClipboardReadResult> {
+  const nativeClipboard = await getNativeClipboard();
+  if (nativeClipboard) {
+    try {
+      const res = await nativeClipboard.readText();
+      const text = typeof res?.text === 'string' ? res.text.trim() : '';
+      return text ? { ok: true, text } : { ok: false, reason: 'empty' };
+    } catch {
+      // Fall through to Web Clipboard API if native bridge fails
+    }
+  }
+  if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
+    return { ok: false, reason: 'unavailable' };
+  }
+  try {
+    const raw = await navigator.clipboard.readText();
+    const text = raw.trim();
+    return text ? { ok: true, text } : { ok: false, reason: 'empty' };
+  } catch {
+    return { ok: false, reason: 'unavailable' };
+  }
+}

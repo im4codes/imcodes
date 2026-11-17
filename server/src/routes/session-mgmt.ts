@@ -4,6 +4,7 @@ import type { Env } from '../env.js';
 import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, getUserPref, setUserPref, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -53,6 +54,15 @@ import {
   normalizeSharedContextRuntimeBackend,
 } from '../../../shared/shared-context-runtime-config.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import {
+  buildTransportConfigWithCompactHijack,
+  extractSessionCompactHijackMode,
+  extractSessionHandoffLimits,
+  hasCompactHijackField,
+  hasInvalidCompactHijackSetting,
+  sanitizeShareTransportConfigRow,
+  stripCompactHijackFromTransportConfig,
+} from '../../../shared/compact-hijack.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
 import {
@@ -63,8 +73,8 @@ import {
 } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { shareCancelDispatchDenial, type SharedActorEnvelope } from '../../../shared/tab-sharing.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
-import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import { issueOwnerMachineAuthorityForSession, issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import {
   buildTransportConfigWithSupervision,
   canSessionRoleOwnAutomaticSupervision,
@@ -107,6 +117,19 @@ export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: 
 
 // Apply auth middleware globally to all session routes
 sessionMgmtRoutes.use('/*', requireAuth());
+sessionMgmtRoutes.use('/:id/*', async (c, next) => {
+  if (c.get('authServerId' as never)) {
+    const authority = await resolveDaemonCallerAuthority(c, {
+      denyParticipant: true,
+      denySharedHostAbsentAuthority: false,
+      targetServerId: c.req.param('id')!,
+      allowOwnerCrossServer: false,
+    });
+    if (!authority.ok) return daemonScopeFailure(c, authority);
+  }
+  await next();
+  return;
+});
 
 function parseStoredTransportConfig(value: Record<string, unknown> | string | null): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
@@ -129,6 +152,12 @@ sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c)
   const serverId = c.req.param('id')!;
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const shareAccess = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  const isShareCaller = shareAccess?.actor?.kind === 'share';
 
   try {
     const [allSessions, subSessions] = await Promise.all([
@@ -136,9 +165,14 @@ sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c)
       // Session-mgmt snapshot listing: exclude ephemeral execution clones (default).
       getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false }),
     ]);
-    const sessions = allSessions.filter((s) => !s.name.startsWith('deck_sub_'));
-    const normalizedSessions = normalizeWorkerSessionRows(sessions);
-    const normalizedSubSessions = normalizeWorkerSubSessionRows(subSessions);
+    const sessions = allSessions
+      .filter((s) => !s.name.startsWith('deck_sub_'))
+      .map((s) => (isShareCaller ? sanitizeShareTransportConfigRow(s as unknown as Record<string, unknown>) : s));
+    const visibleSubSessions = isShareCaller
+      ? subSessions.map((sub) => sanitizeShareTransportConfigRow(sub as unknown as Record<string, unknown>))
+      : subSessions;
+    const normalizedSessions = normalizeWorkerSessionRows(sessions as typeof allSessions);
+    const normalizedSubSessions = normalizeWorkerSubSessionRows(visibleSubSessions as typeof subSessions);
     if (!normalizedSessions.ok || !normalizedSubSessions.ok) {
       logger.warn({
         serverId,
@@ -171,9 +205,17 @@ sessionMgmtRoutes.get('/:id/sessions', async (c) => {
   const serverId = c.req.param('id')!;
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const shareAccess = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  const isShareCaller = shareAccess?.actor?.kind === 'share';
 
   const all = await getDbSessionsByServer(c.env.DB, serverId);
-  const sessions = all.filter((s) => !s.name.startsWith('deck_sub_'));
+  const sessions = all
+    .filter((s) => !s.name.startsWith('deck_sub_'))
+    .map((s) => (isShareCaller ? sanitizeShareTransportConfigRow(s as unknown as Record<string, unknown>) : s));
   return c.json({ sessions });
 });
 
@@ -423,7 +465,12 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     return c.json({ error: 'relay_failed' }, 502);
   }
 
-  return c.json({ ok: true, transportConfig: nextTransportConfig });
+  return c.json({
+    ok: true,
+    transportConfig: access.actor.kind === 'share'
+      ? stripCompactHijackFromTransportConfig(nextTransportConfig)
+      : nextTransportConfig,
+  });
 });
 
 async function resolveSupervisorDefaultsOwner(
@@ -679,9 +726,10 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   // fields, but no transport config (including an apparent `off`) crosses this
   // generic gate. Whole-server participants intentionally follow the owner path.
   if (access.actor.kind === 'share'
-    && !isWholeServerShareAccess(access)
     && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
-    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+    if (!isWholeServerShareAccess(access) || hasCompactHijackField(body.transportConfig)) {
+      return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+    }
   }
 
   const fields: {
@@ -704,12 +752,35 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   if ('requestedModel' in body) fields.requested_model = body.requestedModel ?? null;
   if ('activeModel' in body) fields.active_model = body.activeModel ?? null;
   if ('effort' in body) fields.effort = body.effort ?? null;
-  if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
 
-  if (hasInvalidSessionSupervisionSnapshot(body.transportConfig ?? null)) {
+  let nextTransportConfig = body.transportConfig;
+  if ('transportConfig' in body) {
+    if (hasInvalidCompactHijackSetting(body.transportConfig ?? null)) {
+      return c.json({ error: 'invalid_compact_hijack_config' }, 400);
+    }
+    if (access.actor.kind === 'share') {
+      const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
+      const currentConfig = parseStoredTransportConfig(current?.transport_config ?? null);
+      const existingMode = extractSessionCompactHijackMode(currentConfig);
+      const existingLimits = extractSessionHandoffLimits(currentConfig);
+      nextTransportConfig = buildTransportConfigWithCompactHijack(
+        body.transportConfig ?? null,
+        existingMode,
+        existingLimits,
+      );
+    } else if (body.transportConfig != null) {
+      nextTransportConfig = buildTransportConfigWithCompactHijack(
+        body.transportConfig,
+        extractSessionCompactHijackMode(body.transportConfig),
+      );
+    }
+    fields.transport_config = nextTransportConfig ?? null;
+  }
+
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
     return c.json({ error: 'invalid_supervision_config' }, 400);
   }
-  const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
+  const requestedSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
   if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
     const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
     if (!current || !canSessionRoleOwnAutomaticSupervision(current.role)) {
@@ -742,7 +813,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         ...(body.requestedModel !== undefined ? { requestedModel: body.requestedModel } : {}),
         ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
         ...(body.effort !== undefined ? { effort: body.effort } : {}),
-        ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+        ...(body.transportConfig !== undefined ? { transportConfig: nextTransportConfig ?? null } : {}),
         ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
@@ -768,7 +839,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
         type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
         sessionName,
-        transportConfig: body.transportConfig ?? null,
+        transportConfig: nextTransportConfig ?? null,
         ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
@@ -1163,11 +1234,13 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
       }
       await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'accepted', actionId, now });
       const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
-        [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...rest } = body;
+        [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority,
+        [OWNER_MACHINE_AUTHORITY_FIELD]: _ignoredOwnerAuthority, ...rest } = body;
       void _ignoredType;
       void _ignoredSharedActor;
       void _ignoredShareScope;
       void _ignoredMachineAuthority;
+      void _ignoredOwnerAuthority;
       const sharedActor = await buildHttpSharedActor(c.env.DB, {
         userId,
         coverage: access.actor.coverage,
@@ -1197,7 +1270,21 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
     const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
     if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   }
-  return relayToDaemon(c, 'session.send', stripBrowserShareFields(body));
+  const safeBody = stripBrowserShareFields(body);
+  const ownerMachineAuthority = targetSessionName
+    ? await issueOwnerMachineAuthorityForSession(c.env.DB, {
+        actorUserId: userId,
+        sourceServerId: serverId,
+        sessionName: targetSessionName,
+        actionId: actionIdFromBody(body),
+        signingKey: c.env.JWT_SIGNING_KEY,
+      })
+    : null;
+  return relayToDaemon(
+    c,
+    'session.send',
+    ownerMachineAuthority ? { ...safeBody, [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : safeBody,
+  );
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1234,11 +1321,13 @@ function actionIdFromBody(body: Record<string, unknown>): string {
 
 function stripBrowserShareFields(body: Record<string, unknown>): Record<string, unknown> {
   const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
-    [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...safeBody } = body;
+    [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority,
+    [OWNER_MACHINE_AUTHORITY_FIELD]: _ignoredOwnerAuthority, ...safeBody } = body;
   void _ignoredType;
   void _ignoredSharedActor;
   void _ignoredShareScope;
   void _ignoredMachineAuthority;
+  void _ignoredOwnerAuthority;
   return safeBody;
 }
 

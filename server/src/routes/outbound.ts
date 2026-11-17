@@ -6,6 +6,9 @@ import { getHandler } from '../platform/registry.js';
 import { findChannelBindingByPlatformChannel } from '../db/queries.js';
 import { decryptBotConfig } from '../security/crypto.js';
 import { WsBridge } from '../ws/bridge.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { resolveSharedMachineAuthority } from '../share/shared-machine-authority.js';
+import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import logger from '../util/logger.js';
 
 export const outboundRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -60,6 +63,22 @@ outboundRoutes.post('/', async (c) => {
   const authed = await authenticateDaemonServer(c, null);
   if (!authed.ok) return daemonAuthFailure(c, authed);
   const serverRow = authed.auth;
+  const authority = await resolveSharedMachineAuthority(c.env.DB, {
+    token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+    signingKey: c.env.JWT_SIGNING_KEY,
+    authenticatedSourceServerId: serverRow.serverId,
+    sourceOwnerUserId: serverRow.userId,
+    now: Date.now(),
+  });
+  if (authority.kind === 'participant') {
+    return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
+  }
+  if (authority.kind === 'invalid') {
+    return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
+  }
+  if (authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
+    return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
+  }
 
   const msg = await c.req.json<OutboundMessage>();
 

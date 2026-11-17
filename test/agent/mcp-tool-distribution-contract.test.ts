@@ -10,6 +10,7 @@ import {
   MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS,
   MCP_TOOL_DISTRIBUTION_CONTRACT_VERSION,
   MCP_TOOL_RUNTIME_BOUNDARIES,
+  MEMORY_MCP_SERVER_INSTRUCTIONS,
   getMcpToolDistributionContract,
 } from '../../shared/mcp-tool-distribution.js';
 import {
@@ -18,6 +19,7 @@ import {
   IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { formatCloudDocQuoteBadge } from '../../web/src/cloud-docs-reference.js';
 
 describe('shared MCP tool distribution contract', () => {
   it('classifies every runtime without making provider activity an activation gate', () => {
@@ -103,10 +105,27 @@ describe('shared MCP tool distribution contract', () => {
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('current model turn');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('fallbackCall { name, arguments }');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('search the exact alias ocu');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('Cloud Docs');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('云文档');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('cloud doc');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('group:cloud-docs');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('cloud_docs');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('imcodes cloud-docs');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('ONLYOFFICE');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('every exact tool result includes its registered inputSchema');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('computer_use_docs or computer_use_call');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('never infer unavailability from the initial callable list');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('wildcard/prefix fallback');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('full long-tail publication must fail closed');
+    const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain(canonicalPattern);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('id=<docId>');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/every turn|turn 1|turn 2/i);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/rename/i);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toMatch(/every mention/i);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('bare filename');
+    expect(MEMORY_MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(240);
+    expect(MEMORY_MCP_SERVER_INSTRUCTIONS).toContain(canonicalPattern);
+    expect(MEMORY_MCP_SERVER_INSTRUCTIONS).toContain('EVERY turn and EVERY mention');
   });
 });

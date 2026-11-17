@@ -14,6 +14,7 @@ import {
   type SubSessionEntryState,
 } from '../../src/subsession-entry-gesture.js';
 import { SubSessionBar } from '../../src/components/SubSessionBar.js';
+import { SUBSESSION_DESKTOP_LAYOUT } from '../../src/subsession-desktop-layout-preference.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 
 vi.mock('react-i18next', () => ({
@@ -150,6 +151,17 @@ describe('sub-session entry gesture helper', () => {
       '<span class="subcard-resize-handle"></span>',
       '<span class="subcard-drag-handle"></span>',
       '<span class="subsession-drag-icon"></span>',
+      '<div class="subcard-input-area"><span>padding</span></div>',
+      '<div class="controls"><span>controls</span></div>',
+      '<div class="controls-composer"><span>composer</span></div>',
+      '<div class="quick-input-panel"><span>quick</span></div>',
+      '<div class="qp"><span>qp</span></div>',
+      '<div class="menu-dropdown"><span>menu</span></div>',
+      '<div role="dialog">dialog</div>',
+      '<div role="menu">menu</div>',
+      '<div role="menuitem">menuitem</div>',
+      '<div role="listbox">listbox</div>',
+      '<div role="option">option</div>',
     ];
 
     for (const markup of cases) {
@@ -285,7 +297,7 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
 function renderBar(props: Partial<Parameters<typeof SubSessionBar>[0]> = {}) {
   const subSessions = props.subSessions ?? [makeSubSession()];
   return render(
-    <SubSessionBar
+    <SubSessionBar desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL}
       subSessions={subSessions}
       openIds={props.openIds ?? new Set()}
       maximizedIds={props.maximizedIds}

@@ -22,7 +22,9 @@ it.each(['', null])('does not revive a historical panel label when the current l
   const { container } = render(<TaskPairStatusPanel events={events} sessions={[{ name: id, label }] as never} />);
   const role = container.querySelector('.task-pair-status-row-roles')!;
   expect(role.textContent).not.toContain('Current payload label');
-  expect(role.textContent).toContain(id);
+  expect(role.textContent).not.toContain(id);
+  expect(role.querySelector('.task-pair-status-session-label')?.textContent).toBe('taskPair.panel_executor');
+  expect(role.querySelector('.task-pair-status-session')?.getAttribute('data-session-name')).toBe(id);
 });
 it.each(['', null])('does not revive a historical event label or diagnostic name when explicitly cleared: %s', (label) => {
   const { container } = render(<TaskPairEventChip eventId="current" payload={payload} sessions={[{ name: id, label }]} />);

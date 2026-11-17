@@ -1,3 +1,5 @@
+import { MachineGroupTabs } from './MachineGroupTabs.js';
+import { createPortal } from 'preact/compat';
 import { CONTROLLED_NODE_ABI_GLIBC217 } from '@shared/controlled-node-abi.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -46,16 +48,14 @@ import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
 import { LinuxDesktopManualInstallDialog } from './LinuxDesktopManualInstallDialog.js';
+import { RemoteDesktopGuestAccess } from './RemoteDesktopGuestAccess.js';
 import { REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY } from '@shared/remote-desktop-install.js';
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
-import { RemoteDesktopInstallEntry } from './RemoteDesktopInstallEntry.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
 import { TeamManagementPanel } from './TeamManagementPanel.js';
 import {
-  MACHINE_GROUP_DIRECT,
-  machineGroupTabs,
   machineGroupsOf,
   machinesInGroup,
   resolveMachineGroup,
@@ -131,7 +131,7 @@ const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: str
 export interface ControlledNodesPanelProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
   onOpenRemoteDesktopWall?(): void;
-  onConnectById?(): void;
+  onConnectById?(initialPublicNodeId?: string): void;
   projectKey?: string;
   initialNodeId?: string;
   initialAction?: typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION[
@@ -266,8 +266,13 @@ export function ControlledNodesPanel({
     return () => { active = false; };
   }, [savedRemoteDesktopApi]);
 
+  const [localGuestConnect, setLocalGuestConnect] = useState<{ publicNodeId?: string } | null>(null);
   const openSavedRemoteDevice = (device: SavedRemoteDesktopDevice) => {
-    window.open(`/remote-desktop/access?publicId=${encodeURIComponent(device.publicNodeId)}`, '_blank', 'noopener,noreferrer');
+    if (onConnectById) {
+      onConnectById(device.publicNodeId);
+      return;
+    }
+    setLocalGuestConnect({ publicNodeId: device.publicNodeId });
   };
   const [mobileActionMenuServerId, setMobileActionMenuServerId] = useState<string | null>(null);
   const mobileActionMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -1083,7 +1088,7 @@ export function ControlledNodesPanel({
             <h3>{t('controlled_nodes.machines_title')}</h3>
           </div>
           <div class="controlled-nodes-machines-actions">
-            {onConnectById && <button type="button" class="controlled-nodes-wall" onClick={onConnectById}>
+            {onConnectById && <button type="button" class="controlled-nodes-wall" onClick={() => onConnectById()}>
               <span aria-hidden="true">#</span>{t('remote_desktop.connect_by_id')}
             </button>}
             {onOpenRemoteDesktopWall && (
@@ -1091,7 +1096,6 @@ export function ControlledNodesPanel({
                 <span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}
               </button>
             )}
-            <RemoteDesktopInstallEntry />
             <button
               type="button"
               class="controlled-nodes-refresh"
@@ -1125,22 +1129,7 @@ export function ControlledNodesPanel({
         )}
         {machineTeams.length > 0 && (
           <div class="controlled-nodes-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
-            {machineGroupTabs(machines).map(({ id, name, count }) => (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                aria-selected={machineGroup === id}
-                class={`controlled-nodes-team-chip${machineGroup === id ? ' is-active' : ''}`}
-                data-testid={`controlled-nodes-group-${id}`}
-                onClick={() => setMachineGroup(id)}
-              >
-                {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}
-                {/* Superscript count: which tabs are worth opening, without
-                    opening them. */}
-                <span class="controlled-nodes-team-chip-count">{count}</span>
-              </button>
-            ))}
+            <MachineGroupTabs machines={machines} group={machineGroup} onSelect={setMachineGroup} testIdPrefix="controlled-nodes-group" />
           </div>
         )}
         {loaded && visibleMachines.length === 0 && (
@@ -1452,6 +1441,14 @@ export function ControlledNodesPanel({
             );
           })}
         </div>
+        {availableOses.includes('win') && (
+          <div class="controlled-nodes-win-notice" role="note" data-testid="controlled-nodes-win-security-notice">
+            <span class="controlled-nodes-win-notice-tag">
+              {t('controlled_nodes.win_security_notice_tag')}
+            </span>
+            <p>{t('controlled_nodes.win_security_notice')}</p>
+          </div>
+        )}
         {downloadError && <p class="controlled-nodes-error" role="alert">{downloadError}</p>}
       </section>
 
@@ -1532,6 +1529,16 @@ export function ControlledNodesPanel({
           machine={manualInstallDialogMachine}
           onClose={() => setManualInstallDialogMachine(null)}
         />
+      )}
+
+      {localGuestConnect && typeof document !== 'undefined' && createPortal(
+        <RemoteDesktopGuestAccess
+          standalone={false}
+          initialPublicNodeId={localGuestConnect.publicNodeId}
+          zIndex={20000}
+          onExit={() => setLocalGuestConnect(null)}
+        />,
+        document.body,
       )}
     </div>
   );

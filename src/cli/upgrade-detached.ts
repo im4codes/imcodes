@@ -25,6 +25,10 @@ export interface DetachedUpgradeInput {
   platform: 'linux' | 'darwin';
   stateDir: string;
   home: string;
+  /** Optional node binary override (used when bundled daemon-runtime falls back to a legacy npm install). */
+  nodeBin?: string;
+  /** Optional npm global prefix override (used when bundled daemon-runtime falls back to a legacy npm install). */
+  npmPrefix?: string;
 }
 
 export interface DetachedUpgradeDeps {
@@ -74,19 +78,21 @@ export async function runDetachedPosixUpgrade(input: DetachedUpgradeInput, deps:
   const pollMs = deps.pollMs ?? 400;
   const limit = Date.now() + (deps.followLimitMs ?? 30 * 60_000);
 
+  const nodeBin = input.nodeBin ?? process.execPath;
   const started = launch({
     registryArg: input.registry ? `--registry ${input.registry}` : '',
     pkgSpec: input.pkgSpec,
     targetVer: input.targetVer,
     currentVer: input.currentVer,
     oldDaemonPid: readDaemonPid(input.stateDir),
-    nodeBin: process.execPath,
-    nodeDir: dirname(process.execPath),
+    nodeBin,
+    nodeDir: dirname(nodeBin),
     stateDir: input.stateDir,
     restartCmd: buildPosixRestartCommand({ platform: input.platform, home: input.home, stateDir: input.stateDir }),
     cleanupAfterSec: 24 * 60 * 60,
     // Someone asked for exactly this version: an older one is not a mistake to refuse.
     allowDowngrade: true,
+    ...(input.npmPrefix ? { npmPrefix: input.npmPrefix } : {}),
     ...deps.scriptOverrides,
   });
   started.child.unref();
@@ -169,13 +175,62 @@ export function readWindowsUpgradeResult(logFile: string): UpgradeResult | null 
   return null;
 }
 
+/** How a bundled daemon-runtime detached switch runner ended (`switch-result.json`), or null while running. */
+export function readDaemonRuntimeSwitchResult(resultFile: string): UpgradeResult | null {
+  try {
+    const raw = JSON.parse(readFileSync(resultFile, 'utf8')) as { status?: unknown };
+    if (raw.status === 'ok') return 'ok';
+    if (raw.status === 'rolled_back') return 'rolled_back';
+    if (raw.status === 'failed') return 'failed';
+  } catch {
+    // not written yet
+  }
+  return null;
+}
+
+/**
+ * `imcodes upgrade` for bundled daemon-runtime layouts: hands off to the OS-isolated
+ * switch runner (same runner/host as daemon-triggered upgrade) and streams its log until completion.
+ */
+export async function followDetachedDaemonRuntimeSwitch(
+  input: {
+    scriptDir: string;
+    targetVersion: string;
+    runtimeRoot: string;
+    writableRootKind: string;
+    handoffUncertain?: boolean;
+  },
+  deps: {
+    write?: (line: string) => void;
+    pollMs?: number;
+    followLimitMs?: number;
+  } = {},
+): Promise<number> {
+  const write = deps.write ?? ((line: string) => { console.log(line); });
+  const logFile = join(input.scriptDir, 'runtime-upgrade.log');
+  const resultFile = join(input.scriptDir, 'switch-result.json');
+  write(
+    input.handoffUncertain
+      ? `Daemon-runtime switch-runner handoff status uncertain (v${input.targetVersion}, ${input.writableRootKind}: ${input.runtimeRoot}); preserving staged release and following isolated runner outcome. Log: ${logFile}`
+      : `Daemon-runtime switch runner started in background (v${input.targetVersion}, ${input.writableRootKind}: ${input.runtimeRoot}). Log: ${logFile}`,
+  );
+  return followUpgrade({
+    logFile,
+    readResult: () => readDaemonRuntimeSwitchResult(resultFile),
+    childExited: () => false,
+    write,
+    pollMs: deps.pollMs ?? 250,
+    limit: Date.now() + (deps.followLimitMs ?? 120_000),
+  });
+}
+
 /**
  * `imcodes upgrade` on Windows: the same hand-off. The existing Windows runner (staged
  * alone into a scratch directory, started hidden through wscript) does the install, the
  * watchdog/daemon restart and the health check; this process only follows its log.
  */
 export async function runDetachedWindowsUpgrade(
-  input: { pkgSpec: string; targetVer: string; registry: string | null },
+  input: { pkgSpec: string; targetVer: string; registry: string | null; npmPrefix?: string; nodeBin?: string },
   deps: { write?: (line: string) => void; pollMs?: number; followLimitMs?: number; launch?: typeof launchWindowsUpgrade } = {},
 ): Promise<number> {
   const write = deps.write ?? ((line: string) => { console.log(line); });
@@ -189,6 +244,8 @@ export async function runDetachedWindowsUpgrade(
     targetVer: input.targetVer,
     registryArg: input.registry ?? '-',
     currentVer: '', // an explicit request: no automatic downgrade guard
+    ...(input.npmPrefix ? { npmPrefix: input.npmPrefix } : {}),
+    ...(input.nodeBin ? { nodeBin: input.nodeBin } : {}),
   });
   write(`Upgrade started in the background (it keeps going if this session ends). Log: ${logFile}`);
   return followUpgrade({

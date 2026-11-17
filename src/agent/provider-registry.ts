@@ -39,7 +39,7 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
     await disconnectProvider(id);
   }
 
-  const provider = await createProvider(id);
+  const provider = await createProvider(id, config);
   await provider.connect(config);
   providers.set(id, provider);
   // A reconnected provider may now be able to do what it could not before.
@@ -85,7 +85,7 @@ export async function disconnectAll(): Promise<void> {
   }
 }
 
-async function createProvider(id: string): Promise<TransportProvider> {
+async function createProvider(id: string, config: ProviderConfig): Promise<TransportProvider> {
   switch (id) {
     case 'openclaw': {
       const { OpenClawProvider } = await import('./providers/openclaw.js');
@@ -112,8 +112,8 @@ async function createProvider(id: string): Promise<TransportProvider> {
       return new GrokSdkProvider();
     }
     case AGY_SDK_PROVIDER_ID: {
-      const { AgySdkProvider } = await import('./providers/agy-sdk.js');
-      return new AgySdkProvider();
+      const { createAgyProvider } = await import('./providers/agy-acp.js');
+      return createAgyProvider(config);
     }
     case 'claude-code-sdk': {
       const { ClaudeCodeSdkProvider } = await import('./providers/claude-code-sdk.js');

@@ -1,6 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { options } from 'preact';
@@ -97,6 +98,9 @@ vi.mock('../../src/native.js', () => ({
 }));
 
 vi.mock('../../src/components/VoiceInput.js', () => ({
+  VOICE_LANG_STORAGE_KEY: 'imcodes_voice_lang',
+  getVoiceLanguageMode: vi.fn(() => 'follow'),
+  setVoiceLanguageMode: vi.fn(),
   onAudioLevel: (...args: unknown[]) => voiceApi.onAudioLevel(...args),
   startListening: (...args: unknown[]) => voiceApi.startListening(...args),
   stopListening: (...args: unknown[]) => voiceApi.stopListening(...args),
@@ -180,6 +184,11 @@ describe('low-coverage page and component surfaces', () => {
     const onAdded = vi.fn();
     render(<AddProject apiKey="key-1" serverId="srv-1" onAdded={onAdded} onCancel={vi.fn()} />);
 
+    expect(document.querySelector(`option[value="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`)).toBeNull();
+    expect(document.querySelector('option[value="gemini-sdk"]')).toBeNull();
+    expect(document.querySelector('option[value="gemini"]')).toBeNull();
+    expect(screen.getAllByRole('option', { name: 'claude-code-sdk' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: 'claude-code' })).toHaveLength(2);
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'alpha' } });
     fireEvent.input(screen.getByPlaceholderText('/home/user/projects/my-project'), { target: { value: '/work/alpha' } });
     const issueTrackerSelect = screen.getByText('Issue Tracker').parentElement?.querySelector('select');
@@ -215,6 +224,47 @@ describe('low-coverage page and component surfaces', () => {
 
     fireEvent.click(screen.getByLabelText('Remove'));
     await waitFor(() => expect(nativeApi.removeServerFromList).toHaveBeenCalledWith('https://self-hosted.example'));
+  });
+
+  it('ServerSetupPage renders tech card layout, keeps add panel visible, and handles one-tap clipboard paste', async () => {
+    const readTextMock = vi.fn().mockResolvedValue('  https://pasted.example/  ');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { readText: readTextMock },
+    });
+    const scrollIntoViewMock = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoViewMock;
+
+    const onConnect = vi.fn();
+    const { container } = render(<ServerSetupPage onConnect={onConnect} />);
+
+    expect(await screen.findByText('https://cloud.im.codes')).toBeTruthy();
+    const card = container.querySelector('.login-card.server-setup-card') as HTMLElement;
+    expect(card).toBeTruthy();
+    expect(card.getAttribute('style')).toBeNull();
+
+    fireEvent.click(screen.getByText('serverSetup.addServer'));
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({ block: 'nearest' });
+
+    // Invalid URL error clears when one-tap paste fills trimmed clipboard URL
+    const input = screen.getByPlaceholderText('serverSetup.placeholder') as HTMLInputElement;
+    fireEvent.input(input, { target: { value: 'not-a-url' } });
+    fireEvent.click(screen.getByText('serverSetup.connect'));
+    expect(screen.getByText('serverSetup.errorNotHttps')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('serverSetup.paste'));
+    await waitFor(() => expect(input.value).toBe('https://pasted.example/'));
+    expect(screen.queryByText('serverSetup.errorNotHttps')).toBeNull();
+
+    // Empty clipboard shows non-blocking hint
+    readTextMock.mockResolvedValueOnce('   ');
+    fireEvent.click(screen.getByText('serverSetup.paste'));
+    expect(await screen.findByText('serverSetup.pasteEmpty')).toBeTruthy();
+
+    // Denied / unavailable clipboard shows fallback hint
+    readTextMock.mockRejectedValueOnce(new Error('denied'));
+    fireEvent.click(screen.getByText('serverSetup.paste'));
+    expect(await screen.findByText('serverSetup.pasteUnavailable')).toBeTruthy();
   });
 
   it('AutoFixControls starts task mode and stops a running pipeline', async () => {
@@ -318,6 +368,11 @@ describe('low-coverage page and component surfaces', () => {
     render(<ProjectSettings apiKey="key-1" serverId="srv-1" projectName="alpha" onSaved={onSaved} onCancel={vi.fn()} />);
 
     const branch = await screen.findByDisplayValue('main');
+    expect(document.querySelector(`option[value="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`)).toBeNull();
+    expect(document.querySelector('option[value="gemini-sdk"]')).toBeNull();
+    expect(document.querySelector('option[value="gemini"]')).toBeNull();
+    expect(screen.getAllByRole('option', { name: 'claude-code-sdk' })).toHaveLength(2);
+    expect(screen.getAllByRole('option', { name: 'claude-code' })).toHaveLength(2);
     fireEvent.input(branch, { target: { value: 'release' } });
     fireEvent.click(screen.getByText('Auto-merge on approval'));
     fireEvent.click(screen.getByText('Save Settings'));
@@ -339,6 +394,7 @@ describe('low-coverage page and component surfaces', () => {
     await vi.advanceTimersByTimeAsync(0);
     fireEvent.click(screen.getByText('voice.send'));
 
+    await vi.advanceTimersByTimeAsync(0);
     expect(onSend).toHaveBeenCalledWith('hello world');
     expect(onClose).toHaveBeenCalled();
   });
@@ -357,26 +413,26 @@ describe('low-coverage page and component surfaces', () => {
     expect(onClose).toHaveBeenCalled();
   });
 
-  it('VoiceOverlay keeps the transcript open when the parent rejects the send', () => {
+  it('VoiceOverlay keeps the transcript open when the parent rejects the send', async () => {
     const onSend = vi.fn(() => 'rejected' as const);
     const onClose = vi.fn();
     render(<VoiceOverlay open initialText="retry this" onSend={onSend} onClose={onClose} />);
 
     fireEvent.click(screen.getByText('voice.send'));
 
-    expect(onSend).toHaveBeenCalledWith('retry this');
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('retry this'));
     expect(onClose).not.toHaveBeenCalled();
     expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('retry this');
   });
 
-  it('VoiceOverlay keeps the transcript open while parent confirmation is pending', () => {
+  it('VoiceOverlay keeps the transcript open while parent confirmation is pending', async () => {
     const onSend = vi.fn(() => 'pending' as const);
     const onClose = vi.fn();
     render(<VoiceOverlay open initialText="confirm this" onSend={onSend} onClose={onClose} />);
 
     fireEvent.click(screen.getByText('voice.send'));
 
-    expect(onSend).toHaveBeenCalledWith('confirm this');
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('confirm this'));
     expect(onClose).not.toHaveBeenCalled();
     expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('confirm this');
   });
@@ -388,7 +444,7 @@ describe('low-coverage page and component surfaces', () => {
     await vi.advanceTimersByTimeAsync(150);
     await waitFor(() => expect(voiceApi.startListening).toHaveBeenCalledTimes(1));
     voiceApi.listeningHandler?.(false);
-    await waitFor(() => expect(screen.getByText('voice.paused')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('voice.ready')).toBeTruthy());
 
     const micButton = document.querySelector('.voice-overlay-mic') as HTMLButtonElement;
     fireEvent.click(micButton);
@@ -423,11 +479,29 @@ describe('low-coverage page and component surfaces', () => {
   });
 
   it('OfficePreview renders unsupported and spreadsheet previews', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0, 0]).buffer })));
-    const { rerender } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType="text/plain" path="/tmp/readme.txt" />);
-    // Bytes now arrive over the chunked download URL, so the component renders
-    // a placeholder until the fetch resolves.
-    expect(await screen.findByText('Unsupported format: readme.txt')).toBeTruthy();
+    const textBytes = new TextEncoder().encode('hello plain text content');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
+      if (url.includes('/onlyoffice/config')) {
+        return { ok: true, status: 200, json: async () => ({ enabled: false }), text: async () => '{"enabled":false}' };
+      }
+      if (url.includes('doc-txt')) {
+        return { ok: true, status: 200, arrayBuffer: async () => textBytes.buffer };
+      }
+      return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0, 0]).buffer };
+    }));
+
+    const { rerender } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType="application/octet-stream" path="/tmp/binary.bin" />);
+    // Bytes arrive over the chunked download URL, and unsupported formats display the unsupported local preview banner.
+    const unsupported = await screen.findByTestId('office-preview-unsupported-local');
+    expect(unsupported).toBeTruthy();
+    expect(unsupported.textContent).toContain('binary.bin');
+
+    // Plain text formats fall back to the text preview component.
+    rerender(<OfficePreview srcUrl="https://example.test/doc-txt" mimeType="text/plain" path="/tmp/readme.txt" />);
+    const textElem = await screen.findByTestId('office-preview-text-fallback');
+    expect(textElem).toBeTruthy();
+    expect(textElem.textContent).toContain('hello plain text content');
 
     rerender(<OfficePreview srcUrl="https://example.test/doc2" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" path="/tmp/book.xlsx" />);
     expect(await screen.findByText('Total')).toBeTruthy();

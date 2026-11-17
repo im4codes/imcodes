@@ -7,7 +7,8 @@
  * again. So a phone sub-session's choice lives only in the mounted panel's memory (never in storage, never at module level) and
  * "closed" is the only default, whether or not a task is running (the collapsed strip already shows the live counts).
  *
- * The main chat and the desktop layout keep their server-wide flag and defaults exactly as before this work (desktop open, the
+ * An explicit split-executor visit follows the same closed/per-visit rule on every device.
+ * The main chat and other desktop windows keep their server-wide flag and defaults exactly as before this work (desktop open, the
  * phone main chat closed, one stored flag per server and layout), except that an in-tab copy now backs the stored flag so a blocked
  * storage no longer loses it on a resize.
  */
@@ -33,9 +34,9 @@ export function isPhoneScreen(input: { mobile: boolean; screenWidth?: number; sc
   return typeof shortSide === 'number' && Number.isFinite(shortSide) && shortSide > 0 && shortSide < PHONE_SHORT_SIDE_MAX_PX;
 }
 
-/** A phone sub-session's panel: its choice is per visit and kept in memory only. */
-export function usesVisitScopedChoice(input: { phone: boolean; scopeSessionId?: string | null }): boolean {
-  return input.phone && typeof input.scopeSessionId === 'string' && input.scopeSessionId.length > 0;
+/** A phone sub-session or explicit split visit keeps its choice in component memory only. */
+export function usesVisitScopedChoice(input: { phone: boolean; scopeSessionId?: string | null; collapsedVisitKey?: string | null }): boolean {
+  return !!input.collapsedVisitKey || (input.phone && typeof input.scopeSessionId === 'string' && input.scopeSessionId.length > 0);
 }
 
 /**
@@ -47,6 +48,7 @@ export function resolveTaskPairPanelCollapsed(input: {
   mobile: boolean;
   phone: boolean;
   scopeSessionId?: string | null;
+  collapsedVisitKey?: string | null;
 }): boolean {
   if (input.choice !== undefined) return input.choice;
   if (usesVisitScopedChoice(input)) return true;

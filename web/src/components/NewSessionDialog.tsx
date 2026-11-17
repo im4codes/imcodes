@@ -1,3 +1,5 @@
+import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
+import { scopeIncognitoTimelineCacheKey, setIncognitoTimelineKeyActive } from '../incognito-session-registry.js';
 import { useState, useEffect, useMemo, useRef } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
@@ -7,6 +9,7 @@ import { PREF_KEY_DEFAULT_SHELL } from "../constants/prefs.js";
 import { sanitizeProjectName } from "@shared/sanitize-project-name.js";
 import {
   getSessionAgentGroups,
+  isSessionAgentTypeSelectable,
   getSessionAgentLabel,
   SESSION_AGENT_GROUP_LABEL_KEYS,
 } from "./session-agent-options.js";
@@ -52,6 +55,7 @@ import {
 } from "@shared/cc-presets.js";
 import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
+import { loadAgyModelPreference, saveAgyModelPreference } from "../agy-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from "@shared/agent-types.js";
 import {
@@ -62,7 +66,7 @@ import {
   isCodeBuddyProviderId,
 } from "@shared/codebuddy.js";
 import { HERMES_AGENT_PROVIDER_ID } from "@shared/hermes-agent.js";
-import { AGY_SDK_PROVIDER_ID } from "@shared/agy-agent.js";
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from "@shared/agy-agent.js";
 import { SESSION_IDENTITY_SCOPES, normalizeSessionIdentityContent } from '@shared/session-identity.js';
 import { saveSessionIdentityProfile } from '../api.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
@@ -80,7 +84,7 @@ const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
   // which clips the custom-provider help text into one-character columns.
-  width: "calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
+  width: "calc(var(--imcodes-ui-vw, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
   maxWidth: 660,
   minWidth: 0,
   boxSizing: "border-box",
@@ -138,6 +142,8 @@ export function NewSessionDialog({
   const [requestedModel, setRequestedModel] = useState("");
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [incognito, setIncognito] = useState(false);
+  const canIncognito = !!ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(SESSION_INCOGNITO_CAPABILITY) && !ws?.isDaemonCapabilityStale?.();
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [pendingSessionIdentity, setPendingSessionIdentity] = useState('');
   const [pendingSessionIdentitySourceFile, setPendingSessionIdentitySourceFile] = useState('');
@@ -210,6 +216,7 @@ export function NewSessionDialog({
     return preset;
   };
   const selectAgentType = (nextAgentType: AgentType) => {
+    if (!isSessionAgentTypeSelectable(nextAgentType)) return;
     if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextAgentType)) return;
     setAgentType(nextAgentType);
     if (!customProviderSdk) setLastUnlockedAgentType(nextAgentType);
@@ -355,7 +362,7 @@ export function NewSessionDialog({
       setError("");
       setStarting(false);
       void (async () => {
-        if (pendingSessionIdentity.trim()) {
+        if (!incognito && pendingSessionIdentity.trim()) {
           try {
             await saveSessionIdentityProfile({
               scope: SESSION_IDENTITY_SCOPES.SESSION,
@@ -367,6 +374,9 @@ export function NewSessionDialog({
           } catch {
             onToast?.(t('session.identityCreateApplyFailed'));
           }
+        }
+        if (incognito) {
+          setIncognitoTimelineKeyActive(scopeIncognitoTimelineCacheKey(serverId, sessionName), true);
         }
         onSessionStarted(sessionName);
         onClose();
@@ -415,7 +425,7 @@ export function NewSessionDialog({
     });
 
     return unsub;
-  }, [onClose, onSessionStarted, onToast, pendingSessionIdentity, pendingSessionIdentitySourceFile, serverId, t, ws]);
+  }, [onClose, onSessionStarted, onToast, incognito, pendingSessionIdentity, pendingSessionIdentitySourceFile, serverId, t, ws]);
 
   useEffect(() => {
     if (!ws || !starting) return;
@@ -472,6 +482,9 @@ export function NewSessionDialog({
     }
 
     const slug = sanitizeProjectName(project.trim());
+    if (incognito && (!canIncognito || !supportsSessionIncognito(agentType))) {
+      setError(t('session.incognito_unsupported')); return;
+    }
     const identityPrompt = pendingSessionIdentity.trim()
       ? normalizeSessionIdentityContent(pendingSessionIdentity)
       : undefined;
@@ -494,6 +507,7 @@ export function NewSessionDialog({
               ocDescription: ocDescription.trim(),
             };
       ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
         project: project.trim(),
         dir: dir.trim(),
         agentType,
@@ -528,8 +542,12 @@ export function NewSessionDialog({
         requestedModel.trim()
       ) {
         extra.requestedModel = requestedModel.trim();
+        if (agentType === AGY_SDK_PROVIDER_ID) {
+          saveAgyModelPreference(requestedModel.trim());
+        }
       }
       ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
         project: project.trim(),
         dir: dir.trim(),
         agentType,
@@ -690,12 +708,22 @@ export function NewSessionDialog({
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 
+  const agyModelManuallySelectedRef = useRef(false);
   useEffect(() => {
-    if (agentType !== AGY_SDK_PROVIDER_ID) return;
+    if (agentType !== AGY_SDK_PROVIDER_ID) {
+      agyModelManuallySelectedRef.current = false;
+      return;
+    }
     setRequestedModel((current) => {
       const trimmed = current.trim();
-      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
-      const fallback = transportModels.defaultModel ?? AGY_SDK_MODEL_FALLBACK[0];
+      const stored = loadAgyModelPreference();
+      if (agyModelManuallySelectedRef.current && trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) {
+        return trimmed;
+      }
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) {
+        return stored;
+      }
+      const fallback = transportModels.defaultModel ?? AGY_DEFAULT_MODEL_ID;
       if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       return modelSuggestions[0] ?? fallback;
     });
@@ -851,7 +879,7 @@ export function NewSessionDialog({
                       // underlying data/behavior (and any test that still
                       // queries it directly) stays fully intact.
                       style={choice.hidden ? { display: 'none' } : undefined}
-                      disabled={starting || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
+                      disabled={!isSessionAgentTypeSelectable(choice.id) || starting || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
                       aria-pressed={agentType === choice.id}
                       onClick={() => selectAgentType(choice.id as AgentType)}
                     >
@@ -985,9 +1013,10 @@ export function NewSessionDialog({
               <select
                 value={requestedModel}
                 disabled={starting}
-                onInput={(e) =>
-                  setRequestedModel((e.target as HTMLSelectElement).value)
-                }
+                onInput={(e) => {
+                  if (agentType === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                  setRequestedModel((e.target as HTMLSelectElement).value);
+                }}
                 style={{
                   width: "100%",
                   background: "#0f172a",
@@ -1015,7 +1044,10 @@ export function NewSessionDialog({
                 placeholder={t("session.supervision.selectModel")}
                 value={requestedModel}
                 disabled={starting}
-                onChange={setRequestedModel}
+                onChange={(val) => {
+                  if (agentType === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                  setRequestedModel(val);
+                }}
                 className="input"
                 style={{ width: "100%" }}
               />
@@ -1864,6 +1896,16 @@ export function NewSessionDialog({
 
         </div>
 
+        <div class={`incognito-create-option${incognito ? ' is-active' : ''}`}>
+          <label class={`incognito-toggle-btn${incognito ? ' is-active' : ''}`}>
+            <input type="checkbox" checked={incognito} disabled={!canIncognito}
+              onChange={event => setIncognito(event.currentTarget.checked)} />
+            <span>🕶️ {t('session.incognito')}</span>
+          </label>
+          <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
+          {(!canIncognito || (incognito && !supportsSessionIncognito(agentType))) && <p role="status">{t('session.incognito_unsupported')}</p>}
+        </div>
+
         <div
           class="dialog-footer"
           style={{
@@ -1883,9 +1925,9 @@ export function NewSessionDialog({
             {t("common.cancel")}
           </button>
           <button
-            class="btn btn-primary"
+            class={`btn btn-primary${incognito ? ' incognito-launch-btn' : ''}`}
             onClick={handleStart}
-            disabled={starting}
+            disabled={!isSessionAgentTypeSelectable(agentType) || starting || (incognito && (!canIncognito || !supportsSessionIncognito(agentType)))}
           >
             {starting ? t("new_session.starting") : t("new_session.start")}
           </button>

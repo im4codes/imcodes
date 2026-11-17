@@ -968,6 +968,7 @@ function formatDriftAge(ms: number): string {
 
 export interface IntegrationDriftLine {
   taskId: string;
+  title?: string;
   head: string;
   worktree: string;
   ageMs: number;
@@ -995,7 +996,7 @@ function describeCheckedBranches(line: IntegrationDriftLine): string {
  * branch the project integrates on. Brain merges every PASSed pair (owner rule); dismiss one it will not merge.
  */
 export function buildIntegrationDriftDigest(lines: readonly IntegrationDriftLine[]): string {
-  const body = lines.map((line) => `- ${line.taskId}: head ${line.head.slice(0, 12)} (${line.missing} commit${line.missing === 1 ? '' : 's'} not found on any branch of this repository; checked ${describeCheckedBranches(line)}), worktree ${line.worktree}, finished ${formatDriftAge(line.ageMs)} ago`).join('\n');
+  const body = lines.map((line) => `- ${line.taskId}${line.title ? ` "${line.title}"` : ''}: head ${line.head.slice(0, 12)} (${line.missing} commit${line.missing === 1 ? '' : 's'} not found on any branch of this repository; checked ${describeCheckedBranches(line)}), worktree ${line.worktree}, finished ${formatDriftAge(line.ageMs)} ago`).join('\n');
   return `Finished pair${lines.length === 1 ? '' : 's'} not yet merged into this repository (cherry-picked equivalents on any branch count as merged):\n${body}\n`
     + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head onto the branch you integrate on, then push that branch). ${taskPairBrainEndedPairNote(lines.length === 1 ? 'done' : 'mixed')}`;
 }

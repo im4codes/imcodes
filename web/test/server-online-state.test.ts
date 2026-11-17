@@ -11,7 +11,7 @@ describe('markServerLive', () => {
 
     expect(markServerLive(servers, 'srv-2', 123456)).toEqual([
       { id: 'srv-1', name: 'one', status: 'offline', lastHeartbeatAt: null },
-      { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 123456 },
+      { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 123456, statusObservedAt: 123456 },
     ]);
   });
 
@@ -28,8 +28,8 @@ describe('markServerOffline', () => {
       { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 222 },
     ];
 
-    expect(markServerOffline(servers, 'srv-1')).toEqual([
-      { id: 'srv-1', name: 'one', status: 'offline', lastHeartbeatAt: 111 },
+    expect(markServerOffline(servers, 'srv-1', 555)).toEqual([
+      { id: 'srv-1', name: 'one', status: 'offline', lastHeartbeatAt: 111, statusObservedAt: 555 },
       { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 222 },
     ]);
   });
@@ -43,7 +43,7 @@ describe('markServerDaemonActivity', () => {
     ];
 
     expect(markServerDaemonActivity(servers, 'srv-1', 999)).toEqual([
-      { id: 'srv-1', name: 'one', status: 'online', lastHeartbeatAt: 999 },
+      { id: 'srv-1', name: 'one', status: 'online', lastHeartbeatAt: 999, statusObservedAt: 999 },
       { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 200 },
     ]);
   });

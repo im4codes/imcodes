@@ -87,7 +87,9 @@ export function scanImportedApiPaths(
 export function isNonDaemonApiUse(use: ApiPathUse): boolean {
   const exceptions: Record<string, readonly string[]> = {
     'src/bind/bind-flow.ts': ['/api/bind/verify', '/api/bind/direct', '/api/bind/rebind'], // body proof / account API key
-    'src/node/enrollment.ts': ['/api/enroll/v2/redeem'], // one-use enrollment ticket
+    'src/node/local-daemon-control.ts': ['/api/bind/verify', '/api/bind/direct', '/api/bind/rebind'], // body proof / account API key
+    'src/node/enrollment.ts': ['/api/enroll/v2/redeem', '/api/enroll/v2/direct'], // one-use enrollment ticket / authenticated direct desktop enroll
+    'src/node/remote-desktop-local-panel.ts': ['/api/auth/token-exchange'], // single-use desktop setup auth nonce exchange
     'src/daemon/remote-desktop-login-screen.ts': ['/api/enroll/v2/download'], // enrollment ticket
     'src/daemon/server-link.ts': ['/api/server/:param/ws'], // WS handshake, not REST
     'src/node/runtime.ts': ['/api/server/:param/ws'], // controlled-node WS handshake
@@ -96,6 +98,8 @@ export function isNonDaemonApiUse(use: ApiPathUse): boolean {
     'src/repo/detector.ts': ['/api/v3', '/api/v4'], // repository metadata, not a server call
   };
   // Shared local node UI paths never leave loopback and carry no server token.
-  if (use.path === '/api/state' || use.path === '/api/action') return use.file.startsWith('src/node/');
+  if (use.path === '/api/state' || use.path === '/api/action' || use.path === '/api/daemon/logs') return use.file.startsWith('src/node/');
+  // Caddy reverse-proxy matcher literals for ONLYOFFICE Document Server (/web-apps/apps/api/documents/...), not daemon REST calls.
+  if (use.file === 'src/setup/templates.ts' && use.path.startsWith('/api/documents/')) return true;
   return exceptions[use.file]?.includes(use.path) ?? false;
 }

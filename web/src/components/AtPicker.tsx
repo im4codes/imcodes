@@ -293,7 +293,7 @@ export function AtPicker({
       if (!cancelled) setSkillResults([]);
     });
     return () => { cancelled = true; };
-  }, [category, serverId, visible]);
+  }, [category, projectDir, serverId, sessionName, visible]);
 
   // Debounced file search — only when in files category
   useEffect(() => {

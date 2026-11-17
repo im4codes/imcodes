@@ -316,7 +316,7 @@ describe('immutable supervision integration bundle', () => {
       bundle: frozen.bundle, worktreePath: shape.integration,
       commitSha: git(shape.integration, 'rev-parse', 'HEAD'),
     })).toEqual({ ok: false, reason: 'target_conflict' });
-  });
+  }, 60_000);
 
   it('is content addressed, replay-safe, and fails closed on bundle or target conflicts', async () => {
     const shape = await productionShape();

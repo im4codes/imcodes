@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   CROSS_VENDOR_HANDOFF_DEFAULTS,
   normalizeCrossVendorHandoffConfig,
@@ -7,6 +10,18 @@ import {
 } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff, sourceConversationKey } from '../../src/daemon/cross-vendor-handoff.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import * as sessionHistory from '../../src/daemon/session-history.js';
+import * as tokenizer from '../../src/context/tokenizer.js';
+
+vi.mock('../../src/context/tokenizer.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/context/tokenizer.js')>();
+  return {
+    ...actual,
+    countTokensAsync: vi.fn((...args: Parameters<typeof actual.countTokensAsync>) => actual.countTokensAsync(...args)),
+  };
+});
+import { setTaskPairStoreForTests, TASK_PAIRS_DB_PATH_ENV, TaskPairStore } from '../../src/daemon/task-pairs/store.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 
 const event = (type: TimelineEvent['type'], payload: Record<string, unknown>, seq: number, ts: number): TimelineEvent => ({
@@ -35,22 +50,49 @@ describe('cross-vendor handoff contract', () => {
       enabled: true,
       maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens,
       recentTurns: CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns,
+      summaryLimit: CROSS_VENDOR_HANDOFF_DEFAULTS.summaryLimit,
+      maxChars: CROSS_VENDOR_HANDOFF_DEFAULTS.maxChars,
       timeoutMs: CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs,
       providerWaitMs: CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs,
       includeToolPreviews: false,
     });
-    expect(normalizeCrossVendorHandoffConfig({ maxTokens: 99_999, recentTurns: 0, timeoutMs: 1 })).toMatchObject({
+    expect(normalizeCrossVendorHandoffConfig({
+      maxTokens: 99_999,
+      recentTurns: 0,
+      summaryLimit: -5,
+      maxChars: 10,
+      timeoutMs: 1,
+    })).toMatchObject({
       maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens,
-      recentTurns: 30,
+      recentTurns: 0,
+      summaryLimit: 0,
+      maxChars: 500,
       timeoutMs: 250,
+    });
+    expect(normalizeCrossVendorHandoffConfig().maxTokens).toBe(50_000);
+    expect(normalizeCrossVendorHandoffConfig().recentTurns).toBe(100);
+    expect(normalizeCrossVendorHandoffConfig().summaryLimit).toBe(20);
+    expect(normalizeCrossVendorHandoffConfig().maxChars).toBe(128_000);
+    expect(normalizeCrossVendorHandoffConfig({
+      maxTokens: 50_001,
+      recentTurns: 999,
+      summaryLimit: 999,
+      maxChars: 999_999,
+    })).toMatchObject({
+      maxTokens: 50_000,
+      recentTurns: 200,
+      summaryLimit: 200,
+      maxChars: 500_000,
     });
   });
 
-  it('triggers only for a non-fresh family or runtime-kind switch', () => {
+  it('triggers only for a non-fresh family or runtime-kind switch unless forced for /handoff', () => {
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'codex-sdk', 'transport', false)).toBe(true);
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'claude-code-sdk', 'transport', false)).toBe(false);
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code', runtimeType: 'process' }, 'claude-code-sdk', 'transport', false)).toBe(true);
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'codex-sdk', 'transport', true)).toBe(false);
+    expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'claude-code-sdk', 'transport', true, true)).toBe(true);
+    expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code', runtimeType: 'process' }, 'claude-code', 'process', true, true)).toBe(true);
   });
 
   it('covers SDK, process/tmux, Qoder, and runtime-kind matrix without conflating native threads', () => {
@@ -90,7 +132,7 @@ describe('cross-vendor handoff contract', () => {
       event('user.message', { text: 'delta' }, 9, 100),
     ]);
     await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 20, ts: 200 }, 'claude-code-sdk', 'transport', undefined, { epoch: 7, seq: 8, ts: 99 });
-    expect(read).toHaveBeenCalledWith('handoff-test', 30, { visibleOnly: true, through: { epoch: 7, seq: 20, ts: 200 } });
+    expect(read).toHaveBeenCalledWith('handoff-test', 100, { visibleOnly: true, through: { epoch: 7, seq: 20, ts: 200 } });
   });
 
   it('disables generation explicitly and preserves the one-shot configuration bounds', async () => {
@@ -131,13 +173,15 @@ describe('cross-vendor handoff contract', () => {
 
 
 describe('reported lost provider-switch context counterexamples', () => {
-  it.each([undefined, 3000])('upgrades the old ten-message setting and preserves all thirty messages (budget=%s)', async (maxTokens) => {
-    expect(normalizeCrossVendorHandoffConfig({ recentTurns: 10 }).recentTurns).toBe(30);
+  it.each([undefined, 3000])('upgrades the old ten-message setting and preserves the newest messages first (budget=%s)', async (maxTokens) => {
+    expect(normalizeCrossVendorHandoffConfig({ recentTurns: 10 }).recentTurns).toBe(10);
     const rows = Array.from({ length: 30 }, (_, i) => event(i % 2 ? 'assistant.text' : 'user.message', { text: `消息${i}开始：${'这是需要保留的历史正文。'.repeat(120)}` }, i + 1, i + 1));
     vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(rows);
     const pack = await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 30, ts: 30 }, 'agy-sdk', 'transport', { maxTokens });
     expect(pack).toBeDefined();
-    for (let i = 0; i < 30; i++) expect(pack!.text).toContain(`消息${i}开始`);
+    expect(pack!.text).toContain('消息29开始');
+    if (maxTokens === undefined) expect(pack!.text).toContain('消息0开始');
+    else expect(pack!.text).not.toContain('消息0开始');
     expect(pack!.tokenCount).toBeLessThanOrEqual(maxTokens ?? CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens);
   });
   it('includes the user message that is itself the frozen cutoff', async () => {
@@ -153,5 +197,199 @@ describe('reported lost provider-switch context counterexamples', () => {
     const pack = await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 202, ts: 202 }, 'agy-sdk', 'transport');
     expect(pack?.text).toContain('CURRENT_GOAL_8C');
     expect(pack?.text).toContain('CONFIRMED_DECISION_8C');
+  });
+  it('keeps the newest completed messages when the handoff token budget is tight', async () => {
+    const rows = Array.from({ length: 100 }, (_, i) => event(
+      i % 2 ? 'assistant.text' : 'user.message',
+      { text: `${i === 99 ? 'NEWEST_GOAL_9D' : `OLD_GOAL_${i}`} ${'context '.repeat(300)}` },
+      i + 1,
+      i + 1,
+    ));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(rows);
+    const pack = await buildCrossVendorHandoffPack(
+      record('codex-sdk'),
+      { epoch: 7, seq: 100, ts: 100 },
+      'agy-sdk',
+      'transport',
+      { recentTurns: 100, maxTokens: 120 },
+    );
+    expect(pack).toBeDefined();
+    expect(pack!.text).toContain('NEWEST_GOAL_9D');
+    expect(pack!.text).not.toContain('OLD_GOAL_0');
+    expect(pack!.tokenCount).toBeLessThanOrEqual(120);
+  });
+  it('returns undefined when completed timeline has no non-control turns (prevents empty/loop handoffs)', async () => {
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValueOnce([]);
+    const emptyPack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 1, ts: 1 }, 'claude-code-sdk', 'transport');
+    expect(emptyPack).toBeUndefined();
+
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValueOnce([
+      event('user.message', { text: '/clear' }, 1, 1),
+      event('user.message', { text: ' /handoff ' }, 2, 2),
+      event('user.message', { text: '/compact' }, 3, 3),
+    ]);
+    const controlOnlyPack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 3, ts: 3 }, 'claude-code-sdk', 'transport');
+    expect(controlOnlyPack).toBeUndefined();
+  });
+  it('strips bare session control commands while preserving real turns on consecutive handoffs', async () => {
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
+      event('user.message', { text: 'Fix login retry backoff' }, 1, 1),
+      event('assistant.text', { text: 'Updated backoff in auth.ts', streaming: false }, 2, 2),
+      event('user.message', { text: '/handoff' }, 3, 3),
+    ]);
+    const pack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 3, ts: 3 }, 'claude-code-sdk', 'transport');
+    expect(pack).toBeDefined();
+    expect(pack!.text).toContain('Fix login retry backoff');
+    expect(pack!.text).toContain('Updated backoff in auth.ts');
+    expect(pack!.text).not.toContain('/handoff');
+  });
+
+  it('bounds tokenizer worker IPC to <= 2 calls on 100-turn CJK overload and preserves newest turns within budget', async () => {
+    const countMock = vi.mocked(tokenizer.countTokensAsync);
+    countMock.mockClear();
+    const rows = Array.from({ length: 100 }, (_, i) => event(
+      i % 2 ? 'assistant.text' : 'user.message',
+      { text: `第${i}轮：${'上下文交接正文测试内容。'.repeat(100)}` },
+      i + 1,
+      i + 1,
+    ));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(rows);
+    const started = performance.now();
+    const pack = await buildCrossVendorHandoffPack(
+      record('agy-sdk'),
+      { epoch: 7, seq: 100, ts: 100 },
+      'agy-sdk',
+      'transport',
+      { maxTokens: 16_000 },
+    );
+    const elapsedMs = performance.now() - started;
+    expect(pack).toBeDefined();
+    expect(pack!.tokenCount).toBeLessThanOrEqual(16_000);
+    expect(pack!.text).toContain('第99轮');
+    expect(countMock.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(countMock.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it('includes concise redacted active/recent task-pair state and excludes daemon reset notices', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-handoff-pairs-'));
+    try {
+      vi.stubEnv(TASK_PAIRS_DB_PATH_ENV, join(dir, 'task-pairs.sqlite'));
+      const store = new TaskPairStore(join(dir, 'task-pairs.sqlite'));
+      setTaskPairStoreForTests(store);
+      store.savePair('project', {
+        v: 1,
+        engine: 'pairs',
+        project: 'project',
+        taskId: 'tsk_active_handoff',
+        title: 'Handoff token=ghp_1234567890abcdefghij fix',
+        brief: 'Long brief omitted from summary',
+        brain: 'handoff-test',
+        executor: 'deck_sub_exec',
+        auditor: 'deck_sub_aud',
+        workspace: { kind: 'dir', path: '/repo' },
+        status: 'in_audit',
+        round: 2,
+        reworkCount: 0,
+        revision: '1',
+        createdAt: 100,
+        updatedAt: 200,
+      });
+      vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
+        event('assistant.text', {
+          text: 'Started a fresh conversation',
+          noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+          streaming: false,
+        }, 1, 10),
+        event('user.message', { text: 'Check pair progress' }, 2, 20),
+        event('assistant.text', { text: 'Verified test suite', streaming: false }, 3, 30),
+      ]);
+      const pack = await buildCrossVendorHandoffPack(record('agy-sdk'), { epoch: 1, seq: 3, ts: 30 }, 'agy-sdk', 'transport');
+      expect(pack).toBeDefined();
+      expect(pack!.text).toContain('Work state pointers:');
+      expect(pack!.text).toContain('tsk_active_handoff [in_audit]');
+      expect(pack!.text).not.toContain('ghp_1234567890abcdefghij');
+      expect(pack!.text).not.toContain('Long brief omitted from summary');
+      expect(pack!.text).not.toContain('Started a fresh conversation');
+      expect(pack!.text).toContain('Check pair progress');
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads session summaries, supports recentTurns=0, degrades gracefully on summary error, and enforces maxChars accurately', async () => {
+    const nsRecord = {
+      ...record('claude-code-sdk'),
+      contextNamespace: { scope: 'project', projectId: 'proj-1', userId: 'u1' },
+    } as never;
+
+    // 1. Includes summaries + text messages, newest preserved under maxChars trim
+    const readTextSpy = vi.spyOn(sessionHistory, 'readSessionTextMessages').mockResolvedValue([
+      { eventId: 'e1', role: 'user', text: `OLD_TURN_1 ${'历史第一轮文本内容。'.repeat(45)}`, ts: 1, truncated: false },
+      { eventId: 'e2', role: 'assistant', text: `NEW_TURN_2 ${'最新第二轮文本内容。'.repeat(45)}`, ts: 2, truncated: false },
+    ]);
+    const readSumSpy = vi.spyOn(sessionHistory, 'readSessionSummaries').mockResolvedValue([
+      { id: 'sum-new', summary: 'NEWEST_SUMMARY_B', updatedAt: 20, truncated: false, sourceLookup: { kind: 'projection', projectionId: 'sum-new' } },
+      { id: 'sum-old', summary: `OLDEST_SUMMARY_A ${'旧摘要补充内容。'.repeat(45)}`, updatedAt: 10, truncated: false, sourceLookup: { kind: 'projection', projectionId: 'sum-old' } },
+    ]);
+
+    const pack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 2, ts: 2 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 50, summaryLimit: 10, maxChars: 900 },
+    );
+    expect(pack).toBeDefined();
+    expect(readTextSpy).toHaveBeenCalledWith('handoff-test', 50, { epoch: 1, seq: 2, ts: 2 }, true, { excludeDaemonNotices: true, maxChars: 900 });
+    expect(readSumSpy).toHaveBeenCalledWith('handoff-test', { scope: 'project', projectId: 'proj-1', userId: 'u1' }, 10, true, 900);
+    expect(pack!.text.length).toBeLessThanOrEqual(900);
+    expect(pack!.text).toContain('NEW_TURN_2');
+    expect(pack!.text).toContain('NEWEST_SUMMARY_B');
+    expect(pack!.text).not.toContain('OLD_TURN_1');
+
+    // 2. recentTurns=0 skips readSessionTextMessages and builds pack from summaries alone
+    readTextSpy.mockClear();
+    const sumOnlyPack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 2, ts: 2 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 0, summaryLimit: 5, maxChars: 5000 },
+    );
+    expect(readTextSpy).not.toHaveBeenCalled();
+    expect(sumOnlyPack).toBeDefined();
+    expect(sumOnlyPack!.text).toContain('NEWEST_SUMMARY_B');
+
+    // 3. Summary store failure degrades gracefully to text-only pack
+    readSumSpy.mockRejectedValueOnce(new Error('summary worker offline'));
+    const fallbackPack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 2, ts: 2 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 10, summaryLimit: 5, maxChars: 5000 },
+    );
+    expect(fallbackPack).toBeDefined();
+    expect(fallbackPack!.text).toContain('NEW_TURN_2');
+
+    // 4. Large CJK payload under maxChars=80000 is not prematurely truncated by legacy 50k token constant when maxTokens omitted
+    const bigCjkText = `重要中文上下文${'汉字内容测试。'.repeat(9000)}`; // ~63,006 chars (~63k+ tokens > 50k!)
+    readTextSpy.mockResolvedValueOnce([
+      { eventId: 'e-cjk', role: 'user', text: bigCjkText, ts: 3, truncated: false },
+    ]);
+    readSumSpy.mockResolvedValueOnce([]);
+    const cjkPack = await buildCrossVendorHandoffPack(
+      nsRecord,
+      { epoch: 1, seq: 3, ts: 3 },
+      'codex-sdk',
+      'transport',
+      { recentTurns: 100, summaryLimit: 0, maxChars: 80_000 },
+    );
+    expect(cjkPack).toBeDefined();
+    expect(cjkPack!.text.length).toBeGreaterThan(55_000);
+    expect(cjkPack!.text.length).toBeLessThanOrEqual(80_000);
   });
 });

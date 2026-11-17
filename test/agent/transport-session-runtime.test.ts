@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { ProviderError, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, TransportProvider } from '../../src/agent/transport-provider.js';
@@ -115,6 +116,73 @@ describe('TransportSessionRuntime memory provenance', () => {
         expect(config.env).toEqual({ SDK_TEST_FLAG: 'preserved' });
       } finally { await runtime.kill(); }
     }
+  });
+
+  it('invalidates transport contract registrations only for actual model/identity/compaction lifecycle changes', async () => {
+    const provider=makeProvider();const refresh=vi.fn(); provider.refreshSessionSystemText=refresh;
+    provider.setSessionAgentId=vi.fn();provider.applySessionModel=vi.fn().mockResolvedValue('live');
+    const runtime=new TransportSessionRuntime(provider,'deck_contract_lifecycle');
+    try {
+      await runtime.initialize({sessionKey:'deck_contract_lifecycle',agentId:'a'});
+      runtime.setAgentId('a');expect(refresh).not.toHaveBeenCalled();
+      runtime.setAgentId('b');expect(refresh).toHaveBeenCalledTimes(1);
+      runtime.setAgentId('b');expect(refresh).toHaveBeenCalledTimes(1);
+      await runtime.applyAgentId('c');expect(refresh).toHaveBeenCalledTimes(2);
+      await runtime.applyAgentId('c');expect(refresh).toHaveBeenCalledTimes(2);
+      vi.mocked(provider.applySessionModel!).mockRejectedValueOnce(new Error('rejected'));
+      await expect(runtime.applyAgentId('bad')).rejects.toThrow('rejected');expect(refresh).toHaveBeenCalledTimes(2);
+      runtime.refreshIdentityPrompt();expect(refresh).toHaveBeenCalledTimes(3);
+    } finally {await runtime.kill();}
+  });
+  it('keeps AG assembled full contracts stable across ordinary turns and checks native compaction before assembly', async () => {
+    const provider=makeProvider();provider.id=AGY_SDK_PROVIDER_ID;provider.refreshSessionSystemText=vi.fn();
+    let compact=false;provider.checkSessionCompaction=vi.fn(async()=>{const value=compact;compact=false;return value;});
+    let complete: ((id:string,message:AgentMessage)=>void)|undefined;
+    provider.onComplete=cb=>{complete=cb;return ()=>undefined;};
+    const runtime=new TransportSessionRuntime(provider,'deck_ag_contract');
+    try {
+      await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'a'});
+      runtime.setSessionIdentity('deck_ag_contract','Brain','brain');
+      let n=0;
+      const next=async(register=false)=>{
+        n++;vi.mocked(provider.send).mockClear();
+        runtime.send(`ordinary-${n}`,`id-${n}`,undefined,undefined,register?{registeredSystemContract:{contractId:'dynamic',signature:'v1',body:'ORIGINAL DYNAMIC CONTRACT'}}:undefined);
+        await waitForProviderSend(provider);
+        const payload=vi.mocked(provider.send).mock.calls[0][1] as any;
+        complete?.('provider-session-1',{id:`done-${n}`,sessionId:'provider-session-1',kind:'text',role:'assistant',content:'ok',timestamp:Date.now(),status:'complete'});
+        await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'));
+        return payload.sessionSystemText;
+      };
+      const first=await next(true);expect(first).toContain('ORIGINAL DYNAMIC CONTRACT');
+      expect(await next()).toBe(first);expect(await next()).toBe(first);
+      const before=vi.mocked(provider.refreshSessionSystemText!).mock.calls.length;
+      compact=true;expect(await next()).toBe(first);expect(provider.refreshSessionSystemText).toHaveBeenCalledTimes(before+1);
+      runtime.setAgentId('b');expect(await next()).toBe(first);
+      expect(provider.checkSessionCompaction).toHaveBeenCalledTimes(5);
+      for (const extra of [{},{fresh:true},{fresh:true,startupMemoryAlreadyInjected:false},{startupMemoryAlreadyInjected:true},{runtimeEpoch:"new-native-runtime"}]) {
+        await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b',...extra});
+        expect(await next()).toBe(first);expect(await next()).toBe(first);
+      }
+      // Updating/withdrawing a logical registration must survive the same
+      // initialize path, without resurrecting old bodies or leaking owners.
+      vi.mocked(provider.send).mockClear();
+      runtime.send('withdraw', 'withdraw-id',undefined,undefined,{registeredSystemContract:{contractId:'dynamic',signature:'revoked',body:''}});
+      await waitForProviderSend(provider);
+      complete?.('provider-session-1',{id:'withdraw-done',sessionId:'provider-session-1',kind:'text',role:'assistant',content:'ok',timestamp:Date.now(),status:'complete'});
+      await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'));
+      await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b'});
+      expect(await next()).not.toContain('ORIGINAL DYNAMIC CONTRACT');
+      await next(true);
+      await runtime.initialize({sessionKey:'deck_ag_contract',sessionInstanceId:'different-owner',systemPrompt:'Full original system',agentId:'b'});
+      expect(await next()).not.toContain('ORIGINAL DYNAMIC CONTRACT');
+      for (const owner of [{serverId:'server-b'},{contextNamespace:{scope:'project' as const,userId:'another-user',projectId:'another-project'}}]) {
+        await next(true);await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b',...owner});
+        expect((runtime as any)._agyRegisteredSystemContracts.size).toBe(0);
+      }
+      await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b'});
+      await next(true);runtime.setSessionIdentity('deck_other_owner',null);
+      expect(await next()).not.toContain('ORIGINAL DYNAMIC CONTRACT');
+    } finally {await runtime.kill();}
   });
 
   describe('automatic compaction', () => {
@@ -653,7 +721,7 @@ describe('Pair pause during asynchronous pre-provider assembly', () => {
     const session = 'deck_e2e_pause_transport';
     const brain = 'deck_e2e_pause_transport_brain';
     const store = getTaskPairStore();
-    store.savePair('pause-runtime', { taskId: 'pause-runtime-task', brain, executor: session, auditor: 'none', status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1 });
+    putTaskPairFixture(store, 'pause-runtime', { taskId: 'pause-runtime-task', brain, executor: session, auditor: 'none', status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1 });
     let messageId = '';
     setTaskPairDeliveryDepsForTests({ send: async (_target, _text, id) => { messageId = id; } });
     await sendTaskPairMessage(session, 'pause-runtime-task', 'nudge-executor', 'obsolete pair wake');

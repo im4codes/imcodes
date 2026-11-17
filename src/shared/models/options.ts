@@ -60,6 +60,9 @@ export const MUSE_MODEL_IDS = [
 export type MuseModelId = typeof MUSE_MODEL_IDS[number];
 
 export const AGY_MODEL_IDS = [
+  'gemini-4-hydrogen-high',
+  'gemini-4-hydrogen-medium',
+  'gemini-4-hydrogen-low',
   'gemini-4-argon-medium',
   'gemini-4-argon-high',
   'gemini-4-argon-low',

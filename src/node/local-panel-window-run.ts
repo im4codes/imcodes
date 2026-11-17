@@ -92,7 +92,14 @@ export async function openAideskLocalPanel(): Promise<LocalPanelWindowOutcome> {
   return outcome;
 }
 
-/** What the running service hands to the panel server: native clicks open/focus the window, and the page's two external links open in the default browser. */
+/** Opens an external HTTP/HTTPS URL (such as the setup login page) in the user's default browser. */
+export async function openDefaultDesktopBrowser(url: string): Promise<boolean> {
+  if (!url) return false;
+  const platform = createLocalPanelWindowPlatform();
+  return platform !== undefined && platform.openDefaultBrowser(url);
+}
+
+/** What the running service hands to the panel server: native clicks open/focus the window, and the page's external links open in the default browser. */
 export function localPanelWindowHandlers(serverUrl: string, publicNodeId: string): {
   openWindow: () => Promise<{ ok: boolean; reason: string }>;
   openExternal: (target: RemoteDesktopLocalWebAction) => Promise<boolean>;
@@ -105,6 +112,10 @@ export function localPanelWindowHandlers(serverUrl: string, publicNodeId: string
       const outcome = await runLocalPanelWindow({ ...(platform ? { platform } : {}), store, panelRunning: async () => true });
       return { ok: outcome.reason !== LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED, reason: outcome.reason };
     },
-    openExternal: async (target) => platform !== undefined && platform.openDefaultBrowser(remoteDesktopManagementUrl(serverUrl, publicNodeId, target)),
+    openExternal: async (target) => {
+      if (platform === undefined || !serverUrl || !publicNodeId) return false;
+      const url = remoteDesktopManagementUrl(serverUrl, publicNodeId, target);
+      return url ? platform.openDefaultBrowser(url) : false;
+    },
   };
 }

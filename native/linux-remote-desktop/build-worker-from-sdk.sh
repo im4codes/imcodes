@@ -72,9 +72,11 @@ WORKER_PATH="$ARTIFACT_ROOT/$WORKER_FILENAME"
 MANIFEST_PATH="$ARTIFACT_ROOT/$WORKER_FILENAME.manifest.json"
 
 CLANG="$SDK_ROOT/toolchain/bin/clang"
+SYSROOT="$SDK_ROOT/toolchain/sysroot"
 RESOURCE_DIR_ROOT="$SDK_ROOT/toolchain/lib/clang"
 for required in "$CLANG" "$SDK_ROOT/toolchain/bin/lld" "$SDK_ROOT/toolchain/bin/ld.lld" \
-  "$SDK_ROOT/toolchain/bin/llvm-strip" "$SDK_ROOT/lib/libimcodes_linux_libwebrtc_sdk.a" \
+  "$SDK_ROOT/toolchain/bin/llvm-strip" "$SYSROOT" \
+  "$SDK_ROOT/lib/libimcodes_linux_libwebrtc_sdk.a" \
   "$SDK_ROOT/lib/libimcodes_linux_libcxx_runtime_sdk.a" "$SDK_ROOT/lib/libjsoncpp.a" \
   "$SDK_ROOT/sdk-compile-flags.json"; do
   [[ -e "$required" ]] || { echo "SDK file is missing: $required" >&2; exit 1; }
@@ -159,14 +161,21 @@ for source in "${SOURCES[@]}"; do
   OBJECTS+=("$OBJECT_ROOT/$(basename "${source%.cc}").o")
 done
 
+link_with_sdk() {
+  local output_path="$1"
+  shift
+  "$CLANG" --driver-mode=g++ -B"$SDK_ROOT/toolchain/bin" -fuse-ld=lld \
+    --target=x86_64-unknown-linux-gnu --sysroot="$SYSROOT" \
+    "$@" \
+    "$SDK_ROOT/lib/libimcodes_linux_libwebrtc_sdk.a" \
+    "$SDK_ROOT/lib/libimcodes_linux_libcxx_runtime_sdk.a" \
+    "$SDK_ROOT/lib/libjsoncpp.a" \
+    -lX11 -lXext -lXtst -lXfixes -lXrandr -lpthread -ldl \
+    -o "$output_path"
+}
+
 WORKER_UNSTRIPPED="$BUILD_ROOT/$WORKER_FILENAME"
-"$CLANG" --driver-mode=g++ -B"$SDK_ROOT/toolchain/bin" -fuse-ld=lld \
-  "${OBJECTS[@]}" \
-  "$SDK_ROOT/lib/libimcodes_linux_libwebrtc_sdk.a" \
-  "$SDK_ROOT/lib/libimcodes_linux_libcxx_runtime_sdk.a" \
-  "$SDK_ROOT/lib/libjsoncpp.a" \
-  -lX11 -lXext -lXtst -lXfixes -lXrandr -lpthread -ldl \
-  -o "$WORKER_UNSTRIPPED"
+link_with_sdk "$WORKER_UNSTRIPPED" "${OBJECTS[@]}"
 echo "link OK" >&2
 
 file "$WORKER_UNSTRIPPED" | grep -q 'ELF 64-bit.*executable' \
@@ -186,13 +195,7 @@ if [[ "$RUN_NATIVE_TESTS" -eq 1 ]]; then
   ( cd "$REPOSITORY_ROOT" && eval "\"$CLANG\" --driver-mode=g++ -B\"$SDK_ROOT/toolchain/bin\" \
     -resource-dir=\"$CLANG_RESOURCE_DIR\" $COMPILE_FLAGS -c \"$QUAL_SOURCE\" -o \"$QUAL_OBJECT\"" )
   QUAL_BIN="$BUILD_ROOT/worker_qualification_test"
-  "$CLANG" --driver-mode=g++ -B"$SDK_ROOT/toolchain/bin" -fuse-ld=lld \
-    "$QUAL_OBJECT" "$OBJECT_ROOT/json_protocol.o" \
-    "$SDK_ROOT/lib/libimcodes_linux_libwebrtc_sdk.a" \
-    "$SDK_ROOT/lib/libimcodes_linux_libcxx_runtime_sdk.a" \
-    "$SDK_ROOT/lib/libjsoncpp.a" \
-    -lX11 -lXext -lXtst -lXfixes -lXrandr -lpthread -ldl \
-    -o "$QUAL_BIN"
+  link_with_sdk "$QUAL_BIN" "$QUAL_OBJECT" "$OBJECT_ROOT/json_protocol.o"
   "$QUAL_BIN" "$WORKER_UNSTRIPPED"
   echo "native qualification test OK" >&2
 fi

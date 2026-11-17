@@ -1,3 +1,7 @@
+import { R2_RELAY_MSG } from '../../shared/r2-relay.js';
+import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED } from '../../shared/session-incognito-types.js';
+import { isIncognitoSessionName, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
+import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
 import { queuedUserMessageAttribution } from '../agent/transport-queued-user-message.js';
 /**
  * Handle commands from the web UI and inbound chat messages via ServerLink.
@@ -22,6 +26,7 @@ import { startProject, stopProject, teardownProject, getTransportRuntime, launch
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
+import { isServerLinkResyncStatePayload, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
@@ -34,7 +39,9 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { registerProcessQueueDrainer } from './hook-server.js';
 import { bindProcessSharedMachineCommand, type ProcessSharedMachineBinding } from './shared-machine-authority-context.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
 import {
   emitTransportUserMessage as emitTransportUserMessageEvent,
   persistTransportUserMessage,
@@ -55,6 +62,7 @@ import {
   traceWebCommandReceived,
 } from './latency-tracer.js';
 import { getDefaultTimelineHistoryWorkerPool, shouldUseTimelineHistoryWorkerPool, TimelineHistoryPoolError } from './timeline-history-pool.js';
+import { TimelineProjectionBusyError } from './timeline-projection.js';
 import { FsListPoolError, getDefaultFsListWorkerPool, shouldUseFsListWorkerPool } from './fs-list-pool.js';
 import { scanFsListSnapshot } from './fs-list-worker.js';
 import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
@@ -82,11 +90,21 @@ import {
   type SubSessionRecord,
 } from './subsession-manager.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
-import { sendSubSessionSync } from './subsession-sync.js';
+import {
+  buildSubSessionSyncPayload,
+  createSubSessionSyncSharedCache,
+  sendSubSessionSync,
+} from './subsession-sync.js';
+import {
+  SUBSESSION_SYNC_BATCH_MAX_ITEMS,
+  SUBSESSION_SYNC_BATCH_MSG,
+  SUBSESSION_SYNC_REBUILD_CONCURRENCY,
+} from '../../shared/scale-limits.js';
 import { isMemoryPressureShedding } from './memory-guard.js';
 import { DAEMON_MEMORY_PRESSURE_HISTORY_BUDGET_BYTES } from '../../shared/daemon-memory-guard.js';
 import logger from '../util/logger.js';
 import { getUpgradeReadiness } from './upgrade-readiness.js';
+import { markSessionUserStopped, retireRestartContinuation } from './restart-continuation.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
@@ -115,7 +133,7 @@ import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit, clampTimelineHistoryBudget } from '../../shared/timeline-history-limits.js';
 import { hashSessionName } from '../../shared/session-hash.js';
-import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason, isRecoverableTimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_TEXT_HISTORY_EVENT_TYPES,
@@ -134,7 +152,7 @@ import {
   type TimelineResponseStatus,
 } from '../../shared/timeline-protocol.js';
 import { homedir } from 'os';
-import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { chmod as fsChmod, lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
 import {
@@ -192,7 +210,7 @@ import {
   pickUpgradeRegistry,
   type InstallerConfig,
 } from '../../shared/installer-contract.js';
-import { executeCronJob } from './cron-executor.js';
+// cron-executor.ts imports command-handler.ts; load it lazily in dispatch to keep the module graph acyclic.
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -426,12 +444,32 @@ import {
   type MemoryManagementBoundProject,
 } from '../../shared/memory-management-context.js';
 import {
+  SESSION_CANCEL_IDLE_DECISION_REASON,
   getSessionControlTimelineFeedbackById,
   isDaemonHandledSessionControlSend,
   isSessionControlCommandText,
   shouldHideTimelineUserMessageForSessionControl,
   shouldResetProcessPreferenceContextForSessionControl,
 } from '../../shared/session-control-commands.js';
+import {
+  COMPACT_HIJACK_CONTINUATION_PROMPT,
+  COMPACT_HIJACK_MSG,
+  buildTransportConfigWithCompactHijack,
+  extractSessionCompactHijackMode,
+  extractSessionHandoffLimits,
+  hasCompactHijackField,
+  hasInvalidCompactHijackSetting,
+  normalizeCompactHijackGlobalConfig,
+  resolveCompactHijackEnabled,
+} from '../../shared/compact-hijack.js';
+import {
+  isGlobalCompactHijackEnabled,
+  setPersistedCompactHijackGlobalConfig,
+} from '../store/compact-hijack-config-store.js';
+
+let lastObservedServerLink: ServerLink | undefined;
+const manualCompactProcessTurns = new Map<string, number>();
+
 import type {
   ContextMemoryProjectView,
   ContextMemoryStatsView,
@@ -459,23 +497,313 @@ import {
   isMcpFeatureEnabled,
 } from '../../shared/memory-mcp-feature-flags.js';
 import { getProvider } from '../agent/provider-registry.js';
+import { handleRepoCommand } from './repo-handler.js';
+import {
+  handleFileUpload,
+  handleFileUploadFetch,
+  handleFileDownload,
+  handleFileDownloadStream,
+  handleFileDelete,
+  tryCreateProjectFileHandle,
+  lookupAttachment,
+} from './file-transfer-handler.js';
+import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests } from './file-preview-read-coordinator.js';
+import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
+import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
+import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
+import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
+import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
+import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
+import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
+import { REPO_MSG } from '../shared/repo-types.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
+import { handlePreviewCommand } from './preview-relay.js';
+import { PREVIEW_MSG } from '../../shared/preview-types.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
+import { resolveContextWindow } from '../util/model-context.js';
+import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
+import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
+import { getQwenDisplayMetadata } from '../agent/provider-display.js';
+import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
+import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
+import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
+import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
+import { TERMINAL_CONTROL } from '../../shared/terminal-protocol.js';
+import {
+  loadDaemonP2pStaticPolicy,
+  readCachedHelloSnapshot,
+} from './p2p-workflow-static-policy.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 const TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS = 15_000;
 const TRANSPORT_QUEUE_SEND_SYNC_POLL_MS = 25;
+
+// ── AsyncMutex (per-session serialized stdin writes) ─────────────────────────
+
+class AsyncMutex {
+  private queue: Array<() => void> = [];
+  private locked = false;
+
+  async acquire(): Promise<() => void> {
+    return new Promise<() => void>((resolve) => {
+      const tryLock = () => {
+        if (!this.locked) {
+          this.locked = true;
+          resolve(() => this.release());
+        } else {
+          this.queue.push(tryLock);
+        }
+      };
+      tryLock();
+    });
+  }
+
+  private release(): void {
+    this.locked = false;
+    const next = this.queue.shift();
+    if (next) next();
+  }
+}
+
+// ── CommandId dedup cache (100 entries / 5 min TTL per session) ──────────────
+
+class CommandDedup {
+  private entries = new Map<string, number>(); // commandId → timestamp
+  private readonly MAX_SIZE = 100;
+  private readonly TTL_MS = 5 * 60 * 1000;
+
+  has(commandId: string): boolean {
+    const ts = this.entries.get(commandId);
+    if (ts === undefined) return false;
+    if (Date.now() - ts > this.TTL_MS) {
+      this.entries.delete(commandId);
+      return false;
+    }
+    return true;
+  }
+
+  add(commandId: string): void {
+    if (this.entries.size >= this.MAX_SIZE) {
+      // Evict expired entries first
+      const now = Date.now();
+      for (const [id, ts] of this.entries) {
+        if (now - ts > this.TTL_MS) this.entries.delete(id);
+      }
+      // If still at max, evict the oldest
+      if (this.entries.size >= this.MAX_SIZE) {
+        const oldest = this.entries.keys().next().value;
+        if (oldest !== undefined) this.entries.delete(oldest);
+      }
+    }
+    this.entries.set(commandId, Date.now());
+  }
+}
 
 interface InFlightSessionSend {
   settled: Promise<void>;
   settle: () => void;
 }
 
-// A browser renders an optimistic queued row as soon as session.send receives
-// its receipt ack. The send handler may still be awaiting preference/context
-// work before it reaches TransportSessionRuntime.send(), so a quick follow-up
-// append command can otherwise overtake it and observe a false "not found".
-// Track the exact send command until its handler settles so append can wait for
-// the relevant queue registration without serializing unrelated messages.
+// Module-level state/constants hoisted above all function declarations so dynamic
+// imports (e.g. session-manager -> command-handler) never hit TDZ ReferenceErrors.
 const inFlightSessionSends = new Map<string, InFlightSessionSend>();
+const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
+const DAEMON_LOCAL_PREFERENCE_USER_ID = 'daemon-local';
+const processPreferenceContextSignatures = new Map<string, string>();
+const TAGGED_ATTACHMENT_REFERENCE_RE = /#(\d+):\(([^)\r\n]+)\)/g;
+const pendingSessionRelaunches = new Map<string, Promise<void>>();
+const pendingMcpSessionRestarts = new Map<string, { reset: boolean; result: Promise<boolean> }>();
+const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
+const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
+const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
+// Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
+const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
+const SINGLE_MODES = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss', 'config']);
+const VALID_MODES = SINGLE_MODES; // alias for parseAtTokens (individual session tokens always use single modes)
+const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
+// @@all(mode) or @@all(mode, exclude-same-type)
+const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
+const P2P_CONFIG_TOKEN_RE = /@@p2p-config\([^)]*\)/g;
+const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
+const sessionMutexes = new Map<string, AsyncMutex>();
+const PROCESS_MEMORY_RECALL_DEADLINE_MS = 2_500;
+const processDeliveryChains = new Map<string, Promise<void>>();
+const sessionDedups = new Map<string, CommandDedup>();
+const activeSubscriptions = new Map<string, { subscriber: StreamSubscriber; unsubscribe: () => void }>();
+let routerCtx: RouterContext | null = null;
+// Model intent is independent of the ordinary send/process mutex. A slow
+// catalogue lookup must not let an older selection overwrite a newer one.
+const liveModelIntents = new WeakMap<TransportSessionRuntime, object>();
+/** Agents with sandboxed file access — temp files must be in project dir. */
+const SANDBOXED_AGENTS = new Set(['gemini']);
+const delegationTerminalAcks = new Map<string, DelegationTerminalAck>();
+const DELEGATION_UNSUPPORTED_TOP_LEVEL_FIELDS = [
+  'replyTo',
+  'originSession',
+  'originOverride',
+  'contextTail',
+  'delegationContext',
+  'files',
+  'attachments',
+  'quotes',
+  'fileRefs',
+  'fileReferences',
+  'broadcast',
+  'clone',
+  'idempotencyKey',
+  'delegationId',
+] as const;
+const DELETABLE_TOMBSTONE_TYPES: ReadonlySet<string> = new Set([
+  'user.message', 'assistant.text', 'assistant.thinking', 'tool.call', 'tool.result',
+]);
+const RAW_BATCH_FLUSH_MS = 42;           // ~24fps flush interval
+const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
+/** Per-reply ceiling for timeline history/page responses while the server
+ *  link reports uplink congestion (see ServerLink.isUplinkCongested). */
+const CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES = 64 * 1024;
+const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
+const OPENCODE_SYNTH_HISTORY_OVERLAP_MS = 60_000;
+const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
+const TIMELINE_HISTORY_TRANSIENT_REASONS = new Set<string>([
+  TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+  TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+  TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
+  TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+]);
+const askAnswerLedger = new AskAnswerLedger();
+const P2P_DISCUSSION_HISTORY_LIMIT = 50;
+const P2P_DISCUSSION_PREVIEW_BYTES = 64 * 1024;
+const P2P_DISCUSSION_FILE_STAT_CONCURRENCY = 24;
+const P2P_DISCUSSION_PREVIEW_CONCURRENCY = 8;
+const P2P_DISCUSSION_LIST_CACHE_TTL_MS = 2_000;
+const P2P_DISCUSSION_LIST_GLOBAL_KEY = '__global__';
+const p2pDiscussionListCache = new Map<string, { expiresAt: number; value: P2pDiscussionListResult }>();
+const p2pDiscussionListInflight = new Map<string, Promise<P2pDiscussionListResult>>();
+const MAX_UPGRADE_DEFER_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
+})();
+let upgradeSessionBusyDeferredSince: number | null = null;
+const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
+const WINDOWS_DRIVES_PATH = ':drives:';
+const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
+const FILE_SEARCH_EXCLUDES = new Set([
+  'node_modules', '.git', 'venv', '__pycache__', '.venv',
+  'dist', 'build', '.next', '.nuxt', 'vendor', 'target',
+]);
+const FILE_SEARCH_MAX = 20;
+const FILE_SEARCH_MAX_INDEXED_PATHS = 20_000;
+const FILE_SEARCH_CACHE_TTL_MS = 5_000;
+const FILE_SEARCH_CACHE_MAX_ENTRIES = 32;
+const fileSearchCache = new Map<string, { expiresAt: number; value: FileSearchSnapshot }>();
+const fileSearchInflight = new Map<string, Promise<FileSearchSnapshot>>();
+const fileSearchGenerations = new Map<string, number>();
+const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
+const TRANSPORT_STALE_TURN_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_TRANSPORT_STALE_TURN_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
+})();
+const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running', 'queued']);
+const FS_LIST_DEADLINE_MS = 10_000;
+const FS_LIST_CACHE_TTL_MS = 5_000;
+const FS_LIST_STALE_CACHE_TTL_MS = 30_000;
+const FS_LIST_CACHE_MAX_ENTRIES = 128;
+const FS_LIST_INFLIGHT_FANOUT_CAP = 32;
+const FS_LIST_METADATA_CONCURRENCY = 32;
+const fsListCache = new Map<string, FreshnessCacheEntry<FsLsSnapshot>>();
+const fsListInflight = new Map<string, InflightWork<FsLsSnapshot>>();
+const fsListGenerations = new Map<string, number>();
+const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
+const GIT_STATUS_CACHE_TTL_MS = 5_000;
+const GIT_STATUS_STALE_CACHE_TTL_MS = 30_000;
+const GIT_STATUS_CACHE_MAX_ENTRIES = 128;
+const GIT_STATUS_DEADLINE_MS = 10_000;
+const GIT_STATUS_INFLIGHT_FANOUT_CAP = 32;
+const GIT_DIFF_CACHE_TTL_MS = 5_000;
+const repoContextCache = new Map<string, { expiresAt: number; value: RepoContextBase | null }>();
+const repoSignatureCache = new Map<string, RepoSignatureState>();
+const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
+const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
+const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
+const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
+const gitStatusResponseCache = new Map<string, FreshnessCacheEntry<GitStatusResponseSnapshot>>();
+const gitStatusResponseInflight = new Map<string, InflightWork<GitStatusResponseSnapshot>>();
+const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
+const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
+const gitRepoGenerations = new Map<string, number>();
+const gitDiffGenerations = new Map<string, number>();
+const TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS = 5_000;
+const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
+const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
+const transportListModelsCache = new Map<string, { expiresAt: number; generation: number; value: TransportListModelsResult }>();
+const transportListModelsInflight = new Map<string, { generation: number; promise: Promise<TransportListModelsResult> }>();
+let transportListModelsCacheGeneration = 0;
+const sessionResetGenerations = new Map<string, number>();
+let nextSessionResetGeneration = 0;
+
+const MAX_PROCESS_AUTOMATION_QUEUE_DEPTH = 50;
+
+interface QueuedProcessAutomationMessage {
+  text: string;
+  options?: Parameters<typeof sendProcessSessionMessage>[3];
+}
+
+const processAutomationQueues = new Map<string, QueuedProcessAutomationMessage[]>();
+const processAutomationDrainInFlight = new Set<string>();
+const scheduledProcessAutomationDrains = new Set<string>();
+let processAutomationHooksRegistered = false;
+
+export function noteManualCompactProcessTurn(sessionName: string, now = Date.now()): void {
+  manualCompactProcessTurns.set(sessionName, now + 120_000);
+}
+
+export function consumeManualCompactProcessTurn(sessionName: string, now = Date.now()): boolean {
+  const expiresAt = manualCompactProcessTurns.get(sessionName);
+  manualCompactProcessTurns.delete(sessionName);
+  return typeof expiresAt === 'number' && expiresAt >= now;
+}
+
+function resolveIncomingTransportConfigForCompactHijack(
+  cmd: Record<string, unknown>,
+  rawIncomingConfig: Record<string, unknown> | undefined,
+  existingConfig: Record<string, unknown> | undefined,
+): { ok: true; transportConfig: Record<string, unknown> | undefined } | { ok: false; reason: string } {
+  const isSharedCaller = Boolean(cmd.sharedActor && typeof cmd.sharedActor === 'object');
+  if (isSharedCaller) {
+    if (hasCompactHijackField(rawIncomingConfig)) {
+      return { ok: false, reason: 'shared_caller_cannot_modify_compact_hijack' };
+    }
+    const preservedMode = extractSessionCompactHijackMode(existingConfig);
+    const preservedLimits = extractSessionHandoffLimits(existingConfig);
+    return {
+      ok: true,
+      transportConfig: buildTransportConfigWithCompactHijack(
+        rawIncomingConfig,
+        preservedMode,
+        preservedLimits,
+      ) ?? undefined,
+    };
+  }
+  if (hasInvalidCompactHijackSetting(rawIncomingConfig)) {
+    return { ok: false, reason: 'invalid_compact_hijack' };
+  }
+  return {
+    ok: true,
+    transportConfig: buildTransportConfigWithCompactHijack(
+      rawIncomingConfig,
+      extractSessionCompactHijackMode(rawIncomingConfig),
+    ) ?? undefined,
+  };
+}
 
 function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
   return `${sessionName}\u0000${clientMessageId}`;
@@ -597,9 +925,6 @@ async function waitForSelectedSessionSends(
   }
 }
 
-const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
-const DAEMON_LOCAL_PREFERENCE_USER_ID = 'daemon-local';
-
 function isEligibleSupervisionTaskText(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.length > 0 && !trimmed.startsWith('/');
@@ -663,8 +988,6 @@ function preferenceUserIdForSend(cmd: Record<string, unknown>, record: SessionRe
   return fromNamespace || DAEMON_LOCAL_PREFERENCE_USER_ID;
 }
 
-const processPreferenceContextSignatures = new Map<string, string>();
-
 function normalizePreferenceProviderContextSignature(context: string): string {
   return context.replace(/\s+/g, ' ').trim();
 }
@@ -691,8 +1014,6 @@ function prepareProcessPreferenceProviderText(input: {
   processPreferenceContextSignatures.set(input.sessionName, signature);
   return prependPreferenceProviderContext(input.providerText, context);
 }
-
-const TAGGED_ATTACHMENT_REFERENCE_RE = /#(\d+):\(([^)\r\n]+)\)/g;
 
 /**
  * Build a short, agent-only retention reminder for the numbered upload
@@ -980,11 +1301,21 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
     logger.warn({ sessionName }, 'session.update_transport_config: missing transportConfig field — ignoring');
     return;
   }
-  const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
-  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+  const rawIncomingConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(rawIncomingConfig ?? null)) {
     logger.warn({ sessionName }, 'session.update_transport_config: invalid supervision snapshot — ignoring');
     return;
   }
+  const resolvedCompactHijack = resolveIncomingTransportConfigForCompactHijack(
+    cmd,
+    rawIncomingConfig,
+    record.transportConfig,
+  );
+  if (!resolvedCompactHijack.ok) {
+    logger.warn({ sessionName, reason: resolvedCompactHijack.reason }, 'session.update_transport_config: compactHijack rejected — ignoring');
+    return;
+  }
+  const nextTransportConfig = resolvedCompactHijack.transportConfig;
   const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
   if (isAutomaticSupervisionEnabled(nextSupervision)
     && !canSessionRoleOwnAutomaticSupervision(record.role)) {
@@ -1021,11 +1352,21 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
     logger.warn({ sessionName }, 'subsession.update_transport_config: missing transportConfig field — ignoring');
     return;
   }
-  const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
-  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+  const rawIncomingConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(rawIncomingConfig ?? null)) {
     logger.warn({ sessionName }, 'subsession.update_transport_config: invalid supervision snapshot — ignoring');
     return;
   }
+  const resolvedCompactHijack = resolveIncomingTransportConfigForCompactHijack(
+    cmd,
+    rawIncomingConfig,
+    record.transportConfig,
+  );
+  if (!resolvedCompactHijack.ok) {
+    logger.warn({ sessionName, reason: resolvedCompactHijack.reason }, 'subsession.update_transport_config: compactHijack rejected — ignoring');
+    return;
+  }
+  const nextTransportConfig = resolvedCompactHijack.transportConfig;
   const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
   if (isAutomaticSupervisionEnabled(nextSupervision)) {
     logger.warn({ sessionName }, 'subsession.update_transport_config: automatic supervision requires Brain session — ignoring');
@@ -1082,8 +1423,154 @@ export function supportsTransportClear(agentType: string | undefined): boolean {
 // records raw events into `context_event_archive`, so provenance is preserved
 // independently of provider-side compaction.
 
-function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
+export function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
+}
+
+function allocateSessionResetToken(sessionName: string): number {
+  const token = ++nextSessionResetGeneration;
+  sessionResetGenerations.set(sessionName, token);
+  return token;
+}
+
+function assertSessionResetAdmitted(
+  sessionName: string,
+  expectedInstanceId?: string,
+): void {
+  const latest = getSession(sessionName);
+  if (!latest) {
+    throw new Error(`Session ${sessionName} no longer exists before reset`);
+  }
+  if (expectedInstanceId && latest.sessionInstanceId !== expectedInstanceId) {
+    throw new Error(`Session ${sessionName} ownership changed before reset`);
+  }
+}
+
+function admitAndAllocateSessionResetToken(
+  sessionName: string,
+  expectedInstanceId?: string,
+  existingToken?: number,
+): number {
+  assertSessionResetAdmitted(sessionName, expectedInstanceId);
+  if (existingToken !== undefined) {
+    return existingToken;
+  }
+  return allocateSessionResetToken(sessionName);
+}
+
+function isSessionResetOwnerCurrent(
+  sessionName: string,
+  expectedInstanceId?: string,
+  expectedToken?: number,
+): boolean {
+  if (expectedToken !== undefined && sessionResetGenerations.get(sessionName) !== expectedToken) {
+    return false;
+  }
+  const currentRecord = getSession(sessionName);
+  if (!currentRecord) {
+    return false;
+  }
+  if (expectedInstanceId && currentRecord.sessionInstanceId !== expectedInstanceId) {
+    return false;
+  }
+  return true;
+}
+
+async function finalizeConversationReset(
+  sessionName: string,
+  serverLink?: ServerLink,
+  expectedInstanceId?: string,
+  expectedResetToken?: number,
+): Promise<void> {
+  if (!isSessionResetOwnerCurrent(sessionName, expectedInstanceId, expectedResetToken)) {
+    const actualRecord = getSession(sessionName);
+    logger.warn({
+      sessionName,
+      expectedInstanceId,
+      actualInstanceId: actualRecord?.sessionInstanceId,
+      expectedResetToken,
+      currentResetToken: sessionResetGenerations.get(sessionName),
+    }, 'Skipping reset finalization after session owner changed, session deleted, or reset superseded');
+    return;
+  }
+  const resetRecord = getSession(sessionName)!;
+  // Reset per-session memory injection history — fresh conversation should be
+  // allowed to re-inject previously-shown memories again.
+  clearRecentInjectionHistory(sessionName);
+  clearSummarySyncHistory(sessionName);
+  const model = resetRecord.activeModel ?? resetRecord.requestedModel;
+  const contextWindow = resolveContextWindow(resetRecord.presetContextWindow, model, 1_000_000, {
+    preferExplicit: resetRecord.presetContextWindow !== undefined,
+  });
+  timelineEmitter.emit(sessionName, 'usage.update', {
+    inputTokens: 0,
+    cacheTokens: 0,
+    outputTokens: 0,
+    ...(model ? { model } : {}),
+    ...(contextWindow ? { contextWindow } : {}),
+  }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' }, { source: 'daemon', confidence: 'high' });
+  if (serverLink) {
+    void handleGetSessions(serverLink).catch(() => {});
+    void syncSubSessionIfNeeded(sessionName, serverLink).catch(() => {});
+  }
+}
+
+async function executeDaemonResetCommand(opts: {
+  sessionName: string;
+  serverLink: ServerLink;
+  effectiveId: string;
+  isLegacy: boolean;
+  label: string;
+  expectedInstanceId?: string;
+  run: (resetToken: number) => Promise<void>;
+  formatError: (err: unknown) => string;
+}): Promise<boolean> {
+  const { sessionName, serverLink, effectiveId, isLegacy, label, expectedInstanceId, run, formatError } = opts;
+  let resetToken: number;
+  try {
+    resetToken = admitAndAllocateSessionResetToken(sessionName, expectedInstanceId);
+  } catch (err) {
+    const errMsg = formatError(err);
+    logger.warn({ sessionName, effectiveId, expectedInstanceId, errMsg }, `${label} rejected at admission without modifying current owner`);
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+    return false;
+  }
+  // Emit receipt ack + starting progress immediately before teardown/relaunch
+  // (and before any queued prior relaunch wait) so the UI never hangs silently.
+  const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+  timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
+  emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
+  timelineEmitter.emit(sessionName, 'session.state', { state: 'starting' }, { source: 'daemon', confidence: 'high' });
+  try {
+    await run(resetToken);
+    return true;
+  } catch (err) {
+    const errMsg = formatError(err);
+    logger.error({ sessionName, err }, `${label} failed`);
+    if (isSessionResetOwnerCurrent(sessionName, expectedInstanceId, resetToken)) {
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    } else {
+      logger.warn({
+        sessionName,
+        effectiveId,
+        expectedInstanceId,
+        actualInstanceId: getSession(sessionName)?.sessionInstanceId,
+        resetToken,
+        currentResetToken: sessionResetGenerations.get(sessionName),
+      }, 'Skipping session-level reset failure notice/state after owner changed, session deleted, or reset superseded');
+    }
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+    return false;
+  }
 }
 
 /**
@@ -1094,31 +1581,151 @@ function supportsProcessClear(agentType: string | undefined): agentType is 'clau
  * `serverLink` only pushes the refreshed session list to browsers now; without
  * it the change still persists and reaches them through the normal sync.
  */
-export async function clearTransportConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+export async function clearTransportConversation(
+  record: SessionRecord,
+  serverLink?: ServerLink,
+  resetToken?: number,
+): Promise<void> {
   const sessionName = record.name;
-  // Fresh conversation must not replay stale queued messages from the prior
-  // offline window — drop anything we had buffered for resend.
-  clearResend(sessionName);
-  await runExclusiveSessionRelaunch(sessionName, async () => {
-    await relaunchFreshTransportConversation(record);
-  });
-  // Reset per-session memory injection history — fresh conversation should be
-  // allowed to re-inject previously-shown memories again.
-  clearRecentInjectionHistory(sessionName);
-  clearSummarySyncHistory(sessionName);
-  if (serverLink) {
-    await handleGetSessions(serverLink);
-    await syncSubSessionIfNeeded(sessionName, serverLink);
+  const token = admitAndAllocateSessionResetToken(sessionName, record.sessionInstanceId, resetToken);
+  await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
+    // Fresh conversation must not replay stale queued messages from the prior
+    // offline window — drop anything we had buffered for resend.
+    clearResend(sessionName);
+    await relaunchFreshTransportConversation(currentRecord);
+  }, token);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId, token);
+}
+
+/**
+ * `/handoff` for transport and process sessions: reset the provider
+ * conversation (`fresh: true`) like `/clear` while attaching a bounded handoff
+ * pack from the prior conversation for continuity on the next turn.
+ */
+export async function handoffSessionConversation(
+  record: SessionRecord,
+  serverLink?: ServerLink,
+  resetToken?: number,
+): Promise<void> {
+  if (isIncognitoSession(record)) {
+    throw new Error('Incognito sessions do not support cross-vendor handoff.');
   }
-  timelineEmitter.emit(sessionName, 'assistant.text', {
-    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
-    streaming: false,
-    memoryExcluded: true,
-  }, { source: 'daemon', confidence: 'high' });
+  const sessionName = record.name;
+  const token = admitAndAllocateSessionResetToken(sessionName, record.sessionInstanceId, resetToken);
+  await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
+    clearResend(sessionName);
+    await relaunchSessionWithSettings(currentRecord, { fresh: true, handoff: true });
+  }, token);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId, token);
+}
+
+/**
+ * Send the bounded continuation turn onto the fresh conversation created by
+ * `/handoff` or Compact Hijack. Never throws reset errors after a fresh
+ * session has already succeeded.
+ */
+export async function dispatchHandoffContinuation(
+  sessionName: string,
+  continuationText = COMPACT_HIJACK_CONTINUATION_PROMPT,
+  expectedInstanceId?: string,
+  messageIdPrefix = 'handoff',
+): Promise<void> {
+  const latest = getSession(sessionName);
+  if (!latest || isIncognitoSession(latest)) return;
+  if (expectedInstanceId && latest.sessionInstanceId !== expectedInstanceId) {
+    return;
+  }
+  const text = continuationText.trim() || COMPACT_HIJACK_CONTINUATION_PROMPT;
+  const messageId = `${messageIdPrefix}-${randomUUID()}`;
+  const isTransport = latest.runtimeType === 'transport'
+    || (typeof latest.agentType === 'string' && isTransportAgent(latest.agentType));
+  try {
+    if (isTransport) {
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime) {
+        timelineEmitter.emit(
+          sessionName,
+          'user.message',
+          { text, clientMessageId: messageId },
+          { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
+        );
+        await runtime.send(text, messageId);
+        return;
+      }
+      enqueueResend(sessionName, {
+        ...(recipientFromSessionRecord(latest) ? { recipient: recipientFromSessionRecord(latest) } : {}),
+        text,
+        commandId: messageId,
+        clientMessageId: messageId,
+        queuedAt: Date.now(),
+      });
+      return;
+    }
+    await sendProcessSessionMessageForAutomation(sessionName, text, {
+      verbatim: true,
+    });
+  } catch (err) {
+    logger.warn({ sessionName, err }, 'Failed to dispatch handoff continuation');
+  }
+}
+
+/**
+ * Automatic Compact Hijack: reopen via `/handoff` and immediately send the
+ * concise continuation instruction onto the fresh conversation.
+ */
+export async function triggerCompactHijackForSession(
+  sessionName: string,
+  serverLink?: ServerLink,
+  info?: { reason?: 'status' | 'completion' | 'watermark'; pendingPrompt?: string },
+): Promise<void> {
+  const record = getSession(sessionName);
+  if (!record || isIncognitoSession(record)) return;
+  if (
+    !resolveCompactHijackEnabled(
+      extractSessionCompactHijackMode(record.transportConfig),
+      isGlobalCompactHijackEnabled(),
+    )
+  ) {
+    return;
+  }
+  const resolvedLink = serverLink ?? lastObservedServerLink;
+  await handoffSessionConversation(record, resolvedLink);
+  const pendingPrompt = typeof info?.pendingPrompt === 'string' ? info.pendingPrompt.trim() : '';
+  const continuationText = pendingPrompt && pendingPrompt !== COMPACT_HIJACK_CONTINUATION_PROMPT
+    ? `${COMPACT_HIJACK_CONTINUATION_PROMPT}\n\n${pendingPrompt}`
+    : COMPACT_HIJACK_CONTINUATION_PROMPT;
+  await dispatchHandoffContinuation(
+    sessionName,
+    continuationText,
+    record.sessionInstanceId,
+    'compact-hijack',
+  );
+}
+
+async function clearProcessConversation(
+  record: SessionRecord,
+  serverLink?: ServerLink,
+  resetToken?: number,
+): Promise<void> {
+  const sessionName = record.name;
+  const token = admitAndAllocateSessionResetToken(sessionName, record.sessionInstanceId, resetToken);
+  await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
+    clearResend(sessionName);
+    await relaunchSessionWithSettings(currentRecord, { fresh: true });
+  }, token);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId, token);
 }
 
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
+  const existedAtStart = Boolean(getSession(record.name));
   await stopTransportRuntimeSession(record.name);
+  const latest = getSession(record.name);
+  if (existedAtStart && !latest) {
+    throw new Error(`Session ${record.name} deleted during relaunch`);
+  }
+  if (latest && record.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId) {
+    throw new Error(`Session ${record.name} ownership changed during relaunch`);
+  }
   await launchTransportSession({
     name: record.name,
     projectName: record.projectName,
@@ -1135,6 +1742,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
     ...(record.userCreated ? { userCreated: true } : {}),
+    ...(isIncognitoSession(record) ? { incognito: true } : {}),
     fresh: true,
   });
 }
@@ -1153,6 +1761,9 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
  * the caller enqueued right before invoking this helper is auto-delivered.
  */
 async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<void> {
+  if (isIncognitoSession(record)) {
+    throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+  }
   const runtime = getTransportRuntime(record.name);
   if (runtime) {
     const preservation = preserveTransportRuntimeQueuesToResend(record.name, runtime);
@@ -1234,6 +1845,7 @@ async function applyTransportEffortSwitch(
         { level: requested, supported, detail: `Supported: ${supported}` },
       ),
       streaming: false,
+      automation: true,
       memoryExcluded: true,
     }, { source: 'daemon', confidence: 'high' });
     return {
@@ -1352,47 +1964,6 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
 
   return result;
 }
-import { handleRepoCommand } from './repo-handler.js';
-import {
-  handleFileUpload,
-  handleFileUploadFetch,
-  handleFileDownload,
-  handleFileDownloadStream,
-  handleFileDelete,
-  tryCreateProjectFileHandle,
-  lookupAttachment,
-} from './file-transfer-handler.js';
-import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests } from './file-preview-read-coordinator.js';
-import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
-import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
-import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
-import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
-import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
-import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
-import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
-import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
-import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
-import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
-import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
-import { REPO_MSG } from '../shared/repo-types.js';
-import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
-import { handlePreviewCommand } from './preview-relay.js';
-import { PREVIEW_MSG } from '../../shared/preview-types.js';
-import type { TransportAttachment } from '../../shared/transport-attachments.js';
-
-import { resolveContextWindow } from '../util/model-context.js';
-import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
-import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
-import { getQwenDisplayMetadata } from '../agent/provider-display.js';
-import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
-import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
-import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
-import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
-import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
-import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
-import { TERMINAL_CONTROL } from '../../shared/terminal-protocol.js';
-
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
     const record = err as { message?: unknown };
@@ -1400,12 +1971,6 @@ function describeTransportSendError(err: unknown): string {
   }
   return err instanceof Error ? err.message : String(err);
 }
-
-const pendingSessionRelaunches = new Map<string, Promise<void>>();
-const pendingMcpSessionRestarts = new Map<string, { reset: boolean; result: Promise<boolean> }>();
-const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
-const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
-const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
 
 function trackPendingSessionRelaunch(sessionName: string, pending: Promise<void>): Promise<void> {
   pendingSessionRelaunches.set(sessionName, pending);
@@ -1421,6 +1986,29 @@ function runExclusiveSessionRelaunch(sessionName: string, factory: () => Promise
   const pending = pendingSessionRelaunches.get(sessionName);
   if (pending) return pending;
   return trackPendingSessionRelaunch(sessionName, factory());
+}
+
+async function runSerializedSessionReset(
+  sessionName: string,
+  expectedRecord: SessionRecord,
+  factory: (currentRecord: SessionRecord) => Promise<void>,
+  expectedResetToken?: number,
+): Promise<void> {
+  while (pendingSessionRelaunches.has(sessionName)) {
+    await waitForPendingSessionRelaunch(sessionName);
+  }
+  if (!isSessionResetOwnerCurrent(sessionName, expectedRecord.sessionInstanceId, expectedResetToken)) {
+    const latest = getSession(sessionName);
+    if (expectedResetToken !== undefined && sessionResetGenerations.get(sessionName) !== expectedResetToken) {
+      throw new Error(`Session ${sessionName} reset superseded by newer reset`);
+    }
+    if (!latest) {
+      throw new Error(`Session ${sessionName} no longer exists before reset`);
+    }
+    throw new Error(`Session ${sessionName} ownership changed before reset`);
+  }
+  const currentRecord = getSession(sessionName) ?? expectedRecord;
+  await trackPendingSessionRelaunch(sessionName, factory(currentRecord));
 }
 
 function canAttemptShellBootstrapRecovery(sessionName: string): boolean {
@@ -1464,6 +2052,35 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
   if (serverLink) void handleGetSessions(serverLink);
 }
 
+async function syncSubSessionsForPeriodicRefresh(
+  serverLink: ServerLink,
+  sessions: readonly SessionRecord[],
+): Promise<void> {
+  const subSessions = sessions.filter((s) => s.name.startsWith('deck_sub_'));
+  if (subSessions.length === 0) return;
+  const sharedCache = createSubSessionSyncSharedCache();
+  const workerCount = Math.min(SUBSESSION_SYNC_REBUILD_CONCURRENCY, subSessions.length);
+  let nextIdx = 0;
+  const worker = async () => {
+    while (true) {
+      const idx = nextIdx;
+      nextIdx += 1;
+      if (idx >= subSessions.length) return;
+      const session = subSessions[idx]!;
+      const subId = session.name.replace(/^deck_sub_/, '');
+      try {
+        await sendSubSessionSync(serverLink, subId, undefined, {
+          ...(getSubSessionSyncOptions(session.name) ?? {}),
+          sharedCache,
+        });
+      } catch {
+        // not connected
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, worker));
+}
+
 export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promise<void> {
   const sessions = listSessions();
   const codexSessions = sessions.filter((session) => session.agentType === 'codex' || session.agentType === 'codex-sdk');
@@ -1476,15 +2093,7 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
   }
 
   if (!serverLink) return;
-  for (const session of codexSessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, codexSessions);
 }
 
 /**
@@ -1501,17 +2110,12 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
  */
 export async function refreshClaudeSdkSubQuotaMetadata(serverLink?: ServerLink): Promise<void> {
   if (!serverLink) return;
-  for (const session of listSessions()) {
-    if (session.agentType !== 'claude-code-sdk') continue;
-    if (!session.name.startsWith('deck_sub_')) continue;
-    if (session.state === 'stopped' || session.state === 'error') continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  const eligible = listSessions().filter((session) =>
+    session.agentType === 'claude-code-sdk'
+    && session.name.startsWith('deck_sub_')
+    && session.state !== 'stopped'
+    && session.state !== 'error');
+  await syncSubSessionsForPeriodicRefresh(serverLink, eligible);
 }
 
 /**
@@ -1546,15 +2150,7 @@ export async function refreshAgyQuotaMetadataForSessions(serverLink?: ServerLink
   }
 
   if (!serverLink) return;
-  for (const session of agySessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, agySessions);
 }
 
 /**
@@ -1581,15 +2177,7 @@ export async function refreshGrokQuotaMetadataForSessions(serverLink?: ServerLin
   }
 
   if (!serverLink) return;
-  for (const session of grokSessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, grokSessions);
 }
 
 /**
@@ -1616,15 +2204,7 @@ export async function refreshMuseQuotaMetadataForSessions(serverLink?: ServerLin
   }
 
   if (!serverLink) return;
-  for (const session of museSessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, museSessions);
 }
 
 // ── @@ token parsing ─────────────────────────────────────────────────────────
@@ -1666,11 +2246,6 @@ function sendP2pTargetError(
   emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
 }
 
-// Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
-const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
-const SINGLE_MODES = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss', 'config']);
-const VALID_MODES = SINGLE_MODES; // alias for parseAtTokens (individual session tokens always use single modes)
-
 /** Validate a mode string — single mode or combo pipeline (e.g. "brainstorm>discuss>plan"). */
 function isValidP2pMode(mode: string): boolean {
   if (SINGLE_MODES.has(mode)) return true;
@@ -1678,11 +2253,6 @@ function isValidP2pMode(mode: string): boolean {
   const pipeline = parseModePipeline(mode);
   return pipeline.length > 1 && pipeline.every((m) => SINGLE_MODES.has(m) && m !== 'config');
 }
-const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
-// @@all(mode) or @@all(mode, exclude-same-type)
-const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
-const P2P_CONFIG_TOKEN_RE = /@@p2p-config\([^)]*\)/g;
-const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
 export interface ParsedTokens {
   agents: P2pTarget[];
@@ -1762,34 +2332,6 @@ function packRawFrame(sessionName: string, data: Buffer): Buffer {
   return Buffer.concat([header, data]);
 }
 
-// ── AsyncMutex (per-session serialized stdin writes) ─────────────────────────
-
-class AsyncMutex {
-  private queue: Array<() => void> = [];
-  private locked = false;
-
-  async acquire(): Promise<() => void> {
-    return new Promise<() => void>((resolve) => {
-      const tryLock = () => {
-        if (!this.locked) {
-          this.locked = true;
-          resolve(() => this.release());
-        } else {
-          this.queue.push(tryLock);
-        }
-      };
-      tryLock();
-    });
-  }
-
-  private release(): void {
-    this.locked = false;
-    const next = this.queue.shift();
-    if (next) next();
-  }
-}
-
-const sessionMutexes = new Map<string, AsyncMutex>();
 function getMutex(sessionName: string): AsyncMutex {
   let mutex = sessionMutexes.get(sessionName);
   if (!mutex) {
@@ -1798,8 +2340,6 @@ function getMutex(sessionName: string): AsyncMutex {
   }
   return mutex;
 }
-
-const PROCESS_MEMORY_RECALL_DEADLINE_MS = 2_500;
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1820,8 +2360,6 @@ interface ProcessDeliveryTurn {
   waitForTurn(): Promise<void>;
   releaseTurn(): void;
 }
-
-const processDeliveryChains = new Map<string, Promise<void>>();
 
 function reserveProcessDeliveryTurn(sessionName: string): ProcessDeliveryTurn {
   const previous = processDeliveryChains.get(sessionName) ?? Promise.resolve();
@@ -1847,41 +2385,6 @@ function reserveProcessDeliveryTurn(sessionName: string): ProcessDeliveryTurn {
   };
 }
 
-// ── CommandId dedup cache (100 entries / 5 min TTL per session) ──────────────
-
-class CommandDedup {
-  private entries = new Map<string, number>(); // commandId → timestamp
-  private readonly MAX_SIZE = 100;
-  private readonly TTL_MS = 5 * 60 * 1000;
-
-  has(commandId: string): boolean {
-    const ts = this.entries.get(commandId);
-    if (ts === undefined) return false;
-    if (Date.now() - ts > this.TTL_MS) {
-      this.entries.delete(commandId);
-      return false;
-    }
-    return true;
-  }
-
-  add(commandId: string): void {
-    if (this.entries.size >= this.MAX_SIZE) {
-      // Evict expired entries first
-      const now = Date.now();
-      for (const [id, ts] of this.entries) {
-        if (now - ts > this.TTL_MS) this.entries.delete(id);
-      }
-      // If still at max, evict the oldest
-      if (this.entries.size >= this.MAX_SIZE) {
-        const oldest = this.entries.keys().next().value;
-        if (oldest !== undefined) this.entries.delete(oldest);
-      }
-    }
-    this.entries.set(commandId, Date.now());
-  }
-}
-
-const sessionDedups = new Map<string, CommandDedup>();
 function getDedup(sessionName: string): CommandDedup {
   let dedup = sessionDedups.get(sessionName);
   if (!dedup) {
@@ -1925,17 +2428,22 @@ function expandTilde(p: string): string {
   return p;
 }
 
-// Track active terminal subscriptions for proper cleanup
-const activeSubscriptions = new Map<string, { subscriber: StreamSubscriber; unsubscribe: () => void }>();
-
-let routerCtx: RouterContext | null = null;
-
 /** Set the router context for handling inbound chat messages. Must be called before messages arrive. */
 export function setRouterContext(ctx: RouterContext): void {
   routerCtx = ctx;
 }
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
+  lastObservedServerLink = serverLink;
+  const cmd = msg && typeof msg === 'object' ? msg as Record<string, unknown> : {};
+  const name = resolveSessionCommandName(cmd)
+    ?? (cmd.type === 'subsession.start' && typeof cmd.id === 'string' && cmd.id ? subSessionName(cmd.id) : undefined)
+    ?? (typeof cmd.project === 'string' ? `deck_${sanitizeProjectName(cmd.project)}_brain` : undefined);
+  if ((cmd.type === 'session.start' || cmd.type === 'subsession.start') && name && cmd.incognito === true) setSessionIncognito(name, true);
+  withSessionPrivacy(name, cmd.incognito === true || isIncognitoSession(name ? getSession(name) : undefined), () => handleWebCommandInternal(msg, serverLink));
+}
+
+function handleWebCommandInternal(msg: unknown, serverLink: ServerLink): void {
   // Input validation: anything that isn't a non-null object goes
   // straight to the floor.  We log a debug ping for arrays / primitives
   // so a confused client gets diagnostic feedback without flooding.
@@ -2356,6 +2864,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case MEMORY_FEATURE_CONFIG_MSG.APPLY:
       handleMemoryFeatureConfigApply(cmd);
       break;
+    case COMPACT_HIJACK_MSG.APPLY:
+      handleCompactHijackConfigApply(cmd);
+      break;
     case MEMORY_WS.PERSONAL_QUERY:
       void handlePersonalMemoryQuery(cmd, serverLink);
       break;
@@ -2411,7 +2922,77 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryObservationPromote(cmd, serverLink);
       break;
     case 'file.upload':
-      void handleFileUpload(cmd, serverLink);
+      void (async () => {
+        if (typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim()) {
+          const destDir = typeof cmd.destinationDirectory === 'string' ? cmd.destinationDirectory : '';
+          const sessionRoot = await resolveFsSessionRoot(cmd);
+          if (!sessionRoot.ok || !sessionRoot.realRoot) {
+            try {
+              serverLink.send({
+                type: 'file.upload_error',
+                uploadId: cmd.uploadId,
+                error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+              });
+            } catch { /* ignore */ }
+            return;
+          }
+          try {
+            const rawExpanded = destDir.startsWith('~') ? destDir.replace(/^~/, homedir()) : destDir;
+            const resolvedDest = nodePath.resolve(rawExpanded);
+            const realDest = await fsRealpath(resolvedDest);
+            if (!isPathAllowed(realDest)) {
+              try {
+                serverLink.send({
+                  type: 'file.upload_error',
+                  uploadId: cmd.uploadId,
+                  error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+                });
+              } catch { /* ignore */ }
+              return;
+            }
+            if (sessionRoot.allowedRootIsFile) {
+              const fileName = typeof cmd.sanitizedName === 'string' && cmd.sanitizedName
+                ? cmd.sanitizedName
+                : typeof cmd.originalName === 'string' ? cmd.originalName : '';
+              const targetBase = nodePath.basename(sessionRoot.realRoot);
+              const targetDir = nodePath.dirname(sessionRoot.realRoot);
+              const isAllowedStage = realDest === targetDir
+                && fileName.startsWith('.oo-stage-')
+                && fileName.endsWith(`-${targetBase}`);
+              const isExactFileTarget = realDest === targetDir && fileName === targetBase;
+              if (!isAllowedStage && !isExactFileTarget) {
+                try {
+                  serverLink.send({
+                    type: 'file.upload_error',
+                    uploadId: cmd.uploadId,
+                    error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+                  });
+                } catch { /* ignore */ }
+                return;
+              }
+            } else if (!isSameOrInsidePath(sessionRoot.realRoot, realDest)) {
+              try {
+                serverLink.send({
+                  type: 'file.upload_error',
+                  uploadId: cmd.uploadId,
+                  error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+                });
+              } catch { /* ignore */ }
+              return;
+            }
+          } catch {
+            try {
+              serverLink.send({
+                type: 'file.upload_error',
+                uploadId: cmd.uploadId,
+                error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+              });
+            } catch { /* ignore */ }
+            return;
+          }
+        }
+        await handleFileUpload(cmd, serverLink);
+      })();
       break;
     case 'file.upload_fetch':
       void handleFileUploadFetch(cmd, serverLink);
@@ -2419,6 +3000,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'file.download':
       void handleFileDownload(cmd, serverLink);
       break;
+    case R2_RELAY_MSG.DOWNLOAD:
     case FILE_TRANSFER_MSG.DOWNLOAD_STREAM:
       void handleFileDownloadStream(cmd, serverLink);
       break;
@@ -2429,7 +3011,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleListProviderSessions(cmd, serverLink);
       break;
     case CRON_MSG.DISPATCH:
-      void executeCronJob(cmd as unknown as import('../../shared/cron-types.js').CronDispatchMessage, serverLink);
+      void import('./cron-executor.js')
+        .then(({ executeCronJob }) => executeCronJob(cmd as unknown as import('../../shared/cron-types.js').CronDispatchMessage, serverLink))
+        .catch((err) => { logger.warn({ err }, 'cron dispatch failed'); });
       break;
     case PREVIEW_MSG.REQUEST:
     case PREVIEW_MSG.REQUEST_END:
@@ -2463,6 +3047,8 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.ACK:
+    case TASK_PAIR_DECISION_MSG.HISTORY:
+    case TASK_PAIR_DECISION_MSG.FEEDBACK:
     case SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST:
       // Already handled: createProductionSupervisionConsoleBinding (wired in
       // lifecycle.ts) registers its OWN serverLink.onMessage handler, and
@@ -2490,6 +3076,13 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case REPO_MSG.PR_DETAIL:
     case REPO_MSG.ISSUE_DETAIL:
       void handleRepoCommand(cmd, serverLink);
+      break;
+    case REPO_MSG.CALLBACK_SYNC:
+    case REPO_MSG.CALLBACK_CHECK_NOW:
+    case REPO_MSG.CALLBACK_STATUS_REQUEST:
+      void import('./repo-callback-monitor.js')
+        .then(({ handleRepoCallbackCommand }) => handleRepoCallbackCommand(cmd, serverLink))
+        .catch((err) => { logger.debug({ err }, 'repo callback command failed'); });
       break;
     default:
       if (typeof cmd.type === 'string') {
@@ -2647,6 +3240,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
   const requestedModel = (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined);
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  if (cmd.incognito === true && (!supportsSessionIncognito(agentType) || !serverLink.supportsIncognitoSessions())) {
+    serverLink.send({ type: 'session.error', project: rawProject, message: SESSION_INCOGNITO_UNSUPPORTED });
+    return;
+  }
+
 
   if (!rawProject) {
     logger.warn('session.start: missing project name');
@@ -2700,12 +3298,17 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       return;
     }
 
+    const incognito = cmd.incognito === true;
+    // Only after the duplicate-active-session guard passes can a replacement start
+    // reset any closed-session privacy tombstone for this session name.
+    setSessionIncognito(sessionName, incognito);
+    await withSessionPrivacy(sessionName, incognito, async () => {
     const dir = await maybeCloneGitRemoteToDirectory({
       gitRemoteUrl: cmd.gitRemoteUrl,
       targetDir: requestedDir,
     });
 
-    if (isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk') {
+    if (isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'muse-code-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       // The fresh session starts under the SAME name, so its predecessor's
       // durable queue must be cleared and its authority rotated first.
@@ -2715,7 +3318,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     // The identity chosen at creation lives in the identity store (SESSION scope), not in the session record: that is what a
     // restart, a restore and the identity sync derive it from. It is saved BEFORE the session exists, so nothing that follows can
     // miss it; this run still gets it directly (below). The save never throws: a failure is logged and counted.
-    if (identityPrompt) await persistExplicitSessionIdentity(sessionName, identityPrompt);
+    if (identityPrompt && cmd.incognito !== true) await persistExplicitSessionIdentity(sessionName, identityPrompt);
     const config: ProjectConfig = {
       name: project,
       dir,
@@ -2731,6 +3334,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     if (isClaudeCodeSdkAgentType(agentType)) {
       logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
       await launchTransportSession({
+        ...(cmd.incognito === true ? { incognito: true } : {}),
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
@@ -2748,6 +3352,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     } else if (agentType === 'codex-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
       await launchTransportSession({
+        ...(cmd.incognito === true ? { incognito: true } : {}),
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
@@ -2781,6 +3386,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       // provider and model atomically before the first turn.
       logger.info({ project, agentType }, 'SDK fresh session.start launching ACP SDK main session');
       await launchTransportSession({
+        ...(cmd.incognito === true ? { incognito: true } : {}),
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
@@ -2830,6 +3436,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         }, 5000);
       }
     }
+    });
   } catch (err) {
     logger.error({ project, err }, 'session.start failed');
     const message = describeTransportSendError(err);
@@ -2848,14 +3455,26 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     try {
       await runExclusiveSessionRelaunch(sessionName, async () => {
         try {
-          await relaunchSessionWithSettings(record, {
+  let nextRestartTransportConfig: Record<string, unknown> | null | undefined = undefined;
+  if ('transportConfig' in cmd) {
+    const rawRestartConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+    const resolvedRestartConfig = resolveIncomingTransportConfigForCompactHijack(
+      cmd,
+      rawRestartConfig,
+      record.transportConfig,
+    );
+    nextRestartTransportConfig = resolvedRestartConfig.ok
+      ? (resolvedRestartConfig.transportConfig ?? null)
+      : (record.transportConfig ?? null);
+  }
+  await relaunchSessionWithSettings(record, {
             agentType: (cmd.agentType as any) ?? undefined,
             projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
             label: ('label' in cmd ? (cmd.label as string | null) : undefined),
             description: ('description' in cmd ? (cmd.description as string | null) : undefined),
             requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
             effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
-            transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+            transportConfig: nextRestartTransportConfig,
           });
           await handleGetSessions(serverLink);
           logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
@@ -2935,9 +3554,11 @@ function isModelSwitchAgent(agentType: string | undefined): boolean {
 }
 
 function emitModelSwitchRefusal(sessionName: string, code: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE], text: string, model: string, detail?: string): void {
+  // A failed out-of-band control is not the native turn's terminal.
   timelineEmitter.emit(sessionName, 'assistant.text', {
     ...attachDaemonUserNotice(code, text, { model, ...(detail ? { detail } : {}) }),
     streaming: false,
+    automation: true,
     memoryExcluded: true,
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -3002,9 +3623,12 @@ async function applyTransportModelSwitch(
   transportRuntime: TransportSessionRuntime | undefined,
   requestedModel: string,
   serverLink?: ServerLink,
+  modelIntent?: object,
 ): Promise<SessionModelSwitchResult> {
   const sessionName = record.name;
   const agentType = record.agentType;
+  const currentOwner = () => isCurrentAgyModelOwner(record, transportRuntime)
+    && (!modelIntent || (!!transportRuntime && liveModelIntents.get(transportRuntime) === modelIntent));
   const previousModel = record.activeModel ?? record.requestedModel;
   const refuse = (
     code: SessionModelControlError,
@@ -3018,8 +3642,16 @@ async function applyTransportModelSwitch(
   };
   let nextRecord: SessionRecord;
   let contextWindow: number | undefined;
+  let deferred = false;
+  let applied: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED] = SESSION_MODEL_APPLIED.LIVE;
 
   const validated = await resolveValidatedModelList(record);
+  if (agentType === AGY_SDK_PROVIDER_ID) {
+    if (!currentOwner()) return modelOwnerChanged(sessionName);
+    // Validation yielded. Preserve native-start/info/queue updates from the
+    // current owner rather than writing back the pre-await record snapshot.
+    record = getSession(sessionName)!;
+  }
   if (agentType === 'qwen') {
     const runtimeConfig = validated?.qwenRuntime ?? null;
     const sessionModels = record.qwenAvailableModels ?? [];
@@ -3132,6 +3764,31 @@ async function applyTransportModelSwitch(
       `Qoder model switching is proof-gated in IM.codes v1: ${requestedModel}`,
       DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED,
     );
+  } else if (agentType === AGY_SDK_PROVIDER_ID) {
+    try {
+      applied = SESSION_MODEL_APPLIED.NEXT_START;
+      if (transportRuntime?.supportsConfirmedModelSelection) {
+        applied = await transportRuntime.applyAgentId(requestedModel);
+      } else {
+        transportRuntime?.setAgentId(requestedModel);
+      }
+      if (!currentOwner()) return modelOwnerChanged(sessionName);
+      const latestRecord = getSession(sessionName)!;
+      const turnInFlight = Boolean(transportRuntime?.sending)
+        || isWorkingSessionState(transportRuntime?.getStatus())
+        || isWorkingSessionState(latestRecord.state);
+      deferred = applied !== SESSION_MODEL_APPLIED.LIVE && turnInFlight;
+      // Merge native-info/queue updates which arrived during the confirmed RPC;
+      // only an idle/effective confirmation may advance actual model/UI.
+      nextRecord = { ...latestRecord, requestedModel,
+        ...(!deferred ? { activeModel: requestedModel, modelDisplay: requestedModel } : {}), updatedAt: Date.now() };
+    } catch (error) {
+      if (!currentOwner()) return modelOwnerChanged(sessionName);
+      const detail = typeof error === 'object' && error !== null && 'message' in error
+        ? String(error.message) : 'Native model selection was not confirmed';
+      return refuse(SESSION_MODEL_CONTROL_ERROR.MODEL_SWITCH_FAILED, detail, DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR, undefined, detail);
+    }
+    contextWindow = resolveContextWindow(undefined, requestedModel);
   } else if (isGenericModelSwitchAgent(agentType)) {
     if (agentType === 'grok-sdk') {
       const availableModels = validated?.models ?? [];
@@ -3165,12 +3822,14 @@ async function applyTransportModelSwitch(
   upsertSession(nextRecord);
   persistSessionRecord(nextRecord, sessionName);
   if (serverLink) {
-    await handleGetSessions(serverLink);
+    void handleGetSessions(serverLink).catch(() => {});
     syncSubSessionIfNeeded(sessionName, serverLink);
   }
-  timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
+  if (agentType === AGY_SDK_PROVIDER_ID && !currentOwner()) return modelOwnerChanged(sessionName);
+  if (!deferred) timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
   timelineEmitter.emit(sessionName, 'assistant.text', {
-    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${requestedModel}`, { model: requestedModel }),
+    ...attachDaemonUserNotice(deferred ? DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING : DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
+      deferred ? `Saved model ${requestedModel}; it will apply to the next turn after the current turn finishes.` : `Switched model to ${requestedModel}`, { model: requestedModel }),
     streaming: false,
     automation: true,
     memoryExcluded: true,
@@ -3181,8 +3840,26 @@ async function applyTransportModelSwitch(
     agentType: agentType ?? '',
     model: requestedModel,
     ...(previousModel ? { previousModel } : {}),
-    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+    applied: transportRuntime ? applied : SESSION_MODEL_APPLIED.NEXT_START,
   };
+}
+
+function isCurrentAgyModelOwner(expected: SessionRecord, runtime: TransportSessionRuntime | undefined): boolean {
+  const current = getSession(expected.name);
+  return !!current && current.agentType === expected.agentType
+    && current.sessionInstanceId === expected.sessionInstanceId
+    && current.runtimeEpoch === expected.runtimeEpoch
+    && current.providerSessionId === expected.providerSessionId
+    && getTransportRuntime(expected.name) === runtime
+    && (!runtime || (current.providerSessionId === runtime.providerSessionId
+      && (!runtime.recipientIdentity || (current.sessionInstanceId === runtime.recipientIdentity.sessionInstanceId
+        && current.runtimeEpoch === runtime.recipientIdentity.runtimeEpoch))));
+}
+
+function modelOwnerChanged(sessionName: string): SessionModelSwitchResult {
+  // A stale operation must not post a notice into the replacement's timeline.
+  return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_CHANGED,
+    error: 'Session changed while switching model; retry against the current session' };
 }
 
 function resolveModelControlTarget(sessionName: string):
@@ -3210,7 +3887,7 @@ function resolveModelControlTarget(sessionName: string):
  * another session never matched. Deliberately no caller/ownership check: the
  * exact session name is the only requirement.
  */
-export async function switchSessionModelNow(sessionName: string, model?: string, thinking?: string): Promise<SessionModelSwitchResult | SessionThinkingSwitchResult> {
+export async function switchSessionModelNow(sessionName: string, model?: string, thinking?: string, serverLink?: ServerLink): Promise<SessionModelSwitchResult | SessionThinkingSwitchResult> {
   const requested = model?.trim();
   const target = resolveModelControlTarget(sessionName);
   if (requested && !target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
@@ -3219,10 +3896,16 @@ export async function switchSessionModelNow(sessionName: string, model?: string,
   }
   if (!requested) return switchSessionThinkingNow(sessionName, thinking ?? '');
   if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
-  const release = await getMutex(sessionName).acquire();
+  const live = target.record.agentType === AGY_SDK_PROVIDER_ID && target.runtime?.supportsConfirmedModelSelection;
+  const modelIntent = live ? {} : undefined;
+  if (modelIntent && target.runtime) liveModelIntents.set(target.runtime, modelIntent);
+  // ACP model control is not a prompt: never wait for a send/turn lock. The
+  // provider orders native model writes and checks its captured owner/intent.
+  const release = live ? () => {} : await getMutex(sessionName).acquire();
   try {
+    if (target.record.agentType === AGY_SDK_PROVIDER_ID && !isCurrentAgyModelOwner(target.record, target.runtime)) return modelOwnerChanged(sessionName);
     const latest = getSession(sessionName) ?? target.record;
-    const switched = await applyTransportModelSwitch(latest, target.runtime, requested);
+    const switched = await applyTransportModelSwitch(latest, target.runtime, requested, serverLink, modelIntent);
     if (!switched.ok) return switched;
     if (!thinking?.trim()) {
       const switchedRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
@@ -3381,11 +4064,40 @@ function resolveSessionCommandName(cmd: Record<string, unknown>): string | undef
 }
 
 function markTransportCancelIdle(sessionName: string, error?: string): void {
+  const runtime = getTransportRuntime(sessionName);
+  const activity = typeof runtime?.getDiagnosticSnapshot === 'function'
+    ? runtime.getDiagnosticSnapshot()
+    : null;
+  const queuePayload = buildTransportQueueSessionStatePayload(
+    sessionName,
+    'idle',
+    SESSION_CANCEL_IDLE_DECISION_REASON,
+  );
+  const activityGeneration = activity?.activityGeneration
+    ?? (queuePayload.activityGeneration as ActivityGenerationLike | undefined)
+    ?? { scope: 'session', sessionName, generation: 0 };
+  const pendingEntries = Array.isArray(queuePayload.pendingMessageEntries)
+    ? queuePayload.pendingMessageEntries
+    : [];
+  const pendingVersion = typeof queuePayload.pendingMessageVersion === 'number'
+    && Number.isFinite(queuePayload.pendingMessageVersion)
+    ? queuePayload.pendingMessageVersion
+    : 0;
   timelineEmitter.emit(
     sessionName,
     'session.state',
     {
-      ...buildTransportQueueSessionStatePayload(sessionName, 'idle', 'command_handler_cancel_idle'),
+      ...queuePayload,
+      authoritative: true,
+      activityGeneration,
+      blockingWorkCount: 0,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      decisionReason: SESSION_CANCEL_IDLE_DECISION_REASON,
+      clearInputs: [{ source: 'command_handler', reason: 'clear', count: 0 }],
+      pendingCount: pendingEntries.length,
+      pendingVersion,
       ...(error ? { error } : {}),
     },
     { source: 'daemon', confidence: 'high' },
@@ -3422,6 +4134,9 @@ function cancelTransportTurnNow(
   // calls are idempotent no-ops when nothing is armed.
   supervisionAutomation.cancelForUserStop(sessionName);
   peerAuditService.invalidateCancel(sessionName);
+  if (!markSessionUserStopped(sessionName)) {
+    logger.warn({ sessionName }, 'Failed to persist userStopped restart-continuation state on transport cancel');
+  }
   const isTransportStop = !!stopRuntime
     || stopRecord?.runtimeType === 'transport'
     || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
@@ -3535,6 +4250,9 @@ export function stopSessionNow(sessionName: string): boolean {
   if (cancelTransportTurnNow(sessionName, undefined, undefined)) return true;
   const record = getSession(sessionName);
   if (!record) return false;
+  if (!markSessionUserStopped(sessionName)) {
+    logger.warn({ sessionName }, 'Failed to persist userStopped restart-continuation state on stopSessionNow');
+  }
   const agentType = record.agentType;
   // ESC interrupts CC/opencode; Codex, Gemini and shell only stop on Ctrl+C.
   const interruptKey = (agentType === 'codex' || agentType === 'gemini' || agentType === 'shell')
@@ -3552,9 +4270,6 @@ export function stopSessionNow(sessionName: string): boolean {
  * - codex: strip `!` and send the shell command directly (Codex has no `!` prefix)
  * - others: send as-is
  */
-/** Agents with sandboxed file access — temp files must be in project dir. */
-const SANDBOXED_AGENTS = new Set(['gemini']);
-
 function resolveProcessSendOptions(sessionName: string, agentType: string, verbatim?: boolean): SendKeysOptions | undefined {
   const record = getSession(sessionName);
   const cwd = SANDBOXED_AGENTS.has(agentType) ? record?.projectDir : undefined;
@@ -3831,13 +4546,6 @@ function buildAdvancedLaunchEnvelopeFromCommand(
 // dangerous caps as a hardcoded permissive default, which was a fail-OPEN
 // authorisation bug. The function itself lives in the daemon static-policy
 // module so compile/bind/recheck all share one source.
-import {
-  loadDaemonP2pStaticPolicy,
-  readCachedHelloSnapshot,
-} from './p2p-workflow-static-policy.js';
-import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
-import { imcodesStateDir } from '../util/imcodes-state-dir.js';
-
 function makeBindRuntimeContext(
   options: {
     runId: string;
@@ -4138,8 +4846,9 @@ type DelegationTerminalAck = {
   delegationContextStatus?: DelegationContextStatus;
 };
 
-const delegationTerminalAcks = new Map<string, DelegationTerminalAck>();
-const delegationAckKey = (sessionName: string, commandId: string): string => `${sessionName}:${commandId}`;
+function delegationAckKey(sessionName: string, commandId: string): string {
+  return `${sessionName}:${commandId}`;
+}
 
 function recordDelegationTerminalAck(payload: DelegationTerminalAck): void {
   delegationTerminalAcks.set(delegationAckKey(payload.sessionName, payload.commandId), payload);
@@ -4173,23 +4882,6 @@ function replayDelegationTerminalAckIfPresent(
   return true;
 }
 
-
-const DELEGATION_UNSUPPORTED_TOP_LEVEL_FIELDS = [
-  'replyTo',
-  'originSession',
-  'originOverride',
-  'contextTail',
-  'delegationContext',
-  'files',
-  'attachments',
-  'quotes',
-  'fileRefs',
-  'fileReferences',
-  'broadcast',
-  'clone',
-  'idempotencyKey',
-  'delegationId',
-] as const;
 
 function hasMixedDelegationP2pFields(cmd: Record<string, unknown>): boolean {
   return findMixedAgentDelegationP2pFields(cmd).length > 0;
@@ -4235,6 +4927,13 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     : undefined;
   const sharedMachineAuthority = typeof cmd.sharedMachineAuthority === 'string' && cmd.sharedMachineAuthority.trim()
     ? cmd.sharedMachineAuthority.trim()
+    : undefined;
+  const rawOwnerMachineAuthority = (cmd as Record<string, unknown>)[OWNER_MACHINE_AUTHORITY_FIELD];
+  const ownerMachineAuthority = sharedActor?.effectiveActorRole !== 'participant'
+    && !sharedMachineAuthority
+    && typeof rawOwnerMachineAuthority === 'string'
+    && rawOwnerMachineAuthority.trim()
+    ? rawOwnerMachineAuthority.trim()
     : undefined;
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
@@ -4360,7 +5059,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(requestedUiLocale ? { uiLocale: requestedUiLocale } : {}),
     };
     const payload = { ...base, ...(extra ?? {}) };
-    timelineEmitter.emit(
+    const emitted = timelineEmitter.emit(
       sessionName,
       'user.message',
       payload,
@@ -4375,7 +5074,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         eventId: eventId ?? `transport-user:${effectiveId}`,
       },
     );
-    persistTransportUserMessage(sessionName, payloadText, payload);
+    persistTransportUserMessage(sessionName, payloadText, payload, emitted?.eventId);
   };
 
   const emitDelegationError = (error: AgentDelegationErrorCode | 'delegation_dispatch_failed', detail?: string, targetSession?: string): void => {
@@ -4438,6 +5137,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   }
   if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
     emitAcceptedReceiptAck();
+    if (!retireRestartContinuation(sessionName)) {
+      logger.warn({ sessionName }, 'Failed to persist restart-continuation retirement on user send');
+    }
   }
 
   // Persist UI locale only after the daemon-receipt ack has reached the client.
@@ -4839,6 +5541,70 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
 
+  // Fast-path supported `/clear` and `/handoff` before waiting on any prior
+  // relaunch or running skill/preference/path expansion so receipt ack and
+  // starting feedback are immediate even when another relaunch is in flight.
+  const isResetClearFast = !wantsStructuredP2pRouting
+    && !wantsLegacyP2pRouting
+    && isSessionControlCommandText(trimmedText, 'clear');
+  const isResetHandoffFast = !wantsStructuredP2pRouting
+    && !wantsLegacyP2pRouting
+    && isSessionControlCommandText(trimmedText, 'handoff');
+  if (isResetClearFast || isResetHandoffFast) {
+    const fastRecord = getSession(sessionName);
+    if (!fastRecord) {
+      logger.warn(
+        { sessionName, commandId: effectiveId },
+        'handleSend: session record missing — emitting error ack instead of silent fallthrough',
+      );
+      timelineEmitter.emit(
+        sessionName,
+        'session.state',
+        { state: 'error', error: 'session_missing' },
+        { source: 'daemon', confidence: 'high' },
+      );
+      emitCommandAckReliable(serverLink, {
+        commandId: effectiveId,
+        sessionName,
+        status: 'error',
+        error: 'session_missing',
+      });
+      return;
+    }
+    const isTransportSessionFast = fastRecord.runtimeType === 'transport'
+      || (typeof fastRecord.agentType === 'string' && isTransportAgent(fastRecord.agentType));
+    if (
+      (isTransportSessionFast && supportsTransportClear(fastRecord.agentType))
+      || (fastRecord.runtimeType !== 'transport' && supportsProcessClear(fastRecord.agentType))
+    ) {
+      authorityBinding.current = bindProcessSharedMachineCommand(sessionName, fastRecord, cmd);
+      emitTransportUserMessage(text);
+      receiptAcked = true;
+      const resetOk = await executeDaemonResetCommand({
+        sessionName,
+        serverLink,
+        effectiveId,
+        isLegacy,
+        label: isResetHandoffFast
+          ? (isTransportSessionFast ? 'session.handoff (transport)' : 'session.handoff')
+          : (isTransportSessionFast ? 'session.clear (transport)' : 'session.clear'),
+        expectedInstanceId: fastRecord.sessionInstanceId,
+        run: (resetToken) => isResetHandoffFast
+          ? handoffSessionConversation(fastRecord, serverLink, resetToken)
+          : isTransportSessionFast
+            ? clearTransportConversation(fastRecord, serverLink, resetToken)
+            : clearProcessConversation(fastRecord, serverLink, resetToken),
+        formatError: isTransportSessionFast
+          ? describeTransportSendError
+          : (err) => (err instanceof Error ? err.message : String(err)),
+      });
+      if (resetOk && isResetHandoffFast) {
+        await dispatchHandoffContinuation(sessionName, undefined, fastRecord.sessionInstanceId);
+      }
+      return;
+    }
+  }
+
   await waitForPendingSessionRelaunch(sessionName);
 
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
@@ -5041,6 +5807,27 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const isTransportSession = record?.runtimeType === 'transport'
     || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
+  const isTransportHandoff = isSessionControlCommandText(trimmedText, 'handoff');
+  if (isTransportSession && (isSessionControlCommandText(trimmedText, 'clear') || isTransportHandoff) && supportsTransportClear(record?.agentType)) {
+    emitTransportUserMessage(text);
+    receiptAcked = true;
+    const resetOk = await executeDaemonResetCommand({
+      sessionName,
+      serverLink,
+      effectiveId,
+      isLegacy,
+      label: isTransportHandoff ? 'session.handoff (transport)' : 'session.clear (transport)',
+      expectedInstanceId: record!.sessionInstanceId,
+      run: (resetToken) => isTransportHandoff
+        ? handoffSessionConversation(record!, serverLink, resetToken)
+        : clearTransportConversation(record!, serverLink, resetToken),
+      formatError: describeTransportSendError,
+    });
+    if (resetOk && isTransportHandoff) {
+      await dispatchHandoffContinuation(sessionName, undefined, record!.sessionInstanceId);
+    }
+    return;
+  }
   if (!transportRuntime && isTransportSession) {
     // No runtime — provider is still (re)connecting. Queue the message for
     // automatic redelivery once `restoreTransportSessions()` rebuilds the
@@ -5070,6 +5857,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+      ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -5167,6 +5955,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+      ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -5236,30 +6025,23 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
   if (transportRuntime) {
-    if (isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
-      emitTransportUserMessage(text);
-      try {
-        await clearTransportConversation(record!, serverLink);
-        const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
-      } catch (err) {
-        const errMsg = describeTransportSendError(err);
-        logger.error({ sessionName, err }, 'session.clear (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-      }
-      return;
-    }
     // `/compact` is intentionally NOT handled as daemon-side compaction here.
     // The transport runtime/provider capability decides whether it is translated
     // to an SDK RPC, forwarded as a verified slash command, or rejected visibly.
     // Falling through preserves the ordinary receipt-ack contract while keeping
     // provider-specific compact semantics at the SDK boundary.
+    const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
+    if (record?.agentType === AGY_SDK_PROVIDER_ID && transportRuntime.supportsConfirmedModelSelection && modelMatch) {
+      emitTransportUserMessage(text);
+      const result = await switchSessionModelNow(sessionName, modelMatch[1], undefined, serverLink);
+      const status = result.ok ? (isLegacy ? 'accepted_legacy' : 'accepted') : 'error';
+      const failure = result.ok ? {} : { error: result.error };
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status, ...failure });
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status, ...failure });
+      return;
+    }
     const release = await getMutex(sessionName).acquire();
     try {
-      const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
       const effortMatch = trimmedText.match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
       // `/fast on|off` is this product's switch, not Codex's own toggle: bare
       // `/fast` stays untouched so it still reaches the agent unchanged.
@@ -5322,6 +6104,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         timelineEmitter.emit(sessionName, 'assistant.text', {
           ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, `⚠️ ${errMsg}`, { level: nextEffort }),
           streaming: false,
+          automation: true,
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
@@ -5351,10 +6134,11 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       // `aliasAudit` must ride the metadata, not just the immediate emit: a
       // queued/resent message emits its user.message later from session-manager,
       // which can only anchor what the entry carries.
-      const sendMetadata = (sharedActor || sharedMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
+      const sendMetadata = (sharedActor || sharedMachineAuthority || ownerMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
             ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+            ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
             ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -5468,32 +6252,24 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         preferenceContext: preferenceMessagePreamble,
       });
 
-  if (isSessionControlCommandText(text, 'clear') && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
+  const isProcessHandoff = isSessionControlCommandText(text, 'handoff');
+  if ((isSessionControlCommandText(text, 'clear') || isProcessHandoff) && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
-    try {
-      await runExclusiveSessionRelaunch(sessionName, async () => {
-        await relaunchSessionWithSettings(record, { fresh: true });
-      });
-      // Reset per-session memory injection history — fresh conversation
-      // should be allowed to re-inject previously-shown memories again.
-      clearRecentInjectionHistory(sessionName);
-      clearSummarySyncHistory(sessionName);
-      await handleGetSessions(serverLink);
-      await syncSubSessionIfNeeded(sessionName, serverLink);
-      timelineEmitter.emit(sessionName, 'assistant.text', {
-        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
-        streaming: false,
-        memoryExcluded: true,
-      }, { source: 'daemon', confidence: 'high' });
-      const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      logger.error({ sessionName, err }, 'session.clear failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+    receiptAcked = true;
+    const resetOk = await executeDaemonResetCommand({
+      sessionName,
+      serverLink,
+      effectiveId,
+      isLegacy,
+      label: isProcessHandoff ? 'session.handoff' : 'session.clear',
+      expectedInstanceId: record.sessionInstanceId,
+      run: (resetToken) => isProcessHandoff
+        ? handoffSessionConversation(record, serverLink, resetToken)
+        : clearProcessConversation(record, serverLink, resetToken),
+      formatError: (err) => (err instanceof Error ? err.message : String(err)),
+    });
+    if (resetOk && isProcessHandoff) {
+      await dispatchHandoffContinuation(sessionName, undefined, record.sessionInstanceId);
     }
     return;
   }
@@ -5518,6 +6294,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   }
 
   try {
+    if (isSessionControlCommandText(displayText, 'compact')) {
+      noteManualCompactProcessTurn(sessionName);
+    }
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
       onTyped: () => authorityBinding.current?.typed(),
       originalText: displayText,
@@ -5706,6 +6485,77 @@ async function sendProcessSessionMessage(
   }
 }
 
+function scheduleProcessAutomationDrain(sessionName: string): void {
+  if (!processAutomationQueues.has(sessionName)) return;
+  if (scheduledProcessAutomationDrains.has(sessionName)) return;
+  scheduledProcessAutomationDrains.add(sessionName);
+  queueMicrotask(() => {
+    scheduledProcessAutomationDrains.delete(sessionName);
+    void drainProcessAutomationQueue(sessionName);
+  });
+}
+
+function ensureProcessAutomationQueueHooks(): void {
+  if (processAutomationHooksRegistered) return;
+  processAutomationHooksRegistered = true;
+  registerProcessQueueDrainer((sessionName) => {
+    scheduleProcessAutomationDrain(sessionName);
+  });
+  if (typeof timelineEmitter.on === 'function') {
+    timelineEmitter.on((e) => {
+      if (
+        e.type === 'session.state'
+        && !isServerLinkResyncStatePayload(e.payload)
+        && (e.payload as Record<string, unknown>).state === 'idle'
+      ) {
+        scheduleProcessAutomationDrain(e.sessionId);
+      }
+    });
+  }
+}
+
+export async function drainProcessAutomationQueue(sessionName: string): Promise<void> {
+  if (processAutomationDrainInFlight.has(sessionName)) return;
+  const queue = processAutomationQueues.get(sessionName);
+  if (!queue || queue.length === 0) return;
+
+  const record = getSession(sessionName);
+  if (!record) {
+    processAutomationQueues.delete(sessionName);
+    return;
+  }
+  if (record.state === 'stopped') return;
+
+  processAutomationDrainInFlight.add(sessionName);
+  try {
+    while (queue.length > 0) {
+      const next = queue.shift()!;
+      if (next.options?.beforeTyping && !next.options.beforeTyping()) {
+        continue;
+      }
+      await sendProcessSessionMessage(sessionName, next.text, [], next.options);
+      break; // Deliver one queued turn per idle transition.
+    }
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'Failed to deliver queued process automation message');
+  } finally {
+    processAutomationDrainInFlight.delete(sessionName);
+    if (queue.length === 0) {
+      processAutomationQueues.delete(sessionName);
+    }
+  }
+}
+
+export function getProcessAutomationQueueDepth(sessionName: string): number {
+  return processAutomationQueues.get(sessionName)?.length ?? 0;
+}
+
+export function clearProcessAutomationQueuesForTest(): void {
+  processAutomationQueues.clear();
+  processAutomationDrainInFlight.clear();
+  scheduledProcessAutomationDrains.clear();
+}
+
 export async function sendProcessSessionMessageForAutomation(
   sessionName: string,
   text: string,
@@ -5729,15 +6579,39 @@ export async function sendProcessSessionMessageForAutomation(
       messageOrigin?: ChatMessageOrigin;
     }>;
   },
-): Promise<void> {
-  await sendProcessSessionMessage(sessionName, text, [], {
+): Promise<'sent' | 'queued'> {
+  const sendOpts: Parameters<typeof sendProcessSessionMessage>[3] = {
     originalText: text,
     ...(options?.verbatim ? { verbatim: true } : {}),
     ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.onTyped ? { onTyped: options.onTyped } : {}),
     ...(options?.beforeTyping ? { beforeTyping: options.beforeTyping } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
-  });
+  };
+
+  if (options?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE) {
+    const session = getSession(sessionName);
+    const hasPendingQueue = (processAutomationQueues.get(sessionName)?.length ?? 0) > 0
+      || processAutomationDrainInFlight.has(sessionName);
+    const isBusy = session !== null && session !== undefined && PROCESS_IN_PROGRESS_STATES.has(session.state);
+    if (isBusy || hasPendingQueue) {
+      ensureProcessAutomationQueueHooks();
+      let queue = processAutomationQueues.get(sessionName);
+      if (!queue) {
+        queue = [];
+        processAutomationQueues.set(sessionName, queue);
+      }
+      if (queue.length >= MAX_PROCESS_AUTOMATION_QUEUE_DEPTH) {
+        throw new Error(`process automation queue full for ${sessionName} (${MAX_PROCESS_AUTOMATION_QUEUE_DEPTH})`);
+      }
+      queue.push({ text, options: sendOpts });
+      logger.debug({ sessionName, depth: queue.length }, 'Queued process session automation message');
+      return 'queued';
+    }
+  }
+
+  await sendProcessSessionMessage(sessionName, text, [], sendOpts);
+  return 'sent';
 }
 
 async function resolveProcessRecallQueryContext(
@@ -6014,7 +6888,7 @@ function emitActiveQueueAppendResult(sessionName: string, result: Extract<import
       payload,
       { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
     );
-    persistTransportUserMessage(sessionName, entry.text, payload);
+    persistTransportUserMessage(sessionName, entry.text, payload, `transport-user:${entry.clientMessageId}`);
   }
   for (const fact of result.projectionCommitted ? [] : result.deliveryFacts) {
     timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
@@ -6199,10 +7073,6 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
  * model already saw. Double-insurance write path: the server pod-routes the command
  * by serverId, and the daemon independently re-checks that it owns `sessionName`.
  */
-const DELETABLE_TOMBSTONE_TYPES: ReadonlySet<string> = new Set([
-  'user.message', 'assistant.text', 'assistant.thinking', 'tool.call', 'tool.result',
-]);
-
 function readTimelineDeleteTargets(cmd: Record<string, unknown>): { ids: string[]; tooMany: boolean } {
   const seen = new Set<string>();
   const add = (value: unknown): void => {
@@ -6363,6 +7233,11 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
     // Remap ESC → Ctrl+C for these agents so interrupt behavior is consistent with CC.
     const agentType = getSession(sessionName)?.agentType;
     const isEsc = data === '\x1b';
+    if (agentType && agentType !== 'shell' && agentType !== 'script' && (isEsc || data === '\x03')) {
+      if (!markSessionUserStopped(sessionName)) {
+        logger.warn({ sessionName }, 'Failed to persist userStopped restart-continuation state on terminal interrupt');
+      }
+    }
     if (isEsc && (agentType === 'codex' || agentType === 'gemini')) {
       await sendRawInput(sessionName, '\x03'); // Ctrl+C
     } else {
@@ -6430,9 +7305,6 @@ async function handleGetSessions(serverLink: ServerLink): Promise<void> {
     // not connected
   }
 }
-
-const RAW_BATCH_FLUSH_MS = 42;           // ~24fps flush interval
-const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
 
 function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const session = cmd.session as string | undefined;
@@ -6639,10 +7511,6 @@ function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): ty
   return cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : TIMELINE_MESSAGES.HISTORY;
 }
 
-/** Per-reply ceiling for timeline history/page responses while the server
- *  link reports uplink congestion (see ServerLink.isUplinkCongested). */
-const CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES = 64 * 1024;
-
 function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
   const requested = optionalFiniteNumber(cmd.budgetBytes);
   const cap = TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
@@ -6805,6 +7673,7 @@ function sendTimelineReplayError(
   sessionName: string | undefined,
   requestId: string | undefined,
   errorReason: TimelineRequestErrorReason,
+  options?: { recoverable?: boolean },
 ): void {
   try {
     sendTimelineMessage(serverLink, {
@@ -6822,6 +7691,7 @@ function sendTimelineReplayError(
       hasMore: false,
       droppedEvents: 0,
       truncatedEvents: 0,
+      ...(options?.recoverable ? { recoverable: true } : {}),
     });
   } catch { /* not connected */ }
 }
@@ -6848,10 +7718,9 @@ interface TimelineReplayBuildResult {
   detailRefs?: TimelinePayloadMetadata['detailRefs'];
 }
 
-const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
-
-const resolveTimelineSupervisionTaskProjection = (taskId: string, assignmentId: string) =>
-  getSupervisionTaskRegistry().getSupervisionTaskProjection(taskId, assignmentId);
+function resolveTimelineSupervisionTaskProjection(taskId: string, assignmentId: string) {
+  return getSupervisionTaskRegistry().getSupervisionTaskProjection(taskId, assignmentId);
+}
 
 function timelineReplayInflightKey(params: TimelineReplayRequestParams): string {
   return JSON.stringify({
@@ -6863,7 +7732,8 @@ function timelineReplayInflightKey(params: TimelineReplayRequestParams): string 
 }
 
 async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise<TimelineReplayBuildResult> {
-  if (params.requestEpoch !== timelineEmitter.epoch) {
+  const incognito = isIncognitoSessionName(params.sessionName) || isIncognitoSession(getSession(params.sessionName));
+  if (params.requestEpoch !== timelineEmitter.epoch && !incognito) {
     // Epoch reset (client reconnected across a daemon restart) — serve the
     // latest events from the SQLite projection, the sole chat-history read
     // source. readPreferred returns the most recent N events (across epochs)
@@ -6895,7 +7765,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     };
   }
 
-  const replay = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  const replay = timelineEmitter.replay(params.sessionName, incognito && params.requestEpoch !== timelineEmitter.epoch ? 0 : params.afterSeq);
   // Replay is a gap-fill path, but it can span the whole in-memory ring when
   // a browser reconnects after a busy SDK turn. Keep it on the same bounded
   // 200-event wire contract as history/page responses; the newer cursor lets
@@ -6961,6 +7831,27 @@ async function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: Se
     });
   } catch (err) {
     logger.warn({ err, sessionName, requestId }, 'timeline.replay_request failed');
+    if (err instanceof TimelinePreferredReadError) {
+      const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+      sendTimelineReplayError(
+        serverLink,
+        sessionName,
+        requestId,
+        err.reason as TimelineRequestErrorReason,
+        isRecoverable ? { recoverable: true } : undefined,
+      );
+      return;
+    }
+    if (err instanceof TimelineProjectionBusyError) {
+      sendTimelineReplayError(
+        serverLink,
+        sessionName,
+        requestId,
+        TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+        { recoverable: true },
+      );
+      return;
+    }
     sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR);
   }
 }
@@ -7054,8 +7945,6 @@ function handleTimelineDetailRequest(cmd: Record<string, unknown>, serverLink: S
     });
   } catch { /* not connected */ }
 }
-
-const OPENCODE_SYNTH_HISTORY_OVERLAP_MS = 60_000;
 
 export function getOpenCodeSynthesizedAfterTs(afterTs: number | undefined): number | undefined {
   return afterTs === undefined ? undefined : Math.max(0, afterTs - OPENCODE_SYNTH_HISTORY_OVERLAP_MS);
@@ -7170,22 +8059,6 @@ interface TimelineHistoryBuildResult {
   detailRefs: TimelinePayloadMetadata['detailRefs'];
 }
 
-const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
-
-/**
- * Reasons that mean "the projection could not answer right now".
- *
- * These must never reach buildTimelineHistoryOnMain. Running the heavy path on
- * the event loop is the worst available response to saturation, and it is what
- * turned a worker timeout into a blocked main thread in production.
- */
-const TIMELINE_HISTORY_TRANSIENT_REASONS = new Set<string>([
-  TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
-  TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
-  TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
-  TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
-]);
-
 function timelineHistoryErrorResult(
   source: string,
   errorReason: TimelineRequestErrorReason | string,
@@ -7252,6 +8125,26 @@ function buildTimelineHistory(params: TimelineHistoryRequestParams): Promise<Tim
 }
 
 function getTimelineHistoryResult(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  if (isIncognitoSessionName(params.sessionName) || isIncognitoSession(getSession(params.sessionName))) {
+    const buffered = timelineEmitter.getBufferedEvents(params.sessionName).filter(event =>
+      (params.afterSeq === undefined || event.seq > params.afterSeq)
+      && (params.afterTs === undefined || event.ts > params.afterTs)
+      && (params.beforeTs === undefined || event.ts < params.beforeTs));
+    const selected = buffered.slice(-params.limit);
+    const shaped = shapeTimelineEventsForTransport(selected, {
+      maxResponseBytes: params.maxResponseBytes, detailSink: getDefaultTimelineDetailStore(),
+    }, resolveTimelineSupervisionTaskProjection);
+    return Promise.resolve({
+      events: shaped.events, eventsRead: selected.length, payloadBytes: shaped.payloadBytes,
+      droppedEvents: shaped.droppedEvents, truncatedEvents: shaped.truncatedEvents,
+      hasMore: buffered.length > selected.length || shaped.droppedEvents > 0,
+      readMs: 0, synthesizeMs: 0, sanitizeMs: 0,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+      status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
+      detailRefs: shaped.detailRefs,
+    });
+  }
+
   const key = timelineHistoryInflightKey(params);
   const existing = timelineHistoryInflight.get(key);
   if (existing) return existing;
@@ -7290,7 +8183,11 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     );
   } catch (err) {
     if (err instanceof TimelinePreferredReadError) {
-      return timelineHistoryErrorResult(err.source, err.reason);
+      const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+      return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
+    }
+    if (err instanceof TimelineProjectionBusyError) {
+      return timelineHistoryErrorResult(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE, TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
     }
     throw err;
   }
@@ -7311,7 +8208,11 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       );
     } catch (err) {
       if (err instanceof TimelinePreferredReadError) {
-        return timelineHistoryErrorResult(err.source, err.reason);
+        const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+        return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
+      }
+      if (err instanceof TimelineProjectionBusyError) {
+        return timelineHistoryErrorResult(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE, TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
       }
       throw err;
     }
@@ -7589,9 +8490,23 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
 // ── Sub-session handlers ──────────────────────────────────────────────────
 
 async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const incognito = cmd.incognito === true;
   const id = cmd.id as string | undefined;
   const type = cmd.sessionType as string | undefined;
-  if (!id || !type) {
+  const sessionName = id ? subSessionName(id) : undefined;
+  if (incognito && (!type || !supportsSessionIncognito(type) || !serverLink.supportsIncognitoSessions())) {
+    serverLink.send({
+      type: 'session.error',
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+      ...(id && sessionName ? { id, session: sessionName, sessionName } : {}),
+      ...(typeof cmd.parentSession === 'string' && cmd.parentSession ? { project: cmd.parentSession } : {}),
+    });
+    if (id && sessionName) {
+      serverLink.send({ type: 'subsession.closed', id, sessionName, incognito: true });
+    }
+    return;
+  }
+  if (!id || !type || !sessionName) {
     logger.warn('subsession.start: missing id or type');
     return;
   }
@@ -7628,7 +8543,6 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     parentSession ? getSession(parentSession)?.projectDir : undefined,
   );
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
-  const sessionName = subSessionName(id);
   const existingSub = getSession(sessionName);
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
@@ -7638,77 +8552,104 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     : sessionName;
   if (isKnownTestSessionName(parentSession)) {
     logger.warn({ id, type, cwd, parentSession }, 'subsession.start rejected by test-session guard');
+    serverLink.send({
+      type: 'session.error',
+      message: `Refusing to start known test sub-session pattern: ${sessionName}`,
+      id,
+      session: sessionName,
+      sessionName,
+      ...(parentSession ? { project: parentSession } : {}),
+    });
+    if (incognito) {
+      serverLink.send({ type: 'subsession.closed', id, sessionName, incognito: true });
+    }
     return;
   }
 
   // Transport-backed providers: launch without tmux.
   if (isTransportAgent(type)) {
+    const label = typeof cmd.label === 'string' && cmd.label.trim() ? cmd.label.trim() : undefined;
     const ocMode = cmd.ocMode as string | undefined;
-    const bindExistingKey = type === 'openclaw'
-      ? (ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined)
-      : ((cmd.providerSessionId as string | undefined) || undefined);
+    const bindExistingKey = incognito
+      ? undefined
+      : type === 'openclaw'
+        ? (ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined)
+        : ((cmd.providerSessionId as string | undefined) || undefined);
     const description = ((cmd.ocDescription as string) || (cmd.description as string) || '').trim() || undefined;
     if (bindExistingKey && isProviderSessionBound(bindExistingKey)) {
       logger.warn({ id, bindExistingKey }, 'subsession.start: providerSessionId already bound — skipped');
       return;
     }
-    try {
-      await launchTransportSession({
-        name: sessionName,
-        projectName,
-        role: 'w1',
-        agentType: type as any,
-        projectDir: (cwd as string) || process.cwd(),
-        description,
-        requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
-        transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
-        bindExistingKey,
-        ...(ccPreset ? { ccPreset } : {}),
-        ...(isClaudeCodeSdkAgentType(type) ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
-        ...(effort ? { effort } : {}),
-        userCreated: true,
-        parentSession: parentSession || undefined,
-      });
-      // Sync to server DB
+    setSessionIncognito(sessionName, incognito);
+    await withSessionPrivacy(sessionName, incognito, async () => {
       try {
-        await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
-      } catch { /* not connected */ }
-    } catch (e: unknown) {
-      logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
-      const now = Date.now();
-      const errMsg = e instanceof Error ? e.message : String(e);
-      const existing = getSession(sessionName);
-      const errorRecord: SessionRecord = {
-        name: sessionName,
-        projectName: existing?.projectName ?? sessionName,
-        role: existing?.role ?? 'w1',
-        agentType: type,
-        projectDir: existing?.projectDir ?? ((cwd as string) || process.cwd()),
-        state: 'error',
-        restarts: existing?.restarts ?? 0,
-        restartTimestamps: existing?.restartTimestamps ?? [],
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now,
-        runtimeType: 'transport',
-        providerId: type,
-        ...(description ? { description } : {}),
-        ...(ccPreset ? { ccPreset } : {}),
-        ...(effort ? { effort } : {}),
-        ...(parentSession ? { parentSession } : {}),
-        ...(cmd.requestedModel || cmd.model
-          ? { requestedModel: ((cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined)) }
-          : {}),
-        userCreated: true,
-      };
-      upsertSession(errorRecord);
-      timelineEmitter.emit(
-        sessionName,
-        'session.state',
-        { state: 'error', error: errMsg },
-        { source: 'daemon', confidence: 'high' },
-      );
-    }
+        await launchTransportSession({
+          ...(incognito ? { incognito: true, fresh: true } : {}),
+          name: sessionName,
+          projectName,
+          role: 'w1',
+          agentType: type as any,
+          projectDir: (cwd as string) || process.cwd(),
+          ...(label ? { label } : {}),
+          description,
+          requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
+          transportConfig: (() => {
+            const rawStartConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+            const resolvedStartConfig = resolveIncomingTransportConfigForCompactHijack(cmd, rawStartConfig, undefined);
+            return resolvedStartConfig.ok ? resolvedStartConfig.transportConfig : undefined;
+          })(),
+          bindExistingKey,
+          ...(ccPreset ? { ccPreset } : {}),
+          ...(isClaudeCodeSdkAgentType(type) ? { ccSessionId: randomUUID(), fresh: true } : {}),
+          ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
+          ...(effort ? { effort } : {}),
+          userCreated: true,
+          parentSession: parentSession || undefined,
+        });
+        // Sync to server DB (skipped for incognito sub-sessions)
+        if (!incognito) {
+          try {
+            await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
+          } catch { /* not connected */ }
+        }
+      } catch (e: unknown) {
+        logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
+        const now = Date.now();
+        const errMsg = e instanceof Error ? e.message : String(e);
+        const existing = getSession(sessionName);
+        const errorRecord: SessionRecord = {
+          name: sessionName,
+          projectName: existing?.projectName ?? sessionName,
+          role: existing?.role ?? 'w1',
+          agentType: type,
+          projectDir: existing?.projectDir ?? ((cwd as string) || process.cwd()),
+          state: 'error',
+          restarts: existing?.restarts ?? 0,
+          restartTimestamps: existing?.restartTimestamps ?? [],
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+          runtimeType: 'transport',
+          providerId: type,
+          ...(incognito ? { incognito: true } : {}),
+          ...(label ? { label } : {}),
+          ...(description ? { description } : {}),
+          ...(ccPreset ? { ccPreset } : {}),
+          ...(effort ? { effort } : {}),
+          ...(parentSession ? { parentSession } : {}),
+          ...(cmd.requestedModel || cmd.model
+            ? { requestedModel: ((cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined)) }
+            : {}),
+          userCreated: true,
+        };
+        upsertSession(errorRecord);
+        timelineEmitter.emit(
+          sessionName,
+          'session.state',
+          { state: 'error', error: errMsg },
+          { source: 'daemon', confidence: 'high' },
+        );
+      }
+    });
     return;
   }
   const subCcInitPrompt = cmd.ccInitPrompt as string | null | undefined;
@@ -7768,11 +8709,33 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     logger.warn({ sessionName: sName }, 'subsession.restart: session not found in store');
     return;
   }
+  if ((isIncognitoSession(record) || isIncognitoSessionName(sName))
+    && (record.state === 'error' || record.state === 'stopped' || !getTransportRuntime(sName))) {
+    logger.warn({ sessionName: sName }, 'subsession.restart: refusing to restart dead incognito sub-session');
+    serverLink.send({
+      type: 'session.error',
+      project: record.projectName,
+      message: 'Incognito session cannot be restored; start a new session.',
+    });
+    return;
+  }
   const id = sName.replace(/^deck_sub_/, '');
   try {
     await runExclusiveSessionRelaunch(sName, async () => {
       try {
         const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
+        let nextSubRestartTransportConfig: Record<string, unknown> | null | undefined = undefined;
+        if ('transportConfig' in cmd) {
+          const rawSubRestartConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+          const resolvedSubRestartConfig = resolveIncomingTransportConfigForCompactHijack(
+            cmd,
+            rawSubRestartConfig,
+            effectiveRecord.transportConfig,
+          );
+          nextSubRestartTransportConfig = resolvedSubRestartConfig.ok
+            ? (resolvedSubRestartConfig.transportConfig ?? null)
+            : (effectiveRecord.transportConfig ?? null);
+        }
         await relaunchSessionWithSettings(effectiveRecord, {
           agentType: (cmd.agentType as any) ?? undefined,
           projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
@@ -7780,7 +8743,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           description: ('description' in cmd ? (cmd.description as string | null) : undefined),
           requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
           effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
-          transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+          transportConfig: nextSubRestartTransportConfig,
         });
         try {
           await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sName));
@@ -7799,11 +8762,45 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
   const subSessions = cmd.subSessions as SubSessionRecord[] | undefined;
   if (!Array.isArray(subSessions)) return;
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
-  for (const sub of subSessions) {
+  const sharedCache = createSubSessionSyncSharedCache();
+  const payloads = new Array<Record<string, unknown> | null>(subSessions.length).fill(null);
+  const workerCount = Math.min(SUBSESSION_SYNC_REBUILD_CONCURRENCY, Math.max(1, subSessions.length));
+  let nextIdx = 0;
+  const worker = async () => {
+    while (true) {
+      const idx = nextIdx;
+      nextIdx += 1;
+      if (idx >= subSessions.length) return;
+      const sub = subSessions[idx]!;
+      try {
+        const opts = getSubSessionSyncOptions(`deck_sub_${sub.id}`);
+        payloads[idx] = await buildSubSessionSyncPayload(sub.id, undefined, { ...(opts ?? {}), sharedCache });
+      } catch (e) {
+        logger.warn({ err: e, id: sub.id }, 'Failed to build rebuilt sub-session sync payload');
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  const validPayloads = payloads.filter((p): p is Record<string, unknown> => p !== null);
+  if (cmd.supportsSyncBatch === true) {
+    for (let i = 0; i < validPayloads.length; i += SUBSESSION_SYNC_BATCH_MAX_ITEMS) {
+      const items = validPayloads.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS);
+      try {
+        serverLink.send({ type: SUBSESSION_SYNC_BATCH_MSG, items });
+      } catch (e) {
+        logger.warn({ err: e, count: items.length }, 'Failed to send subsession.sync.batch');
+      }
+    }
+    return;
+  }
+
+  // Backward-compatible fallback for older servers that only speak individual `subsession.sync`.
+  for (const payload of validPayloads) {
     try {
-      await sendSubSessionSync(serverLink, sub.id, undefined, getSubSessionSyncOptions(`deck_sub_${sub.id}`));
+      serverLink.send(payload);
     } catch (e) {
-      logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
+      logger.warn({ err: e, id: payload.id }, 'Failed to sync rebuilt sub-session');
     }
   }
 }
@@ -7840,6 +8837,15 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     logger.warn({ sessionName }, 'subsession.set_model: session not found');
     return;
   }
+  if (isIncognitoSession(existing) || isIncognitoSessionName(sessionName)) {
+    logger.warn({ sessionName }, 'subsession.set_model: refusing process restart for incognito sub-session');
+    serverLink.send({
+      type: 'session.error',
+      project: existing.projectName,
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+    });
+    return;
+  }
 
   logger.info({ sessionName, model }, 'Restarting Codex sub-session with new model');
   await stopSubSession(sessionName, serverLink).catch(() => {});
@@ -7862,8 +8868,6 @@ async function handleSubSessionReadResponse(cmd: Record<string, unknown>, server
     serverLink.send({ type: 'subsession.response', sessionName: sName, ...result });
   } catch { /* not connected */ }
 }
-
-const askAnswerLedger = new AskAnswerLedger();
 
 /** Test seam: forget the in-process ask.answer bookkeeping, as a daemon restart does. */
 export function resetAskAnswerLedgerForTests(): void {
@@ -8107,11 +9111,6 @@ function isPathUnderDir(filePath: string, dir: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
-const P2P_DISCUSSION_HISTORY_LIMIT = 50;
-const P2P_DISCUSSION_PREVIEW_BYTES = 64 * 1024;
-const P2P_DISCUSSION_FILE_STAT_CONCURRENCY = 24;
-const P2P_DISCUSSION_PREVIEW_CONCURRENCY = 8;
-
 interface P2pDiscussionHistoryCandidate {
   id: string;
   fileName: string;
@@ -8207,14 +9206,10 @@ async function materializeP2pDiscussionHistoryEntry(
 // top GC-pressure source under load). Web + mobile clients poll this list
 // frequently and in reconnect bursts; a 2s cache collapses sequential polls
 // and the in-flight map collapses simultaneous ones into a single scan.
-const P2P_DISCUSSION_LIST_CACHE_TTL_MS = 2_000;
-const P2P_DISCUSSION_LIST_GLOBAL_KEY = '__global__';
 interface P2pDiscussionListResult {
   discussions: P2pDiscussionHistoryEntry[];
   aggregated: boolean;
 }
-const p2pDiscussionListCache = new Map<string, { expiresAt: number; value: P2pDiscussionListResult }>();
-const p2pDiscussionListInflight = new Map<string, Promise<P2pDiscussionListResult>>();
 
 async function computeP2pDiscussionList(
   scope: { projectDir: string; canonicalProjectDir: string } | null,
@@ -8652,21 +9647,6 @@ export function evaluateAutoUpgradeCooldown(
 }
 
 /** How long the *session-busy* gate reports continuous deferral in logs before
- *  it marks the wait as capped. It is intentionally advisory only: a daemon
- *  self-upgrade must never force through an active turn, because restarting the
- *  daemon would kill or abandon the user's in-flight work. Override for tests
- *  via IMCODES_MAX_UPGRADE_DEFER_MS. */
-const MAX_UPGRADE_DEFER_MS = (() => {
-  const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
-})();
-
-/** Epoch ms when the session-busy gate FIRST blocked the current run of
- *  upgrade attempts, or null when the last attempt was not session-blocked.
- *  Persists across `handleDaemonUpgrade` calls (each server upgrade broadcast)
- *  so the backstop measures *continuous* deferral, not a single attempt. */
-let upgradeSessionBusyDeferredSince: number | null = null;
-
 /** Pure decision for the session-busy deferral backstop. Given whether the
  *  session gate is currently blocking and how long it has been blocking,
  *  decide whether to keep blocking and what the next "blocked since" marker
@@ -9023,21 +10003,33 @@ async function handleDaemonUpgrade(
       'daemon.upgrade: installed version is at or newer than target, refusing to downgrade');
     return;
   }
-  // For untargeted / `latest` upgrades, pre-flight against the npm registry —
-  // if our running version is already at or newer than what the registry
-  // resolves `imcodes@latest` to, skip the whole upgrade. This stops servers
-  // that blindly broadcast `latest` from clobbering a newer dev build's
-  // global install (npm install -g would replace the symlink/dir with the
-  // older registry release even if we then refused to restart, so we have to
-  // catch this BEFORE spawning the install).
-  // Resolve the registry ONCE here and reuse it for both the pre-flight probe
-  // and the install command baked into the upgrade script, so they never
-  // diverge (this is the fix for the prior hard-coded-official-registry probe).
+
+  const {
+    inspectDaemonRuntimeMode,
+    resolveLegacyNpmCliFallback,
+    upgradeBundledDaemonRuntime,
+  } = await import('./daemon-runtime-upgrade.js');
+  const runtimeMode = inspectDaemonRuntimeMode({ entryScriptPath: process.argv[1] });
+  if (runtimeMode.mode === 'dev_exempt') {
+    logger.warn({ devCheckoutPath: runtimeMode.devCheckoutPath },
+      'daemon.upgrade: refusing auto-upgrade for development checkout/symlink (dev_symlink_exempt)');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'dev_symlink_exempt',
+        detail: runtimeMode.devCheckoutPath ?? '',
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   const normalizedRegistryOverride = normalizeRegistryBase(registryOverride);
   const upgradeRegistry = normalizedRegistryOverride
     ? { base: normalizedRegistryOverride, explicit: normalizedRegistryOverride !== INSTALLER_OFFICIAL_NPM_REGISTRY }
     : await resolveUpgradeRegistry();
-  if (!targetVersion || targetVersion === 'latest') {
+
+  const shouldAbortForRegistryLatest = async (): Promise<boolean> => {
+    if (targetVersion && targetVersion !== 'latest') return false;
     try {
       const res = await fetch(`${upgradeRegistry.base}imcodes/latest`, {
         headers: { accept: 'application/json' },
@@ -9051,7 +10043,7 @@ async function handleDaemonUpgrade(
         if (registryLatest && compareDaemonVersions(DAEMON_VERSION, registryLatest) >= 0) {
           logger.info({ daemonVersion: DAEMON_VERSION, registryLatest },
             'daemon.upgrade: registry "latest" is not newer than current, refusing to downgrade');
-          return;
+          return true;
         }
       } else {
         logger.warn({ status: res.status }, 'daemon.upgrade: registry probe returned non-2xx, proceeding without pre-flight');
@@ -9059,6 +10051,11 @@ async function handleDaemonUpgrade(
     } catch (e) {
       logger.warn({ err: e }, 'daemon.upgrade: registry probe failed, proceeding without pre-flight');
     }
+    return false;
+  };
+
+  if (runtimeMode.mode !== 'bundled' && await shouldAbortForRegistryLatest()) {
+    return;
   }
 
   // ── Toolchain pre-flight (non-Windows; Windows has its own runner) ─────────
@@ -9187,6 +10184,87 @@ async function handleDaemonUpgrade(
       } catch { /* ignore */ }
       return;
     }
+
+  let legacyFallbackNodeBin: string | undefined;
+  let legacyFallbackPrefix: string | undefined;
+  if (runtimeMode.mode === 'bundled') {
+    const bundledResult = await upgradeBundledDaemonRuntime({
+      currentVersion: DAEMON_VERSION,
+      targetVersion,
+      entryScriptPath: process.argv[1],
+      allowLegacyCliFallback: true,
+      detachedHandoff: true,
+      wasRunning: true,
+    });
+    if (bundledResult.status === 'upgraded' || bundledResult.status === 'handoff_uncertain') {
+      if (bundledResult.status === 'handoff_uncertain') {
+        logger.warn({
+          targetVersion: bundledResult.targetVersion,
+          runtimeRoot: bundledResult.runtimeRoot,
+          writableRootKind: bundledResult.writableRootKind,
+          scriptDir: bundledResult.detachedScriptDir,
+          handoffState: bundledResult.handoffState,
+          dispatchStage: bundledResult.dispatchStage,
+          errorCode: bundledResult.errorCode,
+          runnerId: bundledResult.runnerId,
+        }, bundledResult.message);
+      } else {
+        logger.info({
+          targetVersion: bundledResult.targetVersion,
+          runtimeRoot: bundledResult.runtimeRoot,
+          writableRootKind: bundledResult.writableRootKind,
+          scriptDir: bundledResult.detachedScriptDir,
+        }, 'daemon.upgrade: bundled daemon-runtime detached switch runner spawned');
+      }
+      upgradeScriptSpawned = true;
+      announceUpgrading();
+      scheduleUpgradeMemoryFreezeRelease();
+      return;
+    }
+    if (bundledResult.status === 'up_to_date') {
+      logger.info({ daemonVersion: DAEMON_VERSION }, 'daemon.upgrade: bundled daemon-runtime already up to date');
+      return;
+    }
+    if (bundledResult.status === 'blocked' || bundledResult.status === 'rolled_back') {
+      logger.warn({ bundledResult }, 'daemon.upgrade: bundled daemon-runtime upgrade stopped cleanly');
+      if (bundledResult.status === 'blocked') {
+        try {
+          serverLink?.send({
+            type: DAEMON_MSG.UPGRADE_BLOCKED,
+            reason: bundledResult.reason,
+            detail: bundledResult.message,
+          });
+        } catch { /* ignore */ }
+      }
+      return;
+    }
+    const fallback = resolveLegacyNpmCliFallback({
+      platform: process.platform,
+      env: process.env,
+      execPath: process.execPath,
+      userHome: homedir(),
+      stateDir: imcodesStateDir(),
+    });
+    if (!fallback.eligible) {
+      logger.warn({ bundledReason: bundledResult.reason, fallback },
+        'daemon.upgrade: bundled feed unavailable and no writable legacy npm CLI fallback; blocking cleanly');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: fallback.reason,
+          detail: `${bundledResult.reason}: ${fallback.message}`,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    if (await shouldAbortForRegistryLatest()) {
+      return;
+    }
+    legacyFallbackNodeBin = fallback.nodeBin;
+    legacyFallbackPrefix = fallback.prefixDir;
+    logger.warn({ reason: bundledResult.reason, fallbackPrefix: fallback.prefixDir },
+      'daemon.upgrade: falling back to legacy CLI upgrade path');
+  }
   logger.info('daemon.upgrade: preparing upgrade script');
 
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
@@ -9213,6 +10291,8 @@ async function handleDaemonUpgrade(
         registryArg: upgradeRegistry.explicit ? upgradeRegistry.base : '-',
         // Lets the runner apply the post-install downgrade guard for `latest`.
         currentVer: DAEMON_VERSION,
+        ...(legacyFallbackPrefix ? { npmPrefix: legacyFallbackPrefix } : {}),
+        ...(legacyFallbackNodeBin ? { nodeBin: legacyFallbackNodeBin } : {}),
       });
       logger.info({ log: logFile, runnerCopy: launched.runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     } catch (err) {
@@ -9252,7 +10332,7 @@ async function handleDaemonUpgrade(
   //   - snap:   /snap/node/current/{bin/node, lib/node_modules/...}
   // If none of the candidates exist (extremely unusual), fall back to bare
   // `npm` and rely on PATH — same behavior as before.
-  const nodeBin = process.execPath;
+  const nodeBin = legacyFallbackNodeBin ?? process.execPath;
   const nodeDir = dirname(nodeBin);
   // Discovery happens INSIDE the bash script at runtime (see the
   // `discover npm-cli.js` block in the script body). The bash script
@@ -9300,6 +10380,7 @@ async function handleDaemonUpgrade(
     stateDir: imcodesStateDir(),
     restartCmd,
     cleanupAfterSec: CLEANUP_AFTER_SEC,
+    ...(legacyFallbackPrefix ? { npmPrefix: legacyFallbackPrefix } : {}),
   });
   child.on('exit', (code, signal) => {
     if (code !== POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE) return;
@@ -9349,17 +10430,6 @@ async function handleDaemonUpgrade(
 }
 
 // ── File system browser ────────────────────────────────────────────────────
-
-// On Windows, don't restrict paths — projects commonly live on any drive (D:\code, etc.)
-// The daemon runs as the user, so OS-level permissions are the real security boundary.
-// Deny-list: block access to sensitive directories regardless of platform.
-// Everything else is allowed — the daemon runs as the user and inherits their permissions.
-const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
-
-/** Special sentinel path that browses Windows drive roots (C:\, D:\, ...).
- *  Distinct from `~` so the home directory remains accessible on Windows. */
-const WINDOWS_DRIVES_PATH = ':drives:';
-const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 
 function isPathAllowed(realPath: string): boolean {
   return isFilePreviewPathAllowed(realPath);
@@ -9447,7 +10517,7 @@ async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath:
 }
 
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
-  | { ok: true; realRoot?: string }
+  | { ok: true; realRoot?: string; allowedRootIsFile?: boolean }
   | { ok: false; error: string }
 > {
   const sessionName = typeof cmd.sessionName === 'string'
@@ -9455,16 +10525,42 @@ async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
     : typeof cmd.session === 'string'
       ? cmd.session
       : '';
-  if (!sessionName) return { ok: true };
-  const record = getSession(sessionName);
-  if (!record?.projectDir) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
-  try {
-    const realRoot = await fsRealpath(record.projectDir);
-    if (!isPathAllowed(realRoot)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
-    return { ok: true, realRoot };
-  } catch {
-    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND };
+  let sessionRealRoot: string | undefined;
+  if (sessionName) {
+    const record = getSession(sessionName);
+    if (!record?.projectDir) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+    try {
+      const realRoot = await fsRealpath(record.projectDir);
+      if (!isPathAllowed(realRoot)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      sessionRealRoot = realRoot;
+    } catch {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND };
+    }
   }
+
+  const rawAllowedRoot = typeof cmd.allowedRoot === 'string' ? cmd.allowedRoot.trim() : '';
+  if (rawAllowedRoot) {
+    const expanded = rawAllowedRoot.startsWith('~') ? rawAllowedRoot.replace(/^~/, homedir()) : rawAllowedRoot;
+    const resolved = nodePath.resolve(expanded);
+    try {
+      const linkStats = await fsLstat(resolved);
+      if (linkStats.isSymbolicLink()) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      }
+      const allowedReal = await fsRealpath(resolved);
+      if (!isPathAllowed(allowedReal)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      }
+      if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, allowedReal)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      }
+      return { ok: true, realRoot: allowedReal, allowedRootIsFile: linkStats.isFile() };
+    } catch {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+    }
+  }
+
+  return { ok: true, realRoot: sessionRealRoot };
 }
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
@@ -9534,55 +10630,15 @@ async function handleP2pStatus(cmd: Record<string, unknown>, serverLink: ServerL
   }
 }
 
-// ── File search for @ picker ──────────────────────────────────────────────
-
-const FILE_SEARCH_EXCLUDES = new Set([
-  'node_modules', '.git', 'venv', '__pycache__', '.venv',
-  'dist', 'build', '.next', '.nuxt', 'vendor', 'target',
-]);
-
-const FILE_SEARCH_MAX = 20;
-const FILE_SEARCH_MAX_INDEXED_PATHS = 20_000;
-const FILE_SEARCH_CACHE_TTL_MS = 5_000;
-const FILE_SEARCH_CACHE_MAX_ENTRIES = 32;
-
 interface FileSearchSnapshot {
   root: string;
   dirSignature: string;
   paths: string[];
 }
 
-const fileSearchCache = new Map<string, { expiresAt: number; value: FileSearchSnapshot }>();
-const fileSearchInflight = new Map<string, Promise<FileSearchSnapshot>>();
-const fileSearchGenerations = new Map<string, number>();
-
 export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
 }
-
-/** Transport-runtime statuses that represent a genuine in-flight turn the
- *  user is waiting on. `'error'` is intentionally NOT in this set — an
- *  errored runtime is *stuck*, not active, and forever-blocking daemon
- *  upgrades on it leaves the user no way out short of `imcodes service
- *  restart` (which is exactly what the upgrade wants to do anyway). */
-const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
-
-/** A transport turn that reports in-progress (thinking/streaming) or
- *  sending/pending but has produced NO provider activity (no delta /
- *  completion / error / tool call / session-info / dispatch) for this long is
- *  treated as a PHANTOM — the provider wedged mid-turn (classic symptom: a
- *  lost `onComplete` leaves `_status='streaming'` and `_sending=true`
- *  forever) — and must NOT block daemon upgrades. Observed in production: a
- *  codex-sdk sub-session stuck in 'streaming' for 8+ hours blocked every
- *  auto-upgrade, pinning the daemon on a stale version. A live turn refreshes
- *  its activity timestamp on every delta, so a real generation never trips
- *  this (the absolute deferral backstop in `handleDaemonUpgrade` is the final
- *  safety net for everything this doesn't catch, e.g. wedged process agents).
- *  Override for tests via IMCODES_TRANSPORT_STALE_TURN_MS. */
-const TRANSPORT_STALE_TURN_MS = (() => {
-  const raw = parseInt(process.env.IMCODES_TRANSPORT_STALE_TURN_MS ?? '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
-})();
 
 /** Snapshot of why a transport session is currently blocking daemon upgrade.
  *  Embedded in the upgrade-blocked log so future "why didn't it upgrade"
@@ -9664,8 +10720,6 @@ export function getTransportSessionUpgradeBlockReason(
  *  `'queued'` as busy; the upgrade gate previously did not, so a turn
  *  dispatched a few hundred ms before an `daemon.upgrade` broadcast would be
  *  silently killed. Including `'queued'` here closes that race. */
-const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running', 'queued']);
-
 /** Per-session reason a daemon upgrade is currently blocked. Covers both
  *  transport-runtime sessions (claude-code-sdk, codex-sdk, qwen, …) and
  *  process-runtime sessions (claude-code, codex, opencode, gemini, shell)
@@ -9886,13 +10940,6 @@ function invalidateFileSearchCachesForPath(targetPath: string): void {
   }
 }
 
-const FS_LIST_DEADLINE_MS = 10_000;
-const FS_LIST_CACHE_TTL_MS = 5_000;
-const FS_LIST_STALE_CACHE_TTL_MS = 30_000;
-const FS_LIST_CACHE_MAX_ENTRIES = 128;
-const FS_LIST_INFLIGHT_FANOUT_CAP = 32;
-const FS_LIST_METADATA_CONCURRENCY = 32;
-
 interface FreshnessCacheEntry<T> {
   expiresAt: number;
   staleUntil?: number;
@@ -9921,10 +10968,6 @@ interface FsListRequestContext {
   markTerminal(): void;
   send(message: Record<string, unknown>): boolean;
 }
-
-const fsListCache = new Map<string, FreshnessCacheEntry<FsLsSnapshot>>();
-const fsListInflight = new Map<string, InflightWork<FsLsSnapshot>>();
-const fsListGenerations = new Map<string, number>();
 
 function sweepExpiredCache<T, E extends FreshnessCacheEntry<T>>(cache: Map<string, E>, now = Date.now()): void {
   for (const [key, entry] of cache) {
@@ -10345,14 +11388,34 @@ async function handleFsListInner(
   }
 
   const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
+  let visibleEntries = snapshot.entries;
+  if (sessionRealRoot) {
+    const filtered: Array<Record<string, unknown>> = [];
+    for (const entry of visibleEntries) {
+      const candidatePath = typeof entry.path === 'string' && entry.path
+        ? entry.path
+        : typeof entry.name === 'string' && entry.name
+          ? nodePath.join(canonical.realPath, entry.name)
+          : '';
+      if (!candidatePath) continue;
+      try {
+        const realCandidate = await fsRealpath(candidatePath);
+        if (!isPathAllowed(realCandidate) || !isSameOrInsidePath(sessionRealRoot, realCandidate)) {
+          continue;
+        }
+        filtered.push(entry);
+      } catch {
+        // Broken symlink or inaccessible entry inside scoped root — omit
+      }
+    }
+    visibleEntries = filtered;
+  }
   const entries = shouldAttachOpenSpecTaskStats(canonical.realPath, includeOpenSpecTaskStats)
-    ? await attachOpenSpecTaskStats(snapshot.entries)
-    : snapshot.entries;
+    ? await attachOpenSpecTaskStats(visibleEntries)
+    : visibleEntries;
 
   requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries });
 }
-
-const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
 
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = typeof cmd.path === 'string' ? cmd.path : '';
@@ -10435,10 +11498,11 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
   if (sessionRoot.realRoot) {
     const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
     if (!target.ok) {
-      const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+      const hasExplicitAllowedRoot = typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim().length > 0;
+      const registeredUpload = !hasExplicitAllowedRoot && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveRegisteredUploadReadTarget(rawPath)
         : null;
-      const legacyPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+      const legacyPublished = !hasExplicitAllowedRoot && !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveAssistantPublishedReadTarget(
           typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
           rawPath,
@@ -10458,13 +11522,6 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
   }
   getDefaultPreviewReadCoordinator().handle(rawPath, requestId, (message) => serverLink.send(message));
 }
-
-const GIT_STATUS_CACHE_TTL_MS = 5_000;
-const GIT_STATUS_STALE_CACHE_TTL_MS = 30_000;
-const GIT_STATUS_CACHE_MAX_ENTRIES = 128;
-const GIT_STATUS_DEADLINE_MS = 10_000;
-const GIT_STATUS_INFLIGHT_FANOUT_CAP = 32;
-const GIT_DIFF_CACHE_TTL_MS = 5_000;
 
 type GitStatusFile = { path: string; code: string; additions?: number; deletions?: number };
 
@@ -10514,19 +11571,6 @@ interface GitDiffSnapshot {
   fileSignature: string;
   diff: string;
 }
-
-const repoContextCache = new Map<string, { expiresAt: number; value: RepoContextBase | null }>();
-const repoSignatureCache = new Map<string, RepoSignatureState>();
-const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
-const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
-const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
-const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
-const gitStatusResponseCache = new Map<string, FreshnessCacheEntry<GitStatusResponseSnapshot>>();
-const gitStatusResponseInflight = new Map<string, InflightWork<GitStatusResponseSnapshot>>();
-const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
-const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
-const gitRepoGenerations = new Map<string, number>();
-const gitDiffGenerations = new Map<string, number>();
 
 function normalizeFsPath(value: string): string {
   return nodePath.resolve(value);
@@ -11281,8 +12325,8 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   if (!rawPath || !requestId) return;
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
-  if (!sessionRoot.ok) {
-    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+  if (!sessionRoot.ok || sessionRoot.allowedRootIsFile) {
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: sessionRoot.ok ? FS_READ_ERROR_CODES.FORBIDDEN_PATH : sessionRoot.error }); } catch { /* ignore */ }
     return;
   }
 
@@ -11342,6 +12386,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
 
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
   const createOnly = cmd.createOnly === true;
+  const isBase64 = cmd.encoding === 'base64';
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
@@ -11352,8 +12397,10 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
+  const writeBuffer = isBase64 ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf-8');
+
   // Size check first (cheap, before any I/O)
-  if (Buffer.byteLength(content, 'utf-8') > FS_WRITE_MAX_BYTES) {
+  if (writeBuffer.byteLength > FS_WRITE_MAX_BYTES) {
     try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }); } catch { /* ignore */ }
     return;
   }
@@ -11400,8 +12447,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
         }
       }
 
-      // Write the file
-      await fsWriteFile(real, content, 'utf-8');
+      // Write the file preserving mode and inode
+      if (isBase64) {
+        await fsWriteFile(real, writeBuffer);
+      } else {
+        await fsWriteFile(real, content, 'utf-8');
+      }
       const newStats = await fsStat(real);
       invalidateFsListCachesForPath(real);
       invalidateFileSearchCachesForPath(real);
@@ -11412,6 +12463,10 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
     }
   } else {
+    if (sessionRoot.allowedRootIsFile) {
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
     // New file: realpath of parent must be within FS_ALLOWED_ROOTS
     const parent = nodePath.dirname(resolved);
     try {
@@ -11431,8 +12486,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
         const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
         if (code !== 'ENOENT') throw err;
       }
-      // Write the file
-      await fsWriteFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
+      // Keep exclusive creation for both binary and UTF-8 text writes.
+      if (isBase64) {
+        await fsWriteFile(resolved, writeBuffer, { flag: 'wx' });
+      } else {
+        await fsWriteFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
+      }
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);
@@ -11447,7 +12506,11 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   }
 }
 
-async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?: string): Promise<
+async function resolveExistingFsMutationTarget(
+  rawPath: string,
+  sessionRealRoot?: string,
+  options?: { allowStagingNextToFileRoot?: boolean },
+): Promise<
   | { ok: true; resolved: string; real: string }
   | { ok: false; error: string; resolved?: string }
 > {
@@ -11466,7 +12529,12 @@ async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?
     const real = await fsRealpath(resolved);
     if (!isPathAllowed(real)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
     if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, real)) {
-      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+      const isAllowedStage = options?.allowStagingNextToFileRoot
+        && nodePath.dirname(real) === nodePath.dirname(sessionRealRoot)
+        && nodePath.basename(real).startsWith('.oo-stage-');
+      if (!isAllowedStage) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+      }
     }
     return { ok: true, resolved, real };
   } catch {
@@ -11474,7 +12542,11 @@ async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?
   }
 }
 
-async function resolveFsMutationDestination(rawPath: string, sessionRealRoot?: string): Promise<
+async function resolveFsMutationDestination(
+  rawPath: string,
+  sessionRealRoot?: string,
+  options?: { overwrite?: boolean; allowedRootIsFile?: boolean },
+): Promise<
   | { ok: true; resolved: string; realParent: string }
   | { ok: false; error: string; resolved?: string }
 > {
@@ -11484,12 +12556,30 @@ async function resolveFsMutationDestination(rawPath: string, sessionRealRoot?: s
   try {
     const realParent = await fsRealpath(parent);
     if (!isPathAllowed(realParent)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
-    if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, realParent)) {
-      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    if (sessionRealRoot) {
+      if (options?.allowedRootIsFile) {
+        if (nodePath.join(realParent, nodePath.basename(resolved)) !== sessionRealRoot) {
+          return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+        }
+      } else if (!isSameOrInsidePath(sessionRealRoot, realParent)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+      }
     }
     try {
-      await fsLstat(resolved);
-      return { ok: false, error: FS_WRITE_ERROR.FILE_EXISTS, resolved };
+      const targetStats = await fsLstat(resolved);
+      if (targetStats.isSymbolicLink()) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+      }
+      if (!options?.overwrite || targetStats.isDirectory()) {
+        return { ok: false, error: FS_WRITE_ERROR.FILE_EXISTS, resolved };
+      }
+      const realExisting = await fsRealpath(resolved);
+      if (!isPathAllowed(realExisting)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: realExisting };
+      }
+      if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, realExisting)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: realExisting };
+      }
     } catch (err) {
       const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
       if (code !== 'ENOENT') return { ok: false, error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, resolved };
@@ -11504,6 +12594,7 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
   const rawPath = cmd.path as string | undefined;
   const rawNewPath = cmd.newPath as string | undefined;
   const requestId = cmd.requestId as string | undefined;
+  const overwrite = cmd.overwrite === true;
   if (!rawPath || !rawNewPath || !requestId) {
     if (requestId) {
       try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath ?? '', newPath: rawNewPath, status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
@@ -11517,19 +12608,29 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const source = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+  const source = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot, {
+    allowStagingNextToFileRoot: sessionRoot.allowedRootIsFile === true,
+  });
   if (!source.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: source.resolved, status: 'error', error: source.error }); } catch { /* ignore */ }
     return;
   }
-  const destination = await resolveFsMutationDestination(rawNewPath, sessionRoot.realRoot);
+  const destination = await resolveFsMutationDestination(rawNewPath, sessionRoot.realRoot, {
+    overwrite,
+    allowedRootIsFile: sessionRoot.allowedRootIsFile === true,
+  });
   if (!destination.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: destination.resolved, status: 'error', error: destination.error }); } catch { /* ignore */ }
     return;
   }
 
   try {
+    const priorStats = overwrite ? await fsStat(destination.resolved).catch(() => null) : null;
     await fsRename(source.resolved, destination.resolved);
+    if (priorStats) {
+      await fsChmod(destination.resolved, priorStats.mode).catch(() => {});
+    }
+    const destStats = await fsStat(destination.resolved).catch(() => null);
     invalidateFsListCachesForPath(source.real);
     invalidateFsListCachesForPath(destination.resolved);
     invalidateFileSearchCachesForPath(source.real);
@@ -11542,7 +12643,8 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
         requestId,
         path: rawPath,
         newPath: rawNewPath,
-        resolvedPath: source.real,
+        resolvedPath: destination.resolved,
+        ...(destStats ? { mtime: destStats.mtimeMs } : {}),
         status: 'ok',
       });
     } catch { /* ignore */ }
@@ -11568,7 +12670,9 @@ async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+  const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot, {
+    allowStagingNextToFileRoot: sessionRoot.allowedRootIsFile === true,
+  });
   if (!target.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.resolved, status: 'error', error: target.error }); } catch { /* ignore */ }
     return;
@@ -11647,6 +12751,7 @@ async function handleTransportApprovalResponse(cmd: Record<string, unknown>, ser
 async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionId = cmd.sessionId as string | undefined;
   if (!sessionId) return;
+  if (isIncognitoSessionName(sessionId) || isIncognitoSession(getSession(sessionId))) return;
   try {
     const { replayTransportHistory, trimTransportHistoryEventsToReplayBudget } = await import('./transport-history.js');
     const events = trimTransportHistoryEventsToReplayBudget(sessionId, await replayTransportHistory(sessionId));
@@ -11713,20 +12818,12 @@ async function handleTransportListModels(
   }
 }
 
-const TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS = 5_000;
-const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
-const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
-
 type TransportListModelsResult = {
   models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean; supportedEffortLevels?: readonly TransportEffortLevel[] }>;
   defaultModel?: string;
   isAuthenticated?: boolean;
   error?: string;
 };
-
-const transportListModelsCache = new Map<string, { expiresAt: number; generation: number; value: TransportListModelsResult }>();
-const transportListModelsInflight = new Map<string, { generation: number; promise: Promise<TransportListModelsResult> }>();
-let transportListModelsCacheGeneration = 0;
 
 function resolveTransportListModelsCacheTtlMs(): number {
   const raw = process.env[TRANSPORT_LIST_MODELS_TTL_ENV];
@@ -11791,7 +12888,23 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   }
 
   if (provider && typeof provider.listModels === 'function') {
-    return await provider.listModels(force);
+    const listed = await provider.listModels(force);
+    if (agentType === AGY_SDK_PROVIDER_ID) {
+      if (listed.models.length === 0 && !listed.error) {
+        return {
+          models: modelIdsToTransportModels(AGY_MODEL_IDS),
+          defaultModel: AGY_DEFAULT_MODEL_ID,
+          isAuthenticated: true,
+        };
+      }
+      if (listed.models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)) {
+        return {
+          ...listed,
+          defaultModel: AGY_DEFAULT_MODEL_ID,
+        };
+      }
+    }
+    return listed;
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
 }
@@ -11911,7 +13024,9 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
     const provider = getProvider(AGY_SDK_PROVIDER_ID) as import('../agent/providers/agy-sdk.js').AgySdkProvider | undefined;
     const cached = provider?.getCachedModels?.();
     if (cached?.models?.length) {
-      return cached;
+      return cached.models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)
+        ? { ...cached, defaultModel: AGY_DEFAULT_MODEL_ID }
+        : cached;
     }
     return {
       models: modelIdsToTransportModels(AGY_MODEL_IDS),
@@ -12173,6 +13288,18 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
     const { requeueAllForReplication } = await import('../context/processed-context-replication.js');
     await requeueAllForReplication();
   }
+}
+
+function handleCompactHijackConfigApply(cmd: Record<string, unknown>): void {
+  if (cmd.sharedActor && typeof cmd.sharedActor === 'object') {
+    logger.warn('compact_hijack.apply: ignoring command carrying sharedActor');
+    return;
+  }
+  if (typeof cmd.enabled !== 'boolean') {
+    logger.warn('compact_hijack.apply: ignoring non-boolean enabled payload');
+    return;
+  }
+  setPersistedCompactHijackGlobalConfig(normalizeCompactHijackGlobalConfig(cmd));
 }
 
 function handleMemoryFeatureConfigApply(cmd: Record<string, unknown>): void {
@@ -13300,6 +14427,11 @@ async function handleMemorySkillsQuery(cmd: Record<string, unknown>, serverLink:
       return;
     }
   }
+  const { ensureFreshSkillRegistries } = await import('../context/skill-registry-builder.js');
+  const refreshed = ensureFreshSkillRegistries({ projectDir });
+  if (refreshed.rebuiltUser || refreshed.rebuiltProject) {
+    publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+  }
   const { getSkillRegistryManagementSnapshot } = await import('../context/skill-registry.js');
   const snapshot = getSkillRegistryManagementSnapshot({ projectDir });
   serverLink.send({
@@ -13382,7 +14514,8 @@ async function handleMemorySkillRead(cmd: Record<string, unknown>, serverLink: S
     }
     let managedPath;
     try {
-      managedPath = assertManagedSkillPathSync({ path: entry.path, projectDir, maxBytes: SKILL_MAX_BYTES });
+      const { assertReadableSkillPathSync } = await import('../context/managed-skill-path.js');
+      managedPath = assertReadableSkillPathSync({ path: entry.path, projectDir, maxBytes: SKILL_MAX_BYTES });
     } catch (error) {
       const code = error instanceof ManagedSkillPathError && error.reason === 'oversize'
         ? MEMORY_MANAGEMENT_ERROR_CODES.SKILL_FILE_TOO_LARGE
@@ -13440,11 +14573,12 @@ async function handleMemorySkillDelete(cmd: Record<string, unknown>, serverLink:
       const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
       if (code !== 'ENOENT') throw error;
     });
+    const { assertReadableSkillPathSync } = await import('../context/managed-skill-path.js');
     const paths = getSkillRegistryPathsForManagement({ projectDir });
     if (rootKind === 'user') {
       writeSkillRegistryManagementSnapshot(paths.user, snapshot.entries.filter((candidate) => {
         try {
-          if (candidate.path && assertManagedSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'user') return false;
+          if (candidate.path && assertReadableSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'user') return false;
         } catch {
           return false;
         }
@@ -13453,7 +14587,7 @@ async function handleMemorySkillDelete(cmd: Record<string, unknown>, serverLink:
     } else if (paths.project) {
       writeSkillRegistryManagementSnapshot(paths.project, snapshot.entries.filter((candidate) => {
         try {
-          if (candidate.path && assertManagedSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'project') return false;
+          if (candidate.path && assertReadableSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'project') return false;
         } catch {
           return false;
         }

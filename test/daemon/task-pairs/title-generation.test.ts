@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Task pair titles: when none was explicitly authored, a short title is
  * generated in the project Brain's configured UI locale, from the QUEUE
@@ -115,7 +116,7 @@ describe('task-pair title generation', () => {
 
   it('updates an older generic placeholder when the locale arrives later', async () => {
     setBrainLocale(undefined);
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'T12', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working',
       title: TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[0], flags: [], flagSides: {}, round: 0, blocking: [],
       previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,

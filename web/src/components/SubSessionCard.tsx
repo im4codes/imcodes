@@ -10,8 +10,9 @@ import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { resizeHandleHoverEvents } from './window-resize.js';
 import { ChatView } from './ChatView.js';
+import { SubSessionTaskTitle } from './SubSessionTaskTitle.js';
 import { resolveContextWindow } from '../model-context.js';
-import { bestModelLabel } from '../model-label.js';
+import { subSessionModelPresentation } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
 import { TerminalTextPreview } from './TerminalTextPreview.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
@@ -104,6 +105,7 @@ interface Props {
   sharedState?: SharedStateSummary | null;
   accentColor?: string;
   previewHydrateDelayMs?: number;
+  sequenceNumber?: number;
 }
 
 function loadCardW(id: string, fallback: number): number {
@@ -146,10 +148,11 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
+    incognito: sub.incognito,
   };
 }
 
-function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160, sequenceNumber }: Props) {
   recordPerfRender('SubSessionCard');
   const { t } = useTranslation();
   // Shared alias data so the compact card's plain-text composer resolves
@@ -195,6 +198,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
       isVisible: timelineHydrated || isOpen || !!isFocused,
       // Cards are collapsed previews; a promoted/open window owns the full stream.
       subscriptionMode: 'summary',
+      incognito: sub.incognito,
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
@@ -408,7 +412,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
 
   const legacyCodexModel = useMemo(() => loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, lastUsage?.model), [sub, detectedModel, lastUsage]);
   const effectiveModel = useMemo(() => resolveEffectiveSessionModel(sub, detectedModel, lastUsage?.model, legacyCodexModel), [sub, detectedModel, lastUsage, legacyCodexModel]);
-  const modelLabel = useMemo(() => bestModelLabel(effectiveModel, lastUsage?.model), [effectiveModel, lastUsage]);
+  const model = useMemo(() => subSessionModelPresentation(effectiveModel, lastUsage?.model), [effectiveModel, lastUsage]);
 
   // Per-card width override (persisted in localStorage)
   const [localW, setLocalW] = useState(() => loadCardW(sub.id, cardW));
@@ -446,20 +450,25 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}${overlayOpen ? ' subcard-overlay-open' : ''}`}
-      style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative', '--subsession-accent-color': accentColor } as JSX.CSSProperties}
+      class={`subcard${sub.incognito ? ' incognito' : ''}${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}${overlayOpen ? ' subcard-overlay-open' : ''}`}
+      style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative', '--subsession-accent-color': accentColor, '--subcard-h': `${cardH}px` } as JSX.CSSProperties}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subcard-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* Header */}
-      <div class="subcard-header">
+      <div class={`subcard-header${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''}`}>
+        {typeof sequenceNumber === 'number' && sequenceNumber > 0 && (
+          <sup class="subcard-seq" data-testid={`subsession-seq-${sub.id}`}>
+            {sequenceNumber}
+          </sup>
+        )}
         <span class="subcard-icon">{icon}</span>
-        <span class="subcard-label">{label}</span>
+        <span class="subcard-label"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={label} /></span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         <SharedStateIndicator state={sharedState} iconOnly />
         {badge && <span class="subcard-badge">{badge}</span>}
         {busy && <span class="subcard-running">●</span>}
-        {modelLabel && <span class="subcard-model">{modelLabel}</span>}
+        {model.label && <span class="subcard-model" title={model.title}>{model.label}</span>}
         {sub.ccPresetId && <span class="subcard-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         {lastUsage && (() => {
           const ctx = resolveContextWindow(
@@ -533,7 +542,21 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
       </div>
 
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
-      <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
+      <div
+        class="subcard-input-area"
+        draggable={false}
+        onPointerDown={(e) => e.stopPropagation()}
+        onTouchStart={(e) => e.stopPropagation()}
+        onTouchMove={(e) => e.stopPropagation()}
+        onTouchEnd={(e) => e.stopPropagation()}
+        onTouchCancel={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        onDblClick={(e) => e.stopPropagation()}
+        onDragStart={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+      >
         <div class="subcard-input-row">
           {/* Fallback cards do not mount SessionControls. Keep their direct
               cancel, while compact SessionControls uses the ordinary
@@ -678,4 +701,5 @@ export const SubSessionCard = memo(SubSessionCardImpl, (prev, next) => (
   && prev.sharedState === next.sharedState
   && prev.accentColor === next.accentColor
   && prev.previewHydrateDelayMs === next.previewHydrateDelayMs
+  && prev.sequenceNumber === next.sequenceNumber
 ));

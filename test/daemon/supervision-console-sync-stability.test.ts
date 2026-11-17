@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 /**
  * tsk_58c8fb1b73: the pair console went out of sync with the daemon in ways the
  * user could only fix by reloading the page.
@@ -61,7 +62,7 @@ function subscribe(over: Record<string, unknown> = {}) {
 
 function save(taskId: string, over: Record<string, unknown> = {}) {
   clock += 1;
-  return store.savePair(PROJECT, {
+  return putTaskPairFixture(store, PROJECT, {
     taskId, brain: BRAIN, executor: `deck_sub_${taskId}_x`, auditor: `deck_sub_${taskId}_a`,
     title: `Pair ${taskId}`, status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
     previousAuditors: [], createdAt: 1, updatedAt: 1_000 + clock, brief: '# brief', executorPool: 'primary',

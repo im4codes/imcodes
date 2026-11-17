@@ -1,3 +1,4 @@
+import { RemoteDesktopTrafficCounter, isTrafficCounter, type RemoteDesktopTraffic } from '@shared/remote-desktop-traffic.js';
 import type { RemoteDesktopEncoderSummary } from './remote-desktop-encoder-label.js';
 import {
   DecodeTimeMonitor,
@@ -128,6 +129,8 @@ const LATENCY_GUARD = {
 const CLIPBOARD_REQUEST_TIMEOUT_MS = 2_000;
 
 export interface RemoteDesktopSnapshot {
+  /** Measured WebRTC transport bytes for this viewer connection. */
+  traffic?: RemoteDesktopTraffic;
   state: RemoteDesktopState;
   mode: RemoteDesktopAccessMode;
   inputEpoch: number;
@@ -532,6 +535,8 @@ export class RemoteDesktopClient {
   private desiredQualityPreference: RemoteDesktopQualityPreference | null = null;
   /** The preference the current worker session already has. */
   private sentQualityPreferenceKey: string | null = null;
+  /** A worker refusal suppresses automatic STATUS-triggered re-sends until the user chooses again. */
+  private rejectedQualityPreferenceKey: string | null = null;
   /**
    * Latency guard: an extra, temporary bitrate ceiling the browser applies on
    * top of the viewer's own choice when the stream shows up late (round trip
@@ -584,6 +589,8 @@ export class RemoteDesktopClient {
   private mediaStarted = false;
   private firstMediaWaitStartedAt: number | null = null;
   private aggregateBytesReceived = 0;
+  private readonly trafficCounter = new RemoteDesktopTrafficCounter();
+  private trafficPeer: RTCPeerConnection | null = null;
   private pendingInputAckSequence: number | null = null;
   private inputAckTimer: ReturnType<typeof setTimeout> | null = null;
   private layoutTransitionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -809,6 +816,10 @@ export class RemoteDesktopClient {
   ): boolean {
     if (!isRemoteDesktopQualityPreference(preference)) return false;
     this.desiredQualityPreference = normalizeRemoteDesktopQualityPreference(preference);
+    // An explicit user choice is a new attempt, even when it repeats the same
+    // preset that the worker refused previously.
+    this.rejectedQualityPreferenceKey = null;
+    this.sentQualityPreferenceKey = null;
     this.latencyGuardEnabled = options.latencyGuard !== false;
     if (!this.latencyGuardEnabled) this.resetLatencyGuard();
     this.flushQualityPreference();
@@ -888,7 +899,7 @@ export class RemoteDesktopClient {
       ? effective
       : legacyRemoteDesktopQualityPreference(effective);
     const key = JSON.stringify(preference);
-    if (key === this.sentQualityPreferenceKey) return;
+    if (key === this.sentQualityPreferenceKey || key === this.rejectedQualityPreferenceKey) return;
     if (this.sendControl({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
       ...this.inputBase(),
@@ -1782,6 +1793,23 @@ export class RemoteDesktopClient {
         this.clearPendingPaste();
         this.sendTypedText(pending.text);
       }
+      if (parsed.value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE
+        && parsed.value.reason === REMOTE_DESKTOP_CONTROL_REJECTION.QUALITY_UNAVAILABLE) {
+        // Older/current workers do not echo a request id. The last sent key is
+        // therefore the only safe correlation available to this wire version;
+        // remember it so repeated STATUS frames cannot replay the refusal.
+        const effective = this.effectiveQualityPreference();
+        const key = effective ? JSON.stringify(
+          this.snapshot.qualityUltraSupported
+            ? effective
+            : legacyRemoteDesktopQualityPreference(effective),
+        ) : null;
+        if (key !== null) {
+          if (key === this.rejectedQualityPreferenceKey) return;
+          this.rejectedQualityPreferenceKey = key;
+          this.sentQualityPreferenceKey = key;
+        }
+      }
       this.publishControlRejection(
         parsed.value.kind,
         parsed.value.reason,
@@ -1874,7 +1902,10 @@ export class RemoteDesktopClient {
       && isOpen(this.pointerChannel);
     if (!this.channelsReady) this.clearPendingPaste();
     // A reopened channel is a new worker session: it has no preference yet.
-    if (!isOpen(this.controlChannel)) this.sentQualityPreferenceKey = null;
+    if (!isOpen(this.controlChannel)) {
+      this.sentQualityPreferenceKey = null;
+      this.rejectedQualityPreferenceKey = null;
+    }
     else this.flushQualityPreference();
     if (this.channelsReady && !this.dataKeepaliveTimer) {
       this.dataKeepaliveTimer = setInterval(() => {
@@ -1916,6 +1947,18 @@ export class RemoteDesktopClient {
           rttMs = Math.max(0, Math.min(3_600_000, value.currentRoundTripTime * 1_000));
         }
       });
+      if (this.trafficPeer !== peer) {
+        this.trafficPeer = peer;
+        this.trafficCounter.nextPeer();
+      }
+      let measuredTraffic = false;
+      for (const entry of entries) {
+        if (entry.type !== 'transport' || typeof entry.id !== 'string'
+          || !isTrafficCounter(entry.bytesSent) || !isTrafficCounter(entry.bytesReceived)) continue;
+        this.trafficCounter.observe(entry.id, { bytesSent: entry.bytesSent, bytesReceived: entry.bytesReceived }, typeof entry.timestamp === 'number' ? entry.timestamp : undefined);
+        measuredTraffic = true;
+      }
+      const traffic = measuredTraffic ? { traffic: { ...this.trafficCounter.total } } : {};
       const inbound = entries.find((value) => value.type === 'inbound-rtp'
         && (value.kind === 'video' || value.mediaType === 'video'));
       if (inbound) this.observeDecodeTime(entries, inbound);
@@ -1956,6 +1999,7 @@ export class RemoteDesktopClient {
         // there is a picture to measure -- "is anything being sent at all" --
         // so they must not ride along with the quality publish alone.
         this.publish({
+          ...traffic,
           durationMs,
           pointerMovesSent: this.pointerMovesSent,
           pointerMovesMirrored: this.pointerMovesMirrored,
@@ -2046,6 +2090,7 @@ export class RemoteDesktopClient {
         if (visible && this.mediaStarted) this.observeLatency(rttMs, jitterBufferMs, bitrateBps, fps);
       }
       this.publish({
+        ...traffic,
         pointerMovesSent: this.pointerMovesSent,
         pointerMovesMirrored: this.pointerMovesMirrored,
         pointerMoveCalls: this.pointerMoveCalls,

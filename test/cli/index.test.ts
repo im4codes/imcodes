@@ -10,7 +10,10 @@ const { setupFlowMock } = vi.hoisted(() => ({ setupFlowMock: vi.fn(async () => {
 // The setup command's own module, mocked so the CLI boundary can be exercised
 // without running a deployment. Everything asserted below is what the CLI hands
 // across that boundary.
-vi.mock('../../src/setup/setup-flow.js', () => ({ setupFlow: setupFlowMock }));
+vi.mock('../../src/setup/setup-flow.js', () => ({
+  setupFlow: setupFlowMock,
+  recoverDomainFromEnv: vi.fn(() => undefined),
+}));
 
 function captureProgram(program: Command): { out: string[]; err: string[] } {
   const out: string[] = [];

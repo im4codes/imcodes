@@ -15,13 +15,31 @@ vi.mock('react-i18next', () => ({
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
 import { TaskPairStatusPanel, TaskPairStatusPanelHost, collapsedStorageKey } from '../../src/components/TaskPairStatusPanel.js';
-import { taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
+import { resolveOrderedTaskPairRows } from '../../src/task-pair-panel-order.js';
+import { SubSessionTaskTitle } from '../../src/components/SubSessionTaskTitle.js';
+import { SupervisionTaskPairSnapshotBridge, taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
-import { SUPERVISION_CONSOLE_UNAVAILABLE_REASONS } from '../../../shared/supervision-task-console.js';
+import {
+  SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
+  clearAllSupervisionTaskConsoleCaches,
+  writeSupervisionTaskConsoleCache,
+} from '../../src/supervision-task-console-cache.js';
+import {
+  SUPERVISION_TASK_CONSOLE_PHASE,
+  SUPERVISION_TASK_CONSOLE_SYNC_STATE,
+  createSupervisionTaskConsoleState,
+} from '../../src/supervision-task-console-reducer.js';
+import { SUPERVISION_TASK_STATUS_CONTRACT_VERSION } from '../../../shared/supervision-config.js';
+import {
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
+  SUPERVISION_TASK_CONSOLE_MSG,
+  SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+} from '../../../shared/supervision-task-console.js';
 import {
   TASK_PAIR_STATUSES,
+  TASK_PAIR_VERBS,
   TASK_PAIR_TERMINAL_STATUSES,
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_WORKSPACE_EFFECTS,
@@ -76,7 +94,7 @@ describe('TaskPairEventChip', () => {
       executor: 'exec-session', executorLabel: 'Executor', noticeText: 'Readable human summary for the hover preview.',
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    fireEvent.pointerEnter(card, { pointerType: 'mouse' });
+    fireEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
     act(() => vi.advanceTimersByTime(179));
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
@@ -89,7 +107,7 @@ describe('TaskPairEventChip', () => {
     expect(preview.textContent).not.toContain('taskPair.card_thinking');
     expect(preview.textContent).toContain('Readable human summary');
     expect(preview.textContent).not.toContain('"taskId"');
-    fireEvent.pointerLeave(card, { pointerType: 'mouse' });
+    fireEvent.pointerLeave(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     act(() => vi.advanceTimersByTime(139));
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
     act(() => vi.advanceTimersByTime(1));
@@ -105,9 +123,9 @@ describe('TaskPairEventChip', () => {
       taskId: 'touch-task', title: 'Touch task', writer: 'daemon', verb: 'DISPATCH', toStatus: 'queued',
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    const touchEnter = createEvent.pointerEnter(card);
+    const touchEnter = createEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!);
     Object.defineProperty(touchEnter, 'pointerType', { value: 'touch' });
-    fireEvent(card, touchEnter);
+    fireEvent(card.querySelector('.task-pair-title-preview-trigger')!, touchEnter);
     act(() => vi.advanceTimersByTime(500));
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
@@ -187,7 +205,7 @@ describe('TaskPairEventChip', () => {
     window.removeEventListener('deck:navigate', listener);
   });
 
-  it('shows session identities and models in the expanded card', () => {
+  it('shows desktop identities and models without expanding and keeps them visible when expanded', () => {
     const { container } = render(<TaskPairEventChip eventId="e-models" sessions={[
       { name: 'deck_sub_exec', activeModel: 'provider/active-executor', effort: 'high' },
       { name: 'deck_sub_aud', requestedModel: 'provider/requested-auditor', effort: 'medium' },
@@ -196,7 +214,7 @@ describe('TaskPairEventChip', () => {
       executor: 'deck_sub_exec', executorLabel: 'Executor', auditor: 'deck_sub_aud', auditorLabel: 'Auditor', unusual: false,
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    expect(card.textContent).not.toContain('provider/active-executor');
+    expect(card.querySelector('.task-pair-card-overview')?.textContent).toContain('provider/active-executor');
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/active-executor"}');
     expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
@@ -243,13 +261,13 @@ describe('TaskPairEventChip', () => {
     expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('2026-01-02T03:04:05.000Z');
   });
 
-  it('renders a task notice reason only after expanding the same card', () => {
+  it('shows a desktop notice preview immediately and the full reason after expanding', () => {
     const { container } = render(<TaskPairEventChip eventId="e-notice" payload={{
       taskId: 'T-notice', title: 'Needs input', writer: 'daemon', verb: 'NEEDS_INPUT', toStatus: 'rework',
       noticeText: 'Needs your decision: an executor is waiting. Why: verify the exact head.', unusual: false,
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    expect(card.textContent).not.toContain('verify the exact head');
+    expect(card.querySelector('.task-pair-card-overview')?.textContent).toContain('verify the exact head');
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('verify the exact head');
   });
@@ -326,12 +344,12 @@ describe('TaskPairEventChip', () => {
       authorization: 'Bearer super-secret',
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    fireEvent.pointerEnter(card, { pointerType: 'mouse' });
+    fireEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     act(() => vi.advanceTimersByTime(180));
     const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
     expect(preview.textContent).toContain('<user-home>');
     expect(preview.textContent).not.toContain('alice');
-    fireEvent.pointerLeave(card, { pointerType: 'mouse' });
+    fireEvent.pointerLeave(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     act(() => vi.advanceTimersByTime(140));
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     const details = card.querySelector('.task-pair-card-audit-details')!;
@@ -367,11 +385,12 @@ describe('TaskPairEventChip', () => {
 
       const splitBtn = container.querySelector('.task-pair-split-btn') as HTMLButtonElement;
       expect(splitBtn).toBeTruthy();
-      expect(splitBtn.textContent).toContain('taskPair.panel_open_split');
+      expect(splitBtn.getAttribute('aria-label')).toBe('taskPair.panel_open_split');
 
       fireEvent.click(splitBtn);
       expect(onSplit).toHaveBeenCalledWith({
         taskId: 'task-chip-split',
+        title: 'Event Chip Task',
         executor: 'exec-sub-1',
         auditor: 'audit-sub-1',
         action: 'open',
@@ -443,10 +462,11 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText('Details matter.')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
     expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter.');
-    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Implement it');
+    fireEvent.click(screen.getByRole('button', { name: /^taskPair\.checklist_toggle/ }));
+    expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Implement it');
     expect(screen.getAllByRole('checkbox')).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'taskPair.brief_copy' })).toBeTruthy();
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :');
   });
   it('updates checklist progress live when the daemon snapshot changes', async () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
@@ -454,13 +474,13 @@ describe('TaskPairStatusPanel', () => {
       assignments: [],
     };
     const view = render(<TaskPairStatusPanel events={[]} serverId="live-brief" />);
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 0/1');
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('0/1 :');
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
       tasks: [{ taskId: 'live-brief', title: 'Live checklist', brief: '- [x][x] Implement it', pair: { status: 'working', updatedAt: 2 } }],
       assignments: [],
     } }));
-    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1'));
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.audited: 1/1');
+    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :'));
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain(': 1/1');
   });
   it('scopes sub-window rows to its own assignments and expands its active brief by default', () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
@@ -474,7 +494,7 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getByText('Mine')).toBeTruthy();
     expect(screen.queryByText('Other')).toBeNull();
     expect(view.container.querySelector('.task-pair-brief-content')).toBeTruthy();
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :');
   });
   it('keeps all 30 pair rows in a scroll container so the last row is reachable', () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
@@ -703,7 +723,7 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('mobile: an expanded panel is bounded to the measured chat area; when almost nothing is left it presents the strip without touching the stored choice', async () => {
-    const events = [{ eventId: 'fit-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fit-1', title: 'Fit task', toStatus: 'working' } }] as never;
+    const events = [{ eventId: 'fit-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fit-1', title: 'Fit task', toStatus: 'working', executor: 'sub-fit' } }] as never;
     const originalMedia = window.matchMedia;
     const originalRaf = window.requestAnimationFrame;
     const originalObserver = globalThis.ResizeObserver;
@@ -726,7 +746,7 @@ describe('TaskPairStatusPanel', () => {
     titlebar.getBoundingClientRect = () => rect(40, 80);
     const flush = async () => { const pending = frames.splice(0); await waitFor(() => { pending.forEach((cb) => cb(0)); }); };
     try {
-      render(<TaskPairStatusPanel events={events} serverId="fit-server" />, { container: titlebar });
+      render(<TaskPairStatusPanel events={events} serverId="fit-server" scopeSessionId="sub-fit" />, { container: titlebar });
       const panel = () => titlebar.querySelector('.task-pair-status-panel') as HTMLElement;
       expect(panel().classList.contains('is-collapsed')).toBe(false);
       expect(panel().style.getPropertyValue('--task-pair-panel-max-h')).toBe(`${600 - 84 - 8}px`);
@@ -1007,13 +1027,14 @@ describe('TaskPairStatusPanel', () => {
         payload: { taskId: 'store-task', title: 'Store label', toStatus: 'working', executor: 'deck_sub_store' },
       }] as never} />);
       expect(screen.getByText('Store Cx')).toBeTruthy();
-      expect(screen.getByText('deck_sub_store')).toBeTruthy();
+      expect(screen.queryByText('deck_sub_store')).toBeNull();
+      expect(document.querySelector('[data-session-name="deck_sub_store"]')).toBeTruthy();
     } finally {
       watchProjectionStore.setSnapshotStatus('switching');
     }
   });
 
-  it('shows live names, exact ids, and models, and navigates roles', () => {
+  it('shows live names and models, keeps exact routing ids, and navigates roles', () => {
     const navigate = vi.fn();
     const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
     window.addEventListener('deck:navigate', listener);
@@ -1022,10 +1043,11 @@ describe('TaskPairStatusPanel', () => {
       payload: { taskId: 'model-task', title: 'Models', toStatus: 'working', executor: 'deck_sub_exec', executorLabel: 'Executor', executorModel: 'gpt-6-sol', auditor: 'deck_sub_aud' },
     }] as never} />);
     expect(screen.getByText('Cx1')).toBeTruthy();
-    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
     expect(screen.getByText('gpt-6-sol')).toBeTruthy();
     expect(screen.getByText('gpt-6-astra')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: /Cx1.*deck_sub_exec/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Cx1.*gpt-6-sol/ }));
     expect(navigate).toHaveBeenCalledWith('deck_sub_exec');
     window.removeEventListener('deck:navigate', listener);
   });
@@ -1042,13 +1064,15 @@ describe('TaskPairStatusPanel', () => {
       },
     }] as never} />);
     expect(screen.queryByText(/taskPair.card_thinking/)).toBeNull();
-    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
   });
 
   it('uses localized neutral role fallbacks when labels are missing', () => {
     render(<TaskPairStatusPanel events={[{ eventId: 'fallback', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fallback-task', title: 'Fallback', toStatus: 'working', executor: 'deck_sub_exec' } }] as never} />);
     expect(screen.getByText('taskPair.panel_executor')).toBeTruthy();
-    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
   });
 
   const readCss = () => {
@@ -1123,12 +1147,12 @@ describe('TaskPairStatusPanel', () => {
     const css = readCss();
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*position:\s*static/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*margin:\s*0 0 0 auto/);
-    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*max-width:\s*100%/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)\s*\{[^}]*position:\s*absolute/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?top:\s*max\(calc\(100% \+ 4px\), 40px\)/);
     // Mobile expanded rules bound the height by the measured chat area (--task-pair-panel-max-h, see
     // task-pair-panel-fit.ts); the viewport-relative value survives as the fallback inside var().
-    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*(?:var\(--task-pair-panel-max-h,\s*)?min\(65vh/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*(?:var\(--task-pair-panel-max-h,\s*)?min\(calc\(var\(--imcodes-ui-vh, 100vh\) \* 0\.65\)/);
   });
 
   it('gives the panel an opaque background from tokens that are actually defined, so it never renders transparent over the toolbar or chat text', () => {
@@ -1311,28 +1335,75 @@ describe('TaskPairStatusPanel', () => {
       fireEvent.click(splitBtn);
       expect(onSplit).toHaveBeenCalledWith({
         taskId: 'task-split-1',
+        title: 'Split View Task',
         executor: 'exec-sub',
         auditor: 'audit-sub',
         action: 'open',
       });
 
-      // When deck:pair-split-state broadcasts activeTaskId, button updates to active / close
+      // Closing belongs to the split windows' titlebars, not this card.
       act(() => {
         window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: 'task-split-1' } }));
       });
-      expect(splitBtn.classList.contains('is-active')).toBe(true);
-      expect(splitBtn.textContent).toContain('taskPair.panel_close_split');
-
-      // Clicking when active dispatches action: 'close'
-      fireEvent.click(splitBtn);
-      expect(onSplit).toHaveBeenCalledWith({
-        taskId: 'task-split-1',
-        executor: 'exec-sub',
-        auditor: 'audit-sub',
-        action: 'close',
+      expect(rows[0].querySelector('.task-pair-split-btn')).toBeNull();
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
       });
+      expect(rows[0].querySelector('.task-pair-split-btn')?.textContent).toContain('taskPair.panel_open_split');
     } finally {
       window.removeEventListener('deck:pair-split', handler);
+      localStorage.clear();
+    }
+  });
+
+  it('leaves closing an active split to the titlebar instead of the expanded event body', () => {
+    const { container } = render(<TaskPairEventChip eventId="split-titlebar" payload={{
+      taskId: 'task-split-header', title: 'Split', verb: 'WORKING', toStatus: 'working',
+      executor: 'exec-sub', auditor: 'audit-sub',
+    }} />);
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-split-btn')).toBeTruthy();
+    act(() => window.dispatchEvent(new CustomEvent('deck:pair-split-state', {
+      detail: { activeTaskId: 'task-split-header' },
+    })));
+    expect(container.querySelector('.task-pair-split-btn')).toBeNull();
+    act(() => window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } })));
+    expect(container.querySelector('.task-pair-split-btn')).toBeTruthy();
+  });
+
+  it('orders visible sequence badges consistently with resolveOrderedTaskPairRows, keeps auditor=none numbered, and puts shortcut hint on split buttons', () => {
+    localStorage.setItem(collapsedStorageKey('s1', false), 'false');
+    try {
+      const snapshot = {
+        authoritative: true,
+        serverId: 's1',
+        tasks: [
+          { taskId: 't-queued-2', title: 'Queued second', status: 'queued', updatedAt: 10, pair: { status: 'queued', queuePosition: 2, executor: 'exec-1', auditor: 'audit-1' } },
+          { taskId: 't-no-audit', title: 'No auditor task', status: 'working', updatedAt: 20, pair: { status: 'working', executor: 'exec-2', auditor: 'none' } },
+          { taskId: 't-working-1', title: 'Working task', status: 'working', updatedAt: 30, pair: { status: 'working', executor: 'exec-3', auditor: 'audit-3' } },
+          { taskId: 't-queued-1', title: 'Queued first', status: 'queued', updatedAt: 40, pair: { status: 'queued', queuePosition: 1, executor: 'exec-4', auditor: 'audit-4' } },
+        ],
+      };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = snapshot;
+      const ordered = resolveOrderedTaskPairRows({ snapshot, events: [], serverId: 's1' });
+      expect(ordered.map((r) => r.payload.taskId)).toEqual(['t-no-audit', 't-working-1', 't-queued-1', 't-queued-2']);
+
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="s1" />);
+      const rows = [...container.querySelectorAll('.task-pair-status-row')];
+      expect(rows.map((row) => row.querySelector('.task-pair-status-sequence')?.textContent)).toEqual(['1', '2', '3', '4']);
+      expect(rows.map((row) => row.querySelector('.task-pair-status-row-title')?.textContent)).toEqual([
+        'No auditor task',
+        'Working task',
+        '#1 Queued first',
+        '#2 Queued second',
+      ]);
+      // Row 1 has auditor='none' so no split button, while rows 2..4 show shortcut hints with their sequence numbers
+      expect(rows[0].querySelector('.task-pair-split-btn')).toBeNull();
+      expect(rows[1].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('2');
+      expect(rows[2].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('3');
+      expect(rows[3].querySelector<HTMLButtonElement>('.task-pair-split-btn')?.title).toContain('4');
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
       localStorage.clear();
     }
   });
@@ -1544,54 +1615,961 @@ describe('TaskPairEventChip status colours', () => {
       for (const source of sourceKeys) expect(taskPair.cancel_source?.[source], `${locale}.cancel_source.${source}`).toBeTruthy();
     }
   });
+
+  it('renders compact overview on desktop without increasing height, while keeping mobile collapsed overview null and accessible on expansion', () => {
+    // 1. Cancelled event with cancelReason, roles, and models on desktop
+    const { container: cancelView } = render(<TaskPairEventChip eventId="e-mobile-cancel" payload={{
+      taskId: 'cancel-m', title: 'Cancelled boundary', writer: 'daemon',
+      verb: 'CANCEL', toStatus: 'cancelled',
+      executor: 'deck_sub_w1', executorLabel: 'Worker', executorModel: 'gpt-6.1-sol',
+      auditor: 'deck_sub_a1', auditorLabel: 'Auditor', auditorModel: 'MiniMax-M3',
+      cancelReason: 'Explicit cancel reason for boundary check',
+    }} />);
+    const cancelOverview = cancelView.querySelector('.task-pair-card-overview')!;
+    expect(cancelOverview).toBeTruthy();
+    expect(cancelOverview.textContent).toContain('Worker');
+    expect(cancelOverview.textContent).toContain('gpt-6.1-sol');
+    expect(cancelOverview.textContent).toContain('Auditor');
+    expect(cancelOverview.textContent).toContain('MiniMax-M3');
+    expect(cancelOverview.textContent).toContain('Explicit cancel reason for boundary check');
+    expect(cancelOverview.querySelector('.task-pair-card-overview-note')?.getAttribute('title')).toBe('Explicit cancel reason for boundary check');
+    cleanup();
+
+    // 2. Active working event with notice text and auditor='none'
+    const { container: noticeView } = render(<TaskPairEventChip eventId="e-notice-none" payload={{
+      taskId: 'notice-none', title: 'Notice with no auditor', writer: 'daemon',
+      verb: 'WORKING', toStatus: 'working',
+      executor: 'deck_sub_w2', executorLabel: 'SoloWorker', executorModel: 'claude-3-7-sonnet',
+      auditor: 'none',
+      noticeText: 'A concise notice for compact chip display',
+    }} />);
+    const noticeOverview = noticeView.querySelector('.task-pair-card-overview')!;
+    expect(noticeOverview).toBeTruthy();
+    expect(noticeOverview.textContent).toContain('SoloWorker');
+    expect(noticeOverview.textContent).toContain('taskPair.panel_no_audit');
+    expect(noticeOverview.textContent).toContain('A concise notice for compact chip display');
+    cleanup();
+
+    // 3. Role with unassigned auditor and long model title
+    const { container: unassignedView } = render(<TaskPairEventChip eventId="e-unassigned" payload={{
+      taskId: 'unassigned-aud', title: 'Unassigned check', writer: 'brain',
+      verb: 'DISPATCH', toStatus: 'queued',
+      executor: 'deck_sub_w3', executorModel: 'anthropic/claude-3-7-sonnet-20250219-thought',
+      auditor: undefined,
+    }} />);
+    const unassignedOverview = unassignedView.querySelector('.task-pair-card-overview')!;
+    expect(unassignedOverview).toBeTruthy();
+    expect(unassignedOverview.textContent).toContain('taskPair.card_unassigned');
+    expect(unassignedOverview.querySelector('.task-pair-card-role-model')?.getAttribute('title')).toBe('anthropic/claude-3-7-sonnet-20250219-thought');
+  });
 });
 
 describe('TaskPairSettingsSection', () => {
   afterEach(() => cleanup());
 
-  it('edits engine and limit starting from the defaults', () => {
+  it('retires the supervision engine selector and edits max parallel pairs from default 5', () => {
     let value: TaskPairSettingsValue = {};
     const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
     render(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    // An unconfigured project is inert (owner decision, 2026-09-26), not
-    // 'pairs' -- the select must show that truthfully, or choosing 'pairs'
-    // fires no input event because it already matches the shown value.
-    expect((screen.getByTestId('task-pair-engine') as HTMLSelectElement).value).toBe('');
+    expect(screen.queryByTestId('task-pair-engine')).toBeNull();
     expect((screen.getByTestId('task-pair-max-concurrency') as HTMLInputElement).value).toBe('5');
-    // Who does executor/auditor work is not configured here -- it is the
-    // execution pool's per-entry role, in SessionSettingsDialog's pool editor.
     expect(screen.queryByTestId(/task-pair-allowlist-row-/)).toBeNull();
 
-    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
     fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '8' } });
     expect(value.pairMaxConcurrency).toBe(8);
   });
 
-  it('renders a stored legacy value as inert unset without offering it again', () => {
-    render(<TaskPairSettingsSection value={{ pairEngine: 'legacy' }} onChange={vi.fn()} />);
-    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect(engine.value).toBe('');
-    expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
+  it('transparently preserves hidden pairEngine values when updating max parallel pairs', () => {
+    for (const persistedEngine of ['pairs', 'legacy'] as const) {
+      cleanup();
+      let value: TaskPairSettingsValue = { pairEngine: persistedEngine, pairMaxConcurrency: 3 };
+      const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
+      render(<TaskPairSettingsSection value={value} onChange={onChange} />);
+      expect(screen.queryByTestId('task-pair-engine')).toBeNull();
+
+      fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '6' } });
+      expect(onChange).toHaveBeenCalledWith({ pairEngine: persistedEngine, pairMaxConcurrency: 6 });
+    }
+  });
+});
+
+
+describe('Pair concrete event actions', () => {
+  afterEach(cleanup);
+  it.each(['SEND', 'TITLE', 'MATERIAL', 'CHECKLIST_AUTO_TICK', 'BRAIN_RESOLVED', 'DECISION', 'DECISION_REQUEST', 'BRIEF_UPDATED', 'IMPORT', 'CORRECT', 'CLAIM', 'CHECK'])('labels known %s instead of a generic record', (verb) => {
+    const { container } = render(<TaskPairEventChip eventId="action" payload={{ taskId: 'action-task', title: 'Action title', verb, toStatus: 'working' }} />);
+    expect(container.querySelector('.task-pair-card-overview > .task-pair-card-event-meta')?.textContent).toBe(`taskPair.verb.${verb.toLowerCase()}`);
+  });
+  it.each([undefined, null, 17, {}, 'FUTURE_EVENT'])('omits unknown %j action rows without losing state or safe diagnostics', (verb) => {
+    const { container } = render(<TaskPairEventChip eventId="unknown" payload={{ taskId: 'action-task', title: 'Kept title', verb, toStatus: 'rework', writer: 'daemon', executor: 'exec-real', executorLabel: 'Executor', executorModel: 'model-x', noticeText: 'Safe reason', password: 'private-secret' }} />);
+    expect(container.querySelectorAll('.task-pair-card-event-meta')).toHaveLength(0);
+    expect(container.textContent).toContain('Kept title');
+    expect(container.textContent).toContain('taskPair.status.rework');
+    const toggle = container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!;
+    act(() => toggle.focus());
+    fireEvent.keyDown(toggle, { key: 'ArrowDown' });
+    const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+    expect(preview.querySelector('.task-pair-card-hover-preview-event')).toBeNull();
+    expect(preview.textContent).toContain('exec-real');
+    fireEvent.click(toggle);
+    expect(container.querySelector('.task-pair-chip-text')).toBeNull();
+    expect(container.querySelectorAll('.task-pair-card-event-meta')).toHaveLength(0);
+    const raw = container.querySelector('.task-pair-card-payload pre')!.textContent!;
+    expect(raw).toContain('Safe reason');
+    expect(raw).not.toContain('private-secret');
+    expect(container.textContent).not.toContain('taskPair.verb.other');
+  });
+  it('normalizes legacy case, omits missing writers, and preserves ordinary verdict status', () => {
+    const { container } = render(<TaskPairEventChip eventId="legacy" payload={{ taskId: 'legacy', title: 'Legacy title', verb: ' pAsS ', toStatus: 'passed' }} />);
+    expect(container.querySelector('.task-pair-card-event-meta')!.textContent).toBe('taskPair.verb.pass');
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-chip-text')!.textContent).toBe('taskPair.verb.pass');
+    expect(container.textContent).toContain('taskPair.status.passed');
+  });
+  it('does not infer a removed workspace from an unknown effect', () => {
+    const { container } = render(<TaskPairEventChip eventId="future-workspace" payload={{ taskId: 'future', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: 'future_workspace_effect', toStatus: 'working' }} />);
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-chip-text')).toBeNull();
+    expect(container.querySelector('.task-pair-card-event-meta')).toBeNull();
+    expect(container.querySelector('.task-pair-card-payload pre')!.textContent).toContain('future_workspace_effect');
+  });
+  it.each(Object.values(TASK_PAIR_WORKSPACE_EFFECTS))('uses an explicit action for workspace %s', (effect) => {
+    const { container } = render(<TaskPairEventChip eventId="workspace-action" payload={{ taskId: 'workspace', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect }} />);
+    const label = container.querySelector('.task-pair-card-event-meta')!.textContent!;
+    expect(label).not.toContain('taskPair.verb.other');
+    expect(label).not.toBe('');
+  });
+});
+
+
+describe('standard Pair verb translations', () => {
+  for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+    it.each(TASK_PAIR_VERBS)(`${locale} has a concrete label for %s`, (verb) => {
+      const web = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+      const taskPair = JSON.parse(readFileSync(join(web, 'src/i18n/locales', `${locale}.json`), 'utf8')).taskPair;
+      expect(taskPair.verb[verb.toLowerCase()]).toBeTruthy();
+    });
+  }
+});
+
+describe('intentional title-only Pair preview', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('matchMedia', (media: string) => ({ matches: media.includes('hover: hover'), media, addEventListener() {}, removeEventListener() {} }));
+  });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+  const payload = { taskId:'title-only', title:'Intentional preview', verb:'CHECK', toStatus:'working', executor:'canonical-exec', auditor:'canonical-audit' };
+  it.each(['.task-pair-event-card','.task-pair-card-kicker','.task-pair-chip-status','.task-pair-card-time','.task-pair-card-role','.task-pair-card-chevron','.task-pair-card-overview'])('non-title %s never starts a preview', selector => {
+    const {container}=render(<TaskPairEventChip eventId="title-only" timestamp={1700000000000} payload={payload} />);
+    fireEvent.pointerEnter(container.querySelector(selector)!,{pointerType:'mouse'});
+    act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('ordinary toggle focus never opens a preview', () => {
+    const {container}=render(<TaskPairEventChip eventId="mouse-focus" payload={payload} />);
+    act(()=>container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!.focus());
+    act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('keeps title→portal operations usable and closes after mouse leaves even after a click', () => {
+    const navigate=vi.fn();window.addEventListener('deck:navigate',navigate);
+    const {container}=render(<TaskPairEventChip eventId="handoff" payload={payload} />);
+    const title=container.querySelector('.task-pair-title-preview-trigger')!;
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(100));
+    fireEvent.pointerLeave(title);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(180));
+    fireEvent.keyDown(window,{key:'Escape'});
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(180));
+    const preview=document.body.querySelector('.task-pair-card-hover-preview')!;
+    fireEvent.pointerLeave(title);fireEvent.pointerEnter(preview);act(()=>vi.advanceTimersByTime(200));
+    expect(document.body.contains(preview)).toBe(true);
+    const role=preview.querySelector<HTMLButtonElement>('.task-pair-chip-session')!;
+    act(()=>role.focus());fireEvent.click(role);
+    expect(navigate.mock.calls[0][0].detail.session).toBe('canonical-exec');
+    fireEvent.pointerLeave(preview);act(()=>vi.advanceTimersByTime(140));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    window.removeEventListener('deck:navigate',navigate);
+  });
+  it('uses one existing tab stop with deliberate keyboard preview, Escape return and normal expansion', () => {
+    const {container}=render(<TaskPairEventChip eventId="keyboard-preview" payload={payload} />);
+    const toggle=container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!;
+    expect(toggle.querySelector('button,[tabindex]')).toBeNull();
+    expect(toggle.getAttribute('aria-keyshortcuts')).toBe('ArrowDown');
+    expect(toggle.getAttribute('aria-description')).toContain('taskPair.card_preview_hint');
+    act(()=>toggle.focus());fireEvent.keyDown(toggle,{key:'ArrowDown'});
+    const preview=document.body.querySelector<HTMLElement>('.task-pair-card-hover-preview')!;
+    expect(document.activeElement).toBe(preview);
+    fireEvent.keyDown(preview,{key:'Escape'});act(()=>vi.advanceTimersByTime(500));
+    expect(document.activeElement).toBe(toggle);
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(toggle);fireEvent.keyDown(toggle,{key:'ArrowDown'});act(()=>vi.advanceTimersByTime(500));
+    expect(container.querySelector('.task-pair-card-body')).toBeTruthy();
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('cancels pending opens on expansion, event replacement and unmount', () => {
+    const view=render(<TaskPairEventChip eventId="pending-1" payload={payload} />);
+    const enter=()=>fireEvent.pointerEnter(view.container.querySelector('.task-pair-title-preview-trigger')!,{pointerType:'mouse'});
+    enter();fireEvent.click(view.container.querySelector('.task-pair-card-toggle')!);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(view.container.querySelector('.task-pair-card-toggle')!);enter();
+    view.rerender(<TaskPairEventChip eventId="pending-2" payload={{...payload,taskId:'other'}} />);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    enter();view.unmount();act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('keeps a translated preview hint in all seven locales', () => {
+    const root=process.cwd().endsWith('/web')?process.cwd():join(process.cwd(),'web');
+    for(const locale of ['en','zh-CN','zh-TW','ja','ko','es','ru']) {
+      const d=JSON.parse(readFileSync(join(root,'src/i18n/locales',`${locale}.json`),'utf8'));
+      expect(d.taskPair.card_preview_hint).toBeTruthy();
+    }
   });
 
-  it('lets the user opt an unconfigured project into pairs, and back out to not-enabled', () => {
-    let value: TaskPairSettingsValue = {};
-    const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
-    const view = render(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect(engine.value).toBe('');
+});
 
-    engine.value = 'pairs';
-    fireEvent.input(engine);
-    expect(onChange).toHaveBeenCalled();
-    expect(value.pairEngine).toBe('pairs');
+describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
+  function fakeWs() {
+    const handlers = new Set<(message: unknown) => void>();
+    const sent: any[] = [];
+    return {
+      sent,
+      ws: {
+        send: (message: object) => { sent.push(message); },
+        onMessage: (handler: (message: unknown) => void) => {
+          handlers.add(handler);
+          return () => { handlers.delete(handler); };
+        },
+      } as any,
+      emit: (message: unknown) => {
+        for (const handler of [...handlers]) handler(message);
+      },
+      latestSubscribe: () => [...sent].reverse().find((frame) => frame.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE),
+    };
+  }
 
-    view.rerender(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    const reselected = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect(reselected.value).toBe('pairs');
-    reselected.value = '';
-    fireEvent.input(reselected);
-    expect(value.pairEngine).toBeUndefined();
+  function snapshotPayload(input: {
+    subscriptionId: string;
+    projectName: string;
+    coordinatorSessionName: string;
+    tasks: Array<{ taskId: string; title: string; status?: string; executor?: string; updatedAt?: number }>;
+    projectionVersion?: number;
+    pairRevision?: number;
+  }) {
+    return {
+      type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+      subscriptionId: input.subscriptionId,
+      scope: { projectName: input.projectName, coordinatorSessionName: input.coordinatorSessionName },
+      schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+      statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+      projectionVersion: input.projectionVersion ?? 1,
+      lastDurableEventId: 10,
+      projectionEpoch: 'epoch-1',
+      pairRevision: input.pairRevision ?? 0,
+      generatedAt: 1_000,
+      tasks: input.tasks.map((task) => ({
+        taskId: task.taskId,
+        title: task.title,
+        status: 'implementing',
+        phase: 'active',
+        validationState: 'pending',
+        updatedAt: task.updatedAt ?? 1_000,
+        lastEventId: 10,
+        pair: {
+          status: task.status ?? 'working',
+          flags: [],
+          round: 0,
+          blocking: ['P0'],
+          executor: task.executor ?? 'deck_sub_exec',
+          auditor: 'deck_sub_aud',
+          createdAt: 500,
+          startedAt: 600,
+          updatedAt: task.updatedAt ?? 1_000,
+        },
+      })),
+      assignments: [],
+      pools: [],
+    };
+  }
+
+  beforeEach(() => {
+    clearAllSupervisionTaskConsoleCaches();
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearAllSupervisionTaskConsoleCaches();
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+  });
+
+  it('recovers warm cached server/tab tasks and sub-session titles immediately on switch without scopeReset flash, then reconciles on SYNCED', async () => {
+    const mock = fakeWs();
+    const eventsLog: any[] = [];
+    const onSnapshot = (event: Event) => { eventsLog.push((event as CustomEvent).detail); };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    try {
+      const view = render(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-a"
+            projectName="proj-a"
+            coordinatorSessionName="deck_a_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-a" />
+          <SubSessionTaskTitle sessionName="deck_sub_a" serverId="srv-a" fallback="Fallback A" />
+        </div>,
+      );
+
+      // Unvisited scope emits scopeReset before first live snapshot.
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(true);
+      const subA = mock.latestSubscribe();
+      expect(subA).toBeTruthy();
+
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subA.subscriptionId,
+          projectName: 'proj-a',
+          coordinatorSessionName: 'deck_a_brain',
+          tasks: [{ taskId: 'tsk-a1', title: 'Server A Task', executor: 'deck_sub_a', updatedAt: 1_000 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Task');
+
+      // Switch to uncached Server B: emits scopeReset, hides Server A tasks immediately.
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-b"
+            projectName="proj-b"
+            coordinatorSessionName="deck_b_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-b" />
+          <SubSessionTaskTitle sessionName="deck_sub_b" serverId="srv-b" fallback="Fallback B" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(true);
+      expect(screen.queryByText('Server A Task')).toBeNull();
+      expect(screen.getByText('Fallback B')).toBeTruthy();
+
+      const subB = mock.latestSubscribe();
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subB.subscriptionId,
+          projectName: 'proj-b',
+          coordinatorSessionName: 'deck_b_brain',
+          tasks: [{ taskId: 'tsk-b1', title: 'Server B Task', executor: 'deck_sub_b', updatedAt: 1_100 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server B Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server B Task');
+
+      // Switch BACK to Server A while live WS hasn't answered yet: instant warm recovery with NO scopeReset!
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected
+            userId="user-1"
+            serverId="srv-a"
+            projectName="proj-a"
+            coordinatorSessionName="deck_a_brain"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-a" />
+          <SubSessionTaskTitle sessionName="deck_sub_a" serverId="srv-a" fallback="Fallback A" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(false);
+      expect(eventsLog.some((entry) => entry?.cached === true && entry?.serverId === 'srv-a')).toBe(true);
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Task');
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Task');
+      expect(screen.queryByText('Server B Task')).toBeNull();
+
+      // Background live SYNCED update arrives: updates finished/new rows smoothly.
+      const subA2 = mock.latestSubscribe();
+      expect(subA2.scope.projectName).toBe('proj-a');
+      act(() => {
+        mock.emit(snapshotPayload({
+          subscriptionId: subA2.subscriptionId,
+          projectName: 'proj-a',
+          coordinatorSessionName: 'deck_a_brain',
+          projectionVersion: 2,
+          pairRevision: 1,
+          tasks: [{ taskId: 'tsk-a2', title: 'Server A Live Followup', status: 'in_audit', executor: 'deck_sub_a', updatedAt: 2_000 }],
+        }));
+      });
+      expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Server A Live Followup');
+      expect(screen.queryByText('Server A Task')).toBeNull();
+      expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Server A Live Followup');
+    } finally {
+      window.removeEventListener('supervision:task-pairs', onSnapshot);
+    }
+  });
+
+  it('never leaks rows across servers that share identical projectName and coordinatorSessionName', () => {
+    const mock = fakeWs();
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-1', projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          t1: {
+            taskId: 't1',
+            title: 'Only On Server One',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 9_000,
+            lastEventId: 1,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 9_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-2', projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'shared', coordinatorSessionName: 'deck_shared_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          t1: {
+            taskId: 't1',
+            title: 'Only On Server Two',
+            status: 'in_audit',
+            phase: 'audit',
+            validationState: 'pending',
+            updatedAt: 5_000,
+            lastEventId: 1,
+            pair: { status: 'in_audit', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 5_000 },
+          },
+        },
+      },
+    );
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected={false}
+          userId="user-1"
+          serverId="srv-1"
+          projectName="shared"
+          coordinatorSessionName="deck_shared_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-1" />
+      </div>,
+    );
+    expect(screen.getByText('Only On Server One')).toBeTruthy();
+
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected={false}
+          userId="user-1"
+          serverId="srv-2"
+          projectName="shared"
+          coordinatorSessionName="deck_shared_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-2" />
+      </div>,
+    );
+    expect(screen.getByText('Only On Server Two')).toBeTruthy();
+    expect(screen.queryByText('Only On Server One')).toBeNull();
+  });
+
+  it('hydrates persisted cache immediately on cold mount before WS exists and hides cleanly if daemon later reports UNAVAILABLE', () => {
+    const auth = { userId: 'user-1', serverId: 'srv-cold', projectName: 'proj-cold', coordinatorSessionName: 'deck_cold_brain' };
+    writeSupervisionTaskConsoleCache(auth, {
+      ...createSupervisionTaskConsoleState({ projectName: auth.projectName, coordinatorSessionName: auth.coordinatorSessionName }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+      projectionVersion: 2,
+      tasks: {
+        cold: {
+          taskId: 'cold',
+          title: 'Persisted Task Across Reload',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 1_500,
+          lastEventId: 2,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_cold', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 1_500 },
+        },
+      },
+    });
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-cold"
+          projectName="proj-cold"
+          coordinatorSessionName="deck_cold_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-cold" />
+        <SubSessionTaskTitle sessionName="deck_sub_cold" serverId="srv-cold" fallback="Cold Fallback" />
+      </div>,
+    );
+
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Persisted Task Across Reload');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Persisted Task Across Reload');
+
+    // Now WS connects and daemon responds UNAVAILABLE -> hides panel & title and clears cache.
+    const mock = fakeWs();
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-1"
+          serverId="srv-cold"
+          projectName="proj-cold"
+          coordinatorSessionName="deck_cold_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-cold" />
+        <SubSessionTaskTitle sessionName="deck_sub_cold" serverId="srv-cold" fallback="Cold Fallback" />
+      </div>,
+    );
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-cold', coordinatorSessionName: 'deck_cold_brain' },
+        reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
+        retryable: true,
+      });
+    });
+
+    expect(screen.queryByText('Persisted Task Across Reload')).toBeNull();
+    expect(screen.getByText('Cold Fallback')).toBeTruthy();
+  });
+
+  it('clears previous tab tasks immediately when switching to a cached empty scope without emitting scopeReset', () => {
+    const mock = fakeWs();
+    const eventsLog: any[] = [];
+    const onSnapshot = (event: Event) => { eventsLog.push((event as CustomEvent).detail); };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    try {
+      writeSupervisionTaskConsoleCache(
+        { userId: 'user-1', serverId: 'srv-tab', projectName: 'proj-nonempty', coordinatorSessionName: 'deck_tab_1' },
+        {
+          ...createSupervisionTaskConsoleState({ projectName: 'proj-nonempty', coordinatorSessionName: 'deck_tab_1' }),
+          phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+          hasAuthoritativeSnapshot: true,
+          syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+          projectionVersion: 1,
+          tasks: {
+            t1: {
+              taskId: 't1',
+              title: 'Tab One Task',
+              status: 'implementing',
+              phase: 'active',
+              validationState: 'pending',
+              updatedAt: 1_000,
+              lastEventId: 1,
+              pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 1_000 },
+            },
+          },
+        },
+      );
+      writeSupervisionTaskConsoleCache(
+        { userId: 'user-1', serverId: 'srv-tab', projectName: 'proj-empty', coordinatorSessionName: 'deck_tab_2' },
+        {
+          ...createSupervisionTaskConsoleState({ projectName: 'proj-empty', coordinatorSessionName: 'deck_tab_2' }),
+          phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+          hasAuthoritativeSnapshot: true,
+          syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+          projectionVersion: 0,
+          tasks: {},
+        },
+      );
+
+      const view = render(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected={false}
+            userId="user-1"
+            serverId="srv-tab"
+            projectName="proj-nonempty"
+            coordinatorSessionName="deck_tab_1"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-tab" />
+        </div>,
+      );
+      expect(screen.getByText('Tab One Task')).toBeTruthy();
+
+      eventsLog.length = 0;
+      view.rerender(
+        <div>
+          <SupervisionTaskPairSnapshotBridge
+            ws={mock.ws}
+            connected={false}
+            userId="user-1"
+            serverId="srv-tab"
+            projectName="proj-empty"
+            coordinatorSessionName="deck_tab_2"
+          />
+          <TaskPairStatusPanelHost events={[]} serverId="srv-tab" />
+        </div>,
+      );
+      expect(eventsLog.some((entry) => entry?.scopeReset === true)).toBe(false);
+      expect(eventsLog.some((entry) => entry?.authorityUnavailable === true)).toBe(false);
+      expect(screen.queryByText('Tab One Task')).toBeNull();
+    } finally {
+      window.removeEventListener('supervision:task-pairs', onSnapshot);
+    }
+  });
+
+  it('replaces panel rows across different project/coordinator/user scopes on the same server even when taskId matches and target updatedAt is older', async () => {
+    // F1 exact counterexample: same serverId, different project/coordinator, identical taskId `tsk_shared`,
+    // where Project A has newer updatedAt=9_000 and Project B has older updatedAt=1_000.
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-same', projectName: 'proj-a', coordinatorSessionName: 'deck_a_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-a', coordinatorSessionName: 'deck_a_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 5,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'Project A Private Task',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 9_000,
+            lastEventId: 5,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 100, startedAt: 100, updatedAt: 9_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-1', serverId: 'srv-same', projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 2,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'Project B Target Task',
+            status: 'in_audit',
+            phase: 'audit',
+            validationState: 'pending',
+            updatedAt: 1_000,
+            lastEventId: 2,
+            pair: { status: 'in_audit', flags: [], round: 1, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'deck_sub_2', createdAt: 50, startedAt: 50, updatedAt: 1_000 },
+          },
+        },
+      },
+    );
+    writeSupervisionTaskConsoleCache(
+      { userId: 'user-2', serverId: 'srv-same', projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+      {
+        ...createSupervisionTaskConsoleState({ projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' }),
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+        hasAuthoritativeSnapshot: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+        projectionVersion: 1,
+        tasks: {
+          tsk_shared: {
+            taskId: 'tsk_shared',
+            title: 'User 2 Target Task',
+            status: 'implementing',
+            phase: 'active',
+            validationState: 'pending',
+            updatedAt: 500,
+            lastEventId: 1,
+            pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 10, startedAt: 10, updatedAt: 500 },
+          },
+        },
+      },
+    );
+
+    const view = render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-same"
+          projectName="proj-a"
+          coordinatorSessionName="deck_a_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Project A Private Task');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Project A Private Task');
+
+    // Switch to Project B (older updatedAt=1_000, same serverId, same taskId): must replace Project A row immediately.
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-1"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Project B Target Task');
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Project B Target Task');
+    expect(screen.queryByText('Project A Private Task')).toBeNull();
+
+    // Switch user on the exact same server/project/coordinator -> must replace with User 2's row (updatedAt=500).
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={null}
+          connected={false}
+          userId="user-2"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Target Task');
+    expect(screen.queryByText('Project B Target Task')).toBeNull();
+
+    // Live WS SYNCED on User 2 updates smoothly while keeping same-scope stale packet protection.
+    const mock = fakeWs();
+    view.rerender(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-2"
+          serverId="srv-same"
+          projectName="proj-b"
+          coordinatorSessionName="deck_b_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-same" />
+        <SubSessionTaskTitle sessionName="deck_sub_1" serverId="srv-same" fallback="Idle" />
+      </div>,
+    );
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-b', coordinatorSessionName: 'deck_b_brain' },
+        schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+        statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+        projectionVersion: 9,
+        lastDurableEventId: 9,
+        projectionEpoch: 'ep-u2',
+        generatedAt: 2_000,
+        tasks: [{
+          taskId: 'tsk_shared',
+          title: 'User 2 Live Synced',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 9,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_1', auditor: 'none', createdAt: 10, startedAt: 10, updatedAt: 2_000 },
+        }],
+        assignments: [],
+        pools: [],
+      });
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Live Synced');
+
+    // Same-scope older timestamp synthetic packet must still be ignored by anti-reorder guard.
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-same',
+          authorityScopeKey: 'user-2\u0000srv-same\u0000proj-b\u0000deck_b_brain',
+          authoritative: true,
+          tasks: [{ taskId: 'tsk_shared', title: 'Stale Out-Of-Order Packet', updatedAt: 100, pair: { status: 'working', updatedAt: 100 } }],
+          assignments: [],
+        },
+      }));
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('User 2 Live Synced');
+    expect(screen.queryByText('Stale Out-Of-Order Packet')).toBeNull();
+  });
+
+  it('drops structurally corrupted persisted cache (e.g. non-array pair.flags) cleanly on cold mount without breaking rendering', () => {
+    const auth = { userId: 'user-1', serverId: 'srv-bad', projectName: 'proj-bad', coordinatorSessionName: 'deck_bad_brain' };
+    const corruptedState = {
+      ...createSupervisionTaskConsoleState({ projectName: auth.projectName, coordinatorSessionName: auth.coordinatorSessionName }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
+      projectionVersion: 1,
+      lastDurableEventId: 1,
+      projectionEpoch: 'ep-1',
+      tasks: {
+        tsk_shared: {
+          taskId: 'tsk_shared',
+          title: 'Corrupted Pair Flags',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 1_000,
+          lastEventId: 1,
+          pair: { status: 'working', flags: 17, round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 1_000 },
+        },
+      },
+    };
+    window.localStorage.setItem(
+      SUPERVISION_TASK_CONSOLE_CACHE_STORAGE_KEY,
+      JSON.stringify([{ authority: auth, accessedAt: 100, state: corruptedState }]),
+    );
+
+    const mock = fakeWs();
+    render(
+      <div>
+        <SupervisionTaskPairSnapshotBridge
+          ws={mock.ws}
+          connected
+          userId="user-1"
+          serverId="srv-bad"
+          projectName="proj-bad"
+          coordinatorSessionName="deck_bad_brain"
+        />
+        <TaskPairStatusPanelHost events={[]} serverId="srv-bad" />
+      </div>,
+    );
+    expect(screen.queryByText('Corrupted Pair Flags')).toBeNull();
+
+    const sub = mock.latestSubscribe();
+    act(() => {
+      mock.emit({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: sub.subscriptionId,
+        scope: { projectName: 'proj-bad', coordinatorSessionName: 'deck_bad_brain' },
+        schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+        statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+        projectionVersion: 2,
+        lastDurableEventId: 2,
+        projectionEpoch: 'ep-1',
+        generatedAt: 2_000,
+        tasks: [{
+          taskId: 'tsk_live',
+          title: 'Recovered From Live Sync',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 2,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 2_000 },
+        }],
+        assignments: [],
+        pools: [],
+      });
+    });
+    expect(screen.getByText('Recovered From Live Sync')).toBeTruthy();
+  });
+
+  it('rejects explicit authoritative:false snapshots on initial mount and updates without clobbering last good state', async () => {
+    const validState = {
+      ...createSupervisionTaskConsoleState({ projectName: 'proj-auth', coordinatorSessionName: 'deck_auth_brain' }),
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+      projectionVersion: 1,
+      tasks: {
+        t_good: {
+          taskId: 't_good',
+          title: 'Authoritative Cached Task',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'pending',
+          updatedAt: 2_000,
+          lastEventId: 1,
+          pair: { status: 'working', flags: [], round: 0, blocking: ['P0'], executor: 'deck_sub_auth', auditor: 'none', createdAt: 1, startedAt: 1, updatedAt: 2_000 },
+        },
+      },
+    };
+    const baseSnapshot = { ...taskConsoleStateToPairSnapshot(validState), serverId: 'srv-auth', cached: true };
+    const rejectedInitial = {
+      ...baseSnapshot,
+      authoritative: false,
+      tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_bad', title: 'Non-authoritative task' }],
+      taskTitles: { t_bad: 'Non-authoritative task' },
+    };
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = rejectedInitial;
+
+    render(
+      <div>
+        <TaskPairStatusPanelHost events={[]} serverId="srv-auth" />
+        <SubSessionTaskTitle sessionName="deck_sub_auth" serverId="srv-auth" fallback="Fallback Title" />
+      </div>,
+    );
+    expect(screen.queryByText('Non-authoritative task')).toBeNull();
+    expect(screen.getByText('Fallback Title')).toBeTruthy();
+
+    // Positive control: cached:true + authoritative:true renders immediately.
+    act(() => {
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = baseSnapshot;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: baseSnapshot }));
+    });
+    await waitFor(() => expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Authoritative Cached Task'));
+    expect(document.querySelector('.subsession-task-name')?.textContent).toBe('Authoritative Cached Task');
+
+    // Subsequent authoritative:false event or wrong-server event must not overwrite or hide last good rows.
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-auth',
+          authoritative: false,
+          tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_spoof', title: 'Spoofed Non-Authoritative' }],
+          taskTitles: { t_spoof: 'Spoofed Non-Authoritative' },
+          assignments: [],
+        },
+      }));
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: {
+          serverId: 'srv-other',
+          authoritative: true,
+          tasks: [{ ...baseSnapshot.tasks[0], taskId: 't_other', title: 'Other Server Task' }],
+          assignments: [],
+        },
+      }));
+    });
+    expect(document.querySelector('.task-pair-status-row-title')?.textContent).toBe('Authoritative Cached Task');
+    expect(screen.queryByText('Spoofed Non-Authoritative')).toBeNull();
+    expect(screen.queryByText('Other Server Task')).toBeNull();
   });
 });

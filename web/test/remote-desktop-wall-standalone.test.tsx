@@ -8,12 +8,14 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../src/components/RemoteDesktopWall.js', () => ({
-  RemoteDesktopWall: ({ standalone, onOpenHost, onClose }: {
+  RemoteDesktopWall: ({ standalone, onConnectById, onOpenHost, onClose }: {
     standalone: boolean;
+    onConnectById?(): void;
     onOpenHost(machine: unknown): void;
     onClose(hostKeys: readonly string[]): void;
   }) => <div data-testid="standalone-wall">
     {String(standalone)}
+    {onConnectById && <button type="button" onClick={onConnectById}>connect-by-id</button>}
     <button type="button" onClick={() => onOpenHost({
       hostId: 'host-a', remoteDesktopHostId: 'host-a', serverId: 'server-a',
       refName: 'a', displayName: 'A', online: true, execEnabled: true, accessRole: 'owner',
@@ -97,5 +99,16 @@ describe('remote desktop wall standalone window', () => {
       expect.stringContaining('popup=yes'),
     );
     expect(popup.opener).toBeNull();
+  });
+
+  it('opens connect-by-id in-page without window.open and closes cleanly on exit', () => {
+    const open = vi.spyOn(window, 'open');
+    const { container } = render(<RemoteDesktopWallStandalone />);
+    fireEvent.click(screen.getByRole('button', { name: 'connect-by-id' }));
+    expect(open).not.toHaveBeenCalled();
+    expect(container.querySelector('.remote-desktop-guest-overlay')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /remote_desktop\.guest\.back_to_imcodes/ }));
+    expect(container.querySelector('.remote-desktop-guest-overlay')).toBeNull();
   });
 });

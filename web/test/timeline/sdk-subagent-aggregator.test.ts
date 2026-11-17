@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
+  makeAgySubagentCanonicalKey,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
@@ -68,6 +69,21 @@ function makeSessionStateEvent(eventId: string, state: string, ts = NOW - 500): 
 }
 
 describe('deriveSdkSubagentStatusRows', () => {
+  it('aggregates hidden AG ACP launch, bound child and completion into one panel row', () => {
+    const canonicalKey=makeAgySubagentCanonicalKey('parent','launch');
+    const meta=makeMeta({provider:SDK_SUBAGENT_PROVIDERS.AGY_SDK,providerKind:SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey,parentSessionId:'parent',parentItemId:'launch',agentPath:'launch',backgrounded:true});
+    const start=makeEvent('ag-call',meta,{hidden:true,seq:1,ts:NOW-300});
+    const bound=makeEvent('ag-call',{...meta,agentPath:'child'},{hidden:true,seq:2,ts:NOW-200});
+    const complete=makeEvent('ag-result',{...meta,agentPath:'child',active:false,terminal:true,normalizedStatus:SDK_SUBAGENT_STATUS.COMPLETE},
+      {hidden:true,type:'tool.result',seq:3,ts:NOW-100});
+    expect(deriveSdkSubagentStatusRows([start,bound],NOW).runningCount).toBe(1);
+    const result=deriveSdkSubagentStatusRows([start,bound,complete],NOW);
+    expect(result.runningCount).toBe(0);
+    expect(result.rows).toMatchObject([{canonicalKey,agentPath:'child',terminal:true,normalizedStatus:SDK_SUBAGENT_STATUS.COMPLETE}]);
+    expect(result.rows).toHaveLength(1);expect(result.diagnostics).toEqual([]);
+  });
+
   it('derives running rows from raw hidden events without transcript visibility state', () => {
     const event = makeEvent('hidden-running', makeMeta({ taskId: 'task-1', taskType: 'local_bash', model: 'haiku' }), { hidden: true });
 

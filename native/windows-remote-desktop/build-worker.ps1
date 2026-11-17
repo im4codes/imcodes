@@ -78,6 +78,7 @@ $ExpectedCommonSources = @(
   'static_refresh_policy.h',
   'transport_session_core.cc', 'transport_session_core.h',
   'value_types.cc', 'value_types.h',
+  'traffic_stats.h', 'webrtc_traffic_stats.h',
   'video_sender_bitrate.h'
 )
 

@@ -6,6 +6,7 @@ import {
   STARTUP_DIAGNOSTIC_EVENT,
   STARTUP_DIAGNOSTICS_HEALTH_LEASE_TIMEOUT_MS,
   StartupDiagnosticsLog,
+  recordBootstrapFailureDiagnostic,
   startupDiagnosticsDir,
   startupDiagnosticsLogPath,
 } from '../../src/node/startup-diagnostics.js';
@@ -230,5 +231,24 @@ describe('StartupDiagnosticsLog', () => {
     expect(() => log.record(STARTUP_DIAGNOSTIC_EVENT.PROCESS_START, {})).not.toThrow();
     await log.drain();
     expect(log.droppedForTests()).toBeGreaterThan(0);
+  });
+
+  it('records pre-runtime bootstrap errors (such as Windows ACL security drift) cleanly before exit', async () => {
+    const logPath = join(directory, 'startup-diagnostics.log');
+    const log = new StartupDiagnosticsLog({ logPath, now: () => Date.UTC(2026, 8, 22, 3, 0, 0) });
+
+    await recordBootstrapFailureDiagnostic(
+      new Error('windows_credential_acl_insecure:unauthorized_allow:S-1-5-21-1254309406-3540811138-863848884-1001:0x1f01ff'),
+      { installerLaunch: false },
+      log,
+    );
+
+    const lines = await readLines(logPath);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      type: 'bootstrap_failed',
+      installerLaunch: false,
+      reason: 'windows_credential_acl_insecure:unauthorized_allow:S-1-5-21-1254309406-3540811138-863848884-1001:0x1f01ff',
+    });
   });
 });

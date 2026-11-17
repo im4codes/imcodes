@@ -803,6 +803,80 @@ int main() {
       }
       std::printf("CopySelection: falls back to CLIPBOARD when nothing is selected\n");
     }
+
+    // PasteText is asynchronous from the target application's point of view:
+    // after Ctrl+V it sends SelectionRequest back to the worker's owner
+    // window.  The worker must pump that request on its shared X11 sequence;
+    // merely becoming the CLIPBOARD owner is not enough.
+    Display* requestor_display = XOpenDisplay(nullptr);
+    if (requestor_display == nullptr) {
+      XCloseDisplay(display);
+      return 95;
+    }
+    const Window requestor = XCreateSimpleWindow(
+        requestor_display, DefaultRootWindow(requestor_display), 0, 0, 1, 1,
+        0, 0, 0);
+    XMapRaised(requestor_display, requestor);
+    XSetInputFocus(requestor_display, requestor, RevertToParent, CurrentTime);
+    XSync(requestor_display, False);
+
+    const std::string payload = "paste request ";
+    const std::string payload_utf8 = payload + "\xE6\xB5\x8B\xE8\xAF\x95";
+    if (!clipboard.PasteText(payload_utf8)) {
+      XDestroyWindow(requestor_display, requestor);
+      XCloseDisplay(requestor_display);
+      XCloseDisplay(display);
+      return 96;
+    }
+    const Atom clipboard_atom = XInternAtom(requestor_display, "CLIPBOARD", False);
+    const Atom utf8_atom = XInternAtom(requestor_display, "UTF8_STRING", False);
+    const Atom property = XInternAtom(requestor_display, "IMCODES_PASTE_TEST", False);
+    for (const Atom target : {utf8_atom, static_cast<Atom>(XA_STRING)}) {
+      XConvertSelection(requestor_display, clipboard_atom, target, property,
+                        requestor, CurrentTime);
+      XFlush(requestor_display);
+      bool answered = false;
+      for (int attempt = 0; attempt < 1000 && !answered; ++attempt) {
+        clipboard.PumpSelectionRequests(8);
+        XSync(requestor_display, False);
+        XEvent event;
+        while (XCheckTypedWindowEvent(requestor_display, requestor,
+                                      SelectionNotify, &event)) {
+          if (event.xselection.property != property) continue;
+          Atom actual_type = None;
+          int actual_format = 0;
+          unsigned long item_count = 0;
+          unsigned long bytes_after = 0;
+          unsigned char* value = nullptr;
+          if (XGetWindowProperty(requestor_display, requestor, property, 0,
+                                 64 * 1024, True, target, &actual_type,
+                                 &actual_format, &item_count, &bytes_after,
+                                 &value) != Success || actual_format != 8 ||
+              item_count != payload_utf8.size() ||
+              std::string(reinterpret_cast<char*>(value), item_count) !=
+                  payload_utf8) {
+            if (value != nullptr) XFree(value);
+            XDestroyWindow(requestor_display, requestor);
+            XCloseDisplay(requestor_display);
+            XCloseDisplay(display);
+            return target == utf8_atom ? 97 : 98;
+          }
+          if (value != nullptr) XFree(value);
+          answered = true;
+          break;
+        }
+        if (!answered) usleep(1'000);
+      }
+      if (!answered) {
+        XDestroyWindow(requestor_display, requestor);
+        XCloseDisplay(requestor_display);
+        XCloseDisplay(display);
+        return target == utf8_atom ? 99 : 100;
+      }
+    }
+    std::printf("PasteText: worker pump served UTF8_STRING and STRING requests\n");
+    XDestroyWindow(requestor_display, requestor);
+    XCloseDisplay(requestor_display);
   }
 
   XCloseDisplay(display);

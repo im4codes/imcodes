@@ -1,4 +1,6 @@
+import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON, TASK_PAIR_DECISION_KIND, validateTaskPairDecisionDetails } from '../../../shared/task-pair-decision.js';
 import { projectPairScheduling, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
+import { buildDependencyTitleRecord } from '../../../shared/task-pair-display.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_VERSION, taskPairTitleWireAccess, isTaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
  * Marker ingestion for the `pairs` supervision engine.
@@ -72,11 +74,14 @@ import {
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
-import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairDecisionRecord, type TaskPairLiveness } from './store.js';
+import { TaskPairWriteConflictError, flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairDecisionRecord, type TaskPairLiveness } from './store.js';
+import type { TaskPairAuthorityContext } from './authority.js';
+import { captureCallerPairAuthority } from '../machine-authority-send.js';
 import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
 import { brainNoticeForCard } from './brain-notice.js';
+import { isTaskPairMissingExplanation, taskPairMissingExplanationKey } from './decision-context.js';
 import type { ArmBrainDecisionFollowUp } from './brain-decision-followup.js';
 import { checkStaleBaseNotice } from './integration-drift.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
@@ -186,6 +191,10 @@ export interface ApplyMarkerInput {
   suppressAutomaticBrief?: boolean;
   /** Runtime assistant-timeline ingestion rejects new Brain pairs unless pair_create was used. */
   requireStructuredPairCreate?: boolean;
+  /** Internal machine-control authority context captured from the caller turn. */
+  authority?: TaskPairAuthorityContext;
+  /** Explicit Brain lifecycle transitions (`pair_dispatch`, `pair_resume`, `pair_reassign`, `pair_next_round`) may replace an earlier participant binding with an active Owner token. */
+  allowOwnerOverride?: boolean;
 }
 
 export interface TaskPairBriefDelivery {
@@ -347,7 +356,10 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
     if (!stored.state.workspaceRecoveryEscalatedAt) {
       const result = await sendTaskPairMessage(stored.state.brain, taskId, 'brain-workspace-unrecoverable', `Workspace for ${taskId} is missing and could not be rebuilt. Recovery sources exhausted; inspect the original branch/commit or provide a new workspace.`);
       if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
-        store.savePair(project, { ...stored.state, workspaceRecoveryEscalatedAt: Date.now(), updatedAt: Date.now() });
+        const fresh = store.getPair(project, taskId);
+        if (fresh && fresh.state.executor === settled.state.executor && fresh.state.workspace?.path === workspace.path) {
+          store.savePair(project, { ...fresh.state, workspaceRecoveryEscalatedAt: Date.now(), updatedAt: Date.now() }, { expectedRevision: fresh.revision });
+        }
       }
     }
     return;
@@ -358,11 +370,14 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
     ...(provision.nonGit ? { nonGit: provision.nonGit } : {}), ...(provision.workingDir ? { workingDir: provision.workingDir } : {}),
     createdAt: now, status: 'active' as const,
   };
-  const next = { ...settled.state, workspace: rebuilt, workspaceRecoveryEscalatedAt: undefined, updatedAt: now };
-  store.savePair(project, next);
+  const fresh = store.getPair(project, taskId);
+  if (!fresh || fresh.state.executor !== settled.state.executor || fresh.state.workspace?.path !== workspace.path
+    || isTerminalTaskPairStatus(fresh.state.status)) return;
+  const next = { ...fresh.state, workspace: rebuilt, workspaceRecoveryEscalatedAt: undefined, updatedAt: now };
+  store.savePair(project, next, { expectedRevision: fresh.revision });
   const notice = `Workspace for ${taskId} was rebuilt from ${WORKSPACE_REVISION_SOURCE_LABEL[provision.source]}: ${provision.path}`;
-  await sendTaskPairMessage(stored.state.executor, taskId, 'workspace-rebuilt', notice);
-  if (stored.state.auditor && stored.state.auditor !== 'none') await sendTaskPairMessage(stored.state.auditor, taskId, 'workspace-rebuilt', notice);
+  if (next.executor) await sendTaskPairMessage(next.executor, taskId, 'workspace-rebuilt', notice);
+  if (next.auditor && next.auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(next.auditor, taskId, 'workspace-rebuilt', notice);
 }
 
 export async function refreshTaskPairWorkspaceHead(project: string, taskId: string): Promise<void> {
@@ -383,13 +398,15 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     // clobber whatever changed (e.g. reopen an 'ended' workspace to 'active').
     const latest = store.getPair(project, taskId);
     const latestWorkspace = latest?.state.workspace;
-    if (!latest || !latestWorkspace || latestWorkspace.status === 'removed') return;
+    if (!latest || !latestWorkspace || latestWorkspace.status === 'removed' || latestWorkspace.path !== workspace.path
+      || latest.state.executor !== stored.state.executor) return;
     const nextWorkspace = {
       ...latestWorkspace,
       lastHead: material.head,
       lastHeadAt: now,
     };
     store.savePair(project, { ...latest.state, workspace: nextWorkspace, updatedAt: Math.max(latest.state.updatedAt, now) }, {
+      expectedRevision: latest.revision,
       liveness: { ...latest.liveness, lastMaterialAt: now },
     });
     // Head persistence and marker/audit handoff must never wait for the
@@ -429,7 +446,7 @@ function queueWorkspaceRewriteCheck(
         lastRebasePreviousHead: previousHead,
       },
       updatedAt: Math.max(latest.state.updatedAt, Date.now()),
-    });
+    }, { expectedRevision: latest.revision });
     queueRebaseWarning(latest.state, taskId, material, previousHead);
   })().catch((error) => logger.warn({ err: error, taskId }, 'task-pair: rewrite probe failed'));
 }
@@ -476,7 +493,7 @@ function queueAuditRebaseWarning(project: string, pair: TaskPairState, material:
         lastRebasePreviousHead: previousHead,
       },
       updatedAt: Date.now(),
-    });
+    }, { expectedRevision: latest.revision });
     queueRebaseWarning(latest.state, pair.taskId, material, previousHead);
   })().catch((error) => logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: audit rebase advisory failed'));
 }
@@ -521,16 +538,31 @@ export class TaskPairService {
     if (!pair || ![pair.state.brain, pair.state.executor, pair.state.auditor].includes(input.owner)) return { ok: false, conflict: undefined };
     const result = store.tryClaimResource(input); if (!result.ok) return result;
     const next = { ...pair.state, resourceClaims: store.listResourceClaimsForPair(input.project, input.taskId, input.now), updatedAt: input.now ?? Date.now() };
-    store.savePair(input.project, next); return { ok: true, claim: result.claim, pair: next };
+    store.savePair(input.project, next, { expectedRevision: pair.revision }); return { ok: true, claim: result.claim, pair: next };
   }
 
   /** Persist a request/final decision and notify the Brain (and both participants for a final decision). */
-  recordDecision(input: Omit<TaskPairDecisionRecord, 'id' | 'at'> & { at?: number }): { record: TaskPairDecisionRecord; created: boolean; notified: string[] } {
+  recordDecision(input: Omit<TaskPairDecisionRecord, 'id' | 'at'> & { at?: number; authority?: TaskPairAuthorityContext }): { record: TaskPairDecisionRecord; created: boolean; notified: string[] } {
     const store = getTaskPairStore();
     const pair = store.getPair(input.project, input.taskId);
     if (!pair) throw new Error('task pair not found');
-    const result = store.recordDecision({ ...input, at: input.at ?? Date.now() });
+    validateTaskPairDecisionDetails(input);
+    const deliveryRound = input.deliveryRound ?? pair.state.deliveryRound ?? 1;
+    if (input.selectedOptionId && !input.requestId) throw new Error('A selected option requires a question reference');
+    if (input.requestId) {
+      const parent = store.decisionById(input.project, input.taskId, input.requestId);
+      if (!parent || parent.kind !== TASK_PAIR_DECISION_KIND.REQUEST || parent.round !== input.round || (parent.deliveryRound ?? 1) !== deliveryRound) throw new Error('Decision request does not match this task round');
+      if (input.selectedOptionId && !parent.options?.some((option) => option.id === input.selectedOptionId)) throw new Error('Unknown decision option');
+    }
+    const result = store.recordDecision({ ...input, deliveryRound, at: input.at ?? Date.now() });
     if (!result.created) return { ...result, notified: [] };
+    if (input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK && input.authority?.kind === 'owner') {
+      store.savePairAuthority(input.project, input.taskId, input.authority);
+    }
+    const notificationAuthority = input.authority
+      ?? (input.author && input.author !== 'human' ? captureCallerPairAuthority(input.author) : undefined)
+      ?? store.getPair(input.project, input.taskId)?.authority
+      ?? pair.authority;
     const fresh = store.getPair(input.project, input.taskId);
     if (fresh) {
       store.saveLiveness(input.project, input.taskId, {
@@ -543,10 +575,16 @@ export class TaskPairService {
       ? [pair.state.brain, pair.state.executor, pair.state.auditor]
       : [pair.state.brain];
     const uniqueTargets = [...new Set(targets.filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR))];
-    const message = `${input.kind === 'decision' ? 'Final decision' : 'Decision request'} recorded for ${input.taskId} round ${input.round}: ${input.conclusion}. ${input.summary}`;
+    const message = `${input.kind === TASK_PAIR_DECISION_KIND.DECISION ? 'Final decision' : input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK ? 'Human feedback' : 'Decision request'} recorded for ${input.taskId} (${pair.state.title ?? input.taskId}) round ${input.round}: ${input.conclusion}. ${input.summary}`
+      + (input.question ? `\nQuestion: ${input.question}` : '')
+      + (input.options?.length ? `\nOptions: ${input.options.map((option) => `${option.id}: ${option.label}`).join('; ')}` : '')
+      + (input.recommendation ? `\nRecommendation: ${input.recommendation}` : '')
+      + (input.requestId ? `\nRelated question: ${input.requestId}` : '')
+      + (input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK ? '\nThis is human feedback, not an audit verdict or automatic resume. Record your ruling and use the existing pair resume/next-round APIs as appropriate.' : '');
     for (const target of uniqueTargets) store.enqueueDecisionNotification({
       project: input.project, taskId: input.taskId, decisionId: result.record.id, target,
-      reason: `decision-${input.kind}`, text: message,
+      reason: target === pair.state.brain ? TASK_PAIR_DECISION_BRAIN_NOTICE_REASON : `decision-${input.kind}`, text: message,
+      ...(notificationAuthority ? { authority: notificationAuthority } : {}),
     });
     this.#track(this.retryDecisionNotifications());
     emitTaskPairDaemonEvent(pair.state, {
@@ -558,15 +596,53 @@ export class TaskPairService {
   }
 
   /** Deliver persisted decision notifications; failed/no-session rows remain for heartbeat retry. */
-  async retryDecisionNotifications(now = Date.now()): Promise<void> {
+  #decisionFlush?: Promise<void>;
+  #decisionFlushAgain = false;
+  retryDecisionNotifications(now = Date.now()): Promise<void> {
+    this.#decisionFlushAgain = true;
+    if (this.#decisionFlush) return this.#decisionFlush;
+    this.#decisionFlush = (async () => {
+      do { this.#decisionFlushAgain = false; await this.#flushDecisionNotifications(now); }
+      while (this.#decisionFlushAgain);
+    })().finally(() => { this.#decisionFlush = undefined; });
+    return this.#decisionFlush;
+  }
+
+  async #flushDecisionNotifications(now: number): Promise<void> {
     const store = getTaskPairStore();
-    for (const pending of store.listPendingDecisionNotifications(100)) {
-      store.markDecisionNotificationAttempt(pending.id, now);
+    let pendingList: ReturnType<typeof store.listPendingDecisionNotifications> = [];
+    try { pendingList = store.listPendingDecisionNotifications(100); } catch { return; }
+    for (const pending of pendingList) {
+      if (pending.reason === 'missing-explanation-request') {
+        const stored = store.getPair(pending.project, pending.taskId);
+        if (!stored || !isTaskPairMissingExplanation(stored)) {
+          // The blocker is no longer missing an explanation (e.g. note provided, resolved, unblocked).
+          // Retire this obsolete outbox row without delivering.
+          try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+          continue;
+        }
+        const currentKey = taskPairMissingExplanationKey(stored);
+        if (pending.decisionId !== currentKey) {
+          // The pending notification belongs to a stale context/episode (e.g. earlier delivery round or different revision).
+          // Retire this obsolete outbox row without delivering.
+          try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+          continue;
+        }
+        const side = stored.state.flagSides?.blocked || stored.state.flagSides?.needs_input;
+        const currentTarget = (side === 'auditor' ? stored.state.auditor : stored.state.executor) || stored.state.executor || stored.state.brain;
+        if (currentTarget !== pending.target) {
+          try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+          continue;
+        }
+      }
+      try { store.markDecisionNotificationAttempt(pending.id, now); } catch { return; }
       let status: TaskPairDeliveryResult = 'failed';
-      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text); } catch { /* retain the row for the next heartbeat */ }
+      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text, pending.decisionId, undefined, pending.authority); } catch { /* retain the row for the next heartbeat */ }
       // skipped_pending can be only the process-local in-flight gate; the
       // original send may still fail, so keep this row pending for retry.
-      if (status === 'sent' || status === 'queued') store.markDecisionNotificationDelivered(pending.id, now);
+      if (status === 'sent' || status === 'queued') {
+        try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+      }
     }
   }
 
@@ -760,6 +836,15 @@ export class TaskPairService {
   }
 
   applyMarker(input: ApplyMarkerInput): TaskPairTransition {
+    for (let attempt = 0; ; attempt += 1) {
+      try { return this.#applyMarkerOnce(input); }
+      catch (error) {
+        if (!(error instanceof TaskPairWriteConflictError) || attempt >= 2 || getTaskPairStore().hasEvent(input.eventId)) throw error;
+      }
+    }
+  }
+
+  #applyMarkerOnce(input: ApplyMarkerInput): TaskPairTransition {
     // Persist the configured thinking level on the pair at the point a role
     // is named.  This is the durable fallback for queue/replay paths where a
     // later session-list refresh may no longer contain the participant.
@@ -852,7 +937,7 @@ export class TaskPairService {
     const eventAttrs = (input.marker.knownVerb === 'PASS' || input.marker.knownVerb === 'REWORK' || input.marker.knownVerb === 'READY_FOR_AUDIT')
       ? { ...input.marker.attrs, __round: eventRound, __head: eventHead }
       : input.marker.attrs;
-    const recorded = store.recordEvent({
+    const event: Parameters<typeof store.recordEvent>[0] = {
       id: input.eventId,
       project: input.project,
       taskId: taskId ?? input.marker.taskId,
@@ -867,8 +952,8 @@ export class TaskPairService {
       ...(transition.fromStatus ? { fromStatus: transition.fromStatus } : {}),
       ...(transition.toStatus ? { toStatus: transition.toStatus } : {}),
       at: now,
-    });
-    if (!recorded) return { effect: 'replayed', unusual: false, intents: [] };
+    };
+    if (!transition.pair && !store.recordEvent(event)) return { effect: 'replayed', unusual: false, intents: [] };
     let stored: StoredTaskPair | undefined = existing;
     if (transition.pair) {
       if (!existing && input.initialScheduling) transition.pair.scheduling = input.initialScheduling;
@@ -895,8 +980,13 @@ export class TaskPairService {
             workspace: { ...workspace, status: 'active' as const, endedAt: undefined, keptReason: undefined, strippedAt: undefined },
           }
         : transition.pair;
+      const resolvedAuthority = input.authority ?? captureCallerPairAuthority(input.writer);
       stored = store.savePair(input.project, redirectMaterialToCurrentWorkspace(pairToSave), {
+        expectedRevision: existing?.revision,
+        event,
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
+        ...(resolvedAuthority ? { authority: resolvedAuthority } : {}),
+        ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
       });
       if (busySessions.size > 0) stored = this.#noteParticipantConflicts(input.project, stored, busySessions);
       this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
@@ -980,6 +1070,28 @@ export class TaskPairService {
           && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')))) {
       this.#track(this.briefParticipants(input.project, stored.state.taskId));
     }
+    if (stored && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')) {
+      const oldExecutor = existing?.state.executor;
+      const newExecutor = stored.state.executor;
+      if (oldExecutor && newExecutor && oldExecutor !== newExecutor) {
+        this.#track(sendTaskPairMessage(
+          oldExecutor,
+          stored.state.taskId,
+          'task-pair-reassigned',
+          `You have been replaced as executor of task ${stored.state.taskId} by ${newExecutor}. Please stop working on this task and do not call pair tools for it.`,
+        ));
+      }
+      const oldAuditor = existing?.state.auditor;
+      const newAuditor = stored.state.auditor;
+      if (oldAuditor && newAuditor && oldAuditor !== newAuditor && oldAuditor !== TASK_PAIR_NO_AUDITOR) {
+        this.#track(sendTaskPairMessage(
+          oldAuditor,
+          stored.state.taskId,
+          'task-pair-reassigned',
+          `You have been replaced as auditor of task ${stored.state.taskId} by ${newAuditor}.`,
+        ));
+      }
+    }
     // Brain's explicit marker can still start a queued pair by hand. It must end
     // up exactly like an admitted pair: workspace provisioned, brief delivered.
     if (stored && !input.suppressAutomaticBrief && input.source !== 'queue' && transition.fromStatus === 'queued'
@@ -993,7 +1105,7 @@ export class TaskPairService {
       const released = store.releaseResourceClaims(input.project, stored.state.taskId, now);
       if (released.length) {
         const cleanup = { releasedAt: now, resources: released.map((claim) => claim.resource), checklist: released.map((claim) => 'Confirm cleanup of ' + claim.resource + '; do not delete resources owned by another pair.') };
-        stored = store.savePair(input.project, { ...stored.state, resourceClaims: [], resourceCleanup: cleanup, updatedAt: now }); transition.pair = stored.state;
+        stored = store.savePair(input.project, { ...stored.state, resourceClaims: [], resourceCleanup: cleanup, updatedAt: now }, { expectedRevision: stored.revision }); transition.pair = stored.state;
         this.#track(sendTaskPairMessage(stored.state.executor ?? stored.state.brain, stored.state.taskId, 'resource-cleanup', 'Claims released for ' + stored.state.taskId + '. Cleanup checklist: ' + cleanup.checklist.join(' | ')));
       }
       this.#track(this.endWorkspace(input.project, stored.state.taskId, now));
@@ -1081,7 +1193,7 @@ export class TaskPairService {
       const markdown = updateTaskPairChecklist(previous.brief ?? '', items, box, true);
       if (markdown === (previous.brief ?? '')) continue;
       const next = { ...previous, brief: markdown, updatedAt: now };
-      current = store.savePair(project, next, { liveness: current.liveness });
+      current = store.savePair(project, next, { expectedRevision: current.revision, liveness: current.liveness });
       const eventId = `${parentEventId}:checklist-auto:${box}`;
       const role = taskPairRoleOf(previous, 'daemon');
       const notice = `Daemon checklist backstop (${reason}) filled ${box} items ${items.join(',')}; no participant CHECK was received for these items before ${markerVerb}.`;
@@ -1163,7 +1275,7 @@ export class TaskPairService {
       ? { ...stored.liveness, notified: [...stored.liveness.notified, ...freshKeys] }
       : stored.liveness;
     const saved = nextState !== current || liveness !== stored.liveness
-      ? store.savePair(project, nextState, { liveness })
+      ? store.savePair(project, nextState, { expectedRevision: stored.revision, liveness })
       : stored;
     if (freshKeys.length > 0) {
       this.#track(sendTaskPairMessage(
@@ -1221,6 +1333,10 @@ export class TaskPairService {
      *  A pair minted for a plain send_message (no metadata) has none of the
      *  Brain's own task description -- see suppressAutoPickAuditor. */
     hasObjective?: boolean;
+    /** Internal machine-control authority context captured from the caller turn. */
+    authority?: TaskPairAuthorityContext;
+    /** Explicit Brain action allowed to override a prior participant binding with an active Owner token. */
+    allowOwnerOverride?: boolean;
     /** The send's own text (objective, or the plain message as a fallback):
      *  stored as the pair's brief when this creates a new pair with none, so
      *  pair_task_get and a later re-dispatch/REASSIGN still have the actual
@@ -1232,9 +1348,13 @@ export class TaskPairService {
   }): TaskPairTransition | undefined {
     const project = input.project ?? projectOfSession(input.sender) ?? projectOfSession(input.target);
     if (!project || !isTaskPairsAvailable(project)) return undefined;
+    const effectiveAuthority = input.authority ?? captureCallerPairAuthority(input.sender);
     const store = getTaskPairStore();
     const existing = store.getPair(project, input.taskId);
     if (existing) {
+      if (effectiveAuthority) {
+        store.savePairAuthority(project, input.taskId, effectiveAuthority, { allowOwnerOverride: input.allowOwnerOverride });
+      }
       this.ensureTaskPairTitle(project, input.taskId, input.brief ?? existing.state.brief ?? existing.state.title, input.sender, { mechanicalTitle: input.titleExplicit !== true });
       if (input.sender === existing.state.brain
         && (input.target === existing.state.executor
@@ -1263,6 +1383,8 @@ export class TaskPairService {
           project, writer: input.sender,
           marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: input.taskId, attrs: {} },
           source: 'implicit_dispatch', eventId: input.eventId,
+          ...(effectiveAuthority ? { authority: effectiveAuthority } : {}),
+          ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
         });
         noteTaskPairFocus(input.target, input.taskId);
         return resumed;
@@ -1355,6 +1477,8 @@ export class TaskPairService {
       source: input.structuredPairCreate ? 'mcp' : 'implicit_dispatch',
       eventId: input.eventId,
       suppressAutomaticBrief: input.suppressAutomaticBrief,
+      ...(effectiveAuthority ? { authority: effectiveAuthority } : {}),
+      ...(input.allowOwnerOverride ? { allowOwnerOverride: true } : {}),
       // Only when named the auditor is applied immediately as before; a bare
       // dispatch with none holds the auto-pick for the grace window unless
       // this send itself carried a real objective (clearly new work, no
@@ -1401,7 +1525,7 @@ export class TaskPairService {
       brainReminderLastDecisionAt: undefined,
       brainReminderLastDecisionReason: undefined,
     };
-    store.savePair(project, next, { liveness });
+    store.savePair(project, next, { expectedRevision: stored.revision, liveness });
     const eventId = `brain-resolved:${messageId}`;
     if (!store.recordEvent({
       id: eventId, project, taskId, writer, role: 'brain', verb: 'BRAIN_RESOLVED',
@@ -1496,7 +1620,7 @@ export class TaskPairService {
     // throttled path instead of rewriting the whole pair row (brief included)
     // and pushing a console delta for every final assistant message.
     if (nextState === pair.state) getTaskPairStore().saveLivenessActivityStamp(pair.project, pair.state.taskId, liveness);
-    else getTaskPairStore().savePair(pair.project, nextState, { liveness });
+    else getTaskPairStore().savePair(pair.project, nextState, { expectedRevision: pair.revision, liveness });
   }
 
   /** Returns true when the stamp changed more than an activity timestamp. */
@@ -1537,7 +1661,7 @@ export class TaskPairService {
     // Plain activity timestamps go through the throttled stamp path.
     if (pair.state.executor === writer && pair.state.flags.includes('executor_silent')) {
       const nextState = { ...pair.state, flags: pair.state.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now };
-      getTaskPairStore().savePair(pair.project, nextState, { liveness });
+      getTaskPairStore().savePair(pair.project, nextState, { expectedRevision: pair.revision, liveness });
       return true;
     }
     // A Brain reply clears the wait and the badge refresh right after it re-arms
@@ -1807,7 +1931,8 @@ export class TaskPairService {
 
   async #settleWorkspaceOwner(project: string, taskId: string, options: { notify: boolean }): Promise<TaskPairState | undefined> {
     const store = getTaskPairStore();
-    const current = store.getPair(project, taskId)?.state;
+    const currentStored = store.getPair(project, taskId);
+    const current = currentStored?.state;
     const workspace = current?.workspace;
     if (!current || !workspace || workspace.kind !== 'worktree' || workspace.status === 'removed' || !current.executor) return current;
     const backoffKey = `${project}\u0000${taskId}`;
@@ -1817,7 +1942,8 @@ export class TaskPairService {
     else if (result.action === 'failed') this.#settleBackoffUntil.set(backoffKey, Date.now() + 5 * 60_000);
     else this.#settleBackoffUntil.delete(backoffKey);
     if (result.action === 'unchanged') return current;
-    const latest = store.getPair(project, taskId)?.state;
+    const latestStored = store.getPair(project, taskId);
+    const latest = latestStored?.state;
     if (!latest) return undefined;
     // A newer executor change, or a rebuild, landed while git ran: this result describes a stale pair.
     if (latest.executor !== current.executor || latest.workspace?.path !== workspace.path) return latest;
@@ -1836,17 +1962,22 @@ export class TaskPairService {
         const branch = result.action === 'moved' ? result.branch : await gitBranchOf(result.to);
         const moved = { ...latest.workspace, path: result.to, previousPaths, movedAt: now, ...(branch ? { branch } : {}) };
         const siblings = await listTaskPairSiblingWorktrees({ ...latest, workspace: moved }).catch(() => [] as string[]);
+        const authority = store.getPair(project, taskId);
+        const currentAuthoritative = authority?.state;
+        if (!currentAuthoritative?.workspace || currentAuthoritative.executor !== current.executor
+          || currentAuthoritative.workspace.path !== workspace.path || currentAuthoritative.workspace.status === 'removed') return currentAuthoritative;
+        const freshMoved = { ...currentAuthoritative.workspace, path: result.to, previousPaths: [...new Set([...(currentAuthoritative.workspace.previousPaths ?? []), result.from])], movedAt: now, ...(branch ? { branch } : {}) };
         const next: TaskPairState = {
-          ...latest,
-          workspace: { ...moved, ...(siblings.length ? { duplicatePaths: siblings } : { duplicatePaths: undefined }) },
-          ...(latest.material ? { material: {
-            ...latest.material,
-            ...(latest.material.worktree ? { worktree: redirectTaskPairWorkspacePath(moved, latest.material.worktree) } : {}),
-            ...(latest.material.path ? { path: redirectTaskPairWorkspacePath(moved, latest.material.path) } : {}),
+          ...currentAuthoritative,
+          workspace: { ...freshMoved, ...(siblings.length ? { duplicatePaths: siblings } : { duplicatePaths: undefined }) },
+          ...(currentAuthoritative.material ? { material: {
+            ...currentAuthoritative.material,
+            ...(currentAuthoritative.material.worktree ? { worktree: redirectTaskPairWorkspacePath(freshMoved, currentAuthoritative.material.worktree) } : {}),
+            ...(currentAuthoritative.material.path ? { path: redirectTaskPairWorkspacePath(freshMoved, currentAuthoritative.material.path) } : {}),
           } } : {}),
-          updatedAt: Math.max(latest.updatedAt, now),
+          updatedAt: Math.max(currentAuthoritative.updatedAt, now),
         };
-        store.savePair(project, next);
+        store.savePair(project, next, { expectedRevision: authority?.revision });
         this.#recordWorkspaceEvent(project, next, result.action === 'moved' ? TASK_PAIR_WORKSPACE_EFFECTS.MOVED : TASK_PAIR_WORKSPACE_EFFECTS.ADOPTED, { from: result.from, to: result.to }, {}, false);
         if (options.notify) {
           const text = buildWorkspaceMovedNotice(next, result.from, result.to, result.action === 'adopted');
@@ -1866,7 +1997,7 @@ export class TaskPairService {
           workspace: { ...latest.workspace, duplicatePaths: [...new Set([...(latest.workspace.duplicatePaths ?? []), result.duplicate])] },
           updatedAt: Math.max(latest.updatedAt, now),
         };
-        store.savePair(project, next);
+        store.savePair(project, next, { expectedRevision: latestStored?.revision });
         this.#recordWorkspaceEvent(project, next, TASK_PAIR_WORKSPACE_EFFECTS.DUPLICATE, { kept: result.kept, duplicate: result.duplicate }, {}, true);
         const text = buildWorkspaceDuplicateNotice(next);
         if (options.notify && next.executor) await sendTaskPairMessage(next.executor, taskId, 'workspace-duplicate', text);
@@ -1895,24 +2026,27 @@ export class TaskPairService {
    */
   async ensureWorkspace(project: string, taskId: string): Promise<TaskPairState | undefined> {
     const store = getTaskPairStore();
-    const current = store.getPair(project, taskId)?.state;
+    const currentStored = store.getPair(project, taskId);
+    const current = currentStored?.state;
     if (!current || !current.executor || isTerminalTaskPairStatus(current.status)) return current;
     // workspace=none: nothing is created, on disk or in the pair record. Never provisioned later either.
     if (current.workspaceKind === TASK_PAIR_WORKSPACE_NONE) return current;
     if (current.workspace && current.workspace.status !== 'removed') {
       // The brief that follows an executor change carries the path itself, so
       // the move needs no separate notice here.
-      const settled = (await this.settleWorkspaceOwner(project, taskId, { notify: false })) ?? current;
-      const existing = settled.workspace;
-      if (!existing || existing.status === 'active') return settled;
+      await this.settleWorkspaceOwner(project, taskId, { notify: false });
+      const fresh = store.getPair(project, taskId);
+      if (!fresh || isTerminalTaskPairStatus(fresh.state.status)) return fresh?.state;
+      const existing = fresh.state.workspace;
+      if (!existing || existing.status === 'active') return fresh.state;
       const { endedAt: _endedAt, keptReason: _keptReason, strippedAt: _strippedAt, ...workspace } = existing;
       // A reopen starts a fresh retention window; the next terminal transition
       // must not inherit the previous terminal timestamp or keep reason.
       const reopened: TaskPairState = {
-        ...settled,
+        ...fresh.state,
         workspace: { ...workspace, status: 'active', endedAt: undefined, keptReason: undefined, strippedAt: undefined },
       };
-      store.savePair(project, reopened);
+      store.savePair(project, reopened, { expectedRevision: fresh.revision });
       return reopened;
     }
     // Before a new worktree is created: make room from finished pairs if the
@@ -1923,6 +2057,8 @@ export class TaskPairService {
     }));
     const latest = store.getPair(project, taskId);
     if (!latest) return undefined;
+    if (latest.state.executor !== current.executor || isTerminalTaskPairStatus(latest.state.status)
+      || (latest.state.workspace && latest.state.workspace.status !== 'removed')) return latest.state;
     if (!provision.ok) {
       logger.warn({ taskId, detail: provision.detail }, 'task-pair: executor workspace not created');
       return latest.state;
@@ -1940,7 +2076,7 @@ export class TaskPairService {
         status: 'active',
       },
     };
-    store.savePair(project, next);
+    store.savePair(project, next, { expectedRevision: latest.revision });
     if (provision.nonGit) {
       this.#recordWorkspaceEvent(project, next, TASK_PAIR_WORKSPACE_EFFECTS.NON_GIT_MODE, { mode: provision.nonGit.mode, ...(provision.nonGit.fallbackReason ? { reason: provision.nonGit.fallbackReason } : {}) }, {}, false);
       const line = provision.brainNotice ?? buildNonGitModeLine(next, provision.nonGit);
@@ -1964,7 +2100,7 @@ export class TaskPairService {
     const workspace = pair?.workspace;
     if (pair && workspace) {
       const latest = store.getPair(project, taskId);
-      if (latest?.state.workspaceRecoveryEscalatedAt) store.savePair(project, { ...latest.state, workspaceRecoveryEscalatedAt: undefined, updatedAt: Date.now() });
+      if (latest?.state.workspaceRecoveryEscalatedAt) store.savePair(project, { ...latest.state, workspaceRecoveryEscalatedAt: undefined, updatedAt: Date.now() }, { expectedRevision: latest.revision });
       this.#recordWorkspaceEvent(project, pair, TASK_PAIR_WORKSPACE_EFFECTS.PROVISIONED_LATE, { path: workspace.path, kind: workspace.kind }, {}, true);
       const notice = `${pair.taskId} had no workspace when it started. Its workspace is now ready at ${workspace.path}. Work and commit there; if you began elsewhere, move that work into it.`;
       if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'workspace-provisioned', notice);
@@ -1976,7 +2112,7 @@ export class TaskPairService {
     const result = await sendTaskPairMessage(latest.state.brain, taskId, 'brain-workspace-unprovisioned', `${taskId} is ${latest.state.status} but has no workspace and the daemon could not create one. Check the project directory and disk space, or provide a workspace; this notice is sent once.`);
     if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
       const current = store.getPair(project, taskId);
-      if (current) store.savePair(project, { ...current.state, workspaceRecoveryEscalatedAt: Date.now(), updatedAt: Date.now() });
+      if (current) store.savePair(project, { ...current.state, workspaceRecoveryEscalatedAt: Date.now(), updatedAt: Date.now() }, { expectedRevision: current.revision });
     }
   }
 
@@ -1995,7 +2131,8 @@ export class TaskPairService {
     // CANCEL keeps its existing first-sweep semantics. If hygiene could not
     // complete, leave the workspace for the normal retry path rather than
     // allowing the immediate removal pass to skip that safety signal.
-    const latest = getTaskPairStore().getPair(project, taskId)?.state;
+    const latestStored = getTaskPairStore().getPair(project, taskId);
+    const latest = latestStored?.state;
     if (!stripped || latest?.status !== 'done' || latest.workspace?.nonGit) return;
     // A terminal transition is already serialized through the pair store. Run
     // one bounded, fail-safe sweep now so clean merged worktrees do not wait
@@ -2006,7 +2143,8 @@ export class TaskPairService {
 
   async #endWorkspaceRetention(project: string, taskId: string, now: number): Promise<void> {
     const store = getTaskPairStore();
-    const pair = store.getPair(project, taskId)?.state;
+    const pairStored = store.getPair(project, taskId);
+    const pair = pairStored?.state;
     // Ending is scheduled after the marker is persisted.  A Brain can reopen
     // the pair before this asynchronous continuation runs; never apply the
     // old terminal transition to that new open state.
@@ -2015,7 +2153,7 @@ export class TaskPairService {
       let next = pair;
       if (pair.workspace && pair.workspace.status !== 'removed') {
         next = { ...pair, workspace: { ...pair.workspace, status: 'ended', endedAt: now } };
-        store.savePair(project, next);
+        store.savePair(project, next, { expectedRevision: pairStored?.revision });
       }
       if (next.status !== 'done' || !next.output) return;
       const beforeCopy = store.getPair(project, taskId)?.state;
@@ -2024,7 +2162,8 @@ export class TaskPairService {
       const copied = await copyTaskPairOutput(next);
       // Reopening can happen while the copy is in flight.  Do not publish a
       // stale workspace event or notify Brain for a newer pair generation.
-      const latest = store.getPair(project, taskId)?.state;
+      const latestStored = store.getPair(project, taskId);
+      const latest = latestStored?.state;
       if (!latest || !isTerminalTaskPairStatus(latest.status)
         || latest.updatedAt !== now || latest.workspace?.endedAt !== now) return;
       const effect = copied.ok ? TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED : TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED;
@@ -2056,7 +2195,8 @@ export class TaskPairService {
    */
   async finishNonGitWorkspace(project: string, taskId: string): Promise<void> {
     const store = getTaskPairStore();
-    const pair = store.getPair(project, taskId)?.state;
+    const pairStored = store.getPair(project, taskId);
+    const pair = pairStored?.state;
     const workspace = pair?.workspace;
     const nonGit = workspace?.nonGit;
     if (!pair || !workspace || !nonGit || pair.status !== 'done' || (nonGit.mode !== 'git_init' && nonGit.mode !== 'cow') || workspace.status === 'removed') return;
@@ -2091,7 +2231,8 @@ export class TaskPairService {
       const repeat = before?.status === outcome.status && (before.files ?? []).join('\n') === outcome.files.join('\n');
       this.#saveApplyBack(project, taskId, { status: outcome.status, files: outcome.files, at: Date.now() });
       if (repeat && outcome.status !== 'applied') return; // a refused merge retried by the sweep: no second notice for the same thing
-      const latest = store.getPair(project, taskId)?.state;
+      const latestStored = store.getPair(project, taskId);
+      const latest = latestStored?.state;
       if (!latest) return;
       const effect = outcome.status === 'applied' ? TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_APPLIED
         : outcome.status === 'noop' ? TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_NOOP
@@ -2103,15 +2244,17 @@ export class TaskPairService {
 
   #saveApplyBack(project: string, taskId: string, applyBack: NonNullable<NonNullable<TaskPairState['workspace']>['nonGit']>['applyBack']): void {
     const store = getTaskPairStore();
-    const latest = store.getPair(project, taskId)?.state;
+    const latestStored = store.getPair(project, taskId);
+    const latest = latestStored?.state;
     if (!latest?.workspace?.nonGit) return;
-    store.savePair(project, { ...latest, workspace: { ...latest.workspace, nonGit: { ...latest.workspace.nonGit, applyBack } } });
+    store.savePair(project, { ...latest, workspace: { ...latest.workspace, nonGit: { ...latest.workspace.nonGit, applyBack } } }, { expectedRevision: latestStored?.revision });
   }
 
   /** Undo a copy-back from its backup (cow only: a git_init merge is undone with git). Files the user changed since are left alone. */
   async undoNonGitApply(project: string, taskId: string): Promise<{ ok: boolean; detail: string; skipped?: string[] }> {
     const store = getTaskPairStore();
-    const pair = store.getPair(project, taskId)?.state;
+    const pairStored = store.getPair(project, taskId);
+    const pair = pairStored?.state;
     const nonGit = pair?.workspace?.nonGit;
     if (!pair?.workspace || !nonGit || nonGit.mode !== 'cow') return { ok: false, detail: 'only a COW workspace has a backup to undo from (a merged git_init pair is undone with git revert)' };
     if (nonGit.applyBack?.status !== 'applied') return { ok: false, detail: `nothing to undo (apply-back status ${nonGit.applyBack?.status ?? 'none'})` };
@@ -2283,7 +2426,8 @@ export class TaskPairService {
     const releaseDeps = {
       ...(dryRun ? { dryRun: true } : {}),
       beforeRemove: () => {
-        const current = store.getPair(stored.project, pair.taskId)?.state;
+        const currentStored = store.getPair(stored.project, pair.taskId);
+        const current = currentStored?.state;
         return Boolean(current?.workspace
           && (current.workspace.status === 'ended' || current.workspace.status === 'kept')
           && isTerminalTaskPairStatus(current.status)
@@ -2293,7 +2437,9 @@ export class TaskPairService {
     };
     const released = await releaseTaskPairWorkspace(pair, releaseDeps);
     if (dryRun || released.action === 'absent' || released.action === 'skipped') return { released };
-    const latest = store.getPair(stored.project, pair.taskId)?.state ?? pair;
+    const latestStored = store.getPair(stored.project, pair.taskId);
+    const latest = latestStored?.state;
+    if (!latest?.workspace || latest.workspace.path !== workspace.path || latest.workspace.endedAt !== workspace.endedAt) return { released };
     if (!latest.workspace || !isTerminalTaskPairStatus(latest.status)) return { released };
     const firstKeep = released.action === 'kept' && latest.workspace.status !== 'kept';
     const next: TaskPairState = {
@@ -2302,7 +2448,7 @@ export class TaskPairService {
         ? { ...latest.workspace, status: 'kept', keptReason: released.reason }
         : { ...latest.workspace, status: 'removed' },
     };
-    store.savePair(stored.project, next);
+    store.savePair(stored.project, next, { expectedRevision: latestStored?.revision });
     if (released.action === 'removed') {
       this.#recordWorkspaceEvent(stored.project, next, TASK_PAIR_WORKSPACE_EFFECTS.REMOVED, { path: workspace.path }, {}, false);
     } else if (firstKeep) {
@@ -2368,12 +2514,13 @@ export class TaskPairService {
    */
   #holdMaterialOutsideBase(project: string, pair: TaskPairState, head: string, base: string): void {
     const store = getTaskPairStore();
-    const latest = store.getPair(project, pair.taskId)?.state;
+    const latestStored = store.getPair(project, pair.taskId);
+    const latest = latestStored?.state;
     if (!latest || latest.status !== 'in_audit' || latest.materialHold) return;
     if (!latest.material?.head || !sameTaskPairCommit(latest.material.head, head)) return;
     const at = Date.now();
     const next: TaskPairState = { ...latest, materialHold: { reason: 'round_base_not_ancestor', head, base, at }, updatedAt: at };
-    store.savePair(project, next);
+    store.savePair(project, next, { expectedRevision: latestStored?.revision });
     const eventId = `material:${pair.taskId}:${TASK_PAIR_MATERIAL_HELD_EFFECT}:${at}`;
     store.recordEvent({
       id: eventId, project, taskId: pair.taskId, writer: 'daemon', role: 'daemon', verb: TASK_PAIR_MATERIAL_EVENT_VERB,
@@ -2409,14 +2556,16 @@ export class TaskPairService {
    */
   async #stripClosedWorkspace(project: string, taskId: string): Promise<boolean> {
     const store = getTaskPairStore();
-    const pair = store.getPair(project, taskId)?.state;
+    const pairStored = store.getPair(project, taskId);
+    const pair = pairStored?.state;
     const workspace = pair?.workspace;
     if (!pair || !workspace || (workspace.kind !== 'worktree' && workspace.kind !== 'dir') || !isTerminalTaskPairStatus(pair.status)) return false;
     if (workspace.status !== 'ended' && workspace.status !== 'kept') return false;
     if (workspace.strippedAt !== undefined) return false;
     const endedAt = workspace.endedAt;
     const stillEligible = (): boolean => {
-      const current = store.getPair(project, taskId)?.state;
+      const currentStored = store.getPair(project, taskId);
+      const current = currentStored?.state;
       return Boolean(current?.workspace
         && isTerminalTaskPairStatus(current.status)
         && (current.workspace.status === 'ended' || current.workspace.status === 'kept')
@@ -2435,9 +2584,10 @@ export class TaskPairService {
       // Unreadable git state: leave it unstripped so a later sweep retries.
       // A directory that could not be removed leaves the pair unstripped, so the next sweep retries it.
       if (!result.ok || result.aborted || result.skipped.some((entry) => entry.reason === 'error') || !stillEligible()) return false;
-      const latest = store.getPair(project, taskId)?.state;
+      const latestStored = store.getPair(project, taskId);
+      const latest = latestStored?.state;
       if (!latest?.workspace) return false;
-      store.savePair(project, { ...latest, workspace: { ...latest.workspace, strippedAt: Date.now() } });
+      store.savePair(project, { ...latest, workspace: { ...latest.workspace, strippedAt: Date.now() } }, { expectedRevision: latestStored?.revision });
       if (result.removed.length > 0) logger.info({ taskId, removed: result.removed.length }, 'task-pair: stripped finished workspace');
       return true;
     } catch (error) {
@@ -2598,7 +2748,7 @@ export class TaskPairService {
     let pair = stored.state;
     if (pair.title !== placeholder) {
       pair = { ...pair, title: placeholder, updatedAt: Date.now() };
-      store.savePair(project, pair);
+      store.savePair(project, pair, { expectedRevision: stored.revision });
       if (options.emitEvent !== false) this.#recordTitleEvent(project, pair, 'title_placeholder');
     }
     // A Brain request must be authored in the owner's UI language.  When the
@@ -2765,10 +2915,23 @@ export function emitTaskPairTimelineEvent(
   pair: TaskPairState | undefined,
   eventId: string,
 ): void {
+  const store = getTaskPairStore();
+  const brainPairs = pair?.brain && (pair.scheduling?.dependsOn.length || pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION)
+    ? store.pairsForSession(pair.brain)
+    : undefined;
+  const project = pair?.brain
+    ? (brainPairs?.find((stored) => stored.state.taskId === pair.taskId)?.project ?? brainPairs?.[0]?.project ?? getSession(pair.brain)?.projectName)
+    : undefined;
+  const dependencyTitles = pair?.scheduling?.dependsOn.length
+    ? buildDependencyTitleRecord(
+      pair.scheduling.dependsOn,
+      (id) => brainPairs?.find((stored) => stored.state.taskId === id)?.state ?? (project ? store.getPair(project, id)?.state : undefined),
+    )
+    : undefined;
   const payload: TaskPairEventPayload = {
     ...base,
     ...(pair ? {
-      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling) } : {}),
+      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling, dependencyTitles) } : {}),
       ...(pair.title ? { title: pair.title } : {}),
       ...(pair.titleAccess ? { titleAccess: taskPairTitleWireAccess(pair.titleAccess) } : {}),
       ...(pair.executor ? { executor: pair.executor } : {}),
@@ -2819,7 +2982,7 @@ export function emitTaskPairTimelineEvent(
   // A pair waiting on Brain: say what became of the last notice to Brain, so
   // the card is not mistaken for a delivery (it only projects the event).
   if (pair?.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && pair.brain) {
-    const owner = getTaskPairStore().pairsForSession(pair.brain).find((stored) => stored.state.taskId === pair.taskId && stored.state.brain === pair.brain);
+    const owner = (brainPairs ?? getTaskPairStore().pairsForSession(pair.brain)).find((stored) => stored.state.taskId === pair.taskId && stored.state.brain === pair.brain);
     const brainNotice = brainNoticeForCard(owner);
     if (brainNotice) payload.brainNotice = brainNotice;
   }

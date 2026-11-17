@@ -22,6 +22,8 @@ describe('Repo message type contract', () => {
     REPO_MSG.COMMIT_DETAIL_RESPONSE,
     REPO_MSG.PR_DETAIL_RESPONSE,
     REPO_MSG.ISSUE_DETAIL_RESPONSE,
+    REPO_MSG.CALLBACK_STATUS_RESPONSE,
+    REPO_MSG.CALLBACK_EVENT,
     REPO_MSG.ERROR,
   ];
 
@@ -37,6 +39,9 @@ describe('Repo message type contract', () => {
     REPO_MSG.COMMIT_DETAIL,
     REPO_MSG.PR_DETAIL,
     REPO_MSG.ISSUE_DETAIL,
+    REPO_MSG.CALLBACK_SYNC,
+    REPO_MSG.CALLBACK_CHECK_NOW,
+    REPO_MSG.CALLBACK_STATUS_REQUEST,
   ];
 
   it('REPO_MSG constants are non-empty strings', () => {

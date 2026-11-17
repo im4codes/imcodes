@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   assertSigningMaterialRemoved,
   buildNotarizationRecord,
+  buildSecurityFindIdentityArgs,
   buildUnstapledNotarizationRecord,
   macosArtifactCanBeSubmittedDirectly,
   macosArtifactSupportsStapling,
@@ -226,5 +227,22 @@ describe('what may be submitted versus what may be stapled', () => {
     expect(source).toContain("'-c', '-k', '--keepParent'");
     expect(source).toContain("run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'staple', artifactPath])");
     expect(source).toContain('rmSync(uploadPath, { force: true })');
+  });
+
+  it('queries keychain without -p codesigning for Developer ID Installer certificates (F7)', () => {
+    expect(buildSecurityFindIdentityArgs('/tmp/release.keychain', 'installer')).toEqual([
+      'find-identity',
+      '-v',
+      '/tmp/release.keychain',
+    ]);
+    expect(buildSecurityFindIdentityArgs('/tmp/release.keychain', 'application')).toEqual([
+      'find-identity',
+      '-v',
+      '-p',
+      'codesigning',
+      '/tmp/release.keychain',
+    ]);
+    const source = readSource('scripts/macos-release-signing.mjs');
+    expect(source).toContain('buildSecurityFindIdentityArgs(keychainPath, certificateType)');
   });
 });

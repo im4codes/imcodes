@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * NEXT_ROUND through the real marker ingestion (tsk_cd_pair_next_round_after_pass):
  * passed -> NEXT_ROUND -> working -> READY -> PASS all take effect, the
@@ -302,7 +303,7 @@ describe('NEXT_ROUND through marker ingestion', () => {
       await openRoundTwoAndSendBadHead();
       sent = [];
       // The daemon resolves the head again; the same bad head is held again.
-      getTaskPairStore().savePair(PROJECT, { ...pair('T1')!, workspace: { kind: 'worktree', path: '/ws/T1', lastHead: HEAD2, createdAt: 1, status: 'active' } });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('T1')!, workspace: { kind: 'worktree', path: '/ws/T1', lastHead: HEAD2, createdAt: 1, status: 'active' } });
       await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T1 -->');
       await say(AUD, '<!-- IMCODES_TASK PASS T1 blocking=P0 -->');
       expect(pair('T1')?.status).toBe('in_audit');

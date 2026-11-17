@@ -62,7 +62,10 @@ describe('AtPicker', () => {
     vi.clearAllMocks();
   });
 
-  function pickerWithQuery(query: string, options: { serverId?: string; onSelectSkill?: (skill: unknown) => void } = {}) {
+  function pickerWithQuery(
+    query: string,
+    options: { serverId?: string; projectDir?: string; sessionName?: string; onSelectSkill?: (skill: unknown) => void } = {},
+  ) {
     const wsClient = {
       connected: true,
       send: vi.fn(),
@@ -80,7 +83,8 @@ describe('AtPicker', () => {
         ]}
         rootSession="deck_proj_brain"
         wsClient={wsClient as any}
-        projectDir="/tmp/proj"
+        projectDir={options.projectDir ?? '/tmp/proj'}
+        sessionName={options.sessionName}
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
         onSelectDelegateAgent={vi.fn()}
@@ -653,6 +657,28 @@ describe('AtPicker', () => {
     expect(screen.getByText('team/skills')).toBeDefined();
     fireEvent.click(screen.getByText('writer'));
     expect(onSelectSkill).toHaveBeenCalledWith(expect.objectContaining({ name: 'writer', source: 'team/skills' }));
+  });
+
+  it('refetches skills when projectDir or sessionName changes while open', async () => {
+    listAgentSkillsMock.mockResolvedValue([
+      { name: 'proj-skill', description: 'Skill from new project' },
+    ]);
+    const onSelectSkill = vi.fn();
+    const { rerender } = render(pickerWithQuery('', { serverId: 'srv1', projectDir: '/tmp/proj-a', sessionName: 'deck_a_brain', onSelectSkill }));
+    fireEvent.click(screen.getAllByText('category')[1]);
+    await flush();
+    expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1', {
+      projectDir: '/tmp/proj-a',
+      sessionName: 'deck_a_brain',
+    });
+
+    listAgentSkillsMock.mockClear();
+    rerender(pickerWithQuery('', { serverId: 'srv1', projectDir: '/tmp/proj-b', sessionName: 'deck_b_brain', onSelectSkill }));
+    await flush();
+    expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1', {
+      projectDir: '/tmp/proj-b',
+      sessionName: 'deck_b_brain',
+    });
   });
   it('returns to the chooser after Escape even when a filter query is still typed', () => {
     // Every back/Escape handler returns to the chooser WITHOUT clearing the

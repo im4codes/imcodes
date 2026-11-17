@@ -2090,11 +2090,11 @@ describe('p2p-workflow reverse-regression', () => {
     // against either a `min(1400px, ...)` expression or a literal 1400
     // anywhere in the panelStyle block.
     expect(
-      /min\(1400px,\s*calc\(100vw\s*-\s*32px\)\)/.test(file.text),
-      'Panel desktop width must use min(1400px, calc(100vw - 32px))',
+      /min\(1400px,\s*calc\((?:var\(--imcodes-ui-vw,\s*100vw\)|100vw)\s*-\s*32px\)\)/.test(file.text),
+      'Panel desktop width must use min(1400px, calc(var(--imcodes-ui-vw, 100vw) - 32px))',
     ).toBe(true);
     expect(
-      /maxWidth:\s*isMobile\s*\?\s*['"]100vw['"]\s*:\s*1400/.test(file.text),
+      /maxWidth:\s*isMobile\s*\?\s*['"](?:var\(--imcodes-ui-vw,\s*100vw\)|100vw)['"]\s*:\s*1400/.test(file.text),
       'Panel desktop maxWidth must be 1400',
     ).toBe(true);
     // Footer must expose BOTH save buttons.

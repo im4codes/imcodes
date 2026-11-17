@@ -19,11 +19,12 @@ import {
   type TaskPairCreatedSessionReason,
 } from '../../../shared/task-pair.js';
 import { supervisionSecondaryLaunchModelOfFamily, type SupervisionExecutionConfig } from '../../../shared/supervision-execution-pool.js';
-import { autoCreatedCount, configuredPools, createPairSubSession, type PairSubSessionFailureReason, type PairSubSessionRequest, type PairSubSessionResult } from '../supervision-auto-provision.js';
+import { autoCreatedCount, configuredPools, createPairSubSession, poolDefinition, type PairSubSessionFailureReason, type PairSubSessionRequest, type PairSubSessionResult } from '../supervision-auto-provision.js';
 import {
   describeNoPoolDefaultShortfall,
   listTaskPairCandidates,
   resolveRequestedModelProvisionConfig,
+  sameModelId,
   sessionProviderFamily,
   type TaskPairPoolDeps,
 } from './pool.js';
@@ -72,7 +73,9 @@ export interface PairSessionCreationDeps extends TaskPairPoolDeps {
 /** The launch config for a created session: an explicit model, an explicit family's secondary model, or the Brain's own family's. */
 export function resolveCreationConfig(parent: SessionRecord, spec: PairSessionCreateSpec | undefined): { ok: true; config: SupervisionExecutionConfig } | { ok: false; error: string } {
   if (spec?.model) {
-    const config = resolveRequestedModelProvisionConfig(spec.model);
+    const definition = poolDefinition(parent, 'primary');
+    const poolMatch = definition?.configs.find((c) => sameModelId(c.model, spec.model!));
+    const config = poolMatch ?? resolveRequestedModelProvisionConfig(spec.model);
     if (!config) return { ok: false, error: `model ${spec.model} cannot be launched (no known runtime for it); name a model such as sonnet or gpt-6-sol` };
     if (spec.providerFamily && config.providerFamily !== spec.providerFamily) {
       return { ok: false, error: `model ${spec.model} belongs to provider family ${config.providerFamily}, not ${spec.providerFamily}` };

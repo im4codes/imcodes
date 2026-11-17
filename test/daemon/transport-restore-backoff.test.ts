@@ -68,7 +68,7 @@ describe('transport restore backoff state', () => {
     expect(transportRestoreFingerprint({ ...base })).toBe(fp);
     for (const change of [
       { sessionInstanceId: 'i2' }, { runtimeEpoch: 'e2' }, { providerId: 'other' }, { providerSessionId: 'ps2' },
-      { providerResumeId: 'resume-1' }, { projectDir: '/tmp/elsewhere' }, { transportConfig: { a: 1 } },
+      { providerResumeId: 'resume-1' }, { agyNativeSessionState: 'unstarted' }, { projectDir: '/tmp/elsewhere' }, { transportConfig: { a: 1 } },
     ]) {
       expect(transportRestoreFingerprint({ ...base, ...change } as typeof base), JSON.stringify(change)).not.toBe(fp);
     }

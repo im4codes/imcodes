@@ -621,4 +621,237 @@ describe('generic i18n coverage guard', () => {
       }
     }
   });
+
+  it('keeps push notification settings keys present in every locale', () => {
+    const PUSH_NOTIFICATION_SETTINGS_KEYS = [
+      'settings.push_notifications_label',
+      'settings.push_notifications_title',
+      'settings.push_notifications_desc',
+      'settings.push_group_basic',
+      'settings.push_task_complete_title',
+      'settings.push_task_complete_desc',
+      'settings.push_waiting_input_title',
+      'settings.push_waiting_input_desc',
+      'settings.push_session_error_title',
+      'settings.push_session_error_desc',
+      'settings.push_group_task_pair',
+      'settings.push_task_pair_done_title',
+      'settings.push_task_pair_done_desc',
+      'settings.push_task_pair_paused_title',
+      'settings.push_task_pair_paused_desc',
+      'settings.push_task_pair_audit_title',
+      'settings.push_task_pair_audit_desc',
+      'settings.push_group_security',
+      'settings.push_security_highest_badge',
+      'settings.push_remote_desktop_title',
+      'settings.push_remote_desktop_desc',
+    ];
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of PUSH_NOTIFICATION_SETTINGS_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('keeps settings tab labels and concise pain-free Feature Guide keys present and translated in all 7 locales', () => {
+    const GUIDE_SECTION_IDS = [
+      'overview',
+      'team',
+      'taskPairs',
+      'executionPools',
+      'controlledNodes',
+      'remoteDesktopOcu',
+      'quickInputVoice',
+      'aliasesVerification',
+      'isolationLiveness',
+      'memoryIdentity',
+      'autoCronMobile',
+    ] as const;
+    const GUIDE_TOP_KEYS = [
+      'settings.tab_profile',
+      'settings.tab_notifications',
+      'settings.tab_security',
+      'settings.tab_guide',
+      'guide.kicker',
+      'guide.title',
+      'guide.subtitle',
+      'guide.quick_jump',
+      'guide.expand_all',
+      'guide.collapse_all',
+      'guide.tips_label',
+    ] as const;
+    const SECTION_FIELDS = ['pill', 'title', 'tagline', 'summary', 'tip_1', 'tip_2', 'tip_3'] as const;
+
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as unknown;
+    const enTitle = readPath(enMessages, 'guide.title');
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      expect(readPath(messages, 'guide.pain_label'), `${locale}:guide.pain_label must be removed`).toBeUndefined();
+      expect(readPath(messages, 'guide.solution_label'), `${locale}:guide.solution_label must be removed`).toBeUndefined();
+      for (const key of GUIDE_TOP_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+      if (locale !== 'en') {
+        expect(readPath(messages, 'guide.title'), `${locale}:guide.title must be translated`).not.toBe(enTitle);
+        expect(readPath(messages, 'settings.tab_profile'), `${locale}:settings.tab_profile must be translated`).not.toBe('Profile');
+        expect(readPath(messages, 'settings.tab_notifications'), `${locale}:settings.tab_notifications must be translated`).not.toBe('Notifications');
+        expect(readPath(messages, 'settings.tab_security'), `${locale}:settings.tab_security must be translated`).not.toBe('Security');
+        expect(readPath(messages, 'settings.tab_guide'), `${locale}:settings.tab_guide must be translated`).not.toBe('User Guide');
+      }
+      for (const id of GUIDE_SECTION_IDS) {
+        expect(readPath(messages, `guide.sections.${id}.pain`), `${locale}:guide.sections.${id}.pain must be removed`).toBeUndefined();
+        expect(readPath(messages, `guide.sections.${id}.solution`), `${locale}:guide.sections.${id}.solution must be removed`).toBeUndefined();
+        for (const field of SECTION_FIELDS) {
+          const key = `guide.sections.${id}.${field}`;
+          const value = readPath(messages, key);
+          expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+          expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+        }
+      }
+    }
+  });
+
+  it('keeps doc_share keys aligned across all 7 locales and covering every key used in DocShareDialog / FileBrowser / OfficePreview', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enDocShareKeys = Object.keys(enMessages.doc_share ?? {}).sort();
+    expect(enDocShareKeys.length).toBeGreaterThan(0);
+
+    const usedKeys = new Set<string>();
+    for (const relPath of [
+      'src/components/DocShareDialog.tsx',
+      'src/components/FileBrowser.tsx',
+      'src/components/OfficePreview.tsx',
+    ]) {
+      const content = readFileSync(join(WEB_ROOT, relPath), 'utf8');
+      for (const match of content.matchAll(/t\(['"](doc_share\.[^'"`]+)['"]/g)) {
+        usedKeys.add(match[1]!);
+      }
+    }
+    expect(usedKeys.size).toBeGreaterThan(0);
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const localeKeys = Object.keys(messages.doc_share ?? {}).sort();
+      expect(localeKeys, `${locale}:doc_share key parity`).toEqual(enDocShareKeys);
+
+      for (const fullKey of usedKeys) {
+        const val = readPath(messages, fullKey);
+        expect(val, `${locale}:${fullKey}`).toEqual(expect.any(String));
+        expect((val as string).trim().length, `${locale}:${fullKey}`).toBeGreaterThan(0);
+      }
+
+      if (locale !== 'en') {
+        expect(messages.doc_share.group_share_title, `${locale}:group_share_title translated`).not.toBe(
+          enMessages.doc_share.group_share_title,
+        );
+        expect(messages.doc_share.tab_team, `${locale}:tab_team translated`).not.toBe(
+          enMessages.doc_share.tab_team,
+        );
+        expect(messages.doc_share.manage_node_groups_btn, `${locale}:manage_node_groups_btn translated`).not.toBe(
+          enMessages.doc_share.manage_node_groups_btn,
+        );
+      }
+    }
+  });
+
+  it('keeps mobile_menu keys aligned across all 7 locales and translated outside English', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enKeys = Object.keys(enMessages.mobile_menu ?? {}).sort();
+    expect(enKeys).toEqual(
+      expect.arrayContaining(['home', 'change_server', 'switch_view', 'tab_servers', 'tab_remote', 'remote_connect', 'remote_connect_label', 'remote_unavailable']),
+    );
+
+    const usedKeys = new Set<string>();
+    for (const relPath of [
+      'src/components/MobileServerMenuToolbar.tsx',
+      'src/components/MobileRemoteDesktopMenuList.tsx',
+    ]) {
+      const content = readFileSync(join(WEB_ROOT, relPath), 'utf8');
+      for (const match of content.matchAll(/t\(['"](mobile_menu\.[^'"`]+)['"]/g)) {
+        usedKeys.add(match[1]!);
+      }
+    }
+    expect(usedKeys.size).toBeGreaterThan(0);
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const localeKeys = Object.keys(messages.mobile_menu ?? {}).sort();
+      expect(localeKeys, `${locale}:mobile_menu key parity`).toEqual(enKeys);
+
+      for (const fullKey of usedKeys) {
+        const val = readPath(messages, fullKey);
+        expect(val, `${locale}:${fullKey}`).toEqual(expect.any(String));
+        expect((val as string).trim().length, `${locale}:${fullKey}`).toBeGreaterThan(0);
+      }
+
+      if (locale !== 'en') {
+        expect(messages.mobile_menu.tab_servers, `${locale}:tab_servers translated`).not.toBe(
+          enMessages.mobile_menu.tab_servers,
+        );
+        expect(messages.mobile_menu.tab_remote, `${locale}:tab_remote translated`).not.toBe(
+          enMessages.mobile_menu.tab_remote,
+        );
+        expect(messages.mobile_menu.remote_connect, `${locale}:remote_connect translated`).not.toBe(
+          enMessages.mobile_menu.remote_connect,
+        );
+      }
+    }
+  });
+
+  it('keeps featureAnnouncements.cloudDocs localized per language without mixed Chinese/English cloud-doc nouns', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enKeys = Object.keys(enMessages.featureAnnouncements ?? {}).sort();
+    expect(enKeys).toEqual(expect.arrayContaining(['label', 'messagePins', 'cloudDocs', 'dismiss']));
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const announcements = messages.featureAnnouncements ?? {};
+      expect(Object.keys(announcements).sort(), `${locale}:featureAnnouncements key parity`).toEqual(enKeys);
+
+      for (const [key, value] of Object.entries(announcements)) {
+        expect(value, `${locale}:featureAnnouncements.${key}`).toEqual(expect.any(String));
+        expect((value as string).trim().length, `${locale}:featureAnnouncements.${key}`).toBeGreaterThan(0);
+      }
+
+      const cloudDocsText = String(announcements.cloudDocs ?? '');
+      if (locale !== 'en') {
+        expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain English "cloud doc"`).not.toMatch(/cloud\s+docs?/i);
+      }
+      if (!locale.startsWith('zh-')) {
+        expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain Chinese cloud-doc terms`).not.toContain('云文档');
+        expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain Traditional Chinese cloud-doc terms`).not.toContain('雲端文件');
+        if (locale !== 'ja') {
+          expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain Han characters`).not.toMatch(/[\u4e00-\u9fff]/);
+        }
+      } else if (locale === 'zh-CN') {
+        expect(cloudDocsText, 'zh-CN:featureAnnouncements.cloudDocs should use 云文档').toContain('云文档');
+        expect(cloudDocsText, 'zh-CN:featureAnnouncements.cloudDocs must not mix 雲端文件').not.toContain('雲端文件');
+      } else if (locale === 'zh-TW') {
+        expect(cloudDocsText, 'zh-TW:featureAnnouncements.cloudDocs should use 雲端文件').toContain('雲端文件');
+        expect(cloudDocsText, 'zh-TW:featureAnnouncements.cloudDocs must not mix 云文档').not.toContain('云文档');
+      }
+    }
+  });
+
+  it('keeps repo callback pagination keys and placeholders present across all 7 locales', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      for (const key of ['repo.callback_prev_page', 'repo.callback_next_page', 'repo.callback_page_info']) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string).trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+      const pageInfo = String(readPath(messages, 'repo.callback_page_info') ?? '');
+      expect(pageInfo, `${locale}:repo.callback_page_info {{current}}`).toContain('{{current}}');
+      expect(pageInfo, `${locale}:repo.callback_page_info {{total}}`).toContain('{{total}}');
+      expect(pageInfo, `${locale}:repo.callback_page_info {{pageSize}}`).toContain('{{pageSize}}');
+    }
+  });
 });

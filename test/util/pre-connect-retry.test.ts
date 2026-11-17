@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  formatNetworkErrorMessage,
   isPreConnectNetworkError,
   preConnectRetryDelayMs,
   withPreConnectRetry,
@@ -93,5 +94,29 @@ describe('withPreConnectRetry', () => {
     const op = vi.fn().mockRejectedValue(connectTimeout());
     await expect(withPreConnectRetry(op, { maxAttempts: 0, sleep: vi.fn() })).rejects.toThrow('fetch failed');
     expect(op).toHaveBeenCalledTimes(1);
+  });
+
+  it('supports a custom shouldRetry predicate', async () => {
+    const resetErr = fetchFailed(Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }));
+    const op = vi.fn().mockRejectedValueOnce(resetErr).mockResolvedValueOnce('recovered');
+    await expect(withPreConnectRetry(op, {
+      maxAttempts: 2,
+      sleep: async () => {},
+      shouldRetry: (err) => err instanceof Error && /fetch failed/.test(err.message),
+    })).resolves.toBe('recovered');
+    expect(op).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('formatNetworkErrorMessage', () => {
+  it('joins error and cause chain messages including missing error codes and guards cycles', () => {
+    expect(formatNetworkErrorMessage(connectTimeout())).toBe(
+      'fetch failed: Connect Timeout Error (attempted address: relay.example:443, timeout: 10000ms) (UND_ERR_CONNECT_TIMEOUT)',
+    );
+    const a = new Error('top') as Error & { cause?: unknown };
+    const b = new Error('inner') as Error & { cause?: unknown };
+    a.cause = b;
+    b.cause = a;
+    expect(formatNetworkErrorMessage(a)).toBe('top: inner');
   });
 });

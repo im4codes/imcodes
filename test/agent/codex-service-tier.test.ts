@@ -27,7 +27,7 @@ function providerWithSession(state: Record<string, unknown> = {}): {
     (sessionId: string, info: Record<string, unknown>) => infos.push({ sessionId, info }),
   ];
   const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
-  (provider as any).request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+  (provider as any).requestOnChannel = vi.fn(async (_channel: unknown, method: string, params: Record<string, unknown>) => {
     requests.push({ method, params });
     return {};
   });
@@ -40,26 +40,26 @@ describe('codex service tier', () => {
     expect(new CodexSdkProvider().capabilities.serviceTier).toBe(true);
   });
 
-  it('reports the tier a resumed thread came back with', () => {
+  it('reports the tier a resumed thread came back with', async () => {
     const { provider, infos } = providerWithSession();
-    (provider as any).handleNotification('thread/started', {
+    await (provider as any).handleNotification((provider as any).normalChannel, 'thread/started', {
       thread: { id: 'thread-1', serviceTier: CODEX_SERVICE_TIER.FAST },
     });
     expect(infos.some((entry) => entry.info.serviceTier === CODEX_SERVICE_TIER.FAST)).toBe(true);
   });
 
-  it('follows a tier switched on elsewhere while the session is live', () => {
+  it('follows a tier switched on elsewhere while the session is live', async () => {
     const { provider, infos } = providerWithSession({ serviceTier: CODEX_SERVICE_TIER.DEFAULT });
-    (provider as any).handleNotification('thread/settings/updated', {
+    await (provider as any).handleNotification((provider as any).normalChannel, 'thread/settings/updated', {
       threadId: 'thread-1',
       settings: { serviceTier: CODEX_SERVICE_TIER.FAST },
     });
     expect(infos.at(-1)?.info.serviceTier).toBe(CODEX_SERVICE_TIER.FAST);
   });
 
-  it('stays quiet when the reported tier has not changed', () => {
+  it('stays quiet when the reported tier has not changed', async () => {
     const { provider, infos } = providerWithSession({ serviceTier: CODEX_SERVICE_TIER.FAST });
-    (provider as any).handleNotification('thread/settings/updated', {
+    await (provider as any).handleNotification((provider as any).normalChannel, 'thread/settings/updated', {
       threadId: 'thread-1',
       settings: { serviceTier: CODEX_SERVICE_TIER.FAST },
     });

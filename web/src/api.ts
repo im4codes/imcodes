@@ -1,3 +1,14 @@
+import { beginDownloadTransfer, reportR2Preparation, completeDownloadTransfer, failDownloadTransfer } from './download-transfer-store.js';
+// background-transfer-keepalive.ts has zero top-level @capacitor/core imports (preserve globalThis.Capacitor)
+// and keeps uploadFile synchronous on tick 0 so XHR + AbortSignal initialize before returning.
+import { withBackgroundTransferKeepAlive } from './background-transfer-keepalive.js';
+import {
+  createUploadLifecycleRecoveryState,
+  getUploadBackgroundEpoch,
+  recoverUploadFromLifecycleIfNeeded,
+} from './upload-suspend-wait.js';
+import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_PHASE, R2_RELAY_ERROR, type R2RelayProgress, type R2RelayReady } from '@shared/r2-relay.js';
+import { isServerR2RelayEnabled, readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
 /**
  * Fetch wrapper with cookie-based auth for the IM.codes API.
  * Credentials are sent automatically via HttpOnly cookie.
@@ -45,6 +56,20 @@ import {
   type SessionIdentityProfile,
   type SessionIdentityScope,
 } from '@shared/session-identity.js';
+import type {
+  CloudDocBlankType,
+  CloudDocFolder,
+  CloudDocItem,
+  CloudDocShareMode,
+  CloudDocShareRecord,
+  CloudDocShareRole,
+  CloudDocShareTargetKind,
+  CloudDocTeamOption,
+  RecentDocumentItem,
+  RecordRecentDocumentInput,
+  SharedCloudDocItem,
+  SharedCloudFolderItem,
+} from '@shared/cloud-docs.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -88,7 +113,17 @@ export async function withTemporaryApiKey<T>(key: string, fn: () => Promise<T>):
 /** Clear the Bearer API key (reverts to cookie auth). */
 export function clearApiKey(): void {
   _apiKey = null;
+  refreshPromise = null;
+  _refreshRetryAt = 0;
   try { localStorage.removeItem('rcc_api_key'); } catch { /* ignore */ }
+}
+
+export function resetRefreshStateForTesting(): void {
+  refreshPromise = null;
+  _lastRefreshFailure = null;
+  _refreshRetryAt = 0;
+  _crossTabRefreshLocked = false;
+  _crossTabRefreshStartedAt = 0;
 }
 
 /** Return the currently configured Bearer API key, if any. */
@@ -103,6 +138,7 @@ export function getApiKey(): string | null {
  */
 export function configureExpectedUserId(userId: string | null): void {
   _expectedUserId = typeof userId === 'string' ? (userId.trim() || null) : null;
+  setFileRelayUser(_expectedUserId);
 }
 
 export function getExpectedUserId(): string | null {
@@ -440,7 +476,102 @@ export function stopProactiveRefresh(): void {
   }
 }
 
+function throwIfAborted(signal?: AbortSignal | null): void {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+  }
+}
+
+function waitForPromiseWithSignal<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      promise.catch(() => {});
+      reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (val) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(val);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function readResponseTextWithSignal(res: Response, signal?: AbortSignal | null): Promise<string> {
+  throwIfAborted(signal);
+  let textPromise: Promise<string>;
+  try {
+    textPromise = res.text().catch(() => '');
+  } catch {
+    textPromise = Promise.resolve('');
+  }
+  const text = await waitForPromiseWithSignal(textPromise, signal);
+  throwIfAborted(signal);
+  return text;
+}
+
+async function readResponseJsonWithSignal<T>(res: Response, signal?: AbortSignal | null): Promise<T> {
+  throwIfAborted(signal);
+  let jsonPromise: Promise<T>;
+  try {
+    jsonPromise = res.json() as Promise<T>;
+  } catch (err) {
+    throwIfAborted(signal);
+    throw err;
+  }
+  const json = await waitForPromiseWithSignal(jsonPromise, signal);
+  throwIfAborted(signal);
+  return json;
+}
+
+function sleepWithSignal(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+  }
+  return new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+  });
+}
+
 async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl): Promise<Response> {
+  const signal = opts.signal;
+  throwIfAborted(signal);
   const headers = new Headers(opts.headers);
   if (!headers.has('Content-Type') && opts.body && !(opts.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
@@ -456,11 +587,15 @@ async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl
   }
   if (path.startsWith('/api/auth/') && !path.includes('ws-ticket')) {
     try {
-      const telemetry = await getAuthTelemetryHeaders();
+      const telemetry = await waitForPromiseWithSignal(getAuthTelemetryHeaders(), signal);
       for (const [key, value] of Object.entries(telemetry)) {
         if (!headers.has(key)) headers.set(key, value);
       }
-    } catch { /* telemetry headers are best-effort — don't block auth requests */ }
+    } catch (err) {
+      if (signal?.aborted) throw (signal.reason ?? err);
+      /* telemetry headers are best-effort — don't block auth requests */
+    }
+    throwIfAborted(signal);
   }
   if (_apiKey) {
     // Native: Bearer token auth (CSRF middleware skips Bearer auth requests)
@@ -473,10 +608,12 @@ async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl
       if (csrf) headers.set(HEADER_CSRF, csrf);
     }
   }
+  throwIfAborted(signal);
   // Native (Bearer auth): omit credentials — no cookies needed, and 'include' would
   // require Access-Control-Allow-Credentials from the server (cross-origin from capacitor://).
   // Web (cookie auth): include credentials so HttpOnly cookies are sent.
-  return fetch(`${baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
+  const fetchPromise = fetch(`${baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
+  return waitForPromiseWithSignal(fetchPromise, signal);
 }
 
 /**
@@ -654,10 +791,15 @@ export async function apiFetch<T = unknown>(
   path: string,
   opts: RequestInit = {},
 ): Promise<T> {
+  throwIfAborted(opts.signal);
+
   const res = await rawFetch(path, opts);
 
+  throwIfAborted(opts.signal);
+
   if (res.status === 409) {
-    const body = await res.text().catch(() => '');
+    const body = await readResponseTextWithSignal(res, opts.signal);
+    throwIfAborted(opts.signal);
     if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
       _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
     }
@@ -669,31 +811,41 @@ export async function apiFetch<T = unknown>(
     // session. An endpoint-specific 401 (for example, a newly added route that
     // has not yet accepted API keys) must never erase a still-valid app login.
     if (_apiKey) {
+      throwIfAborted(opts.signal);
       console.warn(`[auth] bearer 401 on ${path} — verifying account before changing login state`);
       let verifyRes: Response;
       try {
-        verifyRes = await rawFetch('/api/auth/user/me');
-      } catch {
+        verifyRes = await rawFetch('/api/auth/user/me', { signal: opts.signal });
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
         throw new ApiError(503, 'server_unavailable');
       }
+      throwIfAborted(opts.signal);
       if (verifyRes.ok) {
-        if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
+        if (path === '/api/auth/user/me') {
+          return await readResponseJsonWithSignal<T>(verifyRes, opts.signal);
+        }
         const retryRes = await rawFetch(path, opts);
+        throwIfAborted(opts.signal);
         if (retryRes.status === 409) {
-          const body = await retryRes.text().catch(() => '');
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
+          throwIfAborted(opts.signal);
           if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
             _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
           }
           throw new ApiError(retryRes.status, body);
         }
         if (!retryRes.ok) {
-          throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
+          throw new ApiError(retryRes.status, body);
         }
-        return retryRes.json() as Promise<T>;
+        return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
       }
       if (verifyRes.status >= 500) {
-        throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+        const body = await readResponseTextWithSignal(verifyRes, opts.signal).catch(() => 'server_unavailable');
+        throw new ApiError(verifyRes.status, body || 'server_unavailable');
       }
+      throwIfAborted(opts.signal);
       _onAuthExpired?.(`401 on ${path} — bearer account verification failed`);
       throw new ApiError(401, 'session_expired');
     }
@@ -702,36 +854,42 @@ export async function apiFetch<T = unknown>(
     // Try to refresh the token (with one retry on failure).
     // A single failure might be transient (e.g., CSRF mismatch after cookie rotation).
     for (let attempt = 0; attempt < 2; attempt++) {
+      throwIfAborted(opts.signal);
       if (!refreshPromise) {
         refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
       }
       let ok: boolean;
       try {
-        ok = await refreshPromise;
-      } catch {
+        ok = await waitForPromiseWithSignal(refreshPromise, opts.signal);
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
         // Refresh threw (5xx or network error) — server unavailable, not session expired.
         throw new ApiError(503, 'server_unavailable');
       }
+      throwIfAborted(opts.signal);
       if (ok) {
         const retryRes = await rawFetch(path, opts);
+        throwIfAborted(opts.signal);
         if (retryRes.status === 409) {
-          const body = await retryRes.text().catch(() => '');
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
+          throwIfAborted(opts.signal);
           if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
             _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
           }
           throw new ApiError(retryRes.status, body);
         }
         if (!retryRes.ok) {
-          const body = await retryRes.text().catch(() => '');
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
           throw new ApiError(retryRes.status, body);
         }
-        return retryRes.json() as Promise<T>;
+        return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
       }
       // First attempt failed — wait briefly and retry once (cookies may have been updated)
       if (attempt === 0) {
-        await new Promise((r) => setTimeout(r, 1000));
+        await sleepWithSignal(1000, opts.signal);
       }
     }
+    throwIfAborted(opts.signal);
     // 429 and other non-auth refresh failures are transient. Do not verify
     // /me and call onAuthExpired: the current session may still be valid.
     if (_lastRefreshFailure && _lastRefreshFailure.status !== 401 && _lastRefreshFailure.status !== 403) {
@@ -741,23 +899,39 @@ export async function apiFetch<T = unknown>(
     // Another tab may have refreshed successfully and our cookies are now valid.
     let verifyRes: Response;
     try {
-      verifyRes = await rawFetch('/api/auth/user/me');
-    } catch {
+      verifyRes = await rawFetch('/api/auth/user/me', { signal: opts.signal });
+    } catch (err) {
+      if (opts.signal?.aborted) throw err;
       throw new ApiError(503, 'server_unavailable');
     }
+    throwIfAborted(opts.signal);
     if (verifyRes.ok) {
       console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
       _lastRefreshAt = Date.now();
-      if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
-      const retryRes = await rawFetch(path, opts);
-      if (!retryRes.ok) {
-        throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+      if (path === '/api/auth/user/me') {
+        return await readResponseJsonWithSignal<T>(verifyRes, opts.signal);
       }
-      return retryRes.json() as Promise<T>;
+      const retryRes = await rawFetch(path, opts);
+      throwIfAborted(opts.signal);
+      if (retryRes.status === 409) {
+        const body = await readResponseTextWithSignal(retryRes, opts.signal);
+        throwIfAborted(opts.signal);
+        if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+          _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+        }
+        throw new ApiError(retryRes.status, body);
+      }
+      if (!retryRes.ok) {
+        const body = await readResponseTextWithSignal(retryRes, opts.signal);
+        throw new ApiError(retryRes.status, body);
+      }
+      return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
     }
     if (verifyRes.status >= 500) {
-      throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+      const body = await readResponseTextWithSignal(verifyRes, opts.signal).catch(() => 'server_unavailable');
+      throw new ApiError(verifyRes.status, body || 'server_unavailable');
     }
+    throwIfAborted(opts.signal);
     console.warn(`[auth] LOGOUT: refresh failed twice + /me failed for ${path}, triggering onAuthExpired`);
     _onAuthExpired?.(`401 on ${path} — refresh failed twice`);
     throw new ApiError(401, 'session_expired');
@@ -765,22 +939,41 @@ export async function apiFetch<T = unknown>(
 
   // CSRF token mismatch (cookie expired) — refresh session to get new CSRF cookie, then retry
   if (res.status === 403) {
-    const body = await res.text().catch(() => '');
+    const body = await readResponseTextWithSignal(res, opts.signal);
+    throwIfAborted(opts.signal);
     if (body.includes('csrf_rejected')) {
       console.warn(`[auth] CSRF rejected on ${path} — refreshing session for new CSRF cookie`);
       if (!refreshPromise) {
         refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
       }
       try {
-        const ok = await refreshPromise;
+        const ok = await waitForPromiseWithSignal(refreshPromise, opts.signal);
+        throwIfAborted(opts.signal);
         if (ok) {
           const retryRes = await rawFetch(path, opts);
-          if (!retryRes.ok) throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
-          return retryRes.json() as Promise<T>;
+          throwIfAborted(opts.signal);
+          if (retryRes.status === 409) {
+            const retryBody = await readResponseTextWithSignal(retryRes, opts.signal);
+            throwIfAborted(opts.signal);
+            if (retryBody.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+              _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+            }
+            throw new ApiError(retryRes.status, retryBody);
+          }
+          if (!retryRes.ok) {
+            const retryBody = await readResponseTextWithSignal(retryRes, opts.signal);
+            throw new ApiError(retryRes.status, retryBody);
+          }
+          return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
         }
-      } catch { /* refresh failed */ }
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
+        /* refresh failed */
+      }
+      throwIfAborted(opts.signal);
       throw new ApiError(403, body);
     }
+    throwIfAborted(opts.signal);
     // The ACCOUNT was disabled (or is pending) while this session was open: the server refuses every credential of it with these codes.
     // That is the end of the login, not a failure of this one request.
     if (body.includes(AUTH_ERROR_CODES.ACCOUNT_DISABLED) || body.includes(AUTH_ERROR_CODES.ACCOUNT_PENDING)) {
@@ -790,11 +983,11 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
+    const body = await readResponseTextWithSignal(res, opts.signal);
     throw new ApiError(res.status, body);
   }
 
-  return res.json() as Promise<T>;
+  return await readResponseJsonWithSignal<T>(res, opts.signal);
 }
 
 export async function sendSessionViaHttp(
@@ -924,6 +1117,9 @@ export interface SharedEntrySummary {
   status: 'active' | 'revoked' | 'expired' | 'target-unavailable';
   target: ShareTarget;
   targetLabel: string;
+  serverStatus?: string | null;
+  lastHeartbeatAt?: number | null;
+  statusObservedAt?: number | null;
 }
 
 function shareTargetFallbackLabel(target: ShareTarget): string {
@@ -932,7 +1128,7 @@ function shareTargetFallbackLabel(target: ShareTarget): string {
   return target.subSessionDisplayName || `deck_sub_${target.subSessionId}`;
 }
 
-function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
+export function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
   const raw = value && typeof value === 'object' ? value as Partial<SharedEntrySummary> & Record<string, unknown> : {};
   const fallbackTarget: ShareTarget = { kind: 'server', serverId: typeof raw.serverId === 'string' ? raw.serverId : '' };
   const target: ShareTarget = raw.target && typeof raw.target === 'object'
@@ -952,11 +1148,19 @@ function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
     status: typeof raw.status === 'string' ? raw.status as SharedEntrySummary['status'] : 'active',
     target,
     targetLabel,
+    serverStatus: typeof raw.serverStatus === 'string' ? raw.serverStatus : null,
+    lastHeartbeatAt: typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) && raw.lastHeartbeatAt > 0 ? raw.lastHeartbeatAt : null,
+    statusObservedAt: typeof raw.statusObservedAt === 'number' && Number.isFinite(raw.statusObservedAt)
+      ? raw.statusObservedAt
+      : (typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) ? raw.lastHeartbeatAt : null),
   };
 }
 
-export async function discoverSharedEntries(): Promise<SharedEntrySummary[]> {
-  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>('/api/shares');
+export async function discoverSharedEntries(options?: { signal?: AbortSignal }): Promise<SharedEntrySummary[]> {
+  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>(
+    '/api/shares',
+    { signal: options?.signal },
+  );
   const entries = res.shares ?? res.entries;
   return Array.isArray(entries) ? entries.map(normalizeSharedEntrySummary) : [];
 }
@@ -996,11 +1200,67 @@ export interface OpenSharedEntryResponse {
   }>;
 }
 
-export async function openSharedEntry(target: ShareTarget): Promise<OpenSharedEntryResponse> {
-  return apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
-    method: 'POST',
-    body: JSON.stringify({ target }),
-  });
+export class SharedOpenTimeoutError extends Error {
+  constructor(message = 'Shared entry open timed out') {
+    super(message);
+    this.name = 'SharedOpenTimeoutError';
+  }
+}
+
+export interface OpenSharedEntryOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export const DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS = 15_000;
+
+export async function openSharedEntry(
+  target: ShareTarget,
+  opts?: OpenSharedEntryOptions,
+): Promise<OpenSharedEntryResponse> {
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS;
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new SharedOpenTimeoutError());
+    }, timeoutMs);
+  }
+
+  const parentSignal = opts?.signal;
+  let onParentAbort: (() => void) | null = null;
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      if (timer !== null) clearTimeout(timer);
+      controller.abort(parentSignal.reason);
+      throw parentSignal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+    }
+    onParentAbort = () => {
+      controller.abort(parentSignal.reason);
+    };
+    parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+
+  try {
+    return await apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
+      method: 'POST',
+      body: JSON.stringify({ target }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (timedOut || err instanceof SharedOpenTimeoutError) {
+      throw new SharedOpenTimeoutError();
+    }
+    throw err;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (parentSignal && onParentAbort) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+  }
 }
 
 function isRetryableNonceExchangeError(error: unknown): boolean {
@@ -1154,6 +1414,7 @@ export interface SubSessionData {
   /** The owning parent execution run id for an execution clone. Clones sharing a
    *  `parentRunId` are grouped together in the execution-detail view. */
   parentRunId?: string | null;
+  incognito?: boolean;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
@@ -1203,6 +1464,7 @@ export async function createSubSession(
     activeModel?: string | null;
     effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
     transportConfig?: Record<string, unknown> | null;
+    incognito?: boolean;
   },
 ): Promise<{ id: string; sessionName: string; subSession: SubSessionData }> {
   const res = await apiFetch<{ id: string; sessionName: string; subSession: {
@@ -1213,6 +1475,7 @@ export async function createSubSession(
     gemini_session_id: string | null; parent_session: string | null; description: string | null; cc_preset_id: string | null;
     requested_model: string | null; active_model: string | null; effort: import('../../shared/effort-levels.js').TransportEffortLevel | null;
     transport_config: Record<string, unknown> | string | null;
+    incognito?: boolean;
   } }>(`/api/server/${serverId}/sub-sessions`, {
     method: 'POST',
     body: JSON.stringify({
@@ -1247,6 +1510,7 @@ export async function createSubSession(
       transportConfig: (typeof s.transport_config === 'string'
         ? JSON.parse(s.transport_config)
         : (s.transport_config ?? null)) as Record<string, unknown> | null,
+      ...(s.incognito === true ? { incognito: true } : {}),
     },
   };
 }
@@ -1590,6 +1854,8 @@ export interface MeResponse {
   is_admin: boolean;
   status: string;
   has_password: boolean;
+  scope?: 'doc_collaborator' | null;
+  r2RelayEnabled?: boolean;
 }
 
 export async function fetchMe(): Promise<MeResponse> {
@@ -1649,11 +1915,15 @@ export async function updateAdminSettings(settings: AdminSettings): Promise<void
 
 // ── User preferences ───────────────────────────────────────────────────────
 
-export async function getUserPref(key: string): Promise<unknown | null> {
+export async function getUserPref(key: string, options: { strict?: boolean; signal?: AbortSignal } = {}): Promise<unknown | null> {
   try {
-    const res = await apiFetch<{ value: unknown }>(`/api/preferences/${key}`);
+    const res = await apiFetch<{ value: unknown }>(`/api/preferences/${key}`, {
+      signal: options.signal,
+      headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
+    });
     return res.value ?? null;
-  } catch {
+  } catch (error) {
+    if (options.strict) throw error;
     return null;
   }
 }
@@ -1708,8 +1978,10 @@ export function onUserPrefChanged(cb: (key: string, value: unknown, meta: UserPr
   };
 }
 
-export async function saveUserPref(key: string, value: unknown): Promise<void> {
+export async function saveUserPref(key: string, value: unknown, options: { signal?: AbortSignal } = {}): Promise<void> {
   await apiFetch(`/api/preferences/${key}`, {
+    signal: options.signal,
+    headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
     method: 'PUT',
     body: JSON.stringify({ value }),
   });
@@ -1851,69 +2123,82 @@ export async function uploadFile(
   sessionName?: string,
   destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
-  let highestProgress = 0;
-  const emitProgress = (pct: number) => {
-    highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
-    onProgress?.(highestProgress);
-  };
-  if (!clientUploadId) {
-    const result = await uploadFileRequest({
-      serverId, file, wholeFile: file, offset: 0, emitProgress, signal, sessionName, destinationDirectory,
-    });
-    if (!('attachment' in result)) throw new ApiError(500, 'upload_incomplete');
-    return result;
-  }
-
-  let offset = 0;
-  let failuresWithoutProgress = 0;
-  while (offset < file.size || (file.size === 0 && offset === 0)) {
-    const end = Math.min(file.size, offset + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
-    const chunk = file.slice(offset, end, file.type);
-    try {
-      const result = await uploadFileRequest({
-        serverId,
-        file: chunk,
-        wholeFile: file,
-        offset,
-        clientUploadId,
-        emitProgress,
-        signal,
-        sessionName,
-        destinationDirectory,
-      });
-      if ('attachment' in result) return result;
-      if (!Number.isSafeInteger(result.committedBytes)
-        || result.committedBytes <= offset
-        || result.committedBytes > file.size) {
-        throw new ApiError(409, 'upload_offset_mismatch');
-      }
-      offset = result.committedBytes;
-      // Some mobile WebViews do not dispatch XHR upload-progress events for
-      // multipart bodies. The server's committed offset is authoritative and
-      // arrives once each resumable chunk is accepted, so use it as the
-      // browser-upload half of progress instead of leaving a relay transfer
-      // at 0% until the final daemon commit line.
-      emitProgress(file.size > 0 ? (offset / file.size) * 50 : 50);
-      failuresWithoutProgress = 0;
-      if (file.size === 0) throw new ApiError(500, 'upload_incomplete');
-    } catch (error) {
-      if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
-      const receiverOffset = error instanceof ResumableUploadOffsetError ? error.committedBytes : -1;
-      if (Number.isSafeInteger(receiverOffset)
-        && receiverOffset >= 0 && receiverOffset <= file.size && receiverOffset !== offset) {
-        offset = receiverOffset;
-        failuresWithoutProgress = 0;
-        continue;
-      }
-      const retryable = error instanceof ApiError
-        && (error.status === 0 || RESUMABLE_DOWNLOAD_STATUSES.has(error.status)
-          || (error instanceof ResumableUploadOffsetError && error.committedBytes === offset));
-      if (!retryable || ++failuresWithoutProgress > FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) throw error;
-      const backoff = FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS;
-      await waitBeforeResume(backoff[Math.min(failuresWithoutProgress, backoff.length) - 1]!, signal);
+  return withBackgroundTransferKeepAlive(async () => {
+    if (isR2RelaySelected() && !destinationDirectory) {
+      const relayResult = await tryUploadR2File(serverId, file, onProgress, clientUploadId, signal, sessionName, destinationDirectory);
+      if (relayResult) return relayResult;
     }
-  }
-  throw new ApiError(500, 'upload_incomplete');
+    let highestProgress = 0;
+    const emitProgress = (pct: number) => {
+      highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
+      onProgress?.(highestProgress);
+    };
+    if (!clientUploadId) {
+      const result = await uploadFileRequest({
+        serverId, file, wholeFile: file, offset: 0, emitProgress, signal, sessionName, destinationDirectory,
+      });
+      if (!('attachment' in result)) throw new ApiError(500, 'upload_incomplete');
+      return result;
+    }
+
+    let offset = 0;
+    let failuresWithoutProgress = 0;
+    const lifecycleState = createUploadLifecycleRecoveryState();
+    while (offset < file.size || (file.size === 0 && offset === 0)) {
+      const end = Math.min(file.size, offset + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
+      const chunk = file.slice(offset, end, file.type);
+      const attemptEpoch = getUploadBackgroundEpoch();
+      try {
+        const result = await uploadFileRequest({
+          serverId,
+          file: chunk,
+          wholeFile: file,
+          offset,
+          clientUploadId,
+          emitProgress,
+          signal,
+          sessionName,
+          destinationDirectory,
+        });
+        if ('attachment' in result) return result;
+        if (!Number.isSafeInteger(result.committedBytes)
+          || result.committedBytes <= offset
+          || result.committedBytes > file.size) {
+          throw new ApiError(409, 'upload_offset_mismatch');
+        }
+        offset = result.committedBytes;
+        // Some mobile WebViews do not dispatch XHR upload-progress events for
+        // multipart bodies. The server's committed offset is authoritative and
+        // arrives once each resumable chunk is accepted, so use it as the
+        // browser-upload half of progress instead of leaving a relay transfer
+        // at 0% until the final daemon commit line.
+        emitProgress(file.size > 0 ? (offset / file.size) * 50 : 50);
+        failuresWithoutProgress = 0;
+        if (file.size === 0) throw new ApiError(500, 'upload_incomplete');
+      } catch (error) {
+        if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+        const receiverOffset = error instanceof ResumableUploadOffsetError ? error.committedBytes : -1;
+        if (Number.isSafeInteger(receiverOffset)
+          && receiverOffset >= 0 && receiverOffset <= file.size && receiverOffset !== offset) {
+          offset = receiverOffset;
+          failuresWithoutProgress = 0;
+          continue;
+        }
+        const retryable = error instanceof ApiError
+          && (error.status === 0 || RESUMABLE_DOWNLOAD_STATUSES.has(error.status)
+            || (error instanceof ResumableUploadOffsetError && error.committedBytes === offset));
+        if (!retryable) throw error;
+        const recovery = await recoverUploadFromLifecycleIfNeeded(attemptEpoch, lifecycleState, signal);
+        if (recovery !== 'none') {
+          continue;
+        }
+        if (++failuresWithoutProgress > FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) throw error;
+        const backoff = FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS;
+        await waitBeforeResume(backoff[Math.min(failuresWithoutProgress, backoff.length) - 1]!, signal);
+      }
+    }
+    throw new ApiError(500, 'upload_incomplete');
+  });
 }
 
 type UploadFileRequestResult =
@@ -2318,6 +2603,36 @@ export async function downloadAttachment(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+  if (isR2RelaySelected()) {
+    let relayTransfer: string | undefined;
+    let transferSignal: AbortSignal | undefined;
+    const relayAbort = new AbortController();
+    const abortRelay = () => relayAbort.abort();
+    signal?.addEventListener('abort', abortRelay, { once: true });
+    if (signal?.aborted) relayAbort.abort();
+    const relaySignal = relayAbort.signal;
+    try {
+      const r2Url = await prepareR2AttachmentDownload(serverId, attachmentId, sessionName, relaySignal, (progress) => {
+        if (!relayTransfer) {
+          const transfer = beginDownloadTransfer(attachmentId);
+          relayTransfer = transfer.id; transferSignal = transfer.signal;
+          transferSignal.addEventListener('abort', abortRelay, { once: true });
+        }
+        reportR2Preparation(relayTransfer, progress);
+      });
+      if (r2Url) {
+        await handoffR2Download(r2Url, relaySignal);
+        if (relayTransfer) completeDownloadTransfer(relayTransfer, true);
+        return;
+      }
+    } catch (error) {
+      if (relayTransfer) failDownloadTransfer(relayTransfer, relaySignal.aborted);
+      throw error;
+    } finally {
+      transferSignal?.removeEventListener('abort', abortRelay);
+      signal?.removeEventListener('abort', abortRelay);
+    }
+  }
   // Native: acquire a one-time token and hand off to the system browser.
   if (isNative()) {
     const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
@@ -2927,4 +3242,690 @@ export async function deleteEnterpriseSharedMemory(enterpriseId: string, memoryI
   return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/memory/${encodeURIComponent(memoryId)}`, {
     method: 'DELETE',
   });
+}
+
+// ── ONLYOFFICE & Document Sharing APIs ────────────────────────────────────────
+
+export type DocShareRole = 'viewer' | 'editor';
+export type DocShareMode = 'user' | 'team' | 'external_link' | 'magic_invite';
+export type DocShareTargetKind = 'file' | 'folder';
+
+export interface OnlyOfficeStatusResponse {
+  enabled: boolean;
+  publicUrl?: string;
+  scriptUrl?: string;
+}
+
+export interface OnlyOfficeConfigResponse {
+  enabled: boolean;
+  role: DocShareRole;
+  allowDownload: boolean;
+  canManageShare?: boolean;
+  isOwner?: boolean;
+  mode: 'view' | 'edit';
+  publicUrl?: string;
+  scriptUrl?: string;
+  docToken?: string;
+  fileUrl?: string;
+  config?: {
+    type?: 'desktop' | 'mobile' | 'embedded';
+    documentType: 'word' | 'cell' | 'slide' | 'pdf';
+    document: {
+      fileType: string;
+      key: string;
+      title: string;
+      url: string;
+      permissions: {
+        edit: boolean;
+        download: boolean;
+        print: boolean;
+        copy: boolean;
+        review: boolean;
+        comment: boolean;
+      };
+    };
+    editorConfig: {
+      mode: 'view' | 'edit';
+      callbackUrl: string;
+      lang: string;
+      user: {
+        id: string;
+        name: string;
+      };
+      customization?: Record<string, unknown>;
+    };
+    token: string;
+  };
+}
+
+export interface ServerDocGroup {
+  id: string;
+  name: string;
+  memberCount: number;
+  boundToServer: boolean;
+}
+
+export interface DocumentShareItem {
+  id: string;
+  serverId: string;
+  targetKind: DocShareTargetKind;
+  targetPath: string;
+  label: string | null;
+  shareMode: DocShareMode;
+  targetUserId: string;
+  targetTeamId?: string | null;
+  targetTeamName?: string | null;
+  targetUsername?: string | null;
+  targetDisplayName?: string | null;
+  participantLabel: string | null;
+  hasAccessCode: boolean;
+  deviceLockEnabled: boolean;
+  isDeviceBound: boolean;
+  redeemedByUserId: string | null;
+  redeemedAt: number | null;
+  role: DocShareRole;
+  allowDownload: boolean;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number | null;
+  revokedAt: number | null;
+}
+
+export interface SharedWithMeDocItem extends DocumentShareItem {
+  serverName: string | null;
+}
+
+export interface ExternalShareView {
+  id: string;
+  serverId: string;
+  targetKind: DocShareTargetKind;
+  targetPath: string;
+  label: string;
+  shareMode: DocShareMode;
+  participantLabel: string | null;
+  hasAccessCode: boolean;
+  deviceLockEnabled: boolean;
+  isDeviceBound: boolean;
+  redeemedAt: number | null;
+  role: DocShareRole;
+  allowDownload: boolean;
+  expiresAt: number | null;
+  revokedAt: number | null;
+}
+
+export interface DocShareBrowseEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size?: number;
+  mtime?: number;
+  role: DocShareRole | null;
+  allowDownload: boolean;
+}
+
+export async function fetchOnlyOfficeStatus(): Promise<OnlyOfficeStatusResponse> {
+  return apiFetch<OnlyOfficeStatusResponse>('/api/onlyoffice/status');
+}
+
+export async function fetchOnlyOfficeConfig(
+  serverId: string,
+  params: {
+    path: string;
+    mode?: 'view' | 'edit';
+    shareToken?: string;
+    deviceToken?: string;
+    sessionName?: string;
+    lang?: string;
+    mobile?: boolean;
+  },
+): Promise<OnlyOfficeConfigResponse> {
+  const qs = new URLSearchParams({ path: params.path });
+  if (params.mode) qs.set('mode', params.mode);
+  if (params.shareToken) qs.set('shareToken', params.shareToken);
+  if (params.deviceToken) qs.set('deviceToken', params.deviceToken);
+  if (params.sessionName) qs.set('sessionName', params.sessionName);
+  if (params.lang) qs.set('lang', params.lang);
+  if (params.mobile) qs.set('mobile', '1');
+  return apiFetch<OnlyOfficeConfigResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/onlyoffice/config?${qs.toString()}`,
+    { method: 'GET' },
+  );
+}
+
+export async function listDocumentShares(
+  serverId: string,
+  targetPath?: string,
+): Promise<{ shares: DocumentShareItem[]; groups?: ServerDocGroup[] }> {
+  const qs = new URLSearchParams();
+  if (targetPath) qs.set('path', targetPath);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch<{ shares: DocumentShareItem[]; groups?: ServerDocGroup[] }>(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares${query}`,
+    { method: 'GET' },
+  );
+}
+
+export async function createDocumentShareApi(
+  serverId: string,
+  body: {
+    targetKind: DocShareTargetKind;
+    targetPath: string;
+    label?: string;
+    shareMode: DocShareMode;
+    targetUser?: string;
+    targetUserId?: string;
+    targetTeamId?: string;
+    participantLabel?: string;
+    accessCode?: string;
+    deviceLockEnabled?: boolean;
+    role: DocShareRole;
+    allowDownload?: boolean;
+    expiresAt?: number | null;
+  },
+): Promise<{
+  share: DocumentShareItem;
+  shareToken: string | null;
+  sharePath: string | null;
+  shareUrl: string | null;
+}> {
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export async function updateDocumentShareApi(
+  serverId: string,
+  shareId: string,
+  body: {
+    role?: DocShareRole;
+    allowDownload?: boolean;
+    participantLabel?: string | null;
+    label?: string | null;
+    deviceLockEnabled?: boolean;
+    resetDeviceLock?: boolean;
+    accessCode?: string | null;
+    expiresAt?: number | null;
+  },
+): Promise<{ share: DocumentShareItem }> {
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares/${encodeURIComponent(shareId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export async function revokeDocumentShareApi(
+  serverId: string,
+  shareId: string,
+): Promise<{ ok: boolean; share: DocumentShareItem }> {
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares/${encodeURIComponent(shareId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export async function verifyExternalDocShare(
+  token: string,
+  body?: {
+    accessCode?: string;
+    deviceToken?: string;
+    passkeyCredentialId?: string;
+  },
+): Promise<{
+  ok: boolean;
+  share: ExternalShareView;
+  deviceToken: string;
+  deviceBound: boolean;
+}> {
+  return apiFetch(`/api/doc-shares/external/${encodeURIComponent(token)}/verify`, {
+    method: 'POST',
+    body: JSON.stringify(body ?? {}),
+  });
+}
+
+export async function browseExternalDocShare(
+  token: string,
+  params?: {
+    path?: string;
+    deviceToken?: string;
+    accessCode?: string;
+  },
+): Promise<{
+  share: ExternalShareView;
+  serverId: string;
+  targetKind: DocShareTargetKind;
+  rootPath: string;
+  path: string;
+  role: DocShareRole;
+  allowDownload: boolean;
+  entries: DocShareBrowseEntry[];
+}> {
+  const qs = new URLSearchParams();
+  if (params?.path) qs.set('path', params.path);
+  if (params?.deviceToken) qs.set('deviceToken', params.deviceToken);
+  if (params?.accessCode) qs.set('accessCode', params.accessCode);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch(`/api/doc-shares/external/${encodeURIComponent(token)}/browse${query}`, {
+    method: 'GET',
+  });
+}
+
+export async function redeemMagicInviteDocShare(
+  token: string,
+  body: {
+    displayName: string;
+    accessCode?: string;
+  },
+): Promise<{
+  ok: boolean;
+  userId: string;
+  displayName: string;
+  share: DocumentShareItem;
+  sessionToken: string;
+}> {
+  return apiFetch(`/api/doc-shares/magic-invite/${encodeURIComponent(token)}/redeem`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function listDocsSharedWithMe(serverId?: string): Promise<{ shares: SharedWithMeDocItem[] }> {
+  const qs = serverId ? `?serverId=${encodeURIComponent(serverId)}` : '';
+  return apiFetch(`/api/doc-shares/shared-with-me${qs}`, { method: 'GET' });
+}
+
+export async function browseSharedDocFolder(
+  serverId: string,
+  path: string,
+  params?: { shareToken?: string; deviceToken?: string },
+): Promise<{
+  path: string;
+  role: DocShareRole;
+  allowDownload: boolean;
+  canManageShare: boolean;
+  isOwner: boolean;
+  entries: DocShareBrowseEntry[];
+}> {
+  const qs = new URLSearchParams({ path });
+  if (params?.shareToken) qs.set('shareToken', params.shareToken);
+  if (params?.deviceToken) qs.set('deviceToken', params.deviceToken);
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares/browse?${qs.toString()}`,
+    { method: 'GET' },
+  );
+}
+
+export async function createSharedDocItem(
+  serverId: string,
+  body: {
+    parentDir?: string;
+    name?: string;
+    path?: string;
+    kind: 'file' | 'folder' | 'mkdir';
+    shareToken?: string;
+    deviceToken?: string;
+  },
+): Promise<{
+  ok: boolean;
+  kind: 'file' | 'folder';
+  path: string;
+  ext?: string;
+  size?: number;
+}> {
+  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/doc-shares/create-item`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function buildDocAuthRelayUrl(
+  provider: 'google' | 'github',
+  shareToken?: string,
+  redirectPath?: string,
+): string {
+  const qs = new URLSearchParams();
+  if (shareToken) qs.set('shareToken', shareToken);
+  if (redirectPath) qs.set('redirect', redirectPath);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return `/api/doc-shares/auth-relay/${provider}${query}`;
+}
+
+export function isR2RelaySelected(): boolean {
+  return isServerR2RelayEnabled() && readFileRelayMode(getExpectedUserId()) === FILE_RELAY_MODE.R2;
+}
+function isRetryableR2NetworkError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  if (error instanceof ApiError) {
+    return error.status === 0 || error.status === 408 || error.status === 425 || error.status === 429
+      || error.status === 502 || error.status === 503 || error.status === 504;
+  }
+  return error instanceof Error && error.name !== 'NotReadableError';
+}
+
+async function runR2StepWithLifecycleRecovery<T>(
+  lifecycleState: ReturnType<typeof createUploadLifecycleRecoveryState>,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  for (;;) {
+    if (signal?.aborted) throw new DOMException('upload_canceled', 'AbortError');
+    const attemptEpoch = getUploadBackgroundEpoch();
+    try {
+      return await run();
+    } catch (error) {
+      if (signal?.aborted) {
+        if (error instanceof Error && error.name === 'AbortError') throw error;
+        throw new DOMException('upload_canceled', 'AbortError');
+      }
+      if (!isRetryableR2NetworkError(error, signal)) throw error;
+      const recovery = await recoverUploadFromLifecycleIfNeeded(attemptEpoch, lifecycleState, signal);
+      if (recovery === 'none') throw error;
+    }
+  }
+}
+
+export async function tryUploadR2File(serverId: string, file: File, onProgress?: (pct: number) => void,
+  clientUploadId?: string, signal?: AbortSignal, sessionName?: string, destinationDirectory?: string,
+): Promise<{ ok: boolean; attachment: AttachmentRefResponse } | null> {
+  if (!isR2RelaySelected() || destinationDirectory) return null;
+  if (signal?.aborted) throw new DOMException('upload_canceled', 'AbortError');
+  const lifecycleState = createUploadLifecycleRecoveryState();
+  const root = withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, sessionName);
+  const stage = await runR2StepWithLifecycleRecovery(lifecycleState, signal, async () => {
+    const response = await rawFetch(root, { method: 'POST', signal, body: JSON.stringify({
+      filename: file.name, size: file.size, clientUploadId, destinationDirectory,
+    }) });
+    if (response.status === 204 || response.status === 404) return null;
+    if (!response.ok) throw new ApiError(response.status, await response.text());
+    return await response.json() as { id: string; url: string };
+  });
+  if (!stage) return null;
+  await runR2StepWithLifecycleRecovery(lifecycleState, signal, async () => {
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const abort = () => { xhr.abort(); reject(new DOMException('upload_canceled', 'AbortError')); };
+      const cleanup = () => signal?.removeEventListener('abort', abort);
+      xhr.open('PUT', stage.url); // no app credentials or authorization headers on the R2 request
+      xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress?.(event.loaded * 50 / event.total); };
+      xhr.onload = () => { cleanup(); if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new ApiError(xhr.status, R2_RELAY_ERROR.FAILED)); };
+      xhr.onerror = () => { cleanup(); reject(new ApiError(0, R2_RELAY_ERROR.FAILED)); };
+      xhr.onabort = () => {
+        cleanup();
+        if (signal?.aborted) reject(new DOMException('upload_canceled', 'AbortError'));
+        else reject(new ApiError(0, R2_RELAY_ERROR.FAILED));
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) { abort(); return; }
+      xhr.send(file);
+    });
+  });
+  onProgress?.(50);
+  const commitUrl = withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/${encodeURIComponent(stage.id)}/commit`, sessionName);
+  const result = await runR2StepWithLifecycleRecovery(lifecycleState, signal, async () => {
+    const commit = await rawFetch(commitUrl, { method: 'POST', signal });
+    if (!commit.ok) throw new ApiError(commit.status, await commit.text());
+    return await commit.json() as { ok: boolean; attachment: AttachmentRefResponse };
+  });
+  onProgress?.(100);
+  return result;
+}
+export async function prepareR2AttachmentDownload(serverId: string, attachmentId: string, sessionName?: string,
+  signal?: AbortSignal, onProgress?: (progress: R2RelayProgress) => void): Promise<string | null> {
+  if (!isR2RelaySelected()) return null;
+  const response = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.DOWNLOADS}/${encodeURIComponent(attachmentId)}`, sessionName), { method: 'POST', signal });
+  if (response.status === 204 || response.status === 404) return null;
+  if (!response.ok) throw new ApiError(response.status, await response.text());
+  const reader = response.body?.getReader(); if (!reader) throw new Error(R2_RELAY_ERROR.FAILED);
+  const decoder = new TextDecoder(); let pending = ''; let url: string | null = null;
+  const consume = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as R2RelayProgress | R2RelayReady | { phase: typeof R2_RELAY_PHASE.ERROR };
+    if (event.phase === R2_RELAY_PHASE.ERROR) throw new Error(R2_RELAY_ERROR.FAILED);
+    if (event.phase === R2_RELAY_PHASE.PREPARING) onProgress?.(event);
+    if (event.phase === R2_RELAY_PHASE.READY && typeof event.url === 'string') url = event.url;
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      pending += decoder.decode(value, { stream: !done });
+      const lines = pending.split('\n'); pending = lines.pop()!;
+      for (const line of lines) consume(line);
+      if (pending.length > 65536) throw new Error(R2_RELAY_ERROR.INVALID);
+      if (done) { consume(pending); break; }
+    }
+    if (!url) throw new Error(R2_RELAY_ERROR.FAILED);
+    return url;
+  } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+}
+export async function handoffR2Download(url: string, signal?: AbortSignal): Promise<void> {
+  throwIfDownloadAborted(signal);
+  if (isNative()) { const { Browser } = await import('@capacitor/browser'); await Browser.open({ url }); return; }
+  const anchor = document.createElement('a'); anchor.href = url; anchor.download = ''; anchor.rel = 'noopener';
+  document.body.appendChild(anchor); anchor.click(); anchor.remove();
+}
+
+// ── Cloud Docs & Recent Documents ────────────────────────────────────────────
+
+export async function listCloudDocsApi(params?: {
+  folderId?: string | null;
+  allFolders?: boolean;
+  search?: string;
+  signal?: AbortSignal;
+}): Promise<{
+  folders: CloudDocFolder[];
+  docs: CloudDocItem[];
+  sharedFolders?: SharedCloudFolderItem[];
+  sharedDocs?: SharedCloudDocItem[];
+}> {
+  const qs = new URLSearchParams();
+  if (params?.allFolders) {
+    qs.set('folderId', '*');
+  } else if (params?.folderId !== undefined) {
+    qs.set('folderId', params.folderId ?? '');
+  }
+  if (params?.search?.trim()) qs.set('search', params.search.trim());
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch<{
+    folders: CloudDocFolder[];
+    docs: CloudDocItem[];
+    sharedFolders?: SharedCloudFolderItem[];
+    sharedDocs?: SharedCloudDocItem[];
+  }>(
+    `/api/cloud-docs${suffix}`,
+    { method: 'GET', signal: params?.signal },
+  );
+}
+
+export async function listCloudDocTeamsApi(signal?: AbortSignal): Promise<{ teams: CloudDocTeamOption[] }> {
+  return apiFetch<{ teams: CloudDocTeamOption[] }>('/api/cloud-docs/teams', {
+    method: 'GET',
+    signal,
+  });
+}
+
+export async function listCloudDocSharesApi(
+  targetKind: CloudDocShareTargetKind,
+  targetId: string,
+  signal?: AbortSignal,
+): Promise<{ shares: CloudDocShareRecord[] }> {
+  return apiFetch<{ shares: CloudDocShareRecord[] }>(
+    `/api/cloud-docs/shares/${encodeURIComponent(targetKind)}/${encodeURIComponent(targetId)}`,
+    { method: 'GET', signal },
+  );
+}
+
+export async function upsertCloudDocShareApi(body: {
+  targetKind: CloudDocShareTargetKind;
+  targetId: string;
+  shareMode: CloudDocShareMode;
+  targetTeamId?: string;
+  targetUserId?: string;
+  targetUsername?: string;
+  role: CloudDocShareRole;
+  allowDownload?: boolean;
+}, signal?: AbortSignal): Promise<{ share: CloudDocShareRecord }> {
+  return apiFetch<{ share: CloudDocShareRecord }>('/api/cloud-docs/shares', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export async function revokeCloudDocShareApi(shareId: string, signal?: AbortSignal): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(`/api/cloud-docs/shares/${encodeURIComponent(shareId)}`, {
+    method: 'DELETE',
+    signal,
+  });
+}
+
+export async function createCloudDocFolderApi(body: {
+  name: string;
+  parentId?: string | null;
+}): Promise<{ folder: CloudDocFolder }> {
+  return apiFetch<{ folder: CloudDocFolder }>('/api/cloud-docs/folders', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateCloudDocFolderApi(
+  folderId: string,
+  body: { name?: string; parentId?: string | null },
+): Promise<{ folder: CloudDocFolder }> {
+  return apiFetch<{ folder: CloudDocFolder }>(
+    `/api/cloud-docs/folders/${encodeURIComponent(folderId)}`,
+    { method: 'PATCH', body: JSON.stringify(body) },
+  );
+}
+
+export async function deleteCloudDocFolderApi(folderId: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(
+    `/api/cloud-docs/folders/${encodeURIComponent(folderId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export async function createBlankCloudDocApi(body: {
+  type: CloudDocBlankType;
+  name?: string;
+  folderId?: string | null;
+}): Promise<{ doc: CloudDocItem }> {
+  return apiFetch<{ doc: CloudDocItem }>('/api/cloud-docs/blank', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function uploadCloudDocApi(
+  file: File,
+  options?: { folderId?: string | null; name?: string; signal?: AbortSignal },
+): Promise<{ doc: CloudDocItem }> {
+  const form = new FormData();
+  form.append('file', file);
+  if (options?.folderId) form.append('folderId', options.folderId);
+  if (options?.name) form.append('name', options.name);
+  return apiFetch<{ doc: CloudDocItem }>('/api/cloud-docs/files', {
+    method: 'POST',
+    body: form,
+    signal: options?.signal,
+  });
+}
+
+export async function updateCloudDocApi(
+  docId: string,
+  body: { name?: string; folderId?: string | null },
+): Promise<{ doc: CloudDocItem }> {
+  return apiFetch<{ doc: CloudDocItem }>(
+    `/api/cloud-docs/${encodeURIComponent(docId)}`,
+    { method: 'PATCH', body: JSON.stringify(body) },
+  );
+}
+
+export async function deleteCloudDocApi(docId: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(
+    `/api/cloud-docs/${encodeURIComponent(docId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function getCloudDocDownloadUrl(docId: string, inline = false): string {
+  const qs = inline ? '' : '?download=1';
+  return `${_baseUrl}/api/cloud-docs/${encodeURIComponent(docId)}/download${qs}`;
+}
+
+export async function mintCloudDocDownloadUrl(docId: string, inline = false): Promise<string> {
+  const res = await apiFetch<{
+    ticket: string;
+    downloadPath: string;
+    expiresInSeconds: number;
+  }>(`/api/cloud-docs/${encodeURIComponent(docId)}/download-ticket`, {
+    method: 'POST',
+    body: JSON.stringify({ inline }),
+  });
+  return `${_baseUrl}${res.downloadPath}`;
+}
+
+export async function downloadCloudDocApi(docId: string, filename?: string): Promise<void> {
+  const url = await mintCloudDocDownloadUrl(docId, false);
+  if (isNative()) {
+    const { Browser } = await import('@capacitor/browser');
+    await Browser.open({ url });
+    return;
+  }
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename ?? '';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+}
+
+export async function fetchCloudDocOnlyOfficeConfig(
+  docId: string,
+  params?: { mode?: 'view' | 'edit'; lang?: string; mobile?: boolean },
+): Promise<OnlyOfficeConfigResponse> {
+  const qs = new URLSearchParams();
+  if (params?.mode) qs.set('mode', params.mode);
+  if (params?.lang) qs.set('lang', params.lang);
+  if (params?.mobile) qs.set('mobile', '1');
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch<OnlyOfficeConfigResponse>(
+    `/api/cloud-docs/${encodeURIComponent(docId)}/onlyoffice/config${suffix}`,
+    { method: 'GET' },
+  );
+}
+
+export async function listRecentDocumentsApi(options?: {
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<{ items: RecentDocumentItem[] }> {
+  const qs = options?.limit ? `?limit=${encodeURIComponent(String(options.limit))}` : '';
+  return apiFetch<{ items: RecentDocumentItem[] }>(
+    `/api/recent-documents${qs}`,
+    { method: 'GET', signal: options?.signal },
+  );
+}
+
+export async function recordRecentDocumentApi(
+  body: RecordRecentDocumentInput,
+): Promise<{ item: RecentDocumentItem }> {
+  return apiFetch<{ item: RecentDocumentItem }>('/api/recent-documents/record', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteRecentDocumentApi(recentId: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(
+    `/api/recent-documents/${encodeURIComponent(recentId)}`,
+    { method: 'DELETE' },
+  );
 }

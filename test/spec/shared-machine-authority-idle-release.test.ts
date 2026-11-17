@@ -19,9 +19,10 @@ describe('process shared machine authority: wiring', () => {
     expect(hook).toMatch(/readProcessSharedMachineAuthority\(session\.name,[\s\S]{0,200}session\.state === 'running'/);
   });
 
-  it('both process input paths bind through the same function', async () => {
+  it('all process input and send paths bind through the same function', async () => {
     const handler = await readSourceAsync(new URL('src/daemon/command-handler.ts', root));
-    expect(handler.match(/bindProcessSharedMachineCommand\(/g)?.length).toBe(2);
+    // Fast reset send path, regular send path, and raw input path.
+    expect(handler.match(/bindProcessSharedMachineCommand\(/g)?.length).toBe(3);
     expect(handler).not.toContain('bindProcessSharedMachineAuthority');
   });
 });

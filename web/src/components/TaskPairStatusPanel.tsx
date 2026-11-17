@@ -1,15 +1,37 @@
-import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
-import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
-import { isMobileLayout } from '../mobile-device.js';
-import { bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
+import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
+import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
+import { readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
+import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel, collectTaskPairTitlesFromSnapshot, formatTaskPairDependencyTasks } from '@shared/task-pair-display.js';
+import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
+import { applyTaskPairPanelFit, bindTaskPairPanelFit, TASK_PAIR_PANEL_MAX_HEIGHT_VAR } from '../task-pair-panel-fit.js';
+import { useTaskPairPanelWidth } from '../task-pair-panel-width.js';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
-import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, type TaskPairStatus } from '@shared/task-pair.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
+import {
+  DEFAULT_TASK_PAIR_SPLIT_MODIFIERS,
+  KEYBOARD_SHORTCUTS_PREF_KEY,
+  formatShortcutModifierKeycaps,
+  isMacPlatform,
+  resolveTaskPairSplitModifiers,
+  type KeyboardShortcutOverrides,
+  type ShortcutModifierKey,
+} from '../keyboard-shortcuts.js';
+import {
+  getTaskPairWaitKind,
+  groupAndOrderTaskPairRows,
+  isAcceptedPanelSnapshot,
+  isTaskPairSplittable,
+  mergeSnapshotRows,
+  normalizeTaskPairSnapshot,
+  type TaskPairConsoleSnapshotDetail,
+  type TaskPairPanelRow,
+} from '../task-pair-panel-order.js';
 import {
   cleanLegacyTaskPairPanelKeysOnce,
   isPhoneScreen,
@@ -20,94 +42,59 @@ import {
   writeServerWideChoice,
 } from '../task-pair-panel-state.js';
 
-const MAX_ROWS = 6;
-
 /** Kept for callers and tests: the server-wide flag's key (see task-pair-panel-state.ts). */
 export const collapsedStorageKey = serverWideStorageKey;
 
-function status(value: unknown): value is TaskPairStatus {
-  return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
+type SnapshotScopeMeta = {
+  authorityScopeKey?: string;
+  scopeKey?: string;
+  serverId?: string;
+};
+
+function readTaskPairSplitModifiers(): ShortcutModifierKey[] {
+  const win = window as Window & { __imcodesTaskPairSplitModifiers?: ShortcutModifierKey[] };
+  if (Array.isArray(win.__imcodesTaskPairSplitModifiers) && win.__imcodesTaskPairSplitModifiers.length > 0) {
+    return win.__imcodesTaskPairSplitModifiers;
+  }
+  try {
+    const raw = localStorage.getItem(`rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`);
+    if (raw) {
+      const parsed = JSON.parse(raw) as { v?: KeyboardShortcutOverrides } | KeyboardShortcutOverrides;
+      const overrides = (parsed && typeof parsed === 'object' && 'v' in parsed ? parsed.v : parsed) as KeyboardShortcutOverrides | undefined;
+      return resolveTaskPairSplitModifiers(overrides);
+    }
+  } catch {}
+  return [...DEFAULT_TASK_PAIR_SPLIT_MODIFIERS];
 }
 
-type TaskPairConsoleSnapshotDetail = { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] };
-
-function finiteTimestamp(value: unknown, fallback?: number): number | undefined {
-  const numeric = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
+function formatTaskPairSplitHint(modifiers: readonly ShortcutModifierKey[], sequenceNumber: number): string {
+  const isMac = isMacPlatform();
+  const caps = formatShortcutModifierKeycaps(modifiers, isMac, DEFAULT_TASK_PAIR_SPLIT_MODIFIERS);
+  return isMac ? `${caps.join('')}${sequenceNumber}` : `${caps.join('+')}+${sequenceNumber}`;
 }
 
-function snapshotTimestamp(row: Record<string, unknown>): number {
-  const value = Number(row.updatedAt);
-  return Number.isFinite(value) && value >= 0 ? value : 0;
+function readSnapshotScope(detail: unknown): SnapshotScopeMeta {
+  if (!detail || typeof detail !== 'object') return {};
+  const raw = detail as Record<string, unknown>;
+  return {
+    ...(typeof raw.authorityScopeKey === 'string' && raw.authorityScopeKey ? { authorityScopeKey: raw.authorityScopeKey } : {}),
+    ...(typeof raw.scopeKey === 'string' && raw.scopeKey ? { scopeKey: raw.scopeKey } : {}),
+    ...(typeof raw.serverId === 'string' && raw.serverId ? { serverId: raw.serverId } : {}),
+  };
 }
 
-function isTerminalRow(row: Record<string, unknown> | undefined): boolean {
-  return Boolean(row && TASK_PAIR_TERMINAL_STATUSES.includes(row.toStatus as TaskPairStatus));
-}
-
-/**
- * Pair snapshots can cross.  Once a terminal row has been observed, an older
- * (or even newer but non-terminal) update must not resurrect it or restart its
- * elapsed timer.  An accepted incoming row REPLACES the previous one: it is the
- * daemon's whole row, so a field it no longer carries (a cleared
- * `waitingReason`, a `queuePosition` after the pair left the queue, a
- * participant state) must disappear - merging kept the old value forever.
- */
-function mergeSnapshotRow(
-  previous: Record<string, unknown> | undefined,
-  incoming: Record<string, unknown>,
-): Record<string, unknown> {
-  if (!previous) return incoming;
-  if (isTerminalRow(previous) && !isTerminalRow(incoming)) return previous;
-  if (snapshotTimestamp(incoming) < snapshotTimestamp(previous)) return previous;
-  return incoming;
-}
-
-function mergeSnapshotRows(
-  previous: readonly Record<string, unknown>[] | null,
-  incoming: readonly Record<string, unknown>[],
-): readonly Record<string, unknown>[] {
-  if (!previous) return incoming;
-  const previousByTask = new Map(previous.map((row) => [String(row.taskId), row]));
-  return incoming.map((row) => mergeSnapshotRow(previousByTask.get(String(row.taskId)), row));
-}
-
-function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Record<string, unknown>[] | null {
-  if (!Array.isArray(detail.tasks)) return null;
-  const byTask = new Map<string, Record<string, unknown>[]>();
-  for (const assignment of detail.assignments ?? []) { const id = typeof assignment.taskId === 'string' ? assignment.taskId : ''; if (id) byTask.set(id, [...(byTask.get(id) ?? []), assignment]); }
-  return detail.tasks.map((task) => {
-    const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
-    const executor = roles.find((role) => role.role === 'implementer'); const auditor = roles.find((role) => role.role === 'auditor');
-    const toStatus = pair.status ?? task.status;
-    const startedAt = finiteTimestamp(pair.startedAt ?? pair.createdAt);
-    const updatedAt = finiteTimestamp(pair.updatedAt ?? task.updatedAt, startedAt);
-    const endedAt = TASK_PAIR_TERMINAL_STATUSES.includes(toStatus as TaskPairStatus)
-      ? finiteTimestamp(pair.endedAt ?? task.updatedAt, updatedAt)
-      : undefined;
-    return {
-      ...pair,
-      scheduling: readPairScheduling(pair.scheduling as TaskPairScheduling | undefined),
-      taskId: task.taskId,
-      title: task.title,
-      brief: typeof task.brief === 'string' && task.brief.trim() ? task.brief : pair.brief,
-      toStatus,
-      ...(startedAt !== undefined ? { startedAt } : {}),
-      updatedAt,
-      ...(endedAt !== undefined ? { endedAt } : {}),
-      queuePosition: pair.queuePosition,
-      executor: pair.executor,
-      auditor: pair.auditor,
-      executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel,
-      auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel,
-      executorModel: executor?.observedModel ?? pair.executorModel,
-      executorThinking: executor?.observedThinking ?? pair.executorThinking,
-      auditorModel: auditor?.observedModel ?? pair.auditorModel,
-      auditorThinking: auditor?.observedThinking ?? pair.auditorThinking,
-      executorState: executor?.sessionState ?? pair.executorState,
-      auditorState: auditor?.sessionState ?? pair.auditorState,
-    };
-  });
+function isCrossScopeSnapshot(prev: SnapshotScopeMeta | undefined, next: SnapshotScopeMeta): boolean {
+  if (!prev) return false;
+  if (prev.authorityScopeKey && next.authorityScopeKey) {
+    return prev.authorityScopeKey !== next.authorityScopeKey;
+  }
+  if (prev.scopeKey && next.scopeKey) {
+    return prev.scopeKey !== next.scopeKey;
+  }
+  if (!prev.authorityScopeKey && next.authorityScopeKey) {
+    return true;
+  }
+  return Boolean(prev.serverId && next.serverId && prev.serverId !== next.serverId);
 }
 
 type SessionLabelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
@@ -125,96 +112,159 @@ function resolveSessionModel(
   return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
 }
 
-function hasPairActivity(events: readonly TimelineEvent[]): boolean {
+function hasPairActivity(events: readonly TimelineEvent[], serverId?: string | null): boolean {
   if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
-  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly unknown[]; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+  if (!isAcceptedPanelSnapshot(snapshot, serverId)) return false;
   return Boolean(snapshot?.authorityUnavailable) || (Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0);
 }
 
-export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
+function resetScrollPosition(node: Element | EventTarget | null | undefined): void {
+  if (!node || !('scrollTop' in node) || !('scrollLeft' in node)) return;
+  const el = node as HTMLElement;
+  if (el.scrollTop !== 0) el.scrollTop = 0;
+  if (el.scrollLeft !== 0) el.scrollLeft = 0;
+}
+
+function resetPanelChromeScroll(panel: HTMLElement | null, toggleEl: HTMLElement | null): void {
+  resetScrollPosition(panel);
+  resetScrollPosition(toggleEl);
+  if (panel?.parentElement?.classList.contains('chat-titlebar')) resetScrollPosition(panel.parentElement);
+  if (!panel) return;
+  for (const el of panel.querySelectorAll('.task-pair-status-toggle, .task-pair-status-compact, .task-pair-status-icons, .task-pair-status-mobile-content')) {
+    resetScrollPosition(el);
+  }
+}
+
+function clampElementScroll(event: { currentTarget: EventTarget | null }): void {
+  resetScrollPosition(event.currentTarget);
+}
+
+export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey, mobileAnchor }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
-  // A phone sub-session shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
+  // A phone sub-session or split-executor visit shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
   // (it lives while the view stays mounted, through resizes, and is gone when the user leaves): nothing is stored. The main chat and
-  // the desktop keep the stored server-wide flag. See task-pair-panel-state.ts.
+  // other desktop windows keep the stored server-wide flag. See task-pair-panel-state.ts.
   const phoneNow = () => isPhoneScreen({ mobile: isMobileLayout(), screenWidth: window.screen?.width, screenHeight: window.screen?.height, innerWidth: window.innerWidth });
   const [phone, setPhone] = useState(phoneNow);
-  const visitScoped = usesVisitScopedChoice({ phone, scopeSessionId });
-  const [choice, setChoice] = useState<boolean | undefined>(() => (usesVisitScopedChoice({ phone: phoneNow(), scopeSessionId }) ? undefined : readServerWideChoice({ serverId, mobile: isMobileLayout() })));
+  const visitScoped = usesVisitScopedChoice({ phone, scopeSessionId, collapsedVisitKey });
+  const [choice, setChoice] = useState<boolean | undefined>(() => (usesVisitScopedChoice({ phone: phoneNow(), scopeSessionId, collapsedVisitKey }) ? undefined : readServerWideChoice({ serverId, mobile: isMobileLayout() })));
   cleanLegacyTaskPairPanelKeysOnce();
   // The mobile panel is measured against the visible chat area; when too little
   // room is left (landscape phone, keyboard open) the collapsed strip is shown
   // instead, without touching the user's choice.
   const [cramped, setCramped] = useState(false);
   const panelRef = useRef<HTMLElement>(null);
+  const toggleRef = useRef<HTMLElement | null>(null);
+  const setToggleNode = useCallback((el: HTMLElement | null) => { toggleRef.current = el; }, []);
   const persistCollapsed = useCallback((next: boolean) => {
     setChoice(next);
     if (!visitScoped) writeServerWideChoice({ serverId, mobile: isMobile, collapsed: next });
   }, [serverId, isMobile, visitScoped]);
-  useLayoutEffect(() => {
-    const panel = panelRef.current;
-    if (!isMobile || !panel) { setCramped(false); return undefined; }
-    return bindTaskPairPanelFit(panel, setCramped);
-  }, [isMobile]);
   useEffect(() => {
-    const media = window.matchMedia?.('(max-width: 720px)');
-    if (!media) return undefined;
     // Only the layout class is tracked here; the choice is re-read by the effect below when the layout (or the panel's scope) changes.
     const onChange = () => { setIsMobile(isMobileLayout()); setPhone(phoneNow()); };
-    media.addEventListener?.('change', onChange);
-    window.addEventListener('resize', onChange);
-    return () => { media.removeEventListener?.('change', onChange); window.removeEventListener('resize', onChange); };
+    onChange();
+    return subscribeDeviceLayoutChange(onChange);
   }, []);
   // The choice is re-resolved only when what it belongs to changes: another server or sub-session, or the layout class. A phone
   // sub-session starts closed again for a different session; a resize within the same view never reaches this.
-  const scopeKey = `${serverId ?? ''}|${scopeSessionId ?? ''}|${isMobile ? 'm' : 'd'}|${visitScoped ? 'v' : 's'}`;
+  // A split visit survives responsive layout changes, but not another task/session/server or exit/re-entry.
+  const scopeKey = JSON.stringify([serverId, scopeSessionId, collapsedVisitKey, visitScoped ? 'visit' : isMobile ? 'mobile' : 'desktop']);
   const lastScopeKey = useRef(scopeKey);
   useEffect(() => {
     if (lastScopeKey.current === scopeKey) return;
     lastScopeKey.current = scopeKey;
     setChoice(visitScoped ? undefined : readServerWideChoice({ serverId, mobile: isMobile }));
   }, [scopeKey, serverId, isMobile, visitScoped]);
+  const lastSnapshotScopeRef = useRef<SnapshotScopeMeta | undefined>((() => {
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    if (!isAcceptedPanelSnapshot(detail, serverId)) return undefined;
+    const scope = readSnapshotScope(detail);
+    return scope.authorityScopeKey || scope.scopeKey || scope.serverId ? scope : undefined;
+  })());
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
-    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
-    return detail ? normalizeSnapshot(detail) : null;
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    return detail && isAcceptedPanelSnapshot(detail, serverId) ? normalizeTaskPairSnapshot(detail) : null;
+  });
+  const [snapshotTitles, setSnapshotTitles] = useState<Map<string, string>>(() => {
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    return isAcceptedPanelSnapshot(detail, serverId) ? collectTaskPairTitlesFromSnapshot(detail) : new Map();
   });
   const [activeSplitTaskId, setActiveSplitTaskId] = useState<string | null>(() => {
     return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
   });
+  const [splitShortcutModifiers, setSplitShortcutModifiers] = useState<ShortcutModifierKey[]>(readTaskPairSplitModifiers);
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       setActiveSplitTaskId(detail?.activeTaskId ?? null);
     };
+    const onModifiersChange = () => setSplitShortcutModifiers(readTaskPairSplitModifiers());
     window.addEventListener('deck:pair-split-state', handler);
-    return () => window.removeEventListener('deck:pair-split-state', handler);
+    window.addEventListener('deck:task-pair-split-modifiers', onModifiersChange);
+    return () => {
+      window.removeEventListener('deck:pair-split-state', handler);
+      window.removeEventListener('deck:task-pair-split-modifiers', onModifiersChange);
+    };
   }, []);
   useEffect(() => {
-    const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean } | undefined;
-      if (!detail) return;
+    const applyPanelSnapshot = (detail: TaskPairConsoleSnapshotDetail | undefined) => {
+      if (!detail || !isAcceptedPanelSnapshot(detail, serverId)) return;
       if (detail.scopeReset) {
         (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
+        lastSnapshotScopeRef.current = undefined;
         setSnapshotRows(null);
+        setSnapshotTitles(new Map());
         return;
       }
-      if (Array.isArray(detail.tasks)) {
-        const normalized = normalizeSnapshot(detail);
-        if (normalized) setSnapshotRows((current) => mergeSnapshotRows(current, normalized));
+      if (detail.authorityUnavailable) {
+        setSnapshotTitles(new Map());
+      } else if (Array.isArray(detail.tasks) || detail.taskTitles) {
+        setSnapshotTitles(collectTaskPairTitlesFromSnapshot(detail));
       }
+      if (Array.isArray(detail.tasks)) {
+        const normalized = normalizeTaskPairSnapshot(detail);
+        if (normalized) {
+          const nextScope = readSnapshotScope(detail);
+          const crossScope = isCrossScopeSnapshot(lastSnapshotScopeRef.current, nextScope);
+          if (nextScope.authorityScopeKey || nextScope.scopeKey || nextScope.serverId) {
+            lastSnapshotScopeRef.current = nextScope;
+          }
+          setSnapshotRows((current) => mergeSnapshotRows(crossScope ? null : current, normalized));
+        }
+      }
+    };
+    const current = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    if (current && !current.scopeReset) {
+      applyPanelSnapshot(current);
+    } else if (!current && lastSnapshotScopeRef.current?.serverId && serverId && lastSnapshotScopeRef.current.serverId !== serverId) {
+      lastSnapshotScopeRef.current = undefined;
+      setSnapshotRows(null);
+      setSnapshotTitles(new Map());
+    }
+    const onSnapshot = (event: Event) => {
+      applyPanelSnapshot((event as CustomEvent).detail as TaskPairConsoleSnapshotDetail | undefined);
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
-  }, []);
-  const latest = new Map<string, { payload: Record<string, unknown>; startedAt: number; updatedAt: number }>();
+  }, [serverId]);
+  const latest = new Map<string, TaskPairPanelRow>();
   const reworkCounts = new Map<string, number>();
+  const taskTitles = new Map<string, string>();
   for (const event of events) {
     if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
     const eventPayload = event.payload as Record<string, unknown>;
-    if (typeof eventPayload.taskId === 'string' && eventPayload.verb === 'REWORK') {
-      reworkCounts.set(eventPayload.taskId, (reworkCounts.get(eventPayload.taskId) ?? 0) + 1);
+    if (typeof eventPayload.taskId === 'string') {
+      const eventTitle = taskPairDisplayTitle(eventPayload.title, eventPayload.taskId, eventPayload.brief);
+      if (eventTitle) taskTitles.set(eventPayload.taskId, eventTitle);
+      if (eventPayload.verb === 'REWORK') {
+        reworkCounts.set(eventPayload.taskId, (reworkCounts.get(eventPayload.taskId) ?? 0) + 1);
+      }
     }
   }
+  for (const [id, resolved] of snapshotTitles) taskTitles.set(id, resolved);
   if (snapshotRows) for (const payload of snapshotRows) if (typeof payload.taskId === 'string') latest.set(payload.taskId, { payload, startedAt: Number(payload.startedAt), updatedAt: Number(payload.updatedAt) });
   for (const event of events) {
     if (snapshotRows) break;
@@ -225,25 +275,18 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       latest.set(payload.taskId, { payload, startedAt: old?.startedAt ?? event.ts, updatedAt: event.ts });
     }
   }
+  for (const [id, row] of latest.entries()) {
+    const resolved = taskPairDisplayTitle(row.payload.title, id, row.payload.brief);
+    if (resolved) taskTitles.set(id, resolved);
+  }
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
-  const allRows = [...latest.values()].filter((row) => {
-    if (!status(row.payload.toStatus)) return false;
-    if (!scopeSessionId) return true;
-    return String(row.payload.executor ?? '') === scopeSessionId || String(row.payload.auditor ?? '') === scopeSessionId;
-  });
-  const waitKind = (payload: Record<string, unknown>) => taskPairWaitKind({ scheduling: payload.scheduling as TaskPairScheduling | undefined, status: payload.toStatus as TaskPairStatus });
-  const groupFor = (value: TaskPairStatus, payload: Record<string, unknown>) => waitKind(payload) ?? ( value === 'queued' ? 'queued' : value === 'awaiting_brain_decision' ? 'awaiting_brain_decision' : value === 'rework' ? 'rework' : value === 'in_audit' || value === 'awaiting_audit' ? 'audit' : value === 'done' || value === 'cancelled' || value === 'passed' ? 'recent' : 'working');
-  const groups = (['working', 'audit', 'rework', 'queued', 'awaiting_brain_decision', ...TASK_PAIR_WAIT_KINDS, 'recent'] as const).map((key) => {
-    const rows = allRows.filter((row) => groupFor(row.payload.toStatus as TaskPairStatus, row.payload) === key);
-    if (key === 'queued') rows.sort((a, b) => Number(a.payload.queuePosition ?? Number.MAX_SAFE_INTEGER) - Number(b.payload.queuePosition ?? Number.MAX_SAFE_INTEGER));
-    return { key, rows: key === 'recent' ? rows.slice(-MAX_ROWS) : rows };
-  }).filter((group) => group.rows.length > 0);
+  const { allRows, groups } = groupAndOrderTaskPairRows(latest.values(), scopeSessionId);
   const scopedDefaultTaskId = scopeSessionId
     ? (allRows.find((row) => ['working', 'in_audit', 'awaiting_audit', 'rework'].includes(String(row.payload.toStatus)))?.payload.taskId ?? allRows[0]?.payload.taskId)
     : undefined;
   const counts = allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number; waiting: number }>((result, row) => {
-    if (waitKind(row.payload)) { result.waiting += 1; return result; }
+    if (getTaskPairWaitKind(row.payload)) { result.waiting += 1; return result; }
     const value = row.payload.toStatus;
     if (value === 'working' || value === 'rework') result.working += 1;
     else if (value === 'in_audit' || value === 'awaiting_audit') result.audit += 1;
@@ -251,10 +294,33 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     else if (value === 'queued') result.queued += 1;
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0, waiting: 0 });
-  if (latest.size === 0 || allRows.length === 0) return null;
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
-  // shows the strip without touching the choice.
-  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId }) || (isMobile && cramped);
+  // inline sub-window shows the strip without touching the choice. On mobile main chat (no scopeSessionId), expanding uses fullscreen
+  // overlay so inline cramped measurement / --task-pair-panel-max-h must not collapse or clip it.
+  const usesInlineMobileFit = isMobile && Boolean(scopeSessionId);
+  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (usesInlineMobileFit && cramped);
+  const isFullscreen = isMobile && !scopeSessionId && !collapsed;
+  const hasRows = latest.size > 0 && allRows.length > 0;
+  const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && hasRows, Boolean(scopeSessionId || collapsedVisitKey));
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (!usesInlineMobileFit || !hasRows || !panel) {
+      panel?.style.removeProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
+      setCramped(false);
+      return undefined;
+    }
+    return bindTaskPairPanelFit(panel, setCramped);
+  }, [usesInlineMobileFit, hasRows, mobileAnchor]);
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    resetPanelChromeScroll(panel, toggleRef.current);
+    if (!usesInlineMobileFit || !hasRows || !panel) {
+      panel?.style.removeProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
+      return;
+    }
+    applyTaskPairPanelFit(panel, setCramped);
+  }, [usesInlineMobileFit, hasRows, collapsed, mobileAnchor]);
+  if (!hasRows) return null;
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -268,10 +334,12 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     if (typeof id !== 'string' || !id || id === 'none') return null;
     const text = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id), projectionSessions.find((entry) => entry.sessionName === id)?.title) || t(`taskPair.panel_${role}`);
     const resolvedModel = resolveSessionModel(id, model, sessions, projectionSessions);
-    return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>
+    return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => {
+      if (isFullscreen) persistCollapsed(true);
+      window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
+    }}>
       <span class="task-pair-status-session-main">
         <span class="task-pair-status-session-label">{text}</span>
-        <small class="task-pair-status-session-id">{id}</small>
         {resolvedModel && <small class="task-pair-status-session-model">{resolvedModel}</small>}
       </span>
     </button>;
@@ -303,13 +371,17 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
     </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
-  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
-    {isMobile && collapsed ? <div class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard}>
+  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}${isFullscreen ? ' is-fullscreen' : ''}`} data-testid="task-pair-status-panel" onScroll={clampElementScroll}>
+    {!isMobile && !collapsed && <div class="task-pair-status-resize" role="separator" tabIndex={0}
+      aria-label={t('taskPair.panel_resize')} title={t('taskPair.panel_resize')} aria-orientation="vertical"
+      aria-valuemin={panelWidth.min} aria-valuemax={panelWidth.max} aria-valuenow={panelWidth.width}
+      onPointerDown={panelWidth.onPointerDown} onKeyDown={panelWidth.onKeyDown} />}
+    {isMobile && collapsed ? <div key="compact-toggle" ref={setToggleNode} class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard} onScroll={clampElementScroll}>
       {toggleContent}
-    </div> : <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
+    </div> : <button key={collapsed ? 'collapsed-toggle' : 'expanded-toggle'} ref={setToggleNode} type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle} onScroll={clampElementScroll}>
       {toggleContent}
     </button>}
-    {!collapsed && <div class="task-pair-status-rows" data-testid="task-pair-status-rows">
+    {!collapsed && <div key="expanded-body" class="task-pair-status-body"><div class="task-pair-status-rows" data-testid="task-pair-status-rows">
       {(() => { let sequence = 0; return groups.map((group) => {
         const heading = <h4>{TASK_PAIR_WAIT_KINDS.includes(group.key as typeof TASK_PAIR_WAIT_KINDS[number]) ? t(`taskPair.status.${group.key}`) : group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
         const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = taskPairDisplayTitle(payload.title, String(payload.taskId), payload.brief) ?? t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
@@ -317,44 +389,57 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
               <span class="task-pair-status-badge-dot" aria-hidden="true" />
-              {waitKind(payload) ? t(`taskPair.status.${waitKind(payload)}`) : taskStatus === 'rework' ? t('taskPair.panel_rework_count', { count: reworkCount }) : taskStatus === 'working' && deliveryRound > 1 ? t('taskPair.panel_round_in_progress', { round: deliveryRound }) : t(`taskPair.status.${taskStatus}`)}
+              {getTaskPairWaitKind(payload) ? t(`taskPair.status.${getTaskPairWaitKind(payload)}`) : taskStatus === 'rework' ? t('taskPair.panel_rework_count', { count: reworkCount }) : taskStatus === 'working' && deliveryRound > 1 ? t('taskPair.panel_round_in_progress', { round: deliveryRound }) : t(`taskPair.status.${taskStatus}`)}
             </span>
             {!queued && auditRound > 0 && <span class="task-pair-status-round-badge">{deliveryRound > 1 ? t('taskPair.panel_round_of', { delivery: deliveryRound, audit: auditRound }) : t('taskPair.panel_round', { round: auditRound })}</span>}
             {!queued && <span class="task-pair-status-round-badge task-pair-status-blocking-badge">{t('taskPair.blocking', { levels: Array.isArray(payload.blocking) ? payload.blocking.join(',') : 'P0' })}</span>}
             {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
-          {waitKind(payload) && <small class="task-pair-status-row-meta">{(payload.scheduling as TaskPairScheduling).note}{(payload.scheduling as TaskPairScheduling).dependsOn.length > 0 && t('taskPair.waiting_for_tasks', { tasks: (payload.scheduling as TaskPairScheduling).dependsOn.map((id) => String(latest.get(id)?.payload.title ?? id)).join(', ') })}</small>}
-          <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
+          {(() => {
+            const rowWaitKind = getTaskPairWaitKind(payload);
+            if (!rowWaitKind) return null;
+            const rowScheduling = readPairScheduling(payload.scheduling as TaskPairScheduling | undefined);
+            const deps = rowScheduling?.dependsOn ?? [];
+            return <small class="task-pair-status-row-meta">{rowScheduling?.note}{deps.length > 0 && t('taskPair.waiting_for_tasks', { tasks: formatTaskPairDependencyTasks(deps, taskTitles, rowScheduling?.dependencyTitles) })}</small>;
+          })()}
+          <TaskPairDecisionPanel taskId={String(payload.taskId)} pair={{ ...payload,
+            status: payload.toStatus, flags: payload.flags ?? [], round: payload.round ?? 0,
+          } as SupervisionConsolePairInfo} taskTitles={taskTitles} />
+          <TaskPairBrief key={JSON.stringify([serverId, scopeSessionId, String(payload.taskId)])} brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
           {duration !== undefined && <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{Number.isFinite(row.startedAt) && <>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · </>}{queued ? t('taskPair.panel_queued', { duration }) : t('taskPair.panel_elapsed', { duration })}</small>}
           <div class="task-pair-status-row-roles">
             <span class="task-pair-role-chip" role="group" aria-label={t('taskPair.panel_executor')}><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, payload.executorThinking, 'executor') ?? unassigned(payload.executorModel, payload.executorThinking)}</span>
             {payload.auditor === 'none'
               ? <span class="task-pair-role-chip task-pair-role-chip--muted">{t('taskPair.panel_no_audit')}</span>
               : <span class="task-pair-role-chip" role="group" aria-label={t('taskPair.panel_auditor')}><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, payload.auditorThinking, 'auditor') ?? unassigned(payload.auditorModel, payload.auditorThinking)}</span>}
-            {!isMobile && typeof payload.executor === 'string' && payload.executor && payload.executor !== 'none' && typeof payload.auditor === 'string' && payload.auditor && payload.auditor !== 'none' && (() => {
+            {!isMobile && isTaskPairSplittable(payload) && (() => {
               const taskIdStr = String(payload.taskId);
-              const isSplitOpen = activeSplitTaskId === taskIdStr;
+              // The active pair exits from either window's titlebar.
+              if (activeSplitTaskId === taskIdStr) return null;
+              const splitLabel = t('taskPair.panel_open_split');
+              const splitHint = sequenceNumber <= 9 ? `${splitLabel} (${formatTaskPairSplitHint(splitShortcutModifiers, sequenceNumber)})` : splitLabel;
               return (
                 <button
                   type="button"
-                  class={`task-pair-split-btn${isSplitOpen ? ' is-active' : ''}`}
-                  title={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
-                  aria-label={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
+                  class="task-pair-split-btn"
+                  title={splitHint}
+                  aria-label={splitLabel}
                   onClick={(e) => {
                     e.stopPropagation();
                     window.dispatchEvent(new CustomEvent('deck:pair-split', {
                       detail: {
                         taskId: taskIdStr,
+                        title,
                         executor: payload.executor,
                         auditor: payload.auditor,
-                        action: isSplitOpen ? 'close' : 'open',
+                        action: 'open',
                       },
                     }));
                   }}
                 >
                   <span class="task-pair-split-icon" aria-hidden="true">◫</span>
-                  <span class="task-pair-split-text">{isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}</span>
+                  <span class="task-pair-split-text">{t('taskPair.panel_open_split')}</span>
                 </button>
               );
             })()}
@@ -364,47 +449,56 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           ? <details class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}><summary>{heading}</summary>{content}</details>
           : <section class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}>{heading}{content}</section>;
       }); })()}
-    </div>}
+    </div></div>}
   </aside>;
 }
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
-export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
-  const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
-  const [active, setActive] = useState(() => hasPairActivity(props.events));
-  const [authorityUnavailable, setAuthorityUnavailable] = useState(() => Boolean(initialSnapshot?.authorityUnavailable));
+export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
+  const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+  const [active, setActive] = useState(() => hasPairActivity(props.events, props.serverId));
+  const [authorityUnavailable, setAuthorityUnavailable] = useState(() => (
+    isAcceptedPanelSnapshot(initialSnapshot, props.serverId) && Boolean(initialSnapshot?.authorityUnavailable)
+  ));
   const [resolvedMobileAnchor, setResolvedMobileAnchor] = useState<Element | null>(() => props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null);
   useLayoutEffect(() => {
     const anchor = props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null;
     if (anchor !== resolvedMobileAnchor) setResolvedMobileAnchor(anchor);
-  }, [active, props.mobileAnchor, props.mobileAnchorRef, resolvedMobileAnchor]);
+  });
   useEffect(() => {
-    if (!active && hasPairActivity(props.events)) {
+    if (!active && hasPairActivity(props.events, props.serverId)) {
       setActive(true);
     }
-  }, [active, props.events]);
+  }, [active, props.events, props.serverId]);
   useEffect(() => {
-    const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined;
-      if (detail?.scopeReset) {
+    const applySnapshot = (detail: TaskPairConsoleSnapshotDetail | undefined) => {
+      if (!detail || !isAcceptedPanelSnapshot(detail, props.serverId)) return;
+      if (detail.scopeReset) {
         setActive(true);
         setAuthorityUnavailable(true);
         return;
       }
-      if ((Array.isArray(detail?.tasks) && detail.tasks.length > 0) || detail?.op === 'task_upsert' || detail?.task) {
-        if (Array.isArray(detail?.tasks)) (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
+      if ((Array.isArray(detail.tasks) && detail.tasks.length > 0) || detail.op === 'task_upsert' || detail.task) {
+        if (Array.isArray(detail.tasks)) (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
         setActive(true);
+      } else if (Array.isArray(detail.tasks)) {
+        (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       }
-      if (detail && 'authorityUnavailable' in detail) {
+      if ('authorityUnavailable' in detail) {
         setAuthorityUnavailable(Boolean(detail.authorityUnavailable));
         setActive(true);
-      } else if (detail && Array.isArray(detail.tasks)) {
+      } else if (Array.isArray(detail.tasks)) {
         setAuthorityUnavailable(false);
       }
     };
+    const current = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    if (current && !current.scopeReset) applySnapshot(current);
+    const onSnapshot = (event: Event) => {
+      applySnapshot((event as CustomEvent).detail as TaskPairConsoleSnapshotDetail | undefined);
+    };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
-  }, []);
+  }, [props.serverId]);
   if (!active) return null;
   // Owner rule: load silently, never cover the chat. While the authoritative
   // snapshot for a new scope is pending (or unavailable), render nothing: stale
@@ -412,7 +506,7 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   // box may cover the conversation. The panel reappears with fresh data.
   if (authorityUnavailable) return null;
   const { mobileAnchor, mobileAnchorRef, ...panelProps } = props;
-  const panel = <TaskPairStatusPanel {...panelProps} />;
+  const panel = <TaskPairStatusPanel {...panelProps} mobileAnchor={resolvedMobileAnchor} />;
   // The titlebar is the only safe host: keeping the panel in normal flow makes
   // both mobile and desktop controls reserve space instead of being covered by
   // a chat-main overlay. Expanded rows still open below the titlebar.

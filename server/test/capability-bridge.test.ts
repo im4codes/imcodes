@@ -303,22 +303,98 @@ describe('capability daemon bridge', () => {
     expect(controlled.daemon.sent).toEqual([]);
   });
 
-  it('catches cross-pod capability revisions on the next FULL daemon heartbeat', async () => {
-    const { daemon } = await authenticatedBridge('server-heartbeat');
-    daemon.emit('message', JSON.stringify({ type: CAPABILITY_SYNC_MSG.REQUEST }));
-    await flush();
-    daemon.sent = [];
-    mocks.snapshot.mockResolvedValue({
-      ownerId: 'owner-1', revision: 9, items: [], tombstones: [], digest: 'f'.repeat(64),
-    });
-    daemon.emit('message', JSON.stringify({ type: 'heartbeat' }));
-    await flush();
-    await flush();
-    expect(daemon.sent.map((value) => JSON.parse(value))).toContainEqual(expect.objectContaining({
-      type: CAPABILITY_SYNC_MSG.DELTA,
-      ownerId: 'owner-1',
-      revision: 9,
-    }));
+  it('catches cross-pod capability revisions on the next FULL daemon heartbeat after fallback interval', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      const { daemon } = await authenticatedBridge('server-heartbeat');
+      daemon.emit('message', JSON.stringify({ type: CAPABILITY_SYNC_MSG.REQUEST }));
+      await flush();
+      daemon.sent = [];
+      mocks.snapshot.mockClear();
+      mocks.expirePreActivation.mockClear();
+      mocks.expirePending.mockClear();
+      mocks.snapshot.mockResolvedValue({
+        ownerId: 'owner-1', revision: 9, items: [], tombstones: [], digest: 'f'.repeat(64),
+      });
+      // Immediate heartbeat within fallback window skips redundant capability DB scans while still acking.
+      daemon.emit('message', JSON.stringify({ type: 'heartbeat' }));
+      await flush();
+      expect(mocks.snapshot).not.toHaveBeenCalled();
+      expect(mocks.expirePreActivation).not.toHaveBeenCalled();
+      expect(mocks.expirePending).not.toHaveBeenCalled();
+      expect(daemon.sent.map((value) => JSON.parse(value))).toContainEqual(expect.objectContaining({
+        type: 'heartbeat_ack',
+      }));
+
+      // Fallback interval elapses -> next heartbeat catches cross-pod revision 9.
+      await vi.advanceTimersByTimeAsync(60_000);
+      daemon.emit('message', JSON.stringify({ type: 'heartbeat' }));
+      await flush();
+      await flush();
+      expect(daemon.sent.map((value) => JSON.parse(value))).toContainEqual(expect.objectContaining({
+        type: CAPABILITY_SYNC_MSG.DELTA,
+        ownerId: 'owner-1',
+        revision: 9,
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still runs capability expiry checks on heartbeat while an operation is active and stops after terminal progress', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      const { bridge, daemon } = await authenticatedBridge('server-active-op');
+      daemon.emit('message', JSON.stringify({ type: CAPABILITY_SYNC_MSG.REQUEST }));
+      await flush();
+      mocks.expirePreActivation.mockClear();
+      mocks.expirePending.mockClear();
+      mocks.snapshot.mockClear();
+
+      expect(bridge.dispatchCapabilityInstall('owner-1', {
+        type: CAPABILITY_OPERATION_MSG.INSTALL,
+        operationId: 'operation-active-1',
+        ownerId: 'owner-1',
+        revision: 1,
+        request: {
+          kind: CAPABILITY_KIND.SKILL,
+          source: { kind: CAPABILITY_SOURCE_KIND.INLINE, inlineFiles: { 'SKILL.md': 'safe' } },
+          scope: CAPABILITY_SCOPE.ACCOUNT,
+          idempotencyKey: 'active-op-key',
+        },
+      })).toBe(true);
+
+      // While operation is active, heartbeat must check expiry even before 60s fallback.
+      daemon.emit('message', JSON.stringify({ type: 'heartbeat' }));
+      await flush();
+      await flush();
+      expect(mocks.expirePreActivation).toHaveBeenCalledTimes(1);
+      expect(mocks.expirePending).toHaveBeenCalledTimes(1);
+
+      // Mark operation terminal (failed) via PROGRESS.
+      mocks.update.mockResolvedValue({ revision: 2, state: CAPABILITY_INSTALL_STATE.FAILED });
+      daemon.emit('message', JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: 'operation-active-1',
+        expectedRevision: 1,
+        state: CAPABILITY_INSTALL_STATE.FAILED,
+        errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+      }));
+      await flush();
+
+      mocks.expirePreActivation.mockClear();
+      mocks.expirePending.mockClear();
+      mocks.snapshot.mockClear();
+
+      // Once terminal and within 60s fallback window, heartbeat skips redundant capability DB checks.
+      daemon.emit('message', JSON.stringify({ type: 'heartbeat' }));
+      await flush();
+      expect(mocks.expirePreActivation).not.toHaveBeenCalled();
+      expect(mocks.expirePending).not.toHaveBeenCalled();
+      expect(mocks.snapshot).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('accepts only current-revision progress and persists digest-bound audit evidence', async () => {

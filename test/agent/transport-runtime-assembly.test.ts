@@ -16,9 +16,17 @@ import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machin
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
-import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_CONTRACT_ID } from '../../shared/task-pair.js';
-import { buildFileOutputContract } from '../../shared/file-output-contract.js';
+import {
+  TASK_PAIR_BRAIN_CONTRACT_ID,
+  TASK_PAIR_CONTRACT_ID,
+  TASK_PAIR_MULTI_PHASE_CRON_RULE,
+  TASK_PAIR_MULTI_PHASE_CRON_TOKEN,
+  TASK_PAIR_SPLIT_UNRELATED_RULE,
+  TASK_PAIR_SPLIT_UNRELATED_TOKEN,
+} from '../../shared/task-pair.js';
+import { buildCloudDocOutputContract, buildFileOutputContract } from '../../shared/file-output-contract.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { buildBrainWorkDelegationContractRef } from '../../src/daemon/supervision-prompts.js';
 import {
   SESSION_IDENTITY_PROJECT_MAX_CHARS as ID_PROJECT_MAX,
@@ -96,7 +104,7 @@ describe('buildProviderContextPayload', () => {
 
   it('places a newly registered IM.codes contract in session system text, not turn or user text', () => {
     const body = '{"contractId":"supervision_cron_control_v1","authoritative":{"taskBody":"inspect progress"}}';
-    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', AGY_SDK_PROVIDER_ID), {
       userMessage: '<imcodes-cron-control {"contractRef":"supervision_cron_control_v1","scheduleId":"job-1"}></imcodes-cron-control>',
       registeredSystemContractText: body,
     });
@@ -108,7 +116,7 @@ describe('buildProviderContextPayload', () => {
   });
 
   it('assembles normalized system context from description and runtime prompt', () => {
-    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', AGY_SDK_PROVIDER_ID), {
       userMessage: 'Run tests',
       description: 'Be concise',
       systemPrompt: 'Never edit generated files',
@@ -134,8 +142,12 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('sourceLookup object');
     expect(payload.systemText).toContain('Keep work updates short and high-signal');
     expect(payload.systemText).toContain('at least every 5 minutes or every 15 tool calls');
+    expect(payload.systemText).toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
     expect(payload.systemText).toContain('"contractId":"file_output_v1"');
     expect(payload.systemText).toContain('[display name](/absolute/full/path)');
+    expect(payload.systemText).toContain('"scope":"local_files_only_never_cloud_docs"');
+    expect(payload.systemText).toContain('"contractId":"cloud_doc_output_v1"');
+    expect(payload.systemText).toContain('[CloudDoc: <name> | id=<docId>]');
   });
 
   it('keeps the synchronized identity contract intact in stable session system text', () => {
@@ -232,7 +244,9 @@ describe('buildProviderContextPayload', () => {
     const pairs = brainSystemText({ automaticSupervisionEnabled: false });
     expect(pairs).toContain('"auditedWork":{"route":"task_pair"');
     expect(pairs).toContain('"brainCronSelf":"forbidden"');
-    expect(pairs).not.toContain('cron_create_self');
+    expect(pairs).not.toContain('cron_create_self_every_10_min');
+    expect(pairs).toContain(TASK_PAIR_MULTI_PHASE_CRON_TOKEN);
+    expect(pairs).toContain(TASK_PAIR_MULTI_PHASE_CRON_RULE);
     expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy' }))
       .not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
@@ -311,6 +325,10 @@ describe('buildProviderContextPayload', () => {
     expect(text).toContain('"automaticSupervision":true');
     expect(text).toContain('"engine":"pairs"');
     expect(text).toContain('pair_create_with_brief_and_roles_then_pair_dispatch_if_queued');
+    expect(text).toContain(TASK_PAIR_SPLIT_UNRELATED_TOKEN);
+    expect(text).toContain(TASK_PAIR_SPLIT_UNRELATED_RULE);
+    expect(text).toContain(TASK_PAIR_MULTI_PHASE_CRON_TOKEN);
+    expect(text).toContain(TASK_PAIR_MULTI_PHASE_CRON_RULE);
     expect(text).toContain('never_ask_or_explain_them');
     // Engine-neutral routing stays.
     expect(text).toContain('coordinate_not_implement');
@@ -424,16 +442,14 @@ describe('buildProviderContextPayload', () => {
   // Field complaint: long tasks ran for many minutes with no user-visible word.
   // The old guidance only said "sparse, key boundaries only" and set no ceiling.
   it('bounds how long a session may work without a user-visible progress update', () => {
-    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', AGY_SDK_PROVIDER_ID), {
       userMessage: 'run the full regression and deploy',
       namespace: { scope: 'personal', projectId: 'repo-1' },
     });
     const text = payload.sessionSystemText ?? '';
+    expect(text).toContain('Keep work updates short and high-signal');
     expect(text).toContain('at least every 5 minutes or every 15 tool calls');
-    expect(text).toContain('Never work longer than that with no user-visible update');
-    expect(text).toContain('never turn a status into a long report');
-    expect(text).toContain('Before any step likely to take more than about 2 minutes');
-    expect(text).not.toContain('At key boundaries only');
+    expect(text).toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
   });
 
   it('adds shared system guidance for every managed SDK provider id', () => {
@@ -458,10 +474,24 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('do not invent details from summaries alone');
       expect(payload.systemText).toContain('Keep work updates short and high-signal');
       expect(payload.systemText).toContain('skip routine narration and repeated summaries');
+      if (providerId === AGY_SDK_PROVIDER_ID) {
+        expect(payload.systemText).toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
+      } else {
+        expect(payload.systemText).not.toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
+      }
       expect(payload.systemText?.split(buildFileOutputContract())).toHaveLength(2);
+      expect(payload.systemText?.split(buildCloudDocOutputContract())).toHaveLength(2);
       expect(payload.systemText?.match(/file_output_v1/g)).toHaveLength(1);
+      expect(payload.systemText?.match(/"contractId":"cloud_doc_output_v1"/g)).toHaveLength(1);
       expect(payload.systemText).toContain('[display name](/absolute/full/path)');
       expect(payload.systemText).toContain('"repoRelative":"resolve_against_workspace_if_only_known"');
+      expect(payload.systemText).toContain('"scope":"local_files_only_never_cloud_docs"');
+      expect(payload.systemText).toContain('"cloudDocs":"use_cloud_doc_output_v1"');
+      expect(payload.systemText).toContain('[CloudDoc: <name> | id=<docId>]');
+      expect(payload.systemText).toContain('"turns":"required_in_turn_1_turn_2_and_all_later_replies"');
+      expect(payload.systemText).toContain('"repeatedMentions":"full_token_on_every_occurrence_never_drop_id"');
+      expect(payload.systemText).toContain('"afterRename":"use_latest_name_and_keep_same_id"');
+      expect(payload.systemText).toContain('"forbidden"');
       expect(payload.sessionSystemText).toContain('cross-sdk identity sentinel');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }
@@ -482,7 +512,7 @@ describe('buildProviderContextPayload', () => {
   });
 
   it('keeps agent progress guidance independent from memory guidance suppression', () => {
-    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', AGY_SDK_PROVIDER_ID), {
       userMessage: 'Run tests',
       suppressMcpMemorySearchGuidance: true,
       namespace: { scope: 'personal', projectId: 'repo-1' },
@@ -490,6 +520,7 @@ describe('buildProviderContextPayload', () => {
 
     expect(payload.systemText).not.toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     expect(payload.systemText).toContain('Keep work updates short and high-signal');
+    expect(payload.systemText).toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
   });
 
   it('renders startup memory and message recall into messagePreamble without mutating userMessage', () => {
@@ -1073,7 +1104,7 @@ describe('buildProviderContextPayload', () => {
       // prompt cache hits across turns. The assembly order is:
       //   user authority -> capability tools -> description -> systemPrompt -> identity -> memory-search
       //   guidance -> agent progress guidance.
-      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', AGY_SDK_PROVIDER_ID), {
         userMessage: 'hi',
         description: 'desc-here',
         systemPrompt: 'sp-here',
@@ -1089,6 +1120,7 @@ describe('buildProviderContextPayload', () => {
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
       const realDeviceIdx = systemText.indexOf('REAL-DEVICE TESTING PRIORITY');
       const progressIdx = systemText.indexOf('Keep work updates short and high-signal');
+      const agyProgressIdx = systemText.indexOf('Give brief progress updates during long tool runs; do not stay silent until the end.');
       expect(userAuthorityIdx).toBe(0);
       expect(capabilityIdx).toBeGreaterThan(userAuthorityIdx);
       expect(systemText).toContain('Never rewrite, replace, narrow, or override any third-party provider or SDK tool definition');
@@ -1098,6 +1130,7 @@ describe('buildProviderContextPayload', () => {
       expect(realDeviceIdx).toBeGreaterThan(identityIdx);
       expect(memoryIdx).toBeGreaterThan(realDeviceIdx);
       expect(progressIdx).toBeGreaterThan(memoryIdx);
+      expect(agyProgressIdx).toBeGreaterThan(progressIdx);
     });
   });
 });

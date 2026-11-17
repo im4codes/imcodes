@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { deriveSessionLiveStatus, isActiveTurnFinishedError, isRunningSessionState, resolveTimelineBackedSessionState } from '../src/session-live-status.js';
+import { hasActiveTimelineTurn } from '../src/timeline-running.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import {
   createTransportQueueReducerState,
@@ -225,5 +226,78 @@ describe('session-live-status', () => {
     expect(afterDrain.busy).toBe(true);
     expect(afterDrain.sweep).toBe(true);
     expect(afterDrain.visualMode).toBe('running');
+  });
+
+  it('completed tail must not revive stale running over authoritative idle snapshot', () => {
+    const events: any[] = [
+      { type: 'session.state', ts: 1000, payload: { state: 'running' } },
+      { type: 'user.message', ts: 2000, payload: { text: 'synthetic' } },
+      { type: 'tool.call', ts: 3000, payload: { toolCallId: 'A', tool: 'synthetic' } },
+      { type: 'tool.result', ts: 55000, payload: { toolCallId: 'A', terminalStatus: 'succeeded' } },
+    ];
+    const active = hasActiveTimelineTurn(events);
+    expect(active).toBe(false);
+    const resolvedState = resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: active,
+      timelineStateTs: 1000,
+      timelineLastEventTs: 55000,
+      now: 60000,
+    });
+    expect(resolvedState).toBe('idle');
+    const liveStatus = deriveSessionLiveStatus({
+      sessionState: resolvedState,
+      activeTransportTurn: active,
+      activeToolCall: false,
+      activeThinking: false,
+    });
+    expect(liveStatus.visualMode).toBe('idle');
+  });
+
+  it('converges footer live status to idle after stopping (user_cancel) + command_handler_cancel_idle despite pre-stop open tool.call', async () => {
+    const { getTailSessionStateInfo, hasActiveToolCall } = await import('../src/thinking-utils.js');
+    const events = [
+      { type: 'session.state', ts: 1000, payload: { state: 'running', activityGeneration: { scope: 'session', sessionName: 'deck_aip_brain', generation: 4 } } },
+      { type: 'tool.call', ts: 2000, payload: { toolCallId: 'tool-open-stop', tool: 'Read' } },
+      { type: 'session.state', ts: 3000, payload: { state: 'stopping', reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } },
+      {
+        type: 'session.state',
+        ts: 3010,
+        payload: {
+          state: 'idle',
+          pendingCount: 0,
+          queueSnapshot: { source: 'command_handler_cancel_idle' },
+        },
+      },
+    ];
+    const activeToolCall = hasActiveToolCall(events as any);
+    const tail = getTailSessionStateInfo(events as any);
+    const activeTurn = hasActiveTimelineTurn(events as any);
+    const resolvedState = resolveTimelineBackedSessionState({
+      timelineState: tail.state,
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall,
+      activeTransportTurn: activeTurn,
+      timelineStateTs: tail.ts,
+      timelineLastEventTs: 3010,
+    });
+    const liveStatus = deriveSessionLiveStatus({
+      sessionState: resolvedState,
+      activeThinking: false,
+      activeToolCall,
+      activeTransportTurn: activeTurn,
+    });
+
+    expect(activeToolCall).toBe(false);
+    expect(tail.state).toBe('idle');
+    expect(activeTurn).toBe(false);
+    expect(resolvedState).toBe('idle');
+    expect(liveStatus.mode).toBe('idle');
+    expect(liveStatus.visualMode).toBe('idle');
+    expect(liveStatus.sweep).toBe(false);
   });
 });

@@ -1,4 +1,5 @@
 import type { MemoryMcpSourceProvenance } from './memory-mcp-provenance.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD } from './shared-machine-authority.js';
 
 // ── Cron Action types (discriminated union) ──────────────────────────────
 
@@ -119,6 +120,8 @@ export function normalizeCronCompletionPolicy(value: unknown): CronCompletionPol
 export interface CronCommandAction {
   type: 'command';
   command: string;
+  /** Skip this occurrence instead of appending to a busy target. Defaults true. */
+  onlyWhenIdle?: boolean;
   /** Marks a runtime-bound self cron whose prompt should include lifecycle controls. */
   selfManaged?: boolean;
   /** Server-authored, restart-durable registration for the immutable control contract. */
@@ -172,19 +175,15 @@ export interface CronSendAction extends MemoryMcpSourceProvenance {
 }
 
 /**
- * Short recurring sends default to idle-only delivery unless the caller made
- * an explicit choice.  Keep this rule in shared code so server persistence and
- * older daemons applying the defense-in-depth normalization agree.
+ * Scheduled sends and manual commands default to idle-only at every cadence.
+ * An explicit false remains an opt-out. The interval argument is retained for
+ * existing callers; it no longer controls the default.
  */
-export const CRON_IDLE_ONLY_DEFAULT_MAX_INTERVAL_MS = 15 * 60 * 1000;
-
 export function normalizeCronSendActionForInterval(
   action: CronAction,
-  intervalMs: number | null | undefined,
+  _intervalMs?: number | null,
 ): CronAction {
-  if (action.type !== 'send' || action.onlyWhenIdle !== undefined) return action;
-  if (typeof intervalMs !== 'number' || !Number.isFinite(intervalMs) || intervalMs <= 0
-    || intervalMs > CRON_IDLE_ONLY_DEFAULT_MAX_INTERVAL_MS) return action;
+  if (action.type === 'p2p' || action.onlyWhenIdle !== undefined) return action;
   return { ...action, onlyWhenIdle: true };
 }
 
@@ -430,6 +429,8 @@ export interface CronDispatchMessage {
   nextRunAt?: number | null;
   /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
   targetSessionName?: string;
+  /** Server-signed owner-turn authority for non-shared host-owner cron dispatches. */
+  [OWNER_MACHINE_AUTHORITY_FIELD]?: string;
   action: CronAction;
 }
 

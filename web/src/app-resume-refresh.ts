@@ -1,4 +1,5 @@
 import { requestActiveTimelineRefresh } from './hooks/useTimeline.js';
+import { notifyUploadAppStateChange } from './upload-suspend-wait.js';
 
 export interface NativeAppStateApi {
   addListener(
@@ -14,6 +15,7 @@ export async function installNativeAppResumeRefresh(
 ): Promise<() => void> {
   if (!enabled) return () => {};
   const handle = await appApi.addListener('appStateChange', ({ isActive }) => {
+    notifyUploadAppStateChange(isActive);
     if (!isActive) return;
     reconnectNow(true);
     requestActiveTimelineRefresh({ resetCooldowns: true });

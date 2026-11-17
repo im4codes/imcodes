@@ -32,6 +32,9 @@ import {
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/transport-queue-types.js';
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
 import { isActiveTurnFinishedError } from '../session-live-status.js';
+import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
+import { SESSION_INCOGNITO_UNSUPPORTED } from '@shared/session-incognito-types.js';
+import { forgetIncognitoTimelineSessions, registerIncognitoTimelineSession } from './useTimeline.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -114,7 +117,7 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
 export function buildSubSessionRebuildInputs(
   subSessions: readonly SubSession[],
 ): Parameters<WsClient['subSessionRebuildAll']>[0] {
-  return subSessions.map((s) => ({
+  return subSessions.filter((s) => !s.incognito).map((s) => ({
     id: s.id,
     type: s.type,
     runtimeType: s.runtimeType,
@@ -134,6 +137,20 @@ export function buildSubSessionRebuildInputs(
   }));
 }
 
+function mergeIncognitoSubSessions(
+  primary: readonly SubSession[],
+  fallback: readonly SubSession[],
+): SubSession[] {
+  const byId = new Map<string, SubSession>();
+  for (const s of fallback) {
+    if (s.incognito) byId.set(s.id, s);
+  }
+  for (const s of primary) {
+    if (s.incognito) byId.set(s.id, s);
+  }
+  return [...byId.values()];
+}
+
 export function useSubSessions(
   serverId: string | null,
   ws: WsClient | null,
@@ -141,15 +158,60 @@ export function useSubSessions(
   activeSession?: string | null,
   disableHttpLoad = false,
 ) {
-  const [subSessions, setSubSessions] = useState<SubSession[]>([]);
+  const [subSessions, setSubSessionsRaw] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
   const rebuiltRef = useRef(false);
+  const serverIdRef = useRef<string | null>(serverId);
+  serverIdRef.current = serverId;
+  const incognitoByServerRef = useRef<Map<string, SubSession[]>>(new Map());
+  const pendingIncognitoCreateIdsByServerRef = useRef<Map<string, Set<string>>>(new Map());
+  const prevServerIdForEffectRef = useRef<string | null>(serverId);
+  const getPendingIncognitoSet = useCallback((targetServerId: string | null | undefined): Set<string> | null => {
+    if (!targetServerId) return null;
+    let set = pendingIncognitoCreateIdsByServerRef.current.get(targetServerId);
+    if (!set) {
+      set = new Set<string>();
+      pendingIncognitoCreateIdsByServerRef.current.set(targetServerId, set);
+    }
+    return set;
+  }, []);
+  const syncIncognitoStore = useCallback((targetServerId: string | null | undefined, list: readonly SubSession[]) => {
+    if (!targetServerId) return;
+    const incognitoOnly = list.filter((s) => s.incognito === true);
+    if (incognitoOnly.length > 0) incognitoByServerRef.current.set(targetServerId, incognitoOnly);
+    else incognitoByServerRef.current.delete(targetServerId);
+  }, []);
+  const setSubSessions = useCallback((
+    updater: SubSession[] | ((prev: SubSession[]) => SubSession[]),
+    explicitServerId?: string | null,
+  ) => {
+    const targetServerId = explicitServerId === undefined ? serverIdRef.current : explicitServerId;
+    setSubSessionsRaw((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      if (targetServerId && serverIdRef.current === targetServerId) {
+        syncIncognitoStore(targetServerId, next);
+      }
+      return next;
+    });
+  }, [syncIncognitoStore]);
   // Load from PG — retries indefinitely with backoff until successful.
   // Re-triggers when serverId changes or the WS performs a real reconnect.
   const loadGenRef = useRef(0);
   const loadedGenRef = useRef(0);
   useEffect(() => {
-    if (!serverId) { setSubSessions([]); setLoadedServerId(null); return; }
+    const serverChanged = prevServerIdForEffectRef.current !== serverId;
+    prevServerIdForEffectRef.current = serverId;
+    if (!serverId) {
+      setSubSessionsRaw([]);
+      setLoadedServerId(null);
+      return;
+    }
+    const savedIncognito = incognitoByServerRef.current.get(serverId) ?? [];
+    if (serverChanged) {
+      // Seed preserved in-memory incognito sub-sessions for this server immediately
+      // without clearing or touching other servers' incognito entries.
+      setSubSessionsRaw(savedIncognito);
+    }
     if (disableHttpLoad) {
       const gen = ++loadGenRef.current;
       loadedGenRef.current = gen;
@@ -175,8 +237,14 @@ export function useSubSessions(
           loadedGenRef.current = gen;
           setSubSessions((prev) => {
             const previousById = new Map(prev.map((existing) => [existing.id, existing] as const));
-            return list.map((s) => mergeLoadedSubSession(s, previousById.get(s.id)));
-          });
+            const loaded = list.map((s) => mergeLoadedSubSession(s, previousById.get(s.id)));
+            const loadedIds = new Set(loaded.map((s) => s.id));
+            const preservedIncognito = mergeIncognitoSubSessions(
+              prev,
+              incognitoByServerRef.current.get(serverId!) ?? [],
+            ).filter((s) => !loadedIds.has(s.id));
+            return preservedIncognito.length > 0 ? [...loaded, ...preservedIncognito] : loaded;
+          }, serverId);
           setLoadedServerId(serverId);
         })
         .catch((err) => {
@@ -305,104 +373,135 @@ export function useSubSessions(
       let sessionName: string | undefined;
       let state: string | undefined;
 
-      // Sub-session created by daemon (e.g., discussion orchestrator)
-      if (msg.type === 'subsession.created') {
-        const m = msg as any;
-        if (m.id) {
+      // Sub-session created or synced by daemon (single or batched rebuild replay)
+      if (msg.type === 'subsession.created' || msg.type === SUBSESSION_CREATED_BATCH_MSG) {
+        const items: any[] = msg.type === SUBSESSION_CREATED_BATCH_MSG ? (Array.isArray((msg as any).items) ? (msg as any).items : []) : [msg];
+        const validItems = items.filter((m) => m && m.id);
+        if (validItems.length > 0) {
           setSubSessions((prev) => {
-            // Update existing sub-session metadata (subsession.sync re-broadcasts arrive as subsession.created)
-            const existingIdx = prev.findIndex((s) => s.id === m.id);
-            if (existingIdx !== -1) {
-              const updated = [...prev];
-              const existing = updated[existingIdx];
-              if (isOlderActivityGeneration(m.activityGeneration, existing.activityGeneration)) return prev;
-              const preserveQuota = isQuotaPreservingSubSessionType(existing.type);
-              const transportPendingPatch = buildTransportPendingSyncPatch(
-                existing,
-                m,
-                existing.sessionName,
-              );
-              updated[existingIdx] = { ...updated[existingIdx],
-                ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
-                ...(m.state != null && { state: m.state as SubSession['state'] }),
-                ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
-                ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
-                ...(m.cwd != null && { cwd: m.cwd }),
-                ...(m.label != null && { label: m.label }),
-                ...(m.ccPresetId !== undefined && { ccPresetId: m.ccPresetId }),
-                ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
-                ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
-                ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
-                ...((m.planLabel != null || (!preserveQuota && m.planLabel === null)) ? { planLabel: m.planLabel } : {}),
-                ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
-                ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
-                ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
-                ...(m.effort != null && { effort: m.effort }),
-                ...(m.contextNamespace !== undefined && { contextNamespace: m.contextNamespace }),
-                ...(m.contextNamespaceDiagnostics !== undefined && { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics }),
-                ...(m.executionCloneKind !== undefined && { executionCloneKind: m.executionCloneKind }),
-                ...(m.parentRunId !== undefined && { parentRunId: m.parentRunId }),
-                ...(m.transportConfig !== undefined && {
-                  transportConfig: mergeTransportConfigPreservingSupervision(
-                    m.transportConfig,
-                    updated[existingIdx].transportConfig,
-                  ),
-                }),
-                ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
-                ...(m.supervisionHeartbeat !== undefined && {
-                  supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
-                }),
-                ...transportPendingPatch,
-                ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
-                ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
-                ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
-                ...((m.codexAvailableModels != null || (!preserveQuota && m.codexAvailableModels === null)) ? { codexAvailableModels: m.codexAvailableModels } : {}),
-                updatedAt: Date.now(),
-              };
-              return updated;
+            // Avoid building an O(N) Map on single-item updates (e.g. legacy 1-by-1 stream).
+            const indexById = validItems.length > 1 ? new Map<string, number>() : null;
+            if (indexById) {
+              for (let i = 0; i < prev.length; i += 1) indexById.set(prev[i].id, i);
             }
+            let next = prev;
+            let cloned = false;
             const now = Date.now();
-            const sessionNameForCreate = m.sessionName || `deck_sub_${m.id}`;
-            const transportPendingPatch = buildTransportPendingSyncPatch({}, m, sessionNameForCreate);
-            return [...prev, {
-              id: m.id,
-              sessionInstanceId: m.sessionInstanceId ?? null,
-              runtimeEpoch: m.runtimeEpoch ?? null,
-              serverId: '',
-              type: m.sessionType || 'shell',
-              sessionName: sessionNameForCreate,
-              runtimeType: m.runtimeType ?? getSessionRuntimeType(m.sessionType || 'shell'),
-              providerId: m.providerId ?? null,
-              providerSessionId: m.providerSessionId ?? null,
-              cwd: m.cwd || null,
-              label: m.label || null,
-              ccPresetId: m.ccPresetId ?? null,
-              parentSession: m.parentSession || null,
-              createdAt: now,
-              updatedAt: now,
-              state: (m.state || 'idle') as SubSession['state'],
-              ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
-              qwenModel: m.qwenModel ?? null,
-              requestedModel: m.requestedModel ?? null,
-              activeModel: m.activeModel ?? m.modelDisplay ?? null,
-              qwenAuthType: m.qwenAuthType ?? null,
-              qwenAvailableModels: m.qwenAvailableModels ?? null,
-              codexAvailableModels: m.codexAvailableModels ?? null,
-              modelDisplay: m.modelDisplay ?? null,
-              planLabel: m.planLabel ?? null,
-              quotaLabel: m.quotaLabel ?? null,
-              quotaUsageLabel: m.quotaUsageLabel ?? null,
-              quotaMeta: m.quotaMeta ?? null,
-              effort: m.effort ?? null,
-              contextNamespace: m.contextNamespace ?? null,
-              contextNamespaceDiagnostics: m.contextNamespaceDiagnostics ?? null,
-              executionCloneKind: m.executionCloneKind ?? null,
-              parentRunId: m.parentRunId ?? null,
-              transportConfig: m.transportConfig ?? null,
-              supervisionMode: m.supervisionMode ?? null,
-              supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
-              ...transportPendingPatch,
-            }];
+            const ensureClone = () => {
+              if (!cloned) {
+                next = [...prev];
+                cloned = true;
+              }
+            };
+            for (const m of validItems) {
+              const currentServerId = serverIdRef.current;
+              const sessionNameForCreate = m.sessionName || `deck_sub_${m.id}`;
+              const isIncog = m.incognito === true;
+              if (isIncog) {
+                getPendingIncognitoSet(currentServerId)?.delete(m.id);
+                registerIncognitoTimelineSession(currentServerId, sessionNameForCreate, {
+                  ...(m.sessionInstanceId ? { sessionInstanceId: m.sessionInstanceId } : {}),
+                  ...(m.runtimeEpoch !== undefined ? { runtimeEpoch: m.runtimeEpoch } : {}),
+                });
+              }
+              const foundIdx = indexById ? indexById.get(m.id) : next.findIndex((s) => s.id === m.id);
+              const existingIdx = foundIdx !== undefined && foundIdx !== -1 ? foundIdx : undefined;
+              if (existingIdx !== undefined) {
+                const existing = next[existingIdx];
+                if (isOlderActivityGeneration(m.activityGeneration, existing.activityGeneration)) continue;
+                const preserveQuota = isQuotaPreservingSubSessionType(existing.type);
+                const transportPendingPatch = buildTransportPendingSyncPatch(
+                  existing,
+                  m,
+                  existing.sessionName,
+                );
+                ensureClone();
+                next[existingIdx] = {
+                  ...existing,
+                  ...(isIncog || existing.incognito ? { incognito: true, serverId: currentServerId ?? existing.serverId } : {}),
+                  ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
+                  ...(m.state != null && { state: m.state as SubSession['state'] }),
+                  ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
+                  ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
+                  ...(m.cwd != null && { cwd: m.cwd }),
+                  ...(m.label != null && { label: m.label }),
+                  ...(m.ccPresetId !== undefined && { ccPresetId: m.ccPresetId }),
+                  ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
+                  ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
+                  ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
+                  ...((m.planLabel != null || (!preserveQuota && m.planLabel === null)) ? { planLabel: m.planLabel } : {}),
+                  ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
+                  ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+                  ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
+                  ...(m.effort != null && { effort: m.effort }),
+                  ...(m.contextNamespace !== undefined && { contextNamespace: m.contextNamespace }),
+                  ...(m.contextNamespaceDiagnostics !== undefined && { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics }),
+                  ...(m.executionCloneKind !== undefined && { executionCloneKind: m.executionCloneKind }),
+                  ...(m.parentRunId !== undefined && { parentRunId: m.parentRunId }),
+                  ...(m.transportConfig !== undefined && {
+                    transportConfig: mergeTransportConfigPreservingSupervision(
+                      m.transportConfig,
+                      existing.transportConfig,
+                    ),
+                  }),
+                  ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
+                  ...(m.supervisionHeartbeat !== undefined && {
+                    supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+                  }),
+                  ...transportPendingPatch,
+                  ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
+                  ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
+                  ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
+                  ...((m.codexAvailableModels != null || (!preserveQuota && m.codexAvailableModels === null)) ? { codexAvailableModels: m.codexAvailableModels } : {}),
+                  updatedAt: now,
+                };
+              } else {
+                const transportPendingPatch = buildTransportPendingSyncPatch({}, m, sessionNameForCreate);
+                ensureClone();
+                indexById?.set(m.id, next.length);
+                next.push({
+                  id: m.id,
+                  sessionInstanceId: m.sessionInstanceId ?? null,
+                  runtimeEpoch: m.runtimeEpoch ?? null,
+                  serverId: (isIncog ? currentServerId : '') ?? '',
+                  type: m.sessionType || 'shell',
+                  sessionName: sessionNameForCreate,
+                  runtimeType: m.runtimeType ?? getSessionRuntimeType(m.sessionType || 'shell'),
+                  providerId: m.providerId ?? null,
+                  providerSessionId: m.providerSessionId ?? null,
+                  cwd: m.cwd || null,
+                  label: m.label || null,
+                  ccPresetId: m.ccPresetId ?? null,
+                  parentSession: m.parentSession || null,
+                  createdAt: now,
+                  updatedAt: now,
+                  state: (m.state || 'idle') as SubSession['state'],
+                  ...(isIncog ? { incognito: true } : {}),
+                  ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
+                  qwenModel: m.qwenModel ?? null,
+                  requestedModel: m.requestedModel ?? null,
+                  activeModel: m.activeModel ?? m.modelDisplay ?? null,
+                  qwenAuthType: m.qwenAuthType ?? null,
+                  qwenAvailableModels: m.qwenAvailableModels ?? null,
+                  codexAvailableModels: m.codexAvailableModels ?? null,
+                  modelDisplay: m.modelDisplay ?? null,
+                  planLabel: m.planLabel ?? null,
+                  quotaLabel: m.quotaLabel ?? null,
+                  quotaUsageLabel: m.quotaUsageLabel ?? null,
+                  quotaMeta: m.quotaMeta ?? null,
+                  effort: m.effort ?? null,
+                  contextNamespace: m.contextNamespace ?? null,
+                  contextNamespaceDiagnostics: m.contextNamespaceDiagnostics ?? null,
+                  executionCloneKind: m.executionCloneKind ?? null,
+                  parentRunId: m.parentRunId ?? null,
+                  transportConfig: m.transportConfig ?? null,
+                  supervisionMode: m.supervisionMode ?? null,
+                  supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+                  ...transportPendingPatch,
+                });
+              }
+            }
+            return cloned ? next : prev;
           });
         }
         return;
@@ -410,9 +509,44 @@ export function useSubSessions(
 
       // Sub-session removed by daemon (stopped/cleaned up server-side)
       if (msg.type === 'subsession.removed') {
-        const removedId = (msg as any).id as string;
+        const m = msg as { id?: unknown; sessionName?: unknown };
+        const rawSession = typeof m.sessionName === 'string' ? m.sessionName : '';
+        const removedId = typeof m.id === 'string' && m.id
+          ? m.id
+          : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
         if (removedId) {
+          const activeServer = serverIdRef.current;
+          getPendingIncognitoSet(activeServer)?.delete(removedId);
+          forgetIncognitoTimelineSessions(activeServer, rawSession || toSessionName(removedId));
           setSubSessions((prev) => prev.filter((s) => s.id !== removedId));
+        }
+        return;
+      }
+
+      if (msg.type === 'session.error') {
+        const m = msg as { id?: unknown; session?: unknown; sessionName?: unknown; message?: unknown };
+        const rawSession = typeof m.sessionName === 'string' && m.sessionName
+          ? m.sessionName
+          : (typeof m.session === 'string' && m.session ? m.session : '');
+        const errId = typeof m.id === 'string' && m.id
+          ? m.id
+          : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
+        const messageText = typeof m.message === 'string' ? m.message : '';
+        const activeServer = serverIdRef.current;
+        const pendingSet = getPendingIncognitoSet(activeServer);
+        const isIncognitoUnsupported = messageText === SESSION_INCOGNITO_UNSUPPORTED;
+        const isPendingIncognitoError = messageText === SESSION_INCOGNITO_UNSUPPORTED || /incognito/i.test(messageText);
+        if (errId && (pendingSet?.has(errId) || isIncognitoUnsupported)) {
+          pendingSet?.delete(errId);
+          forgetIncognitoTimelineSessions(activeServer, rawSession || toSessionName(errId));
+          setSubSessions((prev) => prev.filter((s) => s.id !== errId));
+        } else if (!errId && isPendingIncognitoError && pendingSet && pendingSet.size > 0) {
+          const rollbackIds = new Set(pendingSet);
+          pendingSet.clear();
+          for (const id of rollbackIds) {
+            forgetIncognitoTimelineSessions(activeServer, toSessionName(id));
+          }
+          setSubSessions((prev) => prev.filter((s) => !rollbackIds.has(s.id)));
         }
         return;
       }
@@ -421,12 +555,14 @@ export function useSubSessions(
       if (msg.type === 'subsession.sync') {
         const m = msg as any;
         if (m.id) {
+          getPendingIncognitoSet(serverIdRef.current)?.delete(m.id);
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
             if (isOlderActivityGeneration(m.activityGeneration, s.activityGeneration)) return s;
             const preserveQuota = isQuotaPreservingSubSessionType(s.type);
             const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
+              ...(m.incognito === true || s.incognito ? { incognito: true } : {}),
               ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
               ...(m.sessionInstanceId !== undefined ? { sessionInstanceId: m.sessionInstanceId } : {}),
@@ -616,6 +752,9 @@ export function useSubSessions(
       }
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
+      if (state && state !== 'starting' && state !== 'error') {
+        getPendingIncognitoSet(serverIdRef.current)?.delete(sessionName.slice('deck_sub_'.length));
+      }
       if (state === 'queued' || state === 'running' || state === 'idle') {
         // Streaming text, tool calls and repeated session.state frames say
         // "running"/"idle" again and again: keep the same array when nothing
@@ -702,6 +841,7 @@ export function useSubSessions(
       const ccPresetId = extra?.ccPreset as string | undefined;
       const requestedModel = (extra?.requestedModel as string | undefined) ?? (extra?.model as string | undefined);
       const transportConfig = extra?.transportConfig as Record<string, unknown> | undefined;
+      const incognito = extra?.incognito === true;
       const res = await apiCreate(serverId, {
         type,
         shellBin,
@@ -715,7 +855,16 @@ export function useSubSessions(
         activeModel: requestedModel ?? null,
         effort: (extra?.thinking as SubSession['effort'] | undefined) ?? null,
         transportConfig: transportConfig ?? null,
+        ...(incognito ? { incognito: true } : {}),
       });
+      const isPrivate = incognito || res.subSession.incognito === true;
+      if (isPrivate && (!ws || !connected)) {
+        return null;
+      }
+      if (isPrivate) {
+        registerIncognitoTimelineSession(serverId, res.sessionName);
+        getPendingIncognitoSet(serverId)?.add(res.id);
+      }
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,
@@ -726,6 +875,7 @@ export function useSubSessions(
         activeModel: res.subSession.activeModel ?? requestedModel ?? null,
         effort: (extra?.thinking as SubSession['effort'] | undefined) ?? res.subSession.effort ?? null,
         transportConfig: res.subSession.transportConfig ?? transportConfig ?? null,
+        ...(isPrivate ? { incognito: true } : {}),
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it — transport providers may need extra fields
@@ -768,24 +918,30 @@ export function useSubSessions(
       alert(`Failed to create session: ${msg}`);
       return null;
     }
-  }, [serverId, ws, activeSession, subSessions]);
+  }, [serverId, ws, connected, activeSession, subSessions]);
 
   const close = useCallback(async (id: string) => {
     if (!serverId) return;
     const sub = subSessions.find((s) => s.id === id);
     if (!sub) return;
-    // Stop the tmux session
-    ws?.subSessionStop(sub.sessionName);
+    // Stop the session
+    ws?.subSessionStop?.(sub.sessionName);
+    if (sub.incognito && (!ws || !connected)) {
+      getPendingIncognitoSet(serverId)?.delete(id);
+      forgetIncognitoTimelineSessions(serverId, sub.sessionName);
+      setSubSessions((prev) => prev.filter((s) => s.id !== id), serverId);
+      return;
+    }
     // Keep the sub-session visible until daemon/server confirm successful close.
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, state: 'stopping' } : s,
-    ));
-  }, [serverId, ws, subSessions]);
+    ), serverId);
+  }, [serverId, ws, connected, subSessions, getPendingIncognitoSet, setSubSessions]);
 
   const restart = useCallback(async (id: string) => {
     if (!serverId || !ws) return;
     const sub = subSessions.find((s) => s.id === id);
-    if (!sub) return;
+    if (!sub || sub.incognito) return;
     // In-place restart: daemon kills and recreates with same ID/name.
     // PG record stays — no close + create cycle.
     ws.subSessionRestart(sub.sessionName);
@@ -796,11 +952,16 @@ export function useSubSessions(
 
   const rename = useCallback(async (id: string, label: string) => {
     if (!serverId) return;
-    await patchSubSession(serverId, id, { label }).catch(() => {});
+    const sub = subSessions.find((s) => s.id === id);
+    if (sub?.incognito) {
+      ws?.send({ type: 'subsession.rename', sessionName: sub.sessionName, label });
+    } else {
+      await patchSubSession(serverId, id, { label }).catch(() => {});
+    }
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, label } : s,
     ));
-  }, [serverId]);
+  }, [serverId, subSessions, ws]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
   const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession,

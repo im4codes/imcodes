@@ -9,6 +9,11 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART,
+  REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE,
+  REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE,
+} from '../../shared/remote-desktop-local-management.js';
 import { UI_LOCALES, type UiLocale } from '../../shared/ui-locale.js';
 import { startRemoteDesktopLocalPanel, type RemoteDesktopLocalPanel } from '../../src/node/remote-desktop-local-panel.js';
 
@@ -66,22 +71,41 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
   let panel: RemoteDesktopLocalPanel;
   let browser: Browser;
   let scenario: 'active' | 'paused' = 'active';
+  let withDaemon = false;
   const now = Date.now();
 
   beforeAll(async () => {
     panel = await startRemoteDesktopLocalPanel({
       publicNodeId: '1234567890', serverUrl: 'https://example.test/',
-      status: () => (scenario === 'paused'
+      status: () => ({ traffic: { total: { bytesSent: 1048576, bytesReceived: 2048 }, connections: [{ id: 'history-one', label: '#1', connectedAt: now - 9000, endedAt: now - 1000, bytesSent: 1048576, bytesReceived: 2048, measured: true }] }, ...(scenario === 'paused'
         ? { paused: true, connections: [] }
         : { paused: false, connections: [
           { id: 'a', label: '12', connectedAt: now - 3_700_000, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL },
           { id: 'b', label: '2', connectedAt: now - 61_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW },
-        ] }),
+        ] }) }),
       extras: () => ({
         deviceName: 'Konstantinopolitanskaya-workstation-with-a-very-long-host-name.example.internal',
         version: '2026.10.5590',
         permissions: { screenRecording: 'granted', accessibility: 'unknown', fullDiskAccess: 'denied' },
       }),
+      daemon: () => withDaemon ? ({
+        available: true,
+        installed: true,
+        bound: true,
+        running: true,
+        connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+        autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+        runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+        version: '1.2.3',
+        pid: 4321,
+        serverHost: 'app.example.test',
+        serverOrigin: 'https://app.example.test',
+        userName: 'alice',
+        canControl: true,
+        canBind: true,
+        canViewLogs: true,
+      }) : (undefined as never),
+      daemonLogs: async () => ({ text: 'sample daemon log line\n', truncated: false, source: 'logs/daemon.log' }),
       openSettings: async () => true,
       setPaused: async () => {}, stopAll: async () => {}, disconnect: async () => true, port: 0,
     });
@@ -110,7 +134,7 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
           }
           // Settings and About too, once per language.
           if (state === 'active' && scheme === 'light') {
-            for (const name of ['settings', 'about']) {
+            for (const name of ['traffic', 'settings', 'about']) {
               await page.click(`.nav[data-page="${name}"]`);
               for (const [width, height] of SIZES) {
                 await page.setViewportSize({ width, height });
@@ -124,6 +148,21 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
     }
     expect(problems).toEqual([]);
   }, 180_000);
+
+  it('shows cumulative traffic, retained connection details, and keeps the current connection controls usable', async () => {
+    scenario = 'active';
+    const context = await browser.newContext({ locale: 'en-US', viewport: { width: 960, height: 640 } });
+    try {
+      const page = await context.newPage();
+      await page.goto(panel.url);
+      await page.waitForFunction("document.getElementById('trafficHomeTotal').textContent.includes('1.0 MiB')");
+      await page.click('.nav[data-page="traffic"]');
+      expect(await page.evaluate<string>("document.getElementById('trafficHistory').textContent")).toContain('1.0 MiB');
+      expect(await page.evaluate<string>("document.getElementById('trafficHistory').textContent")).toContain('Disconnected');
+      await page.click('.nav[data-page="home"]');
+      expect(await page.evaluate<number>("document.querySelectorAll('#list button').length")).toBe(2);
+    } finally { await context.close(); }
+  });
 
   it('the audit itself catches overflow and clipping (so a pass above means something)', async () => {
     scenario = 'active';
@@ -161,4 +200,71 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
     expect(typeof narrower.pageScrolls).toBe('boolean');
     await context.close();
   }, 60_000);
+
+  it('lays out the Coding Daemon card and modals cleanly across locales without overflow or clipping', async () => {
+    scenario = 'active';
+    withDaemon = true;
+    const problems: string[] = [];
+    try {
+      for (const locale of UI_LOCALES) {
+        const context = await browser.newContext({ locale: LANGUAGE_TAG[locale], viewport: { width: 960, height: 640 } });
+        const page = await context.newPage();
+        await page.goto(panel.url);
+        await page.waitForFunction("document.getElementById('daemonCard') && !document.getElementById('daemonCard').hidden");
+        for (const [width, height] of SIZES) {
+          await page.setViewportSize({ width, height });
+          for (const problem of await page.evaluate<string[]>(AUDIT)) problems.push(`${locale} daemon ${width}x${height}: ${problem}`);
+        }
+        await page.click('#daemonLogsBtn');
+        await page.waitForFunction("!document.getElementById('daemonLogsModal').hidden");
+        for (const problem of await page.evaluate<string[]>(AUDIT)) problems.push(`${locale} logs-modal: ${problem}`);
+        await page.click('#daemonLogsClose');
+        await context.close();
+      }
+    } finally {
+      withDaemon = false;
+    }
+    expect(problems).toEqual([]);
+  }, 120_000);
+
+  it('lays out the Phase 2B Setup wizard cleanly across locales without overflow or clipping', async () => {
+    const setupPanel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '',
+      serverUrl: '',
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+      port: 0,
+      setup: {
+        prefilledRelayUrl: 'https://app.im.codes',
+        existingDaemonBound: true,
+        existingDaemonRelayUrl: 'https://app.im.codes',
+        openBrowser: async () => true,
+        bindRelayAndEnroll: async () => {
+          throw new Error('unused');
+        },
+        onSetupComplete: async () => {},
+      },
+    });
+    const problems: string[] = [];
+    try {
+      for (const locale of UI_LOCALES) {
+        const context = await browser.newContext({ locale: LANGUAGE_TAG[locale], viewport: { width: 960, height: 640 } });
+        const page = await context.newPage();
+        await page.goto(setupPanel.url);
+        await page.waitForFunction("document.getElementById('viewSetup') && !document.getElementById('viewSetup').hidden");
+        await page.click('#setupManualToggleBtn');
+        await page.waitForFunction("document.getElementById('setupManualForm') && !document.getElementById('setupManualForm').hidden");
+        for (const [width, height] of SIZES) {
+          await page.setViewportSize({ width, height });
+          for (const problem of await page.evaluate<string[]>(AUDIT)) problems.push(`${locale} setup ${width}x${height}: ${problem}`);
+        }
+        await context.close();
+      }
+    } finally {
+      await setupPanel.close();
+    }
+    expect(problems).toEqual([]);
+  }, 120_000);
 });

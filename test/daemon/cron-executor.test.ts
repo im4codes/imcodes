@@ -432,6 +432,24 @@ describe('executeCronJob', () => {
     });
   });
 
+  it.each([undefined, true])('skips busy transport commands with idle-only %s without sending or cancelling', async (onlyWhenIdle) => {
+    const runtime = { providerSessionId: 'bound', getStatus: vi.fn(() => 'streaming'), send: vi.fn(), cancel: vi.fn() };
+    vi.mocked(getSession).mockReturnValue(makeSession({ runtimeType: 'transport', agentType: 'codex-sdk' }));
+    vi.mocked(getTransportRuntime).mockReturnValue(runtime as any);
+    await executeCronJob(makeMsg({ action: { type: 'command', command: 'daily check', onlyWhenIdle } }), mockServerLink);
+    expect(runtime.send).not.toHaveBeenCalled();
+    expect(runtime.cancel).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'skipped_busy' }));
+  });
+
+  it('honors the explicit manual-command opt-out for process sessions too', async () => {
+    vi.mocked(getSession).mockReturnValue(makeSession({ runtimeType: 'process' }));
+    vi.mocked(detectStatusAsync).mockResolvedValue('streaming');
+    await executeCronJob(makeMsg({ action: { type: 'command', command: 'check', onlyWhenIdle: false } }), mockServerLink);
+    expect(cronProcessSendMock).toHaveBeenCalled();
+    expect(detectStatusAsync).not.toHaveBeenCalled();
+  });
+
   it('self-managed cron dispatches with append and cancels busy target session only if provider lacks native append', async () => {
     const cancelMock = vi.fn().mockResolvedValue(undefined);
     const mockRuntime = {
@@ -455,7 +473,7 @@ describe('executeCronJob', () => {
     await executeCronJob(makeMsg({
       jobId: 'job-registered-transport-busy-append',
       executionId: 'run-transport-busy-1',
-      action: selfManagedAction('job-registered-transport-busy-append', 'In-flight check.'),
+      action: { ...selfManagedAction('job-registered-transport-busy-append', 'In-flight check.'), onlyWhenIdle: false },
     }), mockServerLink);
 
     expect(cancelMock).not.toHaveBeenCalled();
@@ -472,7 +490,7 @@ describe('executeCronJob', () => {
     await executeCronJob(makeMsg({
       jobId: 'job-registered-transport-busy-no-append',
       executionId: 'run-transport-busy-2',
-      action: selfManagedAction('job-registered-transport-busy-no-append', 'In-flight check 2.'),
+      action: { ...selfManagedAction('job-registered-transport-busy-no-append', 'In-flight check 2.'), onlyWhenIdle: false },
     }), mockServerLink);
 
     expect(cancelMock).toHaveBeenCalledOnce();

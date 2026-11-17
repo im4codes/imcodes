@@ -1,7 +1,7 @@
 import { render } from 'preact';
 import { marked } from 'marked';
 import { App } from './app.js';
-import { configure, configureExpectedUserId } from './api.js';
+import { CloudDocsPanel } from './components/CloudDocsPanel.js';
 import { RemoteDesktopStandalone } from './components/RemoteDesktopStandalone.js';
 import { RemoteDesktopWallStandalone } from './components/RemoteDesktopWallStandalone.js';
 import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
@@ -9,12 +9,19 @@ import {
   REMOTE_DESKTOP_NATIVE_STEP_UP_PATH,
   RemoteDesktopNativeStepUp,
 } from './pages/RemoteDesktopNativeStepUp.js';
-import { applyNativePlatformClasses } from './native-platform.js';
+import { applyNativePlatformClasses, NATIVE_HOST_EVENT } from './native-platform.js';
+import { initGlobalFontScale } from './global-font.js';
+import { applyUiScale, initUiScale, readUiScale } from './ui-scale.js';
 import {
   isRemoteDesktopWallWindow,
   readRemoteDesktopWindowServerId,
   resolveRemoteDesktopAppEntry,
 } from './remote-desktop-window.js';
+import {
+  isCloudDocsStandaloneWindow,
+  readCloudDocsWindowParams,
+} from './cloud-docs-window.js';
+import { hydrateStandaloneAuthFromStorage } from './standalone-auth.js';
 import { ensureRemoteDesktopAppManifestLink, installPwaInstallCapture } from './pwa-install.js';
 import './styles.css';
 import './i18n/index.js';
@@ -41,6 +48,12 @@ marked.use({
 });
 
 applyNativePlatformClasses();
+initGlobalFontScale();
+initUiScale();
+window.addEventListener(NATIVE_HOST_EVENT, () => {
+  applyNativePlatformClasses();
+  applyUiScale(readUiScale());
+});
 
 // The installable remote desktop app (`/remote-desktop/app/`) reuses the two standalone-window screens: the machine wall, or the one
 // machine a `?machine=` deep link names. The manifest link is added here so an installed app's own start page keeps it up to date.
@@ -53,6 +66,7 @@ const remoteDesktopWallEntry = isRemoteDesktopWallWindow() || (remoteDesktopAppE
 const remoteDesktopNativeStepUpEntry = window.location.pathname === REMOTE_DESKTOP_NATIVE_STEP_UP_PATH;
 const remoteDesktopGuestEntry = window.__IMCODES_REMOTE_DESKTOP_INVITE_REQUESTED__ === true
   || window.location.pathname === '/remote-desktop/access';
+const cloudDocsStandaloneEntry = isCloudDocsStandaloneWindow();
 if (remoteDesktopNativeStepUpEntry) {
   render(<RemoteDesktopNativeStepUp />, document.getElementById('app')!);
 } else if (remoteDesktopGuestEntry) {
@@ -62,17 +76,25 @@ if (remoteDesktopNativeStepUpEntry) {
     document.getElementById('app')!,
   );
 } else if (remoteDesktopServerId || remoteDesktopWallEntry) {
-  try {
-    const raw = localStorage.getItem('rcc_auth');
-    const auth = raw ? JSON.parse(raw) as { userId?: unknown; baseUrl?: unknown } : null;
-    if (typeof auth?.baseUrl === 'string') configure(auth.baseUrl);
-    if (typeof auth?.userId === 'string') configureExpectedUserId(auth.userId);
-  } catch { /* API falls back to same-origin session authentication. */ }
+  hydrateStandaloneAuthFromStorage();
   document.documentElement.classList.add('remote-desktop-standalone-root');
   render(
     remoteDesktopWallEntry
       ? <RemoteDesktopWallStandalone />
       : <RemoteDesktopStandalone serverId={remoteDesktopServerId!} />,
+    document.getElementById('app')!,
+  );
+} else if (cloudDocsStandaloneEntry) {
+  hydrateStandaloneAuthFromStorage();
+  const cloudDocsParams = readCloudDocsWindowParams();
+  document.documentElement.classList.add('cloud-docs-standalone-root');
+  render(
+    <CloudDocsPanel
+      standalone
+      initialTab={cloudDocsParams.tab}
+      initialFolderId={cloudDocsParams.folderId ?? null}
+      initialDocId={cloudDocsParams.docId ?? null}
+    />,
     document.getElementById('app')!,
   );
 } else {

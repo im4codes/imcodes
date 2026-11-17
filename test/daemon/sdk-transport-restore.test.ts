@@ -1,5 +1,7 @@
+import { AGY_NATIVE_SESSION_STATE as AG } from '../../shared/agy-agent.js';
+import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdir, symlink } from 'node:fs/promises';
+import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
@@ -15,13 +17,17 @@ const mocks = vi.hoisted(() => {
   // Whether the mock app-server reports the IM delegation MCP server as
   // connected. Default true so ordinary Brain turns may start; a control test
   // flips it to prove the production gate actually blocks the turn.
-  return { store, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true, claudeSessionIdOverride: undefined as string | undefined };
+  return { store, realStore: undefined as any, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true, claudeSessionIdOverride: undefined as string | undefined };
 });
 
 const reassignSessionFileMock = vi.hoisted(() => vi.fn());
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+const timelineReadPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+const timelineReadCompletedTextTailMock = vi.hoisted(() => vi.fn(async () => []));
+const writePrivateInputMock = vi.hoisted(() => vi.fn());
+const preparePrivateInputWriterMock = vi.hoisted(() => vi.fn(async () => writePrivateInputMock));
 const getDshPresetTransportConfigMock = vi.hoisted(() => vi.fn(async () => ({
   env: { ANTHROPIC_MODEL: 'MiniMax-M3' },
   llm: {
@@ -54,6 +60,20 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
+
+// These restore scenarios exercise the legacy stream-json contract. Keep the
+// CLI-version probe explicit instead of relying on an incomplete execFile mock
+// (Node's real promisified execFile returns { stdout, stderr }, not a string).
+vi.mock('../../src/util/exec-helper.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/util/exec-helper.js')>();
+  return {
+    ...actual,
+    execFileOffMain: vi.fn((...args: Parameters<typeof actual.execFileOffMain>) => {
+      if (args[1]?.includes('--version')) return Promise.resolve({ stdout: '1.4.12\n', stderr: '' });
+      return actual.execFileOffMain(...args);
+    }),
+  };
+});
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -167,11 +187,13 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
-  listSessions: vi.fn(() => [...mocks.store.values()]),
-  getSession: vi.fn((name: string) => mocks.store.get(name) ?? null),
-  upsertSession: vi.fn((record: Record<string, any>) => { if (record.name) mocks.store.set(record.name, record); }),
-  removeSession: vi.fn((name: string) => { mocks.store.delete(name); }),
+  flushStore: vi.fn(async (options?: any) => { if (mocks.realStore) await mocks.realStore.flushStore(options); }),
+  listSessions: vi.fn(() => mocks.realStore ? mocks.realStore.listSessions() : [...mocks.store.values()]),
+  getSession: vi.fn((name: string) => mocks.realStore ? mocks.realStore.getSession(name) : mocks.store.get(name) ?? null),
+  upsertSession: vi.fn((record: Record<string, any>) => { if (mocks.realStore) mocks.realStore.upsertSession(record); else if (record.name) mocks.store.set(record.name, record); }),
+  removeSession: vi.fn((name: string) => { if (mocks.realStore) mocks.realStore.removeSession(name); else mocks.store.delete(name); }),
   updateSessionState: vi.fn((name: string, state: string) => {
+    if (mocks.realStore) { mocks.realStore.updateSessionState(name, state); return; }
     const existing = mocks.store.get(name);
     if (existing) mocks.store.set(name, { ...existing, state });
   }),
@@ -190,13 +212,19 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: timelineEmitterEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
 vi.mock('../../src/daemon/timeline-store.js', () => ({
-  timelineStore: { readByTypesPreferred: timelineReadByTypesPreferredMock },
+  timelineStore: {
+    readByTypesPreferred: timelineReadByTypesPreferredMock,
+    readPreferred: timelineReadPreferredMock,
+    readCompletedTextTail: timelineReadCompletedTextTailMock,
+  },
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),
   newSession: vi.fn().mockResolvedValue(undefined), killSession: vi.fn().mockResolvedValue(undefined), sessionExists: vi.fn(), isPaneAlive: vi.fn(), respawnPane: vi.fn(),
-  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(), BACKEND: 'tmux',
+  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(),
+  preparePrivateInputWriter: preparePrivateInputWriterMock,
+  BACKEND: 'tmux',
 }));
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingFile: vi.fn().mockResolvedValue(undefined), reserveSessionFile: vi.fn(), reassignSessionFile: reassignSessionFileMock, stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn(() => '/tmp/mock.jsonl') }));
 vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined), startWatchingById: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
@@ -225,6 +253,7 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
+import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
 import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
 import {
@@ -233,6 +262,7 @@ import {
   launchTransportSession,
   relaunchSessionWithSettings,
   restoreTransportSessions,
+  stopTransportRuntimeSession,
   setSessionEventCallback,
   setSessionPersistCallback,
 } from '../../src/agent/session-manager.js';
@@ -487,18 +517,31 @@ describe('sdk transport session restore', () => {
     timelineEmitterEmitMock.mockClear();
     timelineReadByTypesPreferredMock.mockReset();
     timelineReadByTypesPreferredMock.mockResolvedValue([]);
+    timelineReadPreferredMock.mockReset();
+    timelineReadPreferredMock.mockResolvedValue([]);
+    timelineReadCompletedTextTailMock.mockReset();
+    timelineReadCompletedTextTailMock.mockResolvedValue([]);
+    writePrivateInputMock.mockClear();
+    preparePrivateInputWriterMock.mockClear();
     setSessionEventCallback(() => {});
     setSessionPersistCallback(async () => {});
   });
 
   beforeEach(async () => {
     tempDir = await createIsolatedSharedContextDb('sdk-transport-restore');
+    // The app-server is mocked; an explicitly scoped CODEX_HOME must not turn
+    // this fixture into a dependency on the developer's real login.
+    const codexHome = path.join(tempDir, 'codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'fixture-only-not-a-real-key' }));
+    vi.stubEnv('CODEX_HOME', codexHome);
   });
 
   afterEach(async () => {
     await disconnectAll();
     openCodeSdkRuntimeHooks.start = originalOpenCodeStart;
     await cleanupIsolatedSharedContextDb(tempDir);
+    vi.unstubAllEnvs();
   });
 
   it('preserves an explicit effort when a restore launch omits the optional field', async () => {
@@ -622,6 +665,238 @@ describe('sdk transport session restore', () => {
     } finally {
       resetProcessRoleForTests();
     }
+  });
+
+  it('restores a newly launched unused AG route after daemon state is lost', async () => {
+    const name = 'deck_sdk_ag_unused_brain';
+    await launchTransportSession({ name, projectName: 'sdk-ag-unused', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir });
+    const record = { ...mocks.store.get(name)! };
+    expect(record.providerResumeId).toBeUndefined();
+    // No send: the adapter has not spawned the native conversation at all.
+    await stopTransportRuntimeSession(name);
+    await disconnectAll();
+    mocks.store.set(name, record);
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(getTransportRuntime(name)?.providerSessionId).toBeTruthy();
+  });
+
+  it.each([undefined, AG.STARTED])('keeps an AG record with %s creation evidence and no id unbound', async state => {
+    const name = 'deck_sdk_ag_unknown_brain';
+    mocks.store.set(name, { name, projectName: 'sdk-ag-unknown', role: 'brain', agentType: 'agy-sdk',
+      providerId: 'agy-sdk', providerSessionId: 'legacy-route', projectDir: tempDir, state: 'idle',
+      createdAt: 1, updatedAt: 1, restarts: 0, restartTimestamps: [], runtimeType: 'transport',
+      ...(state ? { agyNativeSessionState: state } : {}) });
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(mocks.store.get(name)?.providerSessionId).toBe('legacy-route');
+    await expect(launchTransportSession({ name, projectName: 'sdk-ag-unknown', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir }))
+      .rejects.toThrow('refusing an implicit fresh launch');
+  });
+
+  it.each(['brain', 'w1'])('persists AG late init for a %s and resumes only its native id', async role => {
+    const name = `deck_sdk_ag_info_${role}`;
+    let config: any;
+    const createSpy = vi.spyOn(AgySdkProvider.prototype, 'createSession').mockImplementation(async c => { config = c; return c.sessionKey; });
+    await launchTransportSession({ name, projectName: 'sdk-ag-info', role, agentType: 'agy-sdk', projectDir: tempDir });
+    expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.UNSTARTED);
+    await config.beforeNativeSessionStart();
+    expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('agy-sdk')!;
+    (provider as any).emitSessionInfo(getTransportRuntime(name)!.providerSessionId, { resumeId: 'native-'+role });
+    expect(mocks.store.get(name)?.providerResumeId).toBe('native-'+role);
+    const saved = { ...mocks.store.get(name)! };
+    await stopTransportRuntimeSession(name);
+    await disconnectAll();
+    mocks.store.set(name, saved);
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(config.resumeId).toBe('native-'+role);
+    expect(config.sessionKey).not.toBe(config.resumeId);
+    expect(getTransportRuntime(name)?.providerSessionId).toBeTruthy();
+    createSpy.mockRestore();
+  });
+
+  it('restores two unused same-cwd AG owners, drains each queue once and never replays accepted ids', async () => {
+    const configs = new Map<string, any>(); const sent: Array<{ owner: string; text: string }> = [];
+    const createSpy = vi.spyOn(AgySdkProvider.prototype, 'createSession').mockImplementation(async c => { configs.set(c.sessionKey,c); return c.sessionKey; });
+    const sendSpy = vi.spyOn(AgySdkProvider.prototype, 'send').mockImplementation(async function(this: AgySdkProvider, sid, payload) {
+      await configs.get(sid).beforeNativeSessionStart();
+      const record = [...mocks.store.values()].find(r=>r.providerSessionId===sid)!;
+      expect(record.agyNativeSessionState).toBe(AG.STARTED);
+      const text = typeof payload==='string'?payload:payload.userMessage;
+      sent.push({owner:record.name,text});
+      (this as any).emitSessionInfo(sid,{resumeId:'native-'+record.name});
+      setTimeout(()=>{ for(const cb of (this as any).completeCallbacks) cb(sid,{id:'done-'+sent.length,content:'ok',role:'assistant',timestamp:Date.now()}); },0);
+    });
+    try {
+      const names=['deck_sdk_ag_queue_brain','deck_sdk_ag_queue_w1'];
+      const ids: Record<string,string[]> = {};
+      for(const [i,name] of names.entries()) {
+        await launchTransportSession({name,projectName:'sdk-ag-queue',role:i?'w1':'brain',agentType:'agy-sdk',projectDir:tempDir});
+        if(i)mocks.store.set(name,{...mocks.store.get(name),parentSession:names[0]});
+        await stopTransportRuntimeSession(name);
+        const {sessionInstanceId,runtimeEpoch}=mocks.store.get(name)!;
+        const recipient={sessionInstanceId,runtimeEpoch};
+        expect(enqueueResend(name,{recipient,text:name+'-one',commandId:name+'-one',queuedAt:Date.now()}).accepted).toBe(true);
+        expect(enqueueResend(name,{recipient,text:name+'-two',commandId:name+'-two',queuedAt:Date.now()}).accepted).toBe(true);
+        ids[name]=getResendEntries(name).map(e=>e.clientMessageId!);
+      }
+      await disconnectAll();await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{concurrency:2,interSessionDelayMs:0});
+      await vi.waitFor(()=>expect(sent).toHaveLength(4));
+      for(const name of names) {
+        expect(sent.filter(s=>s.owner===name).map(s=>s.text)).toEqual([name+'-one',name+'-two']);
+        await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toEqual([]));
+        for(const id of ids[name])expect(getTransportQueueStore().hasDeliveryTombstone(name,id)).toBe(true);
+      }
+      await restoreTransportSessions('agy-sdk');expect(sent).toHaveLength(4);
+      expect(mocks.store.get(names[1])?.parentSession).toBe(names[0]);
+    } finally { sendSpy.mockRestore();createSpy.mockRestore(); }
+  });
+
+  it('keeps both unaccepted AG queue entries when the start commit fails without auto-relaunch', async () => {
+    let config: any; let effects=0;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return c.sessionKey;});
+    const sendSpy=vi.spyOn(AgySdkProvider.prototype,'send').mockImplementation(async()=>{await config.beforeNativeSessionStart();effects++;});
+    const storeModule=await import('../../src/store/session-store.js');
+    const flush=vi.mocked(storeModule.flushStore);
+    const originalFlush=flush.getMockImplementation()!;
+    try {
+      const name='deck_sdk_ag_writefail_brain';
+      await launchTransportSession({name,projectName:'sdk-ag-writefail',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      const {sessionInstanceId,runtimeEpoch}=mocks.store.get(name)!;
+      const recipient={sessionInstanceId,runtimeEpoch};
+      expect(enqueueResend(name,{recipient,text:'one',commandId:'ag-fail-one',queuedAt:Date.now()}).accepted).toBe(true);
+      expect(enqueueResend(name,{recipient,text:'two',commandId:'ag-fail-two',queuedAt:Date.now()}).accepted).toBe(true);
+      flush.mockRejectedValue(new Error('fixture disk full'));
+      await connectProvider('agy-sdk',{});await restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(getTransportRuntime(name)?.getStatus()).toBe('error'));
+      await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toHaveLength(2));
+      expect(effects).toBe(0);expect(createSpy).toHaveBeenCalledTimes(2);
+      expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    } finally { flush.mockImplementation(originalFlush);sendSpy.mockRestore();createSpy.mockRestore(); }
+  });
+
+  it.each(['stop','delete','recreate','rebind'])('does not commit a late AG launch after %s', async action => {
+    const name='deck_sdk_ag_init_brain';
+    await launchTransportSession({name,projectName:'sdk-ag-init',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+    await stopTransportRuntimeSession(name);
+    const saved={...mocks.store.get(name)!};
+    const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const launch=launchTransportSession({name,projectName:'sdk-ag-init',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+      const rejected=expect(launch).rejects.toMatchObject({code:PROVIDER_ERROR_CODES.CANCELLED});
+      await vi.waitFor(()=>expect(config).toBeDefined());
+      if(action==='stop')await stopTransportRuntimeSession(name);
+      else if(action==='delete')mocks.store.delete(name);
+      else if(action==='recreate')mocks.store.set(name,{...saved,sessionInstanceId:'new-owner',providerResumeId:'good-native'});
+      else mocks.store.set(name,{...saved,providerSessionId:'new-route',providerResumeId:'good-native'});
+      const after=mocks.store.get(name);
+      gate.resolve(config.sessionKey);await rejected;
+      expect(getTransportRuntime(name)).toBeUndefined();expect(mocks.store.get(name)).toEqual(after);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it.each(['stop','delete','recreate','rebind'])('does not commit a late AG restore after %s', async action => {
+    const name='deck_sdk_ag_restorelate_brain';
+    await launchTransportSession({name,projectName:'sdk-ag-restorelate',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+    await stopTransportRuntimeSession(name);await disconnectAll();await connectProvider('agy-sdk',{});
+    const saved={...mocks.store.get(name)!};const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const restore=restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(config).toBeDefined());
+      if(action==='stop')await stopTransportRuntimeSession(name);
+      else if(action==='delete')mocks.store.delete(name);
+      else if(action==='recreate')mocks.store.set(name,{...saved,sessionInstanceId:'new-owner'});
+      else mocks.store.set(name,{...saved,providerSessionId:'new-route',providerResumeId:'new-native'});
+      const after=mocks.store.get(name);gate.resolve(config.sessionKey);await restore;
+      expect(getTransportRuntime(name)).toBeUndefined();expect(mocks.store.get(name)).toEqual(after);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it('coalesces concurrent AG launches instead of creating two native owners', async () => {
+    const name='deck_sdk_ag_concurrent_brain';const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const opts={name,projectName:'sdk-ag-concurrent',role:'brain',agentType:'agy-sdk' as const,projectDir:tempDir};
+      const first=launchTransportSession(opts);const second=launchTransportSession(opts);
+      await vi.waitFor(()=>expect(config).toBeDefined());gate.resolve(config.sessionKey);await Promise.all([first,second]);
+      expect(createSpy).toHaveBeenCalledTimes(1);expect(getTransportRuntime(name)?.providerSessionId).toBe(config.sessionKey);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it.each(['brain','w1'])('keeps a trusted AG native binding through a skipStore %s relaunch', async role => {
+    const name=`deck_sdk_ag_skip_${role}`;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>c.sessionKey);
+    try {
+      await launchTransportSession({name,projectName:'sdk-ag-skip',role,agentType:'agy-sdk',projectDir:tempDir});
+      const saved={...mocks.store.get(name)!,providerResumeId:'trusted-native'};
+      mocks.store.set(name,saved);await stopTransportRuntimeSession(name);
+      await launchTransportSession({name,projectName:'sdk-ag-skip',role,agentType:'agy-sdk',projectDir:tempDir,skipStore:true});
+      expect(mocks.store.get(name)?.providerResumeId).toBe('trusted-native');
+      expect(mocks.store.get(name)?.providerSessionId).toBe(getTransportRuntime(name)?.providerSessionId);
+      expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it('runs AG manager restore, native-id capture and queue ownership across a real SQLite reload', async () => {
+    const actual = await vi.importActual<typeof import('../../src/store/session-store.js')>('../../src/store/session-store.js');
+    const { persistedSessions } = await import('../helpers/session-store-db.js');
+    const home=path.join(tempDir,'real-home');await mkdir(home);
+    vi.stubEnv('HOME',home);vi.stubEnv('USERPROFILE',home);vi.stubEnv('IMCODES_HOME',path.join(home,'.imcodes'));
+    mocks.realStore=actual;actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});
+    const name='deck_realproj_ag_sqlite_w1';const configs=new Map<string,any>();const sent:string[]=[];
+    const native='11111111-2222-4333-8444-555555555555';
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{configs.set(c.sessionKey,c);return c.sessionKey;});
+    const sendSpy=vi.spyOn(AgySdkProvider.prototype,'send').mockImplementation(async function(this:AgySdkProvider,sid,payload){
+      await configs.get(sid).beforeNativeSessionStart();
+      const record=actual.getSession(name)!;
+      expect(persistedSessions(home)[name].agyNativeSessionState).toBe(AG.STARTED);
+      expect(record.runtimeEpoch).toBe(configs.get(sid).runtimeEpoch);
+      sent.push(typeof payload==='string'?payload:payload.userMessage);
+      (this as any).emitSessionInfo(sid,{resumeId:native});
+      setTimeout(()=>{for(const cb of (this as any).completeCallbacks)cb(sid,{id:'sqlite-result-'+sent.length,content:'ok',role:'assistant',timestamp:Date.now()});},0);
+    });
+    try {
+      await launchTransportSession({name,projectName:'realproj',role:'w1',agentType:'agy-sdk',projectDir:tempDir});
+      actual.upsertSession({...actual.getSession(name)!,parentSession:'deck_realproj_brain'});await actual.flushStore();
+      const before={...actual.getSession(name)!};
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      const recipient={sessionInstanceId:before.sessionInstanceId!,runtimeEpoch:before.runtimeEpoch!};
+      for(const text of ['one','two'])expect(enqueueResend(name,{recipient,text,commandId:'real-ag-'+text,queuedAt:Date.now()}).accepted).toBe(true);
+      actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(sent).toEqual(['one','two']));
+      await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toEqual([]));
+      await actual.flushStore();
+      expect(persistedSessions(home)[name]).toMatchObject({providerResumeId:native,agyNativeSessionState:AG.STARTED,parentSession:'deck_realproj_brain'});
+      expect(actual.getSession(name)?.runtimeEpoch).not.toBe(before.runtimeEpoch);
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{sessionName:name});
+      const current=getTransportRuntime(name)!;
+      expect(configs.get(current.providerSessionId!).resumeId).toBe(native);expect(sent).toHaveLength(2);
+    } finally {
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      await actual.flushStore();await actual.waitForSessionStoreSnapshotForTests();actual.resetSessionStoreAuthorityForTests();
+      mocks.realStore=undefined;sendSpy.mockRestore();createSpy.mockRestore();
+    }
+  });
+
+  it('rejects an old AG runtime info callback after owner replacement', async () => {
+    const name = 'deck_sdk_ag_late_brain';
+    await launchTransportSession({ name, projectName: 'sdk-ag-late', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir });
+    const old = getTransportRuntime(name)!;
+    const callback = (old as any)._onSessionInfoChange;
+    const saved = { ...mocks.store.get(name)! };
+    mocks.store.set(name, { ...saved, runtimeEpoch: 'replacement', providerSessionId: 'other-route', providerResumeId: 'good-native' });
+    callback({ resumeId: 'late-old-id' });
+    expect(mocks.store.get(name)?.providerResumeId).toBe('good-native');
   });
 
   it('does not restore a stale Muse record while restoring a different provider', async () => {
@@ -2935,5 +3210,739 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get(name)?.agentType).toBe('codex');
     expect(mocks.store.get(name)?.codexSessionId).toBe('codex-thread-switch');
     expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).toContain('codex-thread-switch');
+  });
+
+  it('resets codex-sdk fresh with handoff pack on { fresh: true, handoff: true } and injects it into the next turn', async () => {
+    const name = 'deck_handoff_cxsdk_brain';
+    const record = {
+      name,
+      projectName: 'handoffcxsdk',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/handoff-cxsdk',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-handoff',
+      codexSessionId: 'codex-thread-before-handoff',
+    };
+    mocks.store.set(name, record);
+    const prevUserEvent = {
+      eventId: 'ev-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'HANDOFF_GOAL_ALPHA' },
+    };
+    const prevAssistantEvent = {
+      eventId: 'ev-2',
+      sessionId: name,
+      ts: 200,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'HANDOFF_STATE_BETA', streaming: false },
+    };
+    const handoffCmdEvent = {
+      eventId: 'ev-3',
+      sessionId: name,
+      ts: 300,
+      seq: 3,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    };
+    timelineReadPreferredMock.mockResolvedValue([handoffCmdEvent as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([prevUserEvent, prevAssistantEvent, handoffCmdEvent] as any);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    const pendingDeadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+      await flush();
+    }
+    const updated = mocks.store.get(name);
+    expect(updated?.codexSessionId).not.toBe('codex-thread-before-handoff');
+    expect(updated?.crossVendorHandoff?.pending?.text).toContain('HANDOFF_GOAL_ALPHA');
+    expect(updated?.crossVendorHandoff?.pending?.text).toContain('HANDOFF_STATE_BETA');
+    expect(updated?.crossVendorHandoff?.pending?.text).not.toContain('/handoff');
+
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('continue task');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('continue task') && Date.now() < deadline) {
+      await flush();
+    }
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toContain('HANDOFF_GOAL_ALPHA');
+    expect(run?.input).toContain('HANDOFF_STATE_BETA');
+    expect(run?.input).toContain('continue task');
+    expect(run?.input).not.toContain('/handoff');
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+  });
+
+  it('clears stale pending handoff pack when relaunched fresh without handoff (/clear)', async () => {
+    const name = 'deck_clear_strips_pending_brain';
+    const record = {
+      name,
+      projectName: 'clearpending',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-pending',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-clear-pending',
+      codexSessionId: 'codex-thread-pending',
+      crossVendorHandoff: {
+        pending: {
+          text: 'STALE_HANDOFF_SHOULD_VANISH',
+          sourceAgentType: 'codex-sdk',
+          sourceRuntimeType: 'transport',
+          cutoff: { epoch: 1, seq: 1, ts: 10 },
+          createdAt: 10,
+          tokenCount: 10,
+        },
+      },
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true });
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+    const runtime = getTransportRuntime(name);
+    runtime!.send('brand new start');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('brand new start') && Date.now() < deadline) {
+      await flush();
+    }
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('brand new start');
+  });
+
+  it('degrades cleanly with no handoff pack when timeline is empty or control-only on /handoff', async () => {
+    const name = 'deck_handoff_empty_brain';
+    const record = {
+      name,
+      projectName: 'handoffempty',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/handoff-empty',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-handoff-empty',
+      codexSessionId: 'codex-thread-empty',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-handoff-only',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([{
+      eventId: 'ev-handoff-only',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+    const runtime = getTransportRuntime(name);
+    runtime!.send('first real question');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('first real question') && Date.now() < deadline) {
+      await flush();
+    }
+    expect(codexRunForSession(name, 'start')?.input).toBe('first real question');
+  });
+
+  it('delivers handoff pack via process private writer when relaunching claude-code with { fresh: true, handoff: true }', async () => {
+    const name = 'deck_handoff_cccli_brain';
+    const record = {
+      name,
+      projectName: 'handoffcccli',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      projectDir: '/tmp/handoff-cccli',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ccSessionId: 'cc-old-handoff',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-proc-2',
+      sessionId: name,
+      ts: 200,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'PROCESS_HANDOFF_FACT', streaming: false },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([
+      {
+        eventId: 'ev-proc-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'PROCESS_HANDOFF_TASK' },
+      },
+      {
+        eventId: 'ev-proc-2',
+        sessionId: name,
+        ts: 200,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'PROCESS_HANDOFF_FACT', streaming: false },
+      },
+    ] as any);
+
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    await vi.waitFor(() => {
+      expect(writePrivateInputMock).toHaveBeenCalled();
+    }, { timeout: 15_000, interval: 10 });
+
+    expect(mocks.store.get(name)?.ccSessionId).not.toBe('cc-old-handoff');
+    expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).not.toContain('cc-old-handoff');
+    expect(preparePrivateInputWriterMock).toHaveBeenCalledWith(name);
+    expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_TASK'));
+    expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_FACT'));
+  });
+
+  it('invalidates an in-flight /handoff pack on clearTransportConversation and never resurrects it on later restore', async () => {
+    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
+    const name = 'deck_clear_inflight_handoff_brain';
+    const record = {
+      name,
+      projectName: 'clearinflighthandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-inflight-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-clear-inflight',
+      codexSessionId: 'codex-thread-inflight',
+    };
+    mocks.store.set(name, record);
+
+    const rowsReady = deferred<any[]>();
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-inflight-cutoff',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'PRIVATE_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockImplementation(() => rowsReady.promise);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    // User immediately runs /clear before the async handoff pack finishes building.
+    await clearTransportConversation(mocks.store.get(name) as any);
+
+    rowsReady.resolve([{
+      eventId: 'ev-inflight-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'PRIVATE_CONTEXT_CLEARED_BY_USER' },
+    }]);
+    await flush();
+    await flush();
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+
+    // Stop runtime and run ordinary recovery/restore: cleared session must remain blank.
+    await stopTransportRuntimeSession(name);
+    mocks.codexRuns.length = 0;
+    await restoreTransportSessions('codex-sdk', { sessionName: name });
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('NEW_QUESTION_AFTER_CLEAR');
+    await settleCodexRun(name, 'start', 'NEW_QUESTION_AFTER_CLEAR');
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('NEW_QUESTION_AFTER_CLEAR');
+    expect(run?.input).not.toContain('PRIVATE_CONTEXT_CLEARED_BY_USER');
+  });
+
+  it('clears a ready-pending /handoff pack on clearTransportConversation and keeps subsequent restore clean', async () => {
+    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
+    const name = 'deck_clear_ready_handoff_brain';
+    const record = {
+      name,
+      projectName: 'clearreadyhandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-ready-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-clear-ready',
+      codexSessionId: 'codex-thread-ready',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-ready-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'READY_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([{
+      eventId: 'ev-ready-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'READY_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    const pendingDeadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+      await flush();
+    }
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('READY_CONTEXT_CLEARED_BY_USER');
+
+    await clearTransportConversation(mocks.store.get(name) as any);
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+
+    await stopTransportRuntimeSession(name);
+    mocks.codexRuns.length = 0;
+    await restoreTransportSessions('codex-sdk', { sessionName: name });
+    const runtime = getTransportRuntime(name);
+    runtime!.send('AFTER_READY_CLEAR');
+    await settleCodexRun(name, 'start', 'AFTER_READY_CLEAR');
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('AFTER_READY_CLEAR');
+    expect(run?.input).not.toContain('READY_CONTEXT_CLEARED_BY_USER');
+  });
+
+  it('delivers only the newest pack once across consecutive /handoff calls', async () => {
+    const name = 'deck_consecutive_handoff_brain';
+    const record = {
+      name,
+      projectName: 'consecutivehandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/consecutive-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-consecutive',
+      codexSessionId: 'codex-thread-consec',
+    };
+    mocks.store.set(name, record);
+
+    const firstSlow = deferred<any[]>();
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-consec-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'STALE_FIRST_HANDOFF' },
+    } as any]);
+    timelineReadCompletedTextTailMock
+      .mockImplementationOnce(() => firstSlow.promise)
+      .mockResolvedValueOnce([{
+        eventId: 'ev-consec-2',
+        sessionId: name,
+        ts: 200,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'LATEST_SECOND_HANDOFF' },
+      } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    await relaunchSessionWithSettings(mocks.store.get(name) as any, { fresh: true, handoff: true });
+
+    firstSlow.resolve([{
+      eventId: 'ev-consec-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'STALE_FIRST_HANDOFF' },
+    }]);
+    const deadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < deadline) {
+      await flush();
+    }
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('LATEST_SECOND_HANDOFF');
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).not.toContain('STALE_FIRST_HANDOFF');
+
+    mocks.codexRuns.length = 0;
+    const runtime = getTransportRuntime(name);
+    runtime!.send('turn one');
+    await settleCodexRun(name, 'start');
+    const firstTurnDeadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('turn one') && Date.now() < firstTurnDeadline) {
+      await flush();
+    }
+    expect(codexRunForSession(name, 'start')?.input).toContain('LATEST_SECOND_HANDOFF');
+    expect(codexRunForSession(name, 'start')?.input).not.toContain('STALE_FIRST_HANDOFF');
+
+    // Consumed: second turn after /handoff must not repeat the handoff pack.
+    runtime!.send('turn two');
+    await settleCodexRun(name, 'start', 'turn two');
+    expect(codexRunForSession(name, 'start')?.input).toBe('turn two');
+  });
+
+  it('preserves codex-sdk ccPreset and resolves getCodexPresetTransportConfig on /handoff with one-time pack delivery', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({
+      env: { OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      model: 'custom-codex-model',
+      availableModels: ['custom-codex-model', 'custom-codex-mini'],
+      contextWindow: 128_000,
+      codexModelProvider: {
+        id: 'custom_codex_preset',
+        name: 'custom-codex-preset',
+        baseUrl: 'https://custom-codex.example/v1',
+        envKey: 'CUSTOM_API_KEY',
+      },
+    });
+    try {
+      const name = 'deck_handoff_codex_preset_brain';
+      const record = {
+        name,
+        projectName: 'handoffcodexpreset',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/handoff-codex-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-cx-preset',
+        codexSessionId: 'codex-thread-preset-old',
+        ccPreset: 'custom-codex-preset',
+        requestedModel: 'custom-codex-model',
+      };
+      mocks.store.set(name, record);
+      timelineReadPreferredMock.mockResolvedValue([{
+        eventId: 'ev-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_PRESET_HANDOFF_GOAL' },
+      } as any]);
+      timelineReadCompletedTextTailMock.mockResolvedValue([{
+        eventId: 'ev-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_PRESET_HANDOFF_GOAL' },
+      } as any]);
+
+      await connectProvider('codex-sdk', {});
+      await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('custom-codex-preset', 'custom-codex-model');
+      const updated = mocks.store.get(name);
+      expect(updated?.ccPreset).toBe('custom-codex-preset');
+      expect(updated?.requestedModel).toBe('custom-codex-model');
+      expect(updated?.codexSessionId).not.toBe('codex-thread-preset-old');
+
+      const pendingDeadline = Date.now() + 5_000;
+      while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+        await flush();
+      }
+      mocks.codexRuns.length = 0;
+      const runtime = getTransportRuntime(name);
+      runtime!.send('next step');
+      await settleCodexRun(name, 'start');
+      const runDeadline = Date.now() + 5_000;
+      while (!codexRunForSession(name, 'start')?.input.includes('next step') && Date.now() < runDeadline) {
+        await flush();
+      }
+      expect(codexRunForSession(name, 'start')?.input).toContain('CODEX_PRESET_HANDOFF_GOAL');
+      expect(codexRunForSession(name, 'start')?.options.model).toBe('custom-codex-model');
+
+      // One-time delivery check
+      runtime!.send('follow up');
+      await settleCodexRun(name, 'start', 'follow up');
+      expect(codexRunForSession(name, 'start')?.input).toBe('follow up');
+    } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('preserves codex process ccPreset and available models while rotating thread and delivering handoff pack', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const resolveEnvSpy = vi.spyOn(ccPresets, 'resolvePresetEnv').mockResolvedValue({});
+    const getPresetSpy = vi.spyOn(ccPresets, 'getPreset').mockResolvedValue({
+      name: 'custom-codex-cli-preset',
+      env: { OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      contextWindow: 128_000,
+      availableModels: [{ id: 'custom-codex-model' }],
+    } as any);
+    try {
+      const name = 'deck_handoff_codex_cli_preset_brain';
+      const record = {
+        name,
+        projectName: 'handoffcodexclipreset',
+        role: 'brain',
+        agentType: 'codex',
+        runtimeType: 'process',
+        projectDir: '/tmp/handoff-codex-cli-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        codexSessionId: 'codex-cli-thread-old',
+        ccPreset: 'custom-codex-cli-preset',
+      };
+      mocks.store.set(name, record);
+      timelineReadPreferredMock.mockResolvedValue([{
+        eventId: 'ev-cli-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_CLI_PRESET_GOAL' },
+      } as any]);
+      timelineReadCompletedTextTailMock.mockResolvedValue([{
+        eventId: 'ev-cli-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_CLI_PRESET_GOAL' },
+      } as any]);
+
+      await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+      const deadline = Date.now() + 5_000;
+      while (writePrivateInputMock.mock.calls.length === 0 && Date.now() < deadline) {
+        await flush();
+      }
+
+      const updated = mocks.store.get(name);
+      expect(resolveEnvSpy).toHaveBeenCalledWith('custom-codex-cli-preset', undefined);
+      expect(getPresetSpy).toHaveBeenCalledWith('custom-codex-cli-preset');
+      expect(updated?.ccPreset).toBe('custom-codex-cli-preset');
+      expect(updated?.codexAvailableModels).toEqual(['custom-codex-model']);
+      expect(updated?.codexSessionId).not.toBe('codex-cli-thread-old');
+      expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('CODEX_CLI_PRESET_GOAL'));
+    } finally {
+      resolveEnvSpy.mockRestore();
+      getPresetSpy.mockRestore();
+    }
+  });
+
+  it('does not carry an incompatible ccPreset across families when switching from claude-code to codex-sdk without an override', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig');
+    try {
+      const name = 'deck_cross_family_preset_drop_brain';
+      const record = {
+        name,
+        projectName: 'crossfamilypreset',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        projectDir: '/tmp/cross-family-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        providerId: 'claude-code-sdk',
+        providerSessionId: 'route-cc-cross',
+        ccSessionId: 'cc-cross-old',
+        ccPreset: 'claude-only-preset',
+      };
+      mocks.store.set(name, record);
+
+      await connectProvider('codex-sdk', {});
+      await relaunchSessionWithSettings(record as any, { agentType: 'codex-sdk' });
+
+      expect(codexPresetSpy).not.toHaveBeenCalled();
+      expect(mocks.store.get(name)?.agentType).toBe('codex-sdk');
+      expect(mocks.store.get(name)?.ccPreset).toBeUndefined();
+    } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('resolves codex-sdk ccPreset overrides during restoreTransportSessions without stripping custom model ids', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({
+      env: { CUSTOM_API_KEY: 'preset-secret', OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      model: 'sc117-qwen3.8-flash-opus-custom',
+      availableModels: ['sc117-qwen3.8-flash-opus-custom', 'sc117-mini'],
+      contextWindow: 131_072,
+      systemPrompt: 'Runtime facts: custom codex preset.',
+      codexModelProvider: {
+        id: 'qwen3_8_27b',
+        name: 'qwen3.8-27b',
+        baseUrl: 'https://custom-codex.example/v1',
+        envKey: 'CUSTOM_API_KEY',
+      },
+    });
+    const createSessionSpy = vi.spyOn(CodexSdkProvider.prototype, 'createSession');
+    try {
+      const name = 'deck_sub_restore_codex_preset';
+      mocks.store.set(name, {
+        name,
+        projectName: 'restorecodexpreset',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-cx-restore-preset',
+        codexSessionId: 'codex-thread-restore-preset',
+        projectDir: '/tmp/restore-codex-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccPreset: 'qwen3.8-27b',
+        requestedModel: 'sc117-qwen3.8-flash-opus-custom',
+      });
+
+      await connectProvider('codex-sdk', {});
+      await restoreTransportSessions('codex-sdk', { sessionName: name });
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('qwen3.8-27b', 'sc117-qwen3.8-flash-opus-custom');
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'sc117-qwen3.8-flash-opus-custom',
+        systemPrompt: 'Runtime facts: custom codex preset.',
+        env: expect.objectContaining({
+          CUSTOM_API_KEY: 'preset-secret',
+          OPENAI_BASE_URL: 'https://custom-codex.example/v1',
+        }),
+        settings: expect.objectContaining({
+          codexModelProvider: {
+            id: 'qwen3_8_27b',
+            name: 'qwen3.8-27b',
+            baseUrl: 'https://custom-codex.example/v1',
+            envKey: 'CUSTOM_API_KEY',
+          },
+        }),
+      }));
+      expect(mocks.store.get(name)).toMatchObject({
+        ccPreset: 'qwen3.8-27b',
+        requestedModel: 'sc117-qwen3.8-flash-opus-custom',
+        presetContextWindow: 131_072,
+        codexAvailableModels: ['sc117-qwen3.8-flash-opus-custom', 'sc117-mini'],
+      });
+    } finally {
+      createSessionSpy.mockRestore();
+      codexPresetSpy.mockRestore();
+    }
   });
 });

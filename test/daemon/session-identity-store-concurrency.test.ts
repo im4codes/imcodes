@@ -11,7 +11,7 @@
  * The assertions below are structural (how many times the file was read), never timing or heap-size thresholds.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -80,7 +80,11 @@ describe('identity store: concurrent readers share one read of the file', () => 
   it('a file replaced from outside is noticed on the next read', async () => {
     await writeProductionShapedStore(3, 100);
     expect(await listLocalSessionIdentityProfiles()).toHaveLength(3);
+    const file = join(home, 'session-identities.json');
+    const prevStat = await stat(file);
     await writeProductionShapedStore(5, 100);
+    // Force an identical mtime (same millisecond & inode) to ensure size/stat-signature changes still reload.
+    await utimes(file, prevStat.atime, prevStat.mtime);
     expect(await listLocalSessionIdentityProfiles()).toHaveLength(5);
   });
 

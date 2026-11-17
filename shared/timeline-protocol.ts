@@ -262,7 +262,8 @@ export function isTimelineHistoryContentFilter(value: unknown): value is Timelin
 }
 
 /** The event types a `text` content filter selects. */
-export const TIMELINE_TEXT_HISTORY_EVENT_TYPES = ['user.message', 'assistant.text'] as const;
+export const TIMELINE_ASSISTANT_TEXT_EVENT_TYPE = 'assistant.text' as const;
+export const TIMELINE_TEXT_HISTORY_EVENT_TYPES = ['user.message', TIMELINE_ASSISTANT_TEXT_EVENT_TYPE] as const;
 
 /**
  * How many of the newest messages the stale-window "peek" asks for before anything else, so a

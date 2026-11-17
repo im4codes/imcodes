@@ -33,8 +33,11 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import { isShareScopedState } from '../tab-sharing-ui.js';
+import { focusComposerElement } from '../keyboard-shortcuts.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
+import type { PendingSharedSessionUpload } from '../services/share-receiver.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -118,16 +121,26 @@ export interface SessionPaneProps {
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Open a loopback URL in the shared local-web-preview host. */
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
   /** Mobile: whether the file browser overlay is open. */
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
   onMobileFileBrowserClose?: () => void;
+  /** Open Controlled Nodes management (forwarded to SessionControls -> FileBrowser -> DocShareDialog). */
+  onOpenNodeGroups?: () => void;
   /** Text to prefill into the input when a navigation action carries a quote. */
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been consumed by the input. */
   onPendingPrefillApplied?: () => void;
+  /** Pending shared files/text from external app share target modal. */
+  pendingSharedUpload?: PendingSharedSessionUpload | null;
+  /** Called after pendingSharedUpload has been consumed by the target session composer. */
+  onPendingSharedUploadConsumed?: (id: string) => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
+  /** Allow opening DocShare controls from embedded FileBrowser instances (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 export function SessionPane({
@@ -163,13 +176,19 @@ export function SessionPane({
   onAfterAction,
   onPreviewFile,
   onOpenLocalWebPreview,
+  onCloudDocClick,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
+  onOpenNodeGroups,
   pendingPrefillText,
   onPendingPrefillApplied,
+  pendingSharedUpload,
+  onPendingSharedUploadConsumed,
   onVersionSensitiveAction,
+  canManageFileShares = true,
 }: SessionPaneProps) {
   recordPerfRender(isActive ? 'SessionPane:active' : 'SessionPane:hidden');
+  const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(session.sharedState);
   const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
@@ -202,6 +221,7 @@ export function SessionPane({
     loadMessageContext,
     forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
+    incognito: session.incognito,
     // A focused sub-session window owns keyboard/recovery focus while it is
     // open. Keep this main pane mounted and subscribed, but do not let it join
     // the same global resume broadcast and double the foreground work.
@@ -225,6 +245,13 @@ export function SessionPane({
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => {
     setQuotes((prev) => [...prev, text]);
+    const focusNow = () => {
+      focusComposerElement(inputRef.current);
+    };
+    focusNow();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(focusNow);
+    }
   }, []);
   const removeQuote = useCallback((index: number) => {
     setQuotes((prev) => prev.filter((_, i) => i !== index));
@@ -353,20 +380,31 @@ export function SessionPane({
 
   // inputRef for SessionControls — expose to app.tsx via onInputRef
   const inputRef = useRef<HTMLDivElement>(null);
+  const onInputRefRef = useRef(onInputRef);
+  onInputRefRef.current = onInputRef;
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   // Re-register with app.tsx when session becomes active/inactive
   useEffect(() => {
-    if (!onInputRef) return;
     if (isActive) {
-      // SessionControls is now mounted — inputRef.current will be set after first render.
-      // Use rAF to ensure the DOM ref is populated before registering.
-      const id = requestAnimationFrame(() => { onInputRef(inputRef.current); });
-      return () => cancelAnimationFrame(id);
-    } else {
-      onInputRef(null);
+      if (inputRef.current && inputRef.current.isConnected) {
+        onInputRefRef.current?.(inputRef.current);
+        return undefined;
+      }
+      if (typeof requestAnimationFrame === 'function') {
+        const id = requestAnimationFrame(() => {
+          const el = inputRef.current;
+          onInputRefRef.current?.(el && el.isConnected ? el : null);
+        });
+        return () => cancelAnimationFrame(id);
+      }
       return undefined;
     }
-  }, [isActive, onInputRef]);
+    onInputRefRef.current?.(null);
+    return undefined;
+  }, [isActive]);
+  useEffect(() => () => {
+    onInputRefRef.current?.(null);
+  }, []);
 
   // ── Scroll to bottom in whichever view is active ────────────────────────────
   const scrollToBottom = useCallback(() => {
@@ -470,10 +508,12 @@ export function SessionPane({
           onViewRepo={onViewRepo}
           onPreviewFile={onPreviewFile}
           onOpenLocalWebPreview={onOpenLocalWebPreview}
+          onCloudDocClick={onCloudDocClick}
           ws={connected ? ws : null}
           serverId={serverId}
           scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}
           readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
+          canManageFileShares={effectiveCanManageFileShares}
           onQuote={addQuote}
           agentType={session.agentType}
           onResendFailed={handleResendFailed}
@@ -518,9 +558,6 @@ export function SessionPane({
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
           runExecutionClonesFeedback={executionCloneLaunchState}
-          onRefreshHistory={timelineForceRefresh}
-          historyRefreshing={timelineRefreshing}
-          historyStatus={timelineHistoryStatus}
         />
       )}
 
@@ -583,6 +620,7 @@ export function SessionPane({
           keyboardActive={keyboardActive ?? isActive}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}
+          onOpenNodeGroups={onOpenNodeGroups}
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
@@ -591,8 +629,11 @@ export function SessionPane({
           onRemoveQuote={removeQuote}
           pendingPrefillText={pendingPrefillText}
           onPendingPrefillApplied={onPendingPrefillApplied}
+          pendingSharedUpload={pendingSharedUpload}
+          onPendingSharedUploadConsumed={onPendingSharedUploadConsumed}
           onVersionSensitiveAction={onVersionSensitiveAction}
           onComposerTextChange={setComposerText}
+          canManageFileShares={effectiveCanManageFileShares}
         />
       )}
     </div>

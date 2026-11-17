@@ -1,11 +1,18 @@
 /**
  * @vitest-environment jsdom
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  IOS_MAC_DESKTOP_CLASS,
   IOS_MAC_TEXT_SCALE_CLASS,
   IOS_MAC_TERMINAL_FONT_SIZE,
+  NATIVE_HOST_EVENT,
   applyNativePlatformClasses,
+  isDesignedForIpadMac,
+  isNativeMacDesktop,
   shouldUseIosMacTextScale,
   type NativePlatformEnvironment,
 } from '../src/native-platform';
@@ -28,35 +35,41 @@ function env(overrides: Partial<NativePlatformEnvironment> = {}): NativePlatform
   };
 }
 
-describe('native platform text scaling', () => {
-  it('enables larger text for the packaged iOS app running on Mac', () => {
-    expect(shouldUseIosMacTextScale(env())).toBe(true);
+describe('native platform detection and uniform UI scaling', () => {
+  it('identifies Designed-for-iPad Mac without enabling unbalanced chat-only text inflation', () => {
+    expect(isDesignedForIpadMac(env())).toBe(true);
+    expect(shouldUseIosMacTextScale(env())).toBe(false);
     expect(IOS_MAC_TERMINAL_FONT_SIZE).toBeGreaterThan(13);
   });
 
-  it('does not enable the Mac text scale for touch iPadOS', () => {
-    expect(shouldUseIosMacTextScale(env({
+  it('does not treat touch iPadOS as Mac desktop or Designed-for-iPad Mac', () => {
+    const ipad = env({
       navigator: {
         platform: 'MacIntel',
         userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
         maxTouchPoints: 5,
       },
-    }))).toBe(false);
+    });
+    expect(isDesignedForIpadMac(ipad)).toBe(false);
+    expect(shouldUseIosMacTextScale(ipad)).toBe(false);
   });
 
-  it('does not enable the native-only text scale in web mode', () => {
-    expect(shouldUseIosMacTextScale(env({
+  it('does not mark web mode as native Mac desktop', () => {
+    const webEnv = env({
       capacitor: {
         isNativePlatform: () => false,
         getPlatform: () => 'web',
       },
-    }))).toBe(false);
+    });
+    expect(isDesignedForIpadMac(webEnv)).toBe(false);
+    expect(shouldUseIosMacTextScale(webEnv)).toBe(false);
   });
 
-  it('applies and removes the html marker class from the same contract', () => {
+  it('applies and removes native-mac-desktop while leaving legacy native-ios-mac off', () => {
     const root = document.createElement('html');
     applyNativePlatformClasses(root, env());
-    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(true);
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(true);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
     expect(root.dataset.nativePlatform).toBe('ios');
 
     applyNativePlatformClasses(root, env({
@@ -65,7 +78,206 @@ describe('native platform text scaling', () => {
         getPlatform: () => 'web',
       },
     }));
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(false);
     expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
     expect(root.dataset.nativePlatform).toBeUndefined();
+  });
+
+  it('respects authoritative native host info and avoids double-scaling intermediate pageZoom binaries', () => {
+    const macWithZoom = env({
+      navigator: {
+        platform: 'iPad',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+        maxTouchPoints: 0,
+      },
+      innerWidth: 540,
+      nativeHost: { isMacDesktop: true, pageZoomApplied: true },
+    });
+    expect(isNativeMacDesktop(macWithZoom)).toBe(true);
+    expect(isDesignedForIpadMac(macWithZoom)).toBe(false);
+    expect(shouldUseIosMacTextScale(macWithZoom)).toBe(false);
+
+    const root = document.createElement('html');
+    applyNativePlatformClasses(root, macWithZoom);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+    expect(root.dataset.nativePlatform).toBe('ios');
+    expect(NATIVE_HOST_EVENT).toBe('imcodes:native-host');
+  });
+
+  it('rejects real iPhone/iPad/Android from Mac desktop detection while supporting fine-pointer fallback', () => {
+    expect(isNativeMacDesktop(env({
+      navigator: {
+        platform: 'iPhone',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        maxTouchPoints: 0,
+      },
+    }))).toBe(false);
+
+    expect(isNativeMacDesktop(env({
+      navigator: {
+        platform: 'iPad',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+        maxTouchPoints: 5,
+      },
+      matchMedia: () => ({ matches: true }),
+    }))).toBe(false);
+
+    expect(isNativeMacDesktop(env({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'android' },
+    }))).toBe(false);
+
+    expect(isNativeMacDesktop(env({
+      navigator: {
+        platform: 'iPad',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+        maxTouchPoints: 0,
+      },
+      matchMedia: (q) => ({ matches: q === '(hover: hover) and (pointer: fine)' }),
+      innerWidth: 600,
+    }))).toBe(true);
+
+    // Apple Silicon Mac running an iPhone-compat iOS build exposes zero touch points and a fine pointer.
+    expect(isNativeMacDesktop(env({
+      navigator: {
+        platform: 'iPhone',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        maxTouchPoints: 0,
+      },
+      matchMedia: (q) => ({ matches: q === '(hover: hover) and (pointer: fine)' }),
+      innerWidth: 420,
+    }))).toBe(true);
+
+    // Real iPhone/touch phone with maxTouchPoints > 1 must still be rejected even if matchMedia lies.
+    expect(isNativeMacDesktop(env({
+      navigator: {
+        platform: 'iPhone',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        maxTouchPoints: 5,
+      },
+      matchMedia: (q) => ({ matches: q === '(hover: hover) and (pointer: fine)' }),
+      innerWidth: 390,
+    }))).toBe(false);
+  });
+
+  it('keeps iOS AppDelegate free of WKWebView.pageZoom reads/writes while keeping host signal above Foundation-only OTA helper slice', () => {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const appDelegate = readFileSync(resolve(dir, '../ios/App/App/AppDelegate.swift'), 'utf8');
+    expect(appDelegate).toContain('ProcessInfo.processInfo.isiOSAppOnMac');
+    expect(appDelegate).toContain('targetEnvironment(macCatalyst)');
+    expect(appDelegate).not.toMatch(/\.pageZoom\b/);
+    expect(appDelegate).not.toContain('macDesignedForIpadPageZoom');
+    expect(appDelegate).toContain('let pageZoomApplied = false');
+    expect(appDelegate).toContain('window.__IMCODES_NATIVE_HOST__');
+    expect(appDelegate).toContain("CustomEvent('imcodes:native-host')");
+    expect(appDelegate).toContain('pressesBegan');
+    expect(appDelegate).toContain('pressesEnded');
+    expect(appDelegate).toContain('imcodes:native-modifier-press');
+    expect(appDelegate).toContain('"native-1x"');
+    expect(appDelegate).toContain('"designed-for-ipad"');
+    expect(appDelegate).toContain('"none"');
+
+    const otaStart = appDelegate.indexOf('private static let nativeBundledBuildIdKey');
+    expect(otaStart).toBeGreaterThan(0);
+    const otaSlice = appDelegate.slice(otaStart);
+    expect(otaSlice).not.toContain('UIKit');
+    expect(otaSlice).not.toContain('WKWebView');
+    expect(otaSlice).not.toContain('UIDevice');
+  });
+
+  it('distinguishes native-1x Catalyst .mac, designed-for-ipad Mac shells, and legacy shells', () => {
+    const catalystMac = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'native-1x' },
+    });
+    expect(isNativeMacDesktop(catalystMac)).toBe(true);
+    expect(isDesignedForIpadMac(catalystMac)).toBe(false);
+    expect(shouldUseIosMacTextScale(catalystMac)).toBe(false);
+
+    // Explicit { isMacDesktop: true, pageZoomApplied: false } without designed-for-ipad mode is treated as 1x.
+    const catalystMacImplicit = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: false },
+    });
+    expect(isNativeMacDesktop(catalystMacImplicit)).toBe(true);
+    expect(isDesignedForIpadMac(catalystMacImplicit)).toBe(false);
+    expect(shouldUseIosMacTextScale(catalystMacImplicit)).toBe(false);
+    const root = document.createElement('html');
+    applyNativePlatformClasses(root, catalystMacImplicit);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+
+    const intermediateZoomShell = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: true, scaleMode: 'native-page-zoom' },
+    });
+    expect(isNativeMacDesktop(intermediateZoomShell)).toBe(true);
+    expect(isDesignedForIpadMac(intermediateZoomShell)).toBe(false);
+    expect(shouldUseIosMacTextScale(intermediateZoomShell)).toBe(false);
+
+    const newDesignedForIpadShell = env({
+      nativeHost: { isMacDesktop: true, pageZoomApplied: false, scaleMode: 'designed-for-ipad' },
+    });
+    expect(isDesignedForIpadMac(newDesignedForIpadShell)).toBe(true);
+    expect(shouldUseIosMacTextScale(newDesignedForIpadShell)).toBe(false);
+    applyNativePlatformClasses(root, newDesignedForIpadShell);
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(true);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+
+    // Real iPadOS / iOS must never receive native-mac-desktop or native-ios-mac.
+    const realIpad = env({
+      navigator: {
+        platform: 'iPad',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+        maxTouchPoints: 5,
+      },
+      matchMedia: () => ({ matches: true }),
+    });
+    applyNativePlatformClasses(root, realIpad);
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(false);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+  });
+
+  it('sets #080d16 host, rootVC, webView, scrollView, and underPageBackgroundColor under isiOSAppOnMac', () => {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const appDelegate = readFileSync(resolve(dir, '../ios/App/App/AppDelegate.swift'), 'utf8');
+    expect(appDelegate).toContain('macHostBackgroundColor');
+    expect(appDelegate).toContain('8.0 / 255.0');
+    expect(appDelegate).toContain('13.0 / 255.0');
+    expect(appDelegate).toContain('22.0 / 255.0');
+    expect(appDelegate).toContain('configureMacHostAppearance');
+    expect(appDelegate).toContain('window?.backgroundColor = bg');
+    expect(appDelegate).toContain('rootVC.view.backgroundColor = bg');
+    expect(appDelegate).toContain('targetWebView.backgroundColor = bg');
+    expect(appDelegate).toContain('targetWebView.scrollView.backgroundColor = bg');
+    expect(appDelegate).toContain('targetWebView.underPageBackgroundColor = bg');
+    expect(appDelegate).toContain('applicationWillEnterForeground');
+  });
+
+  it('scopes compact Android mobile sizing rules without CSS zoom and leaves iOS/Mac styles intact', () => {
+    const root = document.createElement('html');
+    applyNativePlatformClasses(root, {
+      capacitor: {
+        isNativePlatform: () => true,
+        getPlatform: () => 'android',
+      },
+      navigator: {
+        platform: 'Linux armv8l',
+        userAgent: 'Mozilla/5.0 (Linux; Android 14)',
+        maxTouchPoints: 5,
+      },
+    });
+    expect(root.dataset.nativePlatform).toBe('android');
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(false);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const styles = readFileSync(resolve(dir, '../src/styles.css'), 'utf8');
+    const androidBlockStart = styles.indexOf('html[data-native-platform="android"]');
+    expect(androidBlockStart).toBeGreaterThan(-1);
+    const androidSection = styles.slice(Math.max(0, androidBlockStart - 120));
+    expect(androidSection).toContain('@media (max-width: 420px)');
+    expect(androidSection).toContain('--subsession-compact-card-width: 46px;');
+    expect(androidSection).toContain('html[data-native-platform="android"] .mobile-server-bar');
+    expect(androidSection).toContain('html[data-native-platform="android"] .subcard-bar-mobile .subsession-bar');
+    expect(androidSection).toContain('html[data-native-platform="android"] .controls-input');
+    expect(androidSection).toContain('html[data-native-platform="android"] .chat-bubble-content');
+    expect(androidSection).not.toMatch(/\bzoom\s*:/);
+    expect(styles).toContain('html.native-ios-mac {\n  -webkit-text-size-adjust: 115%;\n  text-size-adjust: 115%;\n}');
   });
 });

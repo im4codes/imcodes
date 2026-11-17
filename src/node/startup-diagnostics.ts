@@ -41,6 +41,7 @@ export const STARTUP_DIAGNOSTICS_HEALTH_LEASE_TIMEOUT_MS = CONTROLLED_NODE_UPGRA
 
 export const STARTUP_DIAGNOSTIC_EVENT = {
   PROCESS_START: 'process_start',
+  BOOTSTRAP_FAILED: 'bootstrap_failed',
   WS_CONNECT_ATTEMPT: 'ws_connect_attempt',
   WS_CONNECT_ESTABLISHED: 'ws_connect_established',
   WS_CONNECT_FAILED: 'ws_connect_failed',
@@ -367,4 +368,25 @@ export function getStartupDiagnosticsLog(): StartupDiagnosticsLog {
 
 export function __setStartupDiagnosticsLogForTests(log: StartupDiagnosticsLog | undefined): void {
   defaultLog = log;
+}
+
+/** Record a pre-runtime startup/bootstrap error and flush best-effort before exit. */
+export async function recordBootstrapFailureDiagnostic(
+  error: unknown,
+  context: StartupDiagnosticFields = {},
+  diagnostics: StartupDiagnosticsLog = getStartupDiagnosticsLog(),
+): Promise<void> {
+  const reason = error instanceof Error ? error.message : String(error);
+  try {
+    diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.BOOTSTRAP_FAILED, {
+      platform: process.platform,
+      arch: process.arch,
+      pid: process.pid,
+      reason,
+      ...context,
+    });
+    await diagnostics.drain();
+  } catch {
+    // Best-effort observability: never mask or fail the fatal error handler.
+  }
 }

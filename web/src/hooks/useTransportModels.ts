@@ -142,9 +142,11 @@ function normalizeCatalog(entry: CachedTransportModelCatalog | null | undefined,
     models,
     ...(typeof entry.defaultModel === 'string' ? { defaultModel: entry.defaultModel } : {}),
     ...(typeof entry.isAuthenticated === 'boolean' ? { isAuthenticated: entry.isAuthenticated } : {}),
-    // Old stored catalogs can still carry the previous Antigravity default.
-    // Model selections live in session settings, not this catalog default.
-    ...(agentType === AGY_SDK_PROVIDER_ID && models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)
+    // Lock AGY's default model to AGY_DEFAULT_MODEL_ID whenever it is present in
+    // the catalog so an upstream currentModelId (e.g. gemini-4-carbon-medium)
+    // can never steer new sessions away from gemini-4-hydrogen-high.
+    ...(agentType === AGY_SDK_PROVIDER_ID
+      && models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)
       ? { defaultModel: AGY_DEFAULT_MODEL_ID }
       : {}),
   };

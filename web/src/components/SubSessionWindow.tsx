@@ -12,7 +12,9 @@ import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
+import { SubSessionTaskTitle } from './SubSessionTaskTitle.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
 import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
@@ -25,11 +27,12 @@ import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pendi
 import { hasActiveTimelineTurn, hasPendingUserSend } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import { getActiveCssZoom, UI_SCALE_EVENT } from '../ui-scale.js';
 import { useQuickData } from './QuickInputPanel.js';
 import { useSharedGitChanges } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
-import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import { isShareScopedState, type SharedStateSummary } from '../tab-sharing-ui.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -38,7 +41,10 @@ import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
+import { shouldSuppressSubSessionBarForKeyboard } from '../mobile-keyboard.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
+import { focusComposerElement } from '../util/composer-focus.js';
+import { startFloatingWindowDrag, startFloatingWindowResize } from './window-drag.js';
 import {
   clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
@@ -75,12 +81,21 @@ interface Props {
   /** False while its owning main-session tab is hidden; the mounted window and
    * chat state are retained so returning to the tab never rebuilds a blank pane. */
   visible?: boolean;
+  /** Split executor visit: start collapsed without changing session filtering or saved preferences. */
+  taskPairPanelVisitKey?: string;
+  /** Render task-pair details in this window; split pairs show them only on the auditor side. */
+  showTaskPairPanel?: boolean;
+  /** Pair split metadata; absent for ordinary sub-session windows. */
+  pairTaskTitle?: string | null;
+  pairRole?: 'executor' | 'auditor' | null;
   /** Report the trailing pending ask.question (or null) for dialog re-surface. */
   onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
   idleFlashToken?: number;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
+  /** Leave this task's paired layout without stopping either session. */
+  onClosePairSplit?: () => void;
   onClose: () => void;
   maximized?: boolean;
   onToggleMaximized?: () => void;
@@ -98,6 +113,8 @@ interface Props {
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Open a loopback URL in the shared local-web-preview host. */
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -114,6 +131,8 @@ interface Props {
   onDesktopFileBrowserOpen?: () => void;
   onDesktopFileBrowserFocus?: () => void;
   onDesktopFileBrowserClose?: () => void;
+  /** Optional: register this sub-session's composer `.controls-input` element with app.tsx. */
+  onInputRef?: (el: HTMLDivElement | null) => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -149,6 +168,8 @@ interface Props {
   onOpenRemoteDesktop?: (machine: MachineListItem) => void;
   /** This user owns the daemon: its remote-desktop button may offer setup. */
   remoteDesktopCanSetUp?: boolean;
+  /** Allow opening DocShare controls from embedded FileBrowser instances (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -209,8 +230,7 @@ export function measureMobileSubSessionBarHeight(
 }
 
 function isMobileSubSessionBarSuppressed(doc: Document = document): boolean {
-  const root = doc.documentElement;
-  return root.classList.contains('kb-open') || root.classList.contains('input-focused');
+  return shouldSuppressSubSessionBarForKeyboard(doc);
 }
 
 function getInitialMobileSubSessionBarHeight(isMobile: boolean): number {
@@ -282,9 +302,10 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
+  const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(sharedState);
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken, visible);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -328,6 +349,7 @@ export function SubSessionWindow({
     // On-screen windows must paint their local cache and obtain one bounded
     // tail/delta even before focus; hidden windows defer bootstrap entirely.
     bootstrapWhenVisible: visible,
+    incognito: sub.incognito,
   });
 
   // Re-surface a still-pending question in the dedicated dialog from history
@@ -387,6 +409,11 @@ export function SubSessionWindow({
   // (not the parent main session's). The mobile overlay is portaled to body so
   // the sub-session's lower stacking context cannot trap it below app chrome.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
+  const baseOpenNodeGroups = useNodeGroupsNav();
+  const handleOpenNodeGroupsFromBrowser = useCallback(() => {
+    if (isMobile) setShowFileBrowser(false);
+    baseOpenNodeGroups?.();
+  }, [isMobile, baseOpenNodeGroups]);
 
   // Sync the desktop child file-browser open/close into the shared window
   // stack via the parent-supplied callbacks. Mobile is a no-op (it renders
@@ -412,7 +439,16 @@ export function SubSessionWindow({
     sessionName: sub.sessionName,
     ownerSessionName: sub.parentSession ?? sub.sessionName,
   });
-  const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
+  const addQuote = useCallback((text: string) => {
+    setQuotes((prev) => [...prev, text]);
+    const focusNow = () => {
+      focusComposerElement(inputRef.current);
+    };
+    focusNow();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(focusNow);
+    }
+  }, []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
   // ── Retry failed send ─────────────────────────────────────────────────────
@@ -483,6 +519,29 @@ export function SubSessionWindow({
   // confirmClose removed — × now minimizes instead of terminating
 
   const inputRef = useRef<HTMLDivElement>(null);
+  const onInputRefRef = useRef(onInputRef);
+  onInputRefRef.current = onInputRef;
+  useEffect(() => {
+    if (!visible) {
+      onInputRefRef.current?.(null);
+      return;
+    }
+    if (inputRef.current && inputRef.current.isConnected) {
+      onInputRefRef.current?.(inputRef.current);
+      return;
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      const id = requestAnimationFrame(() => {
+        const el = inputRef.current;
+        onInputRefRef.current?.(el && el.isConnected ? el : null);
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    return undefined;
+  }, [visible, active, viewMode]);
+  useEffect(() => () => {
+    onInputRefRef.current?.(null);
+  }, []);
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
@@ -539,6 +598,7 @@ export function SubSessionWindow({
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
     sharedState,
+    incognito: sub.incognito,
   };
   // Keep the controls' working sweep on the same reconciled live state as the
   // footer. Transport sub-session metadata can lag the authoritative timeline
@@ -556,12 +616,15 @@ export function SubSessionWindow({
   }, [sub.id, geom, viewMode, isDesktopMaximized]);
 
   useEffect(() => {
-    if (isMobile) return;
+    if (isMobile || !visible) return;
     const onResize = () => {
       if (isDesktopMaximized) {
         setMaximizeBoundsVersion((v) => v + 1);
       } else {
-        setGeom((g) => clampDesktopGeom(g));
+        setGeom((g) => {
+          const next = clampDesktopGeom(g);
+          return next.x === g.x && next.y === g.y && next.w === g.w && next.h === g.h ? g : next;
+        });
       }
     };
     window.addEventListener('resize', onResize);
@@ -608,6 +671,7 @@ export function SubSessionWindow({
   const stableOnViewRepo = useStableCallback(onViewRepo);
   const stableOnPreviewFile = useStableCallback(onPreviewFile);
   const stableOnOpenLocalWebPreview = useStableCallback(onOpenLocalWebPreview);
+  const stableOnCloudDocClick = useStableCallback(onCloudDocClick);
 
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
@@ -668,7 +732,12 @@ export function SubSessionWindow({
   }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, launchExecutionClones, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
-  const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
+  const activeInteractionCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => () => {
+    activeInteractionCleanupRef.current?.();
+    activeInteractionCleanupRef.current = null;
+  }, []);
 
   const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
     const clamped = clampDesktopGeom({ x, y, w, h });
@@ -681,26 +750,22 @@ export function SubSessionWindow({
       return;
     }
     if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable]')) return;
-    dragStart.current = { mx: e.clientX, my: e.clientY, ox: geomRef.current.x, oy: geomRef.current.y };
-    onFocus();
-    const onMove = (me: MouseEvent) => {
-      if (!dragStart.current) return;
-      const dx = me.clientX - dragStart.current.mx;
-      const dy = me.clientY - dragStart.current.my;
-      setGeom((g) => {
-        const { x, y } = clampPos(dragStart.current!.ox + dx, dragStart.current!.oy + dy, g.w);
-        return { ...g, x, y };
-      });
-    };
-    const onUp = () => {
-      dragStart.current = null;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
     e.preventDefault();
-  }, [isDesktopMaximized, onFocus, clampPos]);
+    activeInteractionCleanupRef.current?.();
+    onFocus();
+    const cancel = startFloatingWindowDrag({
+      element: swipeBackRef.current,
+      startX: e.clientX,
+      startY: e.clientY,
+      origin: geomRef.current,
+      clampPos: (x, y, w, h) => clampPos(x, y, w, h),
+      onCommit: (x, y) => {
+        activeInteractionCleanupRef.current = null;
+        setGeom((g) => (g.x === x && g.y === y ? g : { ...g, x, y }));
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
+  }, [isDesktopMaximized, onFocus, clampPos, swipeBackRef]);
 
   const onHeaderMouseDown = startDrag;
 
@@ -714,14 +779,14 @@ export function SubSessionWindow({
     e.stopPropagation();
     e.preventDefault();
     if (isDesktopMaximized) return;
+    activeInteractionCleanupRef.current?.();
     onFocus();
     setResizingDir(dir);
     const startG = { ...geomRef.current };
-    const sx = e.clientX, sy = e.clientY;
-    const onMove = (me: MouseEvent) => {
-      const dx = me.clientX - sx;
-      const dy = me.clientY - sy;
-      setGeom((_g) => {
+    const cancel = startFloatingWindowResize({
+      startX: e.clientX,
+      startY: e.clientY,
+      computeGeometry: (dx, dy) => {
         let { x, y, w, h } = { ...startG };
         if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
@@ -733,19 +798,21 @@ export function SubSessionWindow({
           h = startBottom - y;
         }
         return clampDesktopGeom({ x, y, w, h });
-      });
-    };
-    const onUp = () => {
-      setResizingDir(null);
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+      },
+      onUpdate: (next) => setGeom(next),
+      onEnd: () => {
+        activeInteractionCleanupRef.current = null;
+        setResizingDir(null);
+      },
+    });
+    activeInteractionCleanupRef.current = cancel;
   }, [isDesktopMaximized, onFocus]);
 
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const typeLabel = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
+  const pairWindow = pairTaskTitle !== null && pairRole !== null;
+  const titleText = pairWindow ? (pairTaskTitle || t('taskPair.panel_untitled')) : typeLabel;
+  const subtitleText = pairWindow ? (typeLabel || sub.sessionName || agentTag) : null;
 
   // Only non-terminal (chat) sub-sessions can be pinned to sidebar
   const isPinnable = !!onPin;
@@ -842,13 +909,20 @@ export function SubSessionWindow({
   }, [lastCostEvent?.costUsd, sub.sessionName]);
 
   const [vvh, setVvh] = useState(() => window.visualViewport?.height ?? window.innerHeight);
+  const [, setUiZoomTick] = useState(0);
   useEffect(() => {
     if (!isMobile) return;
     const vv = window.visualViewport;
-    if (!vv) return;
-    const update = () => setVvh(vv.height);
-    vv.addEventListener('resize', update);
-    return () => vv.removeEventListener('resize', update);
+    const update = () => {
+      setVvh(( window.visualViewport?.height ?? window.innerHeight));
+      setUiZoomTick((n) => n + 1);
+    };
+    vv?.addEventListener('resize', update);
+    window.addEventListener(UI_SCALE_EVENT, update);
+    return () => {
+      vv?.removeEventListener('resize', update);
+      window.removeEventListener(UI_SCALE_EVENT, update);
+    };
   }, [isMobile]);
 
   const [subSessionBarHeight, setSubSessionBarHeight] = useState(() => getInitialMobileSubSessionBarHeight(isMobile));
@@ -917,6 +991,7 @@ export function SubSessionWindow({
       attributeFilter: ['class'],
     });
     window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener(UI_SCALE_EVENT, scheduleUpdate);
     document.addEventListener('focusin', scheduleUpdate, true);
     document.addEventListener('focusout', scheduleUpdate, true);
     vv?.addEventListener('resize', scheduleUpdate);
@@ -926,6 +1001,7 @@ export function SubSessionWindow({
       ro?.disconnect();
       mo?.disconnect();
       window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener(UI_SCALE_EVENT, scheduleUpdate);
       document.removeEventListener('focusin', scheduleUpdate, true);
       document.removeEventListener('focusout', scheduleUpdate, true);
       vv?.removeEventListener('resize', scheduleUpdate);
@@ -940,15 +1016,20 @@ export function SubSessionWindow({
     return clampMaximizedGeom(bounds);
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
-  const mobileSubSessionBarHeight = Math.max(0, Math.min(subSessionBarHeight, Math.max(0, vvh - 120)));
+  const cssZoom = getActiveCssZoom();
+  const scaledVvh = cssZoom === 1 ? vvh : Math.round(vvh / cssZoom);
+  const scaledBarHeight = cssZoom === 1 ? subSessionBarHeight : Math.round(subSessionBarHeight / cssZoom);
+  const scaledTabsBottom = cssZoom === 1 ? sessionTabsBottom : Math.round(sessionTabsBottom / cssZoom);
+  const minRemainCss = cssZoom === 1 ? 120 : Math.round(120 / cssZoom);
+  const mobileSubSessionBarHeight = Math.max(0, Math.min(scaledBarHeight, Math.max(0, scaledVvh - minRemainCss)));
   const measuredMobileWindowTop = Math.max(
     0,
-    Math.min(sessionTabsBottom, Math.max(0, vvh - mobileSubSessionBarHeight)),
+    Math.min(scaledTabsBottom, Math.max(0, scaledVvh - mobileSubSessionBarHeight)),
   );
   const mobileWindowTop = measuredMobileWindowTop > 0
     ? `${measuredMobileWindowTop}px`
     : 'var(--sat, 0px)';
-  const mobileWindowHeight = `calc(${vvh}px - ${mobileWindowTop} - ${mobileSubSessionBarHeight}px)`;
+  const mobileWindowHeight = `calc(${scaledVvh}px - ${mobileWindowTop} - ${mobileSubSessionBarHeight}px)`;
 
   const style: Record<string, string | number> = isMobile
     ? {
@@ -957,15 +1038,18 @@ export function SubSessionWindow({
         top: mobileWindowTop,
         left: 0,
         right: 0,
+        width: 'var(--imcodes-ui-vw, 100%)',
         bottom: `${mobileSubSessionBarHeight}px`,
         height: mobileWindowHeight,
         maxHeight: mobileWindowHeight,
         minHeight: 0,
+        boxSizing: 'border-box',
         zIndex,
       }
     : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
   const rootClass = [
     'subsession-window',
+    sub.incognito ? 'incognito' : '',
     isDesktopMaximized ? 'subsession-window-maximized' : '',
     desktopLayoutCapable && !isMobile && active ? 'subsession-window-active' : '',
     resizingDir ? 'is-resizing' : '',
@@ -975,6 +1059,8 @@ export function SubSessionWindow({
     <div
       ref={swipeBackRef}
       class={rootClass}
+      data-subsession-id={sub.id}
+      data-view-mode={viewMode}
       style={style}
       // Capture phase: an inner widget (xterm with mouse reporting on, a
       // canvas, a future third-party embed) may stopPropagation on the way up,
@@ -995,15 +1081,39 @@ export function SubSessionWindow({
         onDragStart={handleDragStart}
       >
         <span class="subsession-drag-icon">⠿</span>
-        <span class="subsession-title">{typeLabel}</span>
+        {pairWindow ? (
+          <>
+            <div class={`subsession-title-group is-pair`}>
+              <span class="subsession-title" title={titleText}>{titleText}</span>
+              {subtitleText && <small class="subsession-subtitle" title={subtitleText}>{subtitleText}</small>}
+            </div>
+            <span class={`subsession-pair-role is-${pairRole}`} title={t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')} aria-label={t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')}>
+              {t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')}
+            </span>
+          </>
+        ) : (
+          <span class="subsession-title"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={typeLabel} /></span>
+        )}
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
+          {!isMobile && onClosePairSplit && <button
+            type="button"
+            class="subsession-minimize-btn subsession-close-split-btn"
+            title={t('taskPair.panel_close_split')}
+            aria-label={t('taskPair.panel_close_split')}
+            onMouseDown={(event) => { focusInactiveDesktopWindow(event, { suppressFollowingClick: true }); }}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) onClosePairSplit();
+            }}
+          ><span aria-hidden="true">◫×</span></button>}
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
           {/* Left of the file-manager button, on purpose — same convention
               as the main-session toolbar's DaemonRemoteDesktopControl: it
               targets the exact same `serverId` (and so the exact same
               machine) this window's own FileBrowser below is rooted on. */}
+          <div class="subsession-hidden-actions" hidden style={{ display: 'none' }}>
           <DaemonRemoteDesktopControl
             compact
             offerLoginScreenSetup={false}
@@ -1030,6 +1140,7 @@ export function SubSessionWindow({
             {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
           </button>
           {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
+          </div>
           {desktopLayoutCapable && onToggleMaximized && (
             <DesktopWindowMaximizeButton
               maximized={isDesktopMaximized}
@@ -1045,6 +1156,7 @@ export function SubSessionWindow({
             onClick={(event) => { if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) handleMinimize(); }}
             title={t('window.minimize')}
             aria-label={t('window.minimize')}
+            hidden style={{ display: 'none' }}
           >▾</button>
           <button
             class="subsession-close-btn"
@@ -1093,8 +1205,11 @@ export function SubSessionWindow({
             onViewRepo={stableOnViewRepo}
             onPreviewFile={stableOnPreviewFile}
             onOpenLocalWebPreview={onOpenLocalWebPreview ? stableOnOpenLocalWebPreview : undefined}
+            onCloudDocClick={onCloudDocClick ? stableOnCloudDocClick : undefined}
             serverId={serverId}
-            scopeTaskPairs
+            scopeTaskPairs={showTaskPairPanel}
+            taskPairPanelVisitKey={taskPairPanelVisitKey}
+            canManageFileShares={effectiveCanManageFileShares}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
             onResendFailed={handleResendFailed}
@@ -1140,9 +1255,6 @@ export function SubSessionWindow({
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
           runExecutionClonesFeedback={executionCloneLaunchState}
-          onRefreshHistory={timelineForceRefresh}
-          historyRefreshing={refreshing}
-          historyStatus={timelineHistoryStatus}
         />
       )}
 
@@ -1198,6 +1310,7 @@ export function SubSessionWindow({
         onSettings={onSettings}
         onShareSession={onShareSession}
         subSessionId={sub.id}
+        canManageFileShares={effectiveCanManageFileShares}
         onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
@@ -1249,6 +1362,7 @@ export function SubSessionWindow({
               sessionName={sub.sessionName}
               scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
               readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
+              canShare={effectiveCanManageFileShares}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -1263,11 +1377,12 @@ export function SubSessionWindow({
                 if (inputEl) {
                   inputEl.textContent = (inputEl.textContent || '') + rel.join('');
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                  inputEl.focus();
+                  focusComposerElement(inputEl, { moveCursorToEnd: true });
                 }
                 setShowFileBrowser(false);
               }}
               onClose={() => setShowFileBrowser(false)}
+              onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
             />
           </div>,
           document.body,
@@ -1287,6 +1402,7 @@ export function SubSessionWindow({
               sessionName={sub.sessionName}
               scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
               readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
+              canShare={effectiveCanManageFileShares}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -1301,10 +1417,11 @@ export function SubSessionWindow({
                 if (inputEl) {
                   inputEl.textContent = (inputEl.textContent || '') + rel.join('');
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                  inputEl.focus();
+                  focusComposerElement(inputEl, { moveCursorToEnd: true });
                 }
               }}
               onClose={() => setShowFileBrowser(false)}
+              onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
             />
           </FloatingPanel>
         )

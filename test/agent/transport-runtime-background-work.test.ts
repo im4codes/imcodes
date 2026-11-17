@@ -106,6 +106,87 @@ describe('transport runtime — background work does not gate dispatch', () => {
 
     expect((rt as any).getActivitySnapshot().blockingWorkCount).toBeGreaterThan(0);
   });
+
+  it('keeps runtime tool_running when backgroundSessionStatus is running while allowing immediate dispatch, and preserves idle when omitted', async () => {
+    let currentSnapshot: Record<string, unknown> = {
+      ...baseSnapshot,
+      activeWorkCount: 1,
+      backgroundWorkCount: 1,
+      backgroundSessionStatus: 'running',
+    };
+    const statusCallbacks: Array<(sessionId: string, status: { status: string | null }) => void> = [];
+    const completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
+    const provider = {
+      id: 'test-provider',
+      connectionMode: 'local-sdk',
+      sessionOwnership: 'shared',
+      capabilities: { streaming: true, toolCalling: true },
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      send: vi.fn(),
+      onDelta: vi.fn(),
+      onComplete: (cb: (sessionId: string, message: AgentMessage) => void) => {
+        completeCallbacks.push(cb);
+        return () => {};
+      },
+      onError: vi.fn(),
+      onStatus: (cb: (sessionId: string, status: { status: string | null }) => void) => {
+        statusCallbacks.push(cb);
+        return () => {};
+      },
+      getActiveWorkSnapshot: () => currentSnapshot,
+    } as any;
+    const rt = new TransportSessionRuntime(provider, 'deck_bg_running');
+    rt.setProviderSessionId('sess-1');
+
+    // Simulate background task notification: waiting is promoted to tool_running while blockingWorkCount stays 0.
+    statusCallbacks.forEach((cb) => cb('sess-1', { status: 'waiting' }));
+    expect(rt.getActivitySnapshot().blockingWorkCount).toBe(0);
+    expect(rt.getActivitySnapshot().backgroundKeepsSessionRunning).toBe(true);
+    expect(rt.getStatus()).toBe('tool_running');
+    expect(rt.send('plain append while bg runs', 'bg-msg-1')).toBe('sent');
+    await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(1));
+
+    // When the foreground APPEND turn completes while backgroundSessionStatus === 'running',
+    // runtime must stay tool_running (not flash idle).
+    completeCallbacks.forEach((cb) => cb('sess-1', {
+      id: 'bg-msg-1-done',
+      sessionId: 'sess-1',
+      kind: 'text',
+      role: 'assistant',
+      content: 'ack',
+      timestamp: Date.now(),
+      status: 'complete',
+    }));
+    expect(rt.getStatus()).toBe('tool_running');
+
+    // Explicit setStatus('idle') / onStatus(null) must not drop below tool_running while backgroundSessionStatus === 'running'.
+    (rt as any).setStatus('idle');
+    expect(rt.getStatus()).toBe('tool_running');
+    statusCallbacks.forEach((cb) => cb('sess-1', { status: null }));
+    expect(rt.getStatus()).toBe('tool_running');
+
+    // Once background work finishes, null status cleanly clears back to idle.
+    currentSnapshot = {
+      ...baseSnapshot,
+      activeWorkCount: 0,
+      backgroundWorkCount: 0,
+      busyReasons: [],
+    };
+    statusCallbacks.forEach((cb) => cb('sess-1', { status: null }));
+    expect(rt.getActivitySnapshot().backgroundKeepsSessionRunning).toBe(false);
+    expect(rt.getStatus()).toBe('idle');
+
+    // Regression guard: omitting backgroundSessionStatus keeps Claude Code subagent idle behavior.
+    const claudeRt = runtimeWithSnapshot({
+      ...baseSnapshot,
+      activeWorkCount: 1,
+      backgroundWorkCount: 1,
+    });
+    (claudeRt as any).setStatus('idle');
+    expect(claudeRt.getActivitySnapshot().backgroundKeepsSessionRunning).toBe(false);
+    expect(claudeRt.getStatus()).toBe('idle');
+  });
 });
 
 function backgroundSubagentTool(

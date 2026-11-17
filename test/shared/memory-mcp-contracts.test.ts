@@ -13,6 +13,7 @@ import {
   stripForbiddenMcpArgs,
 } from '../../shared/memory-mcp-contracts.js';
 import { PREFERENCE_MAX_BYTES } from '../../shared/preference-ingest.js';
+import { formatCloudDocQuoteBadge } from '../../web/src/cloud-docs-reference.js';
 
 function collectDescriptions(schema: { description?: string; properties?: Readonly<Record<string, unknown>> }): string[] {
   const descriptions: string[] = [];
@@ -123,6 +124,7 @@ describe('memory MCP shared contracts', () => {
       'pair_task_update',
       'pair_task_check',
       'pair_resource_claim',
+      'callback_update',
       'send_stop',
       'destroy_execution_clone',
       'cron_create_self',
@@ -143,6 +145,7 @@ describe('memory MCP shared contracts', () => {
       'fetch_file_from_machine',
       'computer_use_docs',
       'computer_use_call',
+      'cloud_docs',
     ]);
     expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS).filter((name) => MEMORY_MCP_TOOL_NAME_LIST.includes(name as never)))
       .toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
@@ -453,6 +456,18 @@ describe('memory MCP shared contracts', () => {
     expect(cronUpdate.description).toContain('5 minutes');
     expect((updateProps.action as { description?: string }).description).toContain('send action');
     expect((updateProps.expiresAt as { description?: string }).description).toContain('future sends only');
+  });
+
+  it('documents the canonical CloudDoc chat citation format matching formatCloudDocQuoteBadge across turns and renames', () => {
+    const cloudDocs = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS];
+    const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
+    expect(canonicalPattern).toBe('[CloudDoc: <name> | id=<docId>]');
+    expect(cloudDocs.description).toContain(canonicalPattern);
+    expect(cloudDocs.description).toContain('id=<docId>');
+    expect(cloudDocs.description).toMatch(/every turn|turn 1|turn 2/i);
+    expect(cloudDocs.description).toMatch(/rename|edit/i);
+    expect(cloudDocs.description).toMatch(/every mention/i);
+    expect(cloudDocs.description).toContain('bare filename');
   });
 
   // ── memory-source-server-routing change ─────────────────────────────

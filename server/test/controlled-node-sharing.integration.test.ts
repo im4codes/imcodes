@@ -407,6 +407,77 @@ describe('controlled-node version reporting', () => {
       else process.env.APP_VERSION = previousAppVersion;
     }
   });
+
+  it('hides updateAvailable/failed status and refuses manual upgrade cleanly against Postgres when Windows artifacts are not built', async () => {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    await createUser(db, ownerId);
+    const winNode = await controlledNode(ownerId);
+    const linuxNode = await controlledNode(ownerId);
+    await db.execute(
+      `UPDATE servers
+          SET os = 'win', arch = 'x64', abi_profile = 'modern',
+              daemon_version = $2,
+              controlled_upgrade_status = 'failed',
+              controlled_upgrade_target_version = $3,
+              controlled_upgrade_reason = 'download_failed_503'
+        WHERE id = $1`,
+      [winNode, '2026.11.6629-dev.6677', '2026.11.6643-dev.6687'],
+    );
+    await db.execute(
+      `UPDATE servers
+          SET os = 'linux', arch = 'x64', abi_profile = 'modern',
+              daemon_version = $2
+        WHERE id = $1`,
+      [linuxNode, '2026.11.6629-dev.6677'],
+    );
+
+    const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const artifactDir = mkdtempSync(join(tmpdir(), 'imcodes-int-avail-'));
+    const linuxBytes = Buffer.from('linux-bin-int');
+    writeFileSync(join(artifactDir, 'imcodes-node-linux'), linuxBytes);
+    writeFileSync(join(artifactDir, 'imcodes-node-linux.manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        os: 'linux',
+        arch: 'x64',
+        fileName: 'imcodes-node-linux',
+        size: linuxBytes.length,
+        sha256: sha256(linuxBytes.toString()),
+      },
+      build: { version: '2026.11.6643-dev.6687' },
+    }));
+
+    const previousAppVersion = process.env.APP_VERSION;
+    const previousExeDir = process.env.IMCODES_NODE_EXE_DIR;
+    process.env.APP_VERSION = '2026.11.6643-dev.6687';
+    process.env.IMCODES_NODE_EXE_DIR = artifactDir;
+    try {
+      const browser = await (await app.request('/api/machines', { headers: webAuth(ownerId) })).json() as {
+        machines: Array<{ serverId: string; updateAvailable?: boolean; upgradeStatus?: string; upgradeReason?: string }>;
+      };
+      const byId = new Map(browser.machines.map((m) => [m.serverId, m]));
+      expect(byId.get(winNode)?.updateAvailable).toBeUndefined();
+      expect(byId.get(winNode)?.upgradeStatus).toBeUndefined();
+      expect(byId.get(winNode)?.upgradeReason).toBeUndefined();
+      expect(byId.get(linuxNode)?.updateAvailable).toBe(true);
+
+      const upgradeRes = await app.request(`/api/machines/${winNode}/upgrade`, {
+        method: 'POST',
+        headers: webAuth(ownerId),
+      });
+      expect(upgradeRes.status).toBe(409);
+      expect(await upgradeRes.json()).toEqual({ error: 'executable_not_built' });
+    } finally {
+      if (previousAppVersion === undefined) delete process.env.APP_VERSION;
+      else process.env.APP_VERSION = previousAppVersion;
+      if (previousExeDir === undefined) delete process.env.IMCODES_NODE_EXE_DIR;
+      else process.env.IMCODES_NODE_EXE_DIR = previousExeDir;
+      rmSync(artifactDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('controlled-node shared action admission', () => {
@@ -936,7 +1007,13 @@ describe('a shared-session participant reaches only the machines shared with the
       'content-type': 'application/json',
       [SHARED_MACHINE_AUTHORITY_HEADER]: authority as string,
     };
+    const ownerSource = await fullCredential(ownerId);
     const ownerTurn = {
+      'X-Server-Id': ownerSource.serverId,
+      authorization: `Bearer ${ownerSource.token}`,
+      'content-type': 'application/json',
+    };
+    const sharedSourceBare = {
       'X-Server-Id': source.serverId,
       authorization: `Bearer ${source.token}`,
       'content-type': 'application/json',
@@ -950,7 +1027,7 @@ describe('a shared-session participant reaches only the machines shared with the
     const desk = await createDesk(ownerId);
     await joinDesk(desk, participantId);
     expect((await bindDesk(app, ownerId, grouped, desk)).status).toBe(200);
-    return { app, ownerId, participantId, source, delegated, ownerTurn, unshared, participantShared, viewerShared, grouped, sessionShare, sessionName };
+    return { app, ownerId, participantId, source, ownerSource, delegated, ownerTurn, sharedSourceBare, unshared, participantShared, viewerShared, grouped, sessionShare, sessionName };
   }
 
   const listed = async (app: ReturnType<typeof buildApp>, headers: Record<string, string>) => {
@@ -1088,9 +1165,12 @@ describe('a shared-session participant reaches only the machines shared with the
   it('leaves the owner\'s own turns unchanged: every node, no participant involved', async () => {
     const t = await scene();
     expect(await listed(t.app, t.ownerTurn)).toEqual([t.grouped, t.participantShared, t.unshared, t.viewerShared].sort());
+    expect(await app403List(t.app, t.sharedSourceBare)).toBe(403);
     for (const target of [t.unshared, t.viewerShared, t.participantShared, t.grouped]) {
       expect((await exec(t.app, t.ownerTurn, target)).status, `owner exec ${target}`).toBe(200);
       expect((await computerUse(t.app, t.ownerTurn, target)).status, `owner computer-use ${target}`).toBe(200);
+      expect((await exec(t.app, t.sharedSourceBare, target)).status, `shared bare exec ${target}`).toBe(403);
+      expect((await computerUse(t.app, t.sharedSourceBare, target)).status, `shared bare computer-use ${target}`).toBe(403);
     }
   });
 
@@ -1163,12 +1243,12 @@ describe('a shared-session participant reaches only the machines shared with the
       [t.source.serverId, t.participantShared, t.participantId],
     );
     expect(participantAudit).toEqual({ reason: null, outcome: 'completed' });
-    // An owner turn is audited as the owner (allowed), with no delegated actor.
+    // An unshared owner turn is audited as the owner (allowed), with no delegated actor.
     expect((await exec(audited as never, t.ownerTurn, t.participantShared)).status).toBe(200);
     const allowed = await db.queryOne<{ user_id: string; delegated_actor_user_id: string | null; decision: string }>(
       `SELECT user_id, delegated_actor_user_id, decision FROM machine_exec_audit
         WHERE source_server_id = $1 AND target_server_id = $2 AND decision = 'allowed'`,
-      [t.source.serverId, t.participantShared],
+      [t.ownerSource.serverId, t.participantShared],
     );
     expect(allowed).toEqual({ user_id: t.ownerId, delegated_actor_user_id: null, decision: 'allowed' });
     // A target that is not shared with the participant at all is refused as no_access, and that is audited too.
@@ -1249,6 +1329,7 @@ describe('a shared-session participant reaches only the machines shared with the
       }
       expect(n.socket.sent).toHaveLength(before);
       expect((await t.app.request(base + '/download', { headers: t.ownerTurn })).status).toBe(200);
+      expect((await t.app.request(base + '/download', { headers: t.sharedSourceBare })).status).toBe(403);
       expect((await fileHandle(t.app, other, t.participantShared)).status).toBe(200);
       expect((await t.app.request(base + '/download', { headers: other })).status).toBe(200);
     } finally { n.socket.close(); }
@@ -1345,6 +1426,7 @@ describe('a shared-session participant reaches only the machines shared with the
       expect(foreign.status).toBe(409);
       expect(await foreign.json()).toMatchObject({ committedBytes: 0 });
       expect((await chunk(t.ownerTurn, 3)).status).toBe(409);
+      expect((await chunk(t.sharedSourceBare, 3)).status).toBe(403);
       expect(await (await chunk(t.delegated, 3)).json()).toMatchObject({ complete: false, committedBytes: 6 });
       expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.UPLOAD_FETCH)).toHaveLength(0);
       await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);

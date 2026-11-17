@@ -50,6 +50,7 @@ export interface ProjectionWorkerRequestMap {
   pruneSessionToAuthoritative: { sessionId: string; keepLast: number };
   deleteSession: { sessionId: string };
   checkpointIfNeeded: Record<string, never>;
+  retentionTick: { now?: number };
   shutdown: Record<string, never>;
 }
 
@@ -63,6 +64,7 @@ export interface ProjectionWorkerResponseMap {
   pruneSessionToAuthoritative: boolean;
   deleteSession: boolean;
   checkpointIfNeeded: boolean;
+  retentionTick: Record<string, unknown>;
   shutdown: true;
 }
 

@@ -1,3 +1,5 @@
+import { MachineGroupTabs } from './MachineGroupTabs.js';
+import { machineGroupsOf, machinesInGroup, resolveMachineGroup, useRememberedMachineGroup } from '../machine-grouping.js';
 import { useState, useRef, useEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -480,6 +482,11 @@ export function QuickInputPanel({
   const [historyPage, setHistoryPage] = useState(0);
   const [historyScope, setHistoryScope] = useState<HistoryScope>('session');
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
+  const [rememberedMachineGroup, setMachineGroup] = useRememberedMachineGroup(open && activeTab === 'machines');
+  const machineGroup = resolveMachineGroup(rememberedMachineGroup, machines);
+  // Legacy peers without groups still show every machine, just as before.
+  const machineGroups = machineGroupsOf(machines);
+  const visibleMachines = machineGroups.length ? machinesInGroup(machines, machineGroup) : machines;
   const [insertedPaths, setInsertedPaths] = useState<string[]>([]);
   const [layoutTick, setLayoutTick] = useState(0);
   const [verificationMachines, setVerificationMachines] = useState<VerificationMachineProfile[]>([]);
@@ -879,7 +886,13 @@ export function QuickInputPanel({
         {activeTab === 'machines' && machines.length > 0 && (
           <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_machines')}>
             <div class="qp-alias-hint">{t('machine.usage_hint')}</div>
-            {machines.map((machine) => (
+            {machineGroups.length > 0 && (
+              <div class="controlled-nodes-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
+                <MachineGroupTabs machines={machines} group={machineGroup} onSelect={setMachineGroup} testIdPrefix="qp-machine-group" />
+              </div>
+            )}
+            {visibleMachines.length === 0 && <div class="qp-history-empty">{t('controlled_nodes.empty')}</div>}
+            {visibleMachines.map((machine) => (
               <button
                 key={machine.serverId}
                 type="button"

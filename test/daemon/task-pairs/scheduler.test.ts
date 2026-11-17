@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
@@ -71,7 +72,7 @@ function pair(taskId: string) {
 
 /** A `queued` pair injected directly (as a legacy import would), with or without a brief, bypassing marker timing. */
 function queuePairDirect(taskId: string, brief?: string): void {
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     taskId, brain: BRAIN, status: 'queued', flags: [], flagSides: {}, round: 0,
     blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
     ...(brief !== undefined ? { brief } : {}),
@@ -84,7 +85,7 @@ function queuePairDirect(taskId: string, brief?: string): void {
  * no legacy id, and is started normally rather than parked.
  */
 function queueBriefLessPair(taskId: string): void {
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     taskId, brain: BRAIN, status: 'queued', flags: [], flagSides: {}, round: 0,
     blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
   } satisfies TaskPairState, { legacyTaskId: `legacy_${taskId}` });
@@ -376,7 +377,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   it('re-runs admission when a named busy participant transitions idle', async () => {
     queuePairDirect('IDLE-ADMIT', 'brief');
     const queued = getTaskPairStore().getPair(PROJECT, 'IDLE-ADMIT')!.state;
-    getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC, auditor: 'none' });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...queued, executor: EXEC, auditor: 'none' });
     busy.add(EXEC);
     await automation.runQueue(PROJECT, BRAIN);
     expect(pair('IDLE-ADMIT').status).toBe('queued');
@@ -394,8 +395,8 @@ describe('task-pair heartbeat, replacement and queue', () => {
       round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0,
       createdAt: now, startedAt: now, updatedAt: now,
     });
-    getTaskPairStore().savePair(PROJECT, state('STARTUP-A'));
-    getTaskPairStore().savePair(PROJECT, state('STARTUP-B'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, state('STARTUP-A'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, state('STARTUP-B'));
     await automation.tick();
     await flush();
     expect(sentTo(BRAIN, 'participant-conflicts-startup')).toHaveLength(1);
@@ -735,7 +736,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('does not deliver merely when a busy Brain becomes idle before the first cadence slot', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-idle-transition', brain: BRAIN, status: 'working', flags: ['blocked'],
       flagSides: { blocked: 'executor' }, round: 1, blocking: ['P0'], previousAuditors: [],
       capCounts: {}, capRound: 0, createdAt: now - 60_000, updatedAt: now - 60_000,
@@ -1112,8 +1113,8 @@ describe('task-pair heartbeat, replacement and queue', () => {
     queuePairDirect('HOL2', 'good brief');
     const first = getTaskPairStore().getPair(PROJECT, 'HOL1')!.state;
     const second = getTaskPairStore().getPair(PROJECT, 'HOL2')!.state;
-    getTaskPairStore().savePair(PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
-    getTaskPairStore().savePair(PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
     candidates = [SPARE];
     automation = new TaskPairAutomation({
       now: () => now,
@@ -1135,8 +1136,8 @@ describe('task-pair heartbeat, replacement and queue', () => {
       queuePairDirect('HANG2', 'good brief');
       const first = getTaskPairStore().getPair(PROJECT, 'HANG1')!.state;
       const second = getTaskPairStore().getPair(PROJECT, 'HANG2')!.state;
-      getTaskPairStore().savePair(PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
-      getTaskPairStore().savePair(PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
       automation = new TaskPairAutomation({
         now: () => now,
         pickCandidate: ({ requestedModel }) => requestedModel === 'good' ? SPARE : undefined,
@@ -1160,7 +1161,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
     try {
       queuePairDirect('AUDWAIT', 'brief');
       const queued = getTaskPairStore().getPair(PROJECT, 'AUDWAIT')!.state;
-      getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...queued, executor: EXEC });
       automation = new TaskPairAutomation({
         now: () => now,
         pickCandidate: () => undefined,
@@ -1315,7 +1316,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   it('does not start a queued pair from a task-bound send to its executor: admission starts it once, with its brief', async () => {
     queuePairDirect('BOUND_SEND', 'bound brief');
     const queued = pair('BOUND_SEND');
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...queued,
       executor: EXEC,
       auditor: AUD,
@@ -1350,7 +1351,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   it('starts a queued pair on the executor STARTED marker with a fresh start time', async () => {
     queuePairDirect('BOUND_STARTED', 'started brief');
     const queued = pair('BOUND_STARTED');
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...queued,
       executor: EXEC,
       auditor: AUD,
@@ -1369,7 +1370,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   it('does not start queued work from an auditor-directed task-bound send', async () => {
     queuePairDirect('AUDITOR_SEND', 'auditor-only brief');
     const queued = pair('AUDITOR_SEND');
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...queued,
       executor: EXEC,
       auditor: AUD,
@@ -1391,7 +1392,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
     busy.add(EXEC);
     queuePairDirect('BUSY_OTHER', 'busy brief');
     const queued = pair('BUSY_OTHER');
-    getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC, auditor: AUD });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...queued, executor: EXEC, auditor: AUD });
     await automation.runQueue(PROJECT, BRAIN);
     expect(pair('BUSY_OTHER').status).toBe('queued');
     expect(pair('BUSY_OTHER').flags).toContain('waiting_for_capacity');
@@ -1464,7 +1465,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('arms the main Brain only for actionable idle pairs and defers without stacking while busy', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-pass', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
       executor: EXEC, auditor: AUD,
@@ -1490,7 +1491,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('records one deduplicated REMIND skip while Brain is busy, then delivers when idle', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-remind-skip', brain: BRAIN, status: 'working', flags: ['blocked'], flagSides: { blocked: 'executor' }, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now - 6 * 60_000, updatedAt: now - 6 * 60_000,
       executor: EXEC, auditor: AUD,
@@ -1529,7 +1530,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('does not resurrect a stale blocked flag after a persisted Brain resolution', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-stale-resolved', brain: BRAIN, status: 'working', flags: ['blocked'],
       flagSides: { blocked: 'executor' }, blockedNote: 'old wait',
       lastWaitResolution: { writer: BRAIN, note: 'resolved earlier', at: now - 1_000 },
@@ -1543,7 +1544,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('pauses the main heartbeat on NEEDS_INPUT and re-arms after a real user message', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-blocked', brain: BRAIN, status: 'passed', flags: ['blocked'], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
       executor: EXEC, auditor: AUD,
@@ -1563,7 +1564,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('pauses the main heartbeat on the Brain NEEDS_DECISION marker (final reply only), leaves pair state alone, and re-arms after the user replies', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-needs-decision', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
       executor: EXEC, auditor: AUD,
@@ -1588,7 +1589,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('NEEDS_DECISION: ignores a participant and an automation echo; the pause outlives a stretch with nothing for Brain and ends with the last open pair', async () => {
-    const save = (taskId: string, status: TaskPairState['status']) => getTaskPairStore().savePair(PROJECT, {
+    const save = (taskId: string, status: TaskPairState['status']) => putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId, brain: BRAIN, status, flags: [], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
       executor: EXEC, auditor: AUD,
@@ -1623,7 +1624,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('judges the Brain busy at the moment of sending, not by the first look of a tick that is still running', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-stale-busy', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
       executor: EXEC, auditor: AUD,
@@ -1731,20 +1732,20 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   it('clears the Brain projection when the last open pair ends', () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-clear', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
       executor: EXEC, auditor: AUD,
     } satisfies TaskPairState);
     automation.publishBadges();
     expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
-    getTaskPairStore().savePair(PROJECT, { ...pair('brain-clear'), status: 'done', updatedAt: now });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('brain-clear'), status: 'done', updatedAt: now });
     automation.publishBadges();
     expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
   });
 
   it('reconstructs a paused Brain projection from the durable awaiting-decision state after restart', () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'brain-restart', brain: BRAIN, status: 'awaiting_brain_decision', flags: [], flagSides: {}, round: 1,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
       executor: EXEC, auditor: AUD,

@@ -4,12 +4,6 @@
     <!-- Internet access -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Push notifications (FCM) -->
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-
     <!-- Biometric authentication -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
@@ -19,6 +13,11 @@
 
     <!-- Speech recognition -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Background file transfer keep-alive -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".AppApplication"
@@ -34,6 +33,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
             android:theme="@style/AppTheme.NoActionBarLaunch"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density">
 
@@ -49,16 +49,26 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="imcodes" />
             </intent-filter>
+
+            <!-- Receive shared single file / text from external apps -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <!-- Receive shared multiple files from external apps -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
 
-        <!-- FCM service for push notifications -->
         <service
-            android:name="com.google.firebase.messaging.FirebaseMessagingService"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.google.firebase.MESSAGING_EVENT" />
-            </intent-filter>
-        </service>
+            android:name=".FileTransferForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

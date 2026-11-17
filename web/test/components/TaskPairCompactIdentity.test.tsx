@@ -40,11 +40,13 @@ describe('compact pair identities (screenshot counterexamples)', () => {
     const heading = container.querySelector('.task-pair-status-row-title')!;
     expect(heading.textContent).toBe(title);
     const roles = container.querySelector('.task-pair-status-row-roles')!;
-    expect(roles.textContent).toContain(`Pair executor${exec}`);
-    expect(roles.textContent).toContain(`Pair auditor${audit}`);
+    expect(roles.textContent).toContain(`Pair executor`);
+    expect(roles.textContent).toContain(`Pair auditor`);
     expect(roles.textContent).toContain('secret-model');
     expect(roles.textContent).toContain('other-model');
     expect(roles.textContent).not.toContain(taskId);
+    expect(roles.textContent).not.toContain(exec);
+    expect(roles.textContent).not.toContain(audit);
     expect(roles.textContent).not.toContain('产品排序任务');
     expect(roles.textContent).not.toMatch(/card_thinking/);
   });
@@ -60,8 +62,8 @@ describe('compact pair identities (screenshot counterexamples)', () => {
         const panel = render(<TaskPairStatusPanel events={event(p)} />);
         expandedPanel(panel.container);
         const roles = panel.container.querySelector('.task-pair-status-row-roles')!;
-        expect(roles.textContent).toContain(`Pair executor${exec}`);
-        expect(roles.textContent).toContain(`Pair auditor${audit}`);
+        expect(roles.textContent).toContain(`Pair executor`);
+        expect(roles.textContent).toContain(`Pair auditor`);
         expect(roles.textContent).not.toMatch(/发布任务|tsk_release/);
         const buttons = roles.querySelectorAll('button');
         fireEvent.click(buttons[0]!);
@@ -141,5 +143,31 @@ describe('compact pair identities (screenshot counterexamples)', () => {
     fireEvent.click(card.querySelector('.supervision-task-console-details-toggle')!);
     expect(card.textContent).not.toContain(taskId);
     expect(card.querySelector('.supervision-task-console-copy-id')).toBeNull();
+  });
+});
+
+describe('status-panel display-only session pills',()=>{
+  it('shows only label and model while preserving distinct canonical navigation for equal labels',()=>{
+    const nav=vi.fn();const listener=(e:Event)=>nav((e as CustomEvent).detail.session);window.addEventListener('deck:navigate',listener);
+    try {
+      const {container}=render(<TaskPairStatusPanel events={event()} sessions={[{name:exec,label:'Same display'},{name:audit,label:'Same display'}]} />);expandedPanel(container);
+      const buttons=container.querySelectorAll<HTMLButtonElement>('.task-pair-status-session');
+      expect(buttons).toHaveLength(2);
+      expect(buttons[0].textContent).toBe('Same displaysecret-model');expect(buttons[1].textContent).toBe('Same displayother-model');
+      buttons.forEach((button,i)=>{expect(button.dataset.sessionName).toBe([exec,audit][i]);expect(button.getAttribute('title')||'').not.toContain('deck_sub_');expect(button.getAttribute('aria-label')||'').not.toContain('deck_sub_');fireEvent.click(button);});
+      expect(nav.mock.calls).toEqual([[exec],[audit]]);expect(container.querySelector('.task-pair-status-session-id')).toBeNull();
+    } finally {window.removeEventListener('deck:navigate',listener);}
+  });
+  it('uses the localized role fallback with no model or internal-ID placeholder and never links none',()=>{
+    const p={...payload,executorLabel:undefined,auditorLabel:undefined,executorModel:undefined,auditorModel:undefined,auditor:'none'} as unknown as typeof payload;
+    const {container}=render(<TaskPairStatusPanel events={event(p)} />);expandedPanel(container);
+    const button=container.querySelector<HTMLButtonElement>('.task-pair-status-session')!;
+    expect(button.textContent).toBe('taskPair.panel_executor');expect(button.dataset.sessionName).toBe(exec);expect(container.querySelectorAll('.task-pair-status-session')).toHaveLength(1);
+    expect(button.querySelector('.task-pair-status-session-model')).toBeNull();
+  });
+  it('keeps live label renames independent of routing data',()=>{
+    const panel=render(<TaskPairStatusPanel events={event()} sessions={[{name:exec,label:'Before'}]} />);expandedPanel(panel.container);
+    panel.rerender(<TaskPairStatusPanel events={event()} sessions={[{name:exec,label:'After'}]} />);
+    const button=panel.container.querySelector<HTMLButtonElement>('.task-pair-status-session')!;expect(button.textContent).toBe('Aftersecret-model');expect(button.dataset.sessionName).toBe(exec);
   });
 });

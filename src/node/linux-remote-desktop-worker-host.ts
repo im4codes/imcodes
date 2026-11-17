@@ -96,6 +96,7 @@ export function checkLinuxWorkerLibraries(
 }
 
 export interface LinuxRemoteDesktopWorkerHostOptions {
+  trafficStorePath?: string;
   workerPath?: string;
   checkLibraries?: (workerPath: string) => boolean;
 }
@@ -178,6 +179,7 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
     this.workerPath = options.workerPath ?? resolveLinuxRemoteDesktopWorkerPath();
     this.checkLibraries = options.checkLibraries ?? checkLinuxWorkerLibraries;
     this.core = new RemoteDesktopWorkerHostCore({
+      trafficStorePath: options.trafficStorePath,
       nonce: randomBytes(16).toString('hex'),
       onWatchdogTimeout: (event) => {
         this.onMessage(event.terminal);
@@ -245,6 +247,8 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
     if (!this.available() || !this.librariesAvailable()) return [];
     return [REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY, REMOTE_DESKTOP_INPUT_CAPABILITY];
   }
+
+  trafficStatus() { return this.core.traffic.snapshot(); }
 
   activeConnections() {
     return activeLocalRemoteDesktopConnections(this.core);
@@ -331,9 +335,10 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
     child.stdin.on('error', (err) => {
       logger.warn({ err }, 'linux remote desktop worker stdin error');
     });
-    this.connectionGeneration = this.core.beginConnection();
+    const connectionGeneration = this.core.beginConnection();
+    this.connectionGeneration = connectionGeneration;
     child.stdout.on('data', (chunk: Buffer) => {
-      const result = this.core.pushInbound(chunk.toString('utf8'), this.connectionGeneration);
+      const result = this.core.pushInbound(chunk.toString('utf8'), connectionGeneration);
       if (result.overflow) {
         logger.warn('linux remote desktop worker stdout line overflow, killing worker');
         this.killChild();
@@ -349,7 +354,7 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
     });
     child.on('exit', (code, signal) => {
       logger.info({ code, signal }, 'linux remote desktop worker exited');
-      this.core.endConnection(this.connectionGeneration);
+      if (this.core.endConnection(connectionGeneration)) this.core.finishLocalConnections();
       if (this.child === child) this.child = null;
     });
     child.on('error', (err) => {

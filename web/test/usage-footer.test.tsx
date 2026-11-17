@@ -78,90 +78,26 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('portals the Token usage dialog above floating-window stacking contexts', () => {
+  it('hides the execution-clone launcher and omits moved usage-stats and removed footer history-refresh buttons', () => {
+    const onRunExecutionClones = vi.fn();
     const { container } = render(
       <UsageFooter
         usage={{ inputTokens: 1000, cacheTokens: 2000, contextWindow: 1_000_000 }}
         sessionName="deck_test_brain"
-      />,
-    );
-
-    fireEvent.click(screen.getByLabelText('sessionUsage.open'));
-    expect(document.body.querySelector('.session-usage-backdrop')).toBeTruthy();
-    expect(container.querySelector('.session-usage-backdrop')).toBeNull();
-  });
-
-  it('hides the execution-clone launcher and puts history refresh before stats', () => {
-    const onRunExecutionClones = vi.fn();
-    const onRefreshHistory = vi.fn();
-    const { container } = render(
-      <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-        sessionName="deck_test_brain"
         onRunExecutionClones={onRunExecutionClones}
         runExecutionClonesTitle="Run clones"
         runExecutionClonesCount={3}
-        onRefreshHistory={onRefreshHistory}
       />,
     );
 
     expect(screen.queryByLabelText('Run clones')).toBeNull();
     expect(container.querySelector('.shortcut-btn-execution-clones')).toBeNull();
-    const refreshButton = screen.getByLabelText('chat.sync_history');
-    const statsButton = screen.getByLabelText('sessionUsage.open');
-    expect(refreshButton.compareDocumentPosition(statsButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-
-    fireEvent.click(refreshButton);
-    expect(onRefreshHistory).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.shortcut-btn-session-usage')).toBeNull();
+    expect(container.querySelector('.shortcut-btn-history-refresh')).toBeNull();
+    expect(screen.queryByLabelText('sessionUsage.open')).toBeNull();
+    expect(screen.queryByLabelText('chat.sync_history')).toBeNull();
+    expect(document.body.querySelector('.session-usage-backdrop')).toBeNull();
     expect(onRunExecutionClones).not.toHaveBeenCalled();
-  });
-
-  it('disables history refresh and shows a spinner while its timeline is refreshing', () => {
-    const onRefreshHistory = vi.fn();
-    const { container } = render(
-      <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-        sessionName="deck_test_brain"
-        onRefreshHistory={onRefreshHistory}
-        historyRefreshing
-      />,
-    );
-
-    const refreshButton = screen.getByLabelText('chat.refreshing_history') as HTMLButtonElement;
-    expect(refreshButton.disabled).toBe(true);
-    expect(refreshButton.classList.contains('is-refreshing')).toBe(true);
-    expect(container.querySelector('.shortcut-btn-history-refresh-glyph')).toBeTruthy();
-    fireEvent.click(refreshButton);
-    expect(onRefreshHistory).not.toHaveBeenCalled();
-  });
-
-  it('surfaces the timeline refresh error without replacing the refresh action', () => {
-    const onRefreshHistory = vi.fn();
-    const { container } = render(
-      <UsageFooter
-        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-        sessionName="deck_test_brain"
-        onRefreshHistory={onRefreshHistory}
-        historyStatus={{
-          phase: 'idle',
-          steps: { cache: 'skipped', textTail: 'skipped', daemon: 'skipped', http: 'skipped', older: 'skipped' },
-          counts: {},
-          response: {
-            state: 'error',
-            i18nKey: 'chat.timelineStatus.error',
-            localizedMessage: 'History service unavailable',
-            recoverable: true,
-          },
-        }}
-      />,
-    );
-
-    const refreshButton = screen.getByLabelText('chat.sync_history: History service unavailable');
-    expect(refreshButton.getAttribute('title')).toBe('chat.sync_history: History service unavailable');
-    expect(refreshButton.classList.contains('is-error')).toBe(true);
-    expect(container.querySelector('[role="alert"]')?.getAttribute('aria-label')).toBe('History service unavailable');
-    fireEvent.click(refreshButton);
-    expect(onRefreshHistory).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the robot status row visible without hosting the repo branch summary', () => {
@@ -803,6 +739,50 @@ describe('UsageFooter', () => {
     expect(screen.getByText('gpt-5.5')).toBeDefined();
     expect(screen.getByText('0 / 922k (0.0%)')).toBeDefined();
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 0 / 922k (0.0%)');
+  });
+
+  it('displays the last two segments for multi-segment Gemini models and keeps full ID in tooltip', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 10_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'gemini-4-hydrogen-high',
+        }}
+        sessionName="deck_test_agy"
+        agentType="agy-sdk"
+        modelOverride="gemini-4-hydrogen-high"
+      />,
+    );
+
+    const modelEl = container.querySelector('.session-usage-model');
+    expect(modelEl?.textContent).toBe('hydrogen-high');
+    expect(modelEl?.getAttribute('title')).toBe('gemini-4-hydrogen-high');
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('gemini-4-hydrogen-high');
+  });
+
+  it('keeps newly switched multi-segment model ahead of older versioned usage.model', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'gemini-2.5-pro',
+        }}
+        sessionName="deck_test_agy_switch"
+        agentType="agy-sdk"
+        modelOverride="gemini-4-hydrogen-high"
+      />,
+    );
+
+    const modelEl = container.querySelector('.session-usage-model');
+    expect(modelEl?.textContent).toBe('hydrogen-high');
+    expect(modelEl?.getAttribute('title')).toBe('gemini-4-hydrogen-high · gemini-2.5-pro');
+    const footerTitle = container.querySelector('.session-usage-footer')?.getAttribute('title');
+    expect(footerTitle).toContain('gemini-4-hydrogen-high');
+    expect(footerTitle).toContain('Context: 100k / 1M (10%)');
   });
 
   // ── Shell / script sessions are not "agents" ────────────────────────────────

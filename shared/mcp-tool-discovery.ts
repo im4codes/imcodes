@@ -68,6 +68,7 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
       MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
       MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET, MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE, MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
       MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
+      MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
     ]),
   }),
   Object.freeze({
@@ -140,6 +141,14 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
     summary: 'List, install, inspect, activate, update, disable, restore, or uninstall managed capabilities.',
     tools: Object.freeze([...CAPABILITY_MCP_TOOL_NAMES]),
   }),
+  Object.freeze({
+    id: 'cloud-docs',
+    aliases: Object.freeze(['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'shared docs', 'onlyoffice', 'docbuilder', 'convert', 'documents', 'office', 'docx', 'xlsx', 'pptx']),
+    summary: 'Run the unified imcodes cloud-docs CLI (list, read, create, mkdir, edit, ONLYOFFICE DocBuilder, convert, upload/download, delete, share, docs).',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+    ]),
+  }),
 ]);
 
 
@@ -206,6 +215,8 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   ALIAS_MCP_TOOLS.LIST,
   ALIAS_MCP_TOOLS.RESOLVE,
   ALIAS_MCP_TOOLS.DELETE,
+  // Callback status updates are invoked directly from callback prompts.
+  MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
 ]);
 
 export function isDefaultActiveMcpTool(name: string): boolean {

@@ -1,5 +1,6 @@
+import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
 import { taskPairWaitKind } from '@shared/task-pair-suspension.js';
-import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { collectTaskPairTitles, taskPairDisplayTitle, taskPairDisplaySessionLabel, type TaskPairTitleLookup } from '@shared/task-pair-display.js';
 import type { ComponentChildren, RefObject } from 'preact';
 import { useMemo, useRef, useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -33,6 +34,10 @@ import {
   type SupervisionTaskConsoleReducerState,
 } from '../supervision-task-console-reducer.js';
 import {
+  readSupervisionTaskConsoleCache,
+  type SupervisionTaskConsoleAuthority,
+} from '../supervision-task-console-cache.js';
+import {
   canViewSupervisionTaskConsole,
   type SupervisionTaskConsoleVisibilityInput,
 } from '../supervision-task-console-visibility.js';
@@ -51,7 +56,7 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-const BRAIN_DECISION_FLAGS = new Set(['blocked', 'needs_input', 'waiting_for_capacity']);
+const BRAIN_DECISION_FLAGS = new Set(['blocked', 'needs_input']);
 const TASK_PAIR_PANEL_VISIBLE_STATUSES: readonly TaskPairStatus[] = [
   ...TASK_PAIR_OPEN_STATUSES,
   'queued',
@@ -103,8 +108,16 @@ export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleRedu
       pair: snapshotPair,
     }];
   });
+  const taskTitles: Record<string, string> = {};
+  for (const taskId of Object.keys(state.tasks).sort()) {
+    const task = state.tasks[taskId];
+    if (!task) continue;
+    const display = taskPairDisplayTitle(task.title, task.taskId, task.pair?.brief);
+    if (display) taskTitles[task.taskId] = display;
+  }
   return {
     tasks,
+    taskTitles,
     assignments: Object.values(state.assignments),
     authoritative: true,
   };
@@ -120,6 +133,13 @@ export function SupervisionTaskPairSnapshotBridge(props: {
   coordinatorSessionName: string;
 }) {
   const scopeKey = `${props.serverId}\u0000${props.projectName}\u0000${props.coordinatorSessionName}`;
+  const authorityScopeKey = `${props.userId}\u0000${scopeKey}`;
+  const authority = useMemo<SupervisionTaskConsoleAuthority>(() => ({
+    userId: props.userId,
+    serverId: props.serverId,
+    projectName: props.projectName,
+    coordinatorSessionName: props.coordinatorSessionName,
+  }), [authorityScopeKey]);
   const { state } = useSupervisionTaskConsole({
     ws: props.ws,
     connected: props.connected,
@@ -129,29 +149,49 @@ export function SupervisionTaskPairSnapshotBridge(props: {
   });
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    // Invalidate rows from the previous server/project/session immediately;
-    // the new subscription will publish its authoritative snapshot separately.
+    const scopeMatches = state.scope.projectName === props.projectName
+      && state.scope.coordinatorSessionName === props.coordinatorSessionName;
+    const hasCachedForTarget = (scopeMatches && state.hasAuthoritativeSnapshot)
+      || Boolean(readSupervisionTaskConsoleCache(authority));
+    if (hasCachedForTarget) return;
+    // Invalidate rows from the previous server/project/session only when
+    // the new scope has no warm cached projection to show immediately.
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
-    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true, scopeKey } }));
-  }, [scopeKey]);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+      detail: { scopeReset: true, scopeKey, authorityScopeKey, serverId: props.serverId },
+    }));
+  }, [authorityScopeKey]);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (state.scope.projectName !== props.projectName
       || state.scope.coordinatorSessionName !== props.coordinatorSessionName) return;
-    // Cached projections are marked STALE and must not silently replace the
-    // daemon's authoritative list.  Publish only a live, fully synced snapshot.
-    if (state.hasAuthoritativeSnapshot && state.syncState === SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED) {
-      const detail = taskConsoleStateToPairSnapshot(state);
+    if (state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR && !state.hasAuthoritativeSnapshot) {
+      const detail = {
+        authorityUnavailable: true,
+        error: state.error ?? 'unsupported',
+        serverId: props.serverId,
+        scopeKey,
+        authorityScopeKey,
+      };
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
       return;
     }
-    if (state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR) {
-      const detail = { authorityUnavailable: true, error: state.error ?? 'unsupported' };
+    const publishableState = state.hasAuthoritativeSnapshot
+      ? state
+      : readSupervisionTaskConsoleCache(authority);
+    if (publishableState) {
+      const detail = {
+        ...taskConsoleStateToPairSnapshot(publishableState),
+        serverId: props.serverId,
+        scopeKey,
+        authorityScopeKey,
+        cached: publishableState.syncState !== SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+      };
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
     }
-  }, [state, props.projectName, props.coordinatorSessionName]);
+  }, [state, authorityScopeKey]);
   return null;
 }
 
@@ -394,6 +434,7 @@ function TaskCard(props: {
   task: SupervisionTaskConsoleTaskRow;
   assignments: readonly SupervisionTaskConsoleAssignmentRow[];
   events: readonly SupervisionTaskConsoleEventEvidence[];
+  taskTitles?: TaskPairTitleLookup;
   expanded: boolean;
   onToggle: () => void;
   onNavigateSession: (sessionName: string) => void;
@@ -470,6 +511,7 @@ function TaskCard(props: {
           {auditor && <SessionButton assignment={auditor} taskStatus={props.task.status} taskTab={taskTab} lane="auditor" onNavigateSession={props.onNavigateSession} />}
         </div>
       </div>
+      {props.task.pair && <TaskPairDecisionPanel taskId={props.task.taskId} pair={props.task.pair} taskTitles={props.taskTitles} />}
       {props.task.pair && <TaskPairConsoleDetails pair={props.task.pair} taskId={props.task.taskId} />}
       {!props.task.pair && (props.task.blocker || props.task.currentAction || props.task.nextAction) && <div class="supervision-task-console-task-meta">
         {props.task.blocker && <span class="is-blocker">{props.task.blocker}</span>}
@@ -501,6 +543,7 @@ function TaskCard(props: {
 }
 
 export function SupervisionTaskConsoleView(props: {
+  scopeKey?: string;
   state: SupervisionTaskConsoleReducerState;
   mobile: boolean;
   readOnly?: boolean;
@@ -536,6 +579,7 @@ export function SupervisionTaskConsoleView(props: {
     return grouped;
   }, [props.state.assignments]);
   const allTasks = useMemo(() => Object.values(props.state.tasks), [props.state.tasks]);
+  const taskTitles = useMemo(() => collectTaskPairTitles(allTasks), [allTasks]);
   const historyTasks = useMemo(() => allTasks
     .filter((task) => supervisionConsoleTabForTask(task, assignmentsByTask.get(task.taskId) ?? []) === 'history')
     .sort((left, right) => right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId)), [allTasks]);
@@ -655,8 +699,8 @@ export function SupervisionTaskConsoleView(props: {
           class="supervision-task-console-grid" data-tab={activeTab} tabIndex={0}
         >
           {visibleTasks.map((task) => <TaskCard
-            key={task.taskId} task={task} assignments={assignmentsByTask.get(task.taskId) ?? []}
-            events={props.state.eventsByTask[task.taskId] ?? []} expanded={expanded.has(task.taskId)}
+            key={JSON.stringify([props.scopeKey, props.state.scope, task.taskId])} task={task} assignments={assignmentsByTask.get(task.taskId) ?? []}
+            events={props.state.eventsByTask[task.taskId] ?? []} taskTitles={taskTitles} expanded={expanded.has(task.taskId)}
             onToggle={() => setExpanded((previous) => { const next = new Set(previous); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })}
             onNavigateSession={props.onNavigateSession} language={language} now={now}
           />)}
@@ -719,6 +763,7 @@ export function SupervisionTaskConsole(props: {
     event.preventDefault(); persistWidth(width + (event.key === 'ArrowLeft' ? 24 : -24));
   };
   return <SupervisionTaskConsoleView
+    scopeKey={JSON.stringify([props.serverId, props.projectName, props.coordinatorSessionName])}
     state={state} mobile={props.mobile} readOnly={props.readOnly} width={width}
     maxWidth={supervisionConsoleMaxWidth(viewportWidth)} onResizeStart={startResize}
     onResizeKeyDown={resizeWithKeyboard} onRetry={retry} onClose={props.onClose}

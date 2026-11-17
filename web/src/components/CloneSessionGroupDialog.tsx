@@ -437,7 +437,7 @@ export function CloneSessionGroupDialog({
 
   return (
     <div class="dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="clone-session-group-title">
-      <div class="dialog" style={{ width: 'min(560px, calc(100vw - 24px))' }}>
+      <div class="dialog" style={{ width: 'min(560px, calc(var(--imcodes-ui-vw, 100vw) - 24px))' }}>
         <div class="dialog-header">
           <h2 id="clone-session-group-title">{t('session.clone.title')}</h2>
           <button type="button" class="dialog-close" onClick={onClose} aria-label={t('common.close')}>x</button>

@@ -105,6 +105,22 @@ function loadOlderOffered(container: HTMLElement): boolean {
 describe('ChatView render capability contract', () => {
   afterEach(() => cleanup());
 
+  it('forwards split collapse independently of canonical filtering and preserves the main all-task view', () => {
+    delete (window as any).__imcodesTaskPairSnapshot;
+    localStorage.clear();
+    const events = [
+      { ...ev('task_pair.event'), eventId: 'own', payload: { taskId: 'own', title: 'Own task', toStatus: 'working', executor: 'canonical-a' } },
+      { ...ev('task_pair.event'), eventId: 'other', payload: { taskId: 'other', title: 'Other task', toStatus: 'working', executor: 'canonical-b' } },
+    ] as TimelineEvent[];
+    const view = render(<ChatView events={events} loading={false} sessionId="canonical-a" scopeTaskPairs taskPairPanelVisitKey="split-A" />);
+    const panel = () => view.container.querySelector('.task-pair-status-panel') as HTMLElement;
+    expect(panel().classList.contains('is-collapsed')).toBe(true);
+    fireEvent.click(panel().querySelector('.task-pair-status-toggle') as HTMLElement);
+    expect([...panel().querySelectorAll('.task-pair-status-row-title')].map((el) => el.textContent)).toEqual(['Own task']);
+    view.rerender(<ChatView events={events} loading={false} sessionId="main-brain" />);
+    expect([...panel().querySelectorAll('.task-pair-status-row-title')].map((el) => el.textContent)).toEqual(['Own task', 'Other task']);
+  });
+
   it('renders task-pair events as a full-width left-aligned card with role links', () => {
     const event = {
       ...ev('task_pair.event'),

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
@@ -7,7 +7,6 @@ import type { CronAction, CronCompletionPolicy, CronJobStatus } from '@shared/cr
 import {
   CRON_COMPLETION_POLICY,
   CRON_STATUS,
-  isCronExprShortInterval,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
 } from '@shared/cron-types';
@@ -18,6 +17,12 @@ import { getAgentBadgeLabel } from '../agent-display.js';
 import { FloatingPanel } from '../components/FloatingPanel.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { useResourceEvent } from '../hooks/useResourceEvent.js';
+import {
+  CRON_SCOPE_CHANGE_EVENT,
+  CRON_SHOW_ALL_STORAGE_KEY,
+  buildCronListUrl,
+  readCronShowAllPref,
+} from '../hooks/useCronJobCount.js';
 import { RESOURCE_TOPICS } from '@shared/resource-events.js';
 import type { WsClient } from '../ws-client.js';
 
@@ -242,7 +247,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [showAllServers, setShowAllServers] = useState(() => localStorage.getItem('rcc_cron_show_all') === '1');
+  const [showAllServers, setShowAllServers] = useState(readCronShowAllPref);
   // Sub-panel state: 'form' for create/edit, 'history:jobId' for execution log
   const [subPanel, setSubPanel] = useState<string | null>(null);
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
@@ -272,16 +277,29 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   }, [onNavigateSession]);
 
   const toggleShowAll = () => {
-    setShowAllServers(prev => { const v = !prev; localStorage.setItem('rcc_cron_show_all', v ? '1' : ''); return v; });
+    setShowAllServers((prev) => {
+      const v = !prev;
+      localStorage.setItem(CRON_SHOW_ALL_STORAGE_KEY, v ? '1' : '');
+      if (typeof window !== 'undefined') window.dispatchEvent(new Event(CRON_SCOPE_CHANGE_EVENT));
+      return v;
+    });
   };
 
   // ── Load jobs ──────────────────────────────────────────────────────────
   const loadJobs = useCallback(async (silent = false) => {
     try {
-      const q = effectiveShowAllServers || wholeServerSharedScope
-        ? (effectiveShowAllServers ? '' : `serverId=${encodeURIComponent(serverId)}`)
-        : `serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`;
-      const res = await apiFetch<{ jobs: CronJob[] }>(scopedUrl(`/api/cron?${q}`));
+      const url = buildCronListUrl({
+        serverId,
+        projectName,
+        sharedSessionName,
+        sharedScope,
+        showAllServers,
+      }) ?? scopedUrl(
+        effectiveShowAllServers || wholeServerSharedScope
+          ? (effectiveShowAllServers ? '/api/cron?' : `/api/cron?serverId=${encodeURIComponent(serverId)}`)
+          : `/api/cron?serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`,
+      );
+      const res = await apiFetch<{ jobs: CronJob[] }>(url);
       setJobs(res.jobs);
       setError(null);
     } catch (err) {
@@ -497,7 +515,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
               {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>Team {action.mode}</span>}
               {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
               {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ opacity: 0.6, maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
-              {action?.type === 'send' && (action.onlyWhenIdle !== undefined ? action.onlyWhenIdle : isCronExprShortInterval(job.cron_expr)) && (
+              {action && action.type !== 'p2p' && action.onlyWhenIdle !== false && (
                 <span
                   title={t('cron.send_only_when_idle_help')}
                   style={{
@@ -694,10 +712,17 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
           onFocus={onWindowFocus}
           title={`${detailExec.job_name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
-          defaultW={720} defaultH={620}
+          defaultW={960} defaultH={640}
+          minW={300}
           className="cron-floating-panel cron-execution-detail-panel"
         >
-          <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(resolveExecSession(detailExec), detailExec.detail?.slice(0, 500)) : undefined} t={t} />
+          <ExecDetailView
+            jobName={detailExec.job_name}
+            exec={detailExec}
+            targetSession={resolveExecSession(detailExec)}
+            onNavigateSession={onNavigateSession ? () => onNavigateSession(resolveExecSession(detailExec), detailExec.detail?.slice(0, 500)) : undefined}
+            t={t}
+          />
         </FloatingPanel>
       , portalSubPanels)}
     </div>
@@ -809,10 +834,17 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
           onFocus={onWindowFocus}
           title={`${job.name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
-          defaultW={720} defaultH={620}
+          defaultW={960} defaultH={640}
+          minW={300}
           className="cron-floating-panel cron-execution-detail-panel"
         >
-          <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(jobSessionName, detailExec.detail?.slice(0, 500)) : undefined} t={t} />
+          <ExecDetailView
+            jobName={job.name}
+            exec={detailExec}
+            targetSession={jobSessionName}
+            onNavigateSession={onNavigateSession ? () => onNavigateSession(jobSessionName, detailExec.detail?.slice(0, 500)) : undefined}
+            t={t}
+          />
         </FloatingPanel>
       , portalSubPanels)}
     </div>
@@ -821,34 +853,224 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
 
 // ── Execution Detail View (FloatingPanel content, renders markdown) ──────
 
-function ExecDetailView({ exec, onNavigateSession, t }: { exec: { status: string; detail: string | null; created_at: number }; onNavigateSession?: () => void; t: (key: string) => string }) {
+export function ExecDetailView({
+  jobName,
+  exec,
+  targetSession,
+  onNavigateSession,
+  t,
+}: {
+  jobName?: string;
+  exec: {
+    id?: string;
+    status: string;
+    detail: string | null;
+    created_at: number;
+    action?: any;
+    target_role?: string | null;
+    target_session_name?: string | null;
+  };
+  targetSession?: string;
+  onNavigateSession?: () => void;
+  t: (key: string) => string;
+}) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [canExpand, setCanExpand] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setIsExpanded(false);
+  }, [exec.id, exec.created_at]);
+
+  const lineCount = useMemo(() => {
+    if (!exec.detail) return 0;
+    return exec.detail.split('\n').length;
+  }, [exec.detail]);
+
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el || !exec.detail) {
+      setCanExpand(false);
+      return;
+    }
+
+    const checkOverflow = () => {
+      const target = bodyRef.current;
+      if (!target) return;
+
+      // In jsdom without layout engine, clientHeight and scrollHeight are 0
+      const isZeroLayout = target.scrollHeight === 0 && target.clientHeight === 0;
+      if (isZeroLayout) {
+        setCanExpand(lineCount > 5);
+        return;
+      }
+
+      const style = window.getComputedStyle(target);
+      const fontSize = parseFloat(style.fontSize) || 13;
+      // 5 lines max height defined in CSS: calc(5 * 1.65em + 24px)
+      const collapsedMaxHeight = 5 * 1.65 * fontSize + 24;
+
+      // In collapsed mode, check if scrollHeight overflows visible clientHeight.
+      // In expanded mode, check if scrollHeight still overflows collapsedMaxHeight.
+      const threshold = isExpanded ? (collapsedMaxHeight + 1) : (target.clientHeight + 1);
+      const overflows = target.scrollHeight > threshold;
+
+      setCanExpand(overflows);
+
+      // If container resized wider such that content naturally fits in <= 5 lines, reset expanded
+      if (!overflows && isExpanded) {
+        setIsExpanded(false);
+      }
+    };
+
+    checkOverflow();
+    const rafId = requestAnimationFrame(checkOverflow);
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => {
+        checkOverflow();
+      });
+      observer.observe(el);
+    } else {
+      window.addEventListener('resize', checkOverflow);
+    }
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (observer) {
+        observer.disconnect();
+      } else {
+        window.removeEventListener('resize', checkOverflow);
+      }
+    };
+  }, [exec.detail, exec.id, exec.created_at, isExpanded, lineCount]);
+
   return (
     <div class="cron-execution-detail">
-      <div class="cron-execution-detail-toolbar">
-        <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
-        <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>{execStatusLabel(exec.status, t)}</span>
-        {onNavigateSession && exec.detail && (
-          <button type="button" onClick={onNavigateSession}
-            class="cron-execution-detail-action">
-            {t('cron.go_and_quote')} →
-          </button>
-        )}
+      <div class="cron-execution-detail-header">
+        <div class="cron-execution-detail-title-row">
+          <span class="cron-execution-detail-job-name" title={jobName || t('cron.title')}>
+            <span class="cron-execution-hero-icon" style={{ fontSize: '13px', width: '20px', height: '20px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>⌁</span>
+            {jobName || t('cron.title')}
+          </span>
+          <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>
+            <span class="cron-execution-status-dot" style={{ background: execStatusColor(exec.status) }} />
+            {execStatusLabel(exec.status, t)}
+          </span>
+        </div>
+        <div class="cron-execution-detail-toolbar">
+          <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
+          {targetSession && (
+            <span class="cron-execution-target-badge" title={`${t('cron.target_session')}: ${targetSession}`}>
+              🎯 {targetSession}
+            </span>
+          )}
+          {onNavigateSession && exec.detail && (
+            <button type="button" onClick={onNavigateSession}
+              class="cron-execution-detail-action">
+              {t('cron.go_and_quote')} →
+            </button>
+          )}
+        </div>
       </div>
       {exec.detail ? (
-        <section class="cron-execution-output">
+        <section class={`cron-execution-output ${isExpanded ? 'cron-execution-output--expanded' : 'cron-execution-output--collapsed'}`}>
           <div class="cron-execution-output-heading">
             <span class="cron-execution-output-pulse" />
             <span>{t('cron.final_output')}</span>
-            <small>{exec.detail.length.toLocaleString()} {t('cron.characters')}</small>
+            <small>
+              {exec.detail.length.toLocaleString()} {t('cron.characters')}
+              {lineCount > 1 ? ` · ${lineCount} ${t('cron.lines_count')}` : ''}
+            </small>
           </div>
-          <div class="cron-execution-output-body chat-markdown">
+          <div
+            ref={bodyRef}
+            class="cron-execution-output-body chat-markdown"
+            data-testid="cron-execution-output-body"
+            data-expanded={isExpanded ? 'true' : 'false'}
+            data-overflows={canExpand ? 'true' : 'false'}
+          >
             <ChatMarkdown text={exec.detail} />
           </div>
+          {canExpand && (
+            <div class="cron-execution-expand-bar">
+              <button
+                type="button"
+                class="cron-execution-expand-btn"
+                onClick={() => {
+                  const next = !isExpanded;
+                  setIsExpanded(next);
+                  if (!next && bodyRef.current) {
+                    bodyRef.current.scrollTop = 0;
+                  }
+                }}
+                aria-expanded={isExpanded}
+              >
+                <span class="cron-execution-expand-icon">{isExpanded ? '▴' : '▾'}</span>
+                <span class="cron-execution-expand-text">
+                  {isExpanded ? t('cron.collapse_view') : t('cron.expand_view')}
+                </span>
+                <span class="cron-execution-expand-hint">
+                  ({isExpanded ? t('cron.max_15_lines') : t('cron.default_5_lines')})
+                </span>
+              </button>
+            </div>
+          )}
         </section>
       ) : (
         <div class="cron-execution-empty"><span class="cron-execution-empty-icon">◇</span>{t('cron.no_detail')}</div>
       )}
     </div>
+  );
+}
+
+// ── Auto-resizing Textarea (Default 5 lines, max 15 lines) ─────────────────
+
+export function AutoResizeTextarea({
+  value,
+  onInput,
+  placeholder,
+  required,
+  style,
+  className,
+  ...props
+}: {
+  value: string;
+  onInput: (e: any) => void;
+  placeholder?: string;
+  required?: boolean;
+  style?: Record<string, any>;
+  className?: string;
+  [key: string]: any;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const adjustHeight = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, []);
+
+  useEffect(() => {
+    adjustHeight();
+  }, [value, adjustHeight]);
+
+  return (
+    <textarea
+      ref={textareaRef}
+      className={`cron-auto-textarea ${className || ''}`}
+      style={style}
+      value={value}
+      onInput={(e) => {
+        adjustHeight();
+        onInput(e);
+      }}
+      placeholder={placeholder}
+      required={required}
+      {...props}
+    />
   );
 }
 
@@ -1056,11 +1278,11 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
   const [sendMessage, setSendMessage] = useState(existingAction?.type === 'send' ? existingAction.message : '');
   const [sendReply, setSendReply] = useState(existingAction?.type === 'send' ? existingAction.reply === true : false);
   const [sendBroadcast, setSendBroadcast] = useState(existingAction?.type === 'send' ? existingAction.broadcast === true : false);
-  const [sendOnlyWhenIdle, setSendOnlyWhenIdle] = useState<boolean>(() => {
-    if (existingAction?.type === 'send' && existingAction.onlyWhenIdle !== undefined) {
+  const [onlyWhenIdle, setOnlyWhenIdle] = useState<boolean>(() => {
+    if (existingAction && existingAction.type !== 'p2p' && existingAction.onlyWhenIdle !== undefined) {
       return existingAction.onlyWhenIdle;
     }
-    return isCronExprShortInterval(job?.cron_expr ?? (cronExpr || '*/5 * * * *'));
+    return true;
   });
   const [expiresAt, setExpiresAt] = useState(formatDateTimeLocalInput(job?.expires_at));
   const [completionPolicy, setCompletionPolicy] = useState<CronCompletionPolicy>(
@@ -1107,6 +1329,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
       ? {
         type: 'command',
         command,
+        onlyWhenIdle,
         ...(
           completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
           || (existingAction?.type === 'command' && existingAction.selfManaged)
@@ -1125,7 +1348,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
           type: 'send',
           target: sendTarget.trim(),
           message: sendMessage,
-          onlyWhenIdle: sendOnlyWhenIdle,
+          onlyWhenIdle,
           ...(sendReply ? { reply: true } : {}),
           ...(sendBroadcast ? { broadcast: true } : {}),
           ...(existingAction?.type === 'send' && existingAction.idempotencyKey ? { idempotencyKey: existingAction.idempotencyKey } : {}),
@@ -1256,11 +1479,11 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
         {actionType === 'command' && (
           <>
             <label style={labelStyle}>{t('cron.send_message')}</label>
-            <textarea
-              style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
+            <AutoResizeTextarea
+              style={{ ...inputStyle, fontFamily: 'inherit' }}
               value={command}
-              onInput={e => {
-                setCommand((e.target as HTMLTextAreaElement).value);
+              onInput={(e: any) => {
+                setCommand(e.target.value);
                 setError((prev) => prev?.startsWith('Command is too long') ? null : prev);
               }}
               placeholder={t('cron.send_message_placeholder')}
@@ -1286,10 +1509,10 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
         {actionType === 'p2p' && (
           <>
             <label style={labelStyle}>{t('cron.p2p_topic')}</label>
-            <textarea
-              style={{ ...inputStyle, minHeight: '60px', resize: 'vertical', fontFamily: 'inherit' }}
+            <AutoResizeTextarea
+              style={{ ...inputStyle, fontFamily: 'inherit' }}
               value={p2pTopic}
-              onInput={e => setP2pTopic((e.target as HTMLTextAreaElement).value)}
+              onInput={(e: any) => setP2pTopic(e.target.value)}
               placeholder={t('cron.p2p_topic_placeholder')}
               required
             />
@@ -1360,10 +1583,10 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
             </label>
 
             <label style={labelStyle}>{t('cron.send_message')}</label>
-            <textarea
-              style={{ ...inputStyle, minHeight: '90px', resize: 'vertical', fontFamily: 'inherit' }}
+            <AutoResizeTextarea
+              style={{ ...inputStyle, fontFamily: 'inherit' }}
               value={sendMessage}
-              onInput={e => setSendMessage((e.target as HTMLTextAreaElement).value)}
+              onInput={(e: any) => setSendMessage(e.target.value)}
               placeholder={t('cron.send_message_placeholder')}
               required
             />
@@ -1376,17 +1599,19 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
               />
               {t('cron.send_reply')}
             </label>
-
-            <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
-              <input
-                type="checkbox"
-                checked={sendOnlyWhenIdle}
-                onChange={e => setSendOnlyWhenIdle((e.target as HTMLInputElement).checked)}
-              />
-              <span>{t('cron.send_only_when_idle')}</span>
-              <span style={{ color: '#64748b', fontSize: '11px' }}>({t('cron.send_only_when_idle_help')})</span>
-            </label>
           </>
+        )}
+
+        {actionType !== 'p2p' && (
+          <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
+            <input
+              type="checkbox"
+              checked={onlyWhenIdle}
+              onChange={e => setOnlyWhenIdle((e.target as HTMLInputElement).checked)}
+            />
+            <span>{t('cron.send_only_when_idle')}</span>
+            <span style={{ color: '#64748b', fontSize: '11px' }}>({t('cron.send_only_when_idle_help')})</span>
+          </label>
         )}
 
         <label style={labelStyle}>{t('cron.expires_at')}</label>

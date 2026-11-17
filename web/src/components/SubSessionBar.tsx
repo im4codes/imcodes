@@ -33,7 +33,7 @@ import { reorderSubSessions } from '../api.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { resolveContextWindow } from '../model-context.js';
-import { bestModelLabel } from '../model-label.js';
+import { compactSubSessionModelLabel, subSessionModelPresentation } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -43,13 +43,15 @@ import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
+import { SUBSESSION_BAR_MAX_EXPANDED_CARDS } from '@shared/scale-limits.js';
 import type { DiskUsage } from '@shared/disk-usage.js';
 import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
-import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
+import { formatDaemonVersionMobile, formatDaemonVersionShort, getBuildTimeCompact } from '../util/format-version.js';
 import { isAuthoritativeUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
 import {
   createSubSessionEntryGestureController,
+  shouldIgnoreSubSessionEntryGestureTarget,
   type SubSessionEntryGestureController,
 } from '../subsession-entry-gesture.js';
 import {
@@ -116,12 +118,14 @@ type DiscussionSummary = P2pProgressDiscussion & {
 interface CollapsedSubSessionButtonProps {
   sub: SubSession;
   accentColor: string;
+  sequenceNumber?: number;
   isOpen: boolean;
   isFocused: boolean;
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
   orientation?: 'horizontal' | 'vertical';
+  extraClass?: string;
   sharedState?: SharedStateSummary | null;
   inP2p: boolean;
   draggable?: boolean;
@@ -171,6 +175,8 @@ interface Props {
   onViewDiscussion?: (fileId: string) => void;
   onViewRepo?: () => void;
   onViewCron?: () => void;
+  /** Number of cron jobs inside Cron Manager for the active scope (rendered as a corner badge on ⏰). */
+  cronJobCount?: number;
   openSpecAutoProjection?: OpenSpecAutoDeliverProjection | null;
   openSpecAutoStopPending?: boolean;
   openSpecAutoCompact?: boolean;
@@ -215,6 +221,8 @@ interface Props {
   /** Set of sub-session labels participating in active P2P discussions. */
   p2pSessionLabels?: Set<string>;
   onSubTransportConfigSaved?: (subId: string, transportConfig: Record<string, unknown> | null) => void;
+  /** Daemon connection badge state rendered inside the mobile bottom footer strip. */
+  daemonBadgeState?: 'online' | 'connecting' | 'offline';
 }
 
 type Layout = 'single' | 'double';
@@ -230,6 +238,8 @@ const P2P_DESKTOP_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_desktop_compact';
 const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
 const EXPANDED_PREVIEW_BATCH_SIZE = 4;
 const EXPANDED_PREVIEW_BATCH_DELAY_MS = 32;
+const COMPACT_REORDER_HOLD_MS = 400;
+const COMPACT_REORDER_MOVE_CANCEL_PX = 8;
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -360,13 +370,47 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, onContextMenu, pinned, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
+export function selectPrioritizedExpandedSessions(
+  orderedSessions: SubSession[],
+  openIds: Set<string>,
+  focusedSubId: string | null | undefined,
+  maxExpandedCards = SUBSESSION_BAR_MAX_EXPANDED_CARDS,
+): { cardSessions: SubSession[]; overflowSessions: SubSession[] } {
+  if (orderedSessions.length <= maxExpandedCards) {
+    return { cardSessions: orderedSessions, overflowSessions: [] };
+  }
+  const selectedIds = new Set<string>();
+  const addTier = (predicate: (sub: SubSession) => boolean, enforceCap: boolean) => {
+    for (const sub of orderedSessions) {
+      if (enforceCap && selectedIds.size >= maxExpandedCards) break;
+      if (selectedIds.has(sub.id)) continue;
+      if (predicate(sub)) selectedIds.add(sub.id);
+    }
+  };
+  // Focused or currently open floating cards always remain hydrated.
+  addTier((sub) => focusedSubId === sub.id || openIds.has(sub.id), false);
+  // Active/running/queued sessions take precedence over idle historical sessions.
+  addTier((sub) => isVisuallyBusy(sub.state, false) || sub.state === 'error', true);
+  // Fill remaining expanded slots in bar visual order.
+  addTier(() => true, true);
+
+  const cardSessions: SubSession[] = [];
+  const overflowSessions: SubSession[] = [];
+  for (const sub of orderedSessions) {
+    if (selectedIds.has(sub.id)) cardSessions.push(sub);
+    else overflowSessions.push(sub);
+  }
+  return { cardSessions, overflowSessions };
+}
+
+function CollapsedSubSessionButtonImpl({ sub, accentColor, sequenceNumber, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, onContextMenu, pinned, t, detectedModel, orientation = 'horizontal', extraClass }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
   const effectiveModel = resolveQuickAgentDelegationModel(sub, detectedModel, usage?.model);
-  const model = bestModelLabel(effectiveModel, usage?.model);
+  const { label: model, title: modelTitle } = subSessionModelPresentation(effectiveModel, usage?.model);
+  const compactModel = compactSubSessionModelLabel(model);
   let ctxPct = 0;
   if (usage) {
     const ctx = resolveContextWindow(
@@ -378,11 +422,17 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
     ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
   }
 
+  const p2pTagLabel = inP2p ? t('session.p2p_tag') : '';
+  const buttonTitle = label
+    + (modelTitle ? ` · ${modelTitle}` : '')
+    + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')
+    + (p2pTagLabel ? ` · ${p2pTagLabel}` : '');
+
   return (
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subsession-card${sub.incognito ? ' incognito' : ''}${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''}${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}${extraClass ? ` ${extraClass}` : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -392,15 +442,25 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
       onDragOver={(event) => onEntryDragOver(sub.id, event)}
       onDragEnd={(event) => onEntryDragEnd(sub.id, event)}
       onContextMenu={(event) => onContextMenu(sub.id, event)}
-      title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
+      title={buttonTitle}
+      aria-label={inP2p ? buttonTitle : undefined}
       style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
+      {typeof sequenceNumber === 'number' && sequenceNumber > 0 && (
+        <sup class="subsession-card-seq" data-testid={`subsession-seq-${sub.id}`}>
+          {sequenceNumber}
+        </sup>
+      )}
       <span class="subsession-card-icon">{abbr}</span>
       <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
-      {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+      {inP2p && (
+        <sub class="subsession-card-team" data-testid={`subsession-team-${sub.id}`} aria-hidden="true">
+          T
+        </sub>
+      )}
       <SharedStateIndicator state={sharedState} iconOnly />
-      {model && <span class="subsession-card-model">{model}</span>}
+      {compactModel && <span class="subsession-card-model" title={modelTitle}>{compactModel}</span>}
       {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
       {/* tsk_5zv: a static running mark so the running state never depends on the
           bottom marquee alone - it survives prefers-reduced-motion and reads at a
@@ -426,12 +486,14 @@ function sameCollapsedSub(a: SubSession, b: SubSession): boolean {
     && a.runtimeType === b.runtimeType
     && a.activeModel === b.activeModel
     && a.requestedModel === b.requestedModel
-    && a.modelDisplay === b.modelDisplay;
+    && a.modelDisplay === b.modelDisplay
+    && !!a.incognito === !!b.incognito;
 }
 
 const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, next) => (
   sameCollapsedSub(prev.sub, next.sub)
   && prev.accentColor === next.accentColor
+  && prev.sequenceNumber === next.sequenceNumber
   && prev.isOpen === next.isOpen
   && prev.isFocused === next.isFocused
   && prev.idleFlashToken === next.idleFlashToken
@@ -454,24 +516,31 @@ const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, nex
   && prev.t === next.t
   && prev.detectedModel === next.detectedModel
   && prev.orientation === next.orientation
+  && prev.extraClass === next.extraClass
 ));
 
-function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
+function ExpandedSubSessionPlaceholder({ sub, accentColor, sequenceNumber, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; sequenceNumber?: number; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
   return (
     <div
-      class={`subcard subcard-preview-placeholder${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subcard subcard-preview-placeholder${sub.incognito ? ' incognito' : ''}${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
       style={{
         width: cardSize.w,
         height: cardSize.h,
         minWidth: cardSize.w,
         position: 'relative',
         '--subsession-accent-color': accentColor,
+        '--subcard-h': `${cardSize.h}px`,
       } as JSX.CSSProperties}
     >
-      <div class="subcard-header">
+      <div class={`subcard-header${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''}`}>
+        {typeof sequenceNumber === 'number' && sequenceNumber > 0 && (
+          <sup class="subcard-seq" data-testid={`subsession-seq-${sub.id}`}>
+            {sequenceNumber}
+          </sup>
+        )}
         <span class="subcard-icon">{abbr}</span>
         <span class="subcard-label">{label}</span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
@@ -774,16 +843,19 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout: requestedDesktopLayout, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.LEFT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, cronJobCount = 0, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved, daemonBadgeState }: Props) {
   recordPerfRender('SubSessionBar');
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
-  const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
   const isTeamDiscussionRail = desktopLayoutCapable
     && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
-  const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
+  const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, true));
   const collapsed = controlledCollapsed ?? internalCollapsed;
+  const desktopLayout = requestedDesktopLayout ?? (collapsed
+    ? SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+    : SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL);
+  const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
   const [p2pHidden, setP2pHidden] = useState(() => load(P2P_MOBILE_COMPACT_STORAGE_KEY, false));
   const [p2pDesktopCompact, setP2pDesktopCompact] = useState(() => load(P2P_DESKTOP_COMPACT_STORAGE_KEY, false));
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -873,7 +945,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     onRestore,
     onRestoreThenClose,
   };
-  const collapsedBarRef = useRef<HTMLDivElement | null>(null);
+  const [collapsedBarElement, setCollapsedBarElement] = useState<HTMLDivElement | null>(null);
   const expandedScrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => () => {
@@ -1011,6 +1083,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, [subSessions, dragOrder, pinnedSubSessionIds]);
   const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
   const orderedSessionIdsKey = orderedSessionIds.join(',');
+  const sequenceById = useMemo(() => {
+    const map = new Map<string, number>();
+    orderedSessions.forEach((sub, idx) => {
+      map.set(sub.id, idx + 1);
+    });
+    return map;
+  }, [orderedSessions]);
   // Status/state frames replace the SubSession objects while preserving the
   // same ordered ids. Accent assignment is structural, so do not recompute it
   // for every metadata update (the per-card components receive the latest
@@ -1025,9 +1104,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const currentExpandedPreviewBudget = expandedPreviewKeyRef.current === orderedSessionIdsKey
     ? expandedPreviewBudget
     : EXPANDED_PREVIEW_INITIAL_COUNT;
+  const { cardSessions: expandedCardSessions, overflowSessions: expandedOverflowSessions } = useMemo(
+    () => selectPrioritizedExpandedSessions(orderedSessions, openIds, focusedSubId, SUBSESSION_BAR_MAX_EXPANDED_CARDS),
+    [orderedSessions, openIds, focusedSubId],
+  );
   const hydratedExpandedPreviewIds = useMemo(
-    () => new Set(orderedSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
-    [currentExpandedPreviewBudget, orderedSessionIdsKey],
+    () => new Set(expandedCardSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
+    [currentExpandedPreviewBudget, expandedCardSessions],
   );
   const openSubWindowCount = useMemo(
     () => orderedSessionIds.filter((id) => openIds.has(id)).length,
@@ -1087,7 +1170,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, []);
 
   const handleCollapsedEntryDragStart = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
-    if (!desktopLayoutCapableRef.current) {
+    if (!desktopLayoutCapableRef.current || touchDragRef.current.id) {
       event.preventDefault();
       return;
     }
@@ -1130,7 +1213,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       setExpandedPreviewBudget(0);
       return;
     }
-    const total = orderedSessions.length;
+    const total = expandedCardSessions.length;
     const initial = Math.min(total, EXPANDED_PREVIEW_INITIAL_COUNT);
     setExpandedPreviewBudget(initial);
     if (initial >= total) return;
@@ -1151,7 +1234,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [collapsed, orderedSessionIdsKey, orderedSessions.length]);
+  }, [collapsed, orderedSessionIdsKey, expandedCardSessions.length]);
 
   useEffect(() => {
     save(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, collapsed);
@@ -1226,9 +1309,17 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   // Touch-based reorder for collapsed bar — desktop collapsed buttons use HTML5 drag events below.
   // The touch path must use addEventListener({ passive: false }) so touchmove can preventDefault.
   useEffect(() => {
-    const el = collapsedBarRef.current;
+    // The bar can mount after an initially empty session list or be replaced.
+    // Follow the actual element, not an unrelated callback changing identity.
+    const el = collapsedBarElement;
     if (!el) return;
     const td = touchDragRef.current;
+
+    let holdTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearHold = () => {
+      if (holdTimer !== null) clearTimeout(holdTimer);
+      holdTimer = null;
+    };
 
     const findBtnId = (target: EventTarget | null): string | null => {
       let node = target as HTMLElement | null;
@@ -1237,19 +1328,24 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onStart = (e: TouchEvent) => {
+      onCancel();
       const id = findBtnId(e.target);
-      if (!id) return;
       const touch = e.touches[0];
+      if (!id || !touch || e.touches.length !== 1) return;
       td.id = id;
-      td.active = false;
-      td.moved = false;
-      td.startX = touch?.clientX ?? 0;
-      td.startY = touch?.clientY ?? 0;
+      td.startX = touch.clientX;
+      td.startY = touch.clientY;
+      holdTimer = setTimeout(() => {
+        holdTimer = null;
+        if (td.id === id && !td.moved && el.isConnected
+          && orderedSessionsRef.current.some((sub) => sub.id === id)) activateDrag(id);
+      }, COMPACT_REORDER_HOLD_MS);
     };
 
     const activateDrag = (id: string) => {
       td.id = id;
       td.active = true;
+      getEntryGestureController(id).cancelTouchSequence();
       const initialOrder = orderedSessionsRef.current.map((s) => s.id);
       dragOrderRef.current = initialOrder;
       setDragOrder(initialOrder);
@@ -1260,15 +1356,21 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onMove = (e: TouchEvent) => {
+      if (e.touches.length !== 1) {
+        onCancel();
+        return;
+      }
       const touch = e.touches[0];
-      if (touch) {
-        const dx = touch.clientX - td.startX;
-        const dy = touch.clientY - td.startY;
-        if (Math.hypot(dx, dy) > 8) td.moved = true;
+      const dx = touch.clientX - td.startX;
+      const dy = touch.clientY - td.startY;
+      if (Math.hypot(dx, dy) > COMPACT_REORDER_MOVE_CANCEL_PX) {
+        td.moved = true;
+        if (!td.active) {
+          clearHold();
+          if (td.id) getEntryGestureController(td.id).cancelTouchSequence();
+        }
       }
-      if (!td.active && td.moved && td.id) {
-        activateDrag(td.id!);
-      }
+      // A swipe never promotes itself to reorder, even if the finger stops.
       if (!td.active || !td.id) return;
       e.preventDefault(); // works because { passive: false }
       if (!touch) return;
@@ -1277,11 +1379,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         : null;
       const overId = findBtnId(targetEl);
       if (overId && overId !== td.id) {
+        td.moved = true;
         moveSubSessionInDragOrder(td.id, overId);
       }
     };
 
     const resetTouchDrag = () => {
+      clearHold();
       td.id = null;
       td.active = false;
       td.moved = false;
@@ -1290,6 +1394,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onEnd = (e: TouchEvent) => {
+      clearHold();
       const endedId = td.id ?? findBtnId(e.target);
       const wasActive = td.active;
       const moved = td.moved;
@@ -1299,8 +1404,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
         el.style.overflowX = '';
-        if (dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
-      } else if (endedId && !moved) {
+        getEntryGestureController(td.id).cancelTouchSequence();
+        if (moved && dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
+      } else if (endedId && moved) {
+        getEntryGestureController(endedId).cancelTouchSequence();
+      } else if (endedId) {
         const btn = el.querySelector(`[data-sub-id="${endedId}"]`) as HTMLElement | null;
         getEntryGestureController(endedId).handleTouchEndFallback(e, btn);
       }
@@ -1308,6 +1416,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onCancel = () => {
+      clearHold();
       if (td.active && td.id) {
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
@@ -1331,6 +1440,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     el.addEventListener('scroll', onScroll, { passive: true });
     el.addEventListener('contextmenu', onContext);
     return () => {
+      clearHold();
       if (td.active && td.id) {
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
@@ -1346,7 +1456,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('scroll', onScroll);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
+  }, [collapsedBarElement, collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
@@ -1387,13 +1497,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       };
     };
 
-    const cleanupCollapsed = installHorizontalEdgeGuard(collapsedBarRef.current);
+    const cleanupCollapsed = installHorizontalEdgeGuard(collapsedBarElement);
     const cleanupExpanded = installHorizontalEdgeGuard(expandedScrollRef.current);
     return () => {
       cleanupCollapsed();
       cleanupExpanded();
     };
-  }, [collapsed, isVerticalRail, layout, orderedSessions.length]);
+  }, [collapsedBarElement, collapsed, isVerticalRail, layout, orderedSessions.length]);
 
   useEffect(() => {
     // Another server (or socket) never inherits this one's disks, embedding,
@@ -1474,6 +1584,15 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const autoDeliverButtonLabel = t('subsessionBar.auto_deliver');
   const repoButtonLabel = t('repo.info_title', { defaultValue: t('subsessionBar.repository') });
   const cronButtonLabel = t('subsessionBar.scheduled_tasks');
+  const safeCronJobCount = typeof cronJobCount === 'number' && Number.isFinite(cronJobCount) && cronJobCount > 0
+    ? Math.floor(cronJobCount)
+    : 0;
+  const cronButtonTitle = safeCronJobCount > 0
+    ? t('subsessionBar.scheduled_tasks_with_count', {
+        count: safeCronJobCount,
+        defaultValue: `${cronButtonLabel} (${safeCronJobCount})`,
+      })
+    : cronButtonLabel;
 
   const renderQuickSubWindowControl = () => showQuickSubWindowControl ? (
     <button
@@ -1488,12 +1607,18 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     </button>
   ) : null;
 
-  const renderCompactSubSessionButtons = (orientation: 'horizontal' | 'vertical') => orderedSessions.map((sub) => (
+  const renderCompactSubSessionButtons = (
+    orientation: 'horizontal' | 'vertical',
+    sessionsToRender: SubSession[] = orderedSessions,
+    extraClass?: string,
+  ) => sessionsToRender.map((sub) => (
     <CollapsedSubSessionButton
       key={sub.id}
       sub={sub}
       orientation={orientation}
+      extraClass={extraClass}
       accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+      sequenceNumber={sequenceById.get(sub.id)}
       isOpen={openIds.has(sub.id)}
       isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
       idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
@@ -1558,7 +1683,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         <div
           class="subsession-vertical-rail-scroll"
           data-testid="subsession-vertical-rail-scroll"
-          ref={collapsedBarRef}
+          ref={setCollapsedBarElement}
         >
           {renderCompactSubSessionButtons('vertical')}
         </div>
@@ -1628,11 +1753,52 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     )
     : null;
 
+  const hasSubSessions = subSessions.length > 0;
+  const showMobileFooter = isMobile && !!daemonBadgeState;
+  const inlineMobileFooterInToolbar = showMobileFooter
+    && !hasSubSessions
+    && (collapsed || (!onNew && discussions.length === 0));
+
+  const renderMobileFooterStatus = (inline: boolean) => {
+    if (!showMobileFooter || !daemonBadgeState) return null;
+    const buildTimeLabel = getBuildTimeCompact();
+    return (
+      <div
+        class={`subcard-mobile-footer-status${inline ? ' subcard-mobile-footer-status-inline' : ''}`}
+        data-testid="mobile-subsession-footer-status"
+      >
+        <span
+          class={`badge ${
+            daemonBadgeState === 'online'
+              ? 'badge-online'
+              : daemonBadgeState === 'connecting'
+                ? 'badge-connecting'
+                : 'badge-offline'
+          }`}
+          data-testid="mobile-subsession-footer-badge"
+        >
+          {daemonBadgeState === 'online'
+            ? '● Online'
+            : daemonBadgeState === 'connecting'
+              ? (<><span class="connecting-dot" />{' Connecting'}</>)
+              : (<><span class="connecting-dot" />{' Daemon Offline'}</>)}
+        </span>
+        {buildTimeLabel && (
+          <span class="subcard-mobile-footer-version" data-testid="mobile-subsession-footer-version">
+            {`v${buildTimeLabel}`}
+          </span>
+        )}
+      </div>
+    );
+  };
+
   return (
     <>
     {verticalRail}
     {teamDiscussionRail}
-    <div class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}`}>
+    <div
+      class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}${isMobile ? ' subcard-bar-mobile' : ''}${isMobile && !hasSubSessions ? ' subcard-bar-mobile-empty' : ''}${inlineMobileFooterInToolbar ? ' subcard-bar-mobile-inline-footer' : ''}${isMobile && !collapsed ? ' subcard-bar-mobile-expanded' : ''}`}
+    >
       {/* Toolbar */}
       <div class="subcard-toolbar">
         {!isVerticalRail && <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
@@ -1817,6 +1983,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             </button>
           );
         })()}
+        {inlineMobileFooterInToolbar && (
+          <>
+            {renderMobileFooterStatus(true)}
+            <span class="subcard-toolbar-spacer" aria-hidden="true" />
+          </>
+        )}
         {onNew && (
           <button
             class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
@@ -1916,13 +2088,42 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           <button
             class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-onboarding="cron-manager"
+            data-cron-count={safeCronJobCount}
             onClick={onViewCron}
-            title={cronButtonLabel}
-            aria-label={cronButtonLabel}
-            style={{ marginLeft: 4, fontSize: 11 }}
+            title={cronButtonTitle}
+            aria-label={cronButtonTitle}
+            style={{ position: 'relative', overflow: 'visible', marginLeft: 4, fontSize: 11 }}
           >
             <span aria-hidden="true">⏰</span>
             {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{cronButtonLabel}</span>}
+            {safeCronJobCount > 0 && (
+              <span
+                data-testid="cron-jobs-count-badge"
+                aria-label={t('subsessionBar.scheduled_tasks_count_aria', {
+                  count: safeCronJobCount,
+                  defaultValue: '{{count}} scheduled tasks',
+                })}
+                style={{
+                  position: 'absolute',
+                  top: -4,
+                  right: -4,
+                  minWidth: 14,
+                  height: 14,
+                  padding: '0 3px',
+                  borderRadius: 7,
+                  background: '#3b82f6',
+                  color: '#fff',
+                  fontSize: 9,
+                  fontWeight: 700,
+                  lineHeight: '14px',
+                  textAlign: 'center',
+                  pointerEvents: 'none',
+                  boxSizing: 'border-box',
+                }}
+              >
+                {safeCronJobCount > 99 ? '99+' : safeCronJobCount}
+              </span>
+            )}
           </button>
         )}
       </div>
@@ -1991,7 +2192,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       {!isVerticalRail && collapsed && subSessions.length > 0 && (
         <div class="subsession-row-with-close">
           {renderQuickSubWindowControl()}
-          <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
+          <div class="subsession-bar" style={{ borderTop: 'none' }} ref={setCollapsedBarElement}>
             {renderCompactSubSessionButtons('horizontal')}
           </div>
         </div>
@@ -2006,11 +2207,30 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
             style={layout === 'double' ? { gridAutoColumns: 'max-content' } : undefined}
           >
-            {orderedSessions.map((sub, index) => (
+            {expandedCardSessions.map((sub, index) => (
               <div
                 key={sub.id}
                 class="subcard-drag-wrap"
-                draggable
+                draggable={desktopLayoutCapable}
+                onPointerDownCapture={(event) => {
+                  const target = event.target as Element | null;
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable
+                    && !shouldIgnoreSubSessionEntryGestureTarget(target, event.currentTarget as Element);
+                }}
+                onMouseDownCapture={(event) => {
+                  const target = event.target as Element | null;
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable
+                    && !shouldIgnoreSubSessionEntryGestureTarget(target, event.currentTarget as Element);
+                }}
+                onPointerUpCapture={(event) => {
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable;
+                }}
+                onPointerCancelCapture={(event) => {
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable;
+                }}
+                onMouseUpCapture={(event) => {
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable;
+                }}
                 onPointerDown={(event) => handleEntryPointerDown(sub.id, event)}
                 onTouchStart={(event) => handleExpandedEntryTouchStart(sub.id, event)}
                 onTouchMove={(event) => handleExpandedEntryTouchMove(sub.id, event)}
@@ -2019,9 +2239,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 onClick={(event) => handleEntryClick(sub.id, event)}
                 onDblClick={(event) => handleEntryDoubleClick(sub.id, event)}
                 onDragStart={(e) => {
+                  const target = e.target as Element | null;
+                  if (!desktopLayoutCapable || shouldIgnoreSubSessionEntryGestureTarget(target, e.currentTarget as Element)) {
+                    e.preventDefault();
+                    return;
+                  }
                   dragIdRef.current = sub.id;
                   suppressEntryClickRef.current = true;
-                  e.dataTransfer!.effectAllowed = 'move';
+                  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
                   (e.currentTarget as HTMLElement).style.opacity = '0.5';
                   // Initialize dragOrder from current displayed order
                   if (!dragOrder) setDragOrder(orderedSessions.map((s) => s.id));
@@ -2072,11 +2297,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                     accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                     previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
+                    sequenceNumber={sequenceById.get(sub.id)}
                   />
                 ) : (
                   <ExpandedSubSessionPlaceholder
                     sub={sub}
                     accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                    sequenceNumber={sequenceById.get(sub.id)}
                     cardSize={cardSize}
                     sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
                     inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
@@ -2085,9 +2312,19 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 )}
               </div>
             ))}
+            {expandedOverflowSessions.length > 0 && (
+              <div
+                class="subsession-overflow-pills"
+                data-testid="subsession-overflow-pills"
+                style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, padding: '4px 6px' }}
+              >
+                {renderCompactSubSessionButtons('horizontal', expandedOverflowSessions, 'subsession-pill')}
+              </div>
+            )}
           </div>
         </div>
       )}
+      {!inlineMobileFooterInToolbar && renderMobileFooterStatus(false)}
       {showDaemonDetails && stats && (
         <DaemonStatsModal
           stats={stats}

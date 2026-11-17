@@ -1,3 +1,4 @@
+import { suppressIncognitoLog } from '../../shared/session-incognito-context.js';
 import pino from 'pino';
 import { join } from 'path';
 import { mkdirSync, existsSync, openSync, statSync, renameSync, unlinkSync } from 'fs';
@@ -39,12 +40,18 @@ const isDaemon = process.argv.includes('--foreground');
 // Detect if running interactively (start without --foreground, or dev mode)
 const isInteractive = !isDaemon && process.stdout.isTTY;
 
+const privacyHooks: pino.LoggerOptions['hooks'] = {
+  logMethod(args, method) {
+    if (!suppressIncognitoLog(args)) method.apply(this, args as Parameters<typeof method>);
+  },
+};
+
 function buildLogger(): pino.Logger {
   // Interactive CLI commands (status, bind, etc.): console only, with pino-pretty if available
   if (isInteractive) {
     const usePretty = hasPinoPretty();
     return pino({
-      level: process.env.LOG_LEVEL ?? 'info',
+      level: process.env.LOG_LEVEL ?? 'info', hooks: privacyHooks,
       transport: usePretty ? { target: 'pino-pretty', options: { colorize: true } } : undefined,
     });
   }
@@ -84,7 +91,7 @@ function buildLogger(): pino.Logger {
   }
 
   return pino(
-    { level: process.env.LOG_LEVEL ?? 'info' },
+    { level: process.env.LOG_LEVEL ?? 'info', hooks: privacyHooks },
     pino.multistream(streams),
   );
 }

@@ -352,11 +352,9 @@ export function defaultDaemonRuntimeStatusDir(): string {
   return imcodesStateDir();
 }
 
-export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeStatusDir()): DaemonRuntimeStatus | null {
-  const filePath = join(baseDir, RUNTIME_STATUS_FILE);
+export function parseDaemonRuntimeStatus(rawText: string): DaemonRuntimeStatus | null {
   try {
-    if (!existsSync(filePath)) return null;
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    const parsed = JSON.parse(rawText) as Record<string, unknown>;
     const pid = coerceNonNegativeSafeInteger(parsed.pid);
     const startedAt = coerceNonNegativeSafeInteger(parsed.startedAt);
     const updatedAt = coerceNonNegativeSafeInteger(parsed.updatedAt);
@@ -377,6 +375,16 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
       ...(diagnostics ? { diagnostics } : {}),
       ...(eventLoop ? { eventLoop } : {}),
     };
+  } catch {
+    return null;
+  }
+}
+
+export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeStatusDir()): DaemonRuntimeStatus | null {
+  const filePath = join(baseDir, RUNTIME_STATUS_FILE);
+  try {
+    if (!existsSync(filePath)) return null;
+    return parseDaemonRuntimeStatus(readFileSync(filePath, 'utf8'));
   } catch {
     return null;
   }

@@ -10,7 +10,8 @@ import {
 import {
   MCP_TOOL_DISCOVERY_NAME,
 } from '../../shared/mcp-tool-discovery.js';
-import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
+import { MEMORY_MCP_SERVER_INSTRUCTIONS } from '../../shared/mcp-tool-distribution.js';
+import { createMemoryMcpServer, mergeDefaultToolDeps } from '../../src/daemon/memory-mcp-server.js';
 import { parseMcpRuntimeCallerFromEnv, type McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { getDefaultMcpServers } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
@@ -49,7 +50,7 @@ async function withClient(
   runtimeCaller: McpRuntimeCaller,
   capabilityService: CapabilityService | undefined,
   run: (client: Client) => Promise<void>,
-  extra: Pick<NonNullable<Parameters<typeof createMemoryMcpServer>[1]>, 'runAgentSkills' | 'runAgentMcp'> = {},
+  extra: Pick<NonNullable<Parameters<typeof createMemoryMcpServer>[1]>, 'runAgentSkills' | 'runAgentMcp' | 'listAgentMcp' | 'searchAgentMcpRegistry'> = {},
 ): Promise<void> {
   const server = createMemoryMcpServer(runtimeCaller, { capabilityService, ...extra });
   const client = new Client({ name: 'capability-tools-test', version: '1' });
@@ -71,7 +72,8 @@ describe('capability MCP tools', () => {
   it('advertises exactly the four capability tools on a registered FULL node', async () => {
     await withClient(caller(), service(), async (client) => {
       const tools = (await client.listTools()).tools;
-      expect(client.getInstructions()).toBeUndefined();
+      expect(client.getInstructions()).toBe(MEMORY_MCP_SERVER_INSTRUCTIONS);
+      expect(client.getInstructions()).not.toContain('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const names = tools.map((tool) => tool.name);
       expect(names.filter((name) => name.startsWith('capability_'))).toEqual([...CAPABILITY_MCP_TOOL_NAMES]);
       for (const name of CAPABILITY_MCP_TOOL_NAMES) {
@@ -351,5 +353,314 @@ describe('capability MCP tools', () => {
       expect(crossOwner).toMatchObject({ isError: true });
       expect(capabilityService.install).not.toHaveBeenCalled();
     });
+  });
+
+  it('installs standard Streamable HTTP/SSE/stdio/mcp.json/OpenCode configs without requiring scope or idempotencyKey, respects providers, and surfaces partial success', async () => {
+    const capabilityService = service();
+    const runAgentMcp = vi.fn(async (req) => {
+      if (req.server?.name === 'partial-srv') {
+        return {
+          ok: false,
+          error: 'failed' as const,
+          results: [
+            { agent: 'claude-code', ok: true },
+            { agent: 'cursor', ok: false, error: 'corrupt config' },
+          ],
+        };
+      }
+      return {
+        ok: true,
+        results: (req.agents ?? ['claude-code', 'codex']).map((agent: string) => ({ agent, ok: true })),
+      };
+    });
+
+    await withClient(caller(), capabilityService, async (client) => {
+      // 1. Minimal Streamable HTTP with streamable_http + no scope/idempotencyKey + smart URL host fallback ('mcp.context7.com' -> 'context7')
+      const ctx7 = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: {
+            kind: 'mcp_config',
+            mcpConfig: { transport: 'streamable_http', url: 'https://mcp.context7.com/mcp' },
+          },
+        },
+      });
+      expect(ctx7.isError).toBe(false);
+      expect(ctx7.structuredContent).toMatchObject({ status: 'ok', server: 'context7' });
+      expect(runAgentMcp).toHaveBeenLastCalledWith({
+        action: 'add',
+        server: { name: 'context7', transport: 'http', url: 'https://mcp.context7.com/mcp' },
+      });
+
+      // 2. type='sse' + providers filter alias mapping
+      const sseRes = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: { kind: 'mcp_config', mcpConfig: { name: 'events', type: 'sse', url: 'https://events.example.test/sse' } },
+          providers: ['claude-code-sdk', 'gemini'],
+        },
+      });
+      expect(sseRes.isError).toBe(false);
+      expect(runAgentMcp).toHaveBeenLastCalledWith({
+        action: 'add',
+        server: { name: 'events', transport: 'sse', url: 'https://events.example.test/sse' },
+        agents: ['claude-code', 'gemini-cli'],
+      });
+
+      // 3. Standard mcpServers wrapper + stdio package fallback (@upstash/context7-mcp -> context7-mcp)
+      const wrapped = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: {
+            kind: 'mcp_config',
+            mcpConfig: {
+              mcpServers: {
+                '': {},
+              },
+            },
+          },
+        },
+      });
+      expect(wrapped.isError).toBe(true);
+
+      const validWrapped = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: {
+            kind: 'mcp_config',
+            mcpConfig: {
+              mcpServers: {
+                sequential: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-sequential-thinking'] },
+              },
+            },
+          },
+        },
+      });
+      expect(validWrapped.isError).toBe(false);
+      expect(validWrapped.structuredContent).toMatchObject({ status: 'ok', server: 'sequential' });
+
+      // 4. Multi-entry mcpServers fails closed
+      const multiWrapped = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: {
+            kind: 'mcp_config',
+            mcpConfig: {
+              mcpServers: {
+                one: { command: 'npx', args: ['-y', 'a'] },
+                two: { command: 'npx', args: ['-y', 'b'] },
+              },
+            },
+          },
+        },
+      });
+      expect(multiWrapped.isError).toBe(true);
+      expect(multiWrapped.structuredContent).toMatchObject({ status: 'error', reason: 'invalid_input' });
+
+      // 5. OpenCode command array + inferred package name (@upstash/context7-mcp -> context7-mcp)
+      const opencode = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: {
+            kind: 'mcp_config',
+            mcpConfig: { type: 'local', command: ['npx', '-y', '@upstash/context7-mcp'] },
+          },
+        },
+      });
+      expect(opencode.isError).toBe(false);
+      expect(opencode.structuredContent).toMatchObject({ status: 'ok', server: 'context7-mcp' });
+      expect(runAgentMcp).toHaveBeenLastCalledWith({
+        action: 'add',
+        server: { name: 'context7-mcp', transport: 'stdio', command: 'npx', args: ['-y', '@upstash/context7-mcp'] },
+      });
+
+      // 6. Actionable error when string command contains spaces/flags
+      const spacedCmd = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: { kind: 'mcp_config', mcpConfig: { command: 'npx -y @upstash/context7-mcp' } },
+        },
+      });
+      expect(spacedCmd.isError).toBe(true);
+      expect(spacedCmd.structuredContent).toMatchObject({
+        status: 'error',
+        reason: 'invalid_input',
+        error: expect.stringContaining('pass flags/packages in args'),
+      });
+
+      // 7. Partial agent success returns status='ok' with partial=true and detailed agents array
+      const partial = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: { kind: 'mcp_config', mcpConfig: { name: 'partial-srv', url: 'https://partial.example.test/mcp' } },
+        },
+      });
+      expect(partial.isError).toBe(false);
+      expect(partial.structuredContent).toMatchObject({
+        status: 'ok',
+        partial: true,
+        server: 'partial-srv',
+        agents: [
+          { agent: 'claude-code', ok: true },
+          { agent: 'cursor', ok: false, error: 'corrupt config' },
+        ],
+      });
+
+      // 8. Cleartext non-localhost HTTP URL fails closed
+      const cleartext = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: { kind: 'mcp_config', mcpConfig: { name: 'insecure', url: 'http://example.com/mcp' } },
+        },
+      });
+      expect(cleartext.isError).toBe(true);
+      expect(cleartext.structuredContent).toMatchObject({ status: 'error', reason: 'invalid_input' });
+    }, { runAgentMcp });
+  });
+
+  it('lists installed MCPs via listAgentMcp, searches official registry via searchRegistry, and uninstalls MCPs via runAgentMcp', async () => {
+    const capabilityService = service();
+    capabilityService.manage = vi.fn(async () => ({
+      status: 'error' as const,
+      reason: CAPABILITY_ERROR.NOT_FOUND,
+      error: 'not in legacy store',
+    }));
+    const listAgentMcp = vi.fn(async () => ({
+      servers: [
+        {
+          name: 'context7',
+          transport: 'http' as const,
+          url: 'https://mcp.context7.com/mcp',
+          envNames: [],
+          headerNames: [],
+          agents: ['claude-code', 'codex'],
+        },
+        {
+          name: 'imcodes-memory',
+          transport: 'stdio' as const,
+          command: 'imcodes',
+          envNames: [],
+          headerNames: [],
+          agents: ['claude-code'],
+        },
+      ],
+      agents: [{ agent: 'claude-code', displayName: 'Claude Code' }, { agent: 'codex', displayName: 'Codex' }],
+    }));
+    const searchAgentMcpRegistry = vi.fn(async (query: string) => [
+      {
+        id: 'io.upstash/context7',
+        description: `Registry match for ${query}`,
+        remote: { transport: 'http' as const, url: 'https://mcp.context7.com/mcp', headers: [] },
+      },
+    ]);
+    const runAgentMcp = vi.fn(async (req) => {
+      if (req.action === 'remove' && req.name === 'context7') {
+        return { ok: true, results: [{ agent: 'claude-code', ok: true }, { agent: 'codex', ok: true }] };
+      }
+      return { ok: false, error: 'failed' as const, results: [] };
+    });
+
+    await withClient(caller(), capabilityService, async (client) => {
+      // 1. Inventory list returns live installed MCPs + detectedAgents
+      const listed = await client.callTool({ name: 'capability_list', arguments: { kind: 'mcp', query: 'context' } });
+      expect(listed.isError).toBe(false);
+      expect(listed.structuredContent).toMatchObject({
+        status: 'ok',
+        detectedAgents: [{ agent: 'claude-code', displayName: 'Claude Code' }, { agent: 'codex', displayName: 'Codex' }],
+        items: [
+          expect.objectContaining({
+            id: 'mcp:context7',
+            kind: 'mcp',
+            name: 'context7',
+            state: 'active',
+            scope: 'local',
+            transport: 'http',
+            url: 'https://mcp.context7.com/mcp',
+            agents: ['claude-code', 'codex'],
+          }),
+        ],
+      });
+
+      // 2. Registry lookup requires non-empty query
+      const badRegistry = await client.callTool({ name: 'capability_list', arguments: { searchRegistry: true } });
+      expect(badRegistry.isError).toBe(true);
+      expect(badRegistry.structuredContent).toMatchObject({ status: 'error', reason: 'invalid_input' });
+
+      // 3. Registry lookup succeeds
+      const registryRes = await client.callTool({ name: 'capability_list', arguments: { searchRegistry: true, query: 'context7' } });
+      expect(registryRes.isError).toBe(false);
+      expect(searchAgentMcpRegistry).toHaveBeenCalledWith('context7');
+      expect(registryRes.structuredContent).toMatchObject({
+        status: 'ok',
+        registry: true,
+        query: 'context7',
+        servers: [expect.objectContaining({ id: 'io.upstash/context7' })],
+      });
+
+      // 4. Explicit kind='mcp' uninstall removes via runAgentMcp
+      const removed = await client.callTool({
+        name: 'capability_manage',
+        arguments: { action: 'uninstall', kind: 'mcp', name: 'context7', userIntent: 'uninstall context7 MCP' },
+      });
+      expect(removed.isError).toBe(false);
+      expect(removed.structuredContent).toMatchObject({
+        status: 'ok',
+        removed: 'context7',
+        agents: [{ agent: 'claude-code', ok: true }, { agent: 'codex', ok: true }],
+      });
+      expect(runAgentMcp).toHaveBeenCalledWith({ action: 'remove', name: 'context7' });
+
+      // 5. Fallback uninstall when kind omitted and service.manage returns not_found
+      const removedFallback = await client.callTool({
+        name: 'capability_manage',
+        arguments: { action: 'uninstall', name: 'context7', userIntent: 'remove context7' },
+      });
+      expect(removedFallback.isError).toBe(false);
+      expect(removedFallback.structuredContent).toMatchObject({ status: 'ok', removed: 'context7' });
+
+      // 6. imcodes-memory protection returns reserved_name
+      const reserved = await client.callTool({
+        name: 'capability_manage',
+        arguments: { action: 'uninstall', kind: 'mcp', name: 'imcodes-memory', userIntent: 'remove imcodes-memory' },
+      });
+      expect(reserved.isError).toBe(true);
+      expect(reserved.structuredContent).toMatchObject({ status: 'error', reason: 'reserved_name' });
+
+      // 7. Unknown MCP server uninstall returns not_found
+      const missing = await client.callTool({
+        name: 'capability_manage',
+        arguments: { action: 'uninstall', kind: 'mcp', name: 'does-not-exist', userIntent: 'remove missing' },
+      });
+      expect(missing.isError).toBe(true);
+      expect(missing.structuredContent).toMatchObject({ status: 'error', reason: 'not_found' });
+    }, { listAgentMcp, searchAgentMcpRegistry, runAgentMcp });
+
+    // Offline/failing official MCP Registry returns typed error without crashing
+    const failingRegistry = vi.fn(async () => { throw new Error('network timeout'); });
+    await withClient(caller(), capabilityService, async (client) => {
+      const offline = await client.callTool({ name: 'capability_list', arguments: { searchRegistry: true, query: 'context7' } });
+      expect(offline.isError).toBe(true);
+      expect(offline.structuredContent).toMatchObject({ status: 'error', reason: 'acquisition_failed', retryable: true });
+    }, { searchAgentMcpRegistry: failingRegistry });
+  });
+
+  it('wires listAgentMcp and searchAgentMcpRegistry alongside default capabilityService in production', () => {
+    const prodDeps = mergeDefaultToolDeps(caller(), {});
+    expect(typeof prodDeps.capabilityService?.list).toBe('function');
+    expect(typeof prodDeps.listAgentMcp).toBe('function');
+    expect(typeof prodDeps.searchAgentMcpRegistry).toBe('function');
+
+    const unitDeps = mergeDefaultToolDeps(caller(), { capabilityService: service() });
+    expect(unitDeps.listAgentMcp).toBeUndefined();
+    expect(unitDeps.searchAgentMcpRegistry).toBeUndefined();
   });
 });

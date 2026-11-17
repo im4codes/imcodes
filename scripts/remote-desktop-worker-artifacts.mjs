@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { lstat, readFile, readdir } from 'node:fs/promises';
+import { lstat, open, readFile, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,6 +25,7 @@ export const REMOTE_DESKTOP_PROTOCOL_VERSION = 2;
 export const REMOTE_DESKTOP_WORKER_IPC_VERSION = 1;
 export const REMOTE_DESKTOP_MACOS_WORKER_FILENAME = 'imcodes-remote-desktop-worker';
 export const REMOTE_DESKTOP_LINUX_WORKER_FILENAME = 'imcodes-linux-remote-desktop-worker';
+export const REMOTE_DESKTOP_LINUX_MAX_GLIBC_VERSION = '2.31';
 export const REMOTE_DESKTOP_WORKER_SIDECAR_DIR = 'remote-desktop-worker';
 export const REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR = 'linux-x64';
 export const REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME = 'imcodes-remote-desktop-launch-agent';
@@ -375,15 +376,228 @@ export async function verifyRemoteDesktopWorkerArtifactSet(
   return { executablePath, componentPaths, manifestPath, archivePath, manifest };
 }
 
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+const ELFCLASS64 = 2;
+const ELFDATA2LSB = 1;
+const EM_X86_64 = 0x3e;
+const SHT_GNU_VERNEED = 0x6ffffffe;
+const MAX_ELF_METADATA_BYTES = 16 * 1024 * 1024;
+
+function parseGlibcVersionTuple(versionString) {
+  const match = /^([0-9]+)\.([0-9]+)(?:\.([0-9]+))?$/.exec(versionString);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), match[3] === undefined ? 0 : Number(match[3])];
+}
+
+function compareVersionTuples(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return 0;
+}
+
+function readElfCString(buffer, offset) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset >= buffer.length) {
+    throw new Error('malformed linux ELF string table offset');
+  }
+  const end = buffer.indexOf(0, offset);
+  const sliceEnd = end === -1 ? buffer.length : end;
+  return buffer.subarray(offset, sliceEnd).toString('utf8');
+}
+
+function parseElf64Header(header, totalSize) {
+  if (header.length < 64
+    || !header.subarray(0, 4).equals(ELF_MAGIC)
+    || header[4] !== ELFCLASS64
+    || header[5] !== ELFDATA2LSB) {
+    throw new Error('linux remote desktop worker is not a little-endian ELF64 binary');
+  }
+  const machine = header.readUInt16LE(18);
+  if (machine !== EM_X86_64) {
+    throw new Error(`linux remote desktop worker has unexpected ELF machine: ${machine}`);
+  }
+  const shoff = Number(header.readBigUInt64LE(40));
+  const shentsize = header.readUInt16LE(58);
+  const shnum = header.readUInt16LE(60);
+  if (!Number.isSafeInteger(shoff) || shoff <= 0 || shentsize < 64 || shoff > totalSize) {
+    throw new Error('malformed linux ELF section header table');
+  }
+  return { shoff, shentsize, shnum };
+}
+
+function parseElf64SectionHeaders(sectionTable, shnum, shentsize, totalSize) {
+  const sections = [];
+  for (let index = 0; index < shnum; index += 1) {
+    const base = index * shentsize;
+    if (base + 64 > sectionTable.length) {
+      throw new Error('truncated linux ELF section header table');
+    }
+    const type = sectionTable.readUInt32LE(base + 4);
+    const offset = Number(sectionTable.readBigUInt64LE(base + 24));
+    const size = Number(sectionTable.readBigUInt64LE(base + 32));
+    const link = sectionTable.readUInt32LE(base + 40);
+    const info = sectionTable.readUInt32LE(base + 44);
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size < 0) {
+      throw new Error('malformed linux ELF section bounds');
+    }
+    if (type !== 8 && offset + size > totalSize) {
+      throw new Error('truncated linux ELF section payload');
+    }
+    sections.push({ type, offset, size, link, info });
+  }
+  return sections;
+}
+
+function parseVerneedSection(verneedBuf, dynstrBuf, entryCount) {
+  const requirements = [];
+  let pos = 0;
+  for (let entryIndex = 0; entryIndex < entryCount; entryIndex += 1) {
+    if (pos + 16 > verneedBuf.length) {
+      throw new Error('malformed linux ELF .gnu.version_r section');
+    }
+    const vnVersion = verneedBuf.readUInt16LE(pos);
+    const vnCnt = verneedBuf.readUInt16LE(pos + 2);
+    const vnFile = verneedBuf.readUInt32LE(pos + 4);
+    const vnAux = verneedBuf.readUInt32LE(pos + 8);
+    const vnNext = verneedBuf.readUInt32LE(pos + 12);
+    if (vnVersion !== 1 || vnAux < 16) {
+      throw new Error('malformed linux ELF .gnu.version_r entry');
+    }
+    const library = readElfCString(dynstrBuf, vnFile);
+    let auxPos = pos + vnAux;
+    for (let auxIndex = 0; auxIndex < vnCnt; auxIndex += 1) {
+      if (auxPos + 16 > verneedBuf.length) {
+        throw new Error('malformed linux ELF .gnu.version_r aux entry');
+      }
+      const vnaName = verneedBuf.readUInt32LE(auxPos + 8);
+      const vnaNext = verneedBuf.readUInt32LE(auxPos + 12);
+      requirements.push({ library, version: readElfCString(dynstrBuf, vnaName) });
+      if (auxIndex + 1 < vnCnt) {
+        if (vnaNext < 16) {
+          throw new Error('malformed linux ELF .gnu.version_r aux chain');
+        }
+        auxPos += vnaNext;
+      }
+    }
+    if (vnNext === 0) break;
+    if (vnNext < 16) {
+      throw new Error('malformed linux ELF .gnu.version_r chain');
+    }
+    pos += vnNext;
+  }
+  return requirements;
+}
+
+async function collectElf64VerneedRequirements(totalSize, readSlice) {
+  const header = await readSlice(0, 64, 'header');
+  const { shoff, shentsize, shnum: rawShnum } = parseElf64Header(header, totalSize);
+  let shnum = rawShnum;
+  if (shnum === 0) {
+    if (shoff + 64 > totalSize) {
+      throw new Error('truncated linux ELF section header table');
+    }
+    const firstSection = await readSlice(shoff, 64, 'section 0');
+    shnum = Number(firstSection.readBigUInt64LE(32));
+  }
+  const tableBytes = shnum * shentsize;
+  if (!Number.isSafeInteger(tableBytes) || shoff + tableBytes > totalSize) {
+    throw new Error('truncated linux ELF section header table');
+  }
+  const sectionTable = await readSlice(shoff, tableBytes, 'section header table');
+  const sections = parseElf64SectionHeaders(sectionTable, shnum, shentsize, totalSize);
+  const requirements = [];
+  for (const section of sections) {
+    if (section.type !== SHT_GNU_VERNEED) continue;
+    const strSection = sections[section.link];
+    if (!strSection) throw new Error('linux ELF .gnu.version_r links to missing string table');
+    const [verneedBuf, dynstrBuf] = await Promise.all([
+      readSlice(section.offset, section.size, '.gnu.version_r'),
+      readSlice(strSection.offset, strSection.size, '.dynstr'),
+    ]);
+    requirements.push(...parseVerneedSection(verneedBuf, dynstrBuf, section.info));
+  }
+  return requirements;
+}
+
+export async function parseElf64GlibcRequirements(elfBuffer) {
+  const buffer = Buffer.isBuffer(elfBuffer) ? elfBuffer : Buffer.from(elfBuffer);
+  if (buffer.length < 64) {
+    throw new Error('linux remote desktop worker is not a little-endian ELF64 binary');
+  }
+  return collectElf64VerneedRequirements(
+    buffer.length,
+    async (offset, length) => buffer.subarray(offset, offset + length),
+  );
+}
+
+async function readExactSlice(handle, offset, length, label) {
+  if (length < 0 || length > MAX_ELF_METADATA_BYTES) {
+    throw new Error(`linux ELF ${label} exceeds supported metadata size`);
+  }
+  const out = Buffer.allocUnsafe(length);
+  let totalRead = 0;
+  while (totalRead < length) {
+    const { bytesRead } = await handle.read(out, totalRead, length - totalRead, offset + totalRead);
+    if (bytesRead === 0) {
+      throw new Error(`truncated linux ELF ${label}`);
+    }
+    totalRead += bytesRead;
+  }
+  return out;
+}
+
+export async function readLinuxElf64GlibcRequirements(executablePath, knownSize) {
+  const handle = await open(executablePath, 'r');
+  try {
+    const fileSize = knownSize ?? (await handle.stat()).size;
+    if (fileSize < 64) {
+      throw new Error('linux remote desktop worker is not a little-endian ELF64 binary');
+    }
+    return await collectElf64VerneedRequirements(
+      fileSize,
+      (offset, length, label) => readExactSlice(handle, offset, length, label),
+    );
+  } finally {
+    await handle.close();
+  }
+}
+
+export function assertLinuxElfGlibcCeiling(
+  requirements,
+  maxGlibcVersion = REMOTE_DESKTOP_LINUX_MAX_GLIBC_VERSION,
+) {
+  const maxTuple = parseGlibcVersionTuple(maxGlibcVersion);
+  if (!maxTuple) {
+    throw new Error(`invalid max GLIBC version ceiling: ${maxGlibcVersion}`);
+  }
+  const violations = [];
+  for (const requirement of requirements) {
+    if (!requirement.version.startsWith('GLIBC_')) continue;
+    const tuple = parseGlibcVersionTuple(requirement.version.slice('GLIBC_'.length));
+    if (!tuple || compareVersionTuples(tuple, maxTuple) > 0) {
+      violations.push(`${requirement.library} (${requirement.version})`);
+    }
+  }
+  if (violations.length > 0) {
+    throw new Error(
+      `linux remote desktop worker requires unsupported GLIBC version(s) above ${maxGlibcVersion}: ${violations.join(', ')}`,
+    );
+  }
+}
+
 /**
  * The Linux worker is two files, the executable and its manifest, in remote-desktop-worker/linux-x64/ (the exact release version, size and sha256 included). The server serves
  * the executable only together with a manifest that matches it (a missing or mismatching one answers "not published"),
  * and a controlled-node self-upgrade fails its preflight without both, so a release that lacks either must fail HERE, at
  * build time, not on every Linux node in the field. This is the full check -- both files present and regular, the
- * executable bit, the strict manifest shape, size, sha256 and (when given) the release version -- used on the build
- * runner, on the downloaded artifact and on the final image.
+ * executable bit, the strict manifest shape, size, sha256, ELF64 GLIBC symbol ceiling and (when given) the release
+ * version -- used on the build runner, on the downloaded artifact and on the final image.
  */
-export async function verifyLinuxRemoteDesktopWorkerArtifactSet(directory, expectedVersion) {
+export async function verifyLinuxRemoteDesktopWorkerArtifactSet(
+  directory,
+  expectedVersion,
+  options = {},
+) {
   const platformDirectory = join(directory, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
   const manifestName = `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
   const executablePath = join(platformDirectory, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
@@ -431,7 +645,9 @@ export async function verifyLinuxRemoteDesktopWorkerArtifactSet(directory, expec
   if (actualSha256 !== manifest.artifact.sha256) {
     throw new Error(`linux remote desktop worker sha256 mismatch: expected ${manifest.artifact.sha256}, got ${actualSha256}`);
   }
-  return { executablePath, manifestPath, manifest, sha256: actualSha256 };
+  const glibcRequirements = await readLinuxElf64GlibcRequirements(executablePath, executableStat.size);
+  assertLinuxElfGlibcCeiling(glibcRequirements, options.maxGlibcVersion);
+  return { executablePath, manifestPath, manifest, sha256: actualSha256, glibcRequirements };
 }
 
 async function main() {

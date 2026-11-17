@@ -1043,6 +1043,7 @@ describe('TransportSessionRuntime', () => {
       });
 
       it('does not dispatch attachment rows as a new turn on this path', async () => {
+        mock.provider.capabilities.attachments = true;
         runtime.send('foreground work', 'foreground-attach');
         await waitForProviderSendCount(mock.provider, 1);
         expect(runtime.send('has attachment', 'q-attach', [
@@ -1168,6 +1169,7 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
+
   it('directly appends an external MCP message without creating a pending queue row', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -1187,6 +1189,7 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
+
 
   it.each([
     ['delegation completion', 'delegation-reply-real-queue', 'delegation completed'],
@@ -1429,6 +1432,7 @@ describe('TransportSessionRuntime', () => {
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(reason === 'refused'
       ? AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE : AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
     if (reason === 'provider') mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    if (reason === 'attachments') mock.provider.capabilities.attachments = true;
     runtime.send('old turn', 'stop-kind-old');
     await waitForProviderSendCount(mock.provider, 1);
     await flushDispatch();
@@ -1853,6 +1857,7 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
+
 
   it('continues the accepted APPEND flush past a retry head without tombstoning it', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
@@ -2366,6 +2371,7 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
+
   it('keeps queued messages intact when active-turn append is unsupported', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
     runtime.send('foreground work', 'foreground-unsupported');
@@ -2383,8 +2389,9 @@ describe('TransportSessionRuntime', () => {
     ]);
   });
 
-  it('rejects queued attachments without steering or removing them', async () => {
+  it('rejects queued attachments without steering or removing them when provider handles structured attachments', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.capabilities.attachments = true;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
     runtime.send('foreground work', 'foreground-attachment');
     await flushDispatch();
@@ -2404,6 +2411,74 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
       expect.objectContaining({ clientMessageId: 'queued-attachment', status: 'queued' }),
     ]);
+  });
+
+  it('keeps appendFallbackReason attachments_unsupported on send() when provider handles structured attachments', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.capabilities.attachments = true;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-send-attach-true');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+
+    expect(runtime.send('#1:(/tmp/append.png)\ncheck', 'queued-send-attach-true', [
+      { id: 'att-send-true', daemonPath: '/tmp/append.png', originalName: 'append.png', type: 'image' },
+    ], undefined, { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'queued-send-attach-true',
+        appendFallbackReason: 'attachments_unsupported',
+        status: 'queued',
+      }),
+    ]);
+  });
+
+  it('admits active-turn append for text-inlined attachments on both auto-flush and manual append when capabilities.attachments is false', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.capabilities.attachments = false;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-text-inlined');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+
+    expect(runtime.send('#1:(/tmp/append.png)\nlook at this', 'auto-text-inlined', [
+      { id: 'att-inlined-1', daemonPath: '/tmp/append.png', originalName: 'append.png', type: 'image' },
+    ], undefined, { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND })).toBe('queued');
+
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline
+      && ((mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.length < 1
+        || runtime.pendingEntries.length > 0
+        || getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.length > 0)) {
+      await flushDispatch();
+    }
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'auto-text-inlined',
+      text: '#1:(/tmp/append.png)\nlook at this',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+
+    expect(runtime.send('#1:(/tmp/manual.png)\nmanual steer', 'manual-text-inlined', [
+      { id: 'att-inlined-2', daemonPath: '/tmp/manual.png', originalName: 'manual.png', type: 'image' },
+    ])).toBe('queued');
+
+    const manualResult = await runtime.appendPendingMessagesToActiveTurn(['manual-text-inlined'], 'append-manual-inlined');
+
+    expect(manualResult).toMatchObject({
+      status: 'delivered',
+      entries: [expect.objectContaining({ clientMessageId: 'manual-text-inlined' })],
+    });
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'append-manual-inlined',
+      text: '#1:(/tmp/manual.png)\nmanual steer',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
   it('rejects queued slash controls without steering or removing them', async () => {
@@ -7255,6 +7330,56 @@ ${PREFERENCE_CONTEXT_END}`;
     }));
   });
 
+  it('cancel() closes lingering open tools during capacity retry backoff and settles cleanly when !_activeTurn && !_sending', async () => {
+    runtime.send('cap-turn', 'msg-cap');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    vi.useFakeTimers();
+    try {
+      const state = runtime as unknown as {
+        _activeDispatchProviderStarted: boolean;
+        _activeDispatchProviderAccepted: boolean;
+        _activeDispatchHasSideEffectEvidence: boolean;
+      };
+      state._activeDispatchProviderStarted = false;
+      state._activeDispatchProviderAccepted = false;
+      state._activeDispatchHasSideEffectEvidence = false;
+      mock.fireError('sess-1', {
+        code: 'PROVIDER_ERROR',
+        message: 'Selected model is at capacity.',
+        recoverable: false,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('capacity_retry');
+
+      // Simulate a lingering unclosed tool while !_activeTurn && !_sending under capacity retry.
+      (runtime as any)._openTools.set('tool-cap-open', { generation: 1, name: 'Bash', status: 'running' });
+
+      await runtime.cancel();
+
+      expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+        'deck_test_brain',
+        'tool.result',
+        expect.objectContaining({
+          toolCallId: 'tool-cap-open',
+          terminalStatus: 'cancelled',
+          terminalReason: 'user_cancelled',
+        }),
+        expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+      );
+      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getDiagnosticSnapshot().activeToolCount).toBe(0);
+      expect(runtime.getDiagnosticSnapshot().blockingWorkCount).toBe(0);
+
+      // Re-cancelling when already idle / !_activeTurn && !_sending stays clean.
+      await runtime.cancel();
+      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getDiagnosticSnapshot().blockingWorkCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('external completion settles the active turn and drains queued messages without waiting for provider callbacks', async () => {
     runtime.send('first marker-backed workflow turn', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
@@ -7336,6 +7461,244 @@ ${PREFERENCE_CONTEXT_END}`;
       userMessage: 'queued after stuck compact',
       assembledMessage: 'queued after stuck compact',
     }));
+    expect(runtime.pendingCount).toBe(0);
+  });
+
+  it('external completion with silent provider.cancel() does not swallow turn 2 onComplete or wedge future turns', async () => {
+    let providerActive = false;
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: providerActive ? 1 : 0,
+      activeToolCount: providerActive ? 1 : 0,
+      busyReasons: providerActive ? ['open_tool_call', 'background_monitor'] : [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      providerActive = false;
+      // Intentionally silent: emits neither onComplete nor onError (e.g. AgyAcpProvider when !promptInFlight).
+      return Promise.resolve();
+    });
+
+    runtime.send('turn 1 with background task', 'cmd-t1');
+    await waitForProviderSendCount(mock.provider, 1);
+    providerActive = true;
+    (runtime as unknown as { _activeDispatchProviderStarted: boolean })._activeDispatchProviderStarted = false;
+    runtime.send('turn 2 queued while stale', 'cmd-t2');
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+    await waitForProviderSendCount(mock.provider, 2);
+
+    // Turn 2 completes normally: must NOT be swallowed by turn 1's _externalCompletionSettlementsToIgnore.
+    mock.fireComplete('sess-1', {
+      id: 'msg-t2',
+      role: 'assistant',
+      content: 'turn 2 response',
+      timestamp: Date.now(),
+    });
+    await flushDispatch();
+
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getHistory().some((m) => m.id === 'msg-t2' && m.content === 'turn 2 response')).toBe(true);
+
+    // Subsequent turn 3 dispatches immediately instead of queuing forever, and also settles cleanly.
+    expect(runtime.send('turn 3 fresh send', 'cmd-t3')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 3);
+    mock.fireComplete('sess-1', {
+      id: 'msg-t3',
+      role: 'assistant',
+      content: 'turn 3 response',
+      timestamp: Date.now(),
+    });
+    await flushDispatch();
+
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getHistory().some((m) => m.id === 'msg-t3' && m.content === 'turn 3 response')).toBe(true);
+  });
+
+  it('external completion with silent cancel() clears stale ignore before idle-later turn 2 without breaking late CANCELLED suppression or turn 3 cancel', async () => {
+    runtime.send('turn 1 stale without queued follow-up', 'cmd-idle-t1');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    // Turn 2 starts after session went idle, receives a late CANCELLED from turn 1 (must stay active),
+    // then finishes normally with onComplete (must settle to idle).
+    expect(runtime.send('turn 2 after idle', 'cmd-idle-t2')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'late cancellation from settled turn 1', recoverable: true });
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    mock.fireComplete('sess-1', {
+      id: 'msg-idle-t2',
+      role: 'assistant',
+      content: 'turn 2 settled',
+      timestamp: Date.now(),
+    });
+    await flushDispatch();
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+
+    // Even if turn 1 never emitted CANCELLED, turn 2 onComplete clears any leftover ignore budget so
+    // a genuine CANCELLED in turn 3 is handled normally rather than silently ignored.
+    runtime.send('turn 1 silent cancel again', 'cmd-t3-prep');
+    await waitForProviderSendCount(mock.provider, 3);
+    expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+    await flushDispatch();
+
+    expect(runtime.send('turn 2 completes without late cancelled', 'cmd-t3-mid')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 4);
+    mock.fireComplete('sess-1', { id: 'msg-t3-mid', role: 'assistant', content: 'ok', timestamp: Date.now() });
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    expect(runtime.send('turn 3 genuine provider cancel', 'cmd-t3-cancel')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 5);
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'turn 3 cancelled by provider', recoverable: true });
+    await flushDispatch();
+    expect(runtime.sending).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it.each([
+    {
+      name: 'recoverable onError',
+      terminateTurn2: async (
+        rt: TransportSessionRuntime,
+        m: ReturnType<typeof createMockProvider>,
+      ) => {
+        m.fireError('sess-1', {
+          code: 'PROVIDER_ERROR',
+          message: 'turn 2 recoverable failure',
+          recoverable: true,
+        });
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('idle');
+      },
+    },
+    {
+      name: 'permanent onError',
+      terminateTurn2: async (
+        rt: TransportSessionRuntime,
+        m: ReturnType<typeof createMockProvider>,
+      ) => {
+        m.fireError('sess-1', {
+          code: 'PROVIDER_ERROR',
+          message: 'turn 2 permanent failure',
+          recoverable: false,
+        });
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('error');
+      },
+    },
+    {
+      name: 'dispatch promise rejection (.catch)',
+      prepareTurn2Send: (m: ReturnType<typeof createMockProvider>) => {
+        (m.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('turn 2 transport reject'));
+      },
+      terminateTurn2: async (rt: TransportSessionRuntime) => {
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('error');
+      },
+    },
+    {
+      name: 'local STOP acknowledged once without stacking grace budget',
+      terminateTurn2: async (
+        rt: TransportSessionRuntime,
+        m: ReturnType<typeof createMockProvider>,
+      ) => {
+        await rt.cancel();
+        m.fireError('sess-1', {
+          code: 'CANCELLED',
+          message: 'turn 2 cancelled by STOP',
+          recoverable: true,
+        });
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('idle');
+      },
+    },
+  ])(
+    'retires external-completion grace when turn 2 terminates via $name so turn 3 genuine CANCELLED drains turn 4',
+    async ({ prepareTurn2Send, terminateTurn2 }) => {
+      (mock.provider.cancel as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      runtime.send('turn 1 stale', 'cmd-f1-t1');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+      await flushDispatch();
+
+      prepareTurn2Send?.(mock);
+      expect(runtime.send('turn 2 terminates early', 'cmd-f1-t2')).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 2);
+      await terminateTurn2(runtime, mock);
+
+      expect(runtime.send('turn 3 genuine cancel target', 'cmd-f1-t3')).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 3);
+      expect(runtime.send('turn 4 queued behind turn 3', 'cmd-f1-t4')).toBe('queued');
+      expect(runtime.pendingCount).toBe(1);
+
+      mock.fireError('sess-1', {
+        code: 'CANCELLED',
+        message: 'turn 3 cancelled by provider',
+        recoverable: true,
+      });
+      await waitForProviderSendCount(mock.provider, 4);
+
+      expect(mock.provider.send).toHaveBeenCalledTimes(4);
+      expect(runtime.pendingCount).toBe(0);
+      expect(runtime.sending).toBe(true);
+
+      mock.fireComplete('sess-1', {
+        id: 'msg-f1-t4',
+        role: 'assistant',
+        content: 'turn 4 response',
+        timestamp: Date.now(),
+      });
+      await flushDispatch();
+      expect(runtime.sending).toBe(false);
+      expect(runtime.getStatus()).toBe('idle');
+    },
+  );
+
+  it('retires unused grace cleanly across consecutive external settlements without accumulating into later turns', async () => {
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+    runtime.send('turn 1 stale', 'cmd-consec-1');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.settleActiveDispatchFromExternalCompletion('external-1')).toBe(true);
+    await flushDispatch();
+
+    // T2 starts with T1 grace, then T2 is ALSO externally settled silently before T1/T2 emit CANCELLED.
+    runtime.send('turn 2 stale', 'cmd-consec-2');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(runtime.settleActiveDispatchFromExternalCompletion('external-2')).toBe(true);
+    await flushDispatch();
+
+    // T3 inherits at most T2's single late-CANCELLED grace: one late CANCELLED stays suppressed,
+    // then T3 terminates with an error so no grace carries over to T4.
+    runtime.send('turn 3 errors after late cancel', 'cmd-consec-3');
+    await waitForProviderSendCount(mock.provider, 3);
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'late cancel from T2', recoverable: true });
+    expect(runtime.sending).toBe(true);
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'turn 3 error', recoverable: true });
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    // T4 must treat a genuine CANCELLED as terminal and drain T5.
+    expect(runtime.send('turn 4 genuine cancel', 'cmd-consec-4')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 4);
+    expect(runtime.send('turn 5 queued', 'cmd-consec-5')).toBe('queued');
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'genuine T4 cancel', recoverable: true });
+    await waitForProviderSendCount(mock.provider, 5);
+    expect(mock.provider.send).toHaveBeenCalledTimes(5);
     expect(runtime.pendingCount).toBe(0);
   });
 
@@ -7589,6 +7952,37 @@ ${PREFERENCE_CONTEXT_END}`;
       await flushDispatch();
       expect(runtime.requiresSharedMachineAuthority()).toBe(true);
       expect(runtime.getActiveSharedMachineAuthority()).toBeNull();
+      expect(runtime.getActiveOwnerMachineAuthority()).toBeNull();
+    });
+
+    it('preserves active ownerMachineAuthority when a pure daemon SYSTEM message is appended into an owner turn, while failing closed for unstamped non-system appends', async () => {
+      enableNativeAppend();
+      runtime.send('owner work', 'owner-turn-sys', undefined, undefined, { ownerMachineAuthority: 'OWNER_JWT_1' });
+      await flushDispatch();
+      expect(runtime.getActiveOwnerMachineAuthority()).toBe('OWNER_JWT_1');
+
+      runtime.send('task pair reminder', 'sys-append-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      });
+      const sysResult = await runtime.appendPendingMessagesToActiveTurn(['sys-append-1'], 'append-sys-1');
+      expect(sysResult.status).toBe('delivered');
+      expect(runtime.requiresSharedMachineAuthority()).toBe(false);
+      expect(runtime.getActiveOwnerMachineAuthority()).toBe('OWNER_JWT_1');
+
+      // An unstamped non-system append (e.g. legacy/external origin without owner token) still fails closed.
+      runtime.send('unstamped human message', 'human-append-1');
+      const humanResult = await runtime.appendPendingMessagesToActiveTurn(['human-append-1'], 'append-human-1');
+      expect(humanResult.status).toBe('delivered');
+      expect(runtime.getActiveOwnerMachineAuthority()).toBeNull();
+    });
+
+    it('never produces ownerMachineAuthority on a standalone SYSTEM turn with no owner token', async () => {
+      runtime.send('daemon system only', 'sys-only-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      });
+      await flushDispatch();
+      expect(runtime.requiresSharedMachineAuthority()).toBe(false);
+      expect(runtime.getActiveOwnerMachineAuthority()).toBeNull();
     });
   });
 
@@ -7688,6 +8082,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingEntries).toEqual([]);
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
+
 
   it('cancels a stale active turn once so queued messages drain without waiting for the cancel callback', async () => {
     runtime.send('first', 'cmd-first');
@@ -8384,6 +8779,218 @@ ${PREFERENCE_CONTEXT_END}`;
       expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({
         userMessage: 'edited plain text',
       }));
+    });
+  });
+
+  describe('machine authority preservation across autonomous continuations and delegation notifications', () => {
+    it('retains last owner authority only while autonomous work is active and clears permanently on cancel, reset, participant, or unstamped message', async () => {
+      const mock = makeMockProvider();
+      let providerBusy = false;
+      (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => (
+        providerBusy
+          ? { status: 'current', activeWorkCount: 1, activeToolCount: 1, busyReasons: ['provider_tool_item'], updatedAt: Date.now() }
+          : { status: 'current', activeWorkCount: 0, activeToolCount: 0, busyReasons: [], updatedAt: Date.now() }
+      )) as never;
+      const rt = new TransportSessionRuntime(mock.provider, 'deck_auton_brain');
+      await rt.initialize({ ...defaultConfig, agentType: 'claude-code-sdk', sessionId: 'sess-1' });
+
+      expect(rt.send('owner turn 1', 'm-owner-1', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-1',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-1');
+
+      // Settle turn -> idle has NO active turn work, so authority must be null
+      mock.fireComplete('sess-1', {
+        id: 'a-1',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      expect(rt.hasActiveTurnWork()).toBe(false);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+
+      // Provider-initiated autonomous continuation (provider snapshot reports active turn, no queued dispatch) -> inherits owner-tok-1
+      providerBusy = true;
+      mock.fireTool('sess-1', { id: 'tool-auto-1', name: 'Bash', status: 'running' });
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-1');
+
+      // Unstamped non-system human message clears _lastOwnerMachineAuthority permanently
+      providerBusy = false;
+      mock.fireTool('sess-1', { id: 'tool-auto-1', name: 'Bash', status: 'complete' });
+      expect(rt.send('human unstamped', 'm-human-1')).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 2);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      mock.fireComplete('sess-1', {
+        id: 'a-2',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done2',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      providerBusy = false;
+
+      // Re-establish clean owner authority, then cancel() clears it permanently
+      expect(rt.send('owner turn 2', 'm-owner-2', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-2',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 3);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-2');
+      await rt.cancel();
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      providerBusy = false;
+
+      // /clear resets session control and clears authority
+      expect(rt.send('owner turn 3', 'm-owner-3', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-3',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 4);
+      mock.fireComplete('sess-1', {
+        id: 'a-3',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done3',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      expect(rt.send('/clear', 'm-clear-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 5);
+      mock.fireComplete('sess-1', {
+        id: 'a-4',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'cleared',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+    });
+
+    it('updates _appendedTurnOrigins and fails closed on native and idle deliverDelegationNotification', async () => {
+      const mock = makeMockProvider();
+      let providerBusy = false;
+      (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => (
+        providerBusy
+          ? { status: 'current', activeWorkCount: 1, activeToolCount: 1, busyReasons: ['provider_tool_item'], updatedAt: Date.now() }
+          : { status: 'current', activeWorkCount: 0, activeToolCount: 0, busyReasons: [], updatedAt: Date.now() }
+      )) as never;
+      (mock.provider.capabilities as Record<string, unknown>).activeDelegationNotification = 'native';
+      const notifyCalls: unknown[] = [];
+      mock.provider.notifyActiveDelegation = vi.fn(async (_sid, notif) => {
+        notifyCalls.push(notif);
+        return 'delivered';
+      });
+      const rt = new TransportSessionRuntime(mock.provider, 'deck_dlg_brain');
+      await rt.initialize({ ...defaultConfig, agentType: 'claude-code-sdk', sessionId: 'sess-1' });
+
+      // Start busy owner turn
+      expect(rt.send('owner turn', 'm-1', undefined, undefined, {
+        ownerMachineAuthority: 'owner-tok-1',
+      })).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 1);
+
+      // Native busy delivery of owner delegation reply updates authority without leaking token to provider
+      const r1 = await rt.deliverDelegationNotification({
+        notificationId: 'notif-owner-1',
+        delegationId: 'dlg-1',
+        sourceSessionName: 'deck_sub_w1',
+        text: 'worker finished',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-tok-2',
+      });
+      expect(r1).toBe('delivered');
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-2');
+      expect(JSON.stringify(notifyCalls)).not.toContain('owner-tok-2');
+
+      // Native busy delivery of participant delegation reply taints turn fail-closed
+      const participantActor: SharedActorEnvelope = {
+        actorUserId: 'part-user',
+        actorDisplayName: 'Part',
+        snapshot: {
+          target: { kind: 'main', serverId: 'local', sessionName: 'deck_dlg_brain' },
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: [],
+          primaryShareId: null,
+          authorizedAt: 1,
+        },
+        primaryShareId: null,
+        effectiveActorRole: 'participant',
+        actionId: 'act-p',
+        origin: 'server-member',
+        authorizedAt: 1,
+        queuedAt: 1,
+      };
+      const r2 = await rt.deliverDelegationNotification({
+        notificationId: 'notif-part-1',
+        delegationId: 'dlg-2',
+        sourceSessionName: 'deck_sub_w2',
+        text: 'participant worker finished',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        sharedActor: participantActor,
+        sharedMachineAuthority: 'part-tok-1',
+      });
+      expect(r2).toBe('delivered');
+      expect(rt.requiresSharedMachineAuthority()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+
+      // Subsequent owner delegation reply in same tainted turn MUST fail-closed (never escalate)
+      await rt.deliverDelegationNotification({
+        notificationId: 'notif-owner-2',
+        delegationId: 'dlg-3',
+        sourceSessionName: 'deck_sub_w1',
+        text: 'owner worker 2',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-tok-3',
+      });
+      expect(rt.requiresSharedMachineAuthority()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+
+      // Finish tainted turn -> autonomous wake STILL returns null
+      mock.fireComplete('sess-1', {
+        id: 'a-end',
+        sessionId: 'sess-1',
+        kind: 'text',
+        role: 'assistant',
+        content: 'done',
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      providerBusy = true;
+      expect(rt.hasActiveTurnWork()).toBe(true);
+      expect(rt.getActiveOwnerMachineAuthority()).toBeNull();
+      providerBusy = false;
+
+      // Idle fallback preserves owner authority
+      const rIdleOwner = await rt.deliverDelegationNotification({
+        notificationId: 'notif-idle-owner',
+        delegationId: 'dlg-4',
+        sourceSessionName: 'deck_sub_w1',
+        text: 'idle owner wake',
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-tok-4',
+      });
+      expect(rIdleOwner).toBe('delivered');
+      await waitForProviderSendCount(mock.provider, 2);
+      expect(rt.getActiveOwnerMachineAuthority()).toBe('owner-tok-4');
     });
   });
 });

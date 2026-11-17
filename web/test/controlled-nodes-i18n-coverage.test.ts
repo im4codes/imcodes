@@ -132,4 +132,15 @@ describe('controlled-node i18n coverage', () => {
       }
     }
   });
+
+  it('includes the Windows install path in win_security_notice without naming specific antivirus brands', () => {
+    const brandPattern = /\b(360|huorong|kaspersky|mcafee|norton|avast|avg|bitdefender|eset|symantec|crowdstrike|trend\s*micro|kingsoft|tencent|rising|qihoo)\b|火绒|电脑管家|金山毒霸|卡巴斯基|瑞星/i;
+    for (const locale of LOCALES) {
+      const ns = namespaceOf(locale);
+      const notice = ns.win_security_notice;
+      expect(typeof notice).toBe('string');
+      expect(notice).toContain('C:\\ProgramData\\imcodes-node\\');
+      expect(notice).not.toMatch(brandPattern);
+    }
+  });
 });

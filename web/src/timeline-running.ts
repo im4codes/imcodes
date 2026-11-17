@@ -56,12 +56,17 @@ function isAuthoritativeCleanIdle(event: TimelineTailEvent): boolean {
     && isAuthoritativeCleanIdlePayload(event.payload ?? undefined);
 }
 
+function isDiagnosticAssistantNote(event: TimelineTailEvent): boolean {
+  return event.type === 'assistant.text'
+    && event.payload?.automation === true && event.payload?.memoryExcluded === true;
+}
+
 function hasActiveWorkThrough(events: TimelineTailEvent[], endIndex: number): boolean {
   // SDK sub-agent rows have their own lifecycle aggregator. Treating hidden
   // wrapper tool.call events as generic open tools makes old Codex
   // collaboration rows keep the parent chat's global "working" indicator
   // alive forever, even after the dedicated SDK row has terminalized.
-  const activityEvents = events.slice(0, endIndex + 1).filter((event) => !isSdkSubagentTimelineEvent(event));
+  const activityEvents = events.slice(0, endIndex + 1).filter((event) => !isSdkSubagentTimelineEvent(event) && !isDiagnosticAssistantNote(event));
   return reduceTimelineActivity(activityEvents as any).active;
 }
 
@@ -89,6 +94,9 @@ export function hasActiveTimelineTurn(
   let userMessageTailRequiresSessionState = false;
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
+    // Control receipts (including a pending model choice) are not native turn
+    // completions. Keep the existing run visible until its real terminal.
+    if (isDiagnosticAssistantNote(event)) continue;
     if (isIdleSessionStateTimelineEvent(event)) {
       if (isAuthoritativeCleanIdle(event)) return hasActiveWorkThrough(events, i);
       return hasActiveWorkThrough(events, i);

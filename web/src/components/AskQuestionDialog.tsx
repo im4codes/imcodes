@@ -193,7 +193,12 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
                 const v = (e.target as HTMLInputElement).value;
                 setTexts((prev) => prev.map((t, i) => i === qi ? v : t));
               }}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); onSubmit(buildAnswer()); } }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+                  e.preventDefault();
+                  onSubmit(buildAnswer());
+                }
+              }}
             />
           </div>
         ))}

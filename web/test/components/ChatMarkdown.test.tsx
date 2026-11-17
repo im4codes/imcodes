@@ -776,4 +776,53 @@ describe('streaming render mode', () => {
     rerender(<ChatMarkdown text={`${big}more`} cacheKey="stream-big" streaming />);
     expect(container.querySelector('h1')).toBeNull();
   });
+
+  it('routes CloudDoc quote tags, paired filenames, and cdoc_ IDs to onCloudDocClick without local file download actions', () => {
+    const onCloudDocClick = vi.fn();
+    const onPathClick = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={[
+          '引用 [CloudDoc: 无标题表格.xlsx | id=cdoc_503c1c6e391e458b9e56]',
+          '已将结果写入 **`芝加哥机房配件箱设备清单.xlsx`**（`id=cdoc_503c1c6e391e458b9e56`，版本 `v2`），也可直接看 `cdoc_abcdef123456` 或本地 `local-only.xlsx`。',
+        ].join('\n\n')}
+        serverId="srv-1"
+        onPathClick={onPathClick}
+        onDownload={vi.fn()}
+        onCloudDocClick={onCloudDocClick}
+      />,
+    );
+
+    const cloudChips = Array.from(container.querySelectorAll('.chat-cloud-doc-chip'));
+    expect(cloudChips).toHaveLength(1);
+    expect(cloudChips[0]?.textContent).toContain('无标题表格.xlsx');
+    expect(cloudChips[0]?.textContent).not.toContain('[CloudDoc:');
+
+    const cloudLinks = Array.from(container.querySelectorAll('.chat-cloud-doc-link'));
+    expect(cloudLinks.map((el) => el.textContent)).toEqual([
+      '芝加哥机房配件箱设备清单.xlsx',
+      'id=cdoc_503c1c6e391e458b9e56',
+      'cdoc_abcdef123456',
+    ]);
+
+    // Only the genuinely unpaired local file gets a download button and local path link
+    const dlButtons = Array.from(container.querySelectorAll('.chat-dl-btn'));
+    expect(dlButtons).toHaveLength(1);
+    const localLinks = Array.from(container.querySelectorAll('.chat-path-link'));
+    expect(localLinks.map((el) => el.textContent)).toEqual(['local-only.xlsx']);
+
+    fireEvent.click(cloudChips[0]!);
+    fireEvent.click(cloudLinks[0]!);
+    fireEvent.click(cloudLinks[1]!);
+    fireEvent.click(cloudLinks[2]!);
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(1, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(2, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(3, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(4, 'cdoc_abcdef123456');
+    expect(onPathClick).not.toHaveBeenCalled();
+
+    fireEvent.click(localLinks[0]!);
+    expect(onPathClick).toHaveBeenCalledTimes(1);
+    expect(onPathClick).toHaveBeenCalledWith('local-only.xlsx');
+  });
 });

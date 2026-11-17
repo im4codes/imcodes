@@ -16,18 +16,37 @@ type NavigatorLike = {
 
 type MatchMediaLike = (query: string) => { matches: boolean };
 
+export type NativeHostScaleMode =
+  | 'designed-for-ipad'
+  | 'native-page-zoom'
+  | 'native-1x'
+  | 'legacy-css'
+  | 'none';
+
+export type NativeHostInfo = {
+  isMacDesktop?: boolean;
+  pageZoomApplied?: boolean;
+  scaleMode?: NativeHostScaleMode;
+};
+
 export type NativePlatformEnvironment = {
   capacitor?: CapacitorRuntime | null;
   navigator?: NavigatorLike | null;
   matchMedia?: MatchMediaLike | null;
   innerWidth?: number;
+  nativeHost?: NativeHostInfo | null;
 };
 
+export const NATIVE_HOST_EVENT = 'imcodes:native-host';
+export const IOS_MAC_DESKTOP_CLASS = 'native-mac-desktop';
 export const IOS_MAC_TEXT_SCALE_CLASS = 'native-ios-mac';
 export const IOS_MAC_TERMINAL_FONT_SIZE = 15;
 
-function readNativePlatformEnvironment(): NativePlatformEnvironment {
-  const runtime = globalThis as typeof globalThis & { Capacitor?: CapacitorRuntime };
+export function readNativePlatformEnvironment(): NativePlatformEnvironment {
+  const runtime = globalThis as typeof globalThis & {
+    Capacitor?: CapacitorRuntime;
+    __IMCODES_NATIVE_HOST__?: NativeHostInfo;
+  };
   return {
     capacitor: runtime.Capacitor,
     navigator: globalThis.navigator,
@@ -35,6 +54,7 @@ function readNativePlatformEnvironment(): NativePlatformEnvironment {
       ? globalThis.matchMedia.bind(globalThis)
       : undefined,
     innerWidth: globalThis.innerWidth,
+    nativeHost: runtime.__IMCODES_NATIVE_HOST__,
   };
 }
 
@@ -45,23 +65,66 @@ function getNativePlatform(env: NativePlatformEnvironment): string | null {
   return typeof platform === 'string' && platform.length > 0 ? platform : null;
 }
 
-export function shouldUseIosMacTextScale(env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {
+/**
+ * Detects whether the Capacitor iOS bundle is running on macOS
+ * ("Designed for iPad" / Mac Catalyst) rather than on a real iPhone/iPad.
+ */
+export function isNativeMacDesktop(env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {
   if (getNativePlatform(env) !== 'ios') return false;
+
+  if (typeof env.nativeHost?.isMacDesktop === 'boolean') {
+    return env.nativeHost.isMacDesktop;
+  }
 
   const navigatorLike = env.navigator;
   const maxTouchPoints = navigatorLike?.maxTouchPoints ?? 0;
+  // Real iPhones and iPads expose multi-touch (>= 2 points), including iPads with a trackpad.
   if (maxTouchPoints > 1) return false;
 
-  const platformText = [
+  const platformMarker = [
     navigatorLike?.platform,
     navigatorLike?.userAgentData?.platform,
-    navigatorLike?.userAgent,
   ].filter(Boolean).join(' ').toLowerCase();
-  if (platformText.includes('mac')) return true;
+  if (platformMarker.includes('mac')) return true;
+
+  const userAgent = navigatorLike?.userAgent ?? '';
+  // Note: real iPhone/iPad UAs contain "like Mac OS X", so only match Mac UA without Apple mobile tokens.
+  if (/Macintosh|Mac OS X/i.test(userAgent) && !/iPhone|iPad|iPod/i.test(userAgent)) {
+    return true;
+  }
 
   const hasDesktopPointer = env.matchMedia?.('(hover: hover) and (pointer: fine)').matches === true;
-  const hasDesktopWidth = (env.innerWidth ?? 0) >= 768;
-  return hasDesktopPointer && hasDesktopWidth;
+  if (!hasDesktopPointer) return false;
+  return maxTouchPoints <= 1 || !/iPhone|iPod/i.test(userAgent);
+}
+
+/**
+ * Returns true when running inside a Designed-for-iPad macOS native shell (both older OTA shells
+ * lacking `__IMCODES_NATIVE_HOST__` and newer native shells reporting `scaleMode: 'designed-for-ipad'`),
+ * excluding Mac Catalyst (`native-1x`) and intermediate shells that already applied native `pageZoom`.
+ */
+export function isDesignedForIpadMac(env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {
+  if (!isNativeMacDesktop(env)) return false;
+  const host = env.nativeHost;
+  if (host?.scaleMode === 'designed-for-ipad' || host?.scaleMode === 'legacy-css') return true;
+  if (host?.scaleMode === 'native-1x' || host?.scaleMode === 'native-page-zoom' || host?.scaleMode === 'none') {
+    return false;
+  }
+  if (host?.pageZoomApplied === true) return false;
+  // An explicit Catalyst signal (`{ isMacDesktop: true, pageZoomApplied: false, scaleMode: 'native-1x' }`)
+  // or legacy boolean signal without designed-for-ipad scaleMode renders at 1:1 desktop scale.
+  if (typeof host?.isMacDesktop === 'boolean' && typeof host?.pageZoomApplied === 'boolean') {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Legacy chat-only text inflation (`html.native-ios-mac`) is disabled in favor of uniform
+ * whole-page CSS zoom via `ui-scale.ts`.
+ */
+export function shouldUseIosMacTextScale(_env: NativePlatformEnvironment = readNativePlatformEnvironment()): boolean {
+  return false;
 }
 
 export function applyNativePlatformClasses(
@@ -72,5 +135,6 @@ export function applyNativePlatformClasses(
   const platform = getNativePlatform(env);
   if (platform) root.dataset.nativePlatform = platform;
   else delete root.dataset.nativePlatform;
+  root.classList.toggle(IOS_MAC_DESKTOP_CLASS, isNativeMacDesktop(env));
   root.classList.toggle(IOS_MAC_TEXT_SCALE_CLASS, shouldUseIosMacTextScale(env));
 }

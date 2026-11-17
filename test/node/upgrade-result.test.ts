@@ -191,4 +191,27 @@ describe.skipIf(process.platform === 'win32')('readPreviousUpgradeFailure on POS
     expect(await readPreviousUpgradeFailure(journalPath, TARGET, NOW, exe)).toBeNull();
     expect(await readFile(`${exe}.upgrade-old`, 'utf8')).toBe('previous image');
   });
+
+  it('parses UTF-8 Chinese error messages cleanly with or without BOM in last-upgrade-result.json', async () => {
+    const chineseError = '对路径“C:\\ProgramData\\imcodes-node\\remote-desktop-worker.new”的访问被拒绝。';
+    const noBomPath = await journalWith(JSON.stringify({
+      status: S.ROLLED_BACK,
+      targetVersion: TARGET,
+      failedPhase: 'install',
+      error: chineseError,
+      reason: chineseError,
+      recordedAt: NOW - 1,
+    }));
+    const withBomPath = await journalWith(`\uFEFF${JSON.stringify({
+      status: S.ROLLED_BACK,
+      targetVersion: TARGET,
+      failedPhase: 'install',
+      error: chineseError,
+      reason: chineseError,
+      recordedAt: NOW - 1,
+    })}`);
+
+    expect(await readUpgradeResult(noBomPath)).toMatchObject({ status: S.ROLLED_BACK, error: chineseError, reason: chineseError });
+    expect(await readUpgradeResult(withBomPath)).toMatchObject({ status: S.ROLLED_BACK, error: chineseError, reason: chineseError });
+  });
 });

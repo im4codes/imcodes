@@ -1,3 +1,5 @@
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from './shared-machine-authority.js';
+
 export const USAGE_ANALYTICS_SCHEMA_VERSION = 1 as const;
 
 export const USAGE_INGEST_PATH_HEADER = 'x-server-id';
@@ -111,7 +113,8 @@ export const USAGE_UNSAFE_FIELD_NAMES = [
   'secret',
   'rawSharedActorEnvelope',
   'sharedActorEnvelope',
-  'sharedMachineAuthority',
+  SHARED_MACHINE_AUTHORITY_FIELD,
+  OWNER_MACHINE_AUTHORITY_FIELD,
   'childTranscript',
   'internalRuntimeFlags',
 ] as const;

@@ -955,4 +955,108 @@ describe('pending returns are discoverable by their owning coordinator assignmen
     ).toEqual([mine.record.delegationId]);
     reopened.close(); database.close();
   });
+
+  it('persists owner and participant originAuthority across create/get/getMessage/listReceived and upgrades legacy DBs', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-delegation-auth-'));
+    const dbPath = join(dir, 'delegation-replies.sqlite');
+    try {
+      const legacyDb = new DatabaseSync(dbPath);
+      legacyDb.exec(`
+        CREATE TABLE delegation_replies (
+          delegation_id TEXT PRIMARY KEY,
+          capability_hash TEXT NOT NULL DEFAULT '',
+          origin_session_name TEXT NOT NULL,
+          origin_session_instance_id TEXT NOT NULL,
+          origin_runtime_epoch TEXT NOT NULL,
+          target_session_name TEXT NOT NULL,
+          target_session_instance_id TEXT NOT NULL,
+          target_runtime_epoch TEXT NOT NULL,
+          dispatch_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          notification_id TEXT NOT NULL,
+          purpose TEXT,
+          audit_attempt_id TEXT,
+          audit_revision TEXT,
+          audited_session_name TEXT,
+          task_id TEXT,
+          assignment_id TEXT,
+          coordinator_assignment_id TEXT,
+          status TEXT NOT NULL,
+          result TEXT,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          delivered_at INTEGER
+        );
+      `);
+      legacyDb.prepare(`
+        INSERT INTO delegation_replies (
+          delegation_id, capability_hash,
+          origin_session_name, origin_session_instance_id, origin_runtime_epoch,
+          target_session_name, target_session_instance_id, target_runtime_epoch,
+          dispatch_id, message_id, notification_id, status, created_at, expires_at, updated_at
+        ) VALUES ('dlg-legacy', '', 'deck_alpha_brain', 'inst-1', 'epoch-1', 'deck_sub_w1', 'inst-2', 'epoch-2', 'd-0', 'm-0', 'notif-0', 'pending', 1, 999999999, 1)
+      `).run();
+      legacyDb.close();
+
+      const store = new DelegationReplyStore({ dbPath });
+      expect(store.get('dlg-legacy')?.originAuthority).toBeUndefined();
+
+      const ownerAuth = { kind: 'owner' as const, ownerMachineAuthority: 'owner-jwt-1' };
+      const createdOwner = store.create({
+        origin: A,
+        target: T,
+        dispatchId: 'd-owner',
+        messageId: 'm-owner',
+        originAuthority: ownerAuth,
+        now: 200,
+      });
+      expect(createdOwner.record.originAuthority).toEqual(ownerAuth);
+      expect(store.get(createdOwner.record.delegationId)?.originAuthority).toEqual(ownerAuth);
+
+      const participantAuth = {
+        kind: 'participant' as const,
+        sharedActor: {
+          actorUserId: 'part-1',
+          actorDisplayName: 'Participant',
+          snapshot: {
+            target: { kind: 'main' as const, serverId: 'local', sessionName: A.sessionName },
+            effectiveRole: 'participant' as const,
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: [],
+            primaryShareId: null,
+            authorizedAt: 200,
+          },
+          primaryShareId: null,
+          effectiveActorRole: 'participant' as const,
+          actionId: 'act-1',
+          origin: 'server-member' as const,
+          authorizedAt: 200,
+          queuedAt: 200,
+        },
+        sharedMachineAuthority: 'part-jwt-1',
+      };
+      const createdParticipant = store.create({
+        origin: A,
+        target: T,
+        dispatchId: 'd-part',
+        messageId: 'm-part',
+        originAuthority: participantAuth,
+        now: 201,
+      });
+      store.receive({
+        delegationId: createdParticipant.record.delegationId,
+        sender: T,
+        result: 'participant done',
+        now: 202,
+      });
+      const received = store.listReceived().find((r) => r.delegationId === createdParticipant.record.delegationId);
+      expect(received?.originAuthority).toEqual(participantAuth);
+      expect(store.getMessage(createdParticipant.record.delegationId, received!.notificationId)?.originAuthority).toEqual(participantAuth);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

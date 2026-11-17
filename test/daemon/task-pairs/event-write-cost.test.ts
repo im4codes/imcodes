@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -121,7 +122,7 @@ describe('per-event pair write cost', () => {
     it('writes no status event per repeated STARTED once the pair is started, however many times the executor repeats it (54 in 95 minutes was seen)', () => {
       const store = getTaskPairStore();
       const queued = pairState(0, 'queued');
-      store.savePair(PROJECT, queued);
+      putTaskPairFixture(store, PROJECT, queued);
       const t0 = 10_000_000;
       admit(queued, t0);
       expect(store.getPair(PROJECT, queued.taskId)!.state.status).toBe('working');
@@ -140,7 +141,7 @@ describe('per-event pair write cost', () => {
     it('still counts as the executor\'s liveness: every repeat moves progress and activity, in memory at once', () => {
       const store = getTaskPairStore();
       const queued = pairState(1, 'queued');
-      store.savePair(PROJECT, queued);
+      putTaskPairFixture(store, PROJECT, queued);
       started(queued.executor!, queued.taskId, 'first', 5_000_000);
       const stamp = 5_000_000 + 7 * 60_000;
       started(queued.executor!, queued.taskId, 'repeat', stamp);
@@ -153,7 +154,7 @@ describe('per-event pair write cost', () => {
     it('a repeated STARTED after the same event id was recorded is still a plain replay', () => {
       const store = getTaskPairStore();
       const queued = pairState(2, 'queued');
-      store.savePair(PROJECT, queued);
+      putTaskPairFixture(store, PROJECT, queued);
       started(queued.executor!, queued.taskId, 'same-id', 1_000_000);
       expect(started(queued.executor!, queued.taskId, 'same-id', 1_000_100).effect).toBe('replayed');
       expect(startedEvents(queued.taskId)).toHaveLength(1);
@@ -163,14 +164,14 @@ describe('per-event pair write cost', () => {
       const store = getTaskPairStore();
       // queued: an executor STARTED does not start it (only admission does) -- recorded, never swallowed as a no-op
       const queued = pairState(3, 'queued');
-      store.savePair(PROJECT, queued);
+      putTaskPairFixture(store, PROJECT, queued);
       const early = started(queued.executor!, queued.taskId, 'q1', 2_000_000);
       expect(early.effect).toBe('recorded'); // the marker itself changed nothing (the queue may admit the pair right after, on its own path)
       expect(startedEvents(queued.taskId)).toHaveLength(1);
 
       // an executor-side blocked flag is cleared by a fresh STARTED: a real state change
       const blocked = pairState(4, 'working', { flags: ['blocked'], flagSides: { blocked: 'executor' } });
-      store.savePair(PROJECT, blocked);
+      putTaskPairFixture(store, PROJECT, blocked);
       const cleared = started(blocked.executor!, blocked.taskId, 'b1', 2_100_000);
       expect(cleared.effect).toBe('status');
       expect(store.getPair(PROJECT, blocked.taskId)!.state.flags).not.toContain('blocked');
@@ -178,26 +179,26 @@ describe('per-event pair write cost', () => {
 
       // attributes STARTED ignores on an existing pair change nothing: still a strict no-op
       const ignored = pairState(5, 'working');
-      store.savePair(PROJECT, ignored);
+      putTaskPairFixture(store, PROJECT, ignored);
       expect(started(ignored.executor!, ignored.taskId, 'r1', 2_200_000, { auditor: WORKERS[30]! }).effect).toBe(TASK_PAIR_IDEMPOTENT_STARTED_EFFECT);
       expect(store.getPair(PROJECT, ignored.taskId)!.state.auditor).toBe(ignored.auditor);
 
       // a participant that is not the executor is recorded (as unusual), never swallowed
       const foreign = pairState(6, 'working');
-      store.savePair(PROJECT, foreign);
+      putTaskPairFixture(store, PROJECT, foreign);
       const stray = started(foreign.auditor!, foreign.taskId, 'f1', 2_300_000);
       expect(stray.effect).not.toBe(TASK_PAIR_IDEMPOTENT_STARTED_EFFECT);
       expect(startedEvents(foreign.taskId)).toHaveLength(1);
 
       // in_audit: an executor STARTED is unusual and recorded
       const inAudit = pairState(7, 'in_audit');
-      store.savePair(PROJECT, inAudit);
+      putTaskPairFixture(store, PROJECT, inAudit);
       expect(started(inAudit.executor!, inAudit.taskId, 'a1', 2_400_000).effect).not.toBe(TASK_PAIR_IDEMPOTENT_STARTED_EFFECT);
       expect(startedEvents(inAudit.taskId)).toHaveLength(1);
 
       // Brain reopens a passed pair with STARTED: a real transition
       const passed = pairState(8, 'passed');
-      store.savePair(PROJECT, passed);
+      putTaskPairFixture(store, PROJECT, passed);
       const reopened = started(BRAIN, passed.taskId, 'p1', 2_500_000);
       expect(reopened.effect).toBe('reopened');
       expect(store.getPair(PROJECT, passed.taskId)!.state.status).toBe('working');
@@ -211,8 +212,8 @@ describe('per-event pair write cost', () => {
       const store = getTaskPairStore();
       const worker = WORKERS[3]!;
       // A session executing 12 pairs and auditing 6 more: many pairs per session.
-      for (let i = 0; i < 12; i += 1) store.savePair(PROJECT, pairState(100 + i, 'working', { executor: worker, auditor: WORKERS[20 + (i % 10)] }));
-      for (let i = 0; i < 6; i += 1) store.savePair(PROJECT, pairState(200 + i, 'in_audit', { executor: WORKERS[25]!, auditor: worker }));
+      for (let i = 0; i < 12; i += 1) putTaskPairFixture(store, PROJECT, pairState(100 + i, 'working', { executor: worker, auditor: WORKERS[20 + (i % 10)] }));
+      for (let i = 0; i < 6; i += 1) putTaskPairFixture(store, PROJECT, pairState(200 + i, 'in_audit', { executor: WORKERS[25]!, auditor: worker }));
       const owned = store.pairsForSession(worker).filter((pair) => pair.state.executor === worker || pair.state.auditor === worker);
       expect(owned).toHaveLength(18);
       saved = 0;
@@ -251,7 +252,7 @@ describe('per-event pair write cost', () => {
       vi.setSystemTime(30_000_000);
       const store = getTaskPairStore();
       const passed = pairState(300, 'passed', { updatedAt });
-      store.savePair(PROJECT, passed);
+      putTaskPairFixture(store, PROJECT, passed);
       automation.publishBadges(); // arms the durable wait for the passed pair
       const armed = store.getPair(PROJECT, passed.taskId)!.liveness;
       expect(armed.brainWaitKey).toBe(`passed:${passed.round}`);
@@ -279,7 +280,7 @@ describe('per-event pair write cost', () => {
     it('a Brain reply after a reminder was already sent is still a material change: written at once, and badges are republished once', () => {
       const store = getTaskPairStore();
       const passed = pairState(301, 'passed', { updatedAt: 1_000 });
-      store.savePair(PROJECT, passed);
+      putTaskPairFixture(store, PROJECT, passed);
       const live = store.getPair(PROJECT, passed.taskId)!.liveness;
       store.saveLiveness(PROJECT, passed.taskId, { ...live, brainWaitKey: `passed:${passed.round}`, brainWaitStartedAt: 1_000, brainReminderCount: 2, brainReminderLastAt: 5_000, brainReminderDue: true });
       badgePublishes = 0;
@@ -298,7 +299,7 @@ describe('per-event pair write cost', () => {
       vi.setSystemTime(40_000_000);
       const store = getTaskPairStore();
       const pair = pairState(400, 'working');
-      store.savePair(PROJECT, pair);
+      putTaskPairFixture(store, PROJECT, pair);
       service.recordActivity(pair.executor!, Date.now()); // first stamp: persisted
       vi.advanceTimersByTime(3_000);
       const stamp = Date.now();
@@ -324,7 +325,7 @@ describe('per-event pair write cost', () => {
       const store = openFileStore();
       try {
         const pair = pairState(500, 'working');
-        store.savePair(PROJECT, pair);
+        putTaskPairFixture(store, PROJECT, pair);
         const live = () => store.getPair(PROJECT, pair.taskId)!.liveness;
         store.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: 1 }); // first: persisted
         vi.advanceTimersByTime(1_000);
@@ -343,7 +344,7 @@ describe('per-event pair write cost', () => {
       vi.setSystemTime(60_000_000);
       const crashed = openFileStore();
       const pair = pairState(501, 'working');
-      crashed.savePair(PROJECT, pair);
+      putTaskPairFixture(crashed, PROJECT, pair);
       const live = () => crashed.getPair(PROJECT, pair.taskId)!.liveness;
       crashed.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: Date.now() });
       let lastStamp = Date.now();
@@ -372,7 +373,7 @@ describe('per-event pair write cost', () => {
       vi.setSystemTime(70_000_000);
       const store = openFileStore();
       const pair = pairState(502, 'working');
-      store.savePair(PROJECT, pair);
+      putTaskPairFixture(store, PROJECT, pair);
       const live = () => store.getPair(PROJECT, pair.taskId)!.liveness;
       store.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: 10 });
       vi.advanceTimersByTime(500);
@@ -391,7 +392,7 @@ describe('per-event pair write cost', () => {
       setTaskPairStoreForTests(file);
       try {
         const pair = pairState(504, 'working');
-        file.savePair(PROJECT, pair);
+        putTaskPairFixture(file, PROJECT, pair);
         const live = () => file.getPair(PROJECT, pair.taskId)!.liveness;
         file.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: 30 });
         vi.advanceTimersByTime(500);
@@ -413,12 +414,12 @@ describe('per-event pair write cost', () => {
       const store = openFileStore();
       try {
         const pair = pairState(503, 'working');
-        store.savePair(PROJECT, pair);
+        putTaskPairFixture(store, PROJECT, pair);
         const live = () => store.getPair(PROJECT, pair.taskId)!.liveness;
         store.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: 20 });
         vi.advanceTimersByTime(500);
         store.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: 21 }); // deferred
-        store.savePair(PROJECT, { ...pair, status: 'in_audit', updatedAt: Date.now() }); // state change, no explicit liveness
+        putTaskPairFixture(store, PROJECT, { ...pair, status: 'in_audit', updatedAt: Date.now() }); // state change, no explicit liveness
         const reader = openFileStore();
         try {
           expect(reader.getPair(PROJECT, pair.taskId)!.liveness.activityExecutorAt).toBe(21);
@@ -429,8 +430,8 @@ describe('per-event pair write cost', () => {
 
     it('a daemon restart rebuilds the same open-pair view from the file', () => {
       const store = openFileStore();
-      for (let i = 0; i < 20; i += 1) store.savePair(PROJECT, pairState(600 + i, i % 5 === 0 ? 'queued' : 'working'));
-      store.savePair(PROJECT, pairState(630, 'done'));
+      for (let i = 0; i < 20; i += 1) putTaskPairFixture(store, PROJECT, pairState(600 + i, i % 5 === 0 ? 'queued' : 'working'));
+      putTaskPairFixture(store, PROJECT, pairState(630, 'done'));
       const before = store.listActivePairsShared().map((pair) => pair.state.taskId);
       store.close();
       const restarted = openFileStore();
@@ -444,11 +445,11 @@ describe('per-event pair write cost', () => {
   describe('the in-memory session index follows pair writes without a rebuild', () => {
     it('one changed pair costs one single-row read, not a re-parse of every open pair, and the answers equal the database', () => {
       const store = getTaskPairStore();
-      for (let i = 0; i < 50; i += 1) store.savePair(PROJECT, pairState(700 + i));
+      for (let i = 0; i < 50; i += 1) putTaskPairFixture(store, PROJECT, pairState(700 + i));
       store.pairsForSession(WORKERS[0]!); // build once
       const { prepares } = statements(() => {
         for (let round = 0; round < 20; round += 1) {
-          store.savePair(PROJECT, { ...pairState(700 + round), updatedAt: 90_000_000 + round });
+          putTaskPairFixture(store, PROJECT, { ...pairState(700 + round), updatedAt: 90_000_000 + round });
           for (let event = 0; event < 50; event += 1) {
             store.pairsForSession(WORKERS[(round + event) % WORKERS.length]!);
             store.isParticipantOfOpenPair(WORKERS[event % WORKERS.length]!);
@@ -464,15 +465,15 @@ describe('per-event pair write cost', () => {
       for (const name of [BRAIN, ...WORKERS]) expect(store.pairsForSession(name).map((pair) => pair.state.taskId)).toEqual(viaDb(name));
       expect(store.listActivePairsShared().map((pair) => pair.state.taskId)).toEqual(store.listActivePairs().map((pair) => pair.state.taskId));
       // A terminal write and a reassignment move the pair out of / between buckets.
-      store.savePair(PROJECT, { ...pairState(700), status: 'done', updatedAt: 95_000_000 });
-      store.savePair(PROJECT, { ...pairState(701), executor: WORKERS[39]!, updatedAt: 95_000_001 });
+      putTaskPairFixture(store, PROJECT, { ...pairState(700), status: 'done', updatedAt: 95_000_000 });
+      putTaskPairFixture(store, PROJECT, { ...pairState(701), executor: WORKERS[39]!, updatedAt: 95_000_001 });
       for (const name of [BRAIN, ...WORKERS]) expect(store.pairsForSession(name).map((pair) => pair.state.taskId)).toEqual(viaDb(name));
       expect(store.listActivePairsShared().map((pair) => pair.state.taskId)).toEqual(store.listActivePairs().map((pair) => pair.state.taskId));
     });
 
     it('publishing badges over 50 open pairs reads nothing from SQLite and writes nothing when no input changed', () => {
       const store = getTaskPairStore();
-      for (let i = 0; i < 50; i += 1) store.savePair(PROJECT, pairState(800 + i));
+      for (let i = 0; i < 50; i += 1) putTaskPairFixture(store, PROJECT, pairState(800 + i));
       automation.publishBadges(); // warm the index and arm any waits
       const { prepares } = statements(() => { for (let i = 0; i < 20; i += 1) automation.publishBadges(); });
       expect(prepares.filter((sql) => /task_pairs/i.test(sql))).toEqual([]);
@@ -480,7 +481,7 @@ describe('per-event pair write cost', () => {
 
     it('per-event and periodic paths never mutate the shared entries (deep-frozen in this suite)', () => {
       const store = getTaskPairStore();
-      for (let i = 0; i < 12; i += 1) store.savePair(PROJECT, pairState(900 + i, i % 4 === 0 ? 'passed' : 'working'));
+      for (let i = 0; i < 12; i += 1) putTaskPairFixture(store, PROJECT, pairState(900 + i, i % 4 === 0 ? 'passed' : 'working'));
       for (const name of WORKERS.slice(0, 12)) {
         service.recordActivity(name, Date.now());
         service.recordProgress(name, Date.now(), 'done with it');
@@ -497,7 +498,7 @@ describe('per-event pair write cost', () => {
     it('TTL renewals still write the claim row every time, and a repeated STARTED neither renews nor drops a claim', () => {
       const store = getTaskPairStore();
       const pair = pairState(950, 'working');
-      store.savePair(PROJECT, pair);
+      putTaskPairFixture(store, PROJECT, pair);
       const claim = (now: number) => store.tryClaimResource({ project: PROJECT, taskId: pair.taskId, owner: pair.executor!, resource: 'port:8080', mode: 'exclusive', ttlMs: 600_000, now });
       const first = claim(1_000_000);
       expect(first.ok).toBe(true);

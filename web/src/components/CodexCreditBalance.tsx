@@ -156,8 +156,8 @@ export function CodexCreditBalance({ wsClient, connected, balance, unlimited }: 
           style={{
             left: panelPosition ? `${panelPosition.left}px` : `${PANEL_MARGIN}px`,
             bottom: panelPosition ? `${panelPosition.bottom}px` : `${PANEL_MARGIN}px`,
-            maxWidth: panelPosition ? `${panelPosition.maxWidth}px` : `calc(100vw - ${PANEL_MARGIN * 2}px)`,
-            maxHeight: panelPosition ? `${panelPosition.maxHeight}px` : `calc(100vh - ${PANEL_MARGIN * 2}px)`,
+            maxWidth: panelPosition ? `${panelPosition.maxWidth}px` : `calc(var(--imcodes-ui-vw, 100vw) - ${PANEL_MARGIN * 2}px)`,
+            maxHeight: panelPosition ? `${panelPosition.maxHeight}px` : `calc(var(--imcodes-ui-vh, 100vh) - ${PANEL_MARGIN * 2}px)`,
           }}
         >
           <div class="codex-credit-balance-panel-header">

@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
-import { createPortal } from 'preact/compat';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useImperativeHandle } from 'preact/hooks';
+import { createPortal, forwardRef, memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren, JSX, RefObject } from 'preact';
 import type { WsClient, ServerMessage, TimelineEvent } from '../ws-client.js';
@@ -16,6 +16,7 @@ import {
   matchSlashCommandTrigger,
 } from '../quick-commands.js';
 import { FileBrowser } from './file-browser-lazy.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { ConfirmButton } from './ConfirmButton.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -25,6 +26,8 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
+import { VoiceStreamingRobot } from './VoiceStreamingRobot.js';
+import { moveCaretToEnd, registerComposerFocusHandler, type FocusComposerOptions } from '../util/composer-focus.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
 import {
   buildNotepadInlineMessage,
@@ -40,6 +43,7 @@ import type { AgentSkillEntry } from '@shared/agent-skills.js';
 import { agentSkillSourceLabel, buildAgentSkillMarker } from '@shared/agent-skill-references.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
+import { getActiveCssZoom } from '../ui-scale.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
@@ -49,12 +53,14 @@ import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
-import { filterTaskPairReferences, matchTaskPairReferenceTrigger, openTaskPairReferences, replaceTaskPairReferenceTrigger, type TaskPairReference } from '../util/task-pair-reference.js';
+import { filterTaskPairReferences, matchTaskPairReferenceTrigger, openTaskPairReferences, replaceTaskPairReferenceTrigger, taskPairReferenceStatusKey, type TaskPairReference } from '../util/task-pair-reference.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { boundedVisualViewportHeight, createSettledViewportUpdater } from '../visual-viewport.js';
+import { getMobileKeyboardState } from '../mobile-keyboard.js';
 import { buildExecutionTemplateLabel } from '../execution-template-label.js';
 import { formatLabel, formatSessionTabLabel } from '../format-label.js';
 import {
@@ -65,6 +71,8 @@ import {
 import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
 import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
 import { requestActiveTimelineRefreshAfterUserAction } from '../hooks/useTimeline.js';
+import { isIncognitoTimelineSession } from '../incognito-session-registry.js';
+import { isIncognitoSession } from '@shared/session-incognito-types.js';
 import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
 import type { OpenSpecAutoDeliverMaterializedLimits, OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
@@ -85,7 +93,19 @@ import { safeSessionStorageGetItem, safeSessionStorageRemoveItem, safeSessionSto
 import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
-import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
+import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
+import { isNativeMacDesktop } from '../native-platform.js';
+import { setBackgroundTransferKeepAliveLabels } from '../background-transfer-keepalive.js';
+import { getUploadBackgroundEpoch, isUploadEnvironmentSuspended } from '../upload-suspend-wait.js';
+import {
+  deletePendingUpload,
+  listPendingUploadsForKey,
+  PENDING_UPLOAD_MAX_FILE_BYTES,
+  persistPendingUploadFile,
+} from '../pending-upload-store.js';
+import { subscribeDeviceLayoutChange } from '../mobile-device.js';
+import { registerMacVoiceComposerHandler } from '../mac-voice-shortcut.js';
+import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, prewarmDirectFileLease, resolveResumableUploadIdentity, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { collectSettledQueuedIds } from '../session-controls-queue.js';
@@ -133,9 +153,11 @@ import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/
 import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { shortModelLabel } from '../model-label.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
+import { saveAgyModelPreference } from '../agy-model-preference.js';
 import { dispatchSessionModelSwitch } from '../session-model-switch.js';
 import {
   canSessionRoleOwnAutomaticSupervision,
@@ -168,9 +190,448 @@ import {
 import {
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
+import type { PendingSharedSessionUpload } from '../services/share-receiver.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
+export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
+export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
+const VOICE_HOLD_TAP_GUARD_MS = 100;
+const VOICE_HOLD_UNFOCUSED_DELAY_MS = 115;
+const VOICE_HOLD_SLIDE_INTENT_MS = 65;
+const VOICE_HOLD_SLIDE_PROMOTE_PX = 14;
+const VOICE_HOLD_MOVE_SLOP_PX = 18;
+const VOICE_HOLD_SCROLL_ABORT_PX = 40;
+const VOICE_HOLD_CANCEL_THRESHOLD_PX = 44;
+const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
+const VOICE_HOLD_SLIDE_MAX_PX = 84;
+const VOICE_HOLD_START_TIMEOUT_MS = 10_000;
+const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
+const VOICE_HOLD_DROP_ANIMATION_MS = 300;
+export const VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX = 16;
+const VOICE_HOLD_BAR_COUNT = 28;
+const VOICE_HOLD_BAR_MIN_PX = 5;
+const VOICE_HOLD_BAR_MAX_PX = 27;
+const VOICE_HOLD_BAR_MIN_SCALE = VOICE_HOLD_BAR_MIN_PX / VOICE_HOLD_BAR_MAX_PX;
+
+interface VoiceHoldWaveformHandle {
+  pushLevel: (level: number) => void;
+  reset: () => void;
+}
+
+/**
+ * Isolated 28-bar GPU-composited waveform (`scaleY` + `opacity` via DOM refs) so live audio
+ * level ticks never re-render `SessionControls` or trigger layout reflow.
+ */
+const VoiceHoldWaveform = memo(
+  forwardRef<VoiceHoldWaveformHandle, { recording: boolean; liveAudio: boolean; ended: boolean }>(
+    function VoiceHoldWaveform({ recording, liveAudio, ended }, ref) {
+      const barElsRef = useRef<Array<HTMLSpanElement | null>>(Array(VOICE_HOLD_BAR_COUNT).fill(null));
+      const levelsRef = useRef<number[]>(Array(VOICE_HOLD_BAR_COUNT).fill(0));
+
+      const applyLevels = useCallback((levels: number[]) => {
+        const els = barElsRef.current;
+        for (let i = 0; i < VOICE_HOLD_BAR_COUNT; i++) {
+          const el = els[i];
+          if (!el) continue;
+          const level = levels[i] ?? 0;
+          const centerNorm = 1 - Math.abs((i / Math.max(1, VOICE_HOLD_BAR_COUNT - 1)) * 2 - 1);
+          const envelope = 0.38 + 0.62 * Math.sin((centerNorm * Math.PI) / 2);
+          const scale = (VOICE_HOLD_BAR_MIN_PX + level * 22 * envelope) / VOICE_HOLD_BAR_MAX_PX;
+          el.style.transform = `scaleY(${scale.toFixed(6)})`;
+          el.style.opacity = String(0.45 + level * 0.55);
+        }
+      }, []);
+
+      useImperativeHandle(ref, () => ({
+        pushLevel(level: number) {
+          const prev = levelsRef.current;
+          prev.copyWithin(0, 1);
+          prev[prev.length - 1] = level;
+          applyLevels(prev);
+        },
+        reset() {
+          levelsRef.current.fill(0);
+          applyLevels(levelsRef.current);
+        },
+      }), [applyLevels]);
+
+      return (
+        <div
+          class={`voice-hold-hud-waveform${recording && !liveAudio ? ' is-ambient-wave' : ''}${ended ? ' is-ended' : ''}`}
+          aria-hidden="true"
+        >
+          {Array.from({ length: VOICE_HOLD_BAR_COUNT }, (_, idx) => (
+            <span
+              key={idx}
+              ref={(el) => {
+                barElsRef.current[idx] = el;
+              }}
+              class="voice-hold-hud-bar"
+              style={{
+                transform: `scaleY(${VOICE_HOLD_BAR_MIN_SCALE.toFixed(6)})`,
+                opacity: 0.45,
+              }}
+            />
+          ))}
+        </div>
+      );
+    },
+  ),
+);
+
+interface VoiceHoldHudHandle {
+  setDragX: (dragX: number) => void;
+  pushLevel: (level: number) => void;
+  resetBars: () => void;
+  getBottomPx: () => number | null;
+}
+
+interface VoiceHoldHudProps {
+  active: boolean;
+  phase: 'starting' | 'recording' | 'ended' | 'draining' | 'dropping';
+  zone: 'send' | 'cancel' | 'edit';
+  dragXRef: RefObject<number>;
+  dropY: number | null;
+  bottomClearance: number | null;
+  text: string;
+  recognizing: boolean;
+  liveAudio: boolean;
+  transcriptRef: RefObject<HTMLDivElement>;
+}
+
+/**
+ * Isolated hold-to-talk HUD portal: high-frequency horizontal drag offset (`--voice-slide-x`)
+ * and audio level bars mutate DOM refs directly without reconciling `SessionControls`.
+ */
+const VoiceHoldHud = memo(
+  forwardRef<VoiceHoldHudHandle, VoiceHoldHudProps>(function VoiceHoldHud(
+    { active, phase, zone, dragXRef, dropY, bottomClearance, text, recognizing, liveAudio, transcriptRef },
+    ref,
+  ) {
+    const { t } = useTranslation();
+    const hudElRef = useRef<HTMLDivElement | null>(null);
+    const waveformRef = useRef<VoiceHoldWaveformHandle | null>(null);
+
+    useImperativeHandle(ref, () => ({
+      setDragX(dragX: number) {
+        if (hudElRef.current) {
+          hudElRef.current.style.setProperty('--voice-slide-x', `${dragX}px`);
+        }
+      },
+      pushLevel(level: number) {
+        waveformRef.current?.pushLevel(level);
+      },
+      resetBars() {
+        waveformRef.current?.reset();
+      },
+      getBottomPx() {
+        const rect = hudElRef.current?.getBoundingClientRect();
+        return rect && Number.isFinite(rect.bottom) && rect.height > 0 ? rect.bottom : null;
+      },
+    }), []);
+
+    if (!active || typeof document === 'undefined') return null;
+
+    const voiceHoldStarting = phase === 'starting';
+    const voiceHoldRecording = phase === 'recording';
+    const voiceHoldEnded = phase === 'ended';
+    const voiceHoldDraining = phase === 'draining';
+    const voiceHoldDropping = phase === 'dropping';
+    const voiceHoldActuallyRecognizing = (voiceHoldRecording && recognizing) || voiceHoldDraining;
+    const voiceHoldTranscriptDisplay = text.trim()
+      ? text
+      : voiceHoldEnded
+        ? t('voice.no_speech')
+        : voiceHoldDraining
+          ? t('voice.buffering_hint')
+          : voiceHoldRecording
+            ? (voiceHoldActuallyRecognizing ? t('voice.buffering_hint') : t('voice.speak_now'))
+            : '';
+    const voiceHoldStatusLabel = voiceHoldEnded
+      ? (text.trim() ? t('voice.ended') : t('voice.no_speech'))
+      : voiceHoldStarting
+        ? ''
+        : voiceHoldActuallyRecognizing
+          ? t('voice.recognizing')
+          : t('voice.listening');
+
+    return createPortal(
+      <div
+        ref={hudElRef}
+        class={`voice-hold-hud voice-hold-hud-zone-${zone}${voiceHoldDropping ? ' is-dropping' : ''}`}
+        data-zone={zone}
+        data-phase={phase}
+        style={{
+          '--voice-slide-x': `${dragXRef.current ?? 0}px`,
+          ...(dropY !== null ? { '--voice-drop-y': `${dropY}px` } : {}),
+          ...(bottomClearance !== null ? { '--voice-hud-bottom-clearance': `${bottomClearance}px` } : {}),
+        } as JSX.CSSProperties}
+        role="status"
+        aria-live="polite"
+      >
+        <div class="voice-hold-hud-atmosphere" aria-hidden="true">
+          <div class="voice-hold-hud-aurora" />
+          <div class="voice-hold-hud-aurora-core" />
+        </div>
+        <div class="voice-hold-hud-transcript-stage">
+          <div ref={transcriptRef} class="voice-hold-hud-transcript">
+            {voiceHoldTranscriptDisplay}
+            <VoiceStreamingRobot active={voiceHoldActuallyRecognizing} />
+          </div>
+        </div>
+        <div class="voice-hold-hud-card">
+          <div class="voice-hold-hud-header">
+            <span class={`voice-hold-hud-recognizing${voiceHoldActuallyRecognizing ? ' is-recognizing' : ''}${voiceHoldEnded ? ' is-ended' : ''}`}>
+              {voiceHoldStarting ? (
+                <span class="voice-hold-starting-spinner" aria-hidden="true" />
+              ) : (
+                <span
+                  class={`voice-status-dot${voiceHoldRecording || voiceHoldDraining ? ' voice-status-dot-active' : ''}${voiceHoldActuallyRecognizing ? ' voice-status-dot-recognizing' : ''}${voiceHoldEnded ? ' voice-status-dot-ended' : ''}`}
+                  aria-hidden="true"
+                />
+              )}
+              {(voiceHoldRecording || voiceHoldDraining) && (
+                <span class="voice-recognizing-dots" aria-hidden="true">
+                  <i /><i /><i />
+                </span>
+              )}
+              {voiceHoldStatusLabel && <span>{voiceHoldStatusLabel}</span>}
+            </span>
+          </div>
+          <div class={`voice-hold-hud-active-hint is-${zone}`}>
+            {zone === 'cancel'
+              ? t('voice.release_to_cancel')
+              : zone === 'edit'
+                ? t('voice.release_to_edit')
+                : t('voice.release_to_send')}
+          </div>
+          <VoiceHoldWaveform
+            ref={waveformRef}
+            recording={voiceHoldRecording}
+            liveAudio={liveAudio}
+            ended={voiceHoldEnded}
+          />
+          <div class="voice-hold-hud-zones">
+            {(['cancel', 'send', 'edit'] as const).map((z) => {
+              const isActive = zone === z;
+              const label = z === 'cancel'
+                ? t('voice.slide_left_cancel')
+                : z === 'edit'
+                  ? t('voice.slide_right_edit')
+                  : t('voice.release_to_send');
+              return (
+                <div
+                  key={z}
+                  class={`voice-hold-zone voice-hold-zone-${z}${isActive ? ' is-active' : ''}`}
+                  data-zone-target={z}
+                >
+                  {z === 'cancel' && (
+                    <svg
+                      class="voice-hold-zone-arrow"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M19 12H5" />
+                      <path d="M12 19l-7-7 7-7" />
+                    </svg>
+                  )}
+                  {z === 'send' && (
+                    <svg
+                      class="voice-hold-zone-arrow voice-hold-zone-send-icon"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.1"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M12 19V5" />
+                      <path d="M5 12l7-7 7 7" />
+                    </svg>
+                  )}
+                  <span class="voice-hold-zone-label">{label}</span>
+                  {z === 'edit' && (
+                    <svg
+                      class="voice-hold-zone-arrow"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M5 12h14" />
+                      <path d="M12 5l7 7-7 7" />
+                    </svg>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>,
+      document.body,
+    );
+  }),
+);
+
+function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEditable: boolean): void {
+  if (!el) return;
+  const style = el.style as CSSStyleDeclaration & {
+    webkitUserSelect?: string;
+    webkitTouchCallout?: string;
+    webkitUserModify?: string;
+  };
+  style.userSelect = 'none';
+  style.setProperty('-webkit-user-select', 'none');
+  style.webkitUserSelect = 'none';
+  style.setProperty('-webkit-touch-callout', 'none');
+  style.webkitTouchCallout = 'none';
+  style.setProperty('-webkit-user-modify', 'read-only');
+  style.webkitUserModify = 'read-only';
+  if (lockContentEditable) {
+    el.setAttribute('contenteditable', 'false');
+  }
+}
+
+function clearComposerVoiceTouchLock(el: HTMLDivElement | null, disabled: boolean): void {
+  if (!el) return;
+  const composer = el.closest('.controls-composer');
+  if (composer) {
+    // Strip pending/holding classes synchronously so -webkit-user-modify: read-only !important
+    // is lifted before el.focus() executes in the same pointerup/fallback user-gesture turn.
+    composer.classList.remove('controls-composer-voice-pending', 'controls-composer-voice-holding');
+  }
+  const style = el.style as CSSStyleDeclaration & {
+    webkitUserSelect?: string;
+    webkitTouchCallout?: string;
+    webkitUserModify?: string;
+  };
+  style.removeProperty('user-select');
+  style.removeProperty('-webkit-user-select');
+  style.removeProperty('-webkit-touch-callout');
+  style.removeProperty('-webkit-user-modify');
+  style.webkitUserSelect = '';
+  style.webkitTouchCallout = '';
+  style.webkitUserModify = '';
+  el.setAttribute('contenteditable', disabled ? 'false' : 'true');
+}
+
+function prefersVoiceHoldReducedMotion(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Compute CSS pixel bottom padding needed so `.voice-hold-hud-card` and `.voice-hold-hud-zones`
+ * sit cleanly above `.controls-composer` rather than under the holding finger.
+ */
+export function computeVoiceHoldBottomClearancePx(
+  composerEl: HTMLElement | null,
+  viewportHeightPx: number,
+  cssZoom = 1,
+): number | null {
+  if (!composerEl) return null;
+  if (!Number.isFinite(viewportHeightPx) || viewportHeightPx <= 0) return null;
+  const rect = composerEl.getBoundingClientRect();
+  if (
+    !rect
+    || !Number.isFinite(rect.top)
+    || !Number.isFinite(rect.bottom)
+    || !Number.isFinite(rect.width)
+    || !Number.isFinite(rect.height)
+    || (rect.width <= 0 && rect.height <= 0)
+  ) {
+    return null;
+  }
+  const safeZoom = Number.isFinite(cssZoom) && cssZoom > 0 ? cssZoom : 1;
+  const distanceFromBottomPx = (viewportHeightPx - rect.top) / safeZoom;
+  if (!Number.isFinite(distanceFromBottomPx) || distanceFromBottomPx <= 0) {
+    return null;
+  }
+  const clearance = Math.round(distanceFromBottomPx + VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX);
+  return Number.isFinite(clearance) && clearance > 0 ? clearance : null;
+}
+
+function computeVoiceHoldDropOffsetPx(
+  transcriptEl: HTMLElement | null,
+  composerEl: HTMLElement | null,
+): number | null {
+  if (!transcriptEl || !composerEl) return null;
+  const tRect = transcriptEl.getBoundingClientRect();
+  const cRect = composerEl.getBoundingClientRect();
+  if (!tRect || !cRect || (tRect.height <= 0 && tRect.width <= 0) || (cRect.height <= 0 && cRect.width <= 0)) {
+    return null;
+  }
+  const tCenterY = tRect.top + tRect.height / 2;
+  const cCenterY = cRect.top + cRect.height / 2;
+  const delta = Math.round(cCenterY - tCenterY);
+  return delta > 24 ? Math.min(delta, 560) : null;
+}
+
+function prewarmVoiceInput(options?: { requestPermission?: boolean }): void {
+  if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'prewarm')) return;
+  const fn = (VoiceInput as { prewarm?: (opts?: { requestPermission?: boolean }) => Promise<void> }).prewarm;
+  if (typeof fn === 'function') {
+    void fn(options);
+  }
+}
+
+function primeVoiceInputGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (Object.prototype.hasOwnProperty.call(VoiceInput, 'primeVoiceGesture')) {
+    const fn = (VoiceInput as { primeVoiceGesture?: (opts?: { deferAudioPause?: boolean }) => boolean }).primeVoiceGesture;
+    if (typeof fn === 'function') return fn(options);
+  }
+  if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'primeWebGesture')) return false;
+  const fn = (VoiceInput as { primeWebGesture?: (opts?: { deferAudioPause?: boolean }) => boolean }).primeWebGesture;
+  return typeof fn === 'function' ? fn(options) : false;
+}
+
+function cancelVoiceInputGesturePrime(): void {
+  if (Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelVoiceGesturePrime')) {
+    const fn = (VoiceInput as { cancelVoiceGesturePrime?: () => void }).cancelVoiceGesturePrime;
+    if (typeof fn === 'function') {
+      fn();
+      return;
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelWebGesturePrime')) return;
+  const fn = (VoiceInput as { cancelWebGesturePrime?: () => void }).cancelWebGesturePrime;
+  if (typeof fn === 'function') fn();
+}
+
+function triggerVoiceHoldHaptic(): void {
+  if (Object.prototype.hasOwnProperty.call(VoiceInput, 'triggerHapticFeedback')) {
+    const fn = (VoiceInput as { triggerHapticFeedback?: (ms?: number) => Promise<void> }).triggerHapticFeedback;
+    if (typeof fn === 'function') {
+      void fn(20);
+      return;
+    }
+  }
+  try {
+    navigator.vibrate?.(20);
+  } catch {
+    /* ignore */
+  }
+}
 /**
  * Floor for the shared desktop composer height, matching the three-row resting
  * size the desktop stylesheet sets.
@@ -331,6 +792,8 @@ interface Props {
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
+  /** Open Controlled Nodes management (passed through to FileBrowser / DocShareDialog). */
+  onOpenNodeGroups?: () => void;
   /** All sessions — for @ picker agent list. */
   sessions?: SessionInfo[];
   /** Sub-sessions — for @ picker agent list (includes deck_sub_*).
@@ -371,6 +834,10 @@ interface Props {
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been applied. */
   onPendingPrefillApplied?: () => void;
+  /** Pending shared files/text from external app share target modal. */
+  pendingSharedUpload?: PendingSharedSessionUpload | null;
+  /** Called after pendingSharedUpload has been consumed by the target session composer. */
+  onPendingSharedUploadConsumed?: (id: string) => void;
   /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
   compact?: boolean;
   /** Whether this full control surface is the active keyboard target for window-level shortcuts. */
@@ -385,6 +852,8 @@ interface Props {
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
   /** Reports the current composer text to parent surfaces (e.g. footer actions). */
   onComposerTextChange?: (text: string) => void;
+  /** Allow opening DocShare controls from embedded FileBrowser overlays (false for shared-in callers). */
+  canManageFileShares?: boolean;
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
@@ -609,31 +1078,484 @@ function appendComposerNewline(parts: string[]): void {
   if (parts.length === 0 || parts[parts.length - 1] !== '\n') parts.push('\n');
 }
 
-function readComposerElementText(root: HTMLElement): string {
+export function readComposerElementText(
+  root: HTMLElement,
+  options?: { preserveEditingLines?: boolean },
+): string {
+  const preserveEditingLines = Boolean(options?.preserveEditingLines);
   const parts: string[] = [];
+  let pendingBlockBreak = false;
+  let hasContentBeforeBlock = false;
   const walk = (node: Node) => {
     if (node.nodeType === Node.TEXT_NODE) {
-      parts.push(node.textContent ?? '');
+      const value = node.textContent ?? '';
+      if (!preserveEditingLines) {
+        parts.push(value);
+        return;
+      }
+      if (pendingBlockBreak && value.length > 0) {
+        parts.push('\n');
+        pendingBlockBreak = false;
+        hasContentBeforeBlock = false;
+      }
+      if (value.length > 0) hasContentBeforeBlock = true;
+      parts.push(value);
       return;
     }
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const element = node as HTMLElement;
+    if (element.dataset?.inlineVoiceRobot === 'true') return;
     const tag = element.tagName;
-    const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
+    const isBlock = isComposerBlockTag(tag);
     if (tag === 'BR') {
-      appendComposerNewline(parts);
+      if (!preserveEditingLines) {
+        appendComposerNewline(parts);
+        return;
+      }
+      if (pendingBlockBreak) {
+        parts.push('\n');
+        pendingBlockBreak = false;
+      }
+      if (hasFollowingVisibleContentInBlock(element, root)) {
+        parts.push('\n');
+        hasContentBeforeBlock = false;
+      } else {
+        hasContentBeforeBlock = true;
+      }
       return;
     }
-    if (isBlock && parts.length > 0) appendComposerNewline(parts);
+    if (!preserveEditingLines) {
+      if (isBlock && parts.length > 0) appendComposerNewline(parts);
+      element.childNodes.forEach(walk);
+      if (isBlock) appendComposerNewline(parts);
+      return;
+    }
+    if (isBlock && (pendingBlockBreak || hasContentBeforeBlock)) {
+      parts.push('\n');
+      pendingBlockBreak = false;
+      hasContentBeforeBlock = false;
+    }
     element.childNodes.forEach(walk);
-    if (isBlock) appendComposerNewline(parts);
+    if (isBlock) {
+      pendingBlockBreak = true;
+      hasContentBeforeBlock = false;
+    }
   };
   root.childNodes.forEach(walk);
-  return parts.join('').replace(/\n+$/g, '');
+  const raw = parts.join('');
+  return preserveEditingLines ? raw : raw.replace(/\n+$/g, '');
 }
 
 function setComposerElementText(root: HTMLElement, text: string): void {
   root.textContent = text.replace(/\r\n?/g, '\n');
+}
+
+function measureComposerOffsetAtPoint(root: HTMLElement, targetNode: Node, targetOffset: number): number {
+  let length = 0;
+  let pendingBlockBreak = false;
+  let hasContentBeforeBlock = false;
+  let stopped = false;
+
+  const walk = (node: Node): void => {
+    if (stopped) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const full = node.textContent ?? '';
+      const slice = node === targetNode ? full.slice(0, targetOffset) : full;
+      if (pendingBlockBreak && slice.length > 0) {
+        length += 1;
+        pendingBlockBreak = false;
+        hasContentBeforeBlock = false;
+      }
+      if (slice.length > 0) hasContentBeforeBlock = true;
+      length += slice.length;
+      if (node === targetNode) {
+        stopped = true;
+      }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const element = node as HTMLElement;
+    if (element.dataset?.inlineVoiceRobot === 'true') return;
+    const tag = element.tagName;
+    const isBlock = isComposerBlockTag(tag);
+    if (tag === 'BR') {
+      if (pendingBlockBreak) {
+        length += 1;
+        pendingBlockBreak = false;
+      }
+      if (hasFollowingVisibleContentInBlock(element, root)) {
+        length += 1;
+        hasContentBeforeBlock = false;
+      } else {
+        hasContentBeforeBlock = true;
+      }
+      if (node === targetNode) stopped = true;
+      return;
+    }
+    if (isBlock && (pendingBlockBreak || hasContentBeforeBlock)) {
+      length += 1;
+      pendingBlockBreak = false;
+      hasContentBeforeBlock = false;
+    }
+    const maxChildren = node === targetNode ? Math.min(targetOffset, element.childNodes.length) : element.childNodes.length;
+    for (let i = 0; i < maxChildren; i++) {
+      walk(element.childNodes[i]);
+      if (stopped) return;
+    }
+    if (node === targetNode) {
+      stopped = true;
+      return;
+    }
+    if (isBlock) {
+      pendingBlockBreak = true;
+      hasContentBeforeBlock = false;
+    }
+  };
+
+  if (root === targetNode) {
+    const maxChildren = Math.min(targetOffset, root.childNodes.length);
+    for (let i = 0; i < maxChildren; i++) {
+      walk(root.childNodes[i]);
+      if (stopped) break;
+    }
+    return length;
+  }
+
+  for (let i = 0; i < root.childNodes.length; i++) {
+    walk(root.childNodes[i]);
+    if (stopped) break;
+  }
+  return length;
+}
+
+function getComposerSelectionOffsets(root: HTMLElement): { start: number; end: number } | null {
+  if (typeof window === 'undefined' || typeof window.getSelection !== 'function') return null;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  try {
+    const range = sel.getRangeAt(0);
+    if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) {
+      return null;
+    }
+    const start = measureComposerOffsetAtPoint(root, range.startContainer, range.startOffset);
+    const end = range.collapsed
+      ? start
+      : measureComposerOffsetAtPoint(root, range.endContainer, range.endOffset);
+    return start <= end ? { start, end } : { start: end, end: start };
+  } catch {
+    return null;
+  }
+}
+
+function setComposerCaretOffset(root: HTMLElement, offset: number): void {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  try {
+    const sel = window.getSelection();
+    if (!sel || typeof document.createRange !== 'function') return;
+    let remaining = Math.max(0, offset);
+    const range = document.createRange();
+    let placed = false;
+
+    const walk = (node: Node): void => {
+      if (placed) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        const len = node.textContent?.length ?? 0;
+        if (remaining <= len) {
+          range.setStart(node, remaining);
+          range.collapse(true);
+          placed = true;
+          return;
+        }
+        remaining -= len;
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const element = node as HTMLElement;
+      if (element.dataset?.inlineVoiceRobot === 'true') return;
+      if (element.tagName === 'BR') {
+        if (remaining <= 0) {
+          range.setStartBefore(element);
+          range.collapse(true);
+          placed = true;
+          return;
+        }
+        remaining = Math.max(0, remaining - 1);
+        return;
+      }
+      for (let i = 0; i < element.childNodes.length; i++) {
+        walk(element.childNodes[i]);
+        if (placed) return;
+      }
+    };
+
+    for (let i = 0; i < root.childNodes.length; i++) {
+      walk(root.childNodes[i]);
+      if (placed) break;
+    }
+    if (!placed) {
+      range.selectNodeContents(root);
+      range.collapse(false);
+    }
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {
+    /* ignore selection errors in environments lacking full Range support */
+  }
+}
+
+function createInlineVoiceRobotHost(): HTMLSpanElement {
+  const host = document.createElement('span');
+  host.className = 'controls-inline-voice-robot-host';
+  host.setAttribute('contenteditable', 'false');
+  host.dataset.inlineVoiceRobot = 'true';
+  host.setAttribute('aria-hidden', 'true');
+  return host;
+}
+
+function detachInlineVoiceRobotHost(host: HTMLSpanElement | null): void {
+  if (!host) return;
+  const parent = host.parentNode;
+  if (!parent) return;
+  host.remove();
+  if (typeof (parent as Element).normalize === 'function') {
+    (parent as Element).normalize();
+  }
+}
+
+function writeInlineVoiceSegmentDom(
+  root: HTMLElement,
+  before: string,
+  after: string,
+  robotHost: HTMLSpanElement | null,
+  restoreCaret: boolean,
+): void {
+  while (root.firstChild) {
+    root.removeChild(root.firstChild);
+  }
+  const cleanBefore = before.replace(/\r\n?/g, '\n');
+  const cleanAfter = after.replace(/\r\n?/g, '\n');
+  let beforeNode: Text | null = null;
+  if (cleanBefore.length > 0) {
+    beforeNode = document.createTextNode(cleanBefore);
+    root.appendChild(beforeNode);
+  }
+  if (robotHost) {
+    root.appendChild(robotHost);
+  }
+  if (cleanAfter.length > 0) {
+    root.appendChild(document.createTextNode(cleanAfter));
+  }
+  if (restoreCaret && typeof window !== 'undefined' && typeof document !== 'undefined') {
+    try {
+      const sel = window.getSelection();
+      if (sel && typeof document.createRange === 'function') {
+        const range = document.createRange();
+        if (beforeNode) {
+          range.setStart(beforeNode, beforeNode.data.length);
+        } else {
+          range.setStart(root, 0);
+        }
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+const COMPOSER_LINE_RECT_TOLERANCE_PX = 3;
+
+function isCaretLineRect(rect: DOMRect | undefined): rect is DOMRect {
+  return Boolean(rect && rect.height > 0.5);
+}
+
+function getRangeClientRects(range: Range): DOMRect[] {
+  if (typeof range.getClientRects !== 'function') return [];
+  return Array.from(range.getClientRects()).filter(isCaretLineRect);
+}
+
+function resolveComposerCaretRect(
+  range: Range,
+  upProbe: Range,
+  downProbe: Range,
+): DOMRect | null {
+  const caretRects = getRangeClientRects(range);
+  if (caretRects.length > 0) return caretRects[0];
+  const downRects = getRangeClientRects(downProbe);
+  if (downRects.length > 0) return downRects[0];
+  const upRects = getRangeClientRects(upProbe);
+  if (upRects.length > 0) return upRects[upRects.length - 1];
+  return null;
+}
+
+function isComposerBlockTag(tagName: string): boolean {
+  return tagName === 'DIV' || tagName === 'P' || tagName === 'LI';
+}
+
+function hasVisibleComposerNodeContent(node: Node): boolean {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node.textContent ?? '').length > 0;
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return false;
+  const element = node as HTMLElement;
+  if (element.tagName === 'BR') return true;
+  for (let i = 0; i < element.childNodes.length; i += 1) {
+    if (hasVisibleComposerNodeContent(element.childNodes[i])) return true;
+  }
+  return false;
+}
+
+function hasFollowingVisibleContentInBlock(node: Node, root: HTMLElement): boolean {
+  // Climb past transparent inline wrappers (span/b/i/etc.) while stopping at
+  // the enclosing block boundary or composer root so a trailing sentinel <br>
+  // inside a block does not double-count with the block's own line break.
+  let current: Node | null = node;
+  while (current && current !== root) {
+    let sibling: Node | null = current.nextSibling;
+    while (sibling) {
+      if (hasVisibleComposerNodeContent(sibling)) return true;
+      sibling = sibling.nextSibling;
+    }
+    const parent: Node | null = current.parentNode;
+    if (!parent || parent === root) break;
+    if (parent.nodeType === Node.ELEMENT_NODE && isComposerBlockTag((parent as HTMLElement).tagName)) {
+      break;
+    }
+    current = parent;
+  }
+  return false;
+}
+
+function hasStructuralLineBreakRelativeToCaret(
+  root: HTMLElement,
+  range: Range,
+  direction: 'up' | 'down',
+): boolean {
+  // Linearize structural line indices alongside the caret in document order so
+  // `\n`, `<br>`, and block elements (`div`/`p`/`li`) are all detected even
+  // when layout rects are absent (e.g. jsdom), without letting a trailing
+  // sentinel `<br>` trap `ArrowDown`.
+  let line = 0;
+  let caretLine: number | null = null;
+  let pendingBlockBreak = false;
+  let hasContentBeforeBlock = false;
+
+  const maybePlaceCaretAtBoundary = (container: Node, offset: number) => {
+    if (caretLine === null && range.startContainer === container && range.startOffset === offset) {
+      caretLine = line;
+    }
+  };
+
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const value = node.textContent ?? '';
+      if (pendingBlockBreak && value.length > 0) {
+        line += 1;
+        pendingBlockBreak = false;
+        hasContentBeforeBlock = false;
+      }
+      if (value.length > 0) hasContentBeforeBlock = true;
+      if (range.startContainer === node) {
+        const clampedOffset = Math.max(0, Math.min(range.startOffset, value.length));
+        for (let i = 0; i < clampedOffset; i += 1) {
+          if (value[i] === '\n') line += 1;
+        }
+        caretLine = line;
+        for (let i = clampedOffset; i < value.length; i += 1) {
+          if (value[i] === '\n') line += 1;
+        }
+      } else {
+        for (let i = 0; i < value.length; i += 1) {
+          if (value[i] === '\n') line += 1;
+        }
+      }
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const element = node as HTMLElement;
+    if (element.dataset?.inlineVoiceRobot === 'true') return;
+    const tag = element.tagName;
+    if (tag === 'BR') {
+      if (pendingBlockBreak) {
+        line += 1;
+        pendingBlockBreak = false;
+      }
+      if (hasFollowingVisibleContentInBlock(element, root)) {
+        line += 1;
+        hasContentBeforeBlock = false;
+      } else {
+        hasContentBeforeBlock = true;
+      }
+      return;
+    }
+
+    const isBlock = element !== root && isComposerBlockTag(tag);
+    if (isBlock && (pendingBlockBreak || hasContentBeforeBlock)) {
+      line += 1;
+      pendingBlockBreak = false;
+      hasContentBeforeBlock = false;
+    }
+
+    const children = element.childNodes;
+    for (let i = 0; i < children.length; i += 1) {
+      maybePlaceCaretAtBoundary(element, i);
+      walk(children[i]);
+    }
+    maybePlaceCaretAtBoundary(element, children.length);
+
+    if (isBlock) {
+      pendingBlockBreak = true;
+      hasContentBeforeBlock = false;
+    }
+  };
+
+  walk(root);
+  if (caretLine === null) return false;
+  return direction === 'up' ? caretLine > 0 : caretLine < line;
+}
+
+/**
+ * Determine whether the collapsed selection caret in a `contenteditable` composer
+ * currently sits on the first (`'up'`) or last (`'down'`) visual line.
+ * Uses Range client rects when layout geometry exists (covering soft line wraps
+ * as well as explicit breaks) and falls back to DOM structural line tracking.
+ */
+export function isCaretAtComposerLineBoundary(
+  root: HTMLElement | null,
+  direction: 'up' | 'down',
+): boolean {
+  const sel = typeof window !== 'undefined' ? window.getSelection() : null;
+  if (!root || !sel || sel.rangeCount === 0) return true;
+  const range = sel.getRangeAt(0);
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return true;
+  if (!sel.isCollapsed) return false;
+
+  const upProbe = range.cloneRange();
+  upProbe.selectNodeContents(root);
+  upProbe.setEnd(range.startContainer, range.startOffset);
+
+  const downProbe = range.cloneRange();
+  downProbe.selectNodeContents(root);
+  downProbe.setStart(range.endContainer, range.endOffset);
+
+  const caretRect = resolveComposerCaretRect(range, upProbe, downProbe);
+  if (caretRect) {
+    const probeRects = getRangeClientRects(direction === 'up' ? upProbe : downProbe);
+    if (probeRects.length === 0) return true;
+    const hasOtherLine = probeRects.some((rect) => (
+      direction === 'up'
+        ? rect.top < caretRect.top - COMPOSER_LINE_RECT_TOLERANCE_PX
+          && rect.bottom <= caretRect.top + COMPOSER_LINE_RECT_TOLERANCE_PX
+        : rect.bottom > caretRect.bottom + COMPOSER_LINE_RECT_TOLERANCE_PX
+          && rect.top >= caretRect.bottom - COMPOSER_LINE_RECT_TOLERANCE_PX
+    ));
+    return !hasOtherLine;
+  }
+
+  return !hasStructuralLineBreakRelativeToCaret(root, range, direction);
 }
 
 /**
@@ -791,6 +1713,14 @@ type ComposerUploadItem = {
   updatedAt: number;
   /** The daemon path is recorded before the transient row can become done. */
   attachmentPath?: string;
+  /** False when failure is permanent (e.g. expired content:// URI needing reselect). */
+  retryable?: boolean;
+  /** Tracks the wake epoch (connect + online + background) of the last auto-retry. */
+  lastAutoRetryEpoch?: string;
+  /** Number of automatic wake/reconnect retries attempted for this item. */
+  autoRetryCount?: number;
+  /** True when hydrated/queued while disconnected or suspended, waiting to start transport on reconnect/resume. */
+  waitingForConnection?: boolean;
 };
 
 type ComposerUploadEntry = {
@@ -802,6 +1732,7 @@ const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
   uploads: [],
   error: null,
 };
+const MAX_COMPOSER_AUTO_RETRIES = 10;
 const composerUploadStore = new Map<string, ComposerUploadEntry>();
 const composerUploadAbortControllers = new Map<string, AbortController>();
 // Keep the user-selected File alive for an explicit retry.  The transport's
@@ -809,7 +1740,25 @@ const composerUploadAbortControllers = new Map<string, AbortController>();
 // than forcing the user to pick and resend the whole file after a transient
 // direct+HTTP failure.
 const composerUploadRetryFiles = new Map<string, File>();
+const composerUploadClientIds = new Map<string, string>();
+const recoveredPendingUploadIds = new Set<string>();
 let composerUploadIdCounter = 0;
+let composerUploadConnectEpoch = 0;
+let composerUploadOnlineEpoch = 0;
+
+function getComposerUploadWakeEpoch(): string {
+  return `${composerUploadConnectEpoch}:${composerUploadOnlineEpoch}:${getUploadBackgroundEpoch()}`;
+}
+
+export function resetPendingUploadRecoveryForTests(): void {
+  recoveredPendingUploadIds.clear();
+  composerUploadClientIds.clear();
+  composerUploadRetryFiles.clear();
+  composerUploadAbortControllers.clear();
+  composerUploadStore.clear();
+  composerUploadConnectEpoch = 0;
+  composerUploadOnlineEpoch = 0;
+}
 
 function createComposerUploadId(): string {
   composerUploadIdCounter += 1;
@@ -1066,6 +2015,8 @@ interface PendingComboSendConfirmation {
   clearComposer: boolean;
   retainOnRejection: boolean;
   onConfirmedAccepted?: () => void;
+  onConfirmedRejected?: () => void;
+  onCanceled?: () => void;
 }
 
 type ManualP2pTargetCandidate = {
@@ -1236,7 +2187,13 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
+  const baseOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
+  const handleOpenNodeGroupsFromBrowser = useCallback(() => {
+    onMobileFileBrowserClose?.();
+    setOpenSpecFolderPath(null);
+    baseOpenNodeGroups?.();
+  }, [onMobileFileBrowserClose, baseOpenNodeGroups]);
   recordPerfRender(activeSession?.name?.startsWith('deck_sub_') ? 'SessionControls:sub' : 'SessionControls:main');
   const { t, i18n } = useTranslation();
   const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
@@ -1249,7 +2206,109 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
+  const [macDesktop, setMacDesktop] = useState(() => isNativeMacDesktop());
+  const macDesktopRef = useRef(macDesktop);
+  macDesktopRef.current = macDesktop;
+  useEffect(() => subscribeDeviceLayoutChange(() => {
+    setMacDesktop(isNativeMacDesktop());
+  }, { includeResize: false }), []);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [voiceOverlayInitialText, setVoiceOverlayInitialText] = useState<string | null>(null);
+  const [voiceOverlayAutoStart, setVoiceOverlayAutoStart] = useState(true);
+  const [inlineVoiceActive, setInlineVoiceActive] = useState(false);
+  const [inlineVoiceRecognizing, setInlineVoiceRecognizing] = useState(false);
+  const inlineVoiceActiveRef = useRef(false);
+  const inlineVoiceTokenRef = useRef(0);
+  const inlineVoiceRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inlineVoiceRobotHostRef = useRef<HTMLSpanElement | null>(null);
+  const programmaticVoiceWriteRef = useRef(false);
+  const inlineVoiceSegmentRef = useRef<{
+    prefix: string;
+    selectedText: string;
+    suffix: string;
+    partial: string;
+    hasCommittedPartial: boolean;
+    caretAfterSegment: number;
+  }>({
+    prefix: '',
+    selectedText: '',
+    suffix: '',
+    partial: '',
+    hasCommittedPartial: false,
+    caretAfterSegment: 0,
+  });
+  const interruptInlineVoiceRef = useRef<(() => void) | null>(null);
+  const [voiceHoldPending, setVoiceHoldPending] = useState(false);
+  const [voiceHoldActive, setVoiceHoldActive] = useState(false);
+  const [voiceHoldHudActive, setVoiceHoldHudActive] = useState(false);
+  const [voiceHoldZone, setVoiceHoldZone] = useState<'send' | 'cancel' | 'edit'>('send');
+  const voiceHoldDragXRef = useRef(0);
+  const voiceHoldHudRef = useRef<VoiceHoldHudHandle | null>(null);
+  const [voiceHoldDropY, setVoiceHoldDropY] = useState<number | null>(null);
+  const [voiceHoldBottomClearance, setVoiceHoldBottomClearance] = useState<number | null>(null);
+  const [voiceHoldText, setVoiceHoldText] = useState('');
+  const [voiceHoldPhase, setVoiceHoldPhase] = useState<'starting' | 'recording' | 'ended' | 'draining' | 'dropping'>('starting');
+  const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
+  const [voiceHoldLiveAudio, setVoiceHoldLiveAudio] = useState(false);
+  const [voiceHoldError, setVoiceHoldError] = useState<string | null>(null);
+  const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldSlideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldStartTimeoutOwnerRef = useRef<NonNullable<typeof voiceHoldTxRef.current> | null>(null);
+  const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldDropTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldDropCancelRef = useRef<(() => void) | null>(null);
+  const voiceHoldPointerRef = useRef<{
+    id: number;
+    startX: number;
+    startY: number;
+    wasFocused: boolean;
+    pointerType: string;
+    slideIntentDx: number | null;
+    downAt: number;
+    lastActivityAt: number;
+    captureLost: boolean;
+  } | null>(null);
+  const pendingMobileInitialEndFocusRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    pointerType: string;
+  } | null>(null);
+  const voiceHoldPendingRef = useRef(false);
+  const voiceHoldActiveRef = useRef(false);
+  const voiceHoldZoneRef = useRef<'send' | 'cancel' | 'edit'>('send');
+  const voiceHoldTokenRef = useRef(0);
+  const voiceHoldTxRef = useRef<{
+    id: number;
+    baseText: string;
+    transcript: string;
+    zone: 'send' | 'cancel' | 'edit';
+    phase: 'starting' | 'recording' | 'ended' | 'draining' | 'dropping' | 'failed' | 'settled';
+    error: string | null;
+    pointerType: string;
+    didStartRecording: boolean;
+    settled: boolean;
+    startSettled: boolean;
+    startPromise: Promise<boolean> | null;
+    drainPromise: Promise<void> | null;
+  } | null>(null);
+  const voiceHoldLiveAudioRef = useRef(false);
+  const voiceHoldTranscriptRef = useRef<HTMLDivElement | null>(null);
+  const inputDisabledRef = useRef(false);
+  const voiceHoldReadyRef = useRef(false);
+  const composerFocusedRef = useRef(false);
+  const voiceWindowCleanupRef = useRef<(() => void) | null>(null);
+  const voicePointerMoveHandlerRef = useRef<(event: PointerEvent) => void>(() => {});
+  const voicePointerEndHandlerRef = useRef<(event: PointerEvent, cancelled?: boolean) => void>(() => {});
+  const handledVoicePointerEventsRef = useRef<WeakSet<Event>>(new WeakSet());
+  const touchTapCompatShieldCleanupRef = useRef<(() => void) | null>(null);
+  const suppressComposerClickFocusRef = useRef(false);
+  const suppressComposerClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const suppressNextVoiceButtonClickRef = useRef(false);
+  const suppressNextVoiceButtonClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceOpenRef = useRef(voiceOpen);
+  voiceOpenRef.current = voiceOpen;
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
@@ -1275,7 +2334,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
-  const [taskPairReferences, setTaskPairReferences] = useState<TaskPairReference[]>([]);
+  const currentTaskPairReferences = () => {
+    const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { serverId?: string } }).__imcodesTaskPairSnapshot;
+    return snapshot?.serverId && snapshot.serverId !== serverId ? [] : openTaskPairReferences(snapshot);
+  };
+  const [taskPairReferences, setTaskPairReferences] = useState<TaskPairReference[]>(currentTaskPairReferences);
   const [taskPairPickerOpen, setTaskPairPickerOpen] = useState(false);
   const [taskPairQuery, setTaskPairQuery] = useState('');
   const [taskPairHighlightIdx, setTaskPairHighlightIdx] = useState(0);
@@ -1297,19 +2360,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     const onSnapshot = (event: Event) => {
       const detail = (event as CustomEvent).detail;
+      if (detail?.authoritative === false) return;
       if (detail?.scopeReset || detail?.authorityUnavailable) {
         setTaskPairReferences([]);
         setTaskPairPickerOpen(false);
         setTaskPairQuery('');
         return;
       }
+      if (detail?.serverId && detail.serverId !== serverId) return;
       setTaskPairReferences(openTaskPairReferences(detail));
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
-  }, []);
+  }, [serverId]);
   useEffect(() => {
-    setTaskPairReferences([]);
+    setTaskPairReferences(currentTaskPairReferences());
     setTaskPairPickerOpen(false);
     setTaskPairQuery('');
   }, [serverId, activeSession?.name]);
@@ -1435,6 +2500,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [settledQueuedIds, setSettledQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
+  const mobileComposerExpandedRef = useRef(false);
   const sharedComposerHeight = useSharedComposerHeight();
   const composerResizeCleanupRef = useRef<(() => void) | null>(null);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -1446,6 +2512,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const [fileDragActive, setFileDragActive] = useState(false);
   const controlsWrapperRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
   const aliasPickerRef = useRef<HTMLDivElement>(null);
   const machinePickerRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -1747,12 +2814,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
+  const historyEditsRef = useRef<Map<number, string>>(new Map()); // per-index edits while browsing history
   const imeComposingRef = useRef(false);
   const lastImeCompositionAtRef = useRef(0);
   const attachmentDraftRef = useRef<ComposerAttachmentRecord[]>([]);
+  const activeSessionIncognito = isIncognitoSession(activeSession)
+    || (activeSession?.name ? isIncognitoTimelineSession(serverId ?? null, activeSession.name) : false);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
-  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
-  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
+  useEffect(() => {
+    histIdxRef.current = -1;
+    draftRef.current = '';
+    historyEditsRef.current.clear();
+  }, [serverId, composerDraftScope, activeSessionIncognito]);
+  const draftKey = !activeSessionIncognito && composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
+  const attachmentDraftKey = !activeSessionIncognito && composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
   const attachmentDraftKeyRef = useRef<string | null>(attachmentDraftKey);
   attachmentDraftKeyRef.current = attachmentDraftKey;
   const mountedRef = useRef(true);
@@ -1760,7 +2835,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // A voice notepad's local draft is kept per session exactly like the
   // composer's own draft (main sessions and sub-sessions alike), and per
   // server, so two servers' same-named sessions never share one.
-  const voiceNotepadDraftScope = composerDraftScope
+  const voiceNotepadDraftScope = !activeSessionIncognito && composerDraftScope
     ? (serverId ? `${serverId}:${composerDraftScope}` : composerDraftScope)
     : null;
   const [hasVoiceNotepadDraft, setHasVoiceNotepadDraft] = useState(false);
@@ -1791,6 +2866,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [supervisionModeNotice, setSupervisionModeNotice] = useState<string | null>(null);
   const [effortClampNotice, setEffortClampNotice] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
+  const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
   const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1801,10 +2877,36 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const effortClampAppliedRef = useRef<string | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
-  // Keep external inputRef in sync so parent can call .focus()
+  /**
+   * Intentionally transition the composer out of unfocused read-only voice lock
+   * into an editable `contenteditable="true"` state and focus it for typing.
+   * Refuses while disabled or during an active/pending voice hold gesture.
+   */
+  const focusComposerForTyping = useCallback((options?: FocusComposerOptions): boolean => {
+    const el = divRef.current;
+    if (!el || !el.isConnected) return false;
+    if (inputDisabledRef.current || voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
+      return false;
+    }
+    cancelVoiceInputGesturePrime();
+    clearComposerVoiceTouchLock(el, false);
+    composerFocusedRef.current = true;
+    setComposerFocused(true);
+    el.focus();
+    if (options?.moveCursorToEnd) {
+      moveCaretToEnd(el);
+    }
+    return true;
+  }, []);
+
+  // Keep external inputRef and focus handler in sync so external callers can enter typing mode.
   useEffect(() => {
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
+    return registerComposerFocusHandler(divRef.current, focusComposerForTyping);
   });
+  useEffect(() => () => {
+    if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = null;
+  }, [inputRef]);
 
   useEffect(() => {
     const el = divRef.current;
@@ -1813,6 +2915,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const handleCompositionStart = () => {
       imeComposingRef.current = true;
       markImeActivity();
+      if (inlineVoiceActiveRef.current && !programmaticVoiceWriteRef.current) {
+        interruptInlineVoiceRef.current?.();
+      }
     };
     const handleCompositionEnd = () => {
       imeComposingRef.current = false;
@@ -1827,6 +2932,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       el.dispatchEvent(new Event('input', { bubbles: true }));
     };
     const handleNativeBlur = () => {
+      composerFocusedRef.current = false;
       setComposerFocused(false);
       closeQuickSuggestions();
     };
@@ -1858,17 +2964,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
     divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
-    divRef.current.focus();
-    try {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(divRef.current);
-      range.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-    } catch { /* ignore selection API failures */ }
+    focusComposerForTyping({ moveCursorToEnd: true });
     onPendingPrefillApplied?.();
-  }, [closeQuickSuggestions, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
+  }, [closeQuickSuggestions, focusComposerForTyping, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
 
   const clearSendWarning = useCallback(() => {
     if (sendWarningTimerRef.current) {
@@ -1942,6 +3040,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } else {
       publishComposerText('');
     }
+    syncMobileComposerMetrics();
     return () => {
       const text = divRef.current ? readComposerElementText(divRef.current) : '';
       if (draftKey) safeSessionStorageSetItem(draftKey, text);
@@ -1950,8 +3049,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => {
     setHydratedAttachmentDraftKey(null);
+    setAttachmentsExpanded(false);
     if (!attachmentDraftKey) {
       setAttachments([]);
+      setAttachmentsExpanded(false);
       attachmentDraftRef.current = [];
       return;
     }
@@ -1963,6 +3064,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => {
     attachmentDraftRef.current = attachments;
+    if (attachments.length <= ATTACHMENT_BADGE_COLLAPSE_THRESHOLD) {
+      setAttachmentsExpanded(false);
+    }
     closeQuickSuggestions();
     if (!attachmentDraftKey || hydratedAttachmentDraftKey !== attachmentDraftKey) return;
     try {
@@ -1997,6 +3101,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.name, effectiveRuntimeType]);
 
   const connected = connectedProp ?? !!ws?.connected;
+  const connectedRef = useRef(connected);
+  connectedRef.current = connected;
 
   useEffect(() => {
     if (!ws
@@ -2073,6 +3179,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !!onToggleSessionPin;
   // Input only disabled when there's no session or the active share cannot dispatch messages.
   const inputDisabled = !hasSession || !canSharedSessionSend;
+  inputDisabledRef.current = inputDisabled;
   const participantControlDisabled = !connected || !hasSession || !canSharedSessionSend;
   // A participant can use every session-scoped action except stopping the
   // session. Viewers and inactive shares remain read-only.
@@ -2649,14 +3756,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, sessionName);
         return;
       }
-      if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
-        const payload = msg as unknown as Record<string, unknown>;
-        const sessionName = typeof payload.sessionName === 'string'
+      const applySubsessionPayload = (payload: Record<string, unknown>) => {
+        const snapshotSessionName = typeof payload.sessionName === 'string'
           ? payload.sessionName
           : typeof payload.id === 'string'
             ? `deck_sub_${payload.id}`
             : '';
-        applyRealtimeQueueSnapshot(payload, sessionName);
+        if (snapshotSessionName !== sessionName) return;
+        applyRealtimeQueueSnapshot(payload, snapshotSessionName);
+      };
+      if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
+        applySubsessionPayload(msg as unknown as Record<string, unknown>);
+        return;
+      }
+      if (msg.type === SUBSESSION_CREATED_BATCH_MSG) {
+        if (Array.isArray(msg.items)) {
+          for (const item of msg.items) {
+            if (item && typeof item === 'object') {
+              applySubsessionPayload(item as unknown as Record<string, unknown>);
+            }
+          }
+        }
         return;
       }
       if (msg.type === 'command.ack') {
@@ -3124,23 +4244,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const getText = () => (divRef.current ? readComposerElementText(divRef.current) : '').trim();
 
-  const getCaretLineBoundary = (direction: 'up' | 'down') => {
-    const root = divRef.current;
-    const sel = window.getSelection();
-    if (!root || !sel || sel.rangeCount === 0 || !sel.isCollapsed) return true;
-    const range = sel.getRangeAt(0);
-    if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return true;
+  const getCaretLineBoundary = (direction: 'up' | 'down') => (
+    isCaretAtComposerLineBoundary(divRef.current, direction)
+  );
 
-    const probe = range.cloneRange();
-    probe.selectNodeContents(root);
-    if (direction === 'up') {
-      probe.setEnd(range.startContainer, range.startOffset);
-    } else {
-      probe.setStart(range.endContainer, range.endOffset);
+  const syncHistoryEditOrDraft = useCallback((text: string, history?: readonly string[]) => {
+    const idx = histIdxRef.current;
+    if (idx === -1) {
+      draftRef.current = text;
+      return;
     }
-    const text = probe.toString();
-    return !text.includes('\n');
-  };
+    const original = history?.[idx];
+    if (original !== undefined && text === original) {
+      historyEditsRef.current.delete(idx);
+    } else {
+      historyEditsRef.current.set(idx, text);
+    }
+  }, []);
 
   const syncMobileComposerMetrics = useCallback(() => {
     if (typeof window === 'undefined' || window.innerWidth > 640) {
@@ -3152,51 +4272,86 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // every compositionupdate / candidate-bar toggle (a major "focus jumps"
     // cause when typing CJK). The `input` event fired after `compositionend`
     // (imeComposingRef already false) runs the deferred final sync.
-    if (imeComposingRef.current) return;
+    if (imeComposingRef.current || mobileComposerExpandedRef.current) return;
     const root = divRef.current;
     if (!root) return;
     const computed = window.getComputedStyle(root);
     const lineHeight = Number.parseFloat(computed.lineHeight || '') || 20;
     const verticalPadding = (Number.parseFloat(computed.paddingTop || '') || 0)
       + (Number.parseFloat(computed.paddingBottom || '') || 0);
-    // Treat the composer as multiline as soon as it wraps onto a second line.
-    // This keeps the mobile side controls out of the text area once horizontal
-    // space becomes scarce, instead of waiting until a third line appears.
-    const multilineThreshold = lineHeight + verticalPadding + 4;
-    setMobileComposerMultiline(root.scrollHeight > multilineThreshold);
-  }, []);
+    // When real styles are active (verticalPadding > 0) and the composer has no
+    // child nodes at all, empty placeholder text must never trigger multiline.
+    // (Keeps unstyled jsdom metric mocks where verticalPadding === 0 intact.)
+    if (verticalPadding > 0 && root.childNodes.length === 0) {
+      setMobileComposerMultiline(false);
+      return;
+    }
+    const currentHasText = !!readComposerElementText(root).trim();
+    const singleLineTrailingCount = serverId
+      ? (VoiceInput.isAvailable() && (macDesktopRef.current || !currentHasText) ? 2 : 1)
+      : 0;
+    // Require real second-line clearance beyond single-line font/ascender/subpixel
+    // variance (mobile 16px * 1.45 = 23.2px + 14px padding = 37.2px for 1 line vs
+    // 60.4px for 2 lines; ~52.3px avoids both false positives and late flips).
+    const multilineThreshold = lineHeight + verticalPadding + Math.max(lineHeight * 0.65, 12);
+    let measuredScrollHeight = root.scrollHeight;
+    if (singleLineTrailingCount > 0) {
+      // Measure against the single-line trailing padding so removing the embedded
+      // attachment button in multiline mode does not reclaim padding-right width
+      // and cause single/multiline oscillation near the right edge.
+      const desiredClass = `controls-input-with-trailing-${singleLineTrailingCount}`;
+      const hasTrailing = root.classList.contains('controls-input-with-trailing');
+      const hasDesired = root.classList.contains(desiredClass);
+      const otherClass = singleLineTrailingCount === 1
+        ? 'controls-input-with-trailing-2'
+        : 'controls-input-with-trailing-1';
+      const hasOther = root.classList.contains(otherClass);
+      if (!hasTrailing || !hasDesired || hasOther) {
+        const prevClassName = root.className;
+        root.classList.remove('controls-input-with-trailing-1', 'controls-input-with-trailing-2');
+        root.classList.add('controls-input-with-trailing', desiredClass);
+        try {
+          measuredScrollHeight = root.scrollHeight;
+        } finally {
+          root.className = prevClassName;
+        }
+      }
+    }
+    setMobileComposerMultiline(measuredScrollHeight > multilineThreshold);
+  }, [serverId]);
 
-  const fillInput = (text: string) => {
+  const fillInput = useCallback((text: string) => {
     if (divRef.current) {
       setComposerElementText(divRef.current, text);
-      // Place cursor at end
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(divRef.current);
-      range.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-      divRef.current.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     setHasText(!!text.trim());
     publishComposerText(text);
     syncMobileComposerMetrics();
-  };
+  }, [focusComposerForTyping, publishComposerText, syncMobileComposerMetrics]);
 
   const selectQuickSuggestion = (value: string) => {
+    const activeHistory = getNavigableHistory(
+      quickData.data,
+      activeSessionIncognito ? undefined : activeSession?.name,
+    );
     if (quickSuggestionKind === 'command' && value.toLocaleLowerCase() === SESSION_MODEL_COMMAND) {
+      const nextValue = `${SESSION_MODEL_COMMAND} `;
       setQuickSuggestionKind('model');
       setQuickSuggestionQuery('');
       setQuickSuggestionHighlightIdx(0);
-      fillInput(`${SESSION_MODEL_COMMAND} `);
+      fillInput(nextValue);
+      syncHistoryEditOrDraft(nextValue, activeHistory);
       if (supportsDynamicTransportModels(activeSession?.agentType)) {
         dynamicTransportModels.refresh();
       }
       return;
     }
+    const nextValue = quickSuggestionKind === 'model' ? `${SESSION_MODEL_COMMAND} ${value}` : value;
     setQuickSuggestionKind(null);
     setQuickSuggestionQuery('');
-    fillInput(quickSuggestionKind === 'model' ? `${SESSION_MODEL_COMMAND} ${value}` : value);
+    fillInput(nextValue);
+    syncHistoryEditOrDraft(nextValue, activeHistory);
   };
 
   const selectSkillSuggestion = useCallback((skill: AgentSkillEntry) => {
@@ -3215,13 +4370,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       const current = readComposerElementText(divRef.current);
       nextText = current ? `${current} ${suffix}` : suffix;
       setComposerElementText(divRef.current, nextText);
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(divRef.current);
-      range.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-      divRef.current.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     setHasText(true);
     publishComposerText(nextText);
@@ -3245,22 +4394,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // such fragment is present (the `@别名` path), the text is unchanged.
       const stripped = current.replace(/(^|\s);[\p{L}\p{N}._-]{0,20}$/u, (_m, lead: string) => lead);
       setComposerElementText(el, stripped);
-      try {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        range.collapse(false);
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      } catch { /* jsdom lacks Selection API */ }
-      el.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     insertAliasMarkerAtCaret(name);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
     syncMobileComposerMetrics();
-  }, [publishComposerText, syncMobileComposerMetrics]);
+  }, [focusComposerForTyping, publishComposerText, syncMobileComposerMetrics]);
 
   const insertTaskPairReference = useCallback((title: string) => {
     const el = divRef.current;
@@ -3286,22 +4427,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // (the `@machine` path), the text is unchanged.
       const stripped = stripInlineMachineTrigger(current);
       setComposerElementText(el, stripped);
-      try {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        range.collapse(false);
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      } catch { /* jsdom lacks Selection API */ }
-      el.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     insertMachineMarkerAtCaret(nodeId, displayName);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
     syncMobileComposerMetrics();
-  }, [publishComposerText, syncMobileComposerMetrics]);
+  }, [focusComposerForTyping, publishComposerText, syncMobileComposerMetrics]);
 
   const toComposerReference = useCallback((path: string) => {
     const cwd = activeSession?.projectDir;
@@ -3427,7 +4560,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const rect = (openSpecButtonRef.current ?? openSpecRef.current)?.getBoundingClientRect();
     if (!rect) {
       // Fallback: position at bottom-right so portaled dropdown is never off-screen
-      return { position: 'fixed', bottom: '60px', right: '12px', maxHeight: '60vh', zIndex: 2147483646 } as const;
+      return { position: 'fixed', bottom: '60px', right: '12px', maxHeight: 'calc(var(--imcodes-ui-vh, 100vh) * 0.6)', zIndex: 2147483646 } as const;
     }
     const availableHeight = Math.max(96, Math.floor(rect.top - 12));
     if (window.innerWidth > 640) {
@@ -4560,6 +5693,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
       setAttachments([]);
+      setAttachmentsExpanded(false);
       if (quotes && quotes.length > 0) {
         for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
       }
@@ -4571,6 +5705,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setQuickSuggestionQuery('');
       histIdxRef.current = -1;
       draftRef.current = '';
+      historyEditsRef.current.clear();
       if (draftKey) safeSessionStorageRemoveItem(draftKey);
       if (attachmentDraftKey) safeSessionStorageRemoveItem(attachmentDraftKey);
     };
@@ -4620,7 +5755,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch (err) {
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
-    if (!localFailure) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
+    const activeIncognitoNow = isIncognitoSession(activeSession)
+      || isIncognitoTimelineSession(serverId ?? null, activeSession.name);
+    if (!localFailure && !activeIncognitoNow) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     // An Append-mode send is headed INTO the running turn, not behind it, so it
     // belongs in the timeline immediately (optimistic bubble reconciled by the
     // daemon's user.message for the same id), not in the FIFO card strip.
@@ -4672,10 +5809,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposerState();
     }
     return localFailure ? 'rejected' : 'accepted';
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, serverId, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
+    histIdxRef.current = -1;
+    historyEditsRef.current.clear();
     fillInput(entry.text);
     setEditingQueuedMessageId(entry.clientMessageId);
   }, [isEditableQueuedEntry]);
@@ -4688,6 +5827,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       publishComposerText('');
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
+      histIdxRef.current = -1;
+      draftRef.current = '';
+      historyEditsRef.current.clear();
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
     // ALWAYS ask the backend to drop it — even when the entry still looks "local"
@@ -4907,6 +6049,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposer?: boolean;
       retainOnRejection?: boolean;
       onConfirmedAccepted?: () => void;
+      onConfirmedRejected?: () => void;
+      onCanceled?: () => void;
     },
   ): 'accepted' | 'pending' | 'rejected' => {
     closeQuickSuggestions();
@@ -4926,6 +6070,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         clearComposer: !!options?.clearComposer,
         retainOnRejection: !!options?.retainOnRejection,
         onConfirmedAccepted: options?.onConfirmedAccepted,
+        onConfirmedRejected: options?.onConfirmedRejected,
+        onCanceled: options?.onCanceled,
       };
       pendingComboSendConfirmRef.current = confirmation;
       setPendingComboSendConfirm(confirmation);
@@ -4934,9 +6080,54 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return finalizeSend(payload, options);
   }, [clearSendWarning, closeQuickSuggestions, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
+  const stopInlineVoice = useCallback((options?: {
+    abort?: boolean;
+    restoreCaret?: boolean;
+    skipStateUpdate?: boolean;
+  }) => {
+    const wasActive = inlineVoiceActiveRef.current;
+    inlineVoiceTokenRef.current += 1;
+    if (inlineVoiceRecognizingTimerRef.current !== null) {
+      clearTimeout(inlineVoiceRecognizingTimerRef.current);
+      inlineVoiceRecognizingTimerRef.current = null;
+    }
+    inlineVoiceActiveRef.current = false;
+    if (!options?.skipStateUpdate) {
+      setInlineVoiceActive(false);
+      setInlineVoiceRecognizing(false);
+    }
+    const caretTarget = inlineVoiceSegmentRef.current.caretAfterSegment;
+    detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
+    if (
+      options?.restoreCaret
+      && divRef.current
+      && typeof document !== 'undefined'
+      && document.activeElement === divRef.current
+    ) {
+      setComposerCaretOffset(divRef.current, caretTarget);
+    }
+    if (wasActive) {
+      void Promise.resolve(VoiceInput.stopListening({ abort: options?.abort ?? true })).catch(() => {});
+    }
+  }, []);
+
   const handleSend = useCallback(() => {
-    requestSend(buildSendPayload(), { clearComposer: true });
-  }, [buildSendPayload, requestSend]);
+    if (inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false });
+    }
+    const outcome = requestSend(buildSendPayload(), { clearComposer: true });
+    if (outcome === 'rejected' && !inputDisabledRef.current && divRef.current) {
+      const el = divRef.current;
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      if (
+        !composerFocusedRef.current
+        || el.getAttribute('contenteditable') !== 'true'
+        || active !== el
+      ) {
+        focusComposerForTyping({ moveCursorToEnd: true });
+      }
+    }
+  }, [buildSendPayload, focusComposerForTyping, requestSend]);
 
   const handleQuickAgentDelegationDispatch = useCallback((input: {
     sessionName: string;
@@ -5034,10 +6225,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, rootSession, showSendWarning, t, workflowLibraryItems]);
 
   const handleComboSendCancel = useCallback(() => {
+    const pending = pendingComboSendConfirmRef.current;
     maybePersistComboSendSkip();
     pendingComboSendConfirmRef.current = null;
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
+    pending?.onCanceled?.();
   }, [maybePersistComboSendSkip]);
 
   const handleComboSendConfirm = useCallback(() => {
@@ -5054,6 +6247,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       retainOnRejection: pending.retainOnRejection,
     });
     if (outcome === 'accepted') pending.onConfirmedAccepted?.();
+    else pending.onConfirmedRejected?.();
   }, [finalizeSend, maybePersistComboSendSkip]);
 
   const sendOpenSpecPrompt = useCallback((text: string) => {
@@ -5063,13 +6257,1313 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Voice is an alternate editor for the same composer, not a separate send
   // lane. Reuse the ordinary payload builder so the current attachment/quote/
   // routing snapshot is sent and cleared with the same success semantics.
-  const handleVoiceSend = useCallback((voiceText: string) => {
+  const handleVoiceSend = useCallback((
+    voiceText: string,
+    options?: {
+      onRejected?: () => void;
+      onPendingCanceled?: () => void;
+    },
+  ) => {
     return requestSend(buildSendPayload({ textOverride: voiceText }), {
       clearComposer: true,
       retainOnRejection: true,
-      onConfirmedAccepted: () => setVoiceOpen(false),
+      onConfirmedAccepted: () => {
+        setVoiceOpen(false);
+        setVoiceOverlayInitialText(null);
+        setVoiceOverlayAutoStart(true);
+      },
+      onConfirmedRejected: options?.onRejected,
+      onCanceled: options?.onPendingCanceled,
     });
   }, [buildSendPayload, requestSend]);
+
+  const openStandardVoiceOverlay = useCallback(() => {
+    if (inputDisabledRef.current) return;
+    if (!hasVoiceNotepadDraft && VoiceInput.isAvailable()) {
+      primeVoiceInputGesture({ deferAudioPause: false });
+    }
+    setVoiceOverlayInitialText(null);
+    setVoiceOverlayAutoStart(true);
+    setVoiceOpen(true);
+  }, [hasVoiceNotepadDraft]);
+
+  const pulseInlineRecognizing = useCallback(() => {
+    setInlineVoiceRecognizing(true);
+    if (inlineVoiceRecognizingTimerRef.current !== null) {
+      clearTimeout(inlineVoiceRecognizingTimerRef.current);
+    }
+    inlineVoiceRecognizingTimerRef.current = setTimeout(() => {
+      inlineVoiceRecognizingTimerRef.current = null;
+      setInlineVoiceRecognizing(false);
+    }, 900);
+  }, []);
+
+  const interruptInlineVoiceForManualEdit = useCallback(() => {
+    if (!inlineVoiceActiveRef.current) return;
+    inlineVoiceTokenRef.current += 1;
+    if (inlineVoiceRecognizingTimerRef.current !== null) {
+      clearTimeout(inlineVoiceRecognizingTimerRef.current);
+      inlineVoiceRecognizingTimerRef.current = null;
+    }
+    inlineVoiceActiveRef.current = false;
+    setInlineVoiceActive(false);
+    setInlineVoiceRecognizing(false);
+    // Detach the robot badge without rewriting root text so browser-inserted edits stay intact.
+    detachInlineVoiceRobotHost(inlineVoiceRobotHostRef.current);
+    void Promise.resolve(VoiceInput.stopListening({ abort: true })).catch(() => {});
+  }, []);
+  interruptInlineVoiceRef.current = interruptInlineVoiceForManualEdit;
+
+  const startInlineVoice = useCallback((): boolean => {
+    if (inputDisabledRef.current || !VoiceInput.isAvailable()) return false;
+    const el = divRef.current;
+    if (!el || !el.isConnected) return false;
+    const existingSel = getComposerSelectionOffsets(el);
+    if (typeof document === 'undefined' || document.activeElement !== el) {
+      focusComposerForTyping(existingSel ? undefined : { moveCursorToEnd: true });
+      if (existingSel) {
+        setComposerCaretOffset(el, existingSel.end);
+      }
+    }
+    const fullText = readComposerElementText(el, { preserveEditingLines: true });
+    const start = existingSel ? Math.min(existingSel.start, fullText.length) : fullText.length;
+    const end = existingSel ? Math.min(existingSel.end, fullText.length) : fullText.length;
+    const prefix = fullText.slice(0, start);
+    const selectedText = fullText.slice(start, end);
+    const suffix = fullText.slice(end);
+    const robotHost = inlineVoiceRobotHostRef.current ?? createInlineVoiceRobotHost();
+    inlineVoiceRobotHostRef.current = robotHost;
+    inlineVoiceSegmentRef.current = {
+      prefix,
+      selectedText,
+      suffix,
+      partial: '',
+      hasCommittedPartial: false,
+      caretAfterSegment: start + selectedText.length,
+    };
+
+    programmaticVoiceWriteRef.current = true;
+    try {
+      writeInlineVoiceSegmentDom(el, prefix + selectedText, suffix, robotHost, true);
+    } finally {
+      programmaticVoiceWriteRef.current = false;
+    }
+
+    const token = ++inlineVoiceTokenRef.current;
+    inlineVoiceActiveRef.current = true;
+    setInlineVoiceActive(true);
+    setInlineVoiceRecognizing(false);
+    primeVoiceInputGesture({ deferAudioPause: false });
+
+    let started = false;
+    void Promise.resolve(VoiceInput.startListening(
+      (partial) => {
+        if (inlineVoiceTokenRef.current !== token || !inlineVoiceActiveRef.current) return;
+        const target = divRef.current;
+        if (!target) return;
+        const seg = inlineVoiceSegmentRef.current;
+        if (!partial && !seg.hasCommittedPartial) return;
+        seg.hasCommittedPartial = true;
+        seg.partial = partial;
+        const needSep = seg.prefix.length > 0
+          && !/[\s\n]$/.test(seg.prefix)
+          && partial.length > 0
+          && !/^[,.!?;:，。！？；：\s]/.test(partial);
+        const sep = needSep ? ' ' : '';
+        const before = `${seg.prefix}${sep}${partial}`;
+        seg.caretAfterSegment = before.length;
+
+        programmaticVoiceWriteRef.current = true;
+        try {
+          writeInlineVoiceSegmentDom(
+            target,
+            before,
+            seg.suffix,
+            inlineVoiceRobotHostRef.current,
+            typeof document !== 'undefined' && document.activeElement === target,
+          );
+        } finally {
+          programmaticVoiceWriteRef.current = false;
+        }
+
+        const currentPlain = readComposerElementText(target);
+        const currentEditing = readComposerElementText(target, { preserveEditingLines: true });
+        setHasText(!!currentPlain.trim());
+        publishComposerText(currentPlain);
+        syncHistoryEditOrDraft(
+          currentEditing,
+          getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+        );
+        syncMobileComposerMetrics();
+        pulseInlineRecognizing();
+      },
+      (listening) => {
+        if (inlineVoiceTokenRef.current !== token) return;
+        if (listening) {
+          started = true;
+          return;
+        }
+        if (started && inlineVoiceActiveRef.current) {
+          stopInlineVoice({
+            abort: false,
+            restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+          });
+        }
+      },
+      (err) => {
+        if (inlineVoiceTokenRef.current !== token) return;
+        stopInlineVoice({
+          abort: true,
+          restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+        });
+        if (err && err.trim()) {
+          showSendWarning(err);
+        }
+      },
+    )).then((ok) => {
+      if (inlineVoiceTokenRef.current !== token) return;
+      if (ok === false && inlineVoiceActiveRef.current) {
+        stopInlineVoice({
+          abort: true,
+          restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+        });
+      }
+    }).catch(() => {
+      if (inlineVoiceTokenRef.current !== token) return;
+      if (inlineVoiceActiveRef.current) {
+        stopInlineVoice({
+          abort: true,
+          restoreCaret: typeof document !== 'undefined' && document.activeElement === divRef.current,
+        });
+      }
+    });
+
+    return true;
+  }, [
+    activeSession?.name,
+    activeSessionIncognito,
+    focusComposerForTyping,
+    publishComposerText,
+    pulseInlineRecognizing,
+    quickData.data,
+    showSendWarning,
+    stopInlineVoice,
+    syncHistoryEditOrDraft,
+    syncMobileComposerMetrics,
+  ]);
+
+  const handleVoiceButtonActivate = useCallback(() => {
+    if (inputDisabledRef.current) return;
+    if (macDesktopRef.current || isNativeMacDesktop()) {
+      if (inlineVoiceActiveRef.current) {
+        stopInlineVoice({ abort: true, restoreCaret: true });
+      } else {
+        startInlineVoice();
+      }
+      return;
+    }
+    openStandardVoiceOverlay();
+  }, [openStandardVoiceOverlay, startInlineVoice, stopInlineVoice]);
+
+  const keyboardActiveRef = useRef(keyboardActive);
+  keyboardActiveRef.current = keyboardActive;
+  const pendingDelegateTargetRef = useRef(pendingDelegateTarget);
+  pendingDelegateTargetRef.current = pendingDelegateTarget;
+  const handleSendRef = useRef(handleSend);
+  handleSendRef.current = handleSend;
+
+  const handleMacVoiceShortcutTrigger = useCallback((): boolean => {
+    if (inputDisabledRef.current || !VoiceInput.isAvailable()) return false;
+    if (inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false });
+      const currentText = divRef.current ? readComposerElementText(divRef.current).trim() : '';
+      if (currentText.length > 0 || attachmentDraftRef.current.length > 0 || pendingDelegateTargetRef.current) {
+        handleSendRef.current();
+      }
+      return true;
+    }
+    return startInlineVoice();
+  }, [startInlineVoice, stopInlineVoice]);
+
+  useEffect(() => registerMacVoiceComposerHandler({
+    isActive: () => keyboardActiveRef.current !== false,
+    isInlineVoiceActive: () => inlineVoiceActiveRef.current,
+    isFocused: () => composerFocusedRef.current || (
+      typeof document !== 'undefined' && !!divRef.current && document.activeElement === divRef.current
+    ),
+    triggerToggleOrSubmit: handleMacVoiceShortcutTrigger,
+  }), [handleMacVoiceShortcutTrigger]);
+
+  useEffect(() => {
+    if (inputDisabled && inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false });
+    }
+  }, [inputDisabled, stopInlineVoice]);
+
+  useEffect(() => () => {
+    if (inlineVoiceActiveRef.current) {
+      stopInlineVoice({ abort: true, restoreCaret: false, skipStateUpdate: !mountedRef.current });
+    }
+  }, [activeSession?.name, stopInlineVoice]);
+
+  const clearVoiceHoldStartTimeout = useCallback((expectedTx?: NonNullable<typeof voiceHoldTxRef.current>) => {
+    if (expectedTx && voiceHoldStartTimeoutOwnerRef.current !== expectedTx) {
+      return;
+    }
+    if (voiceHoldStartTimeoutRef.current !== null) {
+      clearTimeout(voiceHoldStartTimeoutRef.current);
+      voiceHoldStartTimeoutRef.current = null;
+    }
+    voiceHoldStartTimeoutOwnerRef.current = null;
+  }, []);
+
+  const clearVoiceHoldDropTimer = useCallback(() => {
+    if (voiceHoldDropTimerRef.current !== null) {
+      clearTimeout(voiceHoldDropTimerRef.current);
+      voiceHoldDropTimerRef.current = null;
+    }
+    if (voiceHoldDropCancelRef.current !== null) {
+      const cancel = voiceHoldDropCancelRef.current;
+      voiceHoldDropCancelRef.current = null;
+      cancel();
+    }
+  }, []);
+
+  const clearVoiceHoldTimers = useCallback(() => {
+    if (voiceHoldTimerRef.current !== null) {
+      clearTimeout(voiceHoldTimerRef.current);
+      voiceHoldTimerRef.current = null;
+    }
+    if (voiceHoldSlideTimerRef.current !== null) {
+      clearTimeout(voiceHoldSlideTimerRef.current);
+      voiceHoldSlideTimerRef.current = null;
+    }
+    clearVoiceHoldStartTimeout();
+    if (voiceHoldRecognizingTimerRef.current !== null) {
+      clearTimeout(voiceHoldRecognizingTimerRef.current);
+      voiceHoldRecognizingTimerRef.current = null;
+    }
+    clearVoiceHoldDropTimer();
+  }, [clearVoiceHoldDropTimer, clearVoiceHoldStartTimeout]);
+
+  const clearComposerVoiceWindowListeners = useCallback(() => {
+    voiceWindowCleanupRef.current?.();
+    voiceWindowCleanupRef.current = null;
+  }, []);
+
+  const attachComposerVoiceWindowListeners = useCallback(() => {
+    clearComposerVoiceWindowListeners();
+    if (typeof window === 'undefined') return;
+    const onWinPointerMove = (e: Event) => voicePointerMoveHandlerRef.current(e as PointerEvent);
+    const onWinPointerUp = (e: Event) => voicePointerEndHandlerRef.current(e as PointerEvent, false);
+    const onWinPointerCancel = (e: Event) => voicePointerEndHandlerRef.current(e as PointerEvent, true);
+    const onWinTouchMove = (e: Event) => {
+      if ((voiceHoldPendingRef.current || voiceHoldActiveRef.current) && e.cancelable) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener('pointermove', onWinPointerMove);
+    window.addEventListener('pointerup', onWinPointerUp);
+    window.addEventListener('pointercancel', onWinPointerCancel);
+    window.addEventListener('touchmove', onWinTouchMove, { passive: false });
+    voiceWindowCleanupRef.current = () => {
+      window.removeEventListener('pointermove', onWinPointerMove);
+      window.removeEventListener('pointerup', onWinPointerUp);
+      window.removeEventListener('pointercancel', onWinPointerCancel);
+      window.removeEventListener('touchmove', onWinTouchMove);
+    };
+  }, [clearComposerVoiceWindowListeners]);
+
+  const pulseVoiceHoldRecognizing = useCallback((durationMs = 1500) => {
+    const activePhase = voiceHoldTxRef.current?.phase;
+    if (!voiceHoldActiveRef.current || (activePhase !== 'starting' && activePhase !== 'recording')) return;
+    setVoiceHoldRecognizing(true);
+    if (voiceHoldRecognizingTimerRef.current !== null) {
+      clearTimeout(voiceHoldRecognizingTimerRef.current);
+    }
+    voiceHoldRecognizingTimerRef.current = setTimeout(() => {
+      voiceHoldRecognizingTimerRef.current = null;
+      if (voiceHoldActiveRef.current) setVoiceHoldRecognizing(false);
+    }, durationMs);
+  }, []);
+
+  const releaseVoiceHoldInteraction = useCallback(() => {
+    voiceHoldPointerRef.current = null;
+    voiceHoldPendingRef.current = false;
+    voiceHoldActiveRef.current = false;
+    voiceHoldLiveAudioRef.current = false;
+    clearVoiceHoldTimers();
+    clearComposerVoiceWindowListeners();
+    clearComposerVoiceTouchLock(
+      divRef.current,
+      inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
+    );
+    VoiceInput.onAudioLevel(null);
+    if (mountedRef.current) {
+      setVoiceHoldPending(false);
+      setVoiceHoldLiveAudio(false);
+      setVoiceHoldRecognizing(false);
+      setVoiceHoldActive(false);
+    }
+  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers]);
+
+  const measureVoiceHoldBottomClearance = useCallback((): number | null => {
+    const composerEl = composerRef.current
+      ?? (divRef.current?.closest('.controls-composer') as HTMLElement | null)
+      ?? divRef.current;
+    const viewportHeightPx = voiceHoldHudRef.current?.getBottomPx()
+      ?? (typeof window !== 'undefined'
+        ? (window.visualViewport?.height || window.innerHeight || document.documentElement?.clientHeight || 0)
+        : 0);
+    return computeVoiceHoldBottomClearancePx(composerEl, viewportHeightPx, getActiveCssZoom());
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!voiceHoldHudActive) return;
+    const update = () => {
+      const next = measureVoiceHoldBottomClearance();
+      setVoiceHoldBottomClearance((prev) => (prev === next ? prev : next));
+    };
+    update();
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', update);
+    }
+    vv?.addEventListener('resize', update);
+    const composerEl = composerRef.current ?? divRef.current;
+    const observer = typeof ResizeObserver === 'function' && composerEl
+      ? new ResizeObserver(update)
+      : null;
+    if (observer && composerEl) observer.observe(composerEl);
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', update);
+      }
+      vv?.removeEventListener('resize', update);
+      observer?.disconnect();
+    };
+  }, [measureVoiceHoldBottomClearance, voiceHoldHudActive, mobileComposerExpanded]);
+
+  const closeVoiceHoldHud = useCallback(() => {
+    clearVoiceHoldDropTimer();
+    voiceHoldDragXRef.current = 0;
+    voiceHoldHudRef.current?.setDragX(0);
+    voiceHoldHudRef.current?.resetBars();
+    if (mountedRef.current) {
+      setVoiceHoldHudActive(false);
+      setVoiceHoldPhase('starting');
+      setVoiceHoldZone('send');
+      setVoiceHoldDropY(null);
+      setVoiceHoldBottomClearance(null);
+    }
+  }, [clearVoiceHoldDropTimer]);
+
+  const resetVoiceHoldInteractionState = useCallback(() => {
+    releaseVoiceHoldInteraction();
+    closeVoiceHoldHud();
+  }, [closeVoiceHoldHud, releaseVoiceHoldInteraction]);
+
+  const disarmTouchTapCompatMouseShield = useCallback(() => {
+    touchTapCompatShieldCleanupRef.current?.();
+    touchTapCompatShieldCleanupRef.current = null;
+  }, []);
+
+  /**
+   * Focusing the composer synchronously on a short touch `pointerup` or failed-hold
+   * click fallback (or initial mobile tap focus) can trigger `.input-focused` /
+   * `.subcard-bar` hiding and shift the composer downward before the browser
+   * dispatches compatibility `mousedown` / `click`. Guard against that stale
+   * compatibility `mousedown` landing on `.chat-view` (`tabIndex={-1}`) and stealing
+   * focus back out of the composer, and shield against the paired compatibility
+   * `click` landing outside the composer on shifted chat content (e.g.
+   * `.chat-local-image-preview-img`, `.chat-attachment-dl`).
+   */
+  const armTouchTapCompatMouseShield = useCallback(() => {
+    disarmTouchTapCompatMouseShield();
+    if (typeof document === 'undefined') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      document.removeEventListener('pointerdown', onNewInteraction, true);
+      document.removeEventListener('touchstart', onNewInteraction, true);
+      document.removeEventListener('keydown', onNewInteraction, true);
+      document.removeEventListener('mousedown', onCompatMouseDown, true);
+      document.removeEventListener('click', onCompatClick, true);
+      if (touchTapCompatShieldCleanupRef.current === cleanup) {
+        touchTapCompatShieldCleanupRef.current = null;
+      }
+    };
+    const onNewInteraction = () => {
+      cleanup();
+    };
+    const onCompatMouseDown = (ev: MouseEvent) => {
+      const el = divRef.current;
+      if (el && document.activeElement === el) {
+        ev.preventDefault();
+      }
+    };
+    const onCompatClick = (ev: MouseEvent) => {
+      const el = divRef.current;
+      const target = ev.target;
+      const insideComposer = !!(el && target instanceof Node && el.contains(target));
+      if (!insideComposer) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        ev.stopImmediatePropagation?.();
+      }
+      cleanup();
+    };
+    document.addEventListener('pointerdown', onNewInteraction, true);
+    document.addEventListener('touchstart', onNewInteraction, true);
+    document.addEventListener('keydown', onNewInteraction, true);
+    document.addEventListener('mousedown', onCompatMouseDown, true);
+    document.addEventListener('click', onCompatClick, true);
+    timer = setTimeout(cleanup, 500);
+    touchTapCompatShieldCleanupRef.current = cleanup;
+  }, [disarmTouchTapCompatMouseShield]);
+
+  /** Restore editability and focus the composer on any short tap or failed hold. */
+  const fallbackToComposerClick = useCallback((pointerType?: string) => {
+    pendingMobileInitialEndFocusRef.current = null;
+    cancelVoiceInputGesturePrime();
+    if (!mountedRef.current || inputDisabledRef.current) return;
+    suppressComposerClickFocusRef.current = false;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+      suppressComposerClickTimerRef.current = null;
+    }
+    if (pointerType === 'touch') {
+      armTouchTapCompatMouseShield();
+    }
+    focusComposerForTyping({ moveCursorToEnd: true });
+  }, [armTouchTapCompatMouseShield, focusComposerForTyping]);
+
+  const updateVoiceHoldZoneFromDx = useCallback((
+    tx: NonNullable<typeof voiceHoldTxRef.current>,
+    dx: number,
+    hapticOnChange = true,
+  ) => {
+    const clampedDragX = Math.round(Math.max(-VOICE_HOLD_SLIDE_MAX_PX, Math.min(VOICE_HOLD_SLIDE_MAX_PX, dx)));
+    voiceHoldDragXRef.current = clampedDragX;
+    voiceHoldHudRef.current?.setDragX(clampedDragX);
+    let nextZone: 'send' | 'cancel' | 'edit' = 'send';
+    if (dx <= -VOICE_HOLD_CANCEL_THRESHOLD_PX) nextZone = 'cancel';
+    else if (dx >= VOICE_HOLD_EDIT_THRESHOLD_PX) nextZone = 'edit';
+
+    if (nextZone !== tx.zone) {
+      tx.zone = nextZone;
+      voiceHoldZoneRef.current = nextZone;
+      setVoiceHoldZone(nextZone);
+      if (hapticOnChange) {
+        try { navigator.vibrate?.(12); } catch { /* ignore */ }
+      }
+    }
+  }, []);
+
+  const waitForVoiceHoldDrop = useCallback((): Promise<boolean> => {
+    clearVoiceHoldDropTimer();
+    if (prefersVoiceHoldReducedMotion()) {
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolve) => {
+      let finished = false;
+      const cancel = () => {
+        if (finished) return;
+        finished = true;
+        resolve(false);
+      };
+      voiceHoldDropCancelRef.current = cancel;
+      voiceHoldDropTimerRef.current = setTimeout(() => {
+        voiceHoldDropTimerRef.current = null;
+        if (voiceHoldDropCancelRef.current === cancel) {
+          voiceHoldDropCancelRef.current = null;
+        }
+        if (!finished) {
+          finished = true;
+          resolve(true);
+        }
+      }, VOICE_HOLD_DROP_ANIMATION_MS);
+    });
+  }, [clearVoiceHoldDropTimer]);
+
+  const restoreVoiceHoldToComposer = useCallback((text: string, protectTouchCompat = false) => {
+    if (!mountedRef.current) return;
+    suppressComposerClickFocusRef.current = false;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+      suppressComposerClickTimerRef.current = null;
+    }
+    if (protectTouchCompat && !inputDisabledRef.current) {
+      armTouchTapCompatMouseShield();
+    }
+    fillInput(text);
+    syncHistoryEditOrDraft(
+      text,
+      getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+    );
+    if (draftKey) safeSessionStorageSetItem(draftKey, text);
+  }, [
+    activeSession?.name,
+    activeSessionIncognito,
+    armTouchTapCompatMouseShield,
+    draftKey,
+    fillInput,
+    quickData.data,
+    syncHistoryEditOrDraft,
+  ]);
+
+  const finalizeVoiceHold = useCallback((
+    tx: NonNullable<typeof voiceHoldTxRef.current>,
+    outcome: 'send' | 'cancel' | 'edit' | 'failed',
+  ): Promise<void> => {
+    if (tx.drainPromise !== null) return tx.drainPromise;
+
+    const shouldKeepHudForDrain = outcome === 'send' || outcome === 'edit';
+    if (shouldKeepHudForDrain) {
+      releaseVoiceHoldInteraction();
+      voiceHoldHudRef.current?.resetBars();
+      if (mountedRef.current) {
+        setVoiceHoldPhase('draining');
+        setVoiceHoldHudActive(true);
+      }
+    } else {
+      resetVoiceHoldInteractionState();
+    }
+
+    // Any hold that never succeeded in active capture falls back to typing focus
+    // (regardless of slide zone), whereas explicit slide-to-cancel after active
+    // recording stops cleanly without popping open the keyboard.
+    const didPreRecordingFallback =
+      !tx.didStartRecording
+      && (outcome === 'failed' || outcome === 'cancel');
+    if (didPreRecordingFallback) {
+      fallbackToComposerClick(tx.pointerType);
+    }
+
+    const abortMode = outcome === 'cancel' || outcome === 'failed';
+    if (outcome === 'cancel') {
+      // Cancel discards immediately: detach the active transaction right away so
+      // another hold or short tap never waits on slow/hung native stop/start drains.
+      tx.settled = true;
+      tx.phase = 'settled';
+      if (voiceHoldTxRef.current === tx) {
+        voiceHoldTxRef.current = null;
+      }
+      const stopTask = Promise.resolve(VoiceInput.stopListening({ abort: true })).catch(() => {});
+      tx.drainPromise = Promise.allSettled([
+        tx.startPromise ?? Promise.resolve(false),
+        stopTask,
+      ]).then(() => {});
+      return tx.drainPromise;
+    }
+
+    tx.phase = outcome === 'failed' ? 'failed' : 'draining';
+
+    tx.drainPromise = (async () => {
+      let drainTimer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        // Always join the idempotent VoiceInput.stopListening() barrier BEFORE
+        // awaiting startPromise:
+        // 1. If native start is still pending (permission / first PCM / startingCall),
+        //    stopListening immediately aborts it via the generation barrier.
+        // 2. For normal send/edit drains, await the finite stopListening() barrier
+        //    without an arbitrary timeout so delayed final tails are preserved and
+        //    delivered once, while keeping voiceHoldTxRef non-null against overlapping holds.
+        // 3. For failed outcomes, bound recovery with VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS.
+        const stopTask = Promise.resolve(
+          VoiceInput.stopListening(abortMode ? { abort: true } : undefined),
+        ).catch(() => {});
+        if (!tx.startPromise) {
+          await Promise.resolve();
+        }
+        const work = (async () => {
+          const started = tx.startPromise ? await tx.startPromise : false;
+          await stopTask;
+          return started;
+        })();
+
+        let timedOut = false;
+        let started = false;
+        if (outcome === 'failed') {
+          const raceResult = await Promise.race([
+            work.then((ok) => ({ timedOut: false as const, started: ok })),
+            new Promise<{ timedOut: true; started: false }>((resolve) => {
+              drainTimer = setTimeout(() => {
+                drainTimer = null;
+                resolve({ timedOut: true, started: false });
+              }, VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS);
+            }),
+          ]);
+          if (drainTimer !== null) {
+            clearTimeout(drainTimer);
+            drainTimer = null;
+          }
+          timedOut = raceResult.timedOut;
+          started = raceResult.started;
+        } else {
+          started = await work;
+        }
+
+        if (
+          timedOut
+          || tx.settled
+          || outcome === 'failed'
+          || tx.phase === 'failed'
+          || !started
+          || (!tx.didStartRecording && !tx.transcript.trim())
+          || tx.error !== null
+          || !mountedRef.current
+        ) {
+          if (
+            !didPreRecordingFallback
+            && (!started || !tx.didStartRecording || tx.error !== null || timedOut)
+            && !tx.didStartRecording
+            && mountedRef.current
+          ) {
+            fallbackToComposerClick(tx.pointerType);
+          }
+          tx.settled = true;
+          tx.phase = 'settled';
+          closeVoiceHoldHud();
+          return;
+        }
+
+        const spoken = tx.transcript.trim();
+        const base = tx.baseText;
+        const combined = base
+          ? (spoken ? `${base}${base.endsWith(' ') || base.endsWith('\n') ? '' : ' '}${spoken}` : base)
+          : spoken;
+
+        if (outcome === 'edit') {
+          tx.settled = true;
+          tx.phase = 'settled';
+          closeVoiceHoldHud();
+          setVoiceOverlayInitialText(combined);
+          setVoiceOverlayAutoStart(false);
+          setVoiceOpen(true);
+          return;
+        }
+        if (spoken && combined.trim()) {
+          const dropY = computeVoiceHoldDropOffsetPx(voiceHoldTranscriptRef.current, divRef.current);
+          tx.phase = 'dropping';
+          if (mountedRef.current) {
+            setVoiceHoldDropY(dropY);
+            setVoiceHoldPhase('dropping');
+          }
+          const completed = await waitForVoiceHoldDrop();
+          if (!completed || tx.settled || !mountedRef.current) {
+            return;
+          }
+          tx.settled = true;
+          tx.phase = 'settled';
+          closeVoiceHoldHud();
+          const finalText = combined.trim();
+          const restoreFromModal = () => restoreVoiceHoldToComposer(finalText, false);
+          const sendOutcome = handleVoiceSend(finalText, {
+            onRejected: restoreFromModal,
+            onPendingCanceled: restoreFromModal,
+          });
+          if (sendOutcome === 'rejected') {
+            restoreVoiceHoldToComposer(finalText, tx.pointerType === 'touch');
+          }
+          return;
+        }
+        tx.settled = true;
+        tx.phase = 'settled';
+        closeVoiceHoldHud();
+      } finally {
+        if (drainTimer !== null) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
+        if (!tx.settled) {
+          tx.settled = true;
+          tx.phase = 'settled';
+        }
+        if (mountedRef.current && voiceHoldTxRef.current === tx) {
+          closeVoiceHoldHud();
+        }
+        if (voiceHoldTxRef.current === tx) {
+          voiceHoldTxRef.current = null;
+        }
+      }
+    })();
+
+    return tx.drainPromise;
+  }, [
+    closeVoiceHoldHud,
+    fallbackToComposerClick,
+    handleVoiceSend,
+    releaseVoiceHoldInteraction,
+    resetVoiceHoldInteractionState,
+    restoreVoiceHoldToComposer,
+    waitForVoiceHoldDrop,
+  ]);
+
+  const retireOrphanedVoiceHold = useCallback(() => {
+    const orphanTx = voiceHoldTxRef.current;
+    if (
+      orphanTx
+      && !orphanTx.settled
+      && orphanTx.drainPromise === null
+      && (orphanTx.phase === 'starting' || orphanTx.phase === 'recording' || orphanTx.phase === 'ended')
+    ) {
+      void finalizeVoiceHold(orphanTx, 'cancel');
+      return;
+    }
+    cancelVoiceInputGesturePrime();
+    if (orphanTx && !orphanTx.settled && orphanTx.drainPromise !== null) {
+      releaseVoiceHoldInteraction();
+      return;
+    }
+    resetVoiceHoldInteractionState();
+  }, [finalizeVoiceHold, releaseVoiceHoldInteraction, resetVoiceHoldInteractionState]);
+
+  const handleComposerVoiceLostPointerCapture = useCallback((event: PointerEvent) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    if (event.isPrimary === false) return;
+    const ptr = voiceHoldPointerRef.current;
+    if (!ptr) return;
+    if (event.pointerId !== undefined && event.pointerId !== ptr.id) return;
+    const tx = voiceHoldTxRef.current;
+    if (tx && (tx.settled || tx.phase === 'draining' || tx.phase === 'dropping' || tx.drainPromise !== null)) {
+      return;
+    }
+    // Capture loss is non-terminal across pending/primed/starting/recording:
+    // keep the hold timer, primed capture, and window pointerup/cancel tracking alive.
+    ptr.captureLost = true;
+  }, []);
+
+  /** Transition a pending pointer press into active voice capture (shared by hold timer and slide promotion). */
+  const activateComposerVoiceHold = useCallback((
+    ptr: NonNullable<typeof voiceHoldPointerRef.current>,
+    initialDx = 0,
+    captureTarget?: EventTarget | null,
+  ) => {
+    clearVoiceHoldTimers();
+    pendingMobileInitialEndFocusRef.current = null;
+    voiceHoldPendingRef.current = false;
+    setVoiceHoldPending(false);
+    if (!mountedRef.current || voiceHoldTxRef.current !== null) {
+      voiceHoldPointerRef.current = null;
+      clearComposerVoiceWindowListeners();
+      if (mountedRef.current && !inputDisabledRef.current) {
+        fallbackToComposerClick(ptr.pointerType);
+      } else {
+        clearComposerVoiceTouchLock(
+          divRef.current,
+          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
+        );
+      }
+      return;
+    }
+
+    // Dismiss any active keyboard, selection, or iOS magnifying loupe before starting voice capture.
+    composerFocusedRef.current = false;
+    setComposerFocused(false);
+    applyComposerVoiceTouchLock(divRef.current, true);
+    try { divRef.current?.blur(); } catch { /* ignore */ }
+    try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
+    triggerVoiceHoldHaptic();
+
+    // Defer setPointerCapture until hold actually activates so normal taps and scrolling stay interference-free.
+    const captureEl = captureTarget instanceof HTMLElement ? captureTarget : divRef.current;
+    try {
+      captureEl?.setPointerCapture?.(ptr.id);
+    } catch { /* ignore unsupported pointer capture */ }
+
+    const base = divRef.current ? readComposerElementText(divRef.current) : '';
+    const tx = {
+      id: ++voiceHoldTokenRef.current,
+      baseText: base,
+      transcript: '',
+      zone: 'send' as 'send' | 'cancel' | 'edit',
+      phase: 'starting' as 'starting' | 'recording' | 'ended' | 'draining' | 'dropping' | 'failed' | 'settled',
+      error: null as string | null,
+      pointerType: ptr.pointerType,
+      didStartRecording: false,
+      settled: false,
+      startSettled: false,
+      startPromise: null as Promise<boolean> | null,
+      drainPromise: null as Promise<void> | null,
+    };
+    voiceHoldTxRef.current = tx;
+    voiceHoldActiveRef.current = true;
+    voiceHoldZoneRef.current = 'send';
+    voiceHoldLiveAudioRef.current = false;
+    voiceHoldDragXRef.current = 0;
+    voiceHoldHudRef.current?.resetBars();
+    voiceHoldHudRef.current?.setDragX(0);
+    setVoiceHoldText('');
+    setVoiceHoldZone('send');
+    setVoiceHoldDropY(null);
+    setVoiceHoldBottomClearance(measureVoiceHoldBottomClearance());
+    setVoiceHoldPhase('starting');
+    setVoiceHoldLiveAudio(false);
+    setVoiceHoldRecognizing(false);
+    setVoiceHoldActive(true);
+    setVoiceHoldHudActive(true);
+    if (initialDx !== 0) {
+      updateVoiceHoldZoneFromDx(tx, initialDx, false);
+    }
+
+    const failTransaction = (errCode: string) => {
+      if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
+      clearVoiceHoldStartTimeout(tx);
+      tx.phase = 'failed';
+      tx.error = errCode || 'permission_denied';
+      if (mountedRef.current) {
+        setVoiceHoldError(tx.error);
+      }
+      if (tx.drainPromise !== null) {
+        closeVoiceHoldHud();
+        return;
+      }
+      void finalizeVoiceHold(tx, 'failed');
+    };
+
+    clearVoiceHoldStartTimeout();
+    voiceHoldStartTimeoutOwnerRef.current = tx;
+    voiceHoldStartTimeoutRef.current = setTimeout(() => {
+      if (voiceHoldStartTimeoutOwnerRef.current !== tx) return;
+      voiceHoldStartTimeoutRef.current = null;
+      voiceHoldStartTimeoutOwnerRef.current = null;
+      if (
+        voiceHoldTxRef.current === tx
+        && tx.phase === 'starting'
+        && !tx.settled
+        && tx.drainPromise === null
+      ) {
+        failTransaction('Speech recognition timed out');
+      }
+    }, VOICE_HOLD_START_TIMEOUT_MS);
+
+    VoiceInput.onAudioLevel((rawLevel) => {
+      if (
+        !mountedRef.current
+        || voiceHoldTxRef.current !== tx
+        || tx.settled
+        || tx.error !== null
+        || (tx.phase !== 'starting' && tx.phase !== 'recording')
+      ) return;
+      if (!voiceHoldLiveAudioRef.current) {
+        voiceHoldLiveAudioRef.current = true;
+        setVoiceHoldLiveAudio(true);
+      }
+      const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
+      if (level > 0.025) pulseVoiceHoldRecognizing(1800);
+      voiceHoldHudRef.current?.pushLevel(level);
+    });
+
+    tx.startPromise = VoiceInput.startListening(
+      (partial) => {
+        if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
+        tx.transcript = partial;
+        if (tx.phase === 'starting' && partial.trim()) {
+          clearVoiceHoldStartTimeout(tx);
+          tx.didStartRecording = true;
+          tx.phase = 'recording';
+          if (mountedRef.current) {
+            setVoiceHoldPhase('recording');
+          }
+        }
+        if (
+          mountedRef.current
+          && voiceHoldTxRef.current === tx
+          && (tx.phase === 'starting' || tx.phase === 'recording' || tx.phase === 'draining')
+        ) {
+          setVoiceHoldText(partial);
+          if (tx.phase === 'starting' || tx.phase === 'recording') {
+            pulseVoiceHoldRecognizing(900);
+          }
+        }
+      },
+      (listening) => {
+        if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
+        if (listening) {
+          if (tx.phase !== 'starting' && tx.phase !== 'recording') return;
+          clearVoiceHoldStartTimeout(tx);
+          tx.didStartRecording = true;
+          tx.phase = 'recording';
+          if (mountedRef.current) {
+            setVoiceHoldPhase('recording');
+          }
+          return;
+        }
+        if (tx.phase === 'starting' && !tx.didStartRecording) {
+          failTransaction('permission_denied');
+          return;
+        }
+        if (tx.phase !== 'recording') return;
+        tx.phase = 'ended';
+        if (voiceHoldRecognizingTimerRef.current !== null) {
+          clearTimeout(voiceHoldRecognizingTimerRef.current);
+          voiceHoldRecognizingTimerRef.current = null;
+        }
+        voiceHoldLiveAudioRef.current = false;
+        voiceHoldHudRef.current?.resetBars();
+        if (mountedRef.current) {
+          setVoiceHoldPhase('ended');
+          setVoiceHoldRecognizing(false);
+          setVoiceHoldLiveAudio(false);
+        }
+      },
+      (err) => {
+        failTransaction(err || 'permission_denied');
+      },
+    ).then(
+      (started) => {
+        tx.startSettled = true;
+        if (voiceHoldTxRef.current !== tx || tx.settled) {
+          return false;
+        }
+        if (!started || tx.error !== null) {
+          clearVoiceHoldStartTimeout(tx);
+          if (tx.drainPromise === null) {
+            failTransaction(tx.error ?? 'permission_denied');
+          }
+          return false;
+        }
+        if (tx.didStartRecording && tx.phase === 'starting') {
+          clearVoiceHoldStartTimeout(tx);
+          tx.phase = 'recording';
+        }
+        return true;
+      },
+      (err) => {
+        tx.startSettled = true;
+        if (voiceHoldTxRef.current !== tx || tx.settled) {
+          return false;
+        }
+        clearVoiceHoldStartTimeout(tx);
+        if (tx.drainPromise === null) {
+          failTransaction(err instanceof Error ? err.message : 'permission_denied');
+        }
+        return false;
+      },
+    );
+  }, [
+    clearComposerVoiceWindowListeners,
+    clearVoiceHoldStartTimeout,
+    closeVoiceHoldHud,
+    fallbackToComposerClick,
+    finalizeVoiceHold,
+    pulseVoiceHoldRecognizing,
+    updateVoiceHoldZoneFromDx,
+  ]);
+
+  const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    suppressComposerClickFocusRef.current = false;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+      suppressComposerClickTimerRef.current = null;
+    }
+    const mobile = typeof window !== 'undefined' && window.innerWidth <= 640;
+    if (!mobile || inputDisabled || voiceOpen) return;
+    if (event.button !== undefined && event.button !== 0) return;
+    if (event.isPrimary === false) return;
+
+    if (voiceHoldActiveRef.current || voiceHoldPendingRef.current || voiceHoldPointerRef.current !== null) {
+      // A primary pointerdown cannot legitimately begin while a previous primary pointer
+      // is still physically held; recover any orphaned pending/active lease whose
+      // terminal pointerup/pointercancel was lost after capture loss or OS interruption.
+      retireOrphanedVoiceHold();
+    }
+
+    const el = divRef.current;
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    const isFocusedEditable = !!el
+      && (active === el || (active !== null && el.contains(active)))
+      && el.getAttribute('contenteditable') !== 'false';
+    if (isFocusedEditable) {
+      // Once the composer is focused / IME is active, all taps, moves, and
+      // long-presses stay 100% native so selection, cursor placement, and
+      // copy/paste callouts are never hijacked by voice capture or touch locks.
+      pendingMobileInitialEndFocusRef.current = null;
+      return;
+    }
+
+    // Track initial unfocused mobile tap intent regardless of VoiceInput availability so
+    // the first tap onto an already contenteditable="true" composer places caret at END
+    // even when browser mousedown/focus fires before click.
+    pendingMobileInitialEndFocusRef.current = {
+      pointerId: event.pointerId ?? 1,
+      startX: event.clientX ?? 0,
+      startY: event.clientY ?? 0,
+      pointerType: event.pointerType || 'touch',
+    };
+
+    if (!VoiceInput.isAvailable()) return;
+    // Never call event.preventDefault() on pointerdown: doing so suppresses
+    // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
+    // from opening when tapping the composer. While an earlier drain settles,
+    // pointerdown still tracks short taps cleanly and falls back to typing if
+    // hold cannot acquire the mic.
+    prewarmVoiceInput({ requestPermission: false });
+    setVoiceHoldError(null);
+    const pointerId = event.pointerId ?? 1;
+    const pointerType = event.pointerType || 'touch';
+    const startX = event.clientX ?? 0;
+    const startY = event.clientY ?? 0;
+    const now = Date.now();
+    const ptr = {
+      id: pointerId,
+      startX,
+      startY,
+      wasFocused: false,
+      pointerType,
+      slideIntentDx: null as number | null,
+      downAt: now,
+      lastActivityAt: now,
+      captureLost: false,
+    };
+    voiceHoldPointerRef.current = ptr;
+    voiceHoldPendingRef.current = true;
+    setVoiceHoldPending(true);
+    applyComposerVoiceTouchLock(el, false);
+    attachComposerVoiceWindowListeners();
+    if (voiceHoldTxRef.current === null) {
+      primeVoiceInputGesture({ deferAudioPause: true });
+    }
+
+    if (voiceHoldTimerRef.current !== null) clearTimeout(voiceHoldTimerRef.current);
+    voiceHoldTimerRef.current = setTimeout(() => {
+      activateComposerVoiceHold(ptr, 0, el);
+    }, VOICE_HOLD_UNFOCUSED_DELAY_MS);
+  }, [
+    inputDisabled,
+    voiceOpen,
+    activateComposerVoiceHold,
+    attachComposerVoiceWindowListeners,
+    retireOrphanedVoiceHold,
+  ]);
+
+  const handleComposerVoicePointerMove = useCallback((event: PointerEvent) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    if (event.isPrimary === false) return;
+    const ptr = voiceHoldPointerRef.current;
+    const tx = voiceHoldTxRef.current;
+    if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
+    if (!ptr && !tx) {
+      const pendingEndFocus = pendingMobileInitialEndFocusRef.current;
+      if (pendingEndFocus && (event.pointerId === undefined || event.pointerId === pendingEndFocus.pointerId)) {
+        const dist = Math.hypot((event.clientX ?? 0) - pendingEndFocus.startX, (event.clientY ?? 0) - pendingEndFocus.startY);
+        if (dist > VOICE_HOLD_MOVE_SLOP_PX) {
+          pendingMobileInitialEndFocusRef.current = null;
+        }
+      }
+      return;
+    }
+    if (ptr) {
+      ptr.lastActivityAt = Date.now();
+    }
+
+    if (!tx) {
+      if (!ptr) return;
+      const dx = (event.clientX ?? 0) - ptr.startX;
+      const dy = (event.clientY ?? 0) - ptr.startY;
+      const dist = Math.hypot(dx, dy);
+      const elapsed = Date.now() - ptr.downAt;
+      const hasHorizontalSlideIntent =
+        !ptr.wasFocused
+        && Math.abs(dx) >= VOICE_HOLD_SLIDE_PROMOTE_PX
+        && Math.abs(dx) > Math.abs(dy) * 1.2;
+
+      // Never start mic capture inside the <=100ms tap protection window;
+      // past 65ms recognize horizontal intent and promote once the tap guard clears.
+      if (hasHorizontalSlideIntent && elapsed >= VOICE_HOLD_TAP_GUARD_MS) {
+        if (event.cancelable) event.preventDefault();
+        activateComposerVoiceHold(ptr, dx, divRef.current);
+        return;
+      }
+      if (hasHorizontalSlideIntent && elapsed >= VOICE_HOLD_SLIDE_INTENT_MS) {
+        ptr.slideIntentDx = dx;
+        if (voiceHoldSlideTimerRef.current === null) {
+          const remainingMs = Math.max(1, VOICE_HOLD_TAP_GUARD_MS - elapsed);
+          voiceHoldSlideTimerRef.current = setTimeout(() => {
+            voiceHoldSlideTimerRef.current = null;
+            if (voiceHoldPointerRef.current !== ptr || voiceHoldTxRef.current !== null) return;
+            activateComposerVoiceHold(ptr, ptr.slideIntentDx ?? 0, divRef.current);
+          }, remainingMs);
+        }
+        return;
+      }
+      ptr.slideIntentDx = null;
+      if (voiceHoldSlideTimerRef.current !== null) {
+        clearTimeout(voiceHoldSlideTimerRef.current);
+        voiceHoldSlideTimerRef.current = null;
+      }
+      if (dist > VOICE_HOLD_MOVE_SLOP_PX) {
+        const isStrongVerticalScroll =
+          Math.abs(dy) >= VOICE_HOLD_SCROLL_ABORT_PX
+          && Math.abs(dy) > Math.abs(dx) * 1.5;
+        cancelVoiceInputGesturePrime();
+        resetVoiceHoldInteractionState();
+        if (!isStrongVerticalScroll) {
+          fallbackToComposerClick(ptr.pointerType);
+        }
+      }
+      return;
+    }
+    if (tx.phase !== 'starting' && tx.phase !== 'recording' && tx.phase !== 'ended') {
+      if (tx.phase === 'failed') {
+        void finalizeVoiceHold(tx, 'failed');
+      }
+      return;
+    }
+    if (!ptr) return;
+
+    const dx = (event.clientX ?? 0) - ptr.startX;
+    event.preventDefault();
+    updateVoiceHoldZoneFromDx(tx, dx);
+  }, [
+    activateComposerVoiceHold,
+    fallbackToComposerClick,
+    finalizeVoiceHold,
+    resetVoiceHoldInteractionState,
+    updateVoiceHoldZoneFromDx,
+  ]);
+
+  const handleComposerVoicePointerEnd = useCallback((event: PointerEvent, cancelled = false) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    if (event.isPrimary === false) return;
+    const ptr = voiceHoldPointerRef.current;
+    const tx = voiceHoldTxRef.current;
+    if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
+    if (!ptr && !tx) {
+      const pendingEndFocus = pendingMobileInitialEndFocusRef.current;
+      if (
+        pendingEndFocus
+        && (event.pointerId === undefined || event.pointerId === pendingEndFocus.pointerId)
+      ) {
+        if (cancelled) {
+          pendingMobileInitialEndFocusRef.current = null;
+        } else if ((event.pointerType || pendingEndFocus.pointerType) === 'touch') {
+          armTouchTapCompatMouseShield();
+        }
+      }
+      return;
+    }
+    const resolvedPointerType = ptr?.pointerType || event.pointerType || tx?.pointerType || 'touch';
+    voiceHoldPointerRef.current = null;
+    voiceHoldPendingRef.current = false;
+    setVoiceHoldPending(false);
+
+    if (voiceHoldTimerRef.current !== null || voiceHoldSlideTimerRef.current !== null || !tx) {
+      clearVoiceHoldTimers();
+      clearComposerVoiceWindowListeners();
+      cancelVoiceInputGesturePrime();
+      // Any short release or pending pointercancel before active recording falls back to typing focus.
+      fallbackToComposerClick(resolvedPointerType);
+      return;
+    }
+
+    clearComposerVoiceWindowListeners();
+    if (tx.settled || tx.drainPromise !== null) {
+      if (!tx.didStartRecording && (tx.phase === 'failed' || tx.error !== null)) {
+        fallbackToComposerClick(resolvedPointerType);
+      }
+      return;
+    }
+    event.preventDefault();
+    if ((cancelled || tx.error !== null) && !tx.didStartRecording) {
+      try { divRef.current?.blur(); } catch { /* ignore */ }
+      void finalizeVoiceHold(tx, 'failed');
+      return;
+    }
+    suppressComposerClickFocusRef.current = true;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+    }
+    suppressComposerClickTimerRef.current = setTimeout(() => {
+      suppressComposerClickTimerRef.current = null;
+      suppressComposerClickFocusRef.current = false;
+    }, 80);
+    try { divRef.current?.blur(); } catch { /* ignore */ }
+    const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
+    void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
+  }, [armTouchTapCompatMouseShield, clearComposerVoiceWindowListeners, fallbackToComposerClick, finalizeVoiceHold]);
+
+  voicePointerMoveHandlerRef.current = handleComposerVoicePointerMove;
+  voicePointerEndHandlerRef.current = handleComposerVoicePointerEnd;
+
+  useEffect(() => {
+    const el = divRef.current;
+    if (!el) return;
+    const onDown = (e: Event) => handleComposerVoicePointerDown(e as PointerEvent);
+    const onMove = (e: Event) => handleComposerVoicePointerMove(e as PointerEvent);
+    const onUp = (e: Event) => handleComposerVoicePointerEnd(e as PointerEvent, false);
+    const onCancel = (e: Event) => handleComposerVoicePointerEnd(e as PointerEvent, true);
+    const onLostCapture = (e: Event) => handleComposerVoiceLostPointerCapture(e as PointerEvent);
+    const onSelectStart = (e: Event) => {
+      if (voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
+        e.preventDefault();
+      }
+    };
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onCancel);
+    el.addEventListener('lostpointercapture', onLostCapture);
+    el.addEventListener('selectstart', onSelectStart);
+    return () => {
+      el.removeEventListener('pointerdown', onDown);
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerup', onUp);
+      el.removeEventListener('pointercancel', onCancel);
+      el.removeEventListener('lostpointercapture', onLostCapture);
+      el.removeEventListener('selectstart', onSelectStart);
+    };
+  }, [handleComposerVoiceLostPointerCapture, handleComposerVoicePointerDown, handleComposerVoicePointerMove, handleComposerVoicePointerEnd]);
+
+  useEffect(() => {
+    const initialEl = divRef.current;
+    return () => {
+      if (suppressComposerClickTimerRef.current !== null) {
+        clearTimeout(suppressComposerClickTimerRef.current);
+        suppressComposerClickTimerRef.current = null;
+      }
+      if (suppressNextVoiceButtonClickTimerRef.current !== null) {
+        clearTimeout(suppressNextVoiceButtonClickTimerRef.current);
+        suppressNextVoiceButtonClickTimerRef.current = null;
+      }
+      suppressNextVoiceButtonClickRef.current = false;
+      suppressComposerClickFocusRef.current = false;
+      disarmTouchTapCompatMouseShield();
+      clearVoiceHoldTimers();
+      clearComposerVoiceWindowListeners();
+      cancelVoiceInputGesturePrime();
+      voiceHoldPointerRef.current = null;
+      voiceHoldPendingRef.current = false;
+      clearComposerVoiceTouchLock(divRef.current ?? initialEl, inputDisabledRef.current);
+      const tx = voiceHoldTxRef.current;
+      if (tx) {
+        tx.settled = true;
+        tx.phase = 'settled';
+        voiceHoldTxRef.current = null;
+      }
+      if (voiceHoldActiveRef.current) {
+        voiceHoldActiveRef.current = false;
+        VoiceInput.onAudioLevel(null);
+        void VoiceInput.stopListening({ abort: true });
+      }
+    };
+  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, disarmTouchTapCompatMouseShield]);
+
+  useLayoutEffect(() => {
+    if (!voiceHoldHudActive || voiceHoldPhase === 'dropping') return;
+    const el = voiceHoldTranscriptRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [voiceHoldHudActive, voiceHoldPhase, voiceHoldText]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
@@ -5241,24 +7735,34 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    // Use session-scoped history, falling back to global history if session has no entries
-    const history = getNavigableHistory(quickData.data, activeSession?.name);
-    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && history.length > 0) {
+    // Use session-scoped history, falling back to global history if session has no entries.
+    // Never look up per-session history under an incognito session's name.
+    const history = getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name);
+    if (
+      (e.key === 'ArrowUp' || e.key === 'ArrowDown')
+      && !e.metaKey
+      && !e.ctrlKey
+      && !e.altKey
+      && !e.shiftKey
+      && history.length > 0
+    ) {
       // Only intercept when caret is on first/last visual line to avoid breaking multiline editing
       const atTop = getCaretLineBoundary('up');
       const atBottom = getCaretLineBoundary('down');
 
       if (e.key === 'ArrowUp' && atTop) {
         e.preventDefault();
-        if (histIdxRef.current === -1) {
-          // Save current draft before navigating
-          draftRef.current = divRef.current ? readComposerElementText(divRef.current) : '';
-          if (draftKey) safeSessionStorageSetItem(draftKey, draftRef.current);
+        const currentText = divRef.current
+          ? readComposerElementText(divRef.current, { preserveEditingLines: true })
+          : '';
+        syncHistoryEditOrDraft(currentText, history);
+        if (histIdxRef.current === -1 && draftKey) {
+          safeSessionStorageSetItem(draftKey, draftRef.current);
         }
         const next = Math.min(histIdxRef.current + 1, history.length - 1);
         if (next !== histIdxRef.current || histIdxRef.current === -1) {
           histIdxRef.current = next;
-          fillInput(history[next]);
+          fillInput(historyEditsRef.current.get(next) ?? history[next]);
         }
         return;
       }
@@ -5266,28 +7770,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (e.key === 'ArrowDown' && atBottom) {
         e.preventDefault();
         if (histIdxRef.current === -1) return;
+        const currentText = divRef.current
+          ? readComposerElementText(divRef.current, { preserveEditingLines: true })
+          : '';
+        syncHistoryEditOrDraft(currentText, history);
         const next = histIdxRef.current - 1;
         if (next < 0) {
           histIdxRef.current = -1;
           fillInput(draftRef.current);
         } else {
           histIdxRef.current = next;
-          fillInput(history[next]);
+          fillInput(historyEditsRef.current.get(next) ?? history[next]);
         }
         return;
       }
-    }
-
-    // Any other key while navigating: exit history nav, keep current text as new draft
-    if (histIdxRef.current !== -1 && e.key !== 'Shift' && !e.metaKey && !e.ctrlKey) {
-      histIdxRef.current = -1;
-      // Preserve current input as draft so Up→Down still restores it
-      draftRef.current = divRef.current ? readComposerElementText(divRef.current) : '';
     }
   };
 
   // On mobile, focusing contenteditable can scroll the document body — force it back
   const handleFocus = () => {
+    composerFocusedRef.current = true;
     setComposerFocused(true);
     if (window.scrollY !== 0) window.scrollTo(0, 0);
     if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0;
@@ -5295,51 +7797,123 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const handleBlur = () => {
+    pendingMobileInitialEndFocusRef.current = null;
+    composerFocusedRef.current = false;
     setComposerFocused(false);
     closeQuickSuggestions();
   };
 
-  const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
-    if (files.length === 0 || !serverId) return false;
+  const startComposerUploads = useCallback(async (
+    entries: ReadonlyArray<{
+      file: File;
+      clientUploadId?: string;
+      fromPersistedStore?: boolean;
+      autoRetryEpoch?: string;
+      autoRetryCount?: number;
+    }>,
+  ): Promise<boolean> => {
+    if (entries.length === 0 || !serverId) return false;
+    setBackgroundTransferKeepAliveLabels({
+      title: t('upload.bg_notification_title'),
+      text: t('upload.bg_notification_text'),
+    });
     const uploadKey = composerUploadKey;
     const uploadAttachmentDraftKey = attachmentDraftKey;
-    const uploadItems = files.map((file) => {
+    const uploadSessionName = isShareScopedSession && activeSession?.name ? activeSession.name : undefined;
+    const prepared = entries.map((entry) => {
       const now = Date.now();
+      const id = createComposerUploadId();
+      const clientUploadId = entry.clientUploadId ?? resolveResumableUploadIdentity({
+        serverId,
+        ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
+        file: entry.file,
+      }).clientUploadId;
       return {
-        id: createComposerUploadId(),
-        name: file.name || 'file',
-        progress: 0,
-        status: 'uploading' as const,
-        transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
-        totalBytes: file.size,
-        startedAt: now,
-        lastSampleAt: now,
-        lastSampleBytes: 0,
-        speedBps: 0,
-        updatedAt: now,
+        file: entry.file,
+        clientUploadId,
+        fromPersistedStore: !!entry.fromPersistedStore,
+        autoRetryCount: entry.autoRetryCount ?? 0,
+        item: {
+          id,
+          name: entry.file.name || 'file',
+          progress: 0,
+          status: 'uploading' as const,
+          transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
+          totalBytes: entry.file.size,
+          startedAt: now,
+          lastSampleAt: now,
+          lastSampleBytes: 0,
+          speedBps: 0,
+          updatedAt: now,
+          ...(entry.autoRetryEpoch ? { lastAutoRetryEpoch: entry.autoRetryEpoch } : {}),
+          ...(entry.autoRetryCount ? { autoRetryCount: entry.autoRetryCount } : {}),
+        },
       };
     });
-    for (let index = 0; index < uploadItems.length; index += 1) {
-      composerUploadRetryFiles.set(uploadItems[index].id, files[index]);
+    for (const entry of prepared) {
+      composerUploadRetryFiles.set(entry.item.id, entry.file);
+      composerUploadClientIds.set(entry.item.id, entry.clientUploadId);
     }
-    addComposerUploadItems(uploadKey, uploadItems);
+    addComposerUploadItems(uploadKey, prepared.map((entry) => entry.item));
 
     const settledUploadIds: string[] = [];
     // Uploads run concurrently, but composer sequence numbers follow the
     // user's selection order rather than whichever transfer happens to finish
     // first.  Keep each completed path immediately, then project the completed
-    // subset in `uploadItems` order before the transient row becomes `done`.
+    // subset in `prepared` order before the transient row becomes `done`.
     const completedAttachments = new Map<string, ComposerAttachmentRecord>();
-    const uploadedAttachments = await Promise.all(files.map(async (file, index): Promise<ComposerAttachmentRecord | null> => {
-      const uploadItem = uploadItems[index];
+    const uploadedAttachments = await Promise.all(prepared.map(async (entry): Promise<ComposerAttachmentRecord | null> => {
+      const { file: initialFile, clientUploadId, fromPersistedStore, autoRetryCount, item: uploadItem } = entry;
+      let effectiveFile = initialFile;
+      const attemptStartEpoch = getComposerUploadWakeEpoch();
       const abortController = new AbortController();
+      const persistAbortController = new AbortController();
+      const onUploadAbortForPersist = () => persistAbortController.abort();
+      abortController.signal.addEventListener('abort', onUploadAbortForPersist, { once: true });
       composerUploadAbortControllers.set(uploadItem.id, abortController);
       try {
+        // Stream 4 MiB chunks into IndexedDB (up to 128 MiB total budget) on both
+        // web and native before starting transport so the CONNECTING row survives
+        // app-switching, WebView reload, and OS temporary-URI eviction.
+        if (!fromPersistedStore && !activeSessionIncognito && initialFile.size <= PENDING_UPLOAD_MAX_FILE_BYTES) {
+          const persisted = await persistPendingUploadFile({
+            clientUploadId,
+            serverId,
+            sessionName: uploadSessionName ?? '',
+            composerKey: uploadKey,
+            file: initialFile,
+            signal: persistAbortController.signal,
+          }).catch((err) => {
+            if (err instanceof Error && (err.name === 'AbortError' || err.name === 'NotReadableError')) {
+              throw err;
+            }
+            return { persisted: false, snapshotFile: null as File | null };
+          });
+          if (abortController.signal.aborted) {
+            void deletePendingUpload(clientUploadId);
+            throw new DOMException('Aborted', 'AbortError');
+          }
+          if (persisted.snapshotFile) {
+            effectiveFile = persisted.snapshotFile;
+            composerUploadRetryFiles.set(uploadItem.id, effectiveFile);
+          }
+        }
+
+        if (!connectedRef.current || isUploadEnvironmentSuspended()) {
+          updateComposerUploadItem(uploadKey, uploadItem.id, {
+            status: 'uploading',
+            transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
+            waitingForConnection: true,
+          });
+          return null;
+        }
+
         const result = await uploadFileWithDirectFallback({
           ws,
           serverId,
-          ...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {}),
-          file,
+          ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
+          file: effectiveFile,
+          clientUploadId,
           onProgress: (pct) => {
             updateComposerUploadProgress(uploadKey, uploadItem.id, pct);
           },
@@ -5357,24 +7931,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         // branch; marking the progress row done first briefly enabled Send
         // while `attachments` was still empty, which produced text-only sends.
         if (!daemonPath) throw new Error('attachment_path_missing');
+        persistAbortController.abort();
+        void deletePendingUpload(clientUploadId);
+        composerUploadClientIds.delete(uploadItem.id);
         const attachment: ComposerAttachmentRecord = {
           path: daemonPath,
-          name: file.name,
+          name: effectiveFile.name,
           seq: 0,
           ...(result.attachment.id ? { id: result.attachment.id } : {}),
           ...(result.attachment.serverId ? { serverId: result.attachment.serverId } : { serverId }),
         };
-        rememberAttachmentPreview(daemonPath, file);
+        rememberAttachmentPreview(daemonPath, effectiveFile);
         completedAttachments.set(uploadItem.id, attachment);
-        const orderedCompleted = uploadItems
-          .map((item) => completedAttachments.get(item.id))
-          .filter((entry): entry is ComposerAttachmentRecord => !!entry);
-        const completedPaths = new Set(orderedCompleted.map((entry) => entry.path));
+        const orderedCompleted = prepared
+          .map((preparedEntry) => completedAttachments.get(preparedEntry.item.id))
+          .filter((item): item is ComposerAttachmentRecord => !!item);
+        const completedPaths = new Set(orderedCompleted.map((item) => item.path));
         if (uploadAttachmentDraftKey) {
           appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
           const stored = parseStoredComposerAttachments(safeSessionStorageGetItem(uploadAttachmentDraftKey));
           const next = renumberAttachments([
-            ...stored.filter((entry) => !completedPaths.has(entry.path)),
+            ...stored.filter((item) => !completedPaths.has(item.path)),
             ...orderedCompleted,
           ]);
           // Unbounded: the default draft cap would truncate this JSON.
@@ -5384,7 +7961,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           }
         } else {
           setAttachments((prev) => renumberAttachments([
-            ...prev.filter((entry) => !completedPaths.has(entry.path)),
+            ...prev.filter((item) => !completedPaths.has(item.path)),
             ...orderedCompleted,
           ]));
         }
@@ -5396,7 +7973,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         settledUploadIds.push(uploadItem.id);
         return attachment;
       } catch (err) {
-        if (isFileUploadCanceled(err)) {
+        if (abortController.signal.aborted) {
+          persistAbortController.abort();
+          void deletePendingUpload(clientUploadId);
+          composerUploadClientIds.delete(uploadItem.id);
           removeComposerUploadItems(uploadKey, [uploadItem.id]);
           settledUploadIds.push(uploadItem.id);
           return null;
@@ -5404,8 +7984,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
         let errorMessage: string;
-        if (err instanceof DirectFileTransferFailure && err.code === 'relay_size_limit') {
+        let retryable = true;
+        if ((err instanceof Error && err.name === 'NotReadableError') || body.includes('NotReadableError')) {
+          errorMessage = t('upload.file_unreadable_reselect');
+          retryable = false;
+          persistAbortController.abort();
+          if (!fromPersistedStore) {
+            void deletePendingUpload(clientUploadId);
+          }
+        } else if (err instanceof DirectFileTransferFailure && err.code === 'relay_size_limit') {
           errorMessage = t('upload.direct_required_large', { max: MAX_UPLOAD_SIZE_MB });
+          retryable = false;
+          persistAbortController.abort();
+          void deletePendingUpload(clientUploadId);
         } else if (
           (err instanceof DirectFileTransferFailure
             && err.code === DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY)
@@ -5416,15 +8007,31 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           errorMessage = t('upload.daemon_offline');
         } else if (body.includes('file_too_large')) {
           errorMessage = t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB });
+          retryable = false;
+          persistAbortController.abort();
+          void deletePendingUpload(clientUploadId);
         } else {
           errorMessage = t('upload.upload_failed');
         }
-        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'error' });
+        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'error', retryable, waitingForConnection: false });
         updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
         setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
+        if (
+          retryable
+          && getComposerUploadWakeEpoch() !== attemptStartEpoch
+          && connectedRef.current
+          && !isUploadEnvironmentSuspended()
+          && autoRetryCount < MAX_COMPOSER_AUTO_RETRIES
+        ) {
+          queueMicrotask(() => {
+            if (mountedRef.current) autoRetryFailedUploadsRef.current();
+          });
+        }
         return null;
       } finally {
+        abortController.signal.removeEventListener('abort', onUploadAbortForPersist);
         composerUploadAbortControllers.delete(uploadItem.id);
+        recoveredPendingUploadIds.delete(clientUploadId);
       }
     }));
 
@@ -5433,29 +8040,173 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // visible with a retry action: removing every row here made a 99%-phase
     // failure disappear immediately and look like a silent success/failure.
     removeComposerUploadItems(uploadKey, settledUploadIds);
-    for (const id of settledUploadIds) composerUploadRetryFiles.delete(id);
+    for (const id of settledUploadIds) {
+      composerUploadRetryFiles.delete(id);
+      composerUploadClientIds.delete(id);
+    }
     return successfulAttachments.length > 0;
-  }, [activeSession?.name, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t]);
+  }, [activeSession?.name, activeSessionIncognito, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t, ws]);
+
+  const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => (
+    startComposerUploads(files.map((file) => ({ file })))
+  ), [startComposerUploads]);
 
 
   const handleCancelUpload = useCallback((item: ComposerUploadItem) => {
     if (!window.confirm(t('upload.cancel_confirm', { name: item.name }))) return;
-    composerUploadAbortControllers.get(item.id)?.abort();
-  }, [t]);
+    const clientUploadId = composerUploadClientIds.get(item.id);
+    if (clientUploadId) {
+      recoveredPendingUploadIds.delete(clientUploadId);
+      void deletePendingUpload(clientUploadId);
+      composerUploadClientIds.delete(item.id);
+    }
+    const controller = composerUploadAbortControllers.get(item.id);
+    if (controller) {
+      controller.abort();
+    }
+    if (item.waitingForConnection || !controller) {
+      composerUploadRetryFiles.delete(item.id);
+      composerUploadAbortControllers.delete(item.id);
+      removeComposerUploadItems(composerUploadKey, [item.id]);
+    }
+  }, [composerUploadKey, t]);
 
   const handleRetryUpload = useCallback((item: ComposerUploadItem) => {
     const file = composerUploadRetryFiles.get(item.id);
     if (!file) return;
+    const clientUploadId = composerUploadClientIds.get(item.id);
     composerUploadRetryFiles.delete(item.id);
+    composerUploadClientIds.delete(item.id);
     removeComposerUploadItems(composerUploadKey, [item.id]);
     updateComposerUploadSnapshot(composerUploadKey, { error: null });
-    void uploadAttachmentFiles([file]);
-  }, [composerUploadKey, uploadAttachmentFiles]);
+    void startComposerUploads([{ file, clientUploadId, fromPersistedStore: true }]);
+  }, [composerUploadKey, startComposerUploads]);
 
   const handleDismissFailedUpload = useCallback((item: ComposerUploadItem) => {
+    const clientUploadId = composerUploadClientIds.get(item.id);
+    if (clientUploadId) {
+      recoveredPendingUploadIds.delete(clientUploadId);
+      void deletePendingUpload(clientUploadId);
+      composerUploadClientIds.delete(item.id);
+    }
     composerUploadRetryFiles.delete(item.id);
     removeComposerUploadItems(composerUploadKey, [item.id]);
   }, [composerUploadKey]);
+
+  const autoRetryFailedUploads = useCallback((waitingOnly = false) => {
+    if (!connected || isUploadEnvironmentSuspended()) return;
+    const wakeEpoch = getComposerUploadWakeEpoch();
+    const snapshot = getComposerUploadSnapshot(composerUploadKey);
+    const candidates = snapshot.uploads.filter((item) => {
+      if (!composerUploadRetryFiles.has(item.id)) return false;
+      if (item.status === 'uploading' && item.waitingForConnection) return true;
+      if (waitingOnly) return false;
+      return item.status === 'error'
+        && item.retryable !== false
+        && item.lastAutoRetryEpoch !== wakeEpoch
+        && (item.autoRetryCount ?? 0) < MAX_COMPOSER_AUTO_RETRIES;
+    });
+    if (candidates.length === 0) return;
+    const entries: Array<{
+      file: File;
+      clientUploadId?: string;
+      fromPersistedStore?: boolean;
+      autoRetryEpoch?: string;
+      autoRetryCount?: number;
+    }> = [];
+    const removeIds: string[] = [];
+    for (const item of candidates) {
+      const file = composerUploadRetryFiles.get(item.id);
+      if (!file) continue;
+      const clientUploadId = composerUploadClientIds.get(item.id);
+      composerUploadRetryFiles.delete(item.id);
+      composerUploadClientIds.delete(item.id);
+      removeIds.push(item.id);
+      entries.push({
+        file,
+        clientUploadId,
+        fromPersistedStore: true,
+        ...(item.status === 'error'
+          ? { autoRetryEpoch: wakeEpoch, autoRetryCount: (item.autoRetryCount ?? 0) + 1 }
+          : {}),
+      });
+    }
+    if (entries.length === 0) return;
+    removeComposerUploadItems(composerUploadKey, removeIds);
+    updateComposerUploadSnapshot(composerUploadKey, { error: null });
+    void startComposerUploads(entries);
+  }, [composerUploadKey, connected, startComposerUploads]);
+
+  const autoRetryFailedUploadsRef = useRef(autoRetryFailedUploads);
+  autoRetryFailedUploadsRef.current = autoRetryFailedUploads;
+  const startComposerUploadsRef = useRef(startComposerUploads);
+  startComposerUploadsRef.current = startComposerUploads;
+  const prevConnectedForUploadRetryRef = useRef(connected);
+
+  useEffect(() => {
+    const wasConnected = prevConnectedForUploadRetryRef.current;
+    prevConnectedForUploadRetryRef.current = connected;
+    if (!wasConnected && connected) {
+      composerUploadConnectEpoch += 1;
+    }
+    if (!connected) return;
+    autoRetryFailedUploadsRef.current(wasConnected);
+    const onWake = () => autoRetryFailedUploadsRef.current(false);
+    const onOnline = () => {
+      composerUploadOnlineEpoch += 1;
+      autoRetryFailedUploadsRef.current(false);
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onWake);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', onWake);
+      window.addEventListener('pageshow', onWake);
+      window.addEventListener('online', onOnline);
+    }
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onWake);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', onWake);
+        window.removeEventListener('pageshow', onWake);
+        window.removeEventListener('online', onOnline);
+      }
+    };
+  }, [composerUploadKey, connected]);
+
+  useEffect(() => {
+    if (!serverId || !composerUploadKey || activeSessionIncognito) return;
+    if (attachmentDraftKey && hydratedAttachmentDraftKey !== attachmentDraftKey) return;
+    let canceled = false;
+    void listPendingUploadsForKey(composerUploadKey, serverId).then((entries) => {
+      if (canceled || entries.length === 0) return;
+      const snapshot = getComposerUploadSnapshot(composerUploadKey);
+      const activeClientIds = new Set(
+        snapshot.uploads
+          .map((item) => composerUploadClientIds.get(item.id))
+          .filter((id): id is string => !!id),
+      );
+      const pending = entries.filter(({ meta }) => {
+        if (activeClientIds.has(meta.clientUploadId)) return false;
+        if (recoveredPendingUploadIds.has(meta.clientUploadId)) return false;
+        recoveredPendingUploadIds.add(meta.clientUploadId);
+        return true;
+      });
+      if (pending.length === 0) return;
+      void startComposerUploadsRef.current(
+        pending.map(({ meta, file }) => ({
+          file,
+          clientUploadId: meta.clientUploadId,
+          fromPersistedStore: true,
+        })),
+      );
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [activeSessionIncognito, attachmentDraftKey, composerUploadKey, connected, hydratedAttachmentDraftKey, serverId]);
 
   const handleRemoveAttachment = useCallback(async (attachment: ComposerAttachmentRecord) => {
     closeQuickSuggestions();
@@ -5642,6 +8393,52 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     await uploadAttachmentFiles(Array.from(files));
   }, [closeQuickSuggestions, uploadAttachmentFiles]);
 
+  const consumedSharedUploadIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!pendingSharedUpload || !divRef.current) return;
+    if (consumedSharedUploadIdsRef.current.has(pendingSharedUpload.id)) return;
+    if (!activeSession || activeSession.name !== pendingSharedUpload.sessionName) return;
+    if (!serverId || serverId !== pendingSharedUpload.serverId) return;
+    if (attachmentDraftKey && hydratedAttachmentDraftKey !== attachmentDraftKey) return;
+
+    consumedSharedUploadIdsRef.current.add(pendingSharedUpload.id);
+    onPendingSharedUploadConsumed?.(pendingSharedUpload.id);
+
+    const sharedText = typeof pendingSharedUpload.text === 'string' ? pendingSharedUpload.text.trim() : '';
+    if (sharedText) {
+      const currentText = readComposerElementText(divRef.current);
+      const nextText = currentText.trim().length === 0
+        ? sharedText
+        : `${currentText}${currentText.endsWith('\n') || currentText.endsWith(' ') ? '' : '\n'}${sharedText}`;
+      quickPhraseInputSuppressRef.current = true;
+      closeQuickSuggestions();
+      setComposerElementText(divRef.current, nextText);
+      setHasText(!!nextText.trim());
+      publishComposerText(nextText);
+      if (draftKey) safeSessionStorageSetItem(draftKey, nextText);
+      divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    if (pendingSharedUpload.files.length > 0) {
+      closeQuickSuggestions();
+      void uploadAttachmentFiles(pendingSharedUpload.files);
+    }
+
+    focusComposerForTyping({ moveCursorToEnd: true });
+  }, [
+    activeSession,
+    attachmentDraftKey,
+    closeQuickSuggestions,
+    draftKey,
+    focusComposerForTyping,
+    hydratedAttachmentDraftKey,
+    onPendingSharedUploadConsumed,
+    pendingSharedUpload,
+    publishComposerText,
+    serverId,
+    uploadAttachmentFiles,
+  ]);
+
   const handleFileDragEnter = useCallback((e: DragEvent) => {
     if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;
     e.preventDefault();
@@ -5695,6 +8492,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
     const ce = e as ClipboardEvent;
+    if (inlineVoiceActiveRef.current && !programmaticVoiceWriteRef.current) {
+      interruptInlineVoiceForManualEdit();
+    }
     closeQuickSuggestions();
     const files = ce.clipboardData?.files;
     if (files && files.length > 0) {
@@ -5716,7 +8516,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         const uploaded = await uploadAttachmentFiles([textFile]);
         if (uploaded) {
           showSendWarning(t('upload.long_text_attached', { name: fileName }));
-          divRef.current?.focus();
+          focusComposerForTyping();
         }
       })();
       return;
@@ -5734,11 +8534,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       inserted = false;
     }
     if (!inserted && divRef.current) {
-      const current = readComposerElementText(divRef.current);
-      setComposerElementText(divRef.current, current + text);
+      const current = readComposerElementText(divRef.current, { preserveEditingLines: true });
+      const next = current + text;
+      setComposerElementText(divRef.current, next);
+      syncHistoryEditOrDraft(
+        next,
+        getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+      );
     }
     queueMicrotask(() => { quickPhraseInputSuppressRef.current = false; });
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
+    if (!inserted) syncMobileComposerMetrics();
   };
 
   const handleShortcut = (data: string) => {
@@ -5847,6 +8653,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleGenericTransportModelSelect = (m: string) => {
     if (!dispatchModelSwitch(m)) return;
+    if (activeSession?.agentType === AGY_SDK_PROVIDER_ID) {
+      saveAgyModelPreference(m, activeSession.name);
+    }
     setModelOpen(false);
     onAfterAction?.();
   };
@@ -5869,7 +8678,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
-  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
+  const mobileLayoutRef = useRef(isMobileLayout);
+  mobileLayoutRef.current = isMobileLayout;
+  const [, setResponsiveLayoutTick] = useState(0);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onResize = () => {
+      const next = window.innerWidth <= 640;
+      if (next !== mobileLayoutRef.current) {
+        mobileLayoutRef.current = next;
+        setResponsiveLayoutTick((tick) => tick + 1);
+      }
+      if (next) syncMobileComposerMetrics();
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [syncMobileComposerMetrics]);
+  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && (macDesktop || !hasText);
   const showMobileStackedAttachmentButton = isMobileLayout
     && isTransport
     && !!serverId
@@ -5924,11 +8749,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !machinePickerOpen
     && !p2pOpen
     && !quickOpen;
+  const voiceHoldReady = isMobileLayout && !macDesktop && hasSession && connected && !inputDisabled && VoiceInput.isAvailable();
+  voiceHoldReadyRef.current = voiceHoldReady;
+  composerFocusedRef.current = composerFocused;
+  mobileComposerExpandedRef.current = mobileComposerExpanded;
+  const sessionTargetLabel = sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session';
   const basePlaceholder = !hasSession
     ? t('session.no_session')
     : !connected
       ? t('session.send_queued')
-      : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
+      : voiceHoldReady
+        ? t('session.send_placeholder_mobile_voice', { name: sessionTargetLabel })
+        : t('session.send_placeholder', { name: sessionTargetLabel });
   const placeholder = !hasSession || !connected || isMobileLayout
     ? basePlaceholder
     : compact
@@ -5955,7 +8787,116 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
     syncMobileComposerMetrics();
-  }, [hasText, isMobileLayout, syncMobileComposerMetrics]);
+  }, [hasText, isMobileLayout, mobileComposerExpanded, isTransport, serverId, syncMobileComposerMetrics]);
+
+  useEffect(() => {
+    if (!voiceHoldReady || composerFocused) return;
+    prewarmVoiceInput({ requestPermission: false });
+    if (typeof document === 'undefined') return;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        prewarmVoiceInput({ requestPermission: false });
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [voiceHoldReady, composerFocused]);
+
+  useEffect(() => {
+    if (!isMobileLayout || typeof window === 'undefined' || typeof document === 'undefined') return;
+    const vv = window.visualViewport;
+    if (!vv) return;
+    let lastWidth = window.innerWidth;
+    let hadKeyboardOpen = false;
+    let wasKbOpen = false;
+
+    const syncKeyboardDismiss = () => {
+      const el = divRef.current;
+      if (!el) {
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+        lastWidth = window.innerWidth;
+        return;
+      }
+      if (window.innerWidth !== lastWidth) {
+        lastWidth = window.innerWidth;
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+      }
+      const active = document.activeElement;
+      const composerHasFocus = active === el || (active !== null && el.contains(active));
+      if (!composerHasFocus) {
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+        return;
+      }
+      const viewportHeight = boundedVisualViewportHeight(
+        vv.height,
+        window.innerHeight,
+        document.documentElement.clientHeight,
+        getActiveCssZoom(),
+      );
+      if (viewportHeight === null) return;
+      const shrink = Math.max(0, window.innerHeight - viewportHeight);
+      const state = getMobileKeyboardState(true, shrink, hadKeyboardOpen);
+      const dismissed = wasKbOpen && state.hadKeyboardOpen && !state.kbOpen;
+      hadKeyboardOpen = state.hadKeyboardOpen;
+      wasKbOpen = state.kbOpen;
+      if (!dismissed) return;
+      if (voiceHoldPendingRef.current || voiceHoldActiveRef.current || voiceOpenRef.current) return;
+
+      // Mobile browsers/WebViews often collapse the soft keyboard without blurring
+      // document.activeElement. Exit edit mode explicitly so Hold-to-Talk recovers.
+      pendingMobileInitialEndFocusRef.current = null;
+      hadKeyboardOpen = false;
+      wasKbOpen = false;
+      composerFocusedRef.current = false;
+      setComposerFocused(false);
+      try {
+        el.blur();
+      } catch { /* ignore */ }
+      clearComposerVoiceTouchLock(
+        el,
+        inputDisabledRef.current || voiceHoldReadyRef.current,
+      );
+    };
+
+    const settledViewportUpdater = createSettledViewportUpdater(syncKeyboardDismiss);
+    const schedule = settledViewportUpdater.schedule;
+    const onFocusIn = (e: FocusEvent) => {
+      const el = divRef.current;
+      const target = e.target as Node | null;
+      if (!el || !target || (target !== el && !el.contains(target))) return;
+      schedule();
+    };
+    const onFocusOut = () => {
+      const el = divRef.current;
+      const active = document.activeElement;
+      if (!el || (active !== el && !(active !== null && el.contains(active)))) {
+        hadKeyboardOpen = false;
+        wasKbOpen = false;
+      }
+    };
+
+    vv.addEventListener('resize', schedule);
+    vv.addEventListener('scroll', schedule);
+    window.addEventListener('resize', schedule);
+    window.addEventListener('pageshow', schedule);
+    document.addEventListener('focusin', onFocusIn);
+    document.addEventListener('focusout', onFocusOut);
+    schedule();
+    return () => {
+      settledViewportUpdater.cancel();
+      vv.removeEventListener('resize', schedule);
+      vv.removeEventListener('scroll', schedule);
+      window.removeEventListener('resize', schedule);
+      window.removeEventListener('pageshow', schedule);
+      document.removeEventListener('focusin', onFocusIn);
+      document.removeEventListener('focusout', onFocusOut);
+    };
+  }, [isMobileLayout]);
 
   return (
     <>
@@ -6010,6 +8951,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             sessionName={activeSession.name}
             scopeToSessionRoot={isShareScopedSession && sharedState?.targetKind !== 'server'}
             readOnly={isShareScopedSession && !canSharedSessionSend}
+            canShare={canManageFileShares && !isShareScopedSession}
             mode="file-multi"
           layout="panel"
           initialPath={activeSession.projectDir ?? '~'}
@@ -6024,6 +8966,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onMobileFileBrowserClose?.();
           }}
           onClose={onMobileFileBrowserClose}
+          onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
         />
       </div>,
       document.body,
@@ -6042,6 +8985,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             sessionName={activeSession.name}
             scopeToSessionRoot={isShareScopedSession && sharedState?.targetKind !== 'server'}
             readOnly={isShareScopedSession && !canSharedSessionSend}
+            canShare={canManageFileShares && !isShareScopedSession}
             mode="file-multi"
             layout="panel"
             initialPath={openSpecFolderPath}
@@ -6052,10 +8996,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setOpenSpecFolderPath(null);
             }}
             onClose={() => setOpenSpecFolderPath(null)}
+            onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
           />
         </div>
       </div>
     )}
+    {activeSessionIncognito && <div class="incognito-session-badge" role="status" title={t('session.incognito_hint')}>🕶️ {t('session.incognito')}</div>}
     <div ref={controlsWrapperRef} class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
       {dropOverlayStyle && createPortal(
         <div class="session-file-drop-overlay" style={dropOverlayStyle}>
@@ -6519,7 +9465,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}
               style={{ color: displayedClaudeModel ? '#a78bfa' : '#6b7280', fontSize: 10 }}
             >
-              {displayedClaudeModel ?? 'unknown'}
+              {claudePinnedModel ? (shortModelLabel(claudePinnedModel) ?? claudePinnedModel) : (displayedClaudeModel ?? 'unknown')}
             </button>
             {modelOpen && renderModelDropdown(
               <>
@@ -6548,7 +9494,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
               style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {displayedCodexModel ?? 'default'}
+              {shortModelLabel(displayedCodexModel) ?? displayedCodexModel ?? 'default'}
             </button>
             {modelOpen && renderModelDropdown(
               <>
@@ -6621,7 +9567,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
               style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {genericTransportModel ?? 'default'}
+              {shortModelLabel(genericTransportModel) ?? genericTransportModel ?? 'default'}
             </button>
             {modelOpen && renderModelDropdown(
               <>
@@ -7079,6 +10025,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       )}
 
+      {voiceHoldError && (
+        <div
+          class="voice-hold-error-banner"
+          role="alert"
+          style={{ padding: '4px 12px', fontSize: 12, color: '#ef4444', background: 'rgba(239,68,68,0.1)', borderRadius: 4, margin: '0 8px 4px' }}
+        >
+          {voiceHoldError === 'permission_denied'
+            ? t('voice.mic_permission_failed')
+            : t('voice.error', { error: voiceHoldError })}
+        </div>
+      )}
+
       {/* Delegation target chip — separate from Team/P2P routing tokens. */}
       {pendingDelegateTarget && (
         <div class="attachment-badges">
@@ -7095,23 +10053,49 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       )}
 
       {/* Attachment badges — above input row */}
-      {attachments.length > 0 && (
-        <div class="attachment-badges">
-          {attachments.map((a) => (
-            <ComposerAttachmentBadge
-              key={a.path}
-              seq={a.seq}
-              name={a.name}
-              path={a.path}
-              {...(a.id ? { attachmentId: a.id } : {})}
-              {...((a.serverId || serverId) ? { serverId: a.serverId || serverId } : {})}
-              {...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {})}
-              removing={deletingAttachmentKeys.has(a.id ?? a.path)}
-              onRemove={() => { void handleRemoveAttachment(a); }}
-            />
-          ))}
-        </div>
-      )}
+      {attachments.length > 0 && (() => {
+        const shouldCollapse = attachments.length > ATTACHMENT_BADGE_COLLAPSE_THRESHOLD;
+        const isCollapsed = shouldCollapse && !attachmentsExpanded;
+        const visibleAttachments = isCollapsed
+          ? attachments.slice(0, ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT)
+          : attachments;
+        const hiddenCount = attachments.length - visibleAttachments.length;
+        const toggleTitle = isCollapsed
+          ? t('upload.attachments_expand_title', { count: hiddenCount, total: attachments.length })
+          : t('upload.attachments_collapse_title', { total: attachments.length });
+        return (
+          <div class={`attachment-badges attachment-badges-list${shouldCollapse && attachmentsExpanded ? ' is-expanded' : ''}`}>
+            {visibleAttachments.map((a) => (
+              <ComposerAttachmentBadge
+                key={a.path}
+                seq={a.seq}
+                name={a.name}
+                path={a.path}
+                {...(a.id ? { attachmentId: a.id } : {})}
+                {...((a.serverId || serverId) ? { serverId: a.serverId || serverId } : {})}
+                {...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {})}
+                removing={deletingAttachmentKeys.has(a.id ?? a.path)}
+                onRemove={() => { void handleRemoveAttachment(a); }}
+              />
+            ))}
+            {shouldCollapse && (
+              <button
+                type="button"
+                class="attachment-badge attachment-badge-toggle"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setAttachmentsExpanded((prev) => !prev)}
+                aria-expanded={attachmentsExpanded}
+                aria-label={toggleTitle}
+                title={toggleTitle}
+              >
+                {isCollapsed
+                  ? t('upload.attachments_expand', { count: hiddenCount, total: attachments.length })
+                  : t('upload.attachments_collapse', { total: attachments.length })}
+              </button>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Quote badges — above input row */}
       {quotes && quotes.length > 0 && (
@@ -7144,7 +10128,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 setMobileComposerExpanded((prev) => !prev);
-                setTimeout(() => divRef.current?.focus(), 0);
+                setTimeout(() => { focusComposerForTyping(); }, 0);
               }}
               title={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
               aria-label={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
@@ -7609,6 +10593,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   key={task.taskId}
                   role="option"
                   aria-selected={highlighted ? 'true' : 'false'}
+                  data-task-pair-id={task.taskId}
                   data-task-pair-title={task.title}
                   style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
                   onMouseDown={(event) => {
@@ -7621,7 +10606,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   }}
                   onMouseEnter={() => setTaskPairHighlightIdx(idx)}
                 >
-                  <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{task.title}</span>
+                  <span
+                    class="controls-task-pair-status-badge"
+                    data-task-pair-status={task.status}
+                    aria-label={t(taskPairReferenceStatusKey(task.status))}
+                    title={t(taskPairReferenceStatusKey(task.status))}
+                  >
+                    {t(taskPairReferenceStatusKey(task.status))}
+                  </span>
+                  <span class="controls-task-pair-title">{task.title}</span>
                 </div>
               );
             })}
@@ -7633,7 +10626,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+        <VoiceHoldHud
+          ref={voiceHoldHudRef}
+          active={voiceHoldHudActive}
+          phase={voiceHoldPhase}
+          zone={voiceHoldZone}
+          dragXRef={voiceHoldDragXRef}
+          dropY={voiceHoldDropY}
+          bottomClearance={voiceHoldBottomClearance}
+          text={voiceHoldText}
+          recognizing={voiceHoldRecognizing}
+          liveAudio={voiceHoldLiveAudio}
+          transcriptRef={voiceHoldTranscriptRef}
+        />
+        <div ref={composerRef} class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}${voiceHoldHudActive && voiceHoldPhase === 'dropping' ? ' controls-composer-voice-dropping' : ''}`}>
           {!isMobileLayout && !compact && (
             <>
               <div
@@ -7655,7 +10661,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ref={divRef}
             class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${embeddedComposerActionCount > 0 ? ` controls-input-with-trailing controls-input-with-trailing-${embeddedComposerActionCount}` : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
             data-onboarding="chat-input"
-            contenteditable={inputDisabled ? 'false' : 'true'}
+            contenteditable={inputDisabled || voiceHoldActive || (voiceHoldReady && !composerFocused) ? 'false' : 'true'}
             role="textbox"
             aria-multiline="true"
             aria-label="Message input"
@@ -7672,12 +10678,65 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onFocus={handleFocus}
             onBlur={handleBlur}
+            onClick={() => {
+              const el = divRef.current;
+              if (!el || suppressComposerClickFocusRef.current) {
+                pendingMobileInitialEndFocusRef.current = null;
+                return;
+              }
+              if (inputDisabledRef.current) {
+                pendingMobileInitialEndFocusRef.current = null;
+                return;
+              }
+              if (
+                (voiceHoldPendingRef.current || voiceHoldActiveRef.current)
+                && (voiceHoldPointerRef.current?.captureLost || voiceHoldPointerRef.current === null)
+              ) {
+                retireOrphanedVoiceHold();
+              }
+              if (voiceHoldPendingRef.current || voiceHoldActiveRef.current) return;
+              const shouldMoveInitialMobileToEnd = pendingMobileInitialEndFocusRef.current !== null;
+              pendingMobileInitialEndFocusRef.current = null;
+              const isMobileViewport = typeof window !== 'undefined' && window.innerWidth <= 640;
+              if (
+                shouldMoveInitialMobileToEnd
+                || !composerFocusedRef.current
+                || el.getAttribute('contenteditable') !== 'true'
+              ) {
+                focusComposerForTyping(
+                  shouldMoveInitialMobileToEnd || isMobileViewport
+                    ? { moveCursorToEnd: true }
+                    : undefined,
+                );
+              }
+            }}
+            onPointerDown={handleComposerVoicePointerDown}
+            onPointerMove={handleComposerVoicePointerMove}
+            onPointerUp={(e) => handleComposerVoicePointerEnd(e, false)}
+            onPointerCancel={(e) => handleComposerVoicePointerEnd(e, true)}
+            onContextMenu={(e) => {
+              pendingMobileInitialEndFocusRef.current = null;
+              if (voiceHoldPending || voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
+                e.preventDefault();
+              }
+            }}
             onInput={(event) => {
+              if (inlineVoiceActiveRef.current && !programmaticVoiceWriteRef.current) {
+                interruptInlineVoiceForManualEdit();
+              }
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
+              const editingText = divRef.current
+                ? readComposerElementText(divRef.current, { preserveEditingLines: true })
+                : '';
+              syncHistoryEditOrDraft(
+                editingText,
+                getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+              );
               setHasText(!!currentText.trim());
               publishComposerText(currentText);
               syncMobileComposerMetrics();
               if (sendWarning) clearSendWarning();
+              if (voiceHoldError) setVoiceHoldError(null);
               if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
                 atSelectionLockRef.current = false;
                 atSelectionSnapshotRef.current = currentText;
@@ -7836,13 +10895,39 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             <div class="controls-composer-trailing-actions">
               {showEmbeddedVoiceButton && (
                 <button
-                  class="btn btn-voice btn-voice-embedded"
+                  class={`btn btn-voice btn-voice-embedded${inlineVoiceActive ? ' btn-voice-inline-active' : ''}`}
                   // Open on pointerdown (fires synchronously at touch-start) so the
                   // tap is never lost to the ~300ms click delay or to a re-render
-                  // unmounting this conditionally-rendered button mid-gesture.
-                  onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
-                  onClick={() => setVoiceOpen(true)}
+                  // unmounting this conditionally-rendered button mid-gesture, and
+                  // suppress the trailing synthetic click on the same tap.
+                  onPointerDown={(e) => {
+                    if (e.button !== undefined && e.button !== 0) return;
+                    e.preventDefault();
+                    suppressNextVoiceButtonClickRef.current = true;
+                    if (suppressNextVoiceButtonClickTimerRef.current !== null) {
+                      clearTimeout(suppressNextVoiceButtonClickTimerRef.current);
+                    }
+                    suppressNextVoiceButtonClickTimerRef.current = setTimeout(() => {
+                      suppressNextVoiceButtonClickTimerRef.current = null;
+                      suppressNextVoiceButtonClickRef.current = false;
+                    }, 400);
+                    handleVoiceButtonActivate();
+                  }}
+                  onClick={() => {
+                    if (suppressNextVoiceButtonClickRef.current) {
+                      suppressNextVoiceButtonClickRef.current = false;
+                      if (suppressNextVoiceButtonClickTimerRef.current !== null) {
+                        clearTimeout(suppressNextVoiceButtonClickTimerRef.current);
+                        suppressNextVoiceButtonClickTimerRef.current = null;
+                      }
+                      return;
+                    }
+                    handleVoiceButtonActivate();
+                  }}
                   disabled={inputDisabled}
+                  aria-pressed={macDesktop ? inlineVoiceActive : undefined}
+                  data-voice-trigger="embedded"
+                  data-inline-voice-active={inlineVoiceActive ? 'true' : undefined}
                   data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
                   title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
                   aria-label={t('voice.voice_input')}
@@ -7920,9 +11005,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         )}
         {!isMobileLayout && VoiceInput.isAvailable() && (
           <button
-            class="btn btn-voice"
-            onClick={() => setVoiceOpen(true)}
+            class={`btn btn-voice${inlineVoiceActive ? ' btn-voice-inline-active' : ''}`}
+            onPointerDown={(e) => e.preventDefault()}
+            onClick={() => handleVoiceButtonActivate()}
             disabled={inputDisabled}
+            aria-pressed={macDesktop ? inlineVoiceActive : undefined}
+            data-voice-trigger="desktop"
+            data-inline-voice-active={inlineVoiceActive ? 'true' : undefined}
             data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
             title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
           >
@@ -8213,14 +11302,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       </div>
     )}
+    {inlineVoiceActive && inlineVoiceRobotHostRef.current && createPortal(
+      <VoiceStreamingRobot active={inlineVoiceActive || inlineVoiceRecognizing} />,
+      inlineVoiceRobotHostRef.current,
+    )}
     <VoiceOverlay
       open={voiceOpen}
-      onClose={() => setVoiceOpen(false)}
+      onClose={() => {
+        setVoiceOpen(false);
+        setVoiceOverlayInitialText(null);
+        setVoiceOverlayAutoStart(true);
+      }}
       onSend={handleVoiceSend}
       onSendNotepad={handleVoiceNotepadSend}
       draftScope={voiceNotepadDraftScope}
       sessionLabel={composerTargetName}
-      initialText={divRef.current ? readComposerElementText(divRef.current) : ''}
+      autoStartListening={voiceOverlayAutoStart}
+      initialText={voiceOverlayInitialText !== null ? voiceOverlayInitialText : (divRef.current ? readComposerElementText(divRef.current) : '')}
     />
     {p2pConfigOpen && (
       <P2pConfigPanel

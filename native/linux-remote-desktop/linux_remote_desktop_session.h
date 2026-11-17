@@ -1,3 +1,5 @@
+#include "../remote-desktop-common/traffic_stats.h"
+#include <mutex>
 #ifndef IMCODES_REMOTE_DESKTOP_LINUX_LINUX_REMOTE_DESKTOP_SESSION_H_
 #define IMCODES_REMOTE_DESKTOP_LINUX_LINUX_REMOTE_DESKTOP_SESSION_H_
 
@@ -32,12 +34,12 @@
 // header's own comment), then routed through this session's own
 // SessionCore/InputLedger, exactly as ApplyPointerMove/ApplyKey/etc.'s own
 // header comment already promised they would be. NOT YET DONE, scoped as a
-// real follow-up: display selection/mode/scale, clipboard, and auto-unlock --
-// Linux has one fixed display and does not advertise
-// REMOTE_DESKTOP_CLIPBOARD_CAPABILITY or CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
-// so those "control" kinds have nothing to route to yet and stay silently
-// ignored (an unknown-but-well-formed control kind), matching this file's own
-// established "never claim readiness this session cannot back" convention.
+// real follow-up: display selection/mode/scale and auto-unlock. Linux now
+// routes bounded clipboard copy/paste through its X11 adapter; it still does
+// not advertise CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY, so that control kind
+// remains silently ignored (an unknown-but-well-formed control kind), matching
+// this file's established "never claim readiness this session cannot back"
+// convention.
 //
 // DELIBERATELY NOT YET DONE, scoped as follow-up: the daemon-side worker
 // process/challenge/generation protocol.
@@ -203,7 +205,12 @@ class LinuxRemoteDesktopSession final
   // today, but PeerConnection::GetStats' own contract does not promise
   // otherwise), matching this class's own signaling-thread-confinement rule
   // (see this file's header comment).
-  void HandleMediaStats(bool has_outbound_video, std::uint64_t outbound_bytes);
+  void HandleMediaStats(bool has_outbound_video, std::uint64_t outbound_bytes,
+                        std::vector<imcodes::rd::TrafficSample> traffic = {});
+  [[nodiscard]] std::vector<imcodes::rd::TrafficSample> traffic_stats() const {
+    std::lock_guard lock(traffic_mutex_);
+    return traffic_stats_;
+  }
   void Stop() noexcept;
 
   // Real, externally-driven signaling (not the loopback qualification's
@@ -378,6 +385,8 @@ class LinuxRemoteDesktopSession final
   // runs on it, so nothing here posts to it yet.
   [[maybe_unused]] webrtc::Thread* const signaling_thread_;
   LinuxEmitIceCandidate emit_ice_candidate_;
+  mutable std::mutex traffic_mutex_;
+  std::vector<imcodes::rd::TrafficSample> traffic_stats_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;
   std::vector<imcodes::rd::IceServer> ice_servers_;
   std::unique_ptr<common::NativeVideoSourceLease> video_lease_;

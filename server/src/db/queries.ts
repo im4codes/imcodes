@@ -1,3 +1,4 @@
+import { parseSyncedPreference } from '../../../shared/synced-preference.js';
 import { USER_STATUS, type UserStatus } from '../../../shared/user-status.js';
 import type { Database } from './client.js';
 import type { ContextModelConfig } from '../../../shared/context-types.js';
@@ -193,22 +194,6 @@ function parseSessionTextTailCacheEvents(
     items.push(item);
   }
   return items;
-}
-
-function mergeSessionTextTailCacheEvents(
-  existing: SessionTextTailCacheItem[],
-  incoming: SessionTextTailCacheItem,
-): SessionTextTailCacheItem[] {
-  const deduped = new Map<string, SessionTextTailCacheItem>();
-  for (const item of existing) deduped.set(item.eventId, item);
-  deduped.set(incoming.eventId, incoming);
-  const merged = [...deduped.values()].sort((a, b) => {
-    if (a.ts !== b.ts) return a.ts - b.ts;
-    return a.eventId.localeCompare(b.eventId);
-  });
-  return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
-    ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
-    : merged;
 }
 
 export function mergeSessionTextTailCacheItems(
@@ -824,6 +809,34 @@ export async function updateSession(
   );
 }
 
+const SESSION_TEXT_TAIL_PG_TRIM_CHARS =
+  "E' \\t\\n\\v\\f\\r\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff'";
+const SESSION_TEXT_TAIL_ICU_COLLATION = 'session_text_tail_icu';
+const SESSION_TEXT_TAIL_ICU_DDL =
+  `CREATE COLLATION IF NOT EXISTS ${SESSION_TEXT_TAIL_ICU_COLLATION} (provider = icu, locale = 'und-u-kk-true', deterministic = false)`;
+
+function isMissingSessionTextTailCollationError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = 'code' in err ? String((err as { code?: unknown }).code ?? '') : '';
+  if (code !== '42704') return false;
+  const message = 'message' in err ? String((err as { message?: unknown }).message ?? '') : '';
+  return message.includes(SESSION_TEXT_TAIL_ICU_COLLATION);
+}
+
+function isCollationCreateRaceError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = 'code' in err ? String((err as { code?: unknown }).code ?? '') : '';
+  return code === '42710' || code === '23505';
+}
+
+async function ensureSessionTextTailCollation(db: Database): Promise<void> {
+  try {
+    await db.execute(SESSION_TEXT_TAIL_ICU_DDL);
+  } catch (err) {
+    if (!isCollationCreateRaceError(err)) throw err;
+  }
+}
+
 export async function upsertSessionTextTailCacheEvent(
   db: Database,
   serverId: string,
@@ -831,25 +844,121 @@ export async function upsertSessionTextTailCacheEvent(
 ): Promise<void> {
   const classified = classifySessionTextTailEvent(rawEvent);
   if (!classified) return;
-  await db.transaction(async (tx) => {
-    const row = await tx.queryOne<Pick<DbSessionTextTailCacheRow, 'events'>>(
-      `SELECT events
-         FROM session_text_tail_cache
-        WHERE server_id = $1 AND session_name = $2
-        FOR UPDATE`,
-      [serverId, classified.sessionName],
-    );
-    const existing = parseSessionTextTailCacheEvents(row?.events ?? null);
-    const events = mergeSessionTextTailCacheEvents(existing, classified.item);
-    const latestTs = events.length > 0 ? events[events.length - 1]!.ts : null;
-    await tx.execute(
-      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
-       VALUES ($1, $2, $3::jsonb, $4, NOW())
-       ON CONFLICT (server_id, session_name)
-       DO UPDATE SET events = EXCLUDED.events, latest_ts = EXCLUDED.latest_ts, updated_at = NOW()`,
-      [serverId, classified.sessionName, JSON.stringify(events), latestTs],
-    );
-  });
+  const serializedItem = JSON.stringify(classified.item);
+  const sql = `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+     VALUES ($1, $2, jsonb_build_array($3::jsonb), $4, NOW())
+     ON CONFLICT (server_id, session_name)
+     DO UPDATE SET (events, latest_ts, updated_at) = (
+       SELECT
+         COALESCE(
+           jsonb_agg(
+             t.item
+             ORDER BY t.ts ASC, t.event_id COLLATE "${SESSION_TEXT_TAIL_ICU_COLLATION}" ASC, t.first_ord ASC
+           ),
+           '[]'::jsonb
+         ),
+         TRUNC(MAX(t.ts))::bigint,
+         NOW()
+       FROM (
+         SELECT
+           deduped.item,
+           deduped.ts,
+           deduped.event_id,
+           deduped.first_ord
+         FROM (
+           SELECT
+             all_rows.item,
+             all_rows.ts,
+             all_rows.event_id,
+             MIN(all_rows.ord) OVER (PARTITION BY all_rows.event_id COLLATE "C") AS first_ord,
+             ROW_NUMBER() OVER (PARTITION BY all_rows.event_id COLLATE "C" ORDER BY all_rows.ord DESC) AS rn
+           FROM (
+             SELECT
+               jsonb_strip_nulls(
+                 jsonb_build_object(
+                   'eventId', e.elem->>'eventId',
+                   'ts', e.elem->'ts',
+                   'type', e.elem->>'type',
+                   'text', CASE
+                     WHEN octet_length(trimmed_text.val) <= $6 THEN trimmed_text.val
+                     ELSE COALESCE((
+                       SELECT string_agg(u.ch, '' ORDER BY u.pos)
+                       FROM (
+                         SELECT
+                           t.ch,
+                           t.pos,
+                           SUM(CASE WHEN ascii(t.ch) > 65535 THEN 2 ELSE 1 END) OVER (ORDER BY t.pos) AS u16
+                         FROM string_to_table(trimmed_text.val, NULL) WITH ORDINALITY AS t(ch, pos)
+                       ) AS u
+                       WHERE u.u16 <= $6
+                     ), '')
+                   END,
+                   'source', CASE
+                     WHEN jsonb_typeof(e.elem->'source') IS NOT DISTINCT FROM 'string'
+                      AND btrim(e.elem->>'source', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) <> ''
+                     THEN btrim(e.elem->>'source', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS})
+                     ELSE NULL
+                   END,
+                   'confidence', CASE
+                     WHEN jsonb_typeof(e.elem->'confidence') IS NOT DISTINCT FROM 'string'
+                      AND btrim(e.elem->>'confidence', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) <> ''
+                     THEN btrim(e.elem->>'confidence', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS})
+                     ELSE NULL
+                   END
+                 )
+               ) AS item,
+               (e.elem->>'ts')::numeric AS ts,
+               e.elem->>'eventId' AS event_id,
+               e.ord::bigint AS ord
+             FROM jsonb_array_elements(
+               CASE
+                 WHEN jsonb_typeof(session_text_tail_cache.events) IS NOT DISTINCT FROM 'array'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(session_text_tail_cache.events) AS chk
+                    WHERE jsonb_typeof(chk) IS DISTINCT FROM 'object'
+                       OR jsonb_typeof(chk->'eventId') IS DISTINCT FROM 'string'
+                       OR jsonb_typeof(chk->'ts') IS DISTINCT FROM 'number'
+                       OR jsonb_typeof(chk->'type') IS DISTINCT FROM 'string'
+                       OR NOT COALESCE((chk->>'type') IN ('user.message', 'assistant.text'), FALSE)
+                       OR jsonb_typeof(chk->'text') IS DISTINCT FROM 'string'
+                       OR COALESCE(btrim(chk->>'text', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) = '', TRUE)
+                  )
+                 THEN session_text_tail_cache.events
+                 ELSE '[]'::jsonb
+               END
+             ) WITH ORDINALITY AS e(elem, ord)
+             CROSS JOIN LATERAL (
+               SELECT btrim(e.elem->>'text', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) AS val
+             ) AS trimmed_text
+             UNION ALL
+             SELECT
+               $3::jsonb AS item,
+               ($3::jsonb->>'ts')::numeric AS ts,
+               $3::jsonb->>'eventId' AS event_id,
+               9223372036854775807::bigint AS ord
+           ) AS all_rows
+         ) AS deduped
+         WHERE deduped.rn = 1
+         ORDER BY deduped.ts DESC, deduped.event_id COLLATE "${SESSION_TEXT_TAIL_ICU_COLLATION}" DESC, deduped.first_ord DESC
+         LIMIT $5
+       ) AS t
+     )`;
+  const params = [
+    serverId,
+    classified.sessionName,
+    serializedItem,
+    classified.item.ts,
+    SESSION_TEXT_TAIL_CACHE_LIMIT,
+    SESSION_TEXT_TAIL_TEXT_MAX_CHARS,
+  ];
+  try {
+    await db.execute(sql, params);
+  } catch (err) {
+    if (!isMissingSessionTextTailCollationError(err)) throw err;
+    await ensureSessionTextTailCollation(db);
+    await db.execute(sql, params);
+  }
 }
 
 export async function getSessionTextTailCache(
@@ -1121,6 +1230,81 @@ export async function createSubSession(
   };
 }
 
+export interface SubSessionBatchUpsertInput {
+  id: string;
+  serverId: string;
+  type: string;
+  shellBin: string | null;
+  cwd: string | null;
+  label: string | null;
+  ccSessionId: string | null;
+  geminiSessionId?: string | null;
+  parentSession?: string | null;
+  runtimeType?: string | null;
+  providerId?: string | null;
+  providerSessionId?: string | null;
+  description?: string | null;
+  ccPresetId?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  effort?: string | null;
+  transportConfig?: Record<string, unknown> | null;
+  executionCloneMetadata?: Record<string, unknown> | null;
+}
+
+export async function createSubSessionsBatch(
+  db: Database,
+  rows: SubSessionBatchUpsertInput[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  // Deduplicate by (id, serverId) keeping the latest entry so PostgreSQL
+  // ON CONFLICT DO UPDATE never hits a single-statement duplicate conflict.
+  const dedupedMap = new Map<string, SubSessionBatchUpsertInput>();
+  for (const row of rows) {
+    dedupedMap.set(`${row.serverId}\0${row.id}`, row);
+  }
+  const deduped = Array.from(dedupedMap.values());
+  const now = Date.now();
+  const params: unknown[] = [];
+  const tuples: string[] = [];
+  for (let i = 0; i < deduped.length; i += 1) {
+    const r = deduped[i];
+    const base = i * 21;
+    tuples.push(
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, NULL, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12}, $${base + 13}, $${base + 14}, $${base + 15}, $${base + 16}, $${base + 17}, $${base + 18}, $${base + 19}, $${base + 20}::jsonb, $${base + 21}::jsonb)`,
+    );
+    params.push(
+      r.id,
+      r.serverId,
+      r.type,
+      r.shellBin ?? null,
+      r.cwd ?? null,
+      r.label ?? null,
+      r.ccSessionId ?? null,
+      r.geminiSessionId ?? null,
+      r.parentSession ?? null,
+      r.runtimeType ?? null,
+      r.providerId ?? null,
+      r.providerSessionId ?? null,
+      r.description ?? null,
+      now,
+      now,
+      r.ccPresetId ?? null,
+      r.requestedModel ?? null,
+      r.activeModel ?? null,
+      r.effort ?? null,
+      JSON.stringify(r.transportConfig ?? {}),
+      r.executionCloneMetadata == null ? null : JSON.stringify(r.executionCloneMetadata),
+    );
+  }
+  await db.execute(
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config, execution_clone_metadata)
+     VALUES ${tuples.join(', ')}
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.cc_session_id ELSE COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id) END, gemini_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.gemini_session_id ELSE COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id) END, parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.provider_session_id ELSE COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id) END, description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END, execution_clone_metadata = EXCLUDED.execution_clone_metadata`,
+    params,
+  );
+}
+
 export async function updateSubSession(
   db: Database,
   id: string,
@@ -1188,10 +1372,28 @@ export async function getUserPref(db: Database, userId: string, key: string): Pr
 }
 
 export async function setUserPref(db: Database, userId: string, key: string, value: string): Promise<void> {
-  await db.execute(
-    'INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
-    [userId, key, value, Date.now()],
-  );
+  // The route serializes `value`; old clients put a JSON-string envelope inside
+  // it, while others send an object. Plain scalar preferences keep their API.
+  const parseStored = (raw: string) => {
+    try { return parseSyncedPreference(JSON.parse(raw)); } catch { return null; }
+  };
+  const incoming = parseStored(value);
+  const write = async (tx: Database) => {
+    await tx.execute(
+      'INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+      [userId, key, value, Date.now()],
+    );
+  };
+  if (!incoming) { await write(db); return; }
+  await db.transaction(async (tx) => {
+    // Lock even an absent row: SELECT FOR UPDATE alone races on first insert.
+    // Transaction-scoped and database-backed, so concurrent pods agree too.
+    await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify([userId, key])]);
+    const raw = await getUserPref(tx, userId, key);
+    const current = raw === null ? null : parseStored(raw);
+    if (current && current.t >= incoming.t) return; // server wins existing ties
+    await write(tx);
+  });
 }
 
 export async function deleteUserPref(db: Database, userId: string, key: string): Promise<void> {

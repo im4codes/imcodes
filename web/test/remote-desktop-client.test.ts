@@ -1562,6 +1562,30 @@ describe('RemoteDesktopClient', () => {
     socket.receive({ ...status, qualityPreference: true });
     expect(qualityControls()).toHaveLength(1);
 
+    // A quality refusal is surfaced once, then repeated STATUS frames must not
+    // replay the same request or keep the notice alive indefinitely.
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: authority.sessionId,
+      sequence: 7,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.QUALITY_UNAVAILABLE,
+    });
+    expect(client.current().controlRejection).toMatchObject({
+      id: 1,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.QUALITY_UNAVAILABLE,
+    });
+    socket.receive({ ...status, qualityPreference: true });
+    socket.receive({ ...status, qualityPreference: true });
+    expect(qualityControls()).toHaveLength(1);
+    expect(client.current().controlRejection?.id).toBe(1);
+
+    // An explicit retry is a new user action and is still sent/announced.
+    expect(client.setQualityPreference(smooth)).toBe(true);
+    expect(qualityControls()).toHaveLength(2);
+
     peer.connect();
     const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
     expect(statsTick).toBeTypeOf('function');
@@ -3738,4 +3762,34 @@ it('keeps the contract open to an end-of-candidates marker from any client', () 
   expect(validateRemoteDesktopBrowserMessage({
     type: REMOTE_DESKTOP_MSG.ICE, ...correlation, candidate: '', mid: '0',
   }).ok).toBe(true);
+});
+
+
+describe('remote desktop transport traffic', () => {
+  it('uses transport bytes only, keeps duplicates/ICE stable and isolates old peer results', async () => {
+    const snapshots: Array<{ traffic?: { bytesSent: number; bytesReceived: number } }> = [];
+    const client = new RemoteDesktopClient('traffic-fixture', { onSnapshot: (snapshot) => snapshots.push(snapshot) });
+    const internal = client as unknown as { peer: RTCPeerConnection; collectStats(peer: RTCPeerConnection): Promise<void> };
+    const peer = new FakePeer();
+    internal.peer = peer as unknown as RTCPeerConnection;
+    peer.stats = [
+      { id: 'dtls', type: 'transport', bytesSent: 50, bytesReceived: 1000 },
+      { id: 'rtp', type: 'inbound-rtp', kind: 'video', bytesReceived: 900, timestamp: 1 },
+      { id: 'ice', type: 'candidate-pair', bytesReceived: 1000 },
+      { id: 'data', type: 'data-channel', bytesReceived: 100 },
+    ];
+    await internal.collectStats(internal.peer);
+    await internal.collectStats(internal.peer);
+    expect(snapshots.at(-1)?.traffic).toEqual({ bytesSent: 50, bytesReceived: 1000 });
+    peer.stats = [{ id: 'dtls', type: 'transport', bytesSent: 60, bytesReceived: 1500 }];
+    await internal.collectStats(internal.peer);
+    expect(snapshots.at(-1)?.traffic).toEqual({ bytesSent: 60, bytesReceived: 1500 });
+    const next = new FakePeer();
+    next.stats = [{ id: 'dtls', type: 'transport', bytesSent: 5, bytesReceived: 10 }];
+    internal.peer = next as unknown as RTCPeerConnection;
+    await internal.collectStats(internal.peer);
+    await internal.collectStats(peer as unknown as RTCPeerConnection);
+    expect(snapshots.at(-1)?.traffic).toEqual({ bytesSent: 65, bytesReceived: 1510 });
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
 });

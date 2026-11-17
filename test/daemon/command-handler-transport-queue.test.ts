@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { ASK_ANSWER_ACK_ERRORS, ASK_ANSWER_COMMAND, ASK_ANSWER_DELIVERY } from '../../shared/ask-answer.js';
 import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { SESSION_MODEL_CONTROL_ERROR } from '../../shared/session-model-control.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
@@ -13,9 +14,14 @@ import {
   TRANSPORT_QUEUE_COMMANDS,
 } from '../../shared/transport-queue-types.js';
 import {
+  SESSION_CANCEL_IDLE_DECISION_REASON,
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
 } from '../../shared/session-control-commands.js';
+import {
+  isAuthoritativeCleanIdlePayload,
+  isAuthoritativeIdlePayloadShape,
+} from '../../shared/session-activity-types.js';
 import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_PROVIDER_IDS,
@@ -99,6 +105,7 @@ const {
   getPresetModelCatalogMock,
   loadPresetsMock,
   lookupAttachmentMock,
+  buildSessionListMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -154,6 +161,7 @@ const {
   getPresetModelCatalogMock: vi.fn(),
   loadPresetsMock: vi.fn().mockResolvedValue([]),
   lookupAttachmentMock: vi.fn(() => undefined),
+  buildSessionListMock: vi.fn(async () => []),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -270,6 +278,10 @@ vi.mock('../../src/daemon/preview-relay.js', () => ({
 
 vi.mock('../../src/daemon/provider-sessions.js', () => ({
   listProviderSessions: vi.fn(() => []),
+}));
+
+vi.mock('../../src/daemon/session-list.js', () => ({
+  buildSessionList: buildSessionListMock,
 }));
 
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
@@ -554,6 +566,8 @@ describe('handleWebCommand transport queue behavior', () => {
     getPresetModelCatalogMock.mockReset();
     lookupAttachmentMock.mockReset();
     lookupAttachmentMock.mockReturnValue(undefined);
+    buildSessionListMock.mockReset();
+    buildSessionListMock.mockResolvedValue([]);
     __resetTransportListModelsCacheForTests();
     clearAllTransportQueueRevisions();
     resetTransportQueueStoreForTests();
@@ -1910,6 +1924,61 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('handles /handoff via relaunchSessionWithSettings fresh + handoff, clears resend queue, and acks without queuing', async () => {
+    const { clearAllResend, enqueueResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+    enqueueResend('deck_transport_brain', { text: 'stale queued msg', timestamp: Date.now() });
+    expect(getResendEntries('deck_transport_brain')).toHaveLength(1);
+    relaunchSessionWithSettingsMock.mockResolvedValueOnce(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      label: 'Brain',
+      description: 'desc',
+      requestedModel: 'sonnet',
+      effort: 'high',
+      transportConfig: { supervision: { mode: 'off' } },
+      ccPreset: 'preset-a',
+      ccSessionId: 'cc-old',
+      providerSessionId: 'route-transport',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel: vi.fn(),
+      send: vi.fn(() => 'queued'),
+      pendingCount: 2,
+      pendingMessages: ['a', 'b'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: ' /handoff ', commandId: 'cmd-handoff-cc' }, serverLink as any);
+    await flushAsync();
+
+    expect(getResendEntries('deck_transport_brain')).toEqual([]);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_transport_brain', agentType: 'claude-code-sdk' }),
+      { fresh: true, handoff: true },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: ' /handoff ', allowDuplicate: true, commandId: 'cmd-handoff-cc' },
+      { source: 'daemon', confidence: 'high', eventId: 'transport-user:cmd-handoff-cc' },
+    );
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
+      text: 'Started a fresh conversation',
+      noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+      noticeParams: {},
+      streaming: false,
+      memoryExcluded: true,
+    }, expect.objectContaining({ source: 'daemon' }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-handoff-cc', status: 'accepted' });
+  });
+
   it('passes requestedModel when starting a copilot-sdk main session', async () => {
     handleWebCommand({
       type: 'session.start',
@@ -2444,6 +2513,67 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('emits authoritative clean-idle contract fields from markTransportCancelIdle both with live runtime and after restart (!stopRuntime)', async () => {
+    const gen = { scope: 'session', sessionName: 'deck_transport_brain', generation: 7 };
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel,
+      send: vi.fn(() => 'queued'),
+      getDiagnosticSnapshot: () => ({ activityGeneration: gen }),
+      pendingCount: 0,
+      pendingMessages: [],
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop-auth-runtime',
+    }, serverLink as any);
+    await flushAsync();
+
+    const runtimeIdleCall = emitMock.mock.calls.find((call) => (
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === 'idle'
+    ));
+    const runtimePayload = runtimeIdleCall?.[2] as Record<string, unknown>;
+    expect(runtimePayload).toBeDefined();
+    expect(isAuthoritativeIdlePayloadShape(runtimePayload)).toBe(true);
+    expect(isAuthoritativeCleanIdlePayload(runtimePayload, gen)).toBe(true);
+    expect(runtimePayload.decisionReason).toBe(SESSION_CANCEL_IDLE_DECISION_REASON);
+
+    // Post-restart / missing runtime path (!stopRuntime)
+    emitMock.mockClear();
+    getTransportRuntimeMock.mockReturnValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop-post-restart',
+    }, serverLink as any);
+    await flushAsync();
+
+    const restartIdleCall = emitMock.mock.calls.find((call) => (
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === 'idle'
+    ));
+    const restartPayload = restartIdleCall?.[2] as Record<string, unknown>;
+    expect(restartPayload).toBeDefined();
+    expect(isAuthoritativeIdlePayloadShape(restartPayload)).toBe(true);
+    expect(isAuthoritativeCleanIdlePayload(restartPayload)).toBe(true);
+    expect(restartPayload.decisionReason).toBe(SESSION_CANCEL_IDLE_DECISION_REASON);
   });
 
   it('keeps legacy /stop sends as direct cancel compatibility without emitting /stop text', async () => {
@@ -3759,8 +3889,8 @@ describe('handleWebCommand transport queue behavior', () => {
       type: 'transport.models_response',
       agentType: AGY_SDK_PROVIDER_ID,
       requestId: 'passive-agy-default',
-      defaultModel: 'gemini-3.8-flash-high',
-      models: expect.arrayContaining([expect.objectContaining({ id: 'gemini-3.8-flash-high' })]),
+      defaultModel: 'gemini-4-hydrogen-high',
+      models: expect.arrayContaining([expect.objectContaining({ id: 'gemini-4-hydrogen-high' })]),
     }));
   });
 
@@ -4805,6 +4935,38 @@ describe('handleWebCommand transport queue behavior', () => {
     clearAllResend();
   });
 
+  it('executes /clear even when transport runtime is missing instead of queuing it for resend', async () => {
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      providerId: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      state: 'idle',
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/clear',
+      commandId: 'cmd-missing-runtime-clear',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(getResendEntries('deck_transport_brain')).toHaveLength(0);
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      fresh: true,
+    }));
+
+    clearAllResend();
+  });
+
   it('persists a transport error record when subsession.start fails before runtime creation', async () => {
     launchTransportSessionMock.mockRejectedValueOnce(new Error('provider bootstrap failed'));
 
@@ -5301,6 +5463,9 @@ describe('handleWebCommand transport queue behavior', () => {
       getSessionMock.mockReturnValue({ name: 'deck_sub_bad_effort', projectName: 'p', role: 'w1', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' });
       getTransportRuntimeMock.mockReturnValue(undefined);
       await expect(switchSessionThinkingNow('deck_sub_bad_effort', 'adaptive')).resolves.toMatchObject({ ok: false, code: 'unknown_thinking_level', availableThinkingLevels: ['low', 'medium', 'high', 'xhigh', 'max'] });
+      expect(emitMock).toHaveBeenCalledWith('deck_sub_bad_effort', 'assistant.text', expect.objectContaining({
+        noticeCode: DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, streaming: false, automation: true, memoryExcluded: true,
+      }), expect.any(Object));
     });
 
     it('uses the selected Codex model metadata instead of accepting a global effort level', async () => {
@@ -6755,10 +6920,17 @@ describe('handleWebCommand transport queue behavior', () => {
       runtimeType: 'transport',
       state: 'running',
       requestedModel: 'gemini-2.5-pro',
+      activeModel: 'gemini-2.5-pro',
+      modelDisplay: 'gemini-2.5-pro',
+      providerSessionId: 'provider-route-agy',
+      sessionInstanceId: 'agy-instance',
+      runtimeEpoch: 'agy-epoch',
     });
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'provider-route-agy',
+      recipientIdentity: { sessionInstanceId: 'agy-instance', runtimeEpoch: 'agy-epoch' },
       setAgentId,
+      getStatus: () => 'streaming',
     });
 
     handleWebCommand({
@@ -6772,9 +6944,12 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(setAgentId).toHaveBeenCalledWith('gemini-2.5-flash');
     expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       requestedModel: 'gemini-2.5-flash',
-      activeModel: 'gemini-2.5-flash',
-      modelDisplay: 'gemini-2.5-flash',
+      activeModel: 'gemini-2.5-pro',
+      modelDisplay: 'gemini-2.5-pro',
     }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING,
+    }), expect.any(Object));
   });
 
   it('switches model for muse-code-sdk transport sessions via /model', async () => {
@@ -6838,6 +7013,9 @@ describe('handleWebCommand transport queue behavior', () => {
       'command.ack',
       expect.objectContaining({ status: 'error', error: 'Unknown Grok model: invented-model' }),
     );
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, streaming: false, automation: true, memoryExcluded: true,
+    }), expect.any(Object));
   });
 
   it('switches model for cursor-headless transport sessions via /model', async () => {
@@ -6915,6 +7093,91 @@ describe('handleWebCommand transport queue behavior', () => {
       status: 'error',
       error: expect.stringContaining('Qoder model switching is proof-gated'),
     }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED, streaming: false, automation: true, memoryExcluded: true,
+    }), expect.any(Object));
+  });
+
+  it('acknowledges /model immediately without waiting for hanging or rejecting handleGetSessions quota probes', async () => {
+    const setAgentId = vi.fn();
+    let rejectSessionList!: (err: Error) => void;
+    buildSessionListMock.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectSessionList = reject;
+    }));
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'copilot-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gpt-5.4',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gpt-5.4-mini',
+      commandId: 'cmd-model-nonblocking-ack',
+    }, serverLink as any);
+
+    await waitForAsync(() => serverLink.send.mock.calls.some(([msg]) => msg?.type === 'command.ack' && msg?.commandId === 'cmd-model-nonblocking-ack'));
+    expect(buildSessionListMock).toHaveBeenCalledTimes(1);
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      requestedModel: 'gpt-5.4-mini',
+      activeModel: 'gpt-5.4-mini',
+    }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', expect.objectContaining({
+      commandId: 'cmd-model-nonblocking-ack',
+      status: 'accepted',
+    }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
+    }), expect.any(Object));
+
+    rejectSessionList(new Error('quota probe failed'));
+    await flushAsync();
+  });
+
+  it('preserves AGY session owner semantics while refreshing sessions asynchronously', async () => {
+    let releaseApply!: () => void;
+    const applyGate = new Promise<string>((resolve) => {
+      releaseApply = () => resolve('live');
+    });
+    const staleRuntime = {
+      supportsConfirmedModelSelection: true,
+      applyAgentId: vi.fn(() => applyGate),
+      pendingCount: 0,
+      sending: false,
+      getStatus: () => 'idle',
+    };
+    const agyRecord = {
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      state: 'idle',
+      sessionInstanceId: 'inst-1',
+      runtimeEpoch: 1,
+      providerSessionId: 'agy-1',
+    };
+    getSessionMock.mockReturnValue(agyRecord);
+    getTransportRuntimeMock.mockReturnValue(staleRuntime);
+
+    const switching = switchSessionModelNow('deck_transport_brain', 'model-b', undefined, serverLink as any);
+    // Replace the session owner while native model selection is in flight.
+    getSessionMock.mockReturnValue({ ...agyRecord, sessionInstanceId: 'inst-2' });
+    releaseApply();
+
+    await expect(switching).resolves.toMatchObject({ ok: false, code: SESSION_MODEL_CONTROL_ERROR.SESSION_CHANGED });
+    expect(upsertSessionMock).not.toHaveBeenCalled();
+    expect(buildSessionListMock).not.toHaveBeenCalled();
   });
 
   it('rejects qoder-sdk thinking controls without forwarding them as prompts', async () => {
@@ -6953,6 +7216,9 @@ describe('handleWebCommand transport queue behavior', () => {
         error: expect.stringContaining('Qoder thinking/effort controls are proof-gated'),
       }),
     );
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, streaming: false, automation: true, memoryExcluded: true,
+    }), expect.any(Object));
   });
 
   it('reports effective daemon memory feature states including server runtime override and fallback config', async () => {

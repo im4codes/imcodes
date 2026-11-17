@@ -1,5 +1,6 @@
 import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import {
   VERIFICATION_MACHINE_API_PATH,
   VERIFICATION_MACHINE_KIND_LIST,
@@ -18,11 +19,13 @@ import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 type Failure = { status: 'error'; reason: MCPErrorReason; message: string };
-type Options = {
+export interface VerificationMachineClientOptions {
   endpoint?: { serverId: string; workerUrl: string; token: string } | null;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
-};
+  loadSharedMachineAuthority?: () => Promise<string | null>;
+}
+type Options = VerificationMachineClientOptions;
 
 function failure(reason: MCPErrorReason, message: string): Failure {
   return { status: 'error', reason, message: sanitizeMcpErrorMessage(message) };
@@ -66,12 +69,21 @@ async function request(options: Options, path: string, init: RequestInit) {
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
+    let sharedMachineAuthority: string | null = null;
+    if (options.loadSharedMachineAuthority) {
+      try {
+        sharedMachineAuthority = await options.loadSharedMachineAuthority();
+      } catch {
+        return failure(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
+      }
+    }
     const response = await (options.fetchImpl ?? fetch)(
       daemonApiUrl(endpoint.workerUrl, (init.method ?? 'GET') as DaemonHttpMethod, `${VERIFICATION_MACHINE_API_PATH}${path}`),
       {
         ...init,
         headers: {
           ...daemonServerAuthHeaders(endpoint),
+          ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
           ...(init.body ? { 'Content-Type': 'application/json' } : {}),
         },
         signal: controller.signal,

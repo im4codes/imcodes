@@ -824,6 +824,7 @@ async function runPass(at: number): Promise<IntegrationDriftPassResult> {
   for (const [brain, entries] of unintegrated) {
     const text = buildIntegrationDriftDigest(entries.map(({ candidate, integration }) => ({
       taskId: candidate.stored.state.taskId,
+      title: candidate.stored.state.title,
       head: candidate.head,
       worktree: candidate.repoPath,
       ageMs: at - candidate.endedAt,

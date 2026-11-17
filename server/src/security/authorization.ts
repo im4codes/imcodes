@@ -3,6 +3,7 @@
  * Enforces owner/admin/member/unauthenticated permission matrix.
  */
 import type { Context, Next } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
@@ -30,6 +31,8 @@ export interface AuthContext {
   userId: string;
   role: Role;
   keyId?: string;
+  /** Set when the credential is a restricted document-only collaborator session. */
+  scope?: 'doc_collaborator';
   /** Set when the credential is a daemon server-token; the machine's node role. */
   nodeRole?: NodeRole;
   /** Set when the credential is a daemon server-token; its server id. */
@@ -61,27 +64,123 @@ export function authFailureResponse(c: Pick<Context, 'json'>, resolution: AuthRe
  * and a disabled user keeps none of them. The check is a join in the credential's own lookup where there is one, and a primary-key read
  * for a stateless JWT -- never a per-pod cache, so a disable is honoured by every replica on its next request.
  */
-export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
+export function isAllowedDocCollaboratorRoute(method: string, rawPath: string): boolean {
+  if (method.toUpperCase() === 'OPTIONS') return true;
+  const path = rawPath.startsWith('/api') ? rawPath : `/api${rawPath.startsWith('/') ? '' : '/'}${rawPath}`;
+  const upperMethod = method.toUpperCase();
+
+  // Session verification & lifecycle endpoints
+  if (upperMethod === 'GET' && (path === '/api/auth/user/me' || path === '/api/auth/me')) return true;
+  if (upperMethod === 'POST' && (path === '/api/auth/refresh' || path === '/api/auth/logout')) return true;
+
+  // ONLYOFFICE endpoints (top-level and scoped to server)
+  if (path === '/api/onlyoffice' || path.startsWith('/api/onlyoffice/')) return true;
+  if (/^\/api\/server\/[^/]+\/onlyoffice(\/.*)?$/.test(path)) return true;
+
+  // Doc shares external/public & collaboration endpoints
+  if (path === '/api/doc-shares' || path.startsWith('/api/doc-shares/')) return true;
+  if (upperMethod === 'GET' && /^\/api\/server\/[^/]+\/doc-shares\/browse$/.test(path)) return true;
+  if (upperMethod === 'POST' && /^\/api\/server\/[^/]+\/doc-shares\/create-item$/.test(path)) return true;
+  if (upperMethod === 'GET' && /^\/api\/server\/[^/]+\/doc-shares\/file$/.test(path)) return true;
+
+  return false;
+}
+
+interface MemoizedAuthEntry {
+  cookieHeader: string;
+  authHeader: string;
+  serverIdHeader: string;
+  method: string;
+  path: string;
+  db: Database;
+  signingKey: string;
+  promise: Promise<AuthResolution>;
+}
+
+/**
+ * Single-request memoization for resolveAuthOutcome/resolveAuth.
+ * Keyed by the underlying Request object (or fallback Context object when synthetic)
+ * plus auth input fingerprints so it never leaks auth state across requests.
+ */
+const authOutcomeRequestCache = new WeakMap<object, MemoizedAuthEntry>();
+
+async function computeAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
   // Task 1: Try HttpOnly session cookie first (browser sessions)
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
     if (isAccountSessionJwt(payload)) {
-      return resolveLoginTokenUser(c.env.DB, payload);
+      return resolveLoginTokenUser(c.env.DB, payload, c.req.path, c.req.method);
     }
   }
 
   return resolveBearerOutcome(c);
 }
 
+export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
+  const rawReq = (c.req as { raw?: unknown }).raw;
+  const cacheKey: object = rawReq && typeof rawReq === 'object' ? rawReq : (c as object);
+  const cookieHeader = c.req.header('Cookie') ?? '';
+  const authHeader = c.req.header('Authorization') ?? '';
+  const serverIdHeader = c.req.header(SERVER_ID_HEADER) ?? '';
+  const method = c.req.method ?? '';
+  const path = c.req.path ?? '';
+  const db = c.env.DB;
+  const signingKey = c.env.JWT_SIGNING_KEY ?? '';
+
+  const cached = authOutcomeRequestCache.get(cacheKey);
+  if (
+    cached
+    && cached.cookieHeader === cookieHeader
+    && cached.authHeader === authHeader
+    && cached.serverIdHeader === serverIdHeader
+    && cached.method === method
+    && cached.path === path
+    && cached.db === db
+    && cached.signingKey === signingKey
+  ) {
+    return cached.promise;
+  }
+
+  const promise = computeAuthOutcome(c);
+  authOutcomeRequestCache.set(cacheKey, {
+    cookieHeader,
+    authHeader,
+    serverIdHeader,
+    method,
+    path,
+    db,
+    signingKey,
+    promise,
+  });
+  return promise;
+}
+
 export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthContext | null> {
   return (await resolveAuthOutcome(c)).auth;
 }
 
-async function resolveLoginTokenUser(db: Database, payload: Record<string, unknown> & { sub: string }): Promise<AuthResolution> {
+async function resolveLoginTokenUser(
+  db: Database,
+  payload: Record<string, unknown> & { sub: string },
+  reqPath?: string,
+  reqMethod = 'GET',
+): Promise<AuthResolution> {
   const decision = evaluateUserAccess(await loadUserAccess(db, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);
   if (!decision.ok) return { auth: null, denied: decision.code };
-  return { auth: { userId: payload.sub, role: (payload.role as Role) ?? 'member' } };
+  const scope = payload.scope === 'doc_collaborator' ? 'doc_collaborator' : undefined;
+  if (scope === 'doc_collaborator' && reqPath && !isAllowedDocCollaboratorRoute(reqMethod, reqPath)) {
+    throw new HTTPException(403, {
+      res: Response.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, { status: 403 }),
+    });
+  }
+  return {
+    auth: {
+      userId: payload.sub,
+      role: (payload.role as Role) ?? 'member',
+      ...(scope ? { scope } : {}),
+    },
+  };
 }
 
 /**
@@ -155,10 +254,10 @@ export async function resolveBearerOutcome(
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
   if (!payload) return { auth: null };
   if (!isAccountSessionJwt(payload)) return { auth: null }; // special-purpose tokens (tickets, machine authority, capability blobs) are not logins
-  return resolveLoginTokenUser(c.env.DB, payload);
+  return resolveLoginTokenUser(c.env.DB, payload, c.req.path, c.req.method);
 }
 
-function getCookieFromHeader(cookieHeader: string | undefined, name: string): string | undefined {
+export function getCookieFromHeader(cookieHeader: string | undefined, name: string): string | undefined {
   if (!cookieHeader) return undefined;
   const parts = cookieHeader.split(/;\s*/);
   for (const part of parts) {
@@ -212,6 +311,7 @@ function canPerform(role: Role, op: Operation): boolean {
  * Sets c.var.userId and c.var.role.
  */
 export const DAEMON_CREDENTIAL_REFUSAL = 'daemon_credential_not_accepted';
+export const DOC_COLLABORATOR_SCOPE_REFUSAL = 'doc_collaborator_scope_restricted';
 
 export interface RequireAuthOptions {
   /**
@@ -220,6 +320,12 @@ export interface RequireAuthOptions {
    * minting must not accept it: only a login, an API key or a CLI key reaches those routes.
    */
   refuseDaemonCredential?: boolean;
+  /**
+   * Allow a restricted `doc_collaborator` session (minted by Magic Invite or Keyless Auth Relay)
+   * to access this route. Defaults to false so document-only sessions are default-denied on all
+   * ordinary server/session/team/account endpoints.
+   */
+  allowDocCollaborator?: boolean;
 }
 
 export function requireAuth(options: RequireAuthOptions = {}) {
@@ -229,6 +335,9 @@ export function requireAuth(options: RequireAuthOptions = {}) {
     if (!auth) return authFailureResponse(c, resolution);
     if (options.refuseDaemonCredential && auth.serverId) {
       return c.json({ error: 'forbidden', reason: DAEMON_CREDENTIAL_REFUSAL }, 403);
+    }
+    if (auth.scope === 'doc_collaborator' && !options.allowDocCollaborator) {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
     }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
@@ -240,6 +349,7 @@ export function requireAuth(options: RequireAuthOptions = {}) {
 
     c.set('userId' as never, auth.userId);
     c.set('role' as never, auth.role);
+    if (auth.scope) c.set('authScope' as never, auth.scope);
     if (auth.keyId) c.set('keyId' as never, auth.keyId);
     if (auth.nodeRole) c.set('nodeRole' as never, auth.nodeRole);
     if (auth.serverId) c.set('authServerId' as never, auth.serverId);
@@ -250,7 +360,7 @@ export function requireAuth(options: RequireAuthOptions = {}) {
 /**
  * Require at minimum the given role.
  */
-export function requireRole(minRole: Role) {
+export function requireRole(minRole: Role, options: RequireAuthOptions = {}) {
   const minPerm: Operation = minRole === 'owner' ? 'owner'
     : minRole === 'admin' ? 'admin'
     : 'read';
@@ -259,6 +369,12 @@ export function requireRole(minRole: Role) {
     const resolution = await resolveAuthOutcome(c);
     const auth = resolution.auth;
     if (!auth) return authFailureResponse(c, resolution);
+    if (options.refuseDaemonCredential && auth.serverId) {
+      return c.json({ error: 'forbidden', reason: DAEMON_CREDENTIAL_REFUSAL }, 403);
+    }
+    if (auth.scope === 'doc_collaborator' && !options.allowDocCollaborator) {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+    }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
@@ -271,6 +387,10 @@ export function requireRole(minRole: Role) {
 
     c.set('userId' as never, auth.userId);
     c.set('role' as never, auth.role);
+    if (auth.scope) c.set('authScope' as never, auth.scope);
+    if (auth.keyId) c.set('keyId' as never, auth.keyId);
+    if (auth.nodeRole) c.set('nodeRole' as never, auth.nodeRole);
+    if (auth.serverId) c.set('authServerId' as never, auth.serverId);
     await next();
   };
 }
@@ -278,17 +398,17 @@ export function requireRole(minRole: Role) {
 /**
  * Require write access (member or above).
  */
-export const requireWrite = () => requireRole('member');
+export const requireWrite = (options?: RequireAuthOptions) => requireRole('member', options);
 
 /**
  * Require admin access.
  */
-export const requireAdmin = () => requireRole('admin');
+export const requireAdmin = (options?: RequireAuthOptions) => requireRole('admin', options);
 
 /**
  * Require owner access.
  */
-export const requireOwner = () => requireRole('owner');
+export const requireOwner = (options?: RequireAuthOptions) => requireRole('owner', options);
 
 /**
  * Require team membership at a minimum role level.
@@ -300,6 +420,9 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
     const resolution = await resolveAuthOutcome(c);
     const auth = resolution.auth;
     if (!auth) return authFailureResponse(c, resolution);
+    if (auth.scope === 'doc_collaborator') {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+    }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
 

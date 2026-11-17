@@ -1,3 +1,5 @@
+#include "../remote-desktop-common/webrtc_traffic_stats.h"
+#include "api/stats/rtc_stats_collector_callback.h"
 #include "pinned_libwebrtc_transport_backend.h"
 
 #include <algorithm>
@@ -102,34 +104,46 @@ std::optional<common::DataChannelKind> ChannelKindForLabel(
   return std::nullopt;
 }
 
-// Per-channel observer. Holds only the channel kind and a borrowed adapter; a
-// closed adapter drops the callback via its own stamp check.
+using AdapterSlot = std::shared_ptr<std::atomic<MacosTransportSessionAdapter*>>;
+
+// Per-channel observer. Holds only the channel kind and a weak atomic slot to
+// the adapter; Close() clears the slot before stopping the signaling thread.
 class ChannelObserver final : public webrtc::DataChannelObserver {
  public:
-  ChannelObserver(MacosTransportSessionAdapter* adapter,
+  ChannelObserver(AdapterSlot adapter_slot,
                   common::DataChannelKind kind,
                   webrtc::scoped_refptr<webrtc::DataChannelInterface> channel)
-      : adapter_(adapter), kind_(kind), channel_(std::move(channel)) {}
+      : adapter_slot_(std::move(adapter_slot)),
+        kind_(kind),
+        channel_(std::move(channel)) {}
 
   void OnStateChange() override {
-    if (adapter_ == nullptr || channel_ == nullptr)
+    auto* const adapter =
+        adapter_slot_ != nullptr
+            ? adapter_slot_->load(std::memory_order_acquire)
+            : nullptr;
+    if (adapter == nullptr || channel_ == nullptr)
       return;
-    adapter_->ReportDataChannelState(adapter_->stamp(), kind_,
-                                     TranslateChannelState(channel_->state()));
+    adapter->ReportDataChannelState(adapter->stamp(), kind_,
+                                    TranslateChannelState(channel_->state()));
   }
   void OnMessage(const webrtc::DataBuffer& buffer) override {
-    if (adapter_ == nullptr || buffer.binary || buffer.size() == 0 ||
+    auto* const adapter =
+        adapter_slot_ != nullptr
+            ? adapter_slot_->load(std::memory_order_acquire)
+            : nullptr;
+    if (adapter == nullptr || buffer.binary || buffer.size() == 0 ||
         buffer.size() > imcodes::rd::kMaxDataMessageBytes) {
       return;
     }
-    adapter_->ReportDataChannelMessage(
-        adapter_->stamp(), kind_,
+    adapter->ReportDataChannelMessage(
+        adapter->stamp(), kind_,
         std::string(reinterpret_cast<const char*>(buffer.data.data()),
                     buffer.data.size()));
   }
 
  private:
-  MacosTransportSessionAdapter* adapter_;
+  AdapterSlot adapter_slot_;
   common::DataChannelKind kind_;
   webrtc::scoped_refptr<webrtc::DataChannelInterface> channel_;
 };
@@ -165,9 +179,8 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface,
   // the session's encode size, a few times a second. The encoder ignores their
   // pixels; they only drive encoder setup and the Encode cadence, while the
   // real H.264 arrives through the binder.
-  explicit ImcodesVideoTrackSource(MacosMediaSenderBinder* binder)
-      : binder_(binder),
-        raw_(binder != nullptr ? binder->raw_video() : nullptr),
+  explicit ImcodesVideoTrackSource(std::shared_ptr<RawVideoPath> raw)
+      : raw_(std::move(raw)),
         pump_([this] { Pump(); }) {}
 
   ~ImcodesVideoTrackSource() override { StopPump(); }
@@ -273,7 +286,7 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface,
       // them would be encoded as a flash of black.
       if (raw_ != nullptr && raw_->raw_active()) continue;
       common::PixelSize size =
-          binder_ != nullptr ? binder_->configured_pixels() : common::PixelSize{};
+          raw_ != nullptr ? raw_->configured_pixels() : common::PixelSize{};
       // Before the session configures an encode size there is nothing real to
       // match; a small even-sized frame still lets the encoder come up.
       if (!size.IsValid()) size = common::PixelSize{640, 360};
@@ -297,7 +310,6 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface,
     }
   }
 
-  MacosMediaSenderBinder* binder_;
   const std::shared_ptr<RawVideoPath> raw_;
   std::atomic<bool> stop_{false};
   std::mutex sinks_mutex_;
@@ -323,16 +335,21 @@ class TrackSourceRawSink final : public RawFrameSink {
 
 class PassthroughH264Encoder final : public webrtc::VideoEncoder {
  public:
-  PassthroughH264Encoder(MacosMediaSenderBinder* binder,
-                         MacosTransportSessionAdapter* adapter)
-      : binder_(binder), adapter_(adapter) {}
+  PassthroughH264Encoder(std::shared_ptr<MediaBinderHandle> binder_handle,
+                         AdapterSlot adapter_slot)
+      : binder_handle_(std::move(binder_handle)),
+        adapter_slot_(std::move(adapter_slot)) {}
 
   ~PassthroughH264Encoder() override {
     // Token-scoped: libwebrtc may build the replacement encoder before
     // destroying this one, and detaching the successor here would silently end
-    // media for the session.
-    if (binder_ != nullptr)
-      binder_->Unbind(binding_);
+    // media for the session. Guard via MediaBinderHandle in case the session
+    // already destroyed MacosMediaSenderBinder ahead of adapter teardown.
+    if (binder_handle_ != nullptr && binding_ != kInvalidMediaSenderBinding) {
+      binder_handle_->WithBinder([this](MacosMediaSenderBinder* binder_) {
+        if (binder_ != nullptr) binder_->Unbind(binding_);
+      });
+    }
   }
 
   int32_t InitEncode(const webrtc::VideoCodec* codec_settings,
@@ -349,20 +366,26 @@ class PassthroughH264Encoder final : public webrtc::VideoEncoder {
 
   int32_t RegisterEncodeCompleteCallback(
       webrtc::EncodedImageCallback* callback) override {
-    if (binder_ == nullptr)
+    if (binder_handle_ == nullptr)
       return WEBRTC_VIDEO_CODEC_ERROR;
     if (callback == nullptr) {
       // Upstream is detaching THIS encoder. Unbind so a later Submit cannot
       // reach a dead callback -- but only if this encoder still owns the
       // binding.
-      binder_->Unbind(binding_);
+      binder_handle_->WithBinder([this](MacosMediaSenderBinder* binder_) {
+        if (binder_ != nullptr) binder_->Unbind(binding_);
+      });
       binding_ = kInvalidMediaSenderBinding;
       return WEBRTC_VIDEO_CODEC_OK;
     }
     auto sender = CreatePinnedLibwebrtcH264Sender(callback);
     if (sender == nullptr)
       return WEBRTC_VIDEO_CODEC_ERROR;
-    const MediaSenderBindingId binding = binder_->Bind(std::move(sender));
+    const MediaSenderBindingId binding = binder_handle_->WithBinder(
+        [&](MacosMediaSenderBinder* binder_) -> MediaSenderBindingId {
+          if (binder_ == nullptr) return kInvalidMediaSenderBinding;
+          return binder_->Bind(std::move(sender));
+        });
     if (binding == kInvalidMediaSenderBinding)
       return WEBRTC_VIDEO_CODEC_ERROR;
     binding_ = binding;
@@ -370,8 +393,11 @@ class PassthroughH264Encoder final : public webrtc::VideoEncoder {
   }
 
   int32_t Release() override {
-    if (binder_ != nullptr)
-      binder_->Unbind(binding_);
+    if (binder_handle_ != nullptr && binding_ != kInvalidMediaSenderBinding) {
+      binder_handle_->WithBinder([this](MacosMediaSenderBinder* binder_) {
+        if (binder_ != nullptr) binder_->Unbind(binding_);
+      });
+    }
     binding_ = kInvalidMediaSenderBinding;
     return WEBRTC_VIDEO_CODEC_OK;
   }
@@ -388,14 +414,18 @@ class PassthroughH264Encoder final : public webrtc::VideoEncoder {
   }
 
   void SetRates(const RateControlParameters& parameters) override {
-    if (adapter_ == nullptr || source_width_ <= 0 || source_height_ <= 0)
+    auto* const adapter =
+        adapter_slot_ != nullptr
+            ? adapter_slot_->load(std::memory_order_acquire)
+            : nullptr;
+    if (adapter == nullptr || source_width_ <= 0 || source_height_ <= 0)
       return;
     const std::uint32_t target_bps = parameters.bitrate.get_sum_bps();
     if (target_bps == 0 || target_bps == last_target_bps_)
       return;
     last_target_bps_ = target_bps;
-    adapter_->ReportQualityTarget(
-        adapter_->stamp(),
+    adapter->ReportQualityTarget(
+        adapter->stamp(),
         common::QualityTarget{
             target_bps,
             common::PixelSize{static_cast<std::uint32_t>(source_width_),
@@ -411,10 +441,10 @@ class PassthroughH264Encoder final : public webrtc::VideoEncoder {
   }
 
  private:
-  MacosMediaSenderBinder* binder_;
+  std::shared_ptr<MediaBinderHandle> binder_handle_;
   // This encoder's own binding, so its teardown can never detach another's.
   MediaSenderBindingId binding_ = kInvalidMediaSenderBinding;
-  MacosTransportSessionAdapter* adapter_;
+  AdapterSlot adapter_slot_;
   int source_width_ = 0;
   int source_height_ = 0;
   std::uint32_t last_target_bps_ = 0;
@@ -455,11 +485,11 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
  public:
   RawCodecEncoder(std::unique_ptr<webrtc::VideoEncoder> inner,
                   std::shared_ptr<RawVideoPath> raw,
-                  MacosTransportSessionAdapter* adapter,
+                  AdapterSlot adapter_slot,
                   NegotiatedVideoCodec codec)
       : inner_(std::move(inner)),
         raw_(std::move(raw)),
-        adapter_(adapter),
+        adapter_slot_(std::move(adapter_slot)),
         codec_(codec) {}
 
   void SetFecControllerOverride(
@@ -512,14 +542,18 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
 
   void SetRates(const RateControlParameters& parameters) override {
     inner_->SetRates(parameters);
-    if (adapter_ == nullptr || source_width_ <= 0 || source_height_ <= 0)
+    auto* const adapter =
+        adapter_slot_ != nullptr
+            ? adapter_slot_->load(std::memory_order_acquire)
+            : nullptr;
+    if (adapter == nullptr || source_width_ <= 0 || source_height_ <= 0)
       return;
     const std::uint32_t target_bps = parameters.bitrate.get_sum_bps();
     if (target_bps == 0 || target_bps == last_target_bps_)
       return;
     last_target_bps_ = target_bps;
-    adapter_->ReportQualityTarget(
-        adapter_->stamp(),
+    adapter->ReportQualityTarget(
+        adapter->stamp(),
         common::QualityTarget{
             target_bps,
             common::PixelSize{static_cast<std::uint32_t>(source_width_),
@@ -558,7 +592,7 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
 
   std::unique_ptr<webrtc::VideoEncoder> inner_;
   std::shared_ptr<RawVideoPath> raw_;
-  MacosTransportSessionAdapter* adapter_;
+  AdapterSlot adapter_slot_;
   const NegotiatedVideoCodec codec_;
   CountingCallback counting_callback_;
   int source_width_ = 0;
@@ -568,12 +602,16 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
 
 class PassthroughH264EncoderFactory final : public webrtc::VideoEncoderFactory {
  public:
-  PassthroughH264EncoderFactory(MacosMediaSenderBinder* binder,
-                                MacosTransportSessionAdapter* adapter)
-      : binder_(binder), adapter_(adapter) {}
+  PassthroughH264EncoderFactory(
+      std::shared_ptr<MediaBinderHandle> binder_handle,
+      std::shared_ptr<RawVideoPath> raw,
+      AdapterSlot adapter_slot)
+      : binder_handle_(std::move(binder_handle)),
+        raw_(std::move(raw)),
+        adapter_slot_(std::move(adapter_slot)) {}
 
   bool raw_codecs_allowed() const {
-    return binder_ != nullptr && binder_->raw_video()->raw_codecs_allowed();
+    return raw_ != nullptr && raw_->raw_codecs_allowed();
   }
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
@@ -605,15 +643,17 @@ class PassthroughH264EncoderFactory final : public webrtc::VideoEncoderFactory {
       }
       if (inner != nullptr) {
         return std::make_unique<RawCodecEncoder>(
-            std::move(inner), binder_->raw_video(), adapter_, codec);
+            std::move(inner), raw_, adapter_slot_, codec);
       }
     }
-    return std::make_unique<PassthroughH264Encoder>(binder_, adapter_);
+    return std::make_unique<PassthroughH264Encoder>(binder_handle_,
+                                                    adapter_slot_);
   }
 
  private:
-  MacosMediaSenderBinder* binder_;
-  MacosTransportSessionAdapter* adapter_;
+  std::shared_ptr<MediaBinderHandle> binder_handle_;
+  std::shared_ptr<RawVideoPath> raw_;
+  AdapterSlot adapter_slot_;
 };
 
 // One negotiation attempt, shared by the three upstream observers.
@@ -809,31 +849,72 @@ void ApplyRawCodecAnswerOrder(webrtc::PeerConnectionInterface& peer,
 // hold the single-threaded worker dispatch indefinitely.
 inline constexpr int kNegotiationTimeoutMs = 10'000;
 
+// A late stats callback owns only its isolated sample state, never the backend.
+struct TrafficState {
+  std::mutex mutex;
+  bool in_flight = false;
+  std::vector<imcodes::rd::TrafficSample> samples;
+};
+class TrafficObserver : public webrtc::RTCStatsCollectorCallback {
+ public:
+  explicit TrafficObserver(std::shared_ptr<TrafficState> state) : state_(std::move(state)) {}
+  void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    std::lock_guard lock(state_->mutex);
+    if (report) state_->samples = imcodes::rd::ReadTrafficStats(*report);
+    state_->in_flight = false;
+  }
+ private:
+  const std::shared_ptr<TrafficState> state_;
+};
+
 class PinnedLibwebrtcTransportBackend final
     : public MacosPeerConnectionBackend,
       public webrtc::PeerConnectionObserver {
  public:
   PinnedLibwebrtcTransportBackend() = default;
+  std::vector<imcodes::rd::TrafficSample> SampleTraffic() override {
+    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+    std::shared_ptr<TrafficState> state;
+    { std::lock_guard lock(mutex_); peer = peer_; state = traffic_; }
+    if (!peer || state == nullptr) return {};
+    std::vector<imcodes::rd::TrafficSample> samples;
+    bool collect = false;
+    {
+      std::lock_guard lock(state->mutex);
+      samples = state->samples;
+      if (!state->in_flight) { state->in_flight = true; collect = true; }
+    }
+    if (collect) peer->GetStats(webrtc::make_ref_counted<TrafficObserver>(state).get());
+    return samples;
+  }
+
 
   ~PinnedLibwebrtcTransportBackend() override { Close(); }
 
   void BindAdapter(MacosTransportSessionAdapter* adapter) noexcept override {
     std::lock_guard lock(mutex_);
+    if (closed_) return;
     adapter_ = adapter;
+    adapter_slot_->store(adapter, std::memory_order_release);
   }
 
   void BindMediaSender(MacosMediaSenderBinder* binder) noexcept override {
     std::lock_guard lock(mutex_);
+    if (closed_) return;
     media_binder_ = binder;
+    media_binder_handle_ = binder != nullptr ? binder->handle() : nullptr;
+    raw_video_ = binder != nullptr ? binder->raw_video() : nullptr;
   }
 
   bool Open(const MacosTransportBackendConfiguration& configuration) override {
     std::lock_guard lock(mutex_);
-    if (adapter_ == nullptr || peer_ != nullptr)
+    if (closed_ || adapter_ == nullptr || peer_ != nullptr)
       return false;
 
+    traffic_ = std::make_shared<TrafficState>();
     signaling_thread_ = webrtc::Thread::Create();
     if (signaling_thread_ == nullptr || !signaling_thread_->Start()) {
+      signaling_thread_.reset();
       return false;
     }
     // A media sender must exist before the factory is built: the factory owns
@@ -841,6 +922,12 @@ class PinnedLibwebrtcTransportBackend final
     // binder needs. Without it there is no media path at all, which is a
     // failure rather than a view-only degrade.
     if (media_binder_ == nullptr) {
+      signaling_thread_->Stop();
+      signaling_thread_.reset();
+      return false;
+    }
+    if (raw_video_ == nullptr || media_binder_handle_ == nullptr) {
+      signaling_thread_->Stop();
       signaling_thread_.reset();
       return false;
     }
@@ -850,8 +937,8 @@ class PinnedLibwebrtcTransportBackend final
     // Exactly one encoder factory, advertising exactly one H.264 format. This
     // is the single upstream media path; there is no second packetizer.
     factory_dependencies.video_encoder_factory =
-        std::make_unique<PassthroughH264EncoderFactory>(media_binder_,
-                                                        adapter_);
+        std::make_unique<PassthroughH264EncoderFactory>(
+            media_binder_handle_, raw_video_, adapter_slot_);
     // WITH a media engine. Without EnableMedia the factory is signaling and
     // data only, and libwebrtc refuses any offer carrying a video section:
     // "Not configured for media (UNSUPPORTED_OPERATION)". Every macOS session
@@ -868,6 +955,7 @@ class PinnedLibwebrtcTransportBackend final
     factory_ = webrtc::CreateModularPeerConnectionFactory(
         std::move(factory_dependencies));
     if (factory_ == nullptr) {
+      signaling_thread_->Stop();
       signaling_thread_.reset();
       return false;
     }
@@ -887,6 +975,7 @@ class PinnedLibwebrtcTransportBackend final
         rtc_configuration, std::move(peer_dependencies));
     if (!created.ok()) {
       factory_ = nullptr;
+      signaling_thread_->Stop();
       signaling_thread_.reset();
       return false;
     }
@@ -895,10 +984,21 @@ class PinnedLibwebrtcTransportBackend final
     // The track is what makes upstream instantiate an encoder and therefore
     // produce the EncodedImageCallback. Without AddTrack the passthrough
     // encoder is never created and the binder never binds.
-    auto source = webrtc::make_ref_counted<ImcodesVideoTrackSource>(media_binder_);
+    auto source = webrtc::make_ref_counted<ImcodesVideoTrackSource>(raw_video_);
     video_source_ = source;
-    media_binder_->raw_video()->SetSink(
-        std::make_shared<TrackSourceRawSink>(source));
+    bool sink_bound = false;
+    if (media_binder_handle_ != nullptr) {
+      media_binder_handle_->WithBinder([&](MacosMediaSenderBinder* live_binder) {
+        if (live_binder == nullptr || media_binder_ == nullptr) return;
+        media_binder_->raw_video()->SetSink(
+            std::make_shared<TrackSourceRawSink>(source));
+        sink_bound = true;
+      });
+    }
+    if (!sink_bound) {
+      CloseLocked();
+      return false;
+    }
     video_track_ = factory_->CreateVideoTrack(source, "imcodes-screen");
     if (video_track_ == nullptr) {
       CloseLocked();
@@ -1020,7 +1120,7 @@ class PinnedLibwebrtcTransportBackend final
     auto state = std::make_shared<NegotiationState>();
     {
       std::lock_guard lock(mutex_);
-      if (peer_ == nullptr)
+      if (closed_ || peer_ == nullptr)
         return false;
       // One at a time. A second offer while one is outstanding would race two
       // SetLocalDescription chains onto the same peer.
@@ -1028,8 +1128,8 @@ class PinnedLibwebrtcTransportBackend final
         return false;
       state->peer = peer_;
       negotiation_ = state;
-      if (media_binder_ != nullptr) {
-        const std::shared_ptr<RawVideoPath> raw = media_binder_->raw_video();
+      if (raw_video() != nullptr) {
+        const std::shared_ptr<RawVideoPath> raw = raw_video();
         // Both hooks exist for every route; only a Mac that may send a raw codec
         // changes the answer order. The negotiated codec is recorded for every
         // route, so the session knows H.264 from "not negotiated yet".
@@ -1084,7 +1184,15 @@ class PinnedLibwebrtcTransportBackend final
     ClosedResources closed;
     {
       std::lock_guard lock(mutex_);
-      pending = negotiation_;
+      if (closed_)
+        return;
+      closed_ = true;
+      adapter_ = nullptr;
+      adapter_slot_->store(nullptr, std::memory_order_release);
+      media_binder_ = nullptr;
+      media_binder_handle_.reset();
+      pending = std::move(negotiation_);
+      negotiation_ = nullptr;
       closed = TakeResourcesLocked();
     }
     closed.Release();
@@ -1118,21 +1226,23 @@ class PinnedLibwebrtcTransportBackend final
     common::DataChannelState initial = common::DataChannelState::kFailed;
     {
       std::lock_guard lock(mutex_);
-      if (peer_ == nullptr || std::any_of(channels_.begin(), channels_.end(),
-                                          [kind](const ChannelEntry& entry) {
-                                            return entry.kind == *kind;
-                                          })) {
+      if (closed_ || peer_ == nullptr ||
+          std::any_of(channels_.begin(), channels_.end(),
+                      [kind](const ChannelEntry& entry) {
+                        return entry.kind == *kind;
+                      })) {
         channel->Close();
         return;
       }
       auto observer =
-          std::make_unique<ChannelObserver>(adapter_, *kind, channel);
+          std::make_unique<ChannelObserver>(adapter_slot_, *kind, channel);
       channel->RegisterObserver(observer.get());
       initial = TranslateChannelState(channel->state());
       channels_.push_back({*kind, channel, std::move(observer)});
     }
-    if (adapter_ != nullptr) {
-      adapter_->ReportDataChannelState(adapter_->stamp(), *kind, initial);
+    auto* const adapter = adapter_slot_->load(std::memory_order_acquire);
+    if (adapter != nullptr) {
+      adapter->ReportDataChannelState(adapter->stamp(), *kind, initial);
     }
   }
   void OnRenegotiationNeeded() override {}
@@ -1141,17 +1251,19 @@ class PinnedLibwebrtcTransportBackend final
 
   void OnConnectionChange(
       webrtc::PeerConnectionInterface::PeerConnectionState state) override {
-    if (adapter_ == nullptr)
+    auto* const adapter = adapter_slot_->load(std::memory_order_acquire);
+    if (adapter == nullptr)
       return;
-    adapter_->ReportPeerConnectionState(adapter_->stamp(),
-                                        TranslatePeerState(state));
+    adapter->ReportPeerConnectionState(adapter->stamp(),
+                                       TranslatePeerState(state));
   }
 
   void OnIceConnectionChange(
       webrtc::PeerConnectionInterface::IceConnectionState /*state*/) override {}
 
   void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override {
-    if (adapter_ == nullptr || candidate == nullptr)
+    auto* const adapter = adapter_slot_->load(std::memory_order_acquire);
+    if (adapter == nullptr || candidate == nullptr)
       return;
     std::string serialized;
     if (!candidate->ToString(&serialized))
@@ -1159,18 +1271,19 @@ class PinnedLibwebrtcTransportBackend final
     common::IceCandidate emitted;
     emitted.media_id = candidate->sdp_mid();
     emitted.candidate = std::move(serialized);
-    adapter_->ReportLocalIceCandidate(adapter_->stamp(), std::move(emitted));
+    adapter->ReportLocalIceCandidate(adapter->stamp(), std::move(emitted));
   }
 
   void OnIceSelectedCandidatePairChanged(
       const webrtc::CandidatePairChangeEvent& event) override {
-    if (adapter_ == nullptr)
+    auto* const adapter = adapter_slot_->load(std::memory_order_acquire);
+    if (adapter == nullptr)
       return;
     const auto& local = event.selected_candidate_pair.local_candidate();
     const bool relayed = local.type() == webrtc::IceCandidateType::kRelay;
-    adapter_->ReportTransportPath(adapter_->stamp(),
-                                  relayed ? common::TransportPath::kRelay
-                                          : common::TransportPath::kDirect);
+    adapter->ReportTransportPath(adapter->stamp(),
+                                 relayed ? common::TransportPath::kRelay
+                                         : common::TransportPath::kDirect);
   }
 
  private:
@@ -1215,10 +1328,16 @@ class PinnedLibwebrtcTransportBackend final
     }
   };
 
+  [[nodiscard]] const std::shared_ptr<RawVideoPath>& raw_video()
+      const noexcept {
+    return raw_video_;
+  }
+
   ClosedResources TakeResourcesLocked() noexcept {
     ClosedResources closed;
     // The raw sink holds the track source: drop it before the source goes.
-    if (media_binder_ != nullptr) media_binder_->raw_video()->SetSink(nullptr);
+    if (raw_video() != nullptr) raw_video()->SetSink(nullptr);
+    raw_video_.reset();
     closed.channels = std::move(channels_);
     channels_.clear();
     closed.video_track = std::move(video_track_);
@@ -1238,6 +1357,11 @@ class PinnedLibwebrtcTransportBackend final
   }
 
   void CloseLocked() noexcept {
+    closed_ = true;
+    adapter_ = nullptr;
+    adapter_slot_->store(nullptr, std::memory_order_release);
+    media_binder_ = nullptr;
+    media_binder_handle_.reset();
     for (auto& entry : channels_) {
       if (entry.handle == nullptr)
         continue;
@@ -1246,7 +1370,8 @@ class PinnedLibwebrtcTransportBackend final
       entry.handle = nullptr;
     }
     channels_.clear();
-    if (media_binder_ != nullptr) media_binder_->raw_video()->SetSink(nullptr);
+    if (raw_video() != nullptr) raw_video()->SetSink(nullptr);
+    raw_video_.reset();
     if (video_source_ != nullptr)
       video_source_->StopPump();
     video_source_ = nullptr;
@@ -1269,14 +1394,20 @@ class PinnedLibwebrtcTransportBackend final
       negotiation_ = nullptr;
   }
 
+  bool closed_ = false;
   MacosTransportSessionAdapter* adapter_ = nullptr;
+  const AdapterSlot adapter_slot_ =
+      std::make_shared<std::atomic<MacosTransportSessionAdapter*>>(nullptr);
   MacosMediaSenderBinder* media_binder_ = nullptr;
+  std::shared_ptr<MediaBinderHandle> media_binder_handle_;
+  std::shared_ptr<RawVideoPath> raw_video_;
   std::shared_ptr<NegotiationState> negotiation_;
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_;
   webrtc::scoped_refptr<ImcodesVideoTrackSource> video_source_;
   std::mutex mutex_;
   std::unique_ptr<webrtc::Thread> signaling_thread_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
+  std::shared_ptr<TrafficState> traffic_ = std::make_shared<TrafficState>();
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;
   std::vector<ChannelEntry> channels_;
 };

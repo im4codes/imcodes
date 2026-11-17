@@ -2,11 +2,12 @@
  * Register all built-in pinned panel types.
  * Import this file once at app startup to populate the registry.
  */
-import { registerPanelType, getPanelType } from './PinnedPanelRegistry.js';
+import { registerPanelType, getPanelType, hasPinnedPanelServerProvenance } from './PinnedPanelRegistry.js';
 import { ChatView } from './ChatView.js';
 import { TerminalView } from './TerminalView.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { RepoPage } from '../pages/RepoPage.js';
+import { buildRepoCallbackTargetOptions } from '../repo-callback-prefs.js';
 import { CronManager } from '../pages/CronManager.js';
 import { LocalWebPreviewPanel } from './LocalWebPreviewPanel.js';
 import { useTimeline } from '../hooks/useTimeline.js';
@@ -25,10 +26,45 @@ import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
+import { focusComposerElement } from '../util/composer-focus.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
 export const SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE = 'sharedcontext-diagnostics';
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function canUseCapturedPanelProps(panel: PinnedPanel, ctx: PanelRenderContext): boolean {
+  if (ctx.sessionsLoading) return false;
+  return hasPinnedPanelServerProvenance(panel, ctx.serverId);
+}
+
+function resolveFollowCurrentProjectScope(panel: PinnedPanel, ctx: PanelRenderContext): {
+  loading: boolean;
+  isTabShare: boolean;
+  projectDir: string | undefined;
+  activeSession: string | undefined;
+} {
+  const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
+  if (!isTabShare && ctx.sessionsLoading) {
+    return { loading: true, isTabShare, projectDir: undefined, activeSession: undefined };
+  }
+  const allowCaptured = canUseCapturedPanelProps(panel, ctx);
+  const liveActiveSession = nonEmptyString(ctx.activeSession);
+  const liveSessionInfo = liveActiveSession
+    ? ctx.sessions?.find((s) => s.name === liveActiveSession)
+    : undefined;
+  const projectDir = isTabShare
+    ? FS_SESSION_ROOT_PATH
+    : nonEmptyString(ctx.activeProjectDir)
+      ?? nonEmptyString(liveSessionInfo?.projectDir)
+      ?? (allowCaptured ? nonEmptyString(panel.props?.projectDir) : undefined);
+  const activeSession = liveActiveSession
+    ?? (allowCaptured ? nonEmptyString(panel.props?.sessionName) : undefined);
+  return { loading: false, isTabShare, projectDir, activeSession };
+}
 
 // ── Sub-session panel ────────────────────────────────────────────────────
 
@@ -40,6 +76,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const sessionName = panel.props?.sessionName as string;
   const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
   const { t } = useTranslation();
+  const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
   const { events, refreshing, historyStatus, forceRefresh } = useTimeline(sessionName, ctx.ws, ctx.serverId, {
     isActiveSession: ctx.activeSession === sessionName,
     // Pinned panel is always visible to the user while mounted; participate
@@ -47,8 +84,8 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
     isVisible: true,
     subscriptionMode: 'full',
     bootstrapWhenVisible: true,
+    incognito: liveSub?.incognito,
   });
-  const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
   // A pinned shell/script panel exists precisely to observe live output, but it
   // issues no terminal subscription of its own. Hold the raw PTY stream for the
@@ -108,6 +145,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           serverId={ctx.serverId}
           onPreviewFile={ctx.onPreviewFile}
           onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
+          onCloudDocClick={ctx.onCloudDocClick}
           onQuote={ctx.onQuote}
           agentType={liveSub.type}
           messagePinsEnabled={false}
@@ -132,9 +170,6 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
           now={thinkingNow}
-          onRefreshHistory={forceRefresh}
-          historyRefreshing={refreshing}
-          historyStatus={historyStatus}
         />
       )}
       {(compactQuotaText || liveSub.planLabel) && (
@@ -159,7 +194,12 @@ registerPanelType('subsession', {
     const agentType = liveSub?.type;
     return agentType ? `${label} · ${agentType}` : label;
   },
-  render: (panel, ctx) => <SubSessionContent panel={panel} ctx={ctx} />,
+  render: (panel, ctx) => {
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    }
+    return <SubSessionContent panel={panel} ctx={ctx} />;
+  },
 });
 
 // ── File browser panel ───────────────────────────────────────────────────
@@ -167,13 +207,11 @@ registerPanelType('subsession', {
 registerPanelType('filebrowser', {
   title: () => '📁 Files',
   render: (panel, ctx) => {
-    // Follow active tab's project dir; fall back to captured dir at pin time
-    const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
-    const projectDir = isTabShare
-      ? FS_SESSION_ROOT_PATH
-      : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
+    // Follow active tab's project dir; fall back to captured dir only when hydration has settled for the same server.
+    const scope = resolveFollowCurrentProjectScope(panel, ctx);
+    if (scope.loading) return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    const { isTabShare, projectDir, activeSession } = scope;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
-    const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
         key={`${ctx.serverId}:${projectDir}`}
@@ -182,6 +220,7 @@ registerPanelType('filebrowser', {
         sessionName={activeSession}
         scopeToSessionRoot={isTabShare}
         readOnly={ctx.sharedAccessRole === 'viewer'}
+        canShare={ctx.canManageFileShares ?? !ctx.shareTargetKind}
         mode="file-multi"
         layout="panel"
         initialPath={projectDir}
@@ -189,6 +228,7 @@ registerPanelType('filebrowser', {
         hideFooter={false}
         onPreviewStateChange={ctx.onPreviewStateChange}
         onPreviewFile={ctx.onPreviewFile ? (request) => ctx.onPreviewFile?.({ ...request, rootPath: projectDir }) : undefined}
+        onOpenNodeGroups={ctx.onOpenNodeGroups}
         onConfirm={(paths) => {
           const inputEl = activeSession && ctx.inputRefsMap?.current
             ? ctx.inputRefsMap.current.get(activeSession)
@@ -199,7 +239,7 @@ registerPanelType('filebrowser', {
               : paths.map((p) => '@' + p + ' ');
             inputEl.textContent = (inputEl.textContent || '') + rel.join('');
             inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-            inputEl.focus();
+            focusComposerElement(inputEl, { moveCursorToEnd: true });
           }
         }}
       />
@@ -223,17 +263,18 @@ registerPanelType('repopage', {
   title: () => 'Repository',
   render: (panel, ctx) => {
     // Follow active tab's project dir — keep mounted during WS reconnect to preserve state
-    const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
-    const projectDir = isTabShare
-      ? FS_SESSION_ROOT_PATH
-      : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
+    const scope = resolveFollowCurrentProjectScope(panel, ctx);
+    if (scope.loading) return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    const { isTabShare, projectDir, activeSession } = scope;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
-        sessionId={ctx.activeSession ?? panel.props?.sessionName as string | undefined}
+        sessionId={activeSession}
         projectDir={projectDir}
+        serverId={ctx.serverId}
+        callbackTargets={buildRepoCallbackTargetOptions(projectDir, ctx.sessions, ctx.subSessions)}
         scopeToSessionRoot={isTabShare}
         readOnly={ctx.sharedAccessRole === 'viewer'}
         onBack={() => {}}
@@ -248,14 +289,16 @@ registerPanelType('repopage', {
 registerPanelType('cronmanager', {
   title: () => 'Scheduled Tasks',
   render: (panel, ctx) => {
-    // Derive project from active session or subsession, fall back to pinned prop
+    if (ctx.sessionsLoading) return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    // Derive project from active session or subsession, fall back to pinned prop only when server provenance matches.
+    const allowCaptured = canUseCapturedPanelProps(panel, ctx);
     const activeSub = ctx.subSessions?.find((s) => s.sessionName === ctx.activeSession);
     const activeMain = ctx.sessions?.find((s) => s.name === ctx.activeSession);
     const parentMain = activeSub ? ctx.sessions?.find((s) => s.name === activeSub.parentSession) : null;
-    const projectName = (activeMain?.project
-      ?? parentMain?.project
-      ?? ctx.sessions?.[0]?.project
-      ?? panel.props?.projectName as string | undefined);
+    const projectName = nonEmptyString(activeMain?.project)
+      ?? nonEmptyString(parentMain?.project)
+      ?? nonEmptyString(ctx.sessions?.[0]?.project)
+      ?? (allowCaptured ? nonEmptyString(panel.props?.projectName) : undefined);
     if (!projectName) return <div class="sidebar-pinned-unavailable">No project</div>;
     const subSessionsSlim = ctx.subSessions.map(s => ({
       sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession,
@@ -299,8 +342,10 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
     return `🌐 ${label}${suffix}`;
   },
   render: (panel, ctx) => {
-    const serverId = (panel.props?.serverId as string | undefined) ?? ctx.serverId;
-    if (!serverId) return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    }
+    const serverId = ctx.serverId;
     return (
       <LocalWebPreviewPanel
         serverId={serverId}
@@ -321,38 +366,48 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
 
 registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
   title: (_panel, ctx) => ctx?.t('sharedContext.management.title') ?? 'Shared Context',
-  render: (panel, ctx) => (
-    <SharedContextManagementPanel
-      enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
-      serverId={ctx.serverId}
-      ws={ctx.ws}
-      onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
-      activeProjectDir={ctx.activeProjectDir ?? null}
-      memoryProjectCandidates={(ctx.sessions ?? [])
-        .filter((session) => Boolean(session.projectDir))
-        .map((session) => ({
-          projectDir: session.projectDir,
-          canonicalRepoId: session.contextNamespace?.projectId,
-          displayName: session.label || session.project || session.name,
-          sessionName: session.name,
-          source: session.name === ctx.activeSession ? 'active_session' as const : 'recent_session' as const,
-        }))}
-    />
-  ),
+  render: (panel, ctx) => {
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    }
+    return (
+      <SharedContextManagementPanel
+        enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
+        serverId={ctx.serverId}
+        ws={ctx.ws}
+        onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
+        activeProjectDir={ctx.activeProjectDir ?? null}
+        memoryProjectCandidates={(ctx.sessions ?? [])
+          .filter((session) => Boolean(session.projectDir))
+          .map((session) => ({
+            projectDir: session.projectDir,
+            canonicalRepoId: session.contextNamespace?.projectId,
+            displayName: session.label || session.project || session.name,
+            sessionName: session.name,
+            source: session.name === ctx.activeSession ? 'active_session' as const : 'recent_session' as const,
+          }))}
+      />
+    );
+  },
 });
 
 registerPanelType(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, {
   title: (_panel, ctx) => ctx?.t('sharedContext.diagnostics.title') ?? 'Context Diagnostics',
-  render: (panel, ctx) => (
-    <ContextDiagnosticsPanel
-      enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
-      canonicalRepoId={typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined}
-      workspaceId={typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined}
-      enrollmentId={typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined}
-      language={typeof panel.props?.language === 'string' ? panel.props.language : undefined}
-      filePath={typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined}
-      persistedSnapshot={panel.props?.persistedSnapshot as Parameters<typeof ContextDiagnosticsPanel>[0]['persistedSnapshot']}
-      onStateChange={(next) => ctx.updatePanelProps?.(panel.id, { ...panel.props, ...next })}
-    />
-  ),
+  render: (panel, ctx) => {
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    }
+    return (
+      <ContextDiagnosticsPanel
+        enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
+        canonicalRepoId={typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined}
+        workspaceId={typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined}
+        enrollmentId={typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined}
+        language={typeof panel.props?.language === 'string' ? panel.props.language : undefined}
+        filePath={typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined}
+        persistedSnapshot={panel.props?.persistedSnapshot as Parameters<typeof ContextDiagnosticsPanel>[0]['persistedSnapshot']}
+        onStateChange={(next) => ctx.updatePanelProps?.(panel.id, { ...panel.props, ...next })}
+      />
+    );
+  },
 });

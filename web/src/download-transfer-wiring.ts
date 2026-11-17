@@ -1,4 +1,6 @@
+import { R2_RELAY_PHASE } from '@shared/r2-relay.js';
 import {
+  reportR2Preparation,
   DOWNLOAD_TRANSFER_ROUTE,
   DOWNLOAD_TRANSFER_STATUS,
   completeDownloadTransfer,
@@ -32,11 +34,19 @@ export function createDownloadTransferWiring(transferId: string) {
       state.savePending = true;
       setDownloadTransferSave(transferId, save);
     },
-    onProgress({ loadedBytes, totalBytes }: FileDownloadProgress): void {
+    onProgress(progress: FileDownloadProgress): void {
+      const { loadedBytes, totalBytes } = progress;
+      if (progress.phase === R2_RELAY_PHASE.PREPARING && totalBytes !== null) {
+        reportR2Preparation(transferId, { phase: R2_RELAY_PHASE.PREPARING, loadedBytes, totalBytes,
+          speedBps: progress.speedBps ?? 0, etaSeconds: progress.etaSeconds ?? null });
+        return;
+      }
       reportDownloadTransferProgress(transferId, loadedBytes, totalBytes);
     },
     onMode(mode: FileDownloadTransportMode): void {
-      if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING) {
+      if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.R2) {
+        updateDownloadTransfer(transferId, DOWNLOAD_TRANSFER_ROUTE.R2, DOWNLOAD_TRANSFER_STATUS.PREPARING);
+      } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING) {
         updateDownloadTransfer(transferId, DOWNLOAD_TRANSFER_ROUTE.PENDING, DOWNLOAD_TRANSFER_STATUS.CONNECTING);
       } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT) {
         updateDownloadTransfer(transferId, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);

@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { DEFAULT_SERVER_URL, isNative, isValidServerUrl, setServerUrl, getServerList, addServerToList, removeServerFromList } from '../native.js';
+import { readFromClipboard } from '../util/clipboard.js';
 
 interface Props {
   onConnect: (serverUrl: string) => void | Promise<void>;
@@ -14,12 +15,32 @@ export function ServerSetupPage({ onConnect }: Props) {
   const [adding, setAdding] = useState(false);
   const [inputUrl, setInputUrl] = useState('');
   const [httpWarning, setHttpWarning] = useState(false);
+  const [pasteHint, setPasteHint] = useState<string | null>(null);
+  const addPanelRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     getServerList().then((list) => {
       setServers(list);
     });
   }, []);
+
+  const keepAddPanelVisible = () => {
+    addPanelRef.current?.scrollIntoView?.({ block: 'nearest' });
+  };
+
+  useEffect(() => {
+    if (!adding) return;
+    inputRef.current?.focus();
+    keepAddPanelVisible();
+    const timer = setTimeout(keepAddPanelVisible, 180);
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', keepAddPanelVisible);
+    return () => {
+      clearTimeout(timer);
+      vv?.removeEventListener('resize', keepAddPanelVisible);
+    };
+  }, [adding]);
 
   const handleConnect = async (url: string) => {
     setConnecting(url);
@@ -58,6 +79,7 @@ export function ServerSetupPage({ onConnect }: Props) {
       setHttpWarning(false);
     }
     setError(null);
+    setPasteHint(null);
     if (!servers.includes(trimmed)) {
       setServers((prev) => [...prev, trimmed]);
     }
@@ -72,99 +94,134 @@ export function ServerSetupPage({ onConnect }: Props) {
     setServers((prev) => prev.filter((u) => u !== url));
   };
 
+  const handlePaste = async () => {
+    const result = await readFromClipboard();
+    if (result.ok) {
+      setInputUrl(result.text);
+      setError(null);
+      setPasteHint(null);
+      inputRef.current?.focus();
+      requestAnimationFrame(keepAddPanelVisible);
+      return;
+    }
+    setPasteHint(t(result.reason === 'empty' ? 'serverSetup.pasteEmpty' : 'serverSetup.pasteUnavailable'));
+  };
+
+  const cancelAdd = () => {
+    setAdding(false);
+    setInputUrl('');
+    setError(null);
+    setPasteHint(null);
+  };
+
   return (
     <div class="login-page">
-      <div class="login-card" style={{ maxWidth: 380 }}>
-        <h1>IM.codes</h1>
-        <p style={{ color: '#94a3b8', marginBottom: 24, textAlign: 'center' }}>
-          {t('serverSetup.title')}
-        </p>
+      <div class="login-card server-setup-card">
+        <div class="server-setup-header">
+          <h1>IM.codes</h1>
+          <p class="server-setup-subtitle">
+            {t('serverSetup.title')}
+          </p>
+        </div>
 
         {error && (
-          <div style={{ color: '#f87171', marginBottom: 12, textAlign: 'center', fontSize: 14 }}>
+          <div class="server-setup-banner is-error">
             {error}
           </div>
         )}
 
         {httpWarning && (
-          <div style={{ color: '#fbbf24', marginBottom: 12, textAlign: 'center', fontSize: 13 }}>
+          <div class="server-setup-banner is-warning">
             {t('serverSetup.httpWarning')}
           </div>
         )}
 
-        <div style={{ width: '100%', marginBottom: 12 }}>
-          {servers.map((url) => (
-            <div
-              key={url}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '10px 12px',
-                marginBottom: 8,
-                background: '#1e293b',
-                borderRadius: 8,
-                border: '1px solid #334155',
-                cursor: connecting ? 'default' : 'pointer',
-                opacity: connecting && connecting !== url ? 0.5 : 1,
-              }}
-              onClick={() => !connecting && handleConnect(url)}
-            >
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13, color: '#e2e8f0', wordBreak: 'break-all' }}>{url}</div>
-                {connecting === url && (
-                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
-                    {t('serverSetup.verifying')}
-                  </div>
+        <div class="server-setup-list">
+          {servers.map((url) => {
+            const isVerifying = connecting === url;
+            const isDimmed = Boolean(connecting && !isVerifying);
+            return (
+              <div
+                key={url}
+                class={`server-setup-item${isVerifying ? ' is-verifying' : ''}${isDimmed ? ' is-dimmed' : ''}`}
+                onClick={() => !connecting && handleConnect(url)}
+              >
+                <span class="server-setup-node-dot" aria-hidden="true" />
+                <div class="server-setup-item-body">
+                  <div class="server-setup-url">{url}</div>
+                  {isVerifying && (
+                    <div class="server-setup-status">
+                      {t('serverSetup.verifying')}
+                    </div>
+                  )}
+                </div>
+                {!connecting && url !== DEFAULT_SERVER_URL && (
+                  <button
+                    type="button"
+                    class="server-setup-remove"
+                    onClick={(e) => handleRemove(url, e as unknown as MouseEvent)}
+                    aria-label="Remove"
+                  >
+                    ×
+                  </button>
                 )}
               </div>
-              {!connecting && url !== DEFAULT_SERVER_URL && (
-                <button
-                  style={{
-                    background: 'none',
-                    border: 'none',
-                    color: '#475569',
-                    cursor: 'pointer',
-                    padding: '2px 6px',
-                    fontSize: 16,
-                    lineHeight: 1,
-                    flexShrink: 0,
-                  }}
-                  onClick={(e) => handleRemove(url, e as unknown as MouseEvent)}
-                  aria-label="Remove"
-                >
-                  ×
-                </button>
-              )}
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         {adding ? (
-          <div style={{ width: '100%', marginBottom: 8 }}>
-            <input
-              class="input"
-              style={{ width: '100%', marginBottom: 8, boxSizing: 'border-box' }}
-              type="url"
-              placeholder={t('serverSetup.placeholder')}
-              value={inputUrl}
-              onInput={(e) => { setInputUrl((e.target as HTMLInputElement).value); setError(null); }}
-              autoFocus
-              onKeyDown={(e) => { if (e.key === 'Enter') handleAdd(); if (e.key === 'Escape') { setAdding(false); setInputUrl(''); } }}
-            />
-            <div style={{ display: 'flex', gap: 8 }}>
+          <div ref={addPanelRef} class="server-setup-add-panel">
+            <div class="server-setup-input-row">
+              <input
+                ref={inputRef}
+                class="input server-setup-input"
+                type="url"
+                placeholder={t('serverSetup.placeholder')}
+                value={inputUrl}
+                onFocus={keepAddPanelVisible}
+                onInput={(e) => {
+                  setInputUrl((e.target as HTMLInputElement).value);
+                  setError(null);
+                  setPasteHint(null);
+                }}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleAdd();
+                  if (e.key === 'Escape') cancelAdd();
+                }}
+              />
               <button
+                type="button"
+                class="btn btn-secondary server-setup-paste-btn"
+                onClick={handlePaste}
+                disabled={!!connecting}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
+                  <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+                </svg>
+                <span>{t('serverSetup.paste')}</span>
+              </button>
+            </div>
+            {pasteHint && (
+              <div class="server-setup-paste-hint" role="status">
+                {pasteHint}
+              </div>
+            )}
+            <div class="server-setup-actions">
+              <button
+                type="button"
                 class="btn btn-primary"
-                style={{ flex: 1 }}
                 onClick={handleAdd}
-                disabled={!inputUrl.trim()}
+                disabled={!inputUrl.trim() || !!connecting}
               >
                 {t('serverSetup.connect')}
               </button>
               <button
+                type="button"
                 class="btn btn-ghost"
-                style={{ flex: 1 }}
-                onClick={() => { setAdding(false); setInputUrl(''); setError(null); }}
+                onClick={cancelAdd}
               >
                 {t('common.cancel')}
               </button>
@@ -172,9 +229,13 @@ export function ServerSetupPage({ onConnect }: Props) {
           </div>
         ) : (
           <button
-            class="btn btn-ghost"
-            style={{ width: '100%', fontSize: 14 }}
-            onClick={() => setAdding(true)}
+            type="button"
+            class="btn btn-ghost server-setup-add-trigger"
+            onClick={() => {
+              setAdding(true);
+              setError(null);
+              setPasteHint(null);
+            }}
             disabled={!!connecting}
           >
             {t('serverSetup.addServer')}

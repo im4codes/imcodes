@@ -40,7 +40,7 @@ const entries = new Map<string, BackoffEntry>();
 export function transportRestoreFingerprint(
   record: Pick<SessionRecord,
     'sessionInstanceId' | 'runtimeEpoch' | 'providerId' | 'agentType' | 'providerSessionId'
-    | 'providerResumeId' | 'projectDir' | 'transportConfig'>,
+    | 'providerResumeId' | 'agyNativeSessionState' | 'projectDir' | 'transportConfig'>,
 ): string {
   return JSON.stringify([
     record.sessionInstanceId ?? '',
@@ -49,6 +49,7 @@ export function transportRestoreFingerprint(
     record.agentType,
     record.providerSessionId ?? '',
     record.providerResumeId ?? '',
+    record.agyNativeSessionState ?? '',
     canonicalizeTransportCwd(record.projectDir) ?? '',
     record.transportConfig ?? null,
   ]);

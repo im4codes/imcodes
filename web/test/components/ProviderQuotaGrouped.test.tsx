@@ -264,4 +264,64 @@ describe('ProviderQuotaLine and UsageFooter grouped quota rendering', () => {
     expect(lineElement?.textContent).toBe('Gemini 5h 5% 3h10m · 7d 12% 5d02h');
     footerMobile.unmount();
   });
+
+  it('updates mounted useProviderQuotaLabel on late native-host without resize while keeping real mobile and narrow desktop compact', async () => {
+    const { NATIVE_HOST_EVENT } = await import('../../src/native-platform.js');
+    const { act } = await import('preact/test-utils');
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true, getPlatform: () => 'ios' });
+    vi.stubGlobal('__IMCODES_NATIVE_HOST__', undefined);
+    vi.stubGlobal('navigator', {
+      platform: 'iPad',
+      userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+      maxTouchPoints: 0,
+    });
+    vi.stubGlobal('innerWidth', 1200);
+    vi.stubGlobal('matchMedia', (q: string) => ({
+      matches: q === '(pointer: coarse)',
+      media: q,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }));
+
+    function QuotaProbe() {
+      const label = useProviderQuotaLabel({ quotaLabel: '5h 12.34%' });
+      return <span data-testid="late-host-quota">{label}</span>;
+    }
+
+    try {
+      const view = render(<QuotaProbe />);
+      expect(view.getByTestId('late-host-quota').textContent).toBe('5h 12%');
+
+      // Late Mac host signal without dispatching window resize
+      vi.stubGlobal('__IMCODES_NATIVE_HOST__', { isMacDesktop: true, pageZoomApplied: true, scaleMode: 'native-page-zoom' });
+      await act(() => {
+        window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      });
+      expect(view.getByTestId('late-host-quota').textContent).toBe('5h 12.34%');
+
+      // Negative control 1: narrow desktop window <= 720 remains compact
+      vi.stubGlobal('innerWidth', 640);
+      await act(() => {
+        window.dispatchEvent(new Event('resize'));
+      });
+      expect(view.getByTestId('late-host-quota').textContent).toBe('5h 12%');
+
+      // Negative control 2: real iOS mobile remains compact even at wide viewport
+      vi.stubGlobal('innerWidth', 1200);
+      vi.stubGlobal('__IMCODES_NATIVE_HOST__', { isMacDesktop: false, pageZoomApplied: false, scaleMode: 'none' });
+      vi.stubGlobal('navigator', {
+        platform: 'iPad',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+        maxTouchPoints: 5,
+      });
+      await act(() => {
+        window.dispatchEvent(new CustomEvent(NATIVE_HOST_EVENT));
+      });
+      expect(view.getByTestId('late-host-quota').textContent).toBe('5h 12%');
+
+      view.unmount();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

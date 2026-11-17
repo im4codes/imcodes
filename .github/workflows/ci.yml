@@ -94,13 +94,16 @@ jobs:
   # ── Daemon unit tests ─────────────────────────────────────────────────────
 
   unit-tests:
-    name: Unit Tests (Node ${{ matrix.node }})
+    name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/6)
     runs-on: ubuntu-latest
-    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 10 min, max 11.5).
+    # Keep both Node versions and every daemon test; split across runners instead of increasing per-runner workers.
     timeout-minutes: 30
     strategy:
+      fail-fast: false
+      max-parallel: 12
       matrix:
         node: ['22', '24']
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout
         id: checkout_1
@@ -146,7 +149,7 @@ jobs:
           cache: 'npm'
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/6
 
   preview-dist-smoke:
     name: Preview Dist Smoke
@@ -188,10 +191,15 @@ jobs:
   # ── macOS daemon unit tests ─────────────────────────────────────────────
 
   macos-unit-tests:
-    name: Unit Tests (macOS)
+    name: Unit Tests (macOS, shard ${{ matrix.shard }}/4)
     runs-on: macos-latest
-    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 17 min, max 19.3).
+    # The measured critical path is four disjoint shards, with all platform tests retained.
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -204,7 +212,7 @@ jobs:
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/4
 
   # ── macOS remote-desktop components (built from the immutable SDK) ────────
 
@@ -570,7 +578,8 @@ jobs:
     runs-on: ubuntu-latest
     # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2.2 min, max 2.7).
     timeout-minutes: 15
-    needs: [unit-tests]
+    # Self-contained runner: no unit-test artifacts are consumed. Release jobs
+    # still require BOTH matrices; run E2E alongside units, not after them.
     steps:
       - name: Checkout
         id: checkout_1
@@ -640,6 +649,16 @@ jobs:
       - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps (active timeline refresh e2e wrapper invokes web vitest)
         run: ./scripts/ci-npm-ci.sh web
+      - name: Configure shared Playwright browser path
+        run: |
+          # Test HOME is isolated per file; keep browsers outside it and the checkout.
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/imcodes-playwright" >> "$GITHUB_ENV"
+      - name: Install Chromium for cross-client timeline E2E (bounded)
+        timeout-minutes: 15
+        run: |
+          ./scripts/ci-apt-hardening.sh
+          cd web
+          CI_RETRY_BETWEEN_ATTEMPTS='sudo dpkg --configure -a' ../scripts/ci-retry.sh 3 240 npx playwright install --with-deps chromium
       - name: Run pipe-pane e2e tests
         run: npx vitest run test/e2e/pipe-pane-stream.test.ts
       - name: Run other e2e tests
@@ -681,12 +700,12 @@ jobs:
     name: Coverage shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 5-6 min, max 6.8).
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 6
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -702,7 +721,7 @@ jobs:
         run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - name: Run coverage shard
-        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/4 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default
+        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/6 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default
         env:
           # Shards only need JSON input for the merge; final reports are made
           # once by the merge job, avoiding four lcov/text/reporting passes.
@@ -752,6 +771,16 @@ jobs:
         with:
           name: coverage-shard-4
           path: coverage/shards/shard-4
+      - name: Download coverage shard 5
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-5
+          path: coverage/shards/shard-5
+      - name: Download coverage shard 6
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-6
+          path: coverage/shards/shard-6
       - name: Merge coverage reports
         run: npm run coverage:merge -- coverage/shards coverage
       - name: Write coverage summary and enforce thresholds
@@ -1268,6 +1297,233 @@ jobs:
       - name: Qualify signed Windows self-upgrade and rollback
         if: runner.os == 'Windows'
         run: npx tsx scripts/qualify-windows-self-upgrade.ts
+      - name: Build, verify and smoke-test POSIX daemon-runtime bundle
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGET="darwin-arm64"
+          else
+            TARGET="linux-x64"
+          fi
+          node scripts/build-daemon-runtime.mjs \
+            --target "$TARGET" \
+            --out-dir dist-node-exe/daemon-runtime \
+            --build-version "$IMCODES_BUILD_VERSION"
+          node scripts/daemon-runtime-artifacts.mjs verify \
+            "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.manifest.json" \
+            --expected-version "$IMCODES_BUILD_VERSION"
+          SMOKE_ROOT=""
+          HOME_ROOT=""
+          trap 'chmod -R u+w "$SMOKE_ROOT" 2>/dev/null || true; rm -rf "$SMOKE_ROOT" "$HOME_ROOT"' EXIT
+          SMOKE_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-smoke.XXXXXX")"
+          HOME_ROOT="$(mktemp -d "${RUNNER_TEMP}/daemon-runtime-home.XXXXXX")"
+          tar -xzf "dist-node-exe/daemon-runtime/daemon-runtime-${TARGET}.tar.gz" -C "$SMOKE_ROOT"
+          chmod -R a-w "$SMOKE_ROOT"
+          env -i HOME="$HOME_ROOT" IMCODES_HOME="$HOME_ROOT/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+            "$SMOKE_ROOT/bin/node" "$SMOKE_ROOT/package/dist/src/index.js" --version
+      - name: Build, verify and smoke-test Windows daemon-runtime bundle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-stage'
+          Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+          try {
+            node scripts/build-daemon-runtime.mjs `
+              --target win32-x64 `
+              --out-dir dist-node-exe/daemon-runtime `
+              --stage-dir $stageRoot `
+              --keep-staging `
+              --build-version $env:IMCODES_BUILD_VERSION
+            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime build failed.' }
+            node scripts/daemon-runtime-artifacts.mjs verify `
+              dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.manifest.json `
+              --expected-version $env:IMCODES_BUILD_VERSION `
+              --archive-only
+            if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime manifest verification failed.' }
+            $smokeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-smoke'
+            $homeRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-home'
+            Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $homeRoot | Out-Null
+            try {
+              powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File .\scripts\windows-zip-archive.ps1 `
+                -Mode Expand `
+                -SourcePath 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip' `
+                -DestinationPath $smokeRoot
+              if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke extraction failed.' }
+              & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath (Join-Path $smokeRoot 'node.exe') -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+              $prevHome = $env:IMCODES_HOME
+              $env:IMCODES_HOME = Join-Path $homeRoot '.imcodes'
+              try {
+                & (Join-Path $smokeRoot 'node.exe') (Join-Path $smokeRoot 'package\dist\src\index.js') --version
+                if ($LASTEXITCODE -ne 0) { throw 'Windows daemon-runtime smoke execution failed.' }
+              } finally {
+                $env:IMCODES_HOME = $prevHome
+              }
+            } finally {
+              Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          } catch {
+            Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+            throw
+          }
+      - name: Build and smoke-test Linux unified installers (.deb + .sh)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/build-linux-installer.mjs \
+            --arch x64 \
+            --version "$IMCODES_BUILD_VERSION" \
+            --runtime-archive dist-node-exe/daemon-runtime/daemon-runtime-linux-x64.tar.gz \
+            --node-exe dist-node-exe/imcodes-node-linux \
+            --remote-desktop-dir dist-node-exe/remote-desktop-worker/linux-x64 \
+            --computer-use-dir dist-node-exe/computer-use-helper/linux-x64 \
+            --out-dir dist-node-exe/installers
+          DEB="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb"
+          SH="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh"
+          dpkg-deb --info "$DEB"
+          DEB_CONTENTS_TMP="$(mktemp "${RUNNER_TEMP}/imcodes-deb-contents.XXXXXX")"
+          dpkg-deb --contents "$DEB" > "$DEB_CONTENTS_TMP"
+          head -n 40 "$DEB_CONTENTS_TMP"
+          rm -f "$DEB_CONTENTS_TMP"
+          ISO_ROOT="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-iso.XXXXXX")"
+          ISO_HOME="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-home.XXXXXX")"
+          trap 'rm -rf "$ISO_ROOT" "$ISO_HOME"' EXIT
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --check
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --no-service-control
+          env -i HOME="$ISO_HOME" IMCODES_HOME="$ISO_HOME/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+            "$ISO_ROOT/bin/imcodes" --version
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --rollback "$ISO_ROOT/rollback-snapshot"
+      - name: Build, sign/notarize (when installer cert available), and verify macOS .pkg installer
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          IMCODES_MACOS_INSTALLER_P12_BASE64: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_BASE64 }}
+          IMCODES_MACOS_INSTALLER_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          node scripts/build-macos-installer.mjs \
+            --arch arm64 \
+            --version "$IMCODES_BUILD_VERSION" \
+            --runtime-archive dist-node-exe/daemon-runtime/daemon-runtime-darwin-arm64.tar.gz \
+            --app-bundle "dist-node-exe/aiDesk.to by IM.codes.app" \
+            --node-exe dist-node-exe/imcodes-node-macos \
+            --remote-desktop-dir dist-node-exe/remote-desktop-worker/darwin-arm64 \
+            --computer-use-dir dist-node-exe/computer-use-helper/darwin-universal \
+            --out-dir dist-node-exe/installers
+          PKG="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg"
+          EXPAND_DIR="$(mktemp -d "${RUNNER_TEMP}/imcodes-pkg-expand.XXXXXX")"
+          trap 'rm -rf "$EXPAND_DIR"' EXIT
+          pkgutil --expand-full "$PKG" "$EXPAND_DIR/pkg"
+          APP_INSIDE="$(find "$EXPAND_DIR/pkg" -maxdepth 4 -name "aiDesk.to by IM.codes.app" -type d | head -n 1)"
+          codesign --verify --strict --verbose=2 "$APP_INSIDE"
+          if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ] || security find-identity -v "$RUNNER_TEMP/imcodes-macos-release-signing.keychain-db" 2>/dev/null | grep -q "Developer ID Installer:"; then
+            if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ]; then
+              node scripts/macos-release-signing.mjs import-installer >/dev/null
+            fi
+            node scripts/macos-release-signing.mjs sign-pkg "$PKG"
+            node scripts/macos-release-signing.mjs notarize "$PKG"
+            node scripts/build-macos-installer.mjs \
+              --refresh-manifest "$PKG" \
+              --arch arm64 \
+              --version "$IMCODES_BUILD_VERSION" \
+              --signed \
+              --notarized \
+              --has-app-bundle \
+              --has-node-binary
+          fi
+      - name: Build, sign, and smoke-test Windows Inno Setup (.iss/.exe) installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'daemon-runtime-stage'
+          try {
+            $isccPath = $null
+            foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+              if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+            }
+            if (-not $isccPath -and (Get-Command choco -ErrorAction SilentlyContinue)) {
+              choco install innosetup --no-progress -y | Out-Null
+              foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+                if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+              }
+            }
+            $localUiDir = if (Test-Path -LiteralPath 'dist-node-exe\aidesk-local-ui\win32-x64' -PathType Container) { 'dist-node-exe\aidesk-local-ui\win32-x64' } else { 'dist-node-exe\aidesk-local-ui' }
+            $buildArgs = @(
+              'scripts\build-windows-installer.mjs',
+              '--version', $env:IMCODES_BUILD_VERSION,
+              '--runtime-dir', $stageRoot,
+              '--node-exe', 'dist-node-exe\imcodes-node.exe',
+              '--remote-desktop-dir', 'dist-node-exe\remote-desktop-worker\win32-x64',
+              '--computer-use-dir', 'dist-node-exe\computer-use-helper\win32-x64',
+              '--local-ui-dir', $localUiDir,
+              '--out-dir', 'dist-node-exe\installers',
+              '--require-iscc'
+            )
+            if ($isccPath) { $buildArgs += @('--iscc-path', $isccPath) }
+            node @buildArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Windows installer build failed.' }
+            $exeInstaller = "dist-node-exe\installers\imcodes-desktop-$($env:IMCODES_BUILD_VERSION)-win32-x64.exe"
+            if (-not (Test-Path -LiteralPath $exeInstaller -PathType Leaf)) { throw "Missing compiled Windows installer: $exeInstaller" }
+            $isoRoot = Join-Path $env:RUNNER_TEMP ('imcodes-win-inst-' + [guid]::NewGuid().ToString('N'))
+            $isoHome = Join-Path $isoRoot 'home'
+            New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
+            try {
+              & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode PostInstall -Version $env:IMCODES_BUILD_VERSION -IsolatedRoot $isoRoot -HomeDir $isoHome -StagedCliWrapper 'dist-node-exe\installers\imcodes.cmd' | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Windows isolated PostInstall failed.' }
+              & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode Rollback -IsolatedRoot $isoRoot -HomeDir $isoHome | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Windows isolated Rollback failed.' }
+            } finally {
+              Remove-Item -LiteralPath $isoRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          } finally {
+            Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Build and verify unified desktop release manifest (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGET="darwin-arm64"
+          else
+            TARGET="linux-x64"
+          fi
+          node scripts/desktop-release-manifest.mjs build \
+            --target "$TARGET" \
+            --dist-dir dist-node-exe \
+            --release-version "$IMCODES_BUILD_VERSION" \
+            --git-sha "$GITHUB_SHA"
+          node scripts/desktop-release-manifest.mjs verify \
+            "dist-node-exe/desktop-release-${TARGET}.manifest.json" \
+            --dist-dir dist-node-exe \
+            --expected-version "$IMCODES_BUILD_VERSION" \
+            --expected-git-sha "$GITHUB_SHA" \
+            --target "$TARGET"
+      - name: Build and verify unified desktop release manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          node scripts/desktop-release-manifest.mjs build `
+            --target win32-x64 `
+            --dist-dir dist-node-exe `
+            --release-version $env:IMCODES_BUILD_VERSION `
+            --git-sha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest build failed.' }
+          node scripts/desktop-release-manifest.mjs verify `
+            dist-node-exe\desktop-release-win32-x64.manifest.json `
+            --dist-dir dist-node-exe `
+            --expected-version $env:IMCODES_BUILD_VERSION `
+            --expected-git-sha $env:GITHUB_SHA `
+            --target win32-x64
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest verification failed.' }
       - name: Record exact source revision in the platform artifact
         # A shell-escaped newline becomes a literal `\\n` under PowerShell;
         # writing the bare SHA keeps the marker byte-identical on every runner.
@@ -1279,11 +1535,14 @@ jobs:
           path: |
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/desktop-release*.manifest.json
             dist-node-exe/source-commit-${{ matrix.key }}.txt
             dist-node-exe/computer-use-helper/**
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
             dist-node-exe/aidesk-local-ui/**
+            dist-node-exe/daemon-runtime/**
+            dist-node-exe/installers/**
           if-no-files-found: error
           retention-days: 30
       - name: Remove macOS release-signing material
@@ -1384,6 +1643,8 @@ jobs:
           set -euo pipefail
           find server/controlled-node-artifacts -type f \
             ! -name '*.json' ! -name '*.zip' ! -name '*.dmg' ! -name '*.dll' ! -name '*.cat' \
+            ! -name '*.deb' ! -name '*.pkg' ! -name '*.iss' ! -name '*.ps1' ! -name '*.cmd' ! -name '*.txt' \
+            ! -name '*.tar.gz' \
             -exec chmod +x {} +
 
       - name: Verify controlled-node executable set
@@ -1464,6 +1725,39 @@ jobs:
           # chmod restore above, instead of ~15 minutes later in the image smoke test.
           node scripts/remote-desktop-worker-artifacts.mjs verify \
             server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" linux x64
+
+      - name: Verify daemon-runtime bundles for every desktop target
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          for target in linux-x64 darwin-arm64 win32-x64; do
+            node scripts/daemon-runtime-artifacts.mjs verify \
+              "server/controlled-node-artifacts/daemon-runtime/daemon-runtime-${target}.manifest.json" \
+              --expected-version "$IMCODES_BUILD_VERSION"
+          done
+
+      - name: Generate controlled-node release artifacts manifest and stage flat release assets
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          node scripts/generate-controlled-node-manifest.mjs \
+            server/controlled-node-artifacts \
+            --version "$IMCODES_BUILD_VERSION" \
+            --stage-dir dist-controlled-node-release
+          for f in \
+            "desktop-release.manifest.json" \
+            "desktop-release-linux-x64.manifest.json" \
+            "desktop-release-darwin-arm64.manifest.json" \
+            "desktop-release-win32-x64.manifest.json" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg" \
+            "imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe"; do
+            test -s "dist-controlled-node-release/$f"
+          done
+          test -s "server/controlled-node-artifacts/desktop-release.manifest.json"
 
       - name: Get build timestamp
         id: ts
@@ -1557,8 +1851,6 @@ jobs:
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
             SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           load: true
           push: false
 
@@ -1590,6 +1882,7 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
             imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
+          docker run --rm --entrypoint test imcodes-smoke:test -s /app/controlled-node-executables/release-artifacts-manifest.json
           docker run --rm --entrypoint node imcodes-smoke:test -e \
             "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync('/app/controlled-node-executables/release-provenance.json','utf8')); if(p.sourceCommit!=='${{ github.sha }}'||p.appVersion!=='${{ needs.release_version.outputs.app_version }}') throw new Error('release provenance mismatch'); console.log('release provenance verified:',p.sourceCommit,p.appVersion)"
           # Every target, named. This verifier defaults to the WINDOWS target
@@ -1611,6 +1904,49 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/remote-desktop-worker-artifacts.mjs verify \
             /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" linux x64
+          # Verify desktop release manifests & daemon-runtime bundles are shipped in image, while full installers are excluded.
+          docker run --rm \
+            -e IMCODES_BUILD_VERSION="${{ needs.release_version.outputs.app_version }}" \
+            -e SOURCE_COMMIT="${{ github.sha }}" \
+            --entrypoint node imcodes-smoke:test -e "
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const path = require('node:path');
+            const root = '/app/controlled-node-executables';
+            if (fs.existsSync(path.join(root, 'installers'))) {
+              throw new Error('full desktop installers must not be baked into server Docker image');
+            }
+            import('/app/dist/shared/desktop-release-manifest.js').then((mod) => {
+              const expectedVer = process.env.IMCODES_BUILD_VERSION;
+              const expectedSha = process.env.SOURCE_COMMIT;
+              const targets = ['linux-x64', 'darwin-arm64', 'win32-x64'];
+              for (const t of targets) {
+                const perTarget = mod.validateDesktopReleaseManifest(JSON.parse(fs.readFileSync(path.join(root, 'desktop-release-' + t + '.manifest.json'), 'utf8')));
+                if (perTarget.releaseVersion !== expectedVer || perTarget.gitSha !== expectedSha || !perTarget.targets[t]) {
+                  throw new Error('per-target desktop release manifest mismatch: ' + t);
+                }
+                const drComp = perTarget.targets[t].components['daemon-runtime'];
+                const drAbs = path.join(root, drComp.relativePath || ('daemon-runtime/' + drComp.fileName));
+                const drBytes = fs.readFileSync(drAbs);
+                const drSha = crypto.createHash('sha256').update(drBytes).digest('hex');
+                if (drBytes.length !== drComp.sizeBytes || drSha !== drComp.sha256) {
+                  throw new Error('daemon-runtime archive integrity mismatch inside image: ' + t);
+                }
+                const drManifest = mod.validateDaemonRuntimeManifest(JSON.parse(fs.readFileSync(path.join(root, 'daemon-runtime', drComp.manifestFileName), 'utf8')), t);
+                if (drManifest.build.version !== expectedVer || drManifest.artifact.sha256 !== drSha) {
+                  throw new Error('daemon-runtime manifest mismatch inside image: ' + t);
+                }
+              }
+              const merged = mod.validateDesktopReleaseManifest(JSON.parse(fs.readFileSync(path.join(root, 'desktop-release.manifest.json'), 'utf8')));
+              if (merged.releaseVersion !== expectedVer || merged.gitSha !== expectedSha) {
+                throw new Error('merged desktop-release.manifest.json mismatch');
+              }
+              for (const t of targets) {
+                if (!merged.targets[t]) throw new Error('merged manifest missing target: ' + t);
+              }
+              console.log('Verified desktop-release*.manifest.json, daemon-runtime, and installers exclusion in image');
+            }).catch((err) => { console.error(err); process.exit(1); });
+            "
 
       - name: Build and push (cache hit — only pushes layers)
         id: build_push
@@ -1627,8 +1963,6 @@ jobs:
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
             SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           push: true
 
       - name: Write immutable release metadata
@@ -1668,6 +2002,40 @@ jobs:
             git tag "$GIT_TAG"
             git push origin "$GIT_TAG"
           fi
+
+      - name: Publish controlled-node artifacts GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: controlled-node-v${{ needs.release_version.outputs.app_version }}
+          name: Controlled Node Artifacts v${{ needs.release_version.outputs.app_version }}
+          files: dist-controlled-node-release/*
+          prerelease: ${{ github.ref == 'refs/heads/dev' }}
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync controlled-node artifacts to R2 (optional)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_SECRET_ACCESS_KEY }}
+          R2_PREFIX: ${{ vars.CONTROLLED_NODE_ARTIFACT_R2_PREFIX }}
+        run: |
+          set -euo pipefail
+          if [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${R2_BUCKET:-}" ] || [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ]; then
+            echo "Optional R2 secrets not configured; skipping R2 artifact sync."
+            exit 0
+          fi
+          prefix="${R2_PREFIX#/}"
+          prefix="${prefix%/}"
+          dest="s3://${R2_BUCKET}${prefix:+/${prefix}}"
+          AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+          AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+          AWS_DEFAULT_REGION="auto" \
+            aws s3 sync dist-controlled-node-release "$dest" \
+              --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              --no-progress
 
   # ── Android APK Build ────────────────────────────────────────────────────
 
@@ -1755,49 +2123,23 @@ jobs:
           GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 
-      - name: Write JPush key into web/android/local.properties (china flavor only)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${JPUSH_APP_KEY:-}" ]; then
-            : > web/android/local.properties
-            {
-              echo "JPUSH_APP_KEY=${JPUSH_APP_KEY}"
-              [ -n "${XIAOMI_APPID:-}" ]  && echo "XIAOMI_APPID=${XIAOMI_APPID}"
-              [ -n "${XIAOMI_APPKEY:-}" ] && echo "XIAOMI_APPKEY=${XIAOMI_APPKEY}"
-              [ -n "${VIVO_APPID:-}" ]    && echo "VIVO_APPID=${VIVO_APPID}"
-              [ -n "${VIVO_APPKEY:-}" ]   && echo "VIVO_APPKEY=${VIVO_APPKEY}"
-            } >> web/android/local.properties
-            echo "Wrote JPush + vendor keys to local.properties (china flavor will pick them up)."
-          else
-            echo "JPUSH_APP_KEY not set; china flavor will build but the JPush SDK will refuse to init at runtime."
-          fi
-        env:
-          JPUSH_APP_KEY:  ${{ secrets.JPUSH_APP_KEY }}
-          XIAOMI_APPID:   ${{ secrets.XIAOMI_APPID }}
-          XIAOMI_APPKEY:  ${{ secrets.XIAOMI_APPKEY }}
-          VIVO_APPID:     ${{ secrets.VIVO_APPID }}
-          VIVO_APPKEY:    ${{ secrets.VIVO_APPKEY }}
+      # The web bundle differs per package (compile-time VITE_PUSH_VARIANT).
+      # Build web → cap sync → Gradle assemble for each flavor in turn so the
+      # pure package never inherits the FCM web entry point.
 
-      # The web bundle differs per flavor (compile-time VITE_REGION picks the
-      # push transport: FCM vs JPush). We therefore build web → cap sync →
-      # gradle assemble for each flavor in turn, rather than relying on
-      # gradle's default `assembleRelease` task that walks all flavors with a
-      # single set of web assets.
-
-      - name: Build web (global flavor) + sync + assemble globalRelease
+      - name: Build web (with FCM) + sync + assemble withFcmRelease
         working-directory: web
         run: |
-          npm run build:global
+          npm run build:with-fcm
           npx cap sync android
-          (cd android && ./gradlew assembleGlobalRelease bundleGlobalRelease --stacktrace)
+          (cd android && ./gradlew assembleWithFcmRelease bundleWithFcmRelease --stacktrace)
 
-      - name: Build web (china flavor) + sync + assemble chinaRelease
+      - name: Build web (without FCM) + sync + assemble withoutFcmRelease
         working-directory: web
         run: |
-          npm run build:china
+          npm run build:without-fcm
           npx cap sync android
-          (cd android && ./gradlew assembleChinaRelease bundleChinaRelease --stacktrace)
+          (cd android && ./gradlew assembleWithoutFcmRelease bundleWithoutFcmRelease --stacktrace)
 
       - name: Get version info
         id: version
@@ -1815,27 +2157,41 @@ jobs:
       - name: Rename artifacts with version + flavor
         run: |
           set -euo pipefail
-          GLOBAL_APK=$(ls web/android/app/build/outputs/apk/global/release/*.apk | head -1)
-          CHINA_APK=$(ls  web/android/app/build/outputs/apk/china/release/*.apk  | head -1)
-          GLOBAL_AAB=$(ls web/android/app/build/outputs/bundle/globalRelease/*.aab | head -1)
-          CHINA_AAB=$(ls  web/android/app/build/outputs/bundle/chinaRelease/*.aab  | head -1)
-          cp "$GLOBAL_APK" "imcodes-global-${{ steps.version.outputs.tag }}.apk"
-          cp "$CHINA_APK"  "imcodes-china-${{ steps.version.outputs.tag }}.apk"
-          cp "$GLOBAL_AAB" "imcodes-global-${{ steps.version.outputs.tag }}.aab"
-          cp "$CHINA_AAB"  "imcodes-china-${{ steps.version.outputs.tag }}.aab"
+          WITH_FCM_APK=$(ls web/android/app/build/outputs/apk/withFcm/release/*.apk | head -1)
+          WITHOUT_FCM_APK=$(ls web/android/app/build/outputs/apk/withoutFcm/release/*.apk | head -1)
+          WITH_FCM_AAB=$(ls web/android/app/build/outputs/bundle/withFcmRelease/*.aab | head -1)
+          WITHOUT_FCM_AAB=$(ls web/android/app/build/outputs/bundle/withoutFcmRelease/*.aab | head -1)
+          cp "$WITH_FCM_APK" "imcodes-with-fcm-${{ steps.version.outputs.tag }}.apk"
+          cp "$WITHOUT_FCM_APK" "imcodes-without-fcm-${{ steps.version.outputs.tag }}.apk"
+          cp "$WITH_FCM_AAB" "imcodes-with-fcm-${{ steps.version.outputs.tag }}.aab"
+          cp "$WITHOUT_FCM_AAB" "imcodes-without-fcm-${{ steps.version.outputs.tag }}.aab"
 
-      - name: Upload release APK artifacts
+      - name: Upload with-FCM APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: imcodes-android-release-apk
-          path: imcodes-*-${{ steps.version.outputs.tag }}.apk
+          name: imcodes-android-with-fcm-apk
+          path: imcodes-with-fcm-${{ steps.version.outputs.tag }}.apk
           if-no-files-found: error
 
-      - name: Upload release AAB artifacts
+      - name: Upload without-FCM APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: imcodes-android-release-aab
-          path: imcodes-*-${{ steps.version.outputs.tag }}.aab
+          name: imcodes-android-without-fcm-apk
+          path: imcodes-without-fcm-${{ steps.version.outputs.tag }}.apk
+          if-no-files-found: error
+
+      - name: Upload with-FCM AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-android-with-fcm-aab
+          path: imcodes-with-fcm-${{ steps.version.outputs.tag }}.aab
+          if-no-files-found: error
+
+      - name: Upload without-FCM AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-android-without-fcm-aab
+          path: imcodes-without-fcm-${{ steps.version.outputs.tag }}.aab
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -1845,15 +2201,17 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.name }}
           body: |
-            ## Android — Pick the edition that matches your region
+            ## Android — choose the push capability you need
 
-            - **`imcodes-global-*.apk`** — **International edition**. Push notifications via Firebase FCM (Google Play Services required). Use this everywhere outside Mainland China.
-            - **`imcodes-china-*.apk`** — **Mainland China edition**. Push notifications via 极光推送 JPush, which fans out to the on-device vendor channels (Huawei / Xiaomi / OPPO / vivo / Honor) so they work without Google Play Services.
+            - **`imcodes-with-fcm-*.apk` / `.aab`** — Firebase FCM push notifications (Google Play Services required).
+            - **`imcodes-without-fcm-*.apk` / `.aab`** — pure build with no FCM, GMS, Capacitor push, JPush, or vendor push SDK.
 
-            Both APKs share the same applicationId (`com.im.codes`) and cannot coexist on a single device — install only one.
+            Both packages share the same applicationId (`com.im.codes`) and cannot coexist on a single device — install only one.
           files: |
-            imcodes-*-${{ steps.version.outputs.tag }}.apk
-            imcodes-*-${{ steps.version.outputs.tag }}.aab
+            imcodes-with-fcm-${{ steps.version.outputs.tag }}.apk
+            imcodes-without-fcm-${{ steps.version.outputs.tag }}.apk
+            imcodes-with-fcm-${{ steps.version.outputs.tag }}.aab
+            imcodes-without-fcm-${{ steps.version.outputs.tag }}.aab
           generate_release_notes: true
           prerelease: ${{ github.ref == 'refs/heads/dev' }}
           make_latest: ${{ github.ref == 'refs/heads/master' }}

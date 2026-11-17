@@ -21,6 +21,56 @@ function makeEvent(overrides: Partial<TimelineEvent> & { eventId: string }): Tim
   };
 }
 
+describe('stable user send identity across projections', () => {
+  const user = (eventId: string, commandId?: string, payload: Record<string, unknown> = {}) => makeEvent({
+    eventId, type: 'user.message', payload: { text: 'Intentional repeated content', allowDuplicate: true, ...(commandId ? { commandId } : {}), ...payload },
+  });
+
+  it.each([false, true])('folds live/history/cache replay independently of arrival order (reverse=%s)', (reverse) => {
+    const primary = { ...user('primary', 'send-1', { sharedActor: { actorUserId: 'participant-1' } }), epoch: 2 };
+    const fallback = { ...user('fallback', undefined, { clientMessageId: 'send-1' }), epoch: 0 };
+    const incoming = reverse ? [fallback, primary] : [primary, fallback];
+    const once = mergeTimelineEvents([], incoming);
+    const replayed = mergeTimelineEvents(once, [...incoming, ...incoming]);
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0].eventId).toBe('primary');
+    expect(replayed[0].payload.sharedActor).toEqual({ actorUserId: 'participant-1' });
+    expect(replayed[0].payload.clientMessageId).toBe('send-1');
+  });
+
+  it('heals duplicate old cached rows even without a newly arriving event', () => {
+    expect(mergeTimelineEvents([user('cache-a', 'send-1'), user('cache-b', 'send-1')], [])).toHaveLength(1);
+  });
+
+  it('preserves intentional identical sends, distinct participants and identity-free legacy rows', () => {
+    const rows = [user('a', 'first', { sharedActor: { actorUserId: 'participant-1' } }),
+      user('b', 'second', { sharedActor: { actorUserId: 'participant-1' } }),
+      user('c', 'third', { sharedActor: { actorUserId: 'participant-2' } }), user('legacy-a'), user('legacy-b')];
+    expect(mergeTimelineEvents([], rows)).toHaveLength(5);
+  });
+
+  it('scopes identity to the exact session and supports attachment-only/empty text', () => {
+    const a = user('a', 'send-1', { text: '', attachments: [{ name: 'test.png' }] });
+    expect(mergeTimelineEvents([a], [user('b', 'send-1', { text: '' })])).toHaveLength(1);
+    expect(mergeTimelineEvents([a], [{ ...a, eventId: 'other', sessionId: 'session-b' }])).toHaveLength(2);
+  });
+
+  it('keeps deletion sticky across alternate ids without restoring transient preview/failed state', () => {
+    const preview = user('preview', 'send-1', { historyPayloadTruncated: true, failed: true });
+    const full = user('full', 'send-1');
+    const merged = mergeTimelineEvents([preview], [full]);
+    expect(merged[0].payload.historyPayloadTruncated).toBeUndefined();
+    expect(merged[0].payload.failed).toBeUndefined();
+    const deleted = { ...full, hidden: true, payload: { ...full.payload, userDeleted: true } };
+    expect(mergeTimelineEvents(merged, [deleted, preview])[0].payload.userDeleted).toBe(true);
+  });
+
+  it('does not consume a local optimistic send while folding authoritative projections', () => {
+    const local = user('optimistic:session-a:send-1', 'send-1', { pending: true });
+    expect(mergeTimelineEvents([local], [user('remote-a', 'send-1'), user('remote-b', 'send-1')])).toHaveLength(2);
+  });
+});
+
 describe('preferTimelineEvent', () => {
   it('prefers non-streaming terminal event over streaming event with same id', () => {
     const streaming = makeEvent({ eventId: 'transport:s:1', ts: 100, seq: 1, payload: { text: 'partial', streaming: true } });

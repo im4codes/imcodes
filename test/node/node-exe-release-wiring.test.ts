@@ -469,13 +469,13 @@ describe('controlled-node executable release wiring', () => {
     const runner = readFileSync('src/node/computer-use-runner.ts', 'utf8');
     const workflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
 
-    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.3.3');
+    expect(packageJson.devDependencies?.['open-computer-use']).toBe('1.1.4');
     const packageLock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as {
       packages?: Record<string, { version?: string; integrity?: string }>;
     };
     expect(packageLock.packages?.['node_modules/open-computer-use']).toMatchObject({
-      version: '0.3.3',
-      integrity: 'sha512-A4xCoXgu+Mwi2OdhL15FHY/VcnhhxIJwRgSmC2LwX9mTya85VO2NZN8PNholvgQeTeOlPpej+eEucHXtPhhVrA==',
+      version: '1.1.4',
+      integrity: 'sha512-rx2QUxvzb1ZFGKQjtk8J1eBIyUwv4xCSt7Pz7bA4Pq/zBNFGiGRe8Y36e/pxCDpvBXcZK7nZORSTv2P/0pPtWQ==',
     });
     expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
     expect(copyScript).toContain('open-computer-use must use an exact semver pin');
@@ -668,5 +668,44 @@ describe('headless compatibility release wiring', () => {
     expect(workflow).toContain('release_version, controlled-node-executables, controlled-node-compat-executable]');
     expect(workflow).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217');
     expect(workflow).toContain('controlled-node-compat');
+  });
+
+  it('wires unified desktop client manifests/runtime into Docker smoke while excluding full installers from the image', () => {
+    const workflow = parseYaml(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
+      jobs: {
+        docker: {
+          steps: Array<{ name?: string; run?: string; with?: Record<string, string> }>;
+        };
+      };
+    };
+    const dockerSteps = workflow.jobs.docker.steps;
+    const chmodStep = dockerSteps.find((s) => s.name === 'Restore executable bits actions/download-artifact drops');
+    expect(chmodStep?.run).toContain("! -name '*.deb'");
+    expect(chmodStep?.run).toContain("! -name '*.pkg'");
+    expect(chmodStep?.run).toContain("! -name '*.iss'");
+    expect(chmodStep?.run).toContain("! -name '*.ps1'");
+    expect(chmodStep?.run).toContain("! -name '*.cmd'");
+    expect(chmodStep?.run).toContain("! -name '*.txt'");
+    expect(chmodStep?.run).not.toContain("! -name '*.sh'");
+
+    const manifestStageStep = dockerSteps.find(
+      (s) => s.name === 'Generate controlled-node release artifacts manifest and stage flat release assets',
+    );
+    expect(manifestStageStep?.run).toContain('desktop-release.manifest.json');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg');
+    expect(manifestStageStep?.run).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe');
+
+    const smokeStep = dockerSteps.find((s) => s.name === 'Container startup smoke test');
+    expect(smokeStep?.run).toContain("fs.existsSync(path.join(root, 'installers'))");
+    expect(smokeStep?.run).toContain('validateDesktopReleaseManifest');
+    expect(smokeStep?.run).toContain('validateDaemonRuntimeManifest');
+    expect(smokeStep?.run).toMatch(/validateDaemonRuntimeManifest\([^;]+,\s*t\)/);
+
+    const dockerignore = readFileSync('.dockerignore', 'utf8')
+      .split(/\r?\n/u)
+      .map((line) => line.trim());
+    expect(dockerignore).toContain('server/controlled-node-artifacts/installers');
   });
 });

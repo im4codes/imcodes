@@ -260,4 +260,26 @@ describe('process session: origin chain rows', () => {
     bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN'), { now: 1_000 });
     expect(readProcessSharedMachineAuthority(SESSION, { sessionInstanceId: 'other', runtimeEpoch: 'epoch-1' }, 1_500, true)).toEqual(CLOSED);
   });
+
+  it('binds server-signed ownerMachineAuthority for clean owner turns and clears it when participant or unstamped owner mixes in', () => {
+    const record = { ...identity, state: 'idle' };
+    bindProcessSharedMachineCommand(SESSION, record, { data: 'run\r', ownerMachineAuthority: ' owner-tok ' }, 1_000);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_100, true)).toEqual({
+      required: false,
+      actorKind: 'owner',
+      authority: 'owner-tok',
+    });
+    expect(readProcessSharedMachineAuthority(SESSION, { sessionInstanceId: 'other', runtimeEpoch: 'epoch-1' }, 1_100, true))
+      .toEqual(OPEN);
+
+    // Unstamped local/internal owner activity clears ownerToken (fail closed)
+    bindProcessSharedMachineCommand(SESSION, record, { data: 'local\r' }, 1_200);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_300, true)).toEqual(OPEN);
+
+    // Re-bind ownerToken, then taint with participant activity -> participant restriction wins and ownerToken is gone
+    clearProcessSharedMachineAuthoritiesForTests();
+    bindProcessSharedMachineCommand(SESSION, record, { data: 'run\r', ownerMachineAuthority: 'owner-tok-2' }, 2_000);
+    bindProcessSharedMachineCommand(SESSION, record, { sharedActor: { actorUserId: 'p-1', effectiveActorRole: 'participant' }, sharedMachineAuthority: 'p-tok' }, 2_100);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 2_200, true)).toEqual(CLOSED);
+  });
 });

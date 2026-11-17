@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "json/value.h"
+#include "traffic_stats.h"
 #include "data_channel_constants.h"
 #include "signaling_types.h"
 
@@ -106,6 +107,17 @@ bool IsSafeId(const std::string& value);
 bool IsSafeCapability(const std::string& value);
 
 Json::Value BaseEnvelope(const char* type, const Authority& authority);
+
+inline Json::Value TrafficEnvelope(const Authority& authority,
+                                  const TrafficSample& sample,
+                                  const std::string& peer_id) {
+  Json::Value value = BaseEnvelope(kTrafficType, authority);
+  value["transportId"] = peer_id + ":" + sample.transport_id;
+  value["bytesSent"] = Json::UInt64(sample.bytes_sent);
+  value["bytesReceived"] = Json::UInt64(sample.bytes_received);
+  return value;
+}
+
 Json::Value TerminalEnvelope(const Authority& authority,
                              const char* reason);
 

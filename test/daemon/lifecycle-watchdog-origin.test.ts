@@ -18,7 +18,9 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 }));
 vi.mock('../../src/context/summary-compressor.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/context/summary-compressor.js')>()),
-  getStaleSessionCompressionRun: () => ({ runId: 'run-origin-1', trigger: 'test', eventCount: 1, startedAt: 0 }),
+  getStaleSessionCompressionRun: (_sessionName: string, nowMs: number, thresholdMs: number) => (
+    nowMs >= thresholdMs ? { runId: 'run-origin-1', trigger: 'test', eventCount: 1, startedAt: 0 } : null
+  ),
   resolveSessionCompressionWatchRuns: () => undefined,
 }));
 vi.mock('../../src/agent/session-manager.js', async (importOriginal) => ({
@@ -55,22 +57,16 @@ function activeRuntime(send: ReturnType<typeof vi.fn>) {
   };
 }
 
-function expectSystemContinue(emit: { mock: { calls: unknown[][] } }, send: ReturnType<typeof vi.fn>) {
-  const row = emit.mock.calls.find(([session, type]) => session === SESSION && type === 'user.message');
-  const payload = row?.[2] as Record<string, unknown>;
-  expect(payload).toMatchObject({ text: 'continue', [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
-  expect(classifyUserMessageOrigin(payload)).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
-  expect(send).toHaveBeenCalledWith('continue', expect.any(String), undefined, undefined,
-    expect.objectContaining({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM }));
-}
-
 describe('watchdog continue origin', () => {
-  it('does not auto-continue a stale memory-compression turn', async () => {
+  it('does not auto-continue a memory-compression turn even after the stale threshold while automatic compaction is disabled', async () => {
     const send = vi.fn(() => 'sent' as const);
-    runtimeRef.current = activeRuntime(send);
+    const runtime = activeRuntime(send);
+    runtimeRef.current = runtime;
     const emit = vi.spyOn(timelineEmitter, 'emit');
     expect(await recoverMemoryCompressionStalledSession(SESSION, 7 * 60_000)).toBe(false);
+    expect(await recoverMemoryCompressionStalledSession(SESSION, 13 * 60_000)).toBe(false);
     expect(send).not.toHaveBeenCalled();
+    expect(runtime.cancel).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
   });
 
@@ -100,5 +96,69 @@ describe('watchdog continue origin', () => {
     expect(classifyUserMessageOrigin(payload)).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
     expect(send).toHaveBeenCalledWith('continue', expect.any(String), undefined, undefined,
       expect.objectContaining({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM }));
+  });
+
+  it('captures ownerMachineAuthority before cancel() when stalled Codex continue queues, and omits it for participant turns', async () => {
+    let authorityCleared = false;
+    let activeOwnerAuth: string | null = 'owner-jwt-wd';
+    const send = vi.fn(() => 'queued' as const);
+    const cancel = vi.fn(async () => {
+      authorityCleared = true;
+      activeOwnerAuth = null;
+    });
+    runtimeRef.current = {
+      send,
+      cancel,
+      getActiveOwnerMachineAuthority: () => activeOwnerAuth,
+      requiresSharedMachineAuthority: () => false,
+      getDiagnosticSnapshot: () => ({
+        sending: true,
+        activeDispatchCount: 1,
+        blockingWorkCount: 0,
+        status: 'streaming',
+        activeToolCount: 0,
+        lastActivityAgeMs: 13 * 60_000,
+        activityGeneration: 'gen-origin-owner',
+        pendingVersion: 1,
+      }),
+    };
+
+    expect(await recoverCodexStalledSession({ name: SESSION, agentType: 'codex-sdk' })).toBe(true);
+    expect(authorityCleared).toBe(true);
+    expect(send).toHaveBeenCalledWith(
+      'continue',
+      expect.any(String),
+      undefined,
+      undefined,
+      expect.objectContaining({
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        ownerMachineAuthority: 'owner-jwt-wd',
+      }),
+    );
+
+    // Participant / mixed-turn fail-closed: never propagate ownerMachineAuthority
+    send.mockClear();
+    activeOwnerAuth = 'owner-jwt-wd';
+    runtimeRef.current = {
+      send,
+      cancel: vi.fn(async () => undefined),
+      getActiveOwnerMachineAuthority: () => null,
+      requiresSharedMachineAuthority: () => true,
+      getDiagnosticSnapshot: () => ({
+        sending: true,
+        activeDispatchCount: 1,
+        blockingWorkCount: 0,
+        status: 'streaming',
+        activeToolCount: 0,
+        lastActivityAgeMs: 13 * 60_000,
+        activityGeneration: 'gen-origin-participant',
+        pendingVersion: 2,
+      }),
+    };
+
+    expect(await recoverCodexStalledSession({ name: SESSION, agentType: 'codex-sdk' })).toBe(true);
+    const opts = send.mock.calls[0]?.[4] as Record<string, unknown> | undefined;
+    expect(opts).toMatchObject({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
+    expect(opts?.ownerMachineAuthority).toBeUndefined();
   });
 });

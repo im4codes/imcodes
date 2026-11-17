@@ -1,3 +1,4 @@
+import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 import { readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
@@ -349,6 +350,17 @@ export class TransportQueueStore {
         PRIMARY KEY (session_name, client_message_id)
       );
 
+      -- Logical system registrations survive native/runtime replacement. They
+      -- are private material, never a queue projection or public session DTO.
+      CREATE TABLE IF NOT EXISTS session_system_contracts (
+        session_name TEXT NOT NULL,
+        session_instance_id TEXT NOT NULL,
+        owner_key TEXT NOT NULL,
+        contract_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        PRIMARY KEY (session_name, session_instance_id, owner_key, contract_id)
+      );
+
       CREATE TABLE IF NOT EXISTS queue_private_material (
         session_name TEXT NOT NULL,
         client_message_id TEXT NOT NULL,
@@ -514,6 +526,39 @@ export class TransportQueueStore {
         diagnostic,
       };
     }
+  }
+
+  /** The native runtime epoch is intentionally NOT a read key: /clear and
+   * daemon restore recreate it. Logical instance + known scope are the owner. */
+  readSessionSystemContracts(sessionName: string, instance: string, owner: string): Map<string,string> {
+    const live = getSession(sessionName);
+    if (live?.sessionInstanceId && live.sessionInstanceId !== instance) return new Map();
+    const rows = this.db.prepare(`SELECT contract_id AS id, body FROM session_system_contracts
+      WHERE session_name = ? AND session_instance_id = ? AND owner_key = ?`).all(sessionName,instance,owner) as Array<{id:string;body:string}>;
+    return new Map(rows.map(row => [row.id,row.body]));
+  }
+
+  /** Registration/replacement/withdrawal is atomic and durable BEFORE provider
+   * admission. An old runtime may not resurrect a withdrawn registration. */
+  writeSessionSystemContracts(sessionName: string, instance: string, owner: string,
+    epoch: string | undefined, contracts: ReadonlyArray<{contractId:string;body:string}>): void {
+    const live = getSession(sessionName);
+    if (live && (live.sessionInstanceId !== instance || epoch && live.runtimeEpoch !== epoch)) {
+      throw new Error('System contract registration belongs to a replaced session runtime');
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const contract of contracts) {
+        if (contract.body.trim()) this.db.prepare(`INSERT INTO session_system_contracts
+          (session_name,session_instance_id,owner_key,contract_id,body) VALUES (?,?,?,?,?)
+          ON CONFLICT(session_name,session_instance_id,owner_key,contract_id) DO UPDATE SET body=excluded.body`)
+          .run(sessionName,instance,owner,contract.contractId,contract.body);
+        else this.db.prepare(`DELETE FROM session_system_contracts WHERE session_name = ?
+          AND session_instance_id = ? AND owner_key = ? AND contract_id = ?`)
+          .run(sessionName,instance,owner,contract.contractId);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
   private deleteSessionQueueStateRows(sessionName: string): Omit<DiscardTransportQueueStateResult, 'rebound'> {
@@ -758,6 +803,22 @@ export class TransportQueueStore {
       pendingCount: Number(row.pendingCount),
       oldestQueuedAt: Number(row.oldestQueuedAt),
     }));
+  }
+
+  /** Whether durable queue has strictly queued (not yet dispatched) user entries for a session. */
+  hasQueuedEntries(sessionName: string): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 FROM queue_entries WHERE session_name = ? AND status = 'queued' LIMIT 1`,
+    ).get(sessionName);
+    return Boolean(row);
+  }
+
+  /** Session names with active mid-dispatch rows (`handoff_inflight` or `dispatching`). */
+  listActiveDispatchSessionNames(): string[] {
+    const rows = this.db.prepare(
+      `SELECT DISTINCT session_name AS sessionName FROM queue_entries WHERE status IN ('handoff_inflight', 'dispatching')`,
+    ).all() as Array<{ sessionName: string }>;
+    return rows.map((row) => String(row.sessionName));
   }
 
   /** Sessions with any durable rows, including terminal failures left by a
@@ -2486,13 +2547,38 @@ export class TransportQueueStore {
 }
 
 let singleton: TransportQueueStore | null = null;
+let privateStore: TransportQueueStore | null = null;
+let routedStore: TransportQueueStore | null = null;
 
 export function getTransportQueueStore(): TransportQueueStore {
   singleton ??= new TransportQueueStore();
-  return singleton;
+  // Reuse the exact same synchronous queue state machine, but put private
+  // admission, prompts, handoff material and system contracts in RAM-only SQLite.
+  routedStore ??= new Proxy(singleton, {
+    get(target, key) {
+      const value = Reflect.get(target, key);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        const first = args[0];
+        const sessionName = typeof first === 'string' ? first
+          : first && typeof first === 'object' ? (first as { sessionName?: string }).sessionName : undefined;
+        if (isIncognitoSessionName(sessionName)) {
+          privateStore ??= new TransportQueueStore({ dbPath: ':memory:' });
+          return (Reflect.get(privateStore, key) as (...callArgs: unknown[]) => unknown).apply(privateStore, args);
+        }
+        const result = value.apply(target, args);
+        if (privateStore && ['listLiveQueueSessions', 'listQueueSessionsForReconciliation', 'listSessionNames'].includes(String(key))) {
+          return [...result, ...(Reflect.get(privateStore, key) as (...callArgs: unknown[]) => unknown[]).apply(privateStore, args)];
+        }
+        return result;
+      };
+    },
+  });
+  return routedStore;
 }
 
 export function resetTransportQueueStoreForTests(): void {
   singleton?.close();
   singleton = null;
+  privateStore?.close(); privateStore = null; routedStore = null;
 }

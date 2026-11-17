@@ -1,10 +1,11 @@
+import { TASK_PAIR_DECISION_MSG } from '../../../shared/task-pair-decision.js';
 import { TASK_PAIR_SCHEDULING_FIELD } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_FIELD } from '../../../shared/task-pair-title-access.js';
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
 import { TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
@@ -98,7 +99,7 @@ export type ShareCommandDecision =
   | { allowed: false; reason: ShareReason; closeSocket?: boolean };
 
 type ShareCommandPolicy =
-  | { kind: 'allow-covered-read'; requireTarget: boolean }
+  | { kind: 'allow-covered-read'; requireTarget: boolean; requireCanonicalSessionName?: boolean }
   | { kind: 'allow-main-covered-read' }
   | { kind: 'participant-covered-action' }
   | { kind: 'participant-bound-action' }
@@ -175,6 +176,8 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: TRANSPORT_MSG.CHAT_SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TRANSPORT_MSG.CHAT_HISTORY, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true, requireCanonicalSessionName: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true, requireCanonicalSessionName: true } },
   { bridgeCommand: TIMELINE_MESSAGES.HISTORY_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TIMELINE_MESSAGES.REPLAY_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TIMELINE_MESSAGES.PAGE_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -193,6 +196,8 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.ACK, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: TASK_PAIR_DECISION_MSG.HISTORY, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: TASK_PAIR_DECISION_MSG.FEEDBACK, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: SESSION_IDENTITY_WS.RESOLVE_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
@@ -364,6 +369,7 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
   [SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
   [SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
+  [TASK_PAIR_DECISION_MSG.RESPONSE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
   [SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactBriefResponse }],
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
@@ -603,6 +609,21 @@ export function evaluateShareCommand(input: {
     };
   }
 
+  if (policy.kind === 'allow-covered-read' && policy.requireCanonicalSessionName) {
+    const rawSessionName = input.msg.sessionName;
+    const canonicalSessionName = typeof rawSessionName === 'string'
+      && rawSessionName.trim().length > 0
+      && rawSessionName.trim() === rawSessionName
+      ? rawSessionName
+      : null;
+    if (!canonicalSessionName) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return shareStateCoversSession(input.state, canonicalSessionName)
+      ? { allowed: true }
+      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+  }
+
   const sessionName = commandSessionName(input.msg);
   // A whole-server participant covers every session on the server, including
   // ones that do not exist yet. Commands that carry no session at all -- the
@@ -702,6 +723,7 @@ export function evaluateShareCommand(input: {
       const {
         sharedActor: _clientActor,
         [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
+        [OWNER_MACHINE_AUTHORITY_FIELD]: _clientOwnerAuthority,
         ...rest
       } = input.msg;
       return {
@@ -709,6 +731,27 @@ export function evaluateShareCommand(input: {
         stampedMessage: {
           ...rest,
           sharedActor: buildSharedActorEnvelope(input.state, `share-input-${input.state.userId}`, input.now),
+        },
+      };
+    }
+    if (type === TASK_PAIR_DECISION_MSG.FEEDBACK) {
+      if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+        return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+      }
+      const {
+        sharedActor: _clientActor,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
+        [OWNER_MACHINE_AUTHORITY_FIELD]: _clientOwnerAuthority,
+        ...rest
+      } = input.msg;
+      const actionId = typeof input.msg.requestId === 'string' && input.msg.requestId.trim()
+        ? `pair-feedback-${input.msg.requestId.trim()}`
+        : `pair-feedback-${input.state.userId}`;
+      return {
+        allowed: true,
+        stampedMessage: {
+          ...rest,
+          sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
         },
       };
     }
@@ -1370,7 +1413,7 @@ const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
   TASK_PAIR_SCHEDULING_FIELD,
   'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking',
   'observedModel', 'observedThinking',
-  'brief', 'briefRevision', 'objective',
+  'brief', 'briefRevision', 'objective', 'blockedNote', 'decisionRequest', 'latestDecision', 'decisions',
 ]);
 
 function redactPairValue(value: unknown, state: ShareScopedSocketState): unknown {

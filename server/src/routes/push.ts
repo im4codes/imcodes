@@ -4,7 +4,7 @@
  * Dispatch: send push on session events (idle, notification, ask, error)
  *
  * iOS:                              APNs HTTP/2 with JWT auth
- * Android (International edition):  FCM legacy HTTP API
+ * Android (International edition):  FCM HTTP v1 API
  * Android (Mainland China edition): JPush v3 REST API (aggregates the Huawei /
  *                                   Xiaomi / OPPO / vivo / Honor vendor channels)
  *
@@ -23,37 +23,157 @@ import {
   PUSH_PLATFORM_IOS,
   PUSH_PLATFORM_ANDROID_FCM,
   PUSH_PLATFORM_ANDROID_JPUSH,
+  PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+  DEFAULT_PUSH_NOTIFICATION_TYPES,
   isPushPlatform,
+  isPushNotificationType,
+  sanitizePushEnabledServerIds,
+  isPushEnabledForServer,
+  resolvePushPayloadServerId,
+  shouldBypassServerPushMute,
   type PushPlatform,
+  type PushNotificationType,
 } from '../../../shared/push-notifications.js';
+import { getFullServersByUserId } from '../db/queries.js';
+import { listAccessibleControlledMachines } from '../share/machine-access.js';
+import { MACHINE_LIST_MAX_ITEMS } from '../../../shared/remote-exec.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-// Auth required for register/unregister but NOT for relay (self-hosted servers call relay without auth)
+// Auth required for register/unregister/preferences but NOT for relay (self-hosted servers call relay without auth)
 pushRoutes.use('/register', requireAuth());
 pushRoutes.use('/unregister', requireAuth());
+pushRoutes.use('/preferences', requireAuth());
 
 // POST /api/push/register — store device token for user
 pushRoutes.post('/register', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const body = await c.req.json<{ token: string; platform: PushPlatform }>().catch(() => null);
+  const body = await c.req.json<{ token: string; platform: PushPlatform; notificationTypes?: string[] }>().catch(() => null);
   if (!body?.token || !body?.platform) return c.json({ error: 'token and platform required' }, 400);
   if (!isPushPlatform(body.platform)) {
     return c.json({ error: `unsupported platform: ${body.platform}` }, 400);
   }
 
+  const rawTypes = body.notificationTypes;
+  const hasExplicitTypes = Array.isArray(rawTypes);
+  const notificationTypes = hasExplicitTypes
+    ? rawTypes.filter(isPushNotificationType)
+    : undefined;
+
   try {
-    await c.env.DB.execute(
-      `INSERT INTO push_tokens (user_id, token, platform, created_at)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform`,
-      [userId, body.token, body.platform, Date.now()],
-    );
+    if (hasExplicitTypes) {
+      await c.env.DB.execute(
+        `INSERT INTO push_tokens (user_id, token, platform, notification_types, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform, notification_types = excluded.notification_types`,
+        [userId, body.token, body.platform, notificationTypes, Date.now()],
+      );
+    } else {
+      await c.env.DB.execute(
+        `INSERT INTO push_tokens (user_id, token, platform, notification_types, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform`,
+        [userId, body.token, body.platform, DEFAULT_PUSH_NOTIFICATION_TYPES, Date.now()],
+      );
+    }
   } catch (err) {
     logger.warn({ err }, 'push_tokens insert failed');
   }
 
   return c.json({ ok: true });
+});
+
+// GET /api/push/preferences — get notification types and allowed servers preferences
+pushRoutes.get('/preferences', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const token = c.req.query('token');
+  let row: { notification_types?: string[] | null } | null = null;
+  if (token) {
+    row = await c.env.DB.queryOne<{ notification_types?: string[] | null }>(
+      'SELECT notification_types FROM push_tokens WHERE user_id = $1 AND token = $2 LIMIT 1',
+      [userId, token],
+    );
+  }
+  if (!row) {
+    row = await c.env.DB.queryOne<{ notification_types?: string[] | null }>(
+      'SELECT notification_types FROM push_tokens WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [userId],
+    );
+  }
+  const userRow = await c.env.DB.queryOne<{ push_enabled_server_ids?: string[] | null }>(
+    'SELECT push_enabled_server_ids FROM users WHERE id = $1 LIMIT 1',
+    [userId],
+  );
+  const types = (row && Array.isArray(row.notification_types))
+    ? row.notification_types
+    : DEFAULT_PUSH_NOTIFICATION_TYPES;
+  const enabledServerIds = Array.isArray(userRow?.push_enabled_server_ids)
+    ? sanitizePushEnabledServerIds(userRow.push_enabled_server_ids)
+    : null;
+  return c.json({
+    ok: true,
+    types,
+    defaultTypes: DEFAULT_PUSH_NOTIFICATION_TYPES,
+    enabledServerIds,
+  });
+});
+
+// POST /api/push/preferences — update notification types and/or allowed servers preferences
+pushRoutes.post('/preferences', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const body = await c.req.json<{ types?: unknown; enabledServerIds?: unknown; token?: string }>().catch(() => null);
+  if (!body) {
+    return c.json({ error: 'types or enabledServerIds array required' }, 400);
+  }
+  if (body.types !== undefined && !Array.isArray(body.types)) {
+    return c.json({ error: 'types must be an array' }, 400);
+  }
+  if (body.enabledServerIds !== undefined && body.enabledServerIds !== null && !Array.isArray(body.enabledServerIds)) {
+    return c.json({ error: 'enabledServerIds must be an array or null' }, 400);
+  }
+  const hasTypes = Array.isArray(body.types);
+  const hasEnabledServerIds = body.enabledServerIds === null || Array.isArray(body.enabledServerIds);
+  if (!hasTypes && !hasEnabledServerIds) {
+    return c.json({ error: 'types or enabledServerIds array required' }, 400);
+  }
+
+  const sanitizedTypes = hasTypes ? (body.types as unknown[]).filter(isPushNotificationType) : undefined;
+  const sanitizedServerIds = body.enabledServerIds === null
+    ? null
+    : Array.isArray(body.enabledServerIds)
+      ? sanitizePushEnabledServerIds(body.enabledServerIds)
+      : undefined;
+
+  try {
+    if (sanitizedTypes !== undefined) {
+      if (body.token) {
+        await c.env.DB.execute(
+          'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2 AND token = $3',
+          [sanitizedTypes, userId, body.token],
+        );
+      } else {
+        await c.env.DB.execute(
+          'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2',
+          [sanitizedTypes, userId],
+        );
+      }
+    }
+    if (sanitizedServerIds !== undefined) {
+      await c.env.DB.execute(
+        'UPDATE users SET push_enabled_server_ids = $1 WHERE id = $2',
+        [sanitizedServerIds, userId],
+      );
+    }
+  } catch (err) {
+    logger.error({ err, userId }, 'Failed to update push preferences');
+    return c.json({ error: 'failed to update push preferences' }, 500);
+  }
+
+  return c.json({
+    ok: true,
+    ...(sanitizedTypes !== undefined ? { types: sanitizedTypes } : {}),
+    ...(sanitizedServerIds !== undefined ? { enabledServerIds: sanitizedServerIds } : {}),
+  });
 });
 
 // DELETE /api/push/unregister — remove device token
@@ -87,7 +207,15 @@ pushRoutes.post('/badge-reset', async (c) => {
 // APNs rejects it and we return the error.
 
 pushRoutes.post('/relay', async (c) => {
-  const body = await c.req.json<{ token: string; platform: string; title: string; body: string; badge?: number; data?: Record<string, string> }>().catch(() => null);
+  const body = await c.req.json<{
+    token: string;
+    platform: string;
+    title: string;
+    body: string;
+    badge?: number;
+    data?: Record<string, string>;
+    type?: string;
+  }>().catch(() => null);
   if (!body?.token || !body?.platform || !body?.title) {
     return c.json({ error: 'token, platform, title, body required' }, 400);
   }
@@ -96,19 +224,27 @@ pushRoutes.post('/relay', async (c) => {
   // (Used to require APNs only; relaxed when JPush was added so a relay
   // server that holds only China credentials could still serve android-jpush.)
   const hasApns = !!(c.env.APNS_KEY && c.env.APNS_KEY_ID && c.env.APNS_TEAM_ID);
-  const hasFcm = !!c.env.FCM_SERVER_KEY;
+  const hasFcm = !!c.env.FCM_SERVICE_ACCOUNT_JSON?.trim();
   const hasJpush = !!(c.env.JPUSH_APP_KEY && c.env.JPUSH_MASTER_SECRET);
   if (!hasApns && !hasFcm && !hasJpush) {
     return c.json({ error: 'push relay not available on this server' }, 503);
   }
 
   try {
-    const relayPayload: PushPayload = { userId: '', title: body.title, body: body.body, badge: body.badge, data: body.data };
+    const relayType = isPushNotificationType(body.type) ? body.type : undefined;
+    const relayPayload: PushPayload = {
+      userId: '',
+      title: body.title,
+      body: body.body,
+      badge: body.badge,
+      data: body.data,
+      type: relayType,
+    };
     if (body.platform === PUSH_PLATFORM_IOS && hasApns) {
       await sendApns(body.token, relayPayload, c.env);
       return c.json({ ok: true });
     } else if (body.platform === PUSH_PLATFORM_ANDROID_FCM && hasFcm) {
-      await sendFcm(body.token, relayPayload, c.env.FCM_SERVER_KEY!);
+      await sendFcm(body.token, relayPayload, c.env.FCM_SERVICE_ACCOUNT_JSON!, c.env.FCM_PROJECT_ID);
       return c.json({ ok: true });
     } else if (body.platform === PUSH_PLATFORM_ANDROID_JPUSH && hasJpush) {
       await sendJpush(body.token, relayPayload, c.env.JPUSH_APP_KEY!, c.env.JPUSH_MASTER_SECRET!);
@@ -134,6 +270,19 @@ export interface PushPayload {
   body: string;
   badge?: number;
   data?: Record<string, string>;
+  type?: PushNotificationType;
+  serverId?: string;
+}
+
+async function getAccessiblePushServerIds(db: Database, userId: string): Promise<string[]> {
+  const [fullServers, controlledMachines] = await Promise.all([
+    getFullServersByUserId(db, userId),
+    listAccessibleControlledMachines(db, userId, Date.now(), MACHINE_LIST_MAX_ITEMS + 1),
+  ]);
+  const ids = new Set<string>();
+  for (const s of fullServers) ids.add(s.id);
+  for (const m of controlledMachines) ids.add(m.id);
+  return [...ids];
 }
 
 /**
@@ -154,11 +303,26 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     env = maybeEnv!;
   }
 
-  let tokens: Array<{ token: string; platform: string }> = [];
+  const targetServerId = resolvePushPayloadServerId(payload);
+
+  let tokens: Array<{
+    token: string;
+    platform: string;
+    notification_types?: string[] | null;
+    push_enabled_server_ids?: string[] | null;
+  }> = [];
   try {
-    tokens = await db.query<{ token: string; platform: string }>(
+    tokens = await db.query<{
+      token: string;
+      platform: string;
+      notification_types?: string[] | null;
+      push_enabled_server_ids?: string[] | null;
+    }>(
       // A disabled user's devices receive nothing (security/user-status.ts); their registrations stay, so enabling the account resumes it.
-      `SELECT t.token, t.platform FROM push_tokens t WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
+      `SELECT t.token, t.platform, t.notification_types, usr.push_enabled_server_ids
+       FROM push_tokens t
+       JOIN users usr ON usr.id = t.user_id
+       WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
       [payload.userId],
     );
   } catch (err) {
@@ -167,6 +331,26 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   }
 
   if (tokens.length === 0) return;
+
+  if (targetServerId && !shouldBypassServerPushMute(payload.type)) {
+    const rawEnabledServerIds = tokens[0].push_enabled_server_ids;
+    if (Array.isArray(rawEnabledServerIds)) {
+      if (!isPushEnabledForServer(rawEnabledServerIds, targetServerId, [])) return;
+    } else {
+      const accessibleServerIds = await getAccessiblePushServerIds(db, payload.userId);
+      if (!isPushEnabledForServer(null, targetServerId, accessibleServerIds)) return;
+    }
+  }
+
+  const matchingTokens = tokens.filter((t) => {
+    if (!payload.type) return true;
+    const allowed = Array.isArray(t.notification_types)
+      ? t.notification_types
+      : (DEFAULT_PUSH_NOTIFICATION_TYPES as readonly string[]);
+    return allowed.includes(payload.type);
+  });
+
+  if (matchingTokens.length === 0) return;
 
   // Atomically increment badge count and read the new value
   let badgeCount = 1;
@@ -182,7 +366,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   payload.badge = badgeCount;
 
   const hasApns = !!(env.APNS_KEY && env.APNS_KEY_ID && env.APNS_TEAM_ID);
-  const hasFcm = !!env.FCM_SERVER_KEY;
+  const hasFcm = !!env.FCM_SERVICE_ACCOUNT_JSON?.trim();
   const hasJpush = !!(env.JPUSH_APP_KEY && env.JPUSH_MASTER_SECRET);
   // Self-hosted server detection: no push credentials of any kind configured
   // → this is a self-hosted instance, relay everything through the central
@@ -190,7 +374,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   const isSelfHosted = !hasApns && !hasFcm && !hasJpush;
   const relayUrl = isSelfHosted ? (env.PUSH_RELAY_URL || 'https://app.im.codes') : null;
 
-  for (const { token, platform } of tokens) {
+  for (const { token, platform } of matchingTokens) {
     try {
       if (relayUrl) {
         // Self-hosted: relay through central server
@@ -198,7 +382,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
       } else if (platform === PUSH_PLATFORM_IOS && hasApns) {
         await sendApns(token, payload, env);
       } else if (platform === PUSH_PLATFORM_ANDROID_FCM && hasFcm) {
-        await sendFcm(token, payload, env.FCM_SERVER_KEY!);
+        await sendFcm(token, payload, env.FCM_SERVICE_ACCOUNT_JSON!, env.FCM_PROJECT_ID);
       } else if (platform === PUSH_PLATFORM_ANDROID_JPUSH && hasJpush) {
         await sendJpush(token, payload, env.JPUSH_APP_KEY!, env.JPUSH_MASTER_SECRET!);
       }
@@ -223,6 +407,7 @@ async function relayPush(relayBaseUrl: string, token: string, platform: string, 
       body: payload.body,
       badge: payload.badge,
       data: payload.data,
+      type: payload.type,
     }),
     signal: AbortSignal.timeout(10_000),
   });
@@ -234,7 +419,7 @@ async function relayPush(relayBaseUrl: string, token: string, platform: string, 
   }
 }
 
-class PushError extends Error {
+export class PushError extends Error {
   constructor(message: string, public unregistered = false) {
     super(message);
   }
@@ -333,28 +518,186 @@ async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Pr
   }
 }
 
-// ── FCM (Android) ─────────────────────────────────────────────────────────────
+// ── FCM HTTP v1 (Android) ────────────────────────────────────────────────────
 
-async function sendFcm(deviceToken: string, payload: PushPayload, serverKey: string): Promise<void> {
-  const body = {
-    to: deviceToken,
-    notification: { title: payload.title, body: payload.body },
-    data: payload.data ?? {},
-  };
+const FCM_SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
+const DEFAULT_FCM_TOKEN_URI = 'https://oauth2.googleapis.com/token';
+const FCM_TOKEN_REFRESH_LEEWAY_MS = 5 * 60 * 1000;
 
-  const res = await fetch('https://fcm.googleapis.com/fcm/send', {
+interface FcmServiceAccount {
+  project_id: string;
+  client_email: string;
+  private_key: string;
+  token_uri?: string;
+}
+
+interface FcmTokenCacheEntry {
+  accessToken: string;
+  expiresAt: number;
+}
+
+const fcmTokenCache = new Map<string, FcmTokenCacheEntry>();
+const fcmTokenFlights = new Map<string, Promise<string>>();
+
+/** Clear FCM OAuth state between tests and after credential rotation. */
+export function resetFcmAuthCacheForTesting(): void {
+  fcmTokenCache.clear();
+  fcmTokenFlights.clear();
+}
+
+function parseFcmServiceAccount(raw: string): FcmServiceAccount {
+  const source = raw.trim();
+  if (!source) throw new Error('FCM_SERVICE_ACCOUNT_JSON is empty');
+
+  let json = source;
+  if (!source.startsWith('{')) {
+    try {
+      json = Buffer.from(source, 'base64').toString('utf8');
+    } catch {
+      throw new Error('FCM_SERVICE_ACCOUNT_JSON is not valid JSON or base64 JSON');
+    }
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error('FCM_SERVICE_ACCOUNT_JSON is not valid JSON');
+  }
+  if (!parsed || typeof parsed !== 'object') throw new Error('FCM service account must be a JSON object');
+  const value = parsed as Record<string, unknown>;
+  const projectId = typeof value.project_id === 'string' ? value.project_id.trim() : '';
+  const clientEmail = typeof value.client_email === 'string' ? value.client_email.trim() : '';
+  const privateKey = typeof value.private_key === 'string' ? value.private_key.replace(/\\n/g, '\n') : '';
+  if (!projectId || !clientEmail || !privateKey) {
+    throw new Error('FCM service account requires project_id, client_email, and private_key');
+  }
+  const tokenUri = typeof value.token_uri === 'string' && value.token_uri.trim()
+    ? value.token_uri.trim()
+    : DEFAULT_FCM_TOKEN_URI;
+  let parsedUri: URL;
+  try {
+    parsedUri = new URL(tokenUri);
+  } catch {
+    throw new Error('FCM service account token_uri must be a valid HTTPS URL');
+  }
+  if (parsedUri.protocol !== 'https:') throw new Error('FCM service account token_uri must use HTTPS');
+  return { project_id: projectId, client_email: clientEmail, private_key: privateKey, token_uri: parsedUri.toString() };
+}
+
+async function fetchFcmAccessToken(account: FcmServiceAccount): Promise<FcmTokenCacheEntry> {
+  const tokenUri = account.token_uri ?? DEFAULT_FCM_TOKEN_URI;
+  const key = await importPKCS8(account.private_key, 'RS256');
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = await new SignJWT({ scope: FCM_SCOPE })
+    .setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
+    .setIssuer(account.client_email)
+    .setSubject(account.client_email)
+    .setAudience(tokenUri)
+    .setIssuedAt(now)
+    .setExpirationTime(now + 3600)
+    .sign(key);
+
+  const response = await fetch(tokenUri, {
     method: 'POST',
-    headers: {
-      Authorization: `key=${serverKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
   });
+  const text = await response.text().catch(() => '');
+  let body: { access_token?: unknown; expires_in?: unknown; error?: unknown } = {};
+  try { body = JSON.parse(text) as typeof body; } catch { /* handled below */ }
+  if (!response.ok || typeof body.access_token !== 'string') {
+    throw new Error(`FCM OAuth token request failed (${response.status}): ${text}`);
+  }
+  const expiresIn = typeof body.expires_in === 'number' && Number.isFinite(body.expires_in)
+    ? body.expires_in
+    : 3600;
+  return {
+    accessToken: body.access_token,
+    expiresAt: Date.now() + Math.max(60, expiresIn) * 1000,
+  };
+}
 
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    const unregistered = errBody.includes('NotRegistered');
-    throw new PushError(`FCM ${res.status}: ${errBody}`, unregistered);
+async function getFcmAccessToken(account: FcmServiceAccount): Promise<string> {
+  const cacheKey = `${account.project_id}:${account.client_email}`;
+  const cached = fcmTokenCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt - FCM_TOKEN_REFRESH_LEEWAY_MS) return cached.accessToken;
+
+  const existingFlight = fcmTokenFlights.get(cacheKey);
+  if (existingFlight) return existingFlight;
+
+  const flight = (async () => {
+    const entry = await fetchFcmAccessToken(account);
+    fcmTokenCache.set(cacheKey, entry);
+    return entry.accessToken;
+  })();
+  fcmTokenFlights.set(cacheKey, flight);
+  try {
+    return await flight;
+  } finally {
+    if (fcmTokenFlights.get(cacheKey) === flight) fcmTokenFlights.delete(cacheKey);
+  }
+}
+
+function fcmData(payload: PushPayload): Record<string, string> {
+  const data: Record<string, string> = {};
+  for (const [key, value] of Object.entries(payload.data ?? {})) {
+    if (value !== undefined && value !== null) data[key] = String(value);
+  }
+  return data;
+}
+
+function fcmErrorIsUnregistered(status: number, text: string): boolean {
+  let body: { error?: { status?: string; details?: Array<{ errorCode?: string }> } } = {};
+  try { body = JSON.parse(text) as typeof body; } catch { /* non-JSON error */ }
+  const details = body.error?.details ?? [];
+  const hasUnregisteredDetail = details.some((detail) => detail?.errorCode === 'UNREGISTERED');
+  return status === 410 || hasUnregisteredDetail;
+}
+
+export async function sendFcm(
+  deviceToken: string,
+  payload: PushPayload,
+  serviceAccountRaw: string,
+  projectIdOverride?: string,
+): Promise<void> {
+  const account = parseFcmServiceAccount(serviceAccountRaw);
+  const projectId = projectIdOverride?.trim() || account.project_id;
+  if (!projectId) throw new Error('FCM project_id is required');
+  const cacheKey = `${projectId}:${account.client_email}`;
+  const data = fcmData(payload);
+  const message: Record<string, unknown> = {
+    token: deviceToken,
+    notification: { title: payload.title, body: payload.body },
+    android: {
+      priority: 'HIGH',
+      notification: { sound: 'default' },
+    },
+  };
+  if (Object.keys(data).length > 0) message.data = data;
+
+  let retriedAuth = false;
+  while (true) {
+    const accessToken = await getFcmAccessToken({ ...account, project_id: projectId });
+    const response = await fetch(
+      `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      },
+    );
+    const text = await response.text().catch(() => '');
+    if (response.ok) return;
+    if (response.status === 401 && !retriedAuth) {
+      fcmTokenCache.delete(cacheKey);
+      retriedAuth = true;
+      continue;
+    }
+    throw new PushError(`FCM ${response.status}: ${text}`, fcmErrorIsUnregistered(response.status, text));
   }
 }
 
@@ -394,7 +737,8 @@ export async function sendJpush(
         // priority 1 (high) — developer-tool notifications should arrive
         // promptly but are not life-critical. Value 2 (max) is reserved by
         // most vendors for IM-class and triggers stricter quota checks.
-        priority: 1,
+        // Highest-level security warning (remote desktop auto unlock) uses max priority 2.
+        priority: payload.type === PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP ? 2 : 1,
         // Maps to Android Notification.CATEGORY_SERVICE — matches what this
         // app actually emits ("AI agent finished a task", "session needs
         // your attention"). NOT 'msg' / CATEGORY_MESSAGE: that's the IM

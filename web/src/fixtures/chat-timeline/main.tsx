@@ -54,8 +54,27 @@ import { render } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import '../../styles.css';
 import '../../i18n/index.js';
+import { SupervisionTaskConsoleView } from '../../components/SupervisionTaskConsole.js';
+import { createSupervisionTaskConsoleState, SUPERVISION_TASK_CONSOLE_PHASE, SUPERVISION_TASK_CONSOLE_SYNC_STATE } from '../../supervision-task-console-reducer.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
+import { SubSessionWindow } from '../../components/SubSessionWindow.js';
+import { SubSessionBar } from '../../components/SubSessionBar.js';
+import { SUBSESSION_DESKTOP_LAYOUT } from '../../subsession-desktop-layout-preference.js';
+import {
+  getMobileKeyboardState,
+  isMobileKeyboardInputTarget,
+  isSubSessionBarInputTarget,
+} from '../../mobile-keyboard.js';
+import type { SubSession } from '../../hooks/useSubSessions.js';
+import type { SessionInfo } from '../../types.js';
+import { ChatLocalImagePreview } from '../../components/ChatLocalImagePreview.js';
+import { SessionControls } from '../../components/SessionControls.js';
 import { ChatView, __buildViewItemsForTests } from '../../components/ChatView.js';
-import type { TimelineEvent } from '../../ws-client.js';
+import { WsClient, type TimelineEvent } from '../../ws-client.js';
+import { bindTaskPairDecisions, receiveTaskPairDecision } from '../../task-pair-decisions.js';
+import type { TaskPairDecisionRecord } from '@shared/task-pair-decision.js';
+import { ingestSessionRepoContext } from '../../session-repo-context-store.js';
 import {
   CHAT_TIMELINE_FIXTURE_DEFAULT_BASE_TS,
   CHAT_TIMELINE_FIXTURE_DEFAULT_SEED,
@@ -122,6 +141,8 @@ export interface ChatTimelineHarnessApi {
   eventCount(): number;
   /** Replaces the live event list (used by deterministic integration probes). */
   setEvents(events: TimelineEvent[]): void;
+  /** In-memory IO boundary for the real lazy decision consumer (never a daemon). */
+  setDecisionRecords(records: TaskPairDecisionRecord[]): void;
   /** Appends one new event under a fresh `eventId`. Returns that id. */
   appendEvent(options?: { type?: string; text?: string }): string;
   /**
@@ -154,6 +175,17 @@ const fixturePinsEnabled = query.get('pins') === '1';
  * measure against the elements a chat overlay must never reach.
  */
 const fixtureChromeEnabled = query.get('chrome') === '1';
+// Opt-in real titlebar/portal controls for responsive pair-card regression tests.
+// This client is deliberately never connected; browser tests own the IO boundary.
+const pairControls = query.get('pairControls') === '1';
+const fixtureWs = pairControls ? new WsClient('', 'fixture-server') : undefined;
+const fixtureWorkdir = pairControls && query.has('branch') ? '/scoped-fixture-project' : undefined;
+if (fixtureWorkdir) for (let i = 0; i < windowCount; i++) ingestSessionRepoContext({ sessionId: `fixture-window-${i}`, projectDir: fixtureWorkdir, context: { currentBranch: query.get('branch') } });
+let decisionRecords: TaskPairDecisionRecord[] = [];
+if (pairControls) bindTaskPairDecisions(({ requestId }) => {
+  window.dispatchEvent(new CustomEvent('fixture:decision-request'));
+  setTimeout(() => receiveTaskPairDecision(requestId, { ok: true, decisions: decisionRecords, revision: 'fixture' }), 50);
+});
 /** Live events array. Replaced (never mutated) on every harness update. */
 let currentEvents: TimelineEvent[] = initialEvents;
 let publishEvents: ((next: TimelineEvent[]) => void) | null = null;
@@ -228,6 +260,7 @@ const harness: ChatTimelineHarnessApi = {
   setEvents(events) {
     publish([...events]);
   },
+  setDecisionRecords(records) { decisionRecords = records; },
   appendEvent(options = {}) {
     const type = options.type ?? 'assistant.text';
     const text = options.text ?? `Harness appended message ${harnessCounter + 1}.`;
@@ -301,6 +334,236 @@ function FixtureBottomChrome() {
   );
 }
 
+// Opt-in production sub-window header fixture; no live socket or daemon session.
+function FixtureSubWindow() {
+  const [maximized, setMaximized] = useState(false);
+  const sub: SubSession = { id: 'fixture-header', serverId: 'fixture-server', type: 'codex-sdk', runtimeType: 'transport', shellBin: null, cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Fixture worker', ccPresetId: null, sessionName: 'fixture-window-0', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+  return <SubSessionWindow sub={sub} ws={null} connected={false} active serverId="fixture-server" zIndex={10}
+    onDiff={() => {}} onHistory={() => {}} onMinimize={() => {}} onClose={() => {}} onRestart={() => {}} onRename={() => {}} onFocus={() => {}}
+    onPin={() => {}} maximized={maximized} onToggleMaximized={() => setMaximized(value => !value)}
+    getMaximizeBounds={() => ({ x: 0, y: 0, w: innerWidth, h: innerHeight })} />;
+}
+
+function useFixtureMobileKeyboardClasses(): void {
+  useEffect(() => {
+    const vv = window.visualViewport;
+    let inputFocused = false;
+    let subCardInputFocused = false;
+    let hadKeyboardOpen = false;
+    const update = () => {
+      const vh = vv?.height ?? window.innerHeight;
+      const shrink = Math.max(0, window.innerHeight - vh);
+      const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
+      hadKeyboardOpen = state.hadKeyboardOpen;
+      document.documentElement.classList.toggle('kb-open', state.kbOpen);
+      document.documentElement.classList.toggle('input-focused', state.hideInputUi);
+      document.documentElement.classList.toggle('subcard-input-focused', state.hideInputUi && subCardInputFocused);
+    };
+    const onFocusIn = (e: FocusEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (!el) return;
+      inputFocused = isMobileKeyboardInputTarget(el);
+      subCardInputFocused = isSubSessionBarInputTarget(el);
+      document.documentElement.classList.toggle('input-focused', inputFocused);
+      document.documentElement.classList.toggle('subcard-input-focused', inputFocused && subCardInputFocused);
+    };
+    const onFocusOut = () => {
+      inputFocused = false;
+      subCardInputFocused = false;
+      hadKeyboardOpen = false;
+      document.documentElement.classList.remove('input-focused', 'subcard-input-focused');
+      update();
+    };
+    vv?.addEventListener('resize', update);
+    window.addEventListener('resize', update);
+    document.addEventListener('focusin', onFocusIn);
+    document.addEventListener('focusout', onFocusOut);
+    return () => {
+      vv?.removeEventListener('resize', update);
+      window.removeEventListener('resize', update);
+      document.removeEventListener('focusin', onFocusIn);
+      document.removeEventListener('focusout', onFocusOut);
+      document.documentElement.classList.remove('kb-open', 'input-focused', 'subcard-input-focused');
+    };
+  }, []);
+}
+
+// Opt-in production SubSessionBar + SubSessionCard + SubSessionWindow IME/focus fixture.
+function FixtureSubBar() {
+  const [openIds, setOpenIds] = useState<string[]>([]);
+  const [focusedSubId, setFocusedSubId] = useState<string | null>(null);
+  const [maximizedIds, setMaximizedIds] = useState<string[]>([]);
+  const [showWindow, setShowWindow] = useState(query.get('openWindow') === '1');
+  const [windowMinimizedCount, setWindowMinimizedCount] = useState(0);
+  const subTransport: SubSession = { id: 'sub-tr', serverId: 'fixture-server', type: 'codex-sdk', runtimeType: 'transport', shellBin: null, cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Transport', ccPresetId: null, sessionName: 'fixture-sub-tr', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+  const subShell: SubSession = { id: 'sub-sh', serverId: 'fixture-server', type: 'shell', runtimeType: 'process', shellBin: '/bin/bash', cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Shell', ccPresetId: null, sessionName: 'fixture-sub-sh', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+
+  useFixtureMobileKeyboardClasses();
+
+  const useFallbackInput = query.get('fallback') === '1';
+  const subBarWs = useFallbackInput ? null : ({
+    sendSessionCommand: () => {},
+    send: () => {},
+    subscribeTerminal: () => {},
+    onMessage: () => () => {},
+    getDaemonCapabilitySnapshot: () => null,
+    onDaemonCapabilitySnapshot: () => () => {},
+    fsGitStatus: () => '1',
+  } as unknown as WsClient);
+
+  const quickData = {
+    data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+    loaded: true,
+    recordHistory: () => {},
+    addCommand: () => {},
+    addPhrase: () => {},
+    removeCommand: () => {},
+    removePhrase: () => {},
+    removeHistory: () => {},
+    removeSessionHistory: () => {},
+    clearHistory: () => {},
+    clearSessionHistory: () => {},
+  };
+
+  return (
+    <div
+      data-testid="fixture-subbar-host"
+      data-open-ids={openIds.join(',')}
+      data-focused-id={focusedSubId ?? ''}
+      data-maximized-ids={maximizedIds.join(',')}
+      data-window-minimized-count={String(windowMinimizedCount)}
+      style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw' }}
+    >
+      <div style={{ flex: '1 1 auto', padding: 12 }}>
+        <div
+          contenteditable="true"
+          role="textbox"
+          class="controls-input"
+          data-testid="main-composer"
+          data-placeholder="Main session input"
+        />
+      </div>
+      {showWindow && (
+        <SubSessionWindow
+          sub={subTransport}
+          ws={subBarWs}
+          connected={true}
+          active
+          serverId="fixture-server"
+          zIndex={20}
+          onDiff={() => {}}
+          onHistory={() => {}}
+          onMinimize={() => { setWindowMinimizedCount((c) => c + 1); setShowWindow(false); }}
+          onClose={() => setShowWindow(false)}
+          onRestart={() => {}}
+          onRename={() => {}}
+          onFocus={() => setFocusedSubId(subTransport.id)}
+        />
+      )}
+      <SubSessionBar
+        desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL}
+        subSessions={[subTransport, subShell]}
+        openIds={new Set(openIds)}
+        maximizedIds={new Set(maximizedIds)}
+        focusedSubId={focusedSubId}
+        collapsed={false}
+        desktopLayoutCapable={window.matchMedia('(pointer: fine)').matches}
+        onOpen={(id) => {
+          setOpenIds((prev) => (prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]));
+          setFocusedSubId(id);
+        }}
+        onFocus={(id) => setFocusedSubId(id)}
+        onOpenMaximized={(id) => {
+          setOpenIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+          setMaximizedIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+        }}
+        onMaximize={(id) => setMaximizedIds((prev) => (prev.includes(id) ? prev : [...prev, id]))}
+        onRestore={(id) => setMaximizedIds((prev) => prev.filter((item) => item !== id))}
+        onClose={() => {}}
+        onRestart={() => {}}
+        ws={subBarWs}
+        connected={true}
+        serverId="fixture-server"
+        onDiff={() => {}}
+        onHistory={() => {}}
+        quickData={useFallbackInput ? undefined : (quickData as any)}
+      />
+    </div>
+  );
+}
+
+const FIXTURE_IMAGE_DATA_URL = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="220"><rect width="320" height="220" fill="#38bdf8"/></svg>');
+const fixtureLoadImagePreview = async () => ({ dataUrl: FIXTURE_IMAGE_DATA_URL, alt: 'sent-photo.png' });
+
+// Opt-in production ChatLocalImagePreview + SessionControls mobile layout-shift regression fixture.
+function FixtureMobileImageTap() {
+  useFixtureMobileKeyboardClasses();
+  const activeSession: SessionInfo = {
+    name: 'deck_fixture_main',
+    project: 'fixture',
+    role: 'brain',
+    agentType: 'claude-code-sdk',
+    state: 'idle',
+    runtimeType: 'transport',
+    projectDir: '/tmp/fixture',
+  };
+  const ws = {
+    connected: true,
+    send: () => {},
+    sendSessionCommand: () => {},
+    onMessage: () => () => {},
+    subscribeTerminal: () => {},
+    getDaemonCapabilitySnapshot: () => null,
+    onDaemonCapabilitySnapshot: () => () => {},
+    fsGitStatus: () => '1',
+  } as unknown as WsClient;
+  const quickData = {
+    data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+    loaded: true,
+    recordHistory: () => {},
+    addCommand: () => {},
+    addPhrase: () => {},
+    removeCommand: () => {},
+    removePhrase: () => {},
+    removeHistory: () => {},
+    removeSessionHistory: () => {},
+    clearHistory: () => {},
+    clearSessionHistory: () => {},
+  };
+  return (
+    <div
+      data-testid="fixture-mobile-image-tap"
+      style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw', overflow: 'hidden', background: '#0b1220' }}
+    >
+      <div
+        class="chat-view"
+        tabIndex={-1}
+        style={{ flex: '1 1 0%', minHeight: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', overflowY: 'auto', padding: '0 12px' }}
+      >
+        <ChatLocalImagePreview
+          path="/repo/sent-photo.png"
+          loadImagePreview={fixtureLoadImagePreview}
+        />
+      </div>
+      <SessionControls
+        ws={ws}
+        activeSession={activeSession}
+        connected={true}
+        quickData={quickData as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="fixture-server"
+      />
+      <div class="subcard-bar" style={{ height: '64px', flexShrink: 0, background: '#111827' }}>
+        subcard-bar
+      </div>
+      <div class="session-usage-footer" style={{ height: '28px', flexShrink: 0, background: '#0f172a' }}>
+        usage-footer
+      </div>
+    </div>
+  );
+}
+
 function FixtureHarness() {
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   publishEvents = setEvents;
@@ -312,6 +575,10 @@ function FixtureHarness() {
     return () => { publishEvents = null; publishOlderState = null; };
   }, []);
 
+  if (query.get('mobileImageTap') === '1') return <FixtureMobileImageTap />;
+  if (query.get('subWindow') === '1') return <FixtureSubWindow />;
+  if (query.get('subBar') === '1') return <FixtureSubBar />;
+
   const cellStyle = windowCount === 4
     ? { height: '50vh', width: '50vw', display: 'flex', flexDirection: 'column' as const, overflow: 'hidden', boxSizing: 'border-box' as const, border: '1px solid #222' }
     : { height: '100vh', width: '100vw', display: 'flex', flexDirection: 'column' as const, overflow: 'hidden' };
@@ -319,6 +586,19 @@ function FixtureHarness() {
   const containerStyle = windowCount === 4
     ? { display: 'flex', flexWrap: 'wrap' as const, width: '100vw', height: '100vh' }
     : { width: '100vw', height: '100vh' };
+
+  // Opt-in real console consumer, sharing the same synthetic event IO seam.
+  // This fixture-only module is excluded from normal production builds.
+  if (query.get('console') === '1') {
+    const event = events.find(entry => entry.type === TASK_PAIR_TIMELINE_EVENT);
+    const payload = event?.payload as (SupervisionConsolePairInfo & { taskId: string; title: string }) | undefined;
+    const state = createSupervisionTaskConsoleState({ projectName: 'fixture', coordinatorSessionName: 'fixture-brain' });
+    return <div style={{ display: 'flex', height: '100vh', width: '100vw' }}>
+      <SupervisionTaskConsoleView mobile={window.innerWidth <= 720} width={Math.min(window.innerWidth, 720)} onClose={() => {}} onNavigateSession={session => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session } }))}
+        state={{ ...state, phase: SUPERVISION_TASK_CONSOLE_PHASE.READY, hasAuthoritativeSnapshot: true, syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+          tasks: payload ? { [payload.taskId]: { taskId: payload.taskId, title: payload.title, status: 'implementing', phase: 'active', validationState: 'pending', updatedAt: event!.ts, lastEventId: 1, pair: payload } } : {} }} />
+    </div>;
+  }
 
   return (
     <div
@@ -340,6 +620,12 @@ function FixtureHarness() {
                 sessionId={`fixture-window-${i}`}
                 serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
                 messagePinsEnabled={fixturePinsEnabled}
+                scopeTaskPairs={query.get('scope') === '1'}
+                taskPairPanelVisitKey={query.get('visit') ?? undefined}
+                ws={fixtureWs}
+                workdir={fixtureWorkdir}
+                onViewRepo={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:repo')) : undefined}
+                onForceSync={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:sync')) : undefined}
               />
             </div>
           ) : (
@@ -352,6 +638,12 @@ function FixtureHarness() {
               sessionId={`fixture-window-${i}`}
               serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
               messagePinsEnabled={fixturePinsEnabled}
+              scopeTaskPairs={query.get('scope') === '1'}
+              taskPairPanelVisitKey={query.get('visit') ?? undefined}
+              ws={fixtureWs}
+              workdir={fixtureWorkdir}
+              onViewRepo={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:repo')) : undefined}
+              onForceSync={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:sync')) : undefined}
             />
           )}
           {fixtureChromeEnabled && <FixtureBottomChrome />}

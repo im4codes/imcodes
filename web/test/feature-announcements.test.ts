@@ -38,6 +38,21 @@ describe('feature announcement registry', () => {
     expect(nextFeatureAnnouncement({ dismissed: ['pins@1'] }, [v1, v2])).toEqual(v2);
   });
 
+  it('registers message-pins@1 first and cloud-docs@1 after it with its icon', () => {
+    expect(FEATURE_ANNOUNCEMENTS[0]).toMatchObject({
+      id: 'message-pins',
+      version: 1,
+      messageKey: 'featureAnnouncements.messagePins',
+    });
+    expect(FEATURE_ANNOUNCEMENTS[1]).toMatchObject({
+      id: 'cloud-docs',
+      version: 1,
+      messageKey: 'featureAnnouncements.cloudDocs',
+      icon: '☁️',
+    });
+    expect(nextFeatureAnnouncement({ dismissed: ['message-pins@1'] })).toEqual(FEATURE_ANNOUNCEMENTS[1]);
+  });
+
   it('keeps malformed persisted data fail-open without throwing', () => {
     expect(nextFeatureAnnouncement({ dismissed: null as unknown as string[] }, FEATURE_ANNOUNCEMENTS)).toEqual(FEATURE_ANNOUNCEMENTS[0]);
     expect(dismissFeatureAnnouncement(undefined, FEATURE_ANNOUNCEMENTS[0]!)).toEqual({ dismissed: ['message-pins@1'] });

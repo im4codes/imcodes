@@ -1,3 +1,4 @@
+import { FILE_RELAY_MODE } from '../r2-relay.js';
 /**
  * Shared types for the file transfer channel (upload / download).
  * Used by server, daemon, and web.
@@ -431,6 +432,8 @@ export interface FileUploadRequest {
 }
 
 export interface FileUploadFetchRequest {
+  /** Sent only after the independent R2 capability is negotiated. */
+  relayMode?: typeof FILE_RELAY_MODE.R2;
   type: 'file.upload_fetch';
   uploadId: string;
   filename: string;
@@ -833,7 +836,7 @@ export function validateControlledFileTransferRequest(
   if (value.type === FILE_TRANSFER_MSG.DELETE) return validateFileDeleteRequest(value);
   if (value.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return validateMacosOpenFullDiskAccessRequest(value);
   if (value.type === 'file.upload_fetch') {
-    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'sanitizedName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
+    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'sanitizedName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory', 'relayMode']))
       || !isTransferId(value.uploadId)
       || typeof value.filename !== 'string' || !/^[a-f0-9]{16,128}(\.[A-Za-z0-9]{1,20})?$/.test(value.filename)
       || (value.originalName !== undefined && !isBoundedString(value.originalName, 1024))
@@ -842,6 +845,7 @@ export function validateControlledFileTransferRequest(
       || (value.clientUploadId !== undefined && !isTransferId(value.clientUploadId))
       || (value.destinationDirectory !== undefined && !isBoundedString(value.destinationDirectory, FILE_TRANSFER_PATH_MAX_BYTES))
       || !isSafeSize(value.size)
+      || (value.relayMode !== undefined && value.relayMode !== FILE_RELAY_MODE.R2)
       || !isBoundedString(value.downloadUrl, 8192)) {
       return { ok: false, error: 'invalid_upload_fetch' };
     }

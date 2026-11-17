@@ -250,6 +250,9 @@ function canonicalConnections(
       && safeString(connection.label, 256)
       && Number.isSafeInteger(connection.connectedAt)
       && connection.connectedAt >= 0)
+    // The native IPC v1 client strictly rejects additive fields. The WebView
+    // panel reads traffic through local HTTP; keep v1 snapshots unchanged.
+    .map(({ id, label, connectedAt, mode }) => ({ id, label, connectedAt, mode }))
     .sort((left, right) => left.connectedAt - right.connectedAt || left.id.localeCompare(right.id));
 }
 

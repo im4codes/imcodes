@@ -57,6 +57,7 @@ import {
   updateCapabilityOperation,
 } from '../db/capabilities.js';
 import { requireAuth, requireOwner } from '../security/authorization.js';
+import { resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { sha256Hex } from '../security/crypto.js';
 import {
   toCapabilityOperationWire,
@@ -240,6 +241,8 @@ async function broadcastCapabilitySyncSafely(
 
 capabilityRoutes.get('/capabilities', requireOwner(), async (c) => {
   if (!rateLimit(c)) return c.json(errorBody(CAPABILITY_ERROR.RATE_LIMITED), 429);
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const rawLimit = c.req.query('limit');
   const limit = rawLimit ? Number(rawLimit) : CAPABILITY_LIMITS.LIST_DEFAULT;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > CAPABILITY_LIMITS.LIST_MAX) {
@@ -282,6 +285,8 @@ capabilityRoutes.get('/capabilities', requireOwner(), async (c) => {
 
 capabilityRoutes.get('/capabilities/operations/:operationId', requireOwner(), async (c) => {
   if (!rateLimit(c)) return c.json(errorBody(CAPABILITY_ERROR.RATE_LIMITED), 429);
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const operationId = requiredOpaqueId(c.req.param('operationId'));
   if (!operationId) return c.json(errorBody(CAPABILITY_ERROR.INVALID_INPUT), 400);
   const operation = await getCapabilityOperation(c.env.DB, {
@@ -295,6 +300,8 @@ capabilityRoutes.get('/capabilities/operations/:operationId', requireOwner(), as
 
 capabilityRoutes.get('/capabilities/:capabilityId', requireOwner(), async (c) => {
   if (!rateLimit(c)) return c.json(errorBody(CAPABILITY_ERROR.RATE_LIMITED), 429);
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const capabilityId = requiredOpaqueId(c.req.param('capabilityId'));
   if (!capabilityId) return c.json(errorBody(CAPABILITY_ERROR.INVALID_INPUT), 400);
   const item = await getCapability(c.env.DB, {
@@ -308,6 +315,8 @@ capabilityRoutes.get('/capabilities/:capabilityId', requireOwner(), async (c) =>
 
 capabilityRoutes.get('/capabilities/:capabilityId/audit', requireOwner(), async (c) => {
   if (!rateLimit(c)) return c.json(errorBody(CAPABILITY_ERROR.RATE_LIMITED), 429);
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const capabilityId = requiredOpaqueId(c.req.param('capabilityId'));
   if (!capabilityId) return c.json(errorBody(CAPABILITY_ERROR.INVALID_INPUT), 400);
   const item = await getCapability(c.env.DB, {
@@ -327,6 +336,12 @@ capabilityRoutes.post('/capabilities/install', requireOwner(), async (c) => {
   if (!rateLimit(c)) return c.json(errorBody(CAPABILITY_ERROR.RATE_LIMITED), 429);
   const serverId = requiredOpaqueId(c.req.query('serverId'));
   if (!serverId) return c.json(errorBody(CAPABILITY_ERROR.INVALID_INPUT), 400);
+  const authority = await resolveDaemonCallerAuthority(c, {
+    denyParticipant: true,
+    targetServerId: serverId,
+    allowOwnerCrossServer: true,
+  });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const body = await c.req.json<CapabilityInstallRequest>().catch(() => null);
   if (!body || !isPlainRecord(body) || !isPlainRecord(body.source)) {
     return c.json(errorBody(CAPABILITY_ERROR.INVALID_INPUT), 400);
@@ -511,6 +526,8 @@ capabilityRoutes.post('/capabilities/operations/:operationId/confirmation', requ
 
 capabilityRoutes.post('/capabilities/operations/:operationId/cancel', requireOwner(), async (c) => {
   if (!rateLimit(c)) return c.json(errorBody(CAPABILITY_ERROR.RATE_LIMITED), 429);
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const operationId = requiredOpaqueId(c.req.param('operationId'));
   const body = await c.req.json<Record<string, unknown>>().catch(() => null);
   if (!operationId || !body || !Number.isSafeInteger(body.revision) || (body.revision as number) < 1) {
@@ -549,6 +566,12 @@ capabilityRoutes.post('/capabilities/operations/:operationId/cancel', requireOwn
 
 capabilityRoutes.post('/capabilities/:capabilityId/manage', requireOwner(), async (c) => {
   if (!rateLimit(c)) return c.json(errorBody(CAPABILITY_ERROR.RATE_LIMITED), 429);
+  const targetServerId = c.req.query('serverId')?.trim() || undefined;
+  const authority = await resolveDaemonCallerAuthority(c, {
+    denyParticipant: true,
+    ...(targetServerId ? { targetServerId, allowOwnerCrossServer: true } : {}),
+  });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const capabilityId = requiredOpaqueId(c.req.param('capabilityId'));
   if (!capabilityId) return c.json(errorBody(CAPABILITY_ERROR.INVALID_INPUT), 400);
   const body = await c.req.json<CapabilityManageRequest & { expectedRevision?: number }>().catch(() => null);
@@ -712,6 +735,8 @@ capabilityRoutes.post('/capabilities/:capabilityId/manage', requireOwner(), asyn
 });
 
 capabilityRoutes.post('/capabilities/blobs/:versionId/access', requireAuth(), async (c) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const ownerUserId = ownerId(c);
   const serverId = c.get('authServerId');
   const versionId = requiredOpaqueId(c.req.param('versionId'));
@@ -736,6 +761,8 @@ capabilityRoutes.post('/capabilities/blobs/:versionId/access', requireAuth(), as
 });
 
 capabilityRoutes.put('/capabilities/blobs/:versionId', requireAuth(), async (c) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const ownerUserId = ownerId(c);
   const serverId = c.get('authServerId');
   const versionId = requiredOpaqueId(c.req.param('versionId'));
@@ -783,6 +810,8 @@ capabilityRoutes.put('/capabilities/blobs/:versionId', requireAuth(), async (c) 
 });
 
 capabilityRoutes.get('/capabilities/blobs/:versionId', requireAuth(), async (c) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const ownerUserId = ownerId(c);
   const serverId = c.get('authServerId');
   const versionId = requiredOpaqueId(c.req.param('versionId'));
@@ -809,6 +838,8 @@ capabilityRoutes.get('/capabilities/blobs/:versionId', requireAuth(), async (c) 
 });
 
 capabilityRoutes.get('/capabilities/sync/snapshot', requireAuth(), async (c) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const userId = ownerId(c);
   const authenticatedServerId = c.get('authServerId');
   const serverId = c.req.query('serverId');
@@ -830,6 +861,8 @@ capabilityRoutes.get('/capabilities/sync/snapshot', requireAuth(), async (c) => 
 });
 
 capabilityRoutes.post('/capabilities/:capabilityId/readiness', requireAuth(), async (c) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return c.json(errorBody(CAPABILITY_ERROR.FORBIDDEN), 403);
   const userId = ownerId(c);
   const capabilityId = requiredOpaqueId(c.req.param('capabilityId'));
   if (!capabilityId) return c.json(errorBody(CAPABILITY_ERROR.INVALID_INPUT), 400);

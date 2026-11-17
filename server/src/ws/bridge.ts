@@ -1,3 +1,12 @@
+import { R2_RELAY_MSG } from '../../../shared/r2-relay.js';
+import {
+  isIncognitoSession,
+  SESSION_INCOGNITO_CAPABILITY,
+  SESSION_INCOGNITO_SERVER_READY,
+  SESSION_INCOGNITO_UNSUPPORTED,
+  supportsSessionIncognito,
+} from '../../../shared/session-incognito-types.js';
+import { withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import {
   CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217,
@@ -38,12 +47,13 @@ import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { SHARE_MESSAGE_LANE, SHARE_MESSAGE_LANE_MAX_PENDING, shareBrowserMessageLane, type ShareMessageLane } from './share-lanes.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
-import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
+import { issueOwnerMachineAuthorityForSession, issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { TERMINAL_CONTROL, TERMINAL_STREAM_RESET_REASON } from '../../../shared/terminal-protocol.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
+import { TASK_PAIR_DECISION_MSG } from '../../../shared/task-pair-decision.js';
 import {
   CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME,
   validateControlledNodeLocalDaemonsMessage,
@@ -295,6 +305,13 @@ import {
   type MemoryFeatureFlagResolutionLayers,
   type MemoryFeatureFlagValues,
 } from '../../../shared/feature-flags.js';
+import {
+  COMPACT_HIJACK_GLOBAL_PREF_KEY,
+  COMPACT_HIJACK_MSG,
+  normalizeCompactHijackGlobalConfig,
+  parseCompactHijackGlobalConfigJson,
+  type CompactHijackGlobalConfig,
+} from '../../../shared/compact-hijack.js';
 import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 import {
   MSG_COMMAND_ACK,
@@ -332,7 +349,12 @@ import {
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, createSubSessionsBatch, getSubSessionById, isExecutionCloneRow, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import {
+  SUBSESSION_CREATED_BATCH_MSG,
+  SUBSESSION_SYNC_BATCH_MAX_ITEMS,
+  SUBSESSION_SYNC_BATCH_MSG,
+} from '../../../shared/scale-limits.js';
 import {
   activateCapabilityVersion,
   advanceCapabilityOperation,
@@ -376,7 +398,23 @@ import { addCounter, incrementCounter, snapshotCounters } from '../util/metrics.
 import { logAudit } from '../security/audit.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
-import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
+import {
+  PUSH_TIMELINE_EVENT_MAX_AGE_MS,
+  TIMELINE_SUPPRESS_PUSH_FIELD,
+  PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+  PUSH_NOTIFICATION_TYPE_WAITING_INPUT,
+  PUSH_NOTIFICATION_TYPE_SESSION_ERROR,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
+  classifyTaskPairNotificationType,
+  type PushNotificationType,
+} from '../../../shared/push-notifications.js';
+import {
+  TASK_PAIR_TIMELINE_EVENT,
+  SUBSESSION_NAME_PREFIX,
+  isAutoCreatedSubSessionName,
+} from '../../../shared/task-pair.js';
 import { isServerLinkResyncStatePayload } from '../../../shared/session-activity-types.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
@@ -426,6 +464,10 @@ import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
 } from '../../../shared/p2p-workflow-constants.js';
 import { DaemonUpgradeCoordinator, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import {
+  checkControlledNodeUpgradeArtifactAvailability,
+  type ControlledNodeUpgradeArtifactAvailability,
+} from '../services/controlled-node-artifact-catalog.js';
 import type { DaemonUpgradeSource } from '../../../shared/daemon-upgrade.js';
 import {
   DAEMON_AUTH_RECONCILE_BUDGET_MS,
@@ -870,12 +912,9 @@ class TerminalForwardQueue {
 
 type TimelineQueuePriority = 'final' | 'durable' | 'coalescible';
 
-function timelineQueuePriorityRank(priority: TimelineQueuePriority): number {
-  return priority === 'final' ? 0 : priority === 'durable' ? 1 : 2;
-}
-
 interface TimelineQueueEvent {
   data: string;
+  byteLength?: number;
   sessionId: string;
   epoch: number;
   seq: number;
@@ -883,6 +922,19 @@ interface TimelineQueueEvent {
   coalesceKey?: string;
   gapFromSeq?: number;
   gapToSeq?: number;
+}
+
+interface TimelineQueueNode {
+  item: TimelineQueueEvent;
+  byteLength: number;
+  prev: TimelineQueueNode | null;
+  next: TimelineQueueNode | null;
+}
+
+interface TimelinePriorityList {
+  head: TimelineQueueNode | null;
+  tail: TimelineQueueNode | null;
+  count: number;
 }
 
 interface TimelineEnqueueOptions {
@@ -898,7 +950,11 @@ interface TimelineEnqueueOptions {
  * direct control path above and therefore cannot wait behind this queue.
  */
 export class TimelineOutboundQueue {
-  private pending: TimelineQueueEvent[] = [];
+  private finalList: TimelinePriorityList = { head: null, tail: null, count: 0 };
+  private durableList: TimelinePriorityList = { head: null, tail: null, count: 0 };
+  private coalescibleList: TimelinePriorityList = { head: null, tail: null, count: 0 };
+  private pendingCount = 0;
+  private coalesceSlots = new Map<string, TimelineQueueNode>();
   private bytes = 0;
   private sending = false;
   /** One merged missing range per session/epoch congestion episode. */
@@ -914,12 +970,12 @@ export class TimelineOutboundQueue {
   private coalesceTimer?: NodeJS.Timeout;
 
   isIdle(): boolean {
-    return !this.sending && this.pending.length === 0 && this.bytes === 0
+    return !this.sending && this.pendingCount === 0 && this.bytes === 0
       && this.pendingCoalesced.size === 0 && !this.coalesceTimer;
   }
 
   statsForTests(): { bytes: number; pending: number; pendingGaps: number } {
-    return { bytes: this.bytes, pending: this.pending.length, pendingGaps: this.pendingGaps.size };
+    return { bytes: this.bytes, pending: this.pendingCount, pendingGaps: this.pendingGaps.size };
   }
 
   dispose(): void {
@@ -928,7 +984,11 @@ export class TimelineOutboundQueue {
     if (this.coalesceTimer) clearTimeout(this.coalesceTimer);
     this.gapFlushTimer = undefined;
     this.coalesceTimer = undefined;
-    this.pending = [];
+    this.finalList = { head: null, tail: null, count: 0 };
+    this.durableList = { head: null, tail: null, count: 0 };
+    this.coalescibleList = { head: null, tail: null, count: 0 };
+    this.pendingCount = 0;
+    this.coalesceSlots.clear();
     this.bytes = 0;
     this.pendingGaps.clear();
     this.pendingCoalesced.clear();
@@ -938,7 +998,53 @@ export class TimelineOutboundQueue {
 
   /** Compose-only diagnostics; never used by the delivery path. */
   snapshot(): { bytes: number; pending: number; sending: boolean } {
-    return { bytes: this.bytes, pending: this.pending.length, sending: this.sending };
+    return { bytes: this.bytes, pending: this.pendingCount, sending: this.sending };
+  }
+
+  private listForPriority(priority: TimelineQueuePriority): TimelinePriorityList {
+    return priority === 'final'
+      ? this.finalList
+      : priority === 'durable'
+        ? this.durableList
+        : this.coalescibleList;
+  }
+
+  private appendNode(list: TimelinePriorityList, node: TimelineQueueNode): void {
+    node.prev = list.tail;
+    node.next = null;
+    if (list.tail) list.tail.next = node;
+    else list.head = node;
+    list.tail = node;
+    list.count += 1;
+    this.pendingCount += 1;
+  }
+
+  private unlinkNode(list: TimelinePriorityList, node: TimelineQueueNode): void {
+    if (node.prev) node.prev.next = node.next;
+    else list.head = node.next;
+    if (node.next) node.next.prev = node.prev;
+    else list.tail = node.prev;
+    node.prev = null;
+    node.next = null;
+    list.count -= 1;
+    this.pendingCount -= 1;
+  }
+
+  private unlinkHead(list: TimelinePriorityList): TimelineQueueNode | null {
+    const node = list.head;
+    if (!node) return null;
+    this.unlinkNode(list, node);
+    return node;
+  }
+
+  private popNextNode(): TimelineQueueNode | null {
+    const node = this.unlinkHead(this.finalList)
+      ?? this.unlinkHead(this.durableList)
+      ?? this.unlinkHead(this.coalescibleList);
+    if (node?.item.coalesceKey) {
+      this.coalesceSlots.delete(node.item.coalesceKey);
+    }
+    return node;
   }
 
   enqueue(
@@ -1002,11 +1108,9 @@ export class TimelineOutboundQueue {
   private enqueueImmediate(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
     const bufferedAmount = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
     const wasSocketPressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER;
-    const existingIndex = item.coalesceKey
-      ? this.pending.findIndex((entry) => entry.coalesceKey === item.coalesceKey)
-      : -1;
-    if (existingIndex >= 0) {
-      const previous = this.pending[existingIndex]!;
+    const existingNode = item.coalesceKey ? this.coalesceSlots.get(item.coalesceKey) : undefined;
+    if (existingNode) {
+      const previous = existingNode.item;
       // Replacing a pending latest-value frame is still a loss of its
       // sequence number. Record it for one merged gap per congestion episode;
       // emitting one frame per replacement can itself overwhelm a healthy
@@ -1018,17 +1122,25 @@ export class TimelineOutboundQueue {
       // zero bufferedAmount.
       if (wasSocketPressured) this.noteGap(previous);
       onCoalesced?.();
-      this.bytes -= Buffer.byteLength(previous.data, 'utf8');
-      this.pending[existingIndex] = item;
-      this.bytes += Buffer.byteLength(item.data, 'utf8');
+      const newByteLength = item.byteLength ?? Buffer.byteLength(item.data, 'utf8');
+      this.bytes += newByteLength - existingNode.byteLength;
+      existingNode.item = item;
+      existingNode.byteLength = newByteLength;
+      if (previous.priority !== item.priority) {
+        this.unlinkNode(this.listForPriority(previous.priority), existingNode);
+        this.appendNode(this.listForPriority(item.priority), existingNode);
+      }
     } else {
-      this.insertByPriority(item);
-      this.bytes += Buffer.byteLength(item.data, 'utf8');
+      const byteLength = item.byteLength ?? Buffer.byteLength(item.data, 'utf8');
+      const node: TimelineQueueNode = { item, byteLength, prev: null, next: null };
+      this.appendNode(this.listForPriority(item.priority), node);
+      if (item.coalesceKey) this.coalesceSlots.set(item.coalesceKey, node);
+      this.bytes += byteLength;
     }
 
     const pressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER
       || this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES
-      || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS;
+      || this.pendingCount > TIMELINE_SOCKET_QUEUE_MAX_ITEMS;
     if (pressured) {
       this.trim(ws);
     }
@@ -1037,26 +1149,27 @@ export class TimelineOutboundQueue {
   }
 
   private trim(ws: WebSocket): void {
-    while (this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS) {
+    while (this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES || this.pendingCount > TIMELINE_SOCKET_QUEUE_MAX_ITEMS) {
       // Preserve final and durable events for as long as possible. Under a
       // completely wedged socket, close it for a history resync instead of
       // dropping durable/final events and pretending a gap can repair them.
-      let index = this.pending.findIndex((entry) => entry.priority === 'coalescible');
-      if (index < 0) {
+      const removed = this.unlinkHead(this.coalescibleList);
+      if (!removed) {
         try { ws.close(1013, 'timeline_backpressure_resync'); } catch { /* already closing */ }
         this.dispose();
         return;
       }
-      const [removed] = this.pending.splice(index, 1);
-      if (!removed) break;
-      this.bytes -= Buffer.byteLength(removed.data, 'utf8');
+      if (removed.item.coalesceKey) {
+        this.coalesceSlots.delete(removed.item.coalesceKey);
+      }
+      this.bytes -= removed.byteLength;
       // Summary/latest-value frames are intentionally lossy when only the
       // server-side queue is busy. Do not manufacture backpressure gaps on a
       // healthy socket whose transport bufferedAmount is still below HWM;
       // durable/final events always retain a gap for backfill convergence.
-      if (removed.priority !== 'coalescible'
+      if (removed.item.priority !== 'coalescible'
         || (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER)) {
-        this.noteGap(removed);
+        this.noteGap(removed.item);
       }
     }
   }
@@ -1122,21 +1235,8 @@ export class TimelineOutboundQueue {
   }
 
   private finishCongestionEpisode(): void {
-    if (this.sending || this.pending.length > 0) return;
+    if (this.sending || this.pendingCount > 0) return;
     this.gapEpisodes.clear();
-  }
-
-  /** Keep `pending` ordered final → durable → coalescible (FIFO within a
-   *  priority) at insertion time, so dequeue never re-sorts the backlog. */
-  private insertByPriority(item: TimelineQueueEvent): void {
-    const rank = timelineQueuePriorityRank(item.priority);
-    const last = this.pending[this.pending.length - 1];
-    if (!last || timelineQueuePriorityRank(last.priority) <= rank) {
-      this.pending.push(item);
-      return;
-    }
-    const index = this.pending.findIndex((entry) => timelineQueuePriorityRank(entry.priority) > rank);
-    this.pending.splice(index < 0 ? this.pending.length : index, 0, item);
   }
 
   private schedulePump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
@@ -1151,7 +1251,7 @@ export class TimelineOutboundQueue {
   private pump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
     const deadline = performance.now() + TIMELINE_QUEUE_PUMP_BUDGET_MS;
     let sent = 0;
-    while (!this.disposed && !this.sending && this.pending.length > 0) {
+    while (!this.disposed && !this.sending && this.pendingCount > 0) {
       // Synchronous completions are drained iteratively (never recursively)
       // and only up to a bounded batch/time budget per turn, then the pump
       // yields so one congested socket cannot starve the event loop.
@@ -1159,8 +1259,10 @@ export class TimelineOutboundQueue {
         this.schedulePump(ws, onGap);
         return;
       }
-      const item = this.pending.shift()!;
-      this.bytes -= Buffer.byteLength(item.data, 'utf8');
+      const node = this.popNextNode();
+      if (!node) break;
+      const item = node.item;
+      this.bytes -= node.byteLength;
       this.sending = true;
       sent += 1;
       let insideSend = true;
@@ -1235,6 +1337,8 @@ type WatchActiveSubSessionRow = {
   agentType?: string;
   runtimeType?: string;
   label?: string;
+  isExecutionClone?: boolean;
+  isAutoCreatedPairSession?: boolean;
 };
 
 interface DaemonP2pWorkflowCapabilities {
@@ -1978,10 +2082,15 @@ const REPO_REQUEST_TYPES = new Set<string>([
   REPO_MSG.COMMIT_DETAIL,
   REPO_MSG.PR_DETAIL,
   REPO_MSG.ISSUE_DETAIL,
+  REPO_MSG.CALLBACK_CHECK_NOW,
+  REPO_MSG.CALLBACK_STATUS_REQUEST,
 ]);
 
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
+// Periodic share-expiry & controlled-read sweep handle (module-level, shared across all active bridges)
+let shareExpirySweepHandle: ReturnType<typeof setInterval> | null = null;
+const SHARE_EXPIRY_SWEEP_INTERVAL_MS = 30_000;
 let shareClockNow = (): number => Date.now();
 
 export function __setShareBridgeClockForTests(clock: (() => number) | null): void {
@@ -2014,6 +2123,15 @@ const SHARE_HOT_PATH_COVERAGE_TTL_MS = 5_000;
 const SHARE_INPUT_AUTHORITY_REUSE_MS = 30_000;
 /** Share-command audit rows that may be waiting to be written; beyond it new ones are dropped and counted. */
 const SHARE_AUDIT_MAX_PENDING = 500;
+/** Throttle periodic heartbeat DB writes well below MACHINE_PRESENCE_STALENESS_MS (90s) and cron timeout (10m). */
+const HEARTBEAT_DB_WRITE_INTERVAL_MS = 45_000;
+/** Long fallback interval for cross-pod capability sync checks on heartbeat when no operations are active. */
+const CAPABILITY_HEARTBEAT_FALLBACK_INTERVAL_MS = 60_000;
+/** Cache controlled-node hostId resolution within a connection generation before periodic fallback recheck. */
+const REMOTE_DESKTOP_NODE_CONTEXT_RECHECK_MS = 60_000;
+/** Bounded positive ownership cache for DB-verified main sessions; invalidated on session removal/disconnect. */
+const SESSION_OWNERSHIP_CACHE_TTL_MS = 5 * 60_000;
+const SESSION_OWNERSHIP_CACHE_MAX_ENTRIES = 2048;
 
 function capabilityOpaqueId(value: unknown): string | null {
   return typeof value === 'string' && value.trim() && value.length <= 128 ? value : null;
@@ -2127,6 +2245,11 @@ function heartbeatAckWithClock(
 }
 
 export class WsBridge {
+  // Session names are only unique within a daemon, never across owners.
+  private readonly incognitoSessions = new Set<string>();
+  private readonly pendingIncognitoSubSessionStarts = new Map<string, { id: string; sessionName: string }>();
+  private readonly incognitoSubSessionMetadata = new Map<string, Record<string, unknown>>();
+  private readonly rejectedIncognitoSubSessions = new Set<string>();
   private static instances = new Map<string, WsBridge>();
   private static remoteDesktopReconnectRevalidator: ((serverId: string) => Promise<void>) | null = null;
 
@@ -2174,11 +2297,105 @@ export class WsBridge {
   private daemonVersion: string | null = null;
   private daemonControlledAbiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_ABI_MODERN;
   private daemonControlledOs: ControlledNodeOs | null = null;
+  private daemonControlledArch: string | null = null;
+  private controlledNodeArtifactAvailable = true;
+  private controlledNodeArtifactUnavailableReason: string | null = null;
   /** The authenticated controlled node's public ID (from `servers.node_id`), sent back in its heartbeat acks. */
   private daemonControlledNodeId: ControlledNodeId | null = null;
   private daemonOwnerUserId: string | null = null;
   private lastCapabilityRevisionSent = 0;
   private capabilitySyncInitialized = false;
+  private lastCapabilityHeartbeatRefreshAt = 0;
+  private activeCapabilityOperations = new Set<string>();
+  private remoteDesktopNodeContextCache: {
+    generation: number;
+    hostId: string;
+    checkedAt: number;
+  } | null = null;
+  private remoteDesktopNodeContextLastUnavailableGeneration: number | null = null;
+  private remoteDesktopNodeContextInFlight: {
+    generation: number;
+    promise: Promise<void>;
+  } | null = null;
+  private lastHeartbeatDbWriteAt = 0;
+  private lastHeartbeatDbVersion: string | null = null;
+  private lastHeartbeatDbGeneration: number | null = null;
+  private lastHeartbeatDbStatus: 'online' | 'offline' | null = null;
+
+  private resetHeartbeatDbPersistenceState(status: 'online' | 'offline' | null = null): void {
+    this.lastHeartbeatDbWriteAt = 0;
+    this.lastHeartbeatDbVersion = null;
+    this.lastHeartbeatDbGeneration = null;
+    this.lastHeartbeatDbStatus = status;
+  }
+
+  private persistHeartbeatIfDue(
+    db: Database,
+    connectionGeneration: number,
+    daemonVersion: string | null | undefined,
+    options?: {
+      force?: boolean;
+      controlledCapabilities?: ControlledNodeCapability[];
+      runtimeArch?: string | null;
+      logLabel?: string;
+    },
+  ): void {
+    const normalizedVersion = typeof daemonVersion === 'string' ? daemonVersion : null;
+    const now = Date.now();
+    const force = options?.force === true;
+    const isDue = force
+      || this.lastHeartbeatDbStatus !== 'online'
+      || this.lastHeartbeatDbGeneration !== connectionGeneration
+      || this.lastHeartbeatDbVersion !== normalizedVersion
+      || this.lastHeartbeatDbWriteAt <= 0
+      || (now - this.lastHeartbeatDbWriteAt) >= HEARTBEAT_DB_WRITE_INTERVAL_MS;
+    if (!isDue) return;
+
+    const prevWriteAt = this.lastHeartbeatDbWriteAt;
+    const prevVersion = this.lastHeartbeatDbVersion;
+    const prevGeneration = this.lastHeartbeatDbGeneration;
+    const prevStatus = this.lastHeartbeatDbStatus;
+
+    this.lastHeartbeatDbWriteAt = now;
+    this.lastHeartbeatDbVersion = normalizedVersion;
+    this.lastHeartbeatDbGeneration = connectionGeneration;
+    this.lastHeartbeatDbStatus = 'online';
+
+    const writePromise = options?.controlledCapabilities !== undefined || options?.runtimeArch !== undefined
+      ? updateServerHeartbeat(
+          db,
+          this.serverId,
+          normalizedVersion,
+          options?.controlledCapabilities,
+          options?.runtimeArch,
+        )
+      : updateServerHeartbeat(db, this.serverId, normalizedVersion);
+
+    writePromise.catch((err) => {
+      if (this.daemonGeneration === connectionGeneration && this.lastHeartbeatDbWriteAt === now) {
+        this.lastHeartbeatDbWriteAt = prevWriteAt;
+        this.lastHeartbeatDbVersion = prevVersion;
+        this.lastHeartbeatDbGeneration = prevGeneration;
+        this.lastHeartbeatDbStatus = prevStatus;
+      }
+      logger.error({ err }, options?.logLabel ?? 'Failed to update heartbeat');
+    });
+  }
+
+  invalidateRemoteDesktopNodeContext(): void {
+    this.remoteDesktopNodeContextCache = null;
+    this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+  }
+
+  static invalidateRemoteDesktopNodeContext(serverId?: string): void {
+    if (serverId) {
+      WsBridge.instances.get(serverId)?.invalidateRemoteDesktopNodeContext();
+      return;
+    }
+    for (const bridge of WsBridge.instances.values()) {
+      bridge.invalidateRemoteDesktopNodeContext();
+    }
+  }
 
   /**
    * Publish the two authority coordinates a controlled node cannot derive:
@@ -2195,6 +2412,16 @@ export class WsBridge {
       || this.daemonWs !== ws
       || this.daemonGeneration !== connectionGeneration
       || !this.authenticated) return;
+    if (this.remoteDesktopNodeContextInFlight?.generation === connectionGeneration) {
+      await this.remoteDesktopNodeContextInFlight.promise;
+      return;
+    }
+    const cached = this.remoteDesktopNodeContextCache;
+    if (cached
+      && cached.generation === connectionGeneration
+      && (Date.now() - cached.checkedAt) < REMOTE_DESKTOP_NODE_CONTEXT_RECHECK_MS) {
+      return;
+    }
     const sendUnavailable = () => {
       if (this.daemonWs !== ws
         || this.daemonGeneration !== connectionGeneration
@@ -2204,30 +2431,65 @@ export class WsBridge {
         daemonGeneration: connectionGeneration,
       }));
     };
-    try {
-      const row = await db.queryOne<{ host_id: string }>(
-        'SELECT host_id FROM remote_desktop_host_endpoints WHERE server_id = $1',
-        [this.serverId],
-      );
-      const context = row ? validateRemoteDesktopNodeAuthorityContext({
-        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
-        hostId: row.host_id,
-        daemonGeneration: connectionGeneration,
-      }) : null;
-      if (!context?.ok) {
-        sendUnavailable();
-        return;
+    const run = (async () => {
+      try {
+        const row = await db.queryOne<{ host_id: string }>(
+          'SELECT host_id FROM remote_desktop_host_endpoints WHERE server_id = $1',
+          [this.serverId],
+        );
+        if (this.daemonWs !== ws
+          || this.daemonGeneration !== connectionGeneration
+          || !this.authenticated) return;
+        const context = row ? validateRemoteDesktopNodeAuthorityContext({
+          type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+          hostId: row.host_id,
+          daemonGeneration: connectionGeneration,
+        }) : null;
+        if (!context?.ok || context.value.type !== REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT) {
+          const hadCachedCurrent = this.remoteDesktopNodeContextCache?.generation === connectionGeneration;
+          this.remoteDesktopNodeContextCache = null;
+          if (hadCachedCurrent || this.remoteDesktopNodeContextLastUnavailableGeneration !== connectionGeneration) {
+            this.remoteDesktopNodeContextLastUnavailableGeneration = connectionGeneration;
+            sendUnavailable();
+          }
+          return;
+        }
+        const previousHostId = this.remoteDesktopNodeContextCache?.generation === connectionGeneration
+          ? this.remoteDesktopNodeContextCache.hostId
+          : null;
+        this.remoteDesktopNodeContextCache = {
+          generation: connectionGeneration,
+          hostId: context.value.hostId,
+          checkedAt: Date.now(),
+        };
+        this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+        if (previousHostId !== context.value.hostId) {
+          ws.send(JSON.stringify(context.value));
+        }
+      } catch (error) {
+        // Host backfill/migration failure removes consent authority; it must not
+        // take unrelated controlled-node exec/file-transfer liveness down.
+        logger.warn({ error, serverId: this.serverId },
+          'could not publish remote desktop canonical-host context');
+        if (this.daemonWs !== ws
+          || this.daemonGeneration !== connectionGeneration
+          || !this.authenticated) return;
+        const hadCachedCurrent = this.remoteDesktopNodeContextCache?.generation === connectionGeneration;
+        this.remoteDesktopNodeContextCache = null;
+        if (hadCachedCurrent || this.remoteDesktopNodeContextLastUnavailableGeneration !== connectionGeneration) {
+          this.remoteDesktopNodeContextLastUnavailableGeneration = connectionGeneration;
+          sendUnavailable();
+        }
       }
-      if (this.daemonWs !== ws
-        || this.daemonGeneration !== connectionGeneration
-        || !this.authenticated) return;
-      ws.send(JSON.stringify(context.value));
-    } catch (error) {
-      // Host backfill/migration failure removes consent authority; it must not
-      // take unrelated controlled-node exec/file-transfer liveness down.
-      logger.warn({ error, serverId: this.serverId },
-        'could not publish remote desktop canonical-host context');
-      sendUnavailable();
+    })();
+    const inFlight = { generation: connectionGeneration, promise: run };
+    this.remoteDesktopNodeContextInFlight = inFlight;
+    try {
+      await run;
+    } finally {
+      if (this.remoteDesktopNodeContextInFlight === inFlight) {
+        this.remoteDesktopNodeContextInFlight = null;
+      }
     }
   }
   /**
@@ -2242,9 +2504,7 @@ export class WsBridge {
   ): void {
     const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
     if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
-    updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
-      logger.error({ err }, 'Failed to update heartbeat'),
-    );
+    this.persistHeartbeatIfDue(db, connectionGeneration, hbVersion);
     try { ws.send(JSON.stringify(heartbeatAckWithClock(
       msg,
       this.daemonControlledNodeId,
@@ -2395,6 +2655,7 @@ export class WsBridge {
   private controlledNodeWorkerRefreshStatus: ControlledNodeWorkerRefreshStatusMessage | null = null;
   private controlledNodeWorkerRefreshPersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
+  private batchCreatedBrowsers = new WeakSet<WebSocket>();
   /**
    * Task-console subscriptions each browser socket opened, so a socket that
    * goes away without saying so (tab closed, phone asleep, network drop) can
@@ -2453,6 +2714,9 @@ export class WsBridge {
   private shareCoverageRefreshes = new WeakMap<WebSocket, Promise<ShareScopedSocketState | null>>();
   private shareInputAuthorityTokens = new WeakMap<WebSocket, Map<string, { token: string | null; at: number }>>();
   private shareInputAuthorityMints = new WeakMap<WebSocket, Map<string, Promise<string | null>>>();
+  private ownerInputAuthorityTokens = new WeakMap<WebSocket, Map<string, { token: string | null; at: number }>>();
+  private ownerInputAuthorityMints = new WeakMap<WebSocket, Map<string, Promise<string | null>>>();
+  private ownerCommandChains = new WeakMap<WebSocket, Promise<void>>();
   private pendingShareAudits = 0;
   private browserDataReadRateLimiter = new MemoryRateLimiter();
 
@@ -2479,7 +2743,6 @@ export class WsBridge {
   /** browser socket → live share-scoped authorization state */
   private browserShareStates = new Map<WebSocket, ShareScopedSocketState>();
   private shareCoverageResolver: ShareCoverageResolver = resolveShareCoverageFromDb;
-  private shareExpirySweepTimer: ReturnType<typeof setInterval> | null = null;
   private sessionRuntimeTypes = new Map<string, 'process' | 'transport' | 'unknown'>();
   private activeDispatchIds = new Map<string, string>();
 
@@ -2697,6 +2960,7 @@ export class WsBridge {
   private pendingRecentTextBackfills = new Map<string, Promise<WatchRecentTextRow[]>>();
 
   private timelineDataPlaneQueue: TimelineDataPlaneJob[] = [];
+  private timelineDataPlaneQueueHead = 0;
   private timelineDataPlaneScheduled = false;
   private timelineDataPlaneActiveJobs = new Set<TimelineDataPlaneJob>();
   /** Bytes retained by queued and active timeline data-plane jobs. */
@@ -2727,6 +2991,11 @@ export class WsBridge {
   /** Latest daemon-owned active sub-session snapshot for push title resolution. */
   private activeSubSessions = new Map<string, WatchActiveSubSessionRow>();
   private hasActiveMainSessionSnapshot = false;
+  /** Bounded LRU+TTL positive cache of DB-verified main session names scoped strictly to this serverId. */
+  private verifiedMainSessionOwnership = new Map<string, number>();
+  /** Monotonic epoch incremented on any session ownership/snapshot invalidation to fence stale in-flight DB reads. */
+  private sessionOwnershipEpoch = 0;
+  private disposed = false;
   /**
    * Project-identity scope key per session, exactly as the daemon derives it
    * (sessionIdentityProjectKey). Browser session lists for share recipients
@@ -2852,10 +3121,49 @@ export class WsBridge {
     setPreviewEvictedHook((serverId, previewId) =>
       WsBridge.instances.get(serverId)?.terminatePreviewRelaysForPreview(previewId),
     );
-    this.shareExpirySweepTimer = setInterval(() => {
-      void this.sweepShareSockets();
-    }, 30_000);
-    this.shareExpirySweepTimer.unref?.();
+  }
+
+  private hasActiveShareSweepState(): boolean {
+    return this.browserShareStates.size > 0 || this.controlledTargetBrowserSockets.size > 0;
+  }
+
+  private static ensureShareExpirySweepTimer(): void {
+    if (shareExpirySweepHandle) return;
+    shareExpirySweepHandle = setInterval(() => {
+      if (WsBridge.instances.size === 0) {
+        WsBridge.stopShareExpirySweepTimer();
+        return;
+      }
+      let anyActive = false;
+      for (const bridge of WsBridge.instances.values()) {
+        if (!bridge.hasActiveShareSweepState()) continue;
+        anyActive = true;
+        void bridge.sweepShareSockets().catch((err) =>
+          logger.warn({ err, serverId: bridge.serverId }, 'Share expiry sweep failed'),
+        );
+      }
+      if (!anyActive) {
+        WsBridge.stopShareExpirySweepTimer();
+      }
+    }, SHARE_EXPIRY_SWEEP_INTERVAL_MS);
+    shareExpirySweepHandle.unref?.();
+  }
+
+  private static stopShareExpirySweepTimer(): void {
+    if (shareExpirySweepHandle) {
+      clearInterval(shareExpirySweepHandle);
+      shareExpirySweepHandle = null;
+    }
+  }
+
+  private static syncShareExpirySweepTimer(): void {
+    for (const bridge of WsBridge.instances.values()) {
+      if (bridge.hasActiveShareSweepState()) {
+        WsBridge.ensureShareExpirySweepTimer();
+        return;
+      }
+    }
+    WsBridge.stopShareExpirySweepTimer();
   }
 
   static get(serverId: string): WsBridge {
@@ -2877,11 +3185,41 @@ export class WsBridge {
     targetVersion?: string;
     reason?: string;
   } {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      return { status: CONTROLLED_NODE_UPGRADE_STATUS.CURRENT };
+    }
     return {
       status: this.autoUpgradeStatus,
       ...(this.autoUpgradeTargetVersion ? { targetVersion: this.autoUpgradeTargetVersion } : {}),
       ...(this.autoUpgradeReason ? { reason: this.autoUpgradeReason } : {}),
     };
+  }
+
+  /**
+   * Apply verified artifact availability for a controlled node and immediately
+   * clear any stale failed/deferred/available upgrade state if the running
+   * server image intentionally omits that platform's executable bundle.
+   */
+  syncControlledNodeArtifactAvailability(availability: ControlledNodeUpgradeArtifactAvailability): void {
+    this.controlledNodeArtifactAvailable = availability.available;
+    this.controlledNodeArtifactUnavailableReason = availability.available
+      ? null
+      : (availability.reason ?? 'executable_not_built');
+    if (!availability.available && this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      this.clearControlledNodeUnavailableUpgradeState();
+    }
+  }
+
+  private clearControlledNodeUnavailableUpgradeState(): void {
+    this.daemonUpgradeCoordinator.clear();
+    this.resetAutoUpgradeAttempts(null);
+    if (
+      this.autoUpgradeStatus !== CONTROLLED_NODE_UPGRADE_STATUS.CURRENT
+      || this.autoUpgradeTargetVersion !== null
+      || this.autoUpgradeReason !== null
+    ) {
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.CURRENT, null, null);
+    }
   }
 
   getControlledNodeWorkerRefreshStatus(): ControlledNodeWorkerRefreshStatusMessage | null {
@@ -3063,6 +3401,7 @@ export class WsBridge {
         });
         bridge.daemonWs.send(JSON.stringify(toCapabilitySyncAuthorityFrame(authority, keys)));
         bridge.lastCapabilityRevisionSent = record.revision;
+        bridge.lastCapabilityHeartbeatRefreshAt = Date.now();
         delivered += 1;
       } catch (error) {
         logger.warn({ error, serverId: bridge.serverId }, 'Capability sync fan-out failed');
@@ -3087,6 +3426,7 @@ export class WsBridge {
         pending,
         [bridge.capabilityAuthorizationSigner.key],
       )));
+      bridge.activeCapabilityOperations.add(pending.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: pending.targetServerId, operationId }, 'Capability authorization dispatch failed');
@@ -3111,6 +3451,7 @@ export class WsBridge {
     if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
     try {
       this.daemonWs.send(JSON.stringify(frame));
+      this.activeCapabilityOperations.add(frame.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: this.serverId }, 'Capability install dispatch failed');
@@ -3123,6 +3464,8 @@ export class WsBridge {
     if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
     try {
       this.daemonWs.send(JSON.stringify(frame));
+      if (frame.decision === 'install') this.activeCapabilityOperations.add(frame.operationId);
+      else this.activeCapabilityOperations.delete(frame.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: this.serverId }, 'Capability confirmation dispatch failed');
@@ -3135,6 +3478,7 @@ export class WsBridge {
     if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
     try {
       this.daemonWs.send(JSON.stringify(frame));
+      this.activeCapabilityOperations.delete(frame.operationId);
       return true;
     } catch (error) {
       logger.warn({ error, serverId: this.serverId }, 'Capability cancellation dispatch failed');
@@ -3233,6 +3577,7 @@ export class WsBridge {
     )));
     this.lastCapabilityRevisionSent = record.revision;
     this.capabilitySyncInitialized = true;
+    this.lastCapabilityHeartbeatRefreshAt = Date.now();
     await this.replayPendingCapabilityBlobUploads(db, socket, expectedGeneration, ownerUserId);
     await this.replayPendingCapabilityAuthorizations(db, socket, expectedGeneration, ownerUserId);
     await this.replayLocalCapabilityManageRequests(db, socket, expectedGeneration, ownerUserId);
@@ -3247,59 +3592,75 @@ export class WsBridge {
     if (!ownerUserId
       || !this.capabilitySyncInitialized
       || !this.canAcceptCapabilityOperation(ownerUserId)) return;
-    await this.expirePreActivationCapabilityOperations(
-      db,
-      socket,
-      expectedGeneration,
-      ownerUserId,
-    );
-    const expired = await expireCapabilityPendingActivations(db, {
-      ownerUserId,
-      targetServerId: this.serverId,
-    });
-    for (const entry of expired) {
-      this.broadcastToBrowsers(JSON.stringify({
-        type: CAPABILITY_OPERATION_MSG.PROGRESS,
-        operationId: entry.operation.id,
-        revision: entry.operation.revision,
-        state: entry.operation.state,
-        errorCode: entry.operation.errorCode,
-      }));
-      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
-        socket.send(JSON.stringify({
-          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
-          operationId: entry.operation.id,
-          capabilityId: entry.capabilityId,
-          versionId: entry.versionId,
-          bindingId: entry.bindingId,
-          authorityRevision: entry.authorityRevision,
-          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
-        } satisfies CapabilityOperationCommitAbortFrame));
-      }
+    const hasPendingWork = this.activeCapabilityOperations.size > 0 || this.pendingCapabilityManage.size > 0;
+    const now = Date.now();
+    if (!hasPendingWork
+      && (now - this.lastCapabilityHeartbeatRefreshAt) < CAPABILITY_HEARTBEAT_FALLBACK_INTERVAL_MS) {
+      return;
     }
-    const record = await getCapabilitySyncSnapshot(db, {
-      ownerUserId,
-      maxItems: CAPABILITY_LIMITS.LIST_MAX,
-      afterRevision: this.lastCapabilityRevisionSent,
-    });
-    if (record.revision <= this.lastCapabilityRevisionSent
-      || this.daemonWs !== socket
-      || this.daemonGeneration !== expectedGeneration) return;
-    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
-      record,
-      CAPABILITY_SYNC_MSG.DELTA,
-      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
-    )));
-    const authority = await getCapabilityAuthorityRecordSet(db, {
-      ownerUserId,
-      serverId: this.serverId,
-    });
-    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
-    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
-      authority,
-      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
-    )));
-    this.lastCapabilityRevisionSent = record.revision;
+    const prevRefreshAt = this.lastCapabilityHeartbeatRefreshAt;
+    this.lastCapabilityHeartbeatRefreshAt = now;
+    try {
+      await this.expirePreActivationCapabilityOperations(
+        db,
+        socket,
+        expectedGeneration,
+        ownerUserId,
+      );
+      const expired = await expireCapabilityPendingActivations(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+      });
+      for (const entry of expired) {
+        this.activeCapabilityOperations.delete(entry.operation.id);
+        this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId: entry.operation.id,
+          revision: entry.operation.revision,
+          state: entry.operation.state,
+          errorCode: entry.operation.errorCode,
+        }));
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId: entry.operation.id,
+            capabilityId: entry.capabilityId,
+            versionId: entry.versionId,
+            bindingId: entry.bindingId,
+            authorityRevision: entry.authorityRevision,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+      }
+      const record = await getCapabilitySyncSnapshot(db, {
+        ownerUserId,
+        maxItems: CAPABILITY_LIMITS.LIST_MAX,
+        afterRevision: this.lastCapabilityRevisionSent,
+      });
+      if (record.revision <= this.lastCapabilityRevisionSent
+        || this.daemonWs !== socket
+        || this.daemonGeneration !== expectedGeneration) return;
+      socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+        record,
+        CAPABILITY_SYNC_MSG.DELTA,
+        this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+      )));
+      const authority = await getCapabilityAuthorityRecordSet(db, {
+        ownerUserId,
+        serverId: this.serverId,
+      });
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+        authority,
+        this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+      )));
+      this.lastCapabilityRevisionSent = record.revision;
+    } catch (error) {
+      if (this.lastCapabilityHeartbeatRefreshAt === now) {
+        this.lastCapabilityHeartbeatRefreshAt = prevRefreshAt;
+      }
+      throw error;
+    }
   }
 
   private async expirePreActivationCapabilityOperations(
@@ -3317,6 +3678,7 @@ export class WsBridge {
       serverId: this.serverId,
     });
     for (const operation of expired) {
+      this.activeCapabilityOperations.delete(operation.id);
       this.broadcastToBrowsers(JSON.stringify({
         type: CAPABILITY_OPERATION_MSG.PROGRESS,
         operationId: operation.id,
@@ -3347,6 +3709,7 @@ export class WsBridge {
     });
     for (const entry of expired) {
       const { operation } = entry;
+      this.activeCapabilityOperations.delete(operation.id);
       this.broadcastToBrowsers(JSON.stringify({
         type: CAPABILITY_OPERATION_MSG.PROGRESS,
         operationId: operation.id,
@@ -3373,6 +3736,7 @@ export class WsBridge {
     });
     for (const entry of pending) {
       if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      this.activeCapabilityOperations.add(entry.operationId);
       socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
         entry,
         [this.capabilityAuthorizationSigner.key],
@@ -3393,6 +3757,7 @@ export class WsBridge {
     });
     for (const entry of pending) {
       if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      this.activeCapabilityOperations.add(entry.operationId);
       const access = await issueCapabilityBlobAccess(db, {
         ownerUserId,
         serverId: this.serverId,
@@ -3761,6 +4126,14 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, operationId, expectedRevision }, 'Dropped stale capability progress');
         return true;
       }
+      if (updated.state === CAPABILITY_INSTALL_STATE.INSTALLED
+        || updated.state === CAPABILITY_INSTALL_STATE.REWORK
+        || updated.state === CAPABILITY_INSTALL_STATE.FAILED
+        || updated.state === CAPABILITY_INSTALL_STATE.CANCELLED) {
+        this.activeCapabilityOperations.delete(operationId);
+      } else {
+        this.activeCapabilityOperations.add(operationId);
+      }
       this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: updated.revision }));
       return true;
     }
@@ -3910,6 +4283,7 @@ export class WsBridge {
             } satisfies CapabilityOperationCancelFrame));
           }
         }
+        this.activeCapabilityOperations.delete(operationId);
         return true;
       }
       if (activated.pendingBlob && this.capabilityBlobSigningKey) {
@@ -3949,6 +4323,7 @@ export class WsBridge {
             state: failed.state,
             errorCode: failed.errorCode,
           }));
+          this.activeCapabilityOperations.delete(operationId);
           return true;
         }
       } else if (this.capabilityAuthorizationSigner) {
@@ -3959,6 +4334,14 @@ export class WsBridge {
             [this.capabilityAuthorizationSigner.key],
           )));
         }
+      }
+      if (activated.operation.state === CAPABILITY_INSTALL_STATE.INSTALLED
+        || activated.operation.state === CAPABILITY_INSTALL_STATE.REWORK
+        || activated.operation.state === CAPABILITY_INSTALL_STATE.FAILED
+        || activated.operation.state === CAPABILITY_INSTALL_STATE.CANCELLED) {
+        this.activeCapabilityOperations.delete(operationId);
+      } else {
+        this.activeCapabilityOperations.add(operationId);
       }
       this.broadcastToBrowsers(JSON.stringify({
         type: CAPABILITY_OPERATION_MSG.PROGRESS,
@@ -4010,13 +4393,16 @@ export class WsBridge {
             errorCode,
           } satisfies CapabilityOperationCommitAbortFrame));
         }
-        if (failed) this.broadcastToBrowsers(JSON.stringify({
-          type: CAPABILITY_OPERATION_MSG.PROGRESS,
-          operationId,
-          revision: failed.revision,
-          state: failed.state,
-          errorCode: failed.errorCode,
-        }));
+        if (failed) {
+          this.activeCapabilityOperations.delete(operationId);
+          this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+        }
         return true;
       }
       const completed = await completeCapabilityCommit(db, {
@@ -4054,6 +4440,7 @@ export class WsBridge {
           authorityRevision,
         } satisfies CapabilityOperationCommitAckFrame));
       }
+      this.activeCapabilityOperations.delete(operationId);
       await WsBridge.broadcastCapabilitySync(
         ownerUserId,
         db,
@@ -4506,9 +4893,34 @@ export class WsBridge {
     if (attachment.origin === 'subscriber_fallback') attachment.sockets = [];
   }
 
+  private get timelineDataPlaneQueueLength(): number {
+    return this.timelineDataPlaneQueue.length - this.timelineDataPlaneQueueHead;
+  }
+
+  private shiftTimelineDataPlaneJob(): TimelineDataPlaneJob | undefined {
+    const idx = this.timelineDataPlaneQueueHead;
+    if (idx >= this.timelineDataPlaneQueue.length) {
+      this.timelineDataPlaneQueue.length = 0;
+      this.timelineDataPlaneQueueHead = 0;
+      return undefined;
+    }
+    const job = this.timelineDataPlaneQueue[idx]!;
+    this.timelineDataPlaneQueue[idx] = undefined as unknown as TimelineDataPlaneJob;
+    this.timelineDataPlaneQueueHead = idx + 1;
+    if (this.timelineDataPlaneQueueHead >= this.timelineDataPlaneQueue.length) {
+      this.timelineDataPlaneQueue.length = 0;
+      this.timelineDataPlaneQueueHead = 0;
+    } else if (this.timelineDataPlaneQueueHead > 64 && this.timelineDataPlaneQueueHead * 2 >= this.timelineDataPlaneQueue.length) {
+      this.timelineDataPlaneQueue = this.timelineDataPlaneQueue.slice(this.timelineDataPlaneQueueHead);
+      this.timelineDataPlaneQueueHead = 0;
+    }
+    return job;
+  }
+
   private pruneCanceledTimelineDataPlaneJobs(): void {
     const retained: TimelineDataPlaneJob[] = [];
-    for (const job of this.timelineDataPlaneQueue) {
+    for (let i = this.timelineDataPlaneQueueHead; i < this.timelineDataPlaneQueue.length; i += 1) {
+      const job = this.timelineDataPlaneQueue[i]!;
       const attachments: TimelineDataPlaneAttachment[] = [];
       for (const attachment of job.attachments) {
         if (this.isTimelineDataPlaneAttachmentCanceled(attachment)) {
@@ -4545,10 +4957,12 @@ export class WsBridge {
       }
     }
     this.timelineDataPlaneQueue = retained;
+    this.timelineDataPlaneQueueHead = 0;
   }
 
   private cancelTimelineDataPlaneForSocket(ws: WebSocket): void {
-    for (const job of this.timelineDataPlaneQueue) {
+    for (let i = this.timelineDataPlaneQueueHead; i < this.timelineDataPlaneQueue.length; i += 1) {
+      const job = this.timelineDataPlaneQueue[i]!;
       for (const attachment of job.attachments) {
         if (attachment.origin === 'browser_request' && attachment.socket === ws) {
           incrementCounter('ws_bridge_timeline_data_plane_canceled', {
@@ -4636,7 +5050,7 @@ export class WsBridge {
     if (this.timelineDataPlaneActiveJobs.delete(job)) {
       for (const attachment of job.attachments) this.releaseTimelineDataPlaneAttachment(attachment);
     }
-    if (this.timelineDataPlaneQueue.length > 0 && this.timelineDataPlaneActiveJobs.size < TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) {
+    if (this.timelineDataPlaneQueueLength > 0 && this.timelineDataPlaneActiveJobs.size < TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) {
       this.scheduleTimelineDataPlaneDrain();
     }
   }
@@ -4650,7 +5064,7 @@ export class WsBridge {
   ): boolean {
     if (attachments.length === 0) return true;
     this.pruneCanceledTimelineDataPlaneJobs();
-    const queuedBehindCount = this.timelineDataPlaneQueue.length;
+    const queuedBehindCount = this.timelineDataPlaneQueueLength;
     const estimatedBytes = attachments.reduce((sum, attachment) => sum + this.timelineAttachmentBytes(attachment), 0);
     const socketTotals = new Map<WebSocket, number>();
     const userTotals = new Map<string, number>();
@@ -4870,8 +5284,8 @@ export class WsBridge {
     this.timelineDataPlaneScheduled = false;
     this.pruneCanceledTimelineDataPlaneJobs();
     while (this.timelineDataPlaneActiveJobs.size < TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) {
-      const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
-      const job = this.timelineDataPlaneQueue.shift();
+      const queueDepthBeforeDrain = this.timelineDataPlaneQueueLength;
+      const job = this.shiftTimelineDataPlaneJob();
       if (!job) break;
       this.timelineDataPlaneActiveJobs.add(job);
       const queueMetrics: TimelineDataPlaneQueueMetrics = {
@@ -5404,6 +5818,45 @@ export class WsBridge {
     }));
   }
 
+  private async readUserCompactHijackGlobalConfig(userId: string): Promise<CompactHijackGlobalConfig> {
+    if (!this.db) return { enabled: false };
+    return parseCompactHijackGlobalConfigJson(await getUserPref(this.db, userId, COMPACT_HIJACK_GLOBAL_PREF_KEY));
+  }
+
+  private sendCompactHijackConfigApply(config: CompactHijackGlobalConfig): void {
+    const normalized = normalizeCompactHijackGlobalConfig(config);
+    this.sendToDaemon(JSON.stringify({
+      type: COMPACT_HIJACK_MSG.APPLY,
+      ...normalized,
+    }));
+  }
+
+  static async pushUserCompactHijackConfigToOnlineDaemons(
+    userId: string,
+    config: CompactHijackGlobalConfig,
+  ): Promise<void> {
+    const normalized = normalizeCompactHijackGlobalConfig(config);
+    const entries = [...WsBridge.instances.values()];
+    await Promise.all(entries.map(async (bridge) => {
+      if (!bridge.authenticated || !bridge.daemonWs) return;
+      if (bridge.daemonNodeRole === NODE_ROLE.CONTROLLED) return;
+      let ownerUserId = bridge.daemonOwnerUserId;
+      if (!ownerUserId && bridge.db) {
+        const row = await bridge.db.queryOne<{ user_id?: string }>(
+          'SELECT user_id FROM servers WHERE id = $1',
+          [bridge.serverId],
+        ).catch(() => null);
+        ownerUserId = row?.user_id ?? null;
+      }
+      if (ownerUserId !== userId) return;
+      try {
+        bridge.sendCompactHijackConfigApply(normalized);
+      } catch (error) {
+        logger.warn({ err: error, serverId: bridge.serverId }, 'failed to apply global compact hijack config to daemon');
+      }
+    }));
+  }
+
   /**
    * Identity-over-the-lease access, mirroring the HTTP identity routes
    * (server/src/routes/session-mgmt.ts: resolveSupervisorDefaultsOwner +
@@ -5725,6 +6178,12 @@ export class WsBridge {
     this.authenticated = false;
     this.lastCapabilityRevisionSent = 0;
     this.capabilitySyncInitialized = false;
+    this.lastCapabilityHeartbeatRefreshAt = 0;
+    this.activeCapabilityOperations.clear();
+    this.remoteDesktopNodeContextCache = null;
+    this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+    this.remoteDesktopNodeContextInFlight = null;
+    this.resetHeartbeatDbPersistenceState(null);
     this.controlledNodeCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
@@ -5844,6 +6303,7 @@ export class WsBridge {
           node_role?: string | null;
           revoked_at?: number | null;
           os?: string | null;
+          arch?: string | null;
           node_id?: string | null;
           abi_profile?: unknown;
           owner_status?: string | null;
@@ -5865,11 +6325,17 @@ export class WsBridge {
             node_role?: string | null;
             revoked_at?: number | null;
             os?: string | null;
+            arch?: string | null;
             node_id?: string | null;
             abi_profile?: unknown;
+            owner_status?: string | null;
+            controlled_upgrade_status?: string | null;
+            controlled_upgrade_target_version?: string | null;
+            controlled_upgrade_reason?: string | null;
           }>(
-            `SELECT token_hash, user_id, node_role, revoked_at, os, node_id, abi_profile,
+            `SELECT token_hash, user_id, node_role, revoked_at, os, arch, node_id, abi_profile,
                     (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status,
+                    controlled_upgrade_status, controlled_upgrade_target_version, controlled_upgrade_reason,
                     controlled_worker_refresh_attempt_id, controlled_worker_refresh_phase,
                     controlled_worker_refresh_installed_version, controlled_worker_refresh_target_version,
                     controlled_worker_refresh_artifact_sha256, controlled_worker_refresh_reason,
@@ -5938,6 +6404,15 @@ export class WsBridge {
           && isControlledNodeOs(server.os)
           ? server.os
           : null;
+        this.daemonControlledArch = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+          ? (typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
+            ? msg.runtimeArch
+            : typeof server.arch === 'string' && isControlledNodeArch(server.arch)
+              ? server.arch
+              : null)
+          : null;
+        this.controlledNodeArtifactAvailable = true;
+        this.controlledNodeArtifactUnavailableReason = null;
         this.daemonControlledNodeId = this.daemonNodeRole === NODE_ROLE.CONTROLLED ? parseControlledNodeId(server.node_id) : null;
         const supportsUpgradeBlockedSync = this.daemonNodeRole === NODE_ROLE.FULL
           && msg[DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]
@@ -5996,8 +6471,14 @@ export class WsBridge {
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
+        this.incognitoSessions.clear();
+        this.pendingIncognitoSubSessionStarts.clear();
+        this.incognitoSubSessionMetadata.clear();
+        this.rejectedIncognitoSubSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
+        this.activeSubSessions.clear();
+        this.invalidateSessionOwnershipCache();
         this.hasActiveMainSessionSnapshot = false;
         // This connection's own credentials are verified: a controlled node's heartbeat may be acknowledged now.
         const credentialMs = Date.now() - authStartedAt;
@@ -6036,67 +6517,85 @@ export class WsBridge {
         }
         onAuthenticated?.();
 
-        updateServerHeartbeat(
-          db,
-          this.serverId,
-          this.daemonVersion,
-          this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
+        this.persistHeartbeatIfDue(db, connectionGeneration, this.daemonVersion, {
+          force: true,
+          controlledCapabilities: this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
           // Validated before it is stored: this column is read by artifact
           // selection, and an unrecognised value is worse than the stale one
           // it would replace.
-          typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
+          runtimeArch: typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
             ? msg.runtimeArch
             : null,
-        ).catch((err) =>
-          logger.error({ err }, 'Failed to update heartbeat on auth'),
-        );
-        // Full-daemon-only traffic (memory feature config) is NOT pushed to a
+          logLabel: 'Failed to update heartbeat on auth',
+        });
+        const postAuthTasks: Array<Promise<void>> = [];
+        if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          if (process.env.IMCODES_NODE_EXE_DIR?.trim()) {
+            postAuthTasks.push((async () => {
+              const availability = await checkControlledNodeUpgradeArtifactAvailability({
+                os: this.daemonControlledOs,
+                arch: this.daemonControlledArch,
+                abiProfile: this.daemonControlledAbiProfile,
+              });
+              if (!isCurrentAuthConnection()) return;
+              this.syncControlledNodeArtifactAvailability(availability);
+            })());
+          } else {
+            this.syncControlledNodeArtifactAvailability({ configured: false, available: true });
+          }
+        }
+        // Full-daemon-only traffic (memory feature config + user identity) is NOT pushed to a
         // controlled node — it is a restricted presence/exec-result surface (10.2).
         if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && typeof server.user_id === 'string' && server.user_id.trim()) {
-          try {
-            const memoryFeatureFlags = await this.readUserMemoryFeatureFlags(server.user_id);
-            if (!isCurrentAuthConnection()) {
-              finishLocalAuth();
-              return;
+          const authUserId = server.user_id;
+          postAuthTasks.push((async () => {
+            try {
+              const memoryFeatureFlags = await this.readUserMemoryFeatureFlags(authUserId);
+              if (!isCurrentAuthConnection()) return;
+              this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
+            } catch (err) {
+              logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
             }
-            this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
-          } catch (err) {
-            logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
-          }
-          if (!isCurrentAuthConnection()) {
-            finishLocalAuth();
-            return;
-          }
+          })());
+          postAuthTasks.push((async () => {
+            try {
+              const compactHijackConfig = await this.readUserCompactHijackGlobalConfig(authUserId);
+              if (!isCurrentAuthConnection()) return;
+              this.sendCompactHijackConfigApply(compactHijackConfig);
+            } catch (err) {
+              logger.warn({ err, serverId: this.serverId }, 'failed to push global compact hijack config on daemon auth');
+            }
+          })());
           // USER-scope identity content lives on the server; push it now
           // instead of the daemon polling for it (owner rule,
           // tsk_cd_identity_daemon_storage). Unconditional: this event is
           // rare (one per connect) and the content is capped at 100k chars,
           // so no need for hash comparison here -- a reconnecting daemon
           // with a stale copy gets the current one either way.
-          try {
-            const userProfile = await getServerSessionIdentityProfile(db, server.user_id, 'user', '');
-            if (!isCurrentAuthConnection()) {
-              finishLocalAuth();
-              return;
+          postAuthTasks.push((async () => {
+            try {
+              const userProfile = await getServerSessionIdentityProfile(db, authUserId, 'user', '');
+              if (!isCurrentAuthConnection()) return;
+              if (userProfile && userProfile.content) this.sendSessionIdentityUserPush(userProfile);
+            } catch (err) {
+              logger.warn({ err, serverId: this.serverId }, 'failed to push user identity on daemon auth');
             }
-            if (userProfile && userProfile.content) this.sendSessionIdentityUserPush(userProfile);
-          } catch (err) {
-            logger.warn({ err, serverId: this.serverId }, 'failed to push user identity on daemon auth');
-          }
-          if (!isCurrentAuthConnection()) {
-            finishLocalAuth();
-            return;
-          }
+          })());
         }
         if (this.daemonNodeRole === NODE_ROLE.FULL) {
-          try {
-            await this.sendCapabilitySnapshot(db, ws, connectionGeneration);
-          } catch (error) {
-            // Capability sync is fail-closed and independent from core daemon
-            // liveness. Keep the connection, report the unavailable slice, and
-            // let the daemon retry with CAPABILITY_SYNC_MSG.REQUEST.
-            logger.warn({ error, serverId: this.serverId }, 'Initial capability snapshot failed');
-          }
+          postAuthTasks.push((async () => {
+            try {
+              await this.sendCapabilitySnapshot(db, ws, connectionGeneration);
+            } catch (error) {
+              // Capability sync is fail-closed and independent from core daemon
+              // liveness. Keep the connection, report the unavailable slice, and
+              // let the daemon retry with CAPABILITY_SYNC_MSG.REQUEST.
+              logger.warn({ error, serverId: this.serverId }, 'Initial capability snapshot failed');
+            }
+          })());
+        }
+        if (postAuthTasks.length > 0) {
+          await Promise.all(postAuthTasks);
           if (!isCurrentAuthConnection()) {
             finishLocalAuth();
             return;
@@ -6478,6 +6977,7 @@ export class WsBridge {
 
       if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
         this.handleDaemonP2pWorkflowHello(msg);
+        this.sendToDaemon(JSON.stringify({ type: SESSION_INCOGNITO_SERVER_READY }));
         return;
       }
 
@@ -6511,9 +7011,7 @@ export class WsBridge {
           ? msg.daemonVersion
           : this.daemonVersion;
         if (typeof heartbeatDaemonVersion === 'string') this.daemonVersion = heartbeatDaemonVersion;
-        updateServerHeartbeat(db, this.serverId, heartbeatDaemonVersion).catch((err) =>
-          logger.error({ err }, 'Failed to update heartbeat'),
-        );
+        this.persistHeartbeatIfDue(db, connectionGeneration, heartbeatDaemonVersion);
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead
         try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
         void this.refreshCapabilitySyncOnHeartbeat(db, ws, connectionGeneration).catch((error: unknown) => {
@@ -6521,12 +7019,22 @@ export class WsBridge {
         });
       }
 
+      if (msg.type === 'session.error') {
+        this.rollbackIncognitoSubSessionsOnDaemonError(msg);
+      }
+
       this.relayToBrowsers(msg);
 
       // Push notifications for key events
-      if (env) {
+      const eventForPrivacy = msg.event as { sessionId?: unknown; payload?: unknown } | undefined;
+      const sessionHint = eventForPrivacy?.sessionId ?? msg.session ?? msg.sessionName
+        ?? (typeof msg.id === 'string' && msg.id ? `deck_sub_${msg.id}` : undefined);
+      const privateSession = isIncognitoSession(eventForPrivacy?.payload)
+        || (sessionHint ? this.incognitoSessions.has(String(sessionHint)) : false);
+      if (env && !privateSession) {
         const pushType = msg.type as string;
         if (pushType === 'session.idle') {
+          if (msg[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
           this.scheduleIdleEventPush(db, env, msg);
         } else if (pushType === 'session.error') {
           this.dispatchEventPush(db, env, msg).catch((err) =>
@@ -6573,6 +7081,17 @@ export class WsBridge {
               eventTs: event.ts,
             });
           }
+          // task_pair.event for task lifecycle push notifications (DONE, PAUSED, AUDIT)
+          if (event?.type === TASK_PAIR_TIMELINE_EVENT || event?.type === 'task_pair.event') {
+            const payload = (event.payload && typeof event.payload === 'object')
+              ? (event.payload as Record<string, unknown>)
+              : {};
+            const eventTs = typeof event.ts === 'number' ? event.ts : undefined;
+            if (eventTs && Date.now() - eventTs > PUSH_TIMELINE_EVENT_MAX_AGE_MS) return;
+            this.dispatchTaskPairPush(db, env, event.sessionId ? String(event.sessionId) : '', payload, event.eventId as string | undefined, eventTs).catch((err) =>
+              logger.error({ err }, 'Task pair push dispatch failed'),
+            );
+          }
         }
       }
     });
@@ -6592,9 +7111,14 @@ export class WsBridge {
         this.upgradeBlockedSyncRequiredGeneration = null;
         this.upgradeBlockedSyncCompleteGeneration = null;
         this.recentTextBySession.clear();
+        this.incognitoSessions.clear();
+        this.pendingIncognitoSubSessionStarts.clear();
+        this.incognitoSubSessionMetadata.clear();
+        this.rejectedIncognitoSubSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
+        this.invalidateSessionOwnershipCache();
         this.hasActiveMainSessionSnapshot = false;
         this.clearAutoUpgradeRetryTimer();
         this.rejectAllPendingFileTransfers('daemon_disconnected');
@@ -6612,8 +7136,17 @@ export class WsBridge {
         this.daemonP2pWorkflowCapabilities = null;
         this.controlledNodeCapabilities.clear();
         this.daemonControlledOs = null;
+        this.daemonControlledArch = null;
         this.daemonControlledNodeId = null;
+        this.controlledNodeArtifactAvailable = true;
+        this.controlledNodeArtifactUnavailableReason = null;
         this.daemonOwnerUserId = null;
+        this.lastCapabilityHeartbeatRefreshAt = 0;
+        this.activeCapabilityOperations.clear();
+        this.remoteDesktopNodeContextCache = null;
+        this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+        this.remoteDesktopNodeContextInFlight = null;
+        this.resetHeartbeatDbPersistenceState('offline');
         if (disconnectedOwnerUserId) {
           this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
         }
@@ -6688,6 +7221,7 @@ export class WsBridge {
       coveredSessionNames,
       coveredProjectDirs,
     });
+    WsBridge.ensureShareExpirySweepTimer();
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
     void this.refreshShareActorDisplayName(ws);
     void this.refreshShareCoveredSessions(ws);
@@ -6867,6 +7401,16 @@ export class WsBridge {
   async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
     // Synchronous, before any await: from here no socket's cached coverage serves a command.
     this.shareCoverageEpoch += 1;
+    if (target.kind === 'main') {
+      this.invalidateSessionOwnershipCache(target.sessionName);
+      this.activeMainSessions.delete(target.sessionName);
+    } else if (target.kind === 'subsession') {
+      const subName = `deck_sub_${target.subSessionId}`;
+      this.invalidateSessionOwnershipCache(subName);
+      this.activeSubSessions.delete(subName);
+    } else if (target.kind === 'server') {
+      this.invalidateSessionOwnershipCache();
+    }
     const sockets = [...this.browserShareStates]
       .filter(([, state]) => (
         state.target.serverId === target.serverId
@@ -6892,6 +7436,7 @@ export class WsBridge {
     if (controlledTarget) {
       this.controlledTargetBrowserSockets.add(ws);
       this.controlledBrowserReads.register(ws, userId);
+      WsBridge.ensureShareExpirySweepTimer();
       void this.controlledBrowserReads.revalidate(userId);
     }
     const sendInitial = (json: string) => controlledTarget ? this.controlledBrowserReads.send(ws, json) : safeSend(ws, json);
@@ -6905,6 +7450,10 @@ export class WsBridge {
       // Push cached remote sessions for each connected provider
       for (const [providerId, sessions] of this.providerRemoteSessions) {
         sendInitial(JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
+      }
+      for (const [subName, meta] of this.incognitoSubSessionMetadata) {
+        const liveState = this.activeSubSessions.get(subName)?.state;
+        sendInitial(JSON.stringify(liveState ? { ...meta, state: liveState } : meta));
       }
     }
     // Worker refresh status is durable per controlled node. Replay the latest
@@ -7045,6 +7594,17 @@ export class WsBridge {
           this.rejectShareScopedBrowserCommand(ws, msg, SHARE_REASONS.DIRECT_SURFACE_DENIED);
           return;
         }
+      } else if (
+        Object.prototype.hasOwnProperty.call(msg, OWNER_MACHINE_AUTHORITY_FIELD)
+        || Object.prototype.hasOwnProperty.call(msg, SHARED_MACHINE_AUTHORITY_FIELD)
+        || Object.prototype.hasOwnProperty.call(msg, 'sharedActor')
+      ) {
+        const sanitized = { ...msg };
+        delete sanitized[OWNER_MACHINE_AUTHORITY_FIELD];
+        delete sanitized[SHARED_MACHINE_AUTHORITY_FIELD];
+        delete sanitized.sharedActor;
+        msg = sanitized;
+        raw = JSON.stringify(msg);
       }
       const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
       if (!browserMessageType) {
@@ -7309,14 +7869,18 @@ export class WsBridge {
       // Explicit per-socket timeline quality. This is intentionally separate
       // from terminal/chat subscriptions: a companion tab can subscribe to a
       // session in summary mode without inheriting another socket's stream.
-      if (msg.type === TIMELINE_MESSAGES.SUBSCRIBE && typeof msg.sessionName === 'string') {
-        await this.handleTimelineSubscription(ws, msg);
+      if (msg.type === TIMELINE_MESSAGES.SUBSCRIBE) {
+        if (typeof msg.sessionName === 'string') {
+          await this.handleTimelineSubscription(ws, msg);
+        }
         return;
       }
-      if (msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE && typeof msg.sessionName === 'string') {
-        this.timelineProtocolSockets.add(ws);
-        this.timelineSubscriptions.get(ws)?.delete(msg.sessionName);
-        this.clearTimelineLatestValueFingerprints(ws, msg.sessionName);
+      if (msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE) {
+        if (typeof msg.sessionName === 'string') {
+          this.timelineProtocolSockets.add(ws);
+          this.timelineSubscriptions.get(ws)?.delete(msg.sessionName);
+          this.clearTimelineLatestValueFingerprints(ws, msg.sessionName);
+        }
         return;
       }
 
@@ -7377,6 +7941,56 @@ export class WsBridge {
 
       if (browserMessageType === SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT && this.browserShareStates.has(ws)) {
         await this.handleShareDiscussionCommentCommand(ws, msg);
+        return;
+      }
+
+      if (!shareState && (
+        browserMessageType === 'session.send'
+        || browserMessageType === TASK_PAIR_DECISION_MSG.FEEDBACK
+        || SHARE_PROCESS_INPUT_COMMANDS.has(browserMessageType)
+      )) {
+        const feedbackScopeSession = browserMessageType === TASK_PAIR_DECISION_MSG.FEEDBACK
+          && msg.scope
+          && typeof msg.scope === 'object'
+          && typeof (msg.scope as Record<string, unknown>).coordinatorSessionName === 'string'
+          ? String((msg.scope as Record<string, unknown>).coordinatorSessionName).trim()
+          : '';
+        const targetSession = typeof msg.sessionName === 'string' && msg.sessionName.trim()
+          ? msg.sessionName.trim()
+          : (typeof msg.session === 'string' && msg.session.trim()
+            ? msg.session.trim()
+            : feedbackScopeSession);
+        const capturedMsg = msg;
+        const capturedRaw = raw;
+        await this.enqueueOwnerCommand(ws, async () => {
+          let stampedMsg = capturedMsg;
+          let stampedRaw = capturedRaw;
+          if (targetSession && this.db && this.directFileTransferTicketSigningKey && userId) {
+            const actionId = typeof capturedMsg.commandId === 'string' && capturedMsg.commandId
+              ? capturedMsg.commandId
+              : (typeof capturedMsg.requestId === 'string' && capturedMsg.requestId
+                ? `owner-decision-${capturedMsg.requestId}`
+                : `owner-send-${randomHex(8)}`);
+            const token = (browserMessageType === 'session.send' || browserMessageType === TASK_PAIR_DECISION_MSG.FEEDBACK)
+              ? await issueOwnerMachineAuthorityForSession(this.db, {
+                  actorUserId: userId,
+                  sourceServerId: this.serverId,
+                  sessionName: targetSession,
+                  actionId,
+                  signingKey: this.directFileTransferTicketSigningKey,
+                })
+              : await this.ownerInputMachineAuthority(ws, userId, targetSession);
+            if (token) {
+              stampedMsg = { ...capturedMsg, [OWNER_MACHINE_AUTHORITY_FIELD]: token };
+              stampedRaw = JSON.stringify(stampedMsg);
+            }
+          }
+          if (stampedMsg.type === 'session.send' && typeof stampedMsg.commandId === 'string' && targetSession) {
+            this.handleOutboundSessionSend(ws, stampedMsg.commandId, targetSession, stampedRaw);
+            return;
+          }
+          this.sendToDaemon(stampedRaw);
+        });
         return;
       }
 
@@ -7467,6 +8081,89 @@ export class WsBridge {
       }
       if (msg.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE || msg.type === SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE) {
         this.trackBrowserConsoleSubscription(ws, msg);
+      }
+      if (browserMessageType === 'subsession.start' && msg.incognito === true && typeof msg.id === 'string' && msg.id) {
+        const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
+        const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
+        const subSessionName = `deck_sub_${msg.id}`;
+        const daemonCapable = !this.daemonP2pWorkflowCapabilities
+          || this.daemonP2pWorkflowCapabilities.capabilities.includes(SESSION_INCOGNITO_CAPABILITY);
+        if (
+          !supportsSessionIncognito(agentType)
+          || !this.daemonWs
+          || !this.authenticated
+          || this.daemonWs.readyState !== WebSocket.OPEN
+          || !daemonCapable
+        ) {
+          this.cleanupIncognitoSubSession(subSessionName, msg.id);
+          const errorFrame = JSON.stringify({
+            type: 'session.error',
+            id: msg.id,
+            session: subSessionName,
+            sessionName: subSessionName,
+            ...(parentSession ? { project: parentSession } : {}),
+            message: SESSION_INCOGNITO_UNSUPPORTED,
+          });
+          this.broadcastToBrowsers(errorFrame);
+          this.broadcastToBrowsers(JSON.stringify({
+            type: 'subsession.removed',
+            id: msg.id,
+            sessionName: subSessionName,
+          }));
+          return;
+        }
+        const subLabel = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
+        const subRuntimeType = agentType ? getSessionRuntimeType(agentType) : undefined;
+        this.rejectedIncognitoSubSessions.delete(subSessionName);
+        this.incognitoSessions.add(subSessionName);
+        this.pendingIncognitoSubSessionStarts.set(subSessionName, { id: msg.id, sessionName: subSessionName });
+        this.activeSubSessions.set(subSessionName, {
+          name: subSessionName,
+          state: 'starting',
+          label: subLabel,
+          parentSession,
+          agentType,
+          runtimeType: subRuntimeType,
+        });
+        this.incognitoSubSessionMetadata.set(subSessionName, {
+          type: 'subsession.created',
+          id: msg.id,
+          sessionName: subSessionName,
+          sessionType: agentType ?? null,
+          runtimeType: subRuntimeType ?? null,
+          providerId: subRuntimeType === 'transport' ? (agentType ?? null) : null,
+          cwd: typeof msg.cwd === 'string' ? msg.cwd : null,
+          label: subLabel ?? null,
+          parentSession: parentSession ?? null,
+          state: 'starting',
+          requestedModel: typeof msg.requestedModel === 'string'
+            ? msg.requestedModel
+            : (typeof msg.model === 'string' ? msg.model : null),
+          activeModel: typeof msg.requestedModel === 'string'
+            ? msg.requestedModel
+            : (typeof msg.model === 'string' ? msg.model : null),
+          effort: typeof msg.thinking === 'string'
+            ? msg.thinking
+            : (typeof msg.effort === 'string' ? msg.effort : null),
+          transportConfig: msg.transportConfig && typeof msg.transportConfig === 'object' ? msg.transportConfig : null,
+          incognito: true,
+        });
+      }
+      if (browserMessageType === 'subsession.stop' && typeof msg.sessionName === 'string' && msg.sessionName) {
+        const stopTarget = msg.sessionName;
+        const isIncognitoTarget = this.incognitoSessions.has(stopTarget)
+          || this.pendingIncognitoSubSessionStarts.has(stopTarget);
+        const daemonUnavailable = !this.daemonWs
+          || !this.authenticated
+          || this.daemonWs.readyState !== WebSocket.OPEN;
+        if (isIncognitoTarget && (this.pendingIncognitoSubSessionStarts.has(stopTarget) || daemonUnavailable)) {
+          this.cleanupIncognitoSubSession(stopTarget);
+        }
+      }
+      if (browserMessageType === 'subsession.rebuild_all') {
+        if (msg.supportsCreatedBatch === true) this.batchCreatedBrowsers.add(ws);
+        this.sendToDaemon(JSON.stringify({ ...msg, supportsSyncBatch: true }));
+        return;
       }
       this.sendToDaemon(raw);
     };
@@ -7591,7 +8288,7 @@ export class WsBridge {
       runtimeType,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
     });
-    if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
+    if (decision.allowed && sessionName && (msg.type === 'session.send' || msg.type === TASK_PAIR_DECISION_MSG.FEEDBACK) && decision.stampedMessage) {
       const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
       const token = actor ? await this.issueShareMachineAuthority(actor, sessionName) : null;
       if (!token) {
@@ -7672,6 +8369,57 @@ export class WsBridge {
     if (!mints) {
       mints = new Map();
       this.shareInputAuthorityMints.set(ws, mints);
+    }
+    mints.set(sessionName, run);
+    return run;
+  }
+
+  private enqueueOwnerCommand(ws: WebSocket, task: () => Promise<void>): Promise<void> {
+    const prev = this.ownerCommandChains.get(ws) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(task);
+    this.ownerCommandChains.set(ws, next);
+    return next;
+  }
+
+  private async ownerInputMachineAuthority(
+    ws: WebSocket,
+    userId: string,
+    sessionName: string,
+  ): Promise<string | null> {
+    if (!this.db || !this.directFileTransferTicketSigningKey) return null;
+    let perSession = this.ownerInputAuthorityTokens.get(ws);
+    if (!perSession) {
+      perSession = new Map();
+      this.ownerInputAuthorityTokens.set(ws, perSession);
+    }
+    const cached = perSession.get(sessionName);
+    const now = shareClockNow();
+    if (cached && now >= cached.at && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS) return cached.token;
+    const inFlight = this.ownerInputAuthorityMints.get(ws)?.get(sessionName);
+    if (inFlight) return inFlight;
+    const db = this.db;
+    const signingKey = this.directFileTransferTicketSigningKey;
+    const run = issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: userId,
+      sourceServerId: this.serverId,
+      sessionName,
+      actionId: `owner-input-${randomHex(8)}`,
+      signingKey,
+      now,
+    })
+      .catch(() => null)
+      .then((token) => {
+        perSession.set(sessionName, { token, at: shareClockNow() });
+        return token;
+      })
+      .finally(() => {
+        const mints = this.ownerInputAuthorityMints.get(ws);
+        mints?.delete(sessionName);
+      });
+    let mints = this.ownerInputAuthorityMints.get(ws);
+    if (!mints) {
+      mints = new Map();
+      this.ownerInputAuthorityMints.set(ws, mints);
     }
     mints.set(sessionName, run);
     return run;
@@ -8950,6 +9698,11 @@ export class WsBridge {
     }
 
     // ── File transfer responses: resolve HTTP handler Promises ─────────────────
+    if (type === R2_RELAY_MSG.PROGRESS) {
+      const requestId = msg.downloadId as string | undefined;
+      if (requestId) this.notifyFileTransferProgress(requestId, msg);
+      return;
+    }
     if (type === 'file.upload_progress') {
       const requestId = msg.uploadId as string | undefined;
       if (requestId) this.notifyFileTransferProgress(requestId, msg);
@@ -8965,7 +9718,7 @@ export class WsBridge {
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
     }
-    if (type === 'file.download_done' || type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY || type === 'file.download_error') {
+    if (type === R2_RELAY_MSG.DONE || type === 'file.download_done' || type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY || type === 'file.download_error') {
       const requestId = msg.downloadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
@@ -9035,11 +9788,28 @@ export class WsBridge {
 
     // ── Lifecycle events: broadcast whitelist ─────────────────────────────────
     if (type === 'session_event') {
+      if (typeof msg.session === 'string' && msg.session
+        && (msg.event === 'stopped' || msg.event === 'deleted' || msg.event === 'removed' || msg.event === 'closed')) {
+        this.invalidateSessionOwnershipCache(msg.session);
+        if (msg.event === 'deleted' || msg.event === 'removed') {
+          this.activeMainSessions.delete(msg.session);
+        }
+        if (msg.event === 'stopped') {
+          this.incognitoSessions.delete(msg.session);
+          this.recentTextBySession.delete(msg.session);
+        }
+      }
       this.broadcastToBrowsers(JSON.stringify({ ...msg, type: 'session.event' }));
       return;
     }
 
       if (type === 'session_list') {
+        for (const session of Array.isArray(msg.sessions) ? msg.sessions : []) {
+          if (session && typeof session === 'object' && typeof session.name === 'string') {
+            if (isIncognitoSession(session)) this.incognitoSessions.add(session.name);
+            else this.incognitoSessions.delete(session.name);
+          }
+        }
         this.replaceActiveMainSessions(msg.sessions);
         this.pruneMainSessionRecentText(msg.sessions);
         const sessions = Array.isArray(msg.sessions)
@@ -9069,26 +9839,33 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'timeline event missing sessionId - discarded');
         return;
       }
-      if (rawEvent.type === 'user.message') {
-        const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        const commandId = typeof payload?.commandId === 'string' ? payload.commandId : '';
-        if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
+      if (isIncognitoSession(rawEvent.payload)) this.incognitoSessions.add(sessionId);
+      if (rawEvent.type !== 'session.state' || (rawEvent.payload as Record<string, unknown> | undefined)?.state !== 'error') {
+        this.markIncognitoSubSessionStarted(sessionId);
       }
-      if (rawEvent.type === 'session.state') {
-        const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        if (typeof payload?.state === 'string') this.updateAuthoritativeSessionState(sessionId, payload.state);
-      }
-      this.ingestRecentTextFromTimelineEvent(rawEvent);
-      if (this.db) {
-        void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
-          .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
-      }
-      // New clients have per-socket explicit mode subscriptions. Legacy
-      // clients retain the old path until they speak timeline.subscribe.
-      const timelineRecipients = this.timelineProtocolSockets.size > 0
-        ? this.deliverTimelineEventToSubscribers(sessionId, rawEvent, msg)
-        : this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
-      this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
+      const isPrivate = isIncognitoSession(rawEvent.payload) || this.incognitoSessions.has(sessionId);
+      withSessionPrivacy(undefined, isPrivate, () => {
+        if (rawEvent.type === 'user.message') {
+          const payload = rawEvent.payload as Record<string, unknown> | undefined;
+          const commandId = typeof payload?.commandId === 'string' ? payload.commandId : '';
+          if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
+        }
+        if (rawEvent.type === 'session.state') {
+          const payload = rawEvent.payload as Record<string, unknown> | undefined;
+          if (typeof payload?.state === 'string') this.updateAuthoritativeSessionState(sessionId, payload.state);
+        }
+        this.ingestRecentTextFromTimelineEvent(rawEvent);
+        if (this.db && !isPrivate) {
+          void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
+            .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
+        }
+        // New clients have per-socket explicit mode subscriptions. Legacy
+        // clients retain the old path until they speak timeline.subscribe.
+        const timelineRecipients = this.timelineProtocolSockets.size > 0
+          ? this.deliverTimelineEventToSubscribers(sessionId, rawEvent, msg)
+          : this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg), msg);
+        this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
+      });
       return;
     }
 
@@ -9147,6 +9924,7 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'subsession.response missing sessionName — discarded');
         return;
       }
+      this.markIncognitoSubSessionStarted(sessionName);
       // Control-plane: bypass the PTY queue.
       this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
@@ -9159,6 +9937,7 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, type }, 'session notification missing session — discarded');
         return;
       }
+      this.markIncognitoSubSessionStarted(sessionName);
       // Control-plane: bypass the PTY queue. session.idle is the WS twin
       // of the cancel/stop push notification — must arrive without queueing
       // behind PTY frames so the browser spinner clears in lockstep with
@@ -9171,132 +9950,76 @@ export class WsBridge {
     }
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
-    if (type === 'subsession.sync' && this.db) {
+    if ((type === 'subsession.sync' || type === SUBSESSION_SYNC_BATCH_MSG) && this.db) {
       const db = this.db;
-      if (isKnownTestSessionLike({
-        name: typeof msg.id === 'string' ? `deck_sub_${msg.id}` : undefined,
-        cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
-        parentSession: typeof msg.parentSession === 'string' ? msg.parentSession : undefined,
-      })) {
+      const rawItems = type === SUBSESSION_SYNC_BATCH_MSG
+        ? (Array.isArray(msg.items) ? msg.items.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object') : [])
+        : [msg];
+      const acceptedItems: Record<string, unknown>[] = [];
+      for (const item of rawItems) {
+        if (isIncognitoSession(item) || (typeof item.id === 'string' && this.incognitoSessions.has(`deck_sub_${item.id}`))) {
+          this.registerInMemoryIncognitoSubSession(item);
+          continue;
+        }
+        if (this.registerActiveSubSessionFromSync(item)) acceptedItems.push(item);
+      }
+      if (acceptedItems.length === 0) return;
+
+      if (type === 'subsession.sync') {
+        const single = acceptedItems[0];
+        void (async () => {
+          const resolved = await this.resolveSubSessionSyncItem(db, single);
+          if (!resolved) {
+            logger.warn({ id: single.id }, 'Skipping sub-session DB sync without sessionType');
+            return;
+          }
+          await createSubSession(
+            db,
+            resolved.row.id,
+            this.serverId,
+            resolved.row.type,
+            resolved.row.shellBin,
+            resolved.row.cwd,
+            resolved.row.label,
+            resolved.row.ccSessionId,
+            resolved.row.geminiSessionId ?? null,
+            resolved.row.parentSession ?? null,
+            resolved.row.runtimeType ?? null,
+            resolved.row.providerId ?? null,
+            resolved.row.providerSessionId ?? null,
+            resolved.row.description ?? null,
+            resolved.row.ccPresetId ?? null,
+            resolved.row.requestedModel ?? null,
+            resolved.row.activeModel ?? null,
+            resolved.row.effort ?? null,
+            resolved.row.transportConfig ?? null,
+            resolved.row.executionCloneMetadata ?? null,
+          );
+          this.broadcastToBrowsers(JSON.stringify(resolved.frame));
+        })().catch((e) => logger.error({ err: e, id: single.id }, 'Failed to sync sub-session to DB'));
         return;
       }
-      const subSessionName = `deck_sub_${String(msg.id ?? '')}`;
-      if (subSessionName !== 'deck_sub_') {
-        const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
-        const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
-        const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
-        const runtimeType = typeof msg.runtimeType === 'string'
-          ? msg.runtimeType
-          : agentType
-            ? getSessionRuntimeType(agentType)
-            : undefined;
-        this.activeSubSessions.set(subSessionName, {
-          name: subSessionName,
-          state: typeof msg.state === 'string' ? msg.state : undefined,
-          label,
-          parentSession,
-          agentType,
-          runtimeType,
-        });
-        const subIdentityProjectKey = sessionIdentityProjectKey({
-          contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
-        });
-        if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
-        this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
-        if (typeof msg.state === 'string') this.updateAuthoritativeSessionState(subSessionName, msg.state);
-      }
+
       void (async () => {
-        const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
-          ? msg.sessionType.trim()
-          : null;
-        const persisted = requestedType ? null : await getSubSessionById(db, msg.id as string, this.serverId).catch(() => null);
-        const sessionType = requestedType ?? persisted?.type ?? null;
-        if (!sessionType) {
-          logger.warn({ id: msg.id }, 'Skipping sub-session DB sync without sessionType');
-          return;
+        const resolved = (await Promise.all(acceptedItems.map((item) => this.resolveSubSessionSyncItem(db, item))))
+          .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+        for (let i = 0; i < resolved.length; i += SUBSESSION_SYNC_BATCH_MAX_ITEMS) {
+          const chunk = resolved.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS);
+          await createSubSessionsBatch(db, chunk.map((entry) => entry.row));
+          this.broadcastSubsessionCreatedBatch(chunk.map((entry) => entry.frame));
         }
-        const persistedRuntimeType = typeof msg.runtimeType === 'string'
-          ? msg.runtimeType
-          : sessionType
-            ? getSessionRuntimeType(sessionType)
-            : null;
-        await createSubSession(
-          db,
-          msg.id as string,
-          this.serverId,
-          sessionType,
-          (msg.shellBin as string) || null,
-          (msg.cwd as string) || null,
-          (msg.label as string) || null,
-          (msg.ccSessionId as string) || null,
-          (msg.geminiSessionId as string) || null,
-          (msg.parentSession as string) || null,
-          persistedRuntimeType,
-          (msg.providerId as string) || null,
-          (msg.providerSessionId as string) || null,
-          (msg.description as string) || null,
-          (msg.ccPresetId as string) || null,
-          (msg.requestedModel as string) || null,
-          ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
-          (msg.effort as string) || null,
-          (msg.transportConfig as Record<string, unknown>) || null,
-          (msg.executionCloneMetadata as Record<string, unknown>) || null,
-        );
-        // Notify browsers so sub-session appears immediately without page refresh
-        const queueRelay = buildSubsessionQueueRelay(msg);
-        const executionCloneMetadata = (msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object')
-          ? msg.executionCloneMetadata as Record<string, unknown>
-          : null;
-        const isExecutionClone = executionCloneMetadata?.kind === EXECUTION_CLONE_KIND;
-        const executionCloneProjection = isExecutionClone
-          ? {
-              executionCloneKind: EXECUTION_CLONE_KIND,
-              ...(typeof executionCloneMetadata.parentRunId === 'string'
-                ? { parentRunId: executionCloneMetadata.parentRunId }
-                : {}),
-            }
-          : {};
-        this.broadcastToBrowsers(JSON.stringify({
-          type: 'subsession.created',
-          id: msg.id,
-          sessionName: `deck_sub_${msg.id}`,
-          sessionInstanceId: msg.sessionInstanceId || null,
-          runtimeEpoch: msg.runtimeEpoch || null,
-          sessionType,
-          cwd: msg.cwd || null,
-          label: msg.label || null,
-          parentSession: msg.parentSession || null,
-          ccPresetId: (msg.ccPresetId as string) || null,
-          runtimeType: persistedRuntimeType,
-          providerId: msg.providerId || null,
-          providerSessionId: msg.providerSessionId || null,
-          requestedModel: msg.requestedModel || null,
-          activeModel: msg.activeModel || msg.modelDisplay || null,
-          effort: msg.effort || null,
-          transportConfig: msg.transportConfig || null,
-          supervisionHeartbeat: msg.supervisionHeartbeat || null,
-          ...queueRelay,
-          ...executionCloneProjection,
-          qwenModel: msg.qwenModel || null,
-          qwenAuthType: msg.qwenAuthType || null,
-          qwenAvailableModels: msg.qwenAvailableModels || null,
-          modelDisplay: msg.modelDisplay || null,
-          planLabel: msg.planLabel || null,
-          quotaLabel: msg.quotaLabel || null,
-          quotaUsageLabel: msg.quotaUsageLabel || null,
-          quotaMeta: msg.quotaMeta || null,
-          state: (msg.state as string) || 'idle',
-        }));
-      })().catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
+      })().catch((e) => logger.error({ err: e, count: acceptedItems.length }, 'Failed to batch sync sub-sessions to DB'));
       return;
     }
     if (type === 'subsession.update_gemini_id' && this.db) {
+      if (typeof msg.id === 'string' && this.incognitoSessions.has(`deck_sub_${msg.id}`)) return;
       void updateSubSession(this.db, msg.id as string, this.serverId, {
         gemini_session_id: msg.geminiSessionId as string,
       }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to update gemini_session_id'));
       return;
     }
     if (type === 'subsession.close' && this.db) {
+      if (typeof msg.id === 'string' && this.incognitoSessions.has(`deck_sub_${msg.id}`)) return;
       void updateSubSession(this.db, msg.id as string, this.serverId, { closed_at: Date.now() })
         .catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to close sub-session in DB'));
       return;
@@ -9352,15 +10075,35 @@ export class WsBridge {
     }
 
     // ── Sub-session closed by daemon → mark in DB + notify browsers ─────────
-    if (type === 'subsession.closed' && this.db) {
-      const id = msg.id as string;
-      if (id) {
+    if (type === 'subsession.closed') {
+      const id = typeof msg.id === 'string' ? msg.id : '';
+      const incognitoSubName = id ? `deck_sub_${id}` : '';
+      if (
+        id
+        && (
+          this.incognitoSessions.has(incognitoSubName)
+          || this.pendingIncognitoSubSessionStarts.has(incognitoSubName)
+          || this.rejectedIncognitoSubSessions.has(incognitoSubName)
+          || msg.incognito === true
+        )
+      ) {
+        const hadLiveEntry = this.incognitoSessions.has(incognitoSubName)
+          || this.activeSubSessions.has(incognitoSubName)
+          || this.pendingIncognitoSubSessionStarts.has(incognitoSubName);
+        this.cleanupIncognitoSubSession(incognitoSubName, id);
+        if (!hadLiveEntry) {
+          this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName ?? incognitoSubName }));
+        }
+        return;
+      }
+      if (id && this.db) {
         void this.db.execute('UPDATE sub_sessions SET closed_at = $1 WHERE id = $2 AND server_id = $3',
           [Date.now(), id, this.serverId])
           .then(() => {
             const sessionName = `deck_sub_${id}`;
             this.recentTextBySession.delete(sessionName);
             this.activeSubSessions.delete(sessionName);
+            this.invalidateSessionOwnershipCache(sessionName);
             this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
             // Revoke the grants as well, not just the live sockets. Closing
             // masks coverage (`targetExists` needs `closed_at IS NULL`) but the
@@ -9674,6 +10417,119 @@ export class WsBridge {
     }));
   }
 
+  private markIncognitoSubSessionStarted(sessionName: string): void {
+    if (!sessionName) return;
+    this.pendingIncognitoSubSessionStarts.delete(sessionName);
+  }
+
+  private registerInMemoryIncognitoSubSession(item: Record<string, unknown>): void {
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    if (!id) return;
+    const subSessionName = `deck_sub_${id}`;
+    if (isKnownTestSessionLike({
+      name: subSessionName,
+      cwd: typeof item.cwd === 'string' ? item.cwd : undefined,
+      parentSession: typeof item.parentSession === 'string' ? item.parentSession : undefined,
+    })) {
+      return;
+    }
+    this.rejectedIncognitoSubSessions.delete(subSessionName);
+    this.incognitoSessions.add(subSessionName);
+    this.pendingIncognitoSubSessionStarts.delete(subSessionName);
+    this.registerActiveSubSessionFromSync(item);
+    const agentType = typeof item.sessionType === 'string' && item.sessionType ? item.sessionType : undefined;
+    const runtimeType = typeof item.runtimeType === 'string'
+      ? item.runtimeType
+      : (agentType ? getSessionRuntimeType(agentType) : undefined);
+    const payload: Record<string, unknown> = {
+      type: 'subsession.created',
+      id,
+      sessionName: subSessionName,
+      sessionType: agentType ?? null,
+      runtimeType: runtimeType ?? null,
+      providerId: typeof item.providerId === 'string' ? item.providerId : (runtimeType === 'transport' ? (agentType ?? null) : null),
+      cwd: typeof item.cwd === 'string' ? item.cwd : null,
+      label: typeof item.label === 'string' ? item.label : null,
+      parentSession: typeof item.parentSession === 'string' ? item.parentSession : null,
+      state: typeof item.state === 'string' ? item.state : null,
+      ...(item.sessionInstanceId !== undefined ? { sessionInstanceId: item.sessionInstanceId } : {}),
+      ...(item.runtimeEpoch !== undefined ? { runtimeEpoch: item.runtimeEpoch } : {}),
+      ...(item.requestedModel !== undefined ? { requestedModel: item.requestedModel } : {}),
+      ...(item.activeModel !== undefined ? { activeModel: item.activeModel } : {}),
+      ...(item.modelDisplay !== undefined ? { modelDisplay: item.modelDisplay } : {}),
+      ...(item.planLabel !== undefined ? { planLabel: item.planLabel } : {}),
+      ...(item.quotaLabel !== undefined ? { quotaLabel: item.quotaLabel } : {}),
+      ...(item.quotaUsageLabel !== undefined ? { quotaUsageLabel: item.quotaUsageLabel } : {}),
+      ...(item.quotaMeta !== undefined ? { quotaMeta: item.quotaMeta } : {}),
+      ...(item.effort !== undefined ? { effort: item.effort } : {}),
+      ...(item.transportConfig !== undefined ? { transportConfig: item.transportConfig } : {}),
+      incognito: true,
+    };
+    this.incognitoSubSessionMetadata.set(subSessionName, payload);
+    this.broadcastToBrowsers(JSON.stringify(payload));
+  }
+
+  private cleanupIncognitoSubSession(sessionName: string, explicitId?: string): void {
+    const id = explicitId || rawSubSessionIdFromDisplayName(sessionName) || '';
+    const canonicalName = sessionName || (id ? `deck_sub_${id}` : '');
+    if (!canonicalName) return;
+    const wasTracked = this.incognitoSessions.delete(canonicalName);
+    const hadActive = this.activeSubSessions.delete(canonicalName);
+    const wasPending = this.pendingIncognitoSubSessionStarts.delete(canonicalName);
+    this.incognitoSubSessionMetadata.delete(canonicalName);
+    if (this.rejectedIncognitoSubSessions.size >= 256) {
+      this.rejectedIncognitoSubSessions.clear();
+    }
+    this.rejectedIncognitoSubSessions.add(canonicalName);
+    this.recentTextBySession.delete(canonicalName);
+    this.activeDispatchIds.delete(canonicalName);
+    this.sessionRuntimeTypes.delete(canonicalName);
+    for (const [ws, subs] of this.timelineSubscriptions) {
+      subs.delete(canonicalName);
+      this.clearTimelineLatestValueFingerprints(ws, canonicalName);
+    }
+    for (const [ws, subs] of this.browserSubscriptions) {
+      if (subs.has(canonicalName)) this.removeBrowserSessionSubscription(ws, canonicalName);
+    }
+    for (const subs of this.transportSubscriptions.values()) {
+      subs.delete(canonicalName);
+    }
+    this.invalidateSessionOwnershipCache(canonicalName);
+    if ((wasTracked || hadActive || wasPending) && id) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: 'subsession.removed',
+        id,
+        sessionName: canonicalName,
+      }));
+    }
+  }
+
+  private rollbackIncognitoSubSessionsOnDaemonError(msg: Record<string, unknown>): void {
+    const errorId = typeof msg.id === 'string' && msg.id ? msg.id : '';
+    const rawSession = typeof msg.sessionName === 'string' && msg.sessionName
+      ? msg.sessionName
+      : (typeof msg.session === 'string' && msg.session ? msg.session : '');
+    const targetSession = rawSession || (errorId ? `deck_sub_${errorId}` : '');
+    const messageText = typeof msg.message === 'string' ? msg.message : '';
+    if (targetSession) {
+      if (
+        this.pendingIncognitoSubSessionStarts.has(targetSession)
+        || (this.incognitoSessions.has(targetSession) && messageText === SESSION_INCOGNITO_UNSUPPORTED)
+      ) {
+        this.cleanupIncognitoSubSession(targetSession, errorId || undefined);
+      }
+      return;
+    }
+    if (
+      this.pendingIncognitoSubSessionStarts.size > 0
+      && (messageText === SESSION_INCOGNITO_UNSUPPORTED || /incognito/i.test(messageText))
+    ) {
+      for (const [subName, pending] of [...this.pendingIncognitoSubSessionStarts]) {
+        this.cleanupIncognitoSubSession(subName, pending.id);
+      }
+    }
+  }
+
   private routeBinaryFrame(data: Buffer): void {
     // WS_DATA frames (type 0x04) are handled separately — parsePreviewBinaryFrame returns null for them.
     if (data.length > 0 && data[0] === PREVIEW_BINARY_FRAME.WS_DATA) {
@@ -9712,7 +10568,12 @@ export class WsBridge {
     this.activeMainSessions.clear();
     this.mainIdentityProjectKeys.clear();
     this.hasActiveMainSessionSnapshot = true;
-    if (!Array.isArray(rawSessions)) return;
+    if (!Array.isArray(rawSessions)) {
+      this.invalidateSessionOwnershipCache();
+      this.syncCoveredProjectDirsAcrossShareSockets();
+      this.scheduleAutoUpgradeFlushAtIdleBoundary();
+      return;
+    }
     for (const item of rawSessions) {
       if (!item || typeof item !== 'object') continue;
       const row = item as Record<string, unknown>;
@@ -9733,6 +10594,7 @@ export class WsBridge {
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
+    this.pruneSessionOwnershipCacheToActive(this.activeMainSessions);
     this.syncCoveredProjectDirsAcrossShareSockets();
     this.scheduleAutoUpgradeFlushAtIdleBoundary();
   }
@@ -9753,8 +10615,10 @@ export class WsBridge {
 
   private ingestRecentTextFromTimelineEvent(rawEvent: Record<string, unknown>): void {
     const sessionId = rawEvent.sessionId;
+    if (typeof sessionId !== 'string') return;
+    if (isIncognitoSession(rawEvent.payload) || this.incognitoSessions.has(sessionId)) return;
     const row = recentTextRowFromTimelineEvent(rawEvent);
-    if (typeof sessionId !== 'string' || !row) return;
+    if (!row) return;
     const rows = this.recentTextBySession.get(sessionId) ?? [];
     this.recentTextBySession.set(sessionId, mergeRecentTextRows([...rows, row]));
   }
@@ -9804,22 +10668,33 @@ export class WsBridge {
    *    subscriptions to); we dedup per-WS so the same JSON is never sent
    *    twice.
    */
+  private createShareFilter(json: string, preParsedMsg?: Record<string, unknown>): (ws: WebSocket) => string | null {
+    if (this.browserShareStates.size === 0) return () => json;
+    let msgParsed = preParsedMsg !== undefined;
+    let parsedMsg: Record<string, unknown> | null = preParsedMsg ?? null;
+    return (ws: WebSocket) => {
+      if (!this.browserShareStates.has(ws)) return json;
+      if (!msgParsed) {
+        parsedMsg = this.tryParseJsonRecord(json);
+        msgParsed = true;
+      }
+      return this.filterShareOutgoingJson(ws, parsedMsg, json);
+    };
+  }
+
   private sendJsonToSessionSubscribers(sessionName: string, json: string, extraRecipient?: WebSocket): number {
+    const filterForSocket = this.createShareFilter(json);
     const sent = new Set<WebSocket>();
     for (const [ws, sessions] of this.browserSubscriptions) {
-      if (!sessions.has(sessionName)) continue;
-      if (sent.has(ws)) continue;
-      const msg = this.tryParseJsonRecord(json);
-      const outgoing = this.filterShareOutgoingJson(ws, msg, json);
+      if (!sessions.has(sessionName) || sent.has(ws)) continue;
+      const outgoing = filterForSocket(ws);
       if (!outgoing) continue;
       sent.add(ws);
       safeSend(ws, outgoing);
     }
     for (const [ws, sessions] of this.transportSubscriptions) {
-      if (!sessions.has(sessionName)) continue;
-      if (sent.has(ws)) continue;
-      const msg = this.tryParseJsonRecord(json);
-      const outgoing = this.filterShareOutgoingJson(ws, msg, json);
+      if (!sessions.has(sessionName) || sent.has(ws)) continue;
+      const outgoing = filterForSocket(ws);
       if (!outgoing) continue;
       sent.add(ws);
       safeSend(ws, outgoing);
@@ -9827,8 +10702,7 @@ export class WsBridge {
     // Additive unicast to the socket that sent the originating command, when
     // it isn't already among the subscribers above (see CommandAckOriginRouter).
     if (extraRecipient && !sent.has(extraRecipient)) {
-      const msg = this.tryParseJsonRecord(json);
-      const outgoing = this.filterShareOutgoingJson(extraRecipient, msg, json);
+      const outgoing = filterForSocket(extraRecipient);
       if (outgoing) {
         sent.add(extraRecipient);
         safeSend(extraRecipient, outgoing);
@@ -9848,14 +10722,14 @@ export class WsBridge {
    * is still settling. This preserves cross-user session isolation while
    * preventing the mobile-live / desktop-final-only split.
    */
-  private sendJsonToSessionUserDevices(sessionName: string, json: string): number {
-    const msg = this.tryParseJsonRecord(json);
+  private sendJsonToSessionUserDevices(sessionName: string, json: string, preParsedMsg?: Record<string, unknown>): number {
+    const filterForSocket = this.createShareFilter(json, preParsedMsg);
     const sent = new Set<WebSocket>();
     const viewerUserIds = new Set<string>();
 
     const send = (ws: WebSocket, anchorViewer: boolean): void => {
       if (sent.has(ws)) return;
-      const outgoing = this.filterShareOutgoingJson(ws, msg, json);
+      const outgoing = filterForSocket(ws);
       if (!outgoing || !safeSend(ws, outgoing)) return;
       sent.add(ws);
       if (!anchorViewer) return;
@@ -9942,6 +10816,7 @@ export class WsBridge {
     sessionName: string,
     eventType: string,
     payload: Record<string, unknown>,
+    precomputedFingerprint?: string,
   ): boolean {
     let fingerprints = this.timelineLatestValueFingerprints.get(ws);
     if (!fingerprints) {
@@ -9949,7 +10824,7 @@ export class WsBridge {
       this.timelineLatestValueFingerprints.set(ws, fingerprints);
     }
     const key = `${sessionName}\u0000${eventType}`;
-    const fingerprint = timelinePayloadFingerprint(payload);
+    const fingerprint = precomputedFingerprint ?? timelinePayloadFingerprint(payload);
     if (fingerprints.get(key) === fingerprint) return true;
     fingerprints.set(key, fingerprint);
     return false;
@@ -9981,7 +10856,19 @@ export class WsBridge {
     const sessionId = typeof rawEvent.sessionId === 'string' ? rawEvent.sessionId : sessionName;
     const epoch = typeof rawEvent.epoch === 'number' ? rawEvent.epoch : 0;
     const seq = typeof rawEvent.seq === 'number' ? rawEvent.seq : 0;
-    let recipients = 0;
+    const terminalSessionState = eventType === 'session.state'
+      && TIMELINE_TERMINAL_SESSION_STATES.includes(String(payload.state) as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number]);
+    const terminalUsage = eventType === 'usage.update' && payload.streaming === false;
+    const latestValueEvent = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update';
+    // Terminal states are authoritative transition boundaries. Never
+    // suppress them as duplicate latest values: a reconnecting browser may
+    // have missed the preceding running frame and otherwise stays stuck on
+    // a stale running flag forever.
+    const suppressCandidate = latestValueEvent && !terminalSessionState && !terminalUsage;
+    const finalPriorityBase: TimelineQueuePriority = eventType === 'assistant.text' && payload.streaming !== true
+      ? 'final'
+      : terminalSessionState || terminalUsage ? 'final' : 'durable';
+
     const sockets = new Set<WebSocket>();
     for (const [ws, subscriptions] of this.timelineSubscriptions) {
       if (!subscriptions.has(sessionName)) continue;
@@ -9995,37 +10882,91 @@ export class WsBridge {
       if (this.timelineProtocolSockets.has(ws) || !subscriptions.has(sessionName)) continue;
       sockets.add(ws);
     }
+    if (sockets.size === 0) return 0;
+
+    const hasShares = this.browserShareStates.size > 0;
+    let summaryAllowed: boolean | undefined;
+    let latestFingerprint: string | undefined;
+    let fullEnvelope: Record<string, unknown> | undefined;
+    let fullJson: string | undefined;
+    let fullByteLength: number | undefined;
+    let summaryEnvelope: Record<string, unknown> | undefined;
+    let summaryJson: string | undefined;
+    let summaryByteLength: number | undefined;
+    let recipients = 0;
 
     for (const ws of sockets) {
       const mode = this.timelineSubscriptions.get(ws)?.get(sessionName);
       if (this.timelineProtocolSockets.has(ws) && !mode) continue;
-      if (mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY && !this.isTimelineSummaryEvent(rawEvent)) continue;
-      const outgoingEvent = mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
-        ? this.summarizeTimelineEvent(rawEvent)
-        : rawEvent;
-      const outgoingEnvelope = { ...envelope, event: outgoingEvent };
-      const msg = this.tryParseJsonRecord(JSON.stringify(outgoingEnvelope));
-      const outgoing = this.filterShareOutgoingJson(ws, msg, JSON.stringify(outgoingEnvelope));
-      if (!outgoing) continue;
-      const terminalSessionState = eventType === 'session.state'
-        && TIMELINE_TERMINAL_SESSION_STATES.includes(String(payload.state) as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number]);
-      const terminalUsage = eventType === 'usage.update' && payload.streaming === false;
-      const latestValueEvent = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update';
-      // Terminal states are authoritative transition boundaries. Never
-      // suppress them as duplicate latest values: a reconnecting browser may
-      // have missed the preceding running frame and otherwise stays stuck on
-      // a stale running flag forever.
       const summaryMode = mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY;
-      if (summaryMode && latestValueEvent && !terminalSessionState && !terminalUsage
-        && this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload)) continue;
-      const coalescible = (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')
-        && summaryMode
-        && !terminalSessionState && !terminalUsage;
-      const priority = eventType === 'assistant.text' && payload.streaming !== true
-        ? 'final'
-        : terminalSessionState || terminalUsage ? 'final' : coalescible ? 'coalescible' : 'durable';
+      if (summaryMode) {
+        summaryAllowed ??= this.isTimelineSummaryEvent(rawEvent);
+        if (!summaryAllowed) continue;
+      }
+
+      const shareState = hasShares ? this.browserShareStates.get(ws) : undefined;
+      let outgoing: string;
+      let outgoingByteLength: number;
+
+      if (!shareState) {
+        if (summaryMode && suppressCandidate) {
+          latestFingerprint ??= timelinePayloadFingerprint(payload);
+          if (this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload, latestFingerprint)) continue;
+        }
+        if (summaryMode) {
+          summaryEnvelope ??= { ...envelope, event: this.summarizeTimelineEvent(rawEvent) };
+          if (summaryJson === undefined) {
+            summaryJson = JSON.stringify(summaryEnvelope);
+            summaryByteLength = Buffer.byteLength(summaryJson, 'utf8');
+          }
+          outgoing = summaryJson;
+          outgoingByteLength = summaryByteLength!;
+        } else {
+          fullEnvelope ??= envelope.event === rawEvent ? envelope : { ...envelope, event: rawEvent };
+          if (fullJson === undefined) {
+            fullJson = JSON.stringify(fullEnvelope);
+            fullByteLength = Buffer.byteLength(fullJson, 'utf8');
+          }
+          outgoing = fullJson;
+          outgoingByteLength = fullByteLength!;
+        }
+      } else {
+        const baseEnvelope = summaryMode
+          ? (summaryEnvelope ??= { ...envelope, event: this.summarizeTimelineEvent(rawEvent) })
+          : (fullEnvelope ??= envelope.event === rawEvent ? envelope : { ...envelope, event: rawEvent });
+        const filtered = filterShareDaemonMessage(baseEnvelope, shareState);
+        if (!filtered) continue;
+        if (summaryMode && suppressCandidate) {
+          latestFingerprint ??= timelinePayloadFingerprint(payload);
+          if (this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload, latestFingerprint)) continue;
+        }
+        if (filtered === baseEnvelope) {
+          if (summaryMode) {
+            if (summaryJson === undefined) {
+              summaryJson = JSON.stringify(baseEnvelope);
+              summaryByteLength = Buffer.byteLength(summaryJson, 'utf8');
+            }
+            outgoing = summaryJson;
+            outgoingByteLength = summaryByteLength!;
+          } else {
+            if (fullJson === undefined) {
+              fullJson = JSON.stringify(baseEnvelope);
+              fullByteLength = Buffer.byteLength(fullJson, 'utf8');
+            }
+            outgoing = fullJson;
+            outgoingByteLength = fullByteLength!;
+          }
+        } else {
+          outgoing = JSON.stringify(filtered);
+          outgoingByteLength = Buffer.byteLength(outgoing, 'utf8');
+        }
+      }
+
+      const coalescible = summaryMode && suppressCandidate;
+      const priority: TimelineQueuePriority = coalescible ? 'coalescible' : finalPriorityBase;
       const item: TimelineQueueEvent = {
         data: outgoing,
+        byteLength: outgoingByteLength,
         sessionId,
         epoch,
         seq,
@@ -10041,7 +10982,7 @@ export class WsBridge {
         this.timelineQueues.set(ws, queue);
       }
       incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
-      addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
+      addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, outgoingByteLength, { mode: mode ?? 'legacy', eventType });
       if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER) {
         addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BUFFERED, ws.bufferedAmount, { mode: mode ?? 'legacy' });
       }
@@ -10126,10 +11067,10 @@ export class WsBridge {
   }
 
   private sendToTransportSubscribers(sessionId: string, data: string): void {
+    const filterForSocket = this.createShareFilter(data);
     for (const [ws, sessions] of this.transportSubscriptions) {
       if (!sessions.has(sessionId)) continue;
-      const msg = this.tryParseJsonRecord(data);
-      const outgoing = this.filterShareOutgoingJson(ws, msg, data);
+      const outgoing = filterForSocket(ws);
       if (!outgoing) continue;
       safeSend(ws, outgoing);
     }
@@ -10388,6 +11329,7 @@ export class WsBridge {
     this.controlledTargetBrowserSockets.delete(ws);
     this.controlledBrowserReads.remove(ws);
     this.browserShareStates.delete(ws);
+    WsBridge.syncShareExpirySweepTimer();
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
       for (const sessionName of [...sessions.keys()]) {
@@ -10437,20 +11379,74 @@ export class WsBridge {
     }
   }
 
+  private invalidateSessionOwnershipCache(sessionName?: string): void {
+    this.sessionOwnershipEpoch += 1;
+    if (sessionName !== undefined) {
+      this.verifiedMainSessionOwnership.delete(sessionName);
+      return;
+    }
+    this.verifiedMainSessionOwnership.clear();
+  }
+
+  private pruneSessionOwnershipCacheToActive(activeSessions: ReadonlyMap<string, unknown>): void {
+    this.sessionOwnershipEpoch += 1;
+    for (const cachedSession of this.verifiedMainSessionOwnership.keys()) {
+      if (!activeSessions.has(cachedSession)) {
+        this.verifiedMainSessionOwnership.delete(cachedSession);
+      }
+    }
+  }
+
+  private cacheVerifiedMainSessionOwnership(sessionName: string, expectedEpoch: number): void {
+    if (sessionName.startsWith('deck_sub_')) return;
+    if (this.disposed || expectedEpoch !== this.sessionOwnershipEpoch) return;
+    this.verifiedMainSessionOwnership.delete(sessionName);
+    this.verifiedMainSessionOwnership.set(sessionName, Date.now());
+    while (this.verifiedMainSessionOwnership.size > SESSION_OWNERSHIP_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.verifiedMainSessionOwnership.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.verifiedMainSessionOwnership.delete(oldestKey);
+    }
+  }
+
   /**
    * Verify that a session name belongs to this server.
    * Checks both regular sessions and sub-sessions.
    */
-  private async verifySessionOwnership(sessionName: string): Promise<boolean> {
+  private async verifySessionOwnership(sessionName: string, attempt = 0): Promise<boolean> {
+    if (this.disposed) return false;
     if (!this.db) return true; // no db = dev/test mode, allow all
     if (this.activeSubSessions.has(sessionName)) return true;
+    if (this.authenticated && this.incognitoSessions.has(sessionName)) return true;
+    if (this.authenticated
+      && this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      && this.activeMainSessions.has(sessionName)) {
+      return true;
+    }
+    const cachedAt = this.verifiedMainSessionOwnership.get(sessionName);
+    if (cachedAt !== undefined) {
+      if ((Date.now() - cachedAt) < SESSION_OWNERSHIP_CACHE_TTL_MS) {
+        this.verifiedMainSessionOwnership.delete(sessionName);
+        this.verifiedMainSessionOwnership.set(sessionName, cachedAt);
+        return true;
+      }
+      this.verifiedMainSessionOwnership.delete(sessionName);
+    }
+    const observedEpoch = this.sessionOwnershipEpoch;
     try {
       // Check regular sessions
       const row = await this.db.queryOne<Record<string, unknown>>(
         'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
         [this.serverId, sessionName],
       );
-      if (row) return true;
+      if (this.disposed) return false;
+      if (observedEpoch !== this.sessionOwnershipEpoch) {
+        return attempt === 0 ? this.verifySessionOwnership(sessionName, 1) : false;
+      }
+      if (row) {
+        this.cacheVerifiedMainSessionOwnership(sessionName, observedEpoch);
+        return true;
+      }
 
       // Check sub-sessions: name is deck_sub_{id}
       const subMatch = sessionName.match(/^deck_sub_(.+)$/);
@@ -10460,6 +11456,10 @@ export class WsBridge {
           'SELECT 1 FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
           [this.serverId, subId],
         );
+        if (this.disposed) return false;
+        if (observedEpoch !== this.sessionOwnershipEpoch) {
+          return attempt === 0 ? this.verifySessionOwnership(sessionName, 1) : false;
+        }
         if (subRow) return true;
       }
 
@@ -10561,13 +11561,172 @@ export class WsBridge {
     }
   }
 
-  private broadcastToBrowsers(json: string): void {
-    const msg = this.tryParseJsonRecord(json);
+  private registerActiveSubSessionFromSync(msg: Record<string, unknown>): boolean {
+    if (isKnownTestSessionLike({
+      name: typeof msg.id === 'string' ? `deck_sub_${msg.id}` : undefined,
+      cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
+      parentSession: typeof msg.parentSession === 'string' ? msg.parentSession : undefined,
+    })) {
+      return false;
+    }
+    const subSessionName = `deck_sub_${String(msg.id ?? '')}`;
+    if (subSessionName !== 'deck_sub_') {
+      const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
+      const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
+      const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
+      const runtimeType = typeof msg.runtimeType === 'string'
+        ? msg.runtimeType
+        : agentType
+          ? getSessionRuntimeType(agentType)
+          : undefined;
+      const execCloneMeta = msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object'
+        ? (msg.executionCloneMetadata as Record<string, unknown>)
+        : null;
+      const pairCreatedMeta = msg.pairCreatedMetadata && typeof msg.pairCreatedMetadata === 'object'
+        ? (msg.pairCreatedMetadata as Record<string, unknown>)
+        : null;
+      this.activeSubSessions.set(subSessionName, {
+        name: subSessionName,
+        state: typeof msg.state === 'string' ? msg.state : undefined,
+        label,
+        parentSession,
+        agentType,
+        runtimeType,
+        ...(execCloneMeta?.kind === EXECUTION_CLONE_KIND ? { isExecutionClone: true } : {}),
+        ...(pairCreatedMeta?.autoCreated === true ? { isAutoCreatedPairSession: true } : {}),
+      });
+      const subIdentityProjectKey = sessionIdentityProjectKey({
+        contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
+      });
+      if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
+      this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
+      if (typeof msg.state === 'string') this.updateAuthoritativeSessionState(subSessionName, msg.state);
+    }
+    return true;
+  }
+
+  private async resolveSubSessionSyncItem(
+    db: Database,
+    msg: Record<string, unknown>,
+  ): Promise<{ row: import('../db/queries.js').SubSessionBatchUpsertInput; frame: Record<string, unknown> } | null> {
+    if (typeof msg.id !== 'string' || !msg.id) return null;
+    const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
+      ? msg.sessionType.trim()
+      : null;
+    const persisted = requestedType ? null : await getSubSessionById(db, msg.id, this.serverId).catch(() => null);
+    const sessionType = requestedType ?? persisted?.type ?? null;
+    if (!sessionType) return null;
+    const persistedRuntimeType = typeof msg.runtimeType === 'string'
+      ? msg.runtimeType
+      : sessionType
+        ? getSessionRuntimeType(sessionType)
+        : null;
+    const queueRelay = buildSubsessionQueueRelay(msg);
+    const executionCloneMetadata = (msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object')
+      ? msg.executionCloneMetadata as Record<string, unknown>
+      : null;
+    const isExecutionClone = executionCloneMetadata?.kind === EXECUTION_CLONE_KIND;
+    const executionCloneProjection = isExecutionClone
+      ? {
+          executionCloneKind: EXECUTION_CLONE_KIND,
+          ...(typeof executionCloneMetadata.parentRunId === 'string'
+            ? { parentRunId: executionCloneMetadata.parentRunId }
+            : {}),
+        }
+      : {};
+    const activeModel = ((msg.activeModel as string) || (msg.modelDisplay as string)) || null;
+    return {
+      row: {
+        id: msg.id,
+        serverId: this.serverId,
+        type: sessionType,
+        shellBin: (msg.shellBin as string) || null,
+        cwd: (msg.cwd as string) || null,
+        label: (msg.label as string) || null,
+        ccSessionId: (msg.ccSessionId as string) || null,
+        geminiSessionId: (msg.geminiSessionId as string) || null,
+        parentSession: (msg.parentSession as string) || null,
+        runtimeType: persistedRuntimeType,
+        providerId: (msg.providerId as string) || null,
+        providerSessionId: (msg.providerSessionId as string) || null,
+        description: (msg.description as string) || null,
+        ccPresetId: (msg.ccPresetId as string) || null,
+        requestedModel: (msg.requestedModel as string) || null,
+        activeModel,
+        effort: (msg.effort as string) || null,
+        transportConfig: (msg.transportConfig as Record<string, unknown>) || null,
+        executionCloneMetadata,
+      },
+      frame: {
+        type: 'subsession.created',
+        id: msg.id,
+        sessionName: `deck_sub_${msg.id}`,
+        sessionInstanceId: msg.sessionInstanceId || null,
+        runtimeEpoch: msg.runtimeEpoch || null,
+        sessionType,
+        cwd: msg.cwd || null,
+        label: msg.label || null,
+        parentSession: msg.parentSession || null,
+        ccPresetId: (msg.ccPresetId as string) || null,
+        runtimeType: persistedRuntimeType,
+        providerId: msg.providerId || null,
+        providerSessionId: msg.providerSessionId || null,
+        requestedModel: msg.requestedModel || null,
+        activeModel: msg.activeModel || msg.modelDisplay || null,
+        effort: msg.effort || null,
+        transportConfig: msg.transportConfig || null,
+        supervisionHeartbeat: msg.supervisionHeartbeat || null,
+        ...queueRelay,
+        ...executionCloneProjection,
+        qwenModel: msg.qwenModel || null,
+        qwenAuthType: msg.qwenAuthType || null,
+        qwenAvailableModels: msg.qwenAvailableModels || null,
+        modelDisplay: msg.modelDisplay || null,
+        planLabel: msg.planLabel || null,
+        quotaLabel: msg.quotaLabel || null,
+        quotaUsageLabel: msg.quotaUsageLabel || null,
+        quotaMeta: msg.quotaMeta || null,
+        state: (msg.state as string) || 'idle',
+      },
+    };
+  }
+
+  private broadcastSubsessionCreatedBatch(frames: Array<Record<string, unknown>>): void {
+    if (frames.length === 0) return;
+    const batchJson = JSON.stringify({ type: SUBSESSION_CREATED_BATCH_MSG, items: frames });
+    this.controlledBrowserReads.broadcast(batchJson);
+    let legacyFrames: Array<{ frame: Record<string, unknown>; json: string }> | null = null;
+    const getLegacyFrames = () => {
+      if (!legacyFrames) {
+        legacyFrames = frames.map((frame) => ({ frame, json: JSON.stringify(frame) }));
+      }
+      return legacyFrames;
+    };
+    for (const bs of this.browserSockets) {
+      if (this.controlledTargetBrowserSockets.has(bs)) continue;
+      try {
+        const isShare = this.browserShareStates.has(bs);
+        if (!isShare && this.batchCreatedBrowsers.has(bs)) {
+          bs.send(batchJson);
+          continue;
+        }
+        for (const { frame, json } of getLegacyFrames()) {
+          const outgoing = this.filterShareOutgoingJson(bs, frame, json);
+          if (outgoing) bs.send(outgoing);
+        }
+      } catch {
+        this.browserSockets.delete(bs);
+      }
+    }
+  }
+
+  private broadcastToBrowsers(json: string, preParsedMsg?: Record<string, unknown>): void {
+    const filterForSocket = this.createShareFilter(json, preParsedMsg);
     this.controlledBrowserReads.broadcast(json);
     for (const bs of this.browserSockets) {
       if (this.controlledTargetBrowserSockets.has(bs)) continue;
       try {
-        const outgoing = this.filterShareOutgoingJson(bs, msg, json);
+        const outgoing = filterForSocket(bs);
         if (!outgoing) continue;
         bs.send(outgoing);
       } catch {
@@ -10615,6 +11774,7 @@ export class WsBridge {
     sessionName: string,
     raw: string,
   ): void {
+    withSessionPrivacy(undefined, this.incognitoSessions.has(sessionName), () => {
     // Guard: if we already have an inflight for this commandId, the browser is
     // retrying / double-sending. Keep the existing inflight and wait for its
     // ack/timeout instead of forwarding another copy to the daemon.
@@ -10682,6 +11842,7 @@ export class WsBridge {
       timeoutTimer: null,
       share: this.inflightShareMetadata(ws),
     }, ACK_FAILURE_DAEMON_OFFLINE);
+    });
   }
 
   /** Replay buffered + dispatched commands to the daemon after reconnect. */
@@ -10824,7 +11985,10 @@ export class WsBridge {
 
   /** Called when RECONNECT_GRACE_MS elapses without the daemon coming back. */
   private onReconnectGraceExpired(): void {
-    if (this.authenticated) return;  // daemon actually came back — nothing to do
+    if (this.authenticated) {
+      this.maybeCleanup();
+      return;  // daemon actually came back — nothing to do
+    }
     if (!this.daemonOfflineAnnounced) {
       this.daemonOfflineAnnounced = true;
       this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_OFFLINE }));
@@ -10833,6 +11997,7 @@ export class WsBridge {
       this.emitInflightFailure(entry, ACK_FAILURE_DAEMON_OFFLINE);
       this.removeInflight(entry.commandId);
     }
+    this.maybeCleanup();
   }
 
   /** Per-command ack timeout fired. */
@@ -11194,6 +12359,14 @@ export class WsBridge {
       this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DAEMON_VERSION_UNKNOWN);
       return null;
     }
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      this.clearControlledNodeUnavailableUpgradeState();
+      this.logAutoUpgradeWait(
+        targetVersion,
+        this.controlledNodeArtifactUnavailableReason ?? 'executable_not_built',
+      );
+      return null;
+    }
     this.autoUpgradeTargetVersion = targetVersion;
     if (this.daemonNodeRole === NODE_ROLE.FULL && this.autoUpgradeDisabledOnDaemon
       && isDaemonAutoUpgradeAvailable(this.daemonVersion, targetVersion)) {
@@ -11427,6 +12600,15 @@ export class WsBridge {
     force?: boolean;
     isStillCurrent?: () => boolean;
   } = {}): RequestDaemonUpgradeResult {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      this.clearControlledNodeUnavailableUpgradeState();
+      return {
+        ok: false,
+        ...(typeof input.targetVersion === 'string' && input.targetVersion ? { targetVersion: input.targetVersion } : {}),
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
+        reason: this.controlledNodeArtifactUnavailableReason ?? 'executable_not_built',
+      };
+    }
     this.releaseManualUpgradeSentToEarlierConnection();
     const result = this.daemonUpgradeCoordinator.request({
       targetVersion: input.targetVersion,
@@ -11488,6 +12670,10 @@ export class WsBridge {
   }
 
   private flushPendingDaemonUpgrade(ws: WebSocket): RequestDaemonUpgradeResult | null {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      this.clearControlledNodeUnavailableUpgradeState();
+      return null;
+    }
     const result = this.daemonUpgradeCoordinator.flushPending({
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
@@ -11573,6 +12759,9 @@ export class WsBridge {
   }
 
   private needsLegacyWindowsUpgradeRescue(): boolean {
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && !this.controlledNodeArtifactAvailable) {
+      return false;
+    }
     return (this.requiresLegacyWindowsUpgradeRescue()
       || this.upgradeLatchRescueRequiredGeneration === this.daemonGeneration)
       && this.legacyUpgradeRescuePreparedGeneration !== this.daemonGeneration;
@@ -12009,8 +13198,11 @@ export class WsBridge {
       this.daemonP2pWorkflowCapabilities = null;
       this.controlledNodeCapabilities.clear();
       this.daemonControlledOs = null;
+      this.daemonControlledArch = null;
       this.daemonControlledNodeId = null;
       this.daemonOwnerUserId = null;
+      this.controlledNodeArtifactAvailable = true;
+      this.controlledNodeArtifactUnavailableReason = null;
       this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
       this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
     }
@@ -12599,11 +13791,13 @@ export class WsBridge {
   }
 
   getRecentText(sessionName: string): WatchRecentTextRow[] {
+    if (this.incognitoSessions.has(sessionName)) return [];
     const rows = this.recentTextBySession.get(sessionName);
     return rows ? rows.map((row) => ({ ...row })) : [];
   }
 
   async getRecentTextForWatch(sessionName: string, timeoutMs = 1500): Promise<WatchRecentTextRow[]> {
+    if (this.incognitoSessions.has(sessionName)) return [];
     const cached = this.getRecentText(sessionName);
     if (cached.length > 0 || !this.isDaemonConnected()) return cached;
 
@@ -13917,9 +15111,18 @@ export class WsBridge {
     return merged;
   }
 
+  private isSuppressedIdlePushSession(sessionName: string): boolean {
+    if (!sessionName) return false;
+    if (isAutoCreatedSubSessionName(sessionName)) return true;
+    const activeSub = this.activeSubSessions.get(sessionName);
+    return activeSub?.isExecutionClone === true || activeSub?.isAutoCreatedPairSession === true;
+  }
+
   private scheduleIdleEventPush(db: Database, env: Env, msg: Record<string, unknown>): void {
     const sessionName = String(msg.session ?? msg.sessionId ?? '');
     if (!sessionName) return;
+    if (msg[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
+    if (this.isSuppressedIdlePushSession(sessionName)) return;
     const key = `session.idle:${sessionName}`;
     const existing = this.pendingIdlePushes.get(key);
     if (existing?.timer) clearTimeout(existing.timer);
@@ -14008,19 +15211,30 @@ export class WsBridge {
     let title: string;
     let body: string;
     let assistantEventId: string | undefined;
+    let pushType: PushNotificationType;
     switch (eventType) {
-      case 'session.idle':
+      case 'session.idle': {
+        if (this.isSuppressedIdlePushSession(sessionName)) return;
+        if (sessionName.startsWith(SUBSESSION_NAME_PREFIX)) {
+          const subId = sessionName.slice(SUBSESSION_NAME_PREFIX.length);
+          const subRow = subId ? await getSubSessionById(db, subId, this.serverId).catch(() => null) : null;
+          if (subRow && isExecutionCloneRow(subRow)) return;
+        }
         title = titleParts.join(' · ');
         ({ text: body, eventId: assistantEventId } = this.resolveLatestAssistantForPush(sessionName, daemonLastText));
         body = body || 'Task complete — ready for input';
+        pushType = PUSH_NOTIFICATION_TYPE_TASK_COMPLETE;
         break;
+      }
       case 'session.error':
         title = titleParts.join(' · ');
         body = `Error: ${String(msg.error ?? 'unknown')}`;
+        pushType = PUSH_NOTIFICATION_TYPE_SESSION_ERROR;
         break;
       case 'ask.question':
         title = titleParts.join(' · ');
         body = this.extractAskQuestionBody(msg) || 'Waiting for your answer';
+        pushType = PUSH_NOTIFICATION_TYPE_WAITING_INPUT;
         break;
       default:
         return;
@@ -14037,9 +15251,116 @@ export class WsBridge {
     try {
       await dispatchPush({
         userId: server.user_id,
+        serverId: this.serverId,
         title,
         body,
+        type: pushType,
         data: { serverId: this.serverId, session: sessionName, type: eventType },
+      }, env);
+      this.deliveredPushKeys.set(pushKey, now);
+    } finally {
+      this.inFlightPushKeys.delete(pushKey);
+    }
+  }
+
+  private async dispatchTaskPairPush(
+    db: Database,
+    env: Env,
+    sessionName: string,
+    payload: Record<string, unknown>,
+    eventId?: string,
+    eventTs?: number,
+  ): Promise<void> {
+    const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
+    if (!server) return;
+
+    for (const mobileWs of this.mobileSockets) {
+      if (mobileWs.readyState !== WebSocket.OPEN) continue;
+      if (this.browserUserIds.get(mobileWs) !== server.user_id) continue;
+      return;
+    }
+
+    const { dispatchPush } = await import('../routes/push.js').catch((err) => {
+      logger.error({ err }, 'Failed to import push module — push notifications disabled');
+      return { dispatchPush: null };
+    });
+    if (!dispatchPush) return;
+
+    const taskId = String(payload.taskId ?? '');
+    if (!taskId) return;
+
+    const unusual = Boolean(payload.unusual);
+    const verb = typeof payload.verb === 'string' ? payload.verb : undefined;
+    const effect = typeof payload.effect === 'string' ? payload.effect : undefined;
+    const fromStatus = typeof payload.fromStatus === 'string' ? payload.fromStatus : undefined;
+    const toStatus = typeof payload.toStatus === 'string' ? payload.toStatus : undefined;
+    const scheduling = (payload.scheduling && typeof payload.scheduling === 'object')
+      ? (payload.scheduling as { manual?: boolean; epoch?: number; dependsOn?: string[] })
+      : undefined;
+
+    const notifType = classifyTaskPairNotificationType({
+      verb,
+      toStatus,
+      fromStatus,
+      effect,
+      unusual,
+      scheduling,
+    });
+    if (!notifType) return;
+
+    const taskTitle = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : taskId;
+    const titleParts = [server.name, taskTitle];
+    const title = titleParts.join(' · ');
+
+    let body = '';
+    if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE) {
+      body = `任务完成 (DONE) · ${taskTitle}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED) {
+      body = `任务暂停 / 等待决策 (PAUSED) · ${taskTitle}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT) {
+      const v = (verb ?? '').toUpperCase();
+      const s = (toStatus ?? '').toLowerCase();
+      if (v === 'REWORK' || s === 'rework') {
+        body = `任务返工 (REWORK) · ${taskTitle}`;
+      } else if (v === 'PASS' || s === 'passed') {
+        body = `任务审计通过 (PASS) · ${taskTitle}`;
+      } else {
+        body = `任务审计中 (READY_FOR_AUDIT) · ${taskTitle}`;
+      }
+    }
+
+    const round = typeof payload.round === 'number' ? payload.round : 0;
+    let transitionIdentity = '';
+    if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE) {
+      transitionIdentity = `done:${round}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED) {
+      const epoch = typeof scheduling?.epoch === 'number' ? scheduling.epoch : round;
+      transitionIdentity = `paused:${epoch}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT) {
+      const v = (verb ?? '').toUpperCase();
+      const s = (toStatus ?? '').toLowerCase();
+      const stage = (v === 'REWORK' || s === 'rework')
+        ? 'rework'
+        : (v === 'PASS' || s === 'passed')
+          ? 'pass'
+          : 'ready';
+      transitionIdentity = `audit_${stage}:${round}`;
+    }
+
+    // Stable transition identity deduplication across executor / auditor / Brain copies
+    const pushKey = `task_pair:${taskId}:${notifType}:${transitionIdentity}`;
+    const now = Date.now();
+    if (this.wasPushDelivered(pushKey, now)) return;
+
+    this.inFlightPushKeys.add(pushKey);
+    try {
+      await dispatchPush({
+        userId: server.user_id,
+        serverId: this.serverId,
+        title,
+        body,
+        type: notifType,
+        data: { serverId: this.serverId, taskId, type: notifType },
       }, env);
       this.deliveredPushKeys.set(pushKey, now);
     } finally {
@@ -14072,17 +15393,57 @@ export class WsBridge {
   private maybeCleanup(): void {
     if (
       !this.daemonWs
+      && !this.graceTimer
       && this.browserSockets.size === 0
       && this.previewWsTunnels.size === 0
       && this.pendingPreviewWsUpgrades.size === 0
     ) {
-      this.browserRateLimiter.stop();
-      this.browserDataReadRateLimiter.stop();
-      if (this.shareExpirySweepTimer) {
-        clearInterval(this.shareExpirySweepTimer);
-        this.shareExpirySweepTimer = null;
-      }
-      WsBridge.instances.delete(this.serverId);
+      this.dispose();
+    }
+  }
+
+  dispose(): void {
+    this.browserRateLimiter.stop();
+    this.browserDataReadRateLimiter.stop();
+    if (this.ackHousekeepingTimer) {
+      clearInterval(this.ackHousekeepingTimer);
+      this.ackHousekeepingTimer = null;
+    }
+    if (this.graceTimer) {
+      clearTimeout(this.graceTimer);
+      this.graceTimer = null;
+    }
+    if (this.authTimer) {
+      clearTimeout(this.authTimer);
+      this.authTimer = null;
+    }
+    this.clearAutoUpgradeRetryTimer();
+    this.clearPendingIdlePushes();
+    this.resetHeartbeatDbPersistenceState(null);
+    this.lastCapabilityHeartbeatRefreshAt = 0;
+    this.activeCapabilityOperations.clear();
+    this.remoteDesktopNodeContextCache = null;
+    this.remoteDesktopNodeContextLastUnavailableGeneration = null;
+    this.remoteDesktopNodeContextInFlight = null;
+    this.disposed = true;
+    this.invalidateSessionOwnershipCache();
+    WsBridge.instances.delete(this.serverId);
+    WsBridge.syncShareExpirySweepTimer();
+    if (WsBridge.instances.size === 0 && cleanupSweepHandle) {
+      clearInterval(cleanupSweepHandle);
+      cleanupSweepHandle = null;
+    }
+  }
+
+  static disposeAll(): void {
+    for (const bridge of [...WsBridge.instances.values()]) {
+      bridge.dispose();
+    }
+    WsBridge.instances.clear();
+    WsBridge.stopShareExpirySweepTimer();
+    if (cleanupSweepHandle) {
+      clearInterval(cleanupSweepHandle);
+      cleanupSweepHandle = null;
     }
   }
 

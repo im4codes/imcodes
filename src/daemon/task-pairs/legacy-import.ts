@@ -194,6 +194,7 @@ function correctUnauditedPassedImport(stored: StoredTaskPair, task: SupervisionT
     updatedAt: now,
   };
   store.savePair(project, next, {
+    expectedRevision: stored.revision,
     liveness: {
       ...stored.liveness,
       silenceExecutor: 0,

@@ -9,6 +9,7 @@ import {
   reorderSubSessions,
 } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import {
   resolveHttpShareAccess,
   resolveHttpShareAccessForCoveredSession,
@@ -18,7 +19,8 @@ import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { listActiveSharesForUser } from '../db/tab-sharing.js';
 import { rawSubSessionIdFromDisplayName } from '../../../shared/tab-sharing.js';
-import { isSessionAgentType } from '../../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType } from '../../../shared/agent-types.js';
+import { SESSION_INCOGNITO_UNSUPPORTED, supportsSessionIncognito } from '../../../shared/session-incognito-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import {
@@ -26,11 +28,31 @@ import {
   hasInvalidSessionSupervisionSnapshot,
   SUPERVISION_MODE,
 } from '../../../shared/supervision-config.js';
+import {
+  buildTransportConfigWithCompactHijack,
+  extractSessionCompactHijackMode,
+  hasCompactHijackField,
+  hasInvalidCompactHijackSetting,
+  sanitizeShareTransportConfigRow,
+} from '../../../shared/compact-hijack.js';
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 type SubSessionRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
 subSessionRoutes.use('/*', requireAuth());
+subSessionRoutes.use('/:id/*', async (c, next) => {
+  if (c.get('authServerId' as never)) {
+    const authority = await resolveDaemonCallerAuthority(c, {
+      denyParticipant: true,
+      denySharedHostAbsentAuthority: false,
+      targetServerId: c.req.param('id')!,
+      allowOwnerCrossServer: false,
+    });
+    if (!authority.ok) return daemonScopeFailure(c, authority);
+  }
+  await next();
+  return;
+});
 
 async function resolveSubSessionRouteAccess(c: SubSessionRouteContext, serverId: string, userId: string) {
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
@@ -49,14 +71,26 @@ subSessionRoutes.get('/:id/sub-sessions', async (c) => {
   // Normal sub-session listing surface: execution clones are excluded (default)
   // so ephemeral clone workers never clutter the normal sub-session list.
   const subSessions = (await getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false })) ?? [];
-  if (member.ok) return c.json({ subSessions });
+  if (member.ok) {
+    const serverAccess = await resolveHttpShareAccess(c.env.DB, {
+      serverId,
+      userId,
+      target: { kind: 'server', serverId },
+    });
+    const isShareCaller = serverAccess?.actor?.kind === 'share';
+    return c.json({
+      subSessions: isShareCaller
+        ? subSessions.map((sub) => sanitizeShareTransportConfigRow(sub as unknown as Record<string, unknown>))
+        : subSessions,
+    });
+  }
   const visible = (await Promise.all(subSessions.map(async (sub) => {
     const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
       serverId,
       userId,
       target: { kind: 'subsession', serverId, subSessionId: sub.id },
     });
-    return access.actor.kind === 'share' ? sub : null;
+    return access.actor.kind === 'share' ? sanitizeShareTransportConfigRow(sub as unknown as Record<string, unknown>) : null;
   }))).filter((sub): sub is NonNullable<typeof sub> => sub !== null);
   return c.json({ subSessions: visible });
 });
@@ -79,6 +113,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     active_model?: string | null;
     effort?: string | null;
     transport_config?: Record<string, unknown> | null;
+    incognito?: boolean;
   };
   try {
     body = await c.req.json() as typeof body;
@@ -88,6 +123,9 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
 
   if (!body.type) return c.json({ error: 'missing_fields' }, 400);
   if (!isSessionAgentType(body.type)) return c.json({ error: 'invalid_type' }, 400);
+  if (body.incognito === true && !supportsSessionIncognito(body.type)) {
+    return c.json({ error: SESSION_INCOGNITO_UNSUPPORTED }, 400);
+  }
   if (isKnownTestSessionLike({
     cwd: body.cwd ?? null,
     parentSession: body.parent_session ?? null,
@@ -175,11 +213,55 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     const reason = shareReason ?? (member.ok ? 'share-role-denied' : member.reason);
     return c.json({ error: 'forbidden', reason }, 403);
   }
+  if (!memberMayCreate && hasCompactHijackField(body.transport_config)) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  if (hasInvalidCompactHijackSetting(body.transport_config ?? null)) {
+    return c.json({ error: 'invalid_compact_hijack_config' }, 400);
+  }
+  const normalizedCreateTransportConfig = body.transport_config != null
+    ? buildTransportConfigWithCompactHijack(
+        body.transport_config,
+        extractSessionCompactHijackMode(body.transport_config),
+      )
+    : body.transport_config;
   // Generate 8-char id
   const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))
     .map((b) => b.toString(36).padStart(2, '0'))
     .join('')
     .slice(0, 8);
+
+  const sessionName = `deck_sub_${id}`;
+  if (body.incognito === true) {
+    const now = Date.now();
+    const sub = {
+      id,
+      server_id: serverId,
+      type: body.type,
+      shell_bin: body.shellBin ?? null,
+      cwd: body.cwd ?? null,
+      label: body.label ?? null,
+      closed_at: null,
+      cc_session_id: null,
+      gemini_session_id: null,
+      parent_session: effectiveParentSession || null,
+      sort_order: null,
+      runtime_type: getSessionRuntimeType(body.type),
+      provider_id: body.type,
+      provider_session_id: null,
+      description: body.description ?? null,
+      created_at: now,
+      updated_at: now,
+      cc_preset_id: body.cc_preset_id ?? null,
+      requested_model: body.requested_model ?? null,
+      active_model: body.active_model ?? null,
+      effort: body.effort ?? null,
+      transport_config: normalizedCreateTransportConfig ?? {},
+      execution_clone_metadata: null,
+      incognito: true,
+    };
+    return c.json({ id: sub.id, sessionName, subSession: sub }, 201);
+  }
 
   const sub = await createSubSession(
     c.env.DB,
@@ -198,10 +280,9 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     body.requested_model ?? null,
     body.active_model ?? null,
     body.effort ?? null,
-    body.transport_config ?? null,
+    normalizedCreateTransportConfig ?? null,
   );
 
-  const sessionName = `deck_sub_${id}`;
   return c.json({ id: sub.id, sessionName, subSession: sub }, 201);
 });
 
@@ -303,11 +384,23 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   if ('requestedModel' in body) fields.requested_model = body.requestedModel ?? null;
   if ('activeModel' in body) fields.active_model = body.activeModel ?? null;
   if ('effort' in body) fields.effort = body.effort ?? null;
-  if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
-  if (hasInvalidSessionSupervisionSnapshot(body.transportConfig ?? null)) {
+  let nextTransportConfig = body.transportConfig;
+  if ('transportConfig' in body) {
+    if (hasInvalidCompactHijackSetting(body.transportConfig ?? null)) {
+      return c.json({ error: 'invalid_compact_hijack_config' }, 400);
+    }
+    if (body.transportConfig != null) {
+      nextTransportConfig = buildTransportConfigWithCompactHijack(
+        body.transportConfig,
+        extractSessionCompactHijackMode(body.transportConfig),
+      );
+    }
+    fields.transport_config = nextTransportConfig ?? null;
+  }
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
     return c.json({ error: 'invalid_supervision_config' }, 400);
   }
-  const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
+  const requestedSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
   if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
     return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
   }
@@ -326,7 +419,7 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
         ...(body.requestedModel !== undefined ? { requestedModel: body.requestedModel } : {}),
         ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
         ...(body.effort !== undefined ? { effort: body.effort } : {}),
-        ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+        ...(body.transportConfig !== undefined ? { transportConfig: nextTransportConfig ?? null } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, subId, err }, 'WsBridge sub-session settings relay failed');
@@ -350,7 +443,7 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
         type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
         sessionName: `deck_sub_${subId}`,
-        transportConfig: body.transportConfig ?? null,
+        transportConfig: nextTransportConfig ?? null,
       }));
     } catch (err) {
       logger.error({ serverId, subId, err }, 'WsBridge sub-session transportConfig relay failed');

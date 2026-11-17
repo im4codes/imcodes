@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { COMPACT_HIJACK_CONTINUATION_PROMPT } from '../../shared/compact-hijack.js';
 import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 
 const {
@@ -63,7 +64,13 @@ vi.mock('../../src/util/imc-dir.js', () => ({ ensureImcDir: vi.fn().mockResolved
 vi.mock('../../src/daemon/supervision-broker.js', () => ({ supervisionBroker: { decide: vi.fn() } }));
 vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutomation: { init: vi.fn(), setServerLink: vi.fn(), cancelSession: vi.fn(), queueTaskIntent: vi.fn(), updateQueuedTaskIntent: vi.fn(), removeQueuedTaskIntent: vi.fn(), registerTaskIntent: vi.fn(), applySnapshotUpdate: vi.fn() } }));
 
-import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import {
+  clearTransportConversation,
+  dispatchHandoffContinuation,
+  handleWebCommand,
+  handoffSessionConversation,
+} from '../../src/daemon/command-handler.js';
+import { sendKeysDelayedEnter } from '../../src/agent/tmux.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -77,6 +84,7 @@ describe('process session /clear handling', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    relaunchSessionWithSettingsMock.mockReset().mockResolvedValue(undefined);
     buildSessionListMock.mockResolvedValue([]);
   });
 
@@ -170,5 +178,443 @@ describe('process session /clear handling', () => {
       session: 'deck_proj_brain',
       error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
     });
+  });
+
+  it('relaunches claude-code sessions fresh with handoff on /handoff', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/proj',
+      ccSessionId: 'cc-old',
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_brain', text: '/handoff', commandId: 'cmd-handoff-process' }, serverLink as any);
+    await flushAsync();
+
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_proj_brain', agentType: 'claude-code' }),
+      { fresh: true, handoff: true },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      'user.message',
+      { text: '/handoff', allowDuplicate: true, commandId: 'cmd-handoff-process' },
+      { source: 'daemon', confidence: 'high', eventId: 'transport-user:cmd-handoff-process' },
+    );
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'assistant.text', {
+      text: 'Started a fresh conversation',
+      noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+      noticeParams: {},
+      streaming: false,
+      memoryExcluded: true,
+    }, expect.objectContaining({ source: 'daemon' }));
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'command.ack', { commandId: 'cmd-handoff-process', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      'usage.update',
+      expect.objectContaining({ inputTokens: 0, cacheTokens: 0, outputTokens: 0 }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+  });
+
+  it('emits immediate accepted ack and starting state before slow handoff completes, then resets usage to 0', async () => {
+    let resolveRelaunch!: () => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { resolveRelaunch = resolve; }),
+    );
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_ag',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      activeModel: 'claude-sonnet-4-6',
+      sessionInstanceId: 'inst-1',
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_ag', text: '/handoff', commandId: 'cmd-handoff-immediate' }, serverLink as any);
+    await flushAsync();
+
+    // Immediate UX feedback is already emitted while relaunch is still blocked.
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_ag', 'command.ack', { commandId: 'cmd-handoff-immediate', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_ag', 'session.state', { state: 'starting' }, expect.objectContaining({ source: 'daemon' }));
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_proj_ag',
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED }),
+      expect.anything(),
+    );
+
+    resolveRelaunch();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_ag',
+      'usage.update',
+      expect.objectContaining({ inputTokens: 0, cacheTokens: 0, outputTokens: 0, model: 'claude-sonnet-4-6' }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_ag',
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_ag', 'session.state', { state: 'idle' }, expect.objectContaining({ source: 'daemon' }));
+  });
+
+  it('surfaces error ack on handoff failure, allows clean retry, and serializes concurrent resets', async () => {
+    const rec = {
+      name: 'deck_proj_retry',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-retry',
+    };
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockRejectedValueOnce(new Error('provider down'));
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_retry', text: '/handoff', commandId: 'cmd-fail-1' }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_retry', 'command.ack', { commandId: 'cmd-fail-1', status: 'error', error: 'provider down' });
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_retry', 'session.state', { state: 'idle', error: 'provider down' }, expect.objectContaining({ source: 'daemon' }));
+
+    // Retry succeeds cleanly and concurrent handoffs execute sequentially (never overlapping).
+    let active = 0;
+    let maxActive = 0;
+    relaunchSessionWithSettingsMock.mockImplementation(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 15));
+      active -= 1;
+    });
+    await Promise.all([
+      handoffSessionConversation(rec as any, serverLink as any),
+      handoffSessionConversation(rec as any, serverLink as any),
+    ]);
+    expect(maxActive).toBe(1);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('isolates old vs new session owners when sessionInstanceId changes before/during handoff', async () => {
+    const oldRec = {
+      name: 'deck_proj_owner',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-old',
+    };
+    let releaseFirst!: () => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((r) => { releaseFirst = r; }));
+    getSessionMock.mockReturnValue(oldRec);
+
+    const first = handoffSessionConversation(oldRec as any, serverLink as any);
+    await flushAsync();
+
+    // Simulate the session being replaced by a new owner while waiting.
+    getSessionMock.mockReturnValue({ ...oldRec, sessionInstanceId: 'inst-new' });
+    const staleSecond = handoffSessionConversation(oldRec as any, serverLink as any);
+    releaseFirst();
+    await first;
+    await expect(staleSecond).rejects.toThrow(/ownership changed/i);
+    // Only the first call ran; the stale second owner call aborted before relaunch.
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits immediate receipt ack and starting state for /handoff and /clear even while a prior relaunch is pending or fails', async () => {
+    const rec = {
+      name: 'deck_proj_queued_ack',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-queued',
+    };
+    getSessionMock.mockReturnValue(rec);
+
+    let active = 0;
+    let maxActive = 0;
+    let releaseFirst!: () => void;
+    let rejectSecond!: (e: Error) => void;
+    relaunchSessionWithSettingsMock
+      .mockImplementationOnce(() => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        return new Promise<void>((resolve) => {
+          releaseFirst = () => {
+            active -= 1;
+            resolve();
+          };
+        });
+      })
+      .mockImplementationOnce(() => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        return new Promise<void>((_, reject) => {
+          rejectSecond = (e: Error) => {
+            active -= 1;
+            reject(e);
+          };
+        });
+      });
+
+    // 1) Start a slow prior restart; queued /handoff must still ack immediately without waiting.
+    handleWebCommand({ type: 'session.restart', sessionName: rec.name }, serverLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-queued-handoff' }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', { commandId: 'cmd-queued-handoff', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'session.state', { state: 'starting' }, expect.objectContaining({ source: 'daemon' }));
+    // Only the initial restart has started running while blocked.
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    // Release prior restart -> queued handoff starts and can itself be queued behind by /clear.
+    releaseFirst();
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(2);
+
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/clear', commandId: 'cmd-queued-clear' }, serverLink as any);
+    await flushAsync();
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', { commandId: 'cmd-queued-clear', status: 'accepted' });
+
+    // Even when prior /handoff fails, cmd-queued-handoff still receives its error ack
+    // without clobbering cmd-queued-clear's starting state, and cmd-queued-clear finishes cleanly.
+    rejectSecond(new Error('prior failed'));
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', {
+      commandId: 'cmd-queued-handoff',
+      status: 'error',
+      error: 'prior failed',
+    });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      rec.name,
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED }),
+      expect.anything(),
+    );
+    expect(maxActive).toBe(1);
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'usage.update', expect.objectContaining({ inputTokens: 0 }), expect.anything());
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'session.state', { state: 'idle' }, expect.objectContaining({ source: 'daemon' }));
+  });
+
+  it('never leaks old reset failure notice, late success finalization, or deleted-session emits onto replacement or missing owners', async () => {
+    const rec = {
+      name: 'deck_proj_reset_isolation',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-a',
+    };
+    getSessionMock.mockReturnValue(rec);
+
+    // Case 1: Old owner rejects after replacement -> error ack to old commandId, zero timeline/state pollution on new owner.
+    let rejectOld!: (e: Error) => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectOld = reject; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-old-fail' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue({ ...rec, state: 'working', sessionInstanceId: 'inst-b' });
+    emitMock.mockClear();
+    rejectOld(new Error('Session ownership changed during relaunch'));
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', {
+      commandId: 'cmd-old-fail',
+      status: 'error',
+      error: 'Session ownership changed during relaunch',
+    });
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+
+    // Case 2: Old owner resolves late after replacement -> zero finalization emitted on new owner.
+    let resolveOld!: () => void;
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((r) => { resolveOld = r; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-old-late-win' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue({ ...rec, state: 'working', sessionInstanceId: 'inst-c' });
+    emitMock.mockClear();
+    resolveOld();
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+
+    // Case 3: Session deleted mid-handoff (both reject and late resolve paths) -> no session-level emits.
+    let rejectDeleted!: (e: Error) => void;
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectDeleted = reject; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-deleted-fail' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue(undefined);
+    emitMock.mockClear();
+    rejectDeleted(new Error('deleted mid-flight'));
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', {
+      commandId: 'cmd-deleted-fail',
+      status: 'error',
+      error: 'deleted mid-flight',
+    });
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+
+    let resolveDeleted!: () => void;
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((r) => { resolveDeleted = r; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-deleted-win' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue(undefined);
+    emitMock.mockClear();
+    resolveDeleted();
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+  });
+
+  it('rejected stale-owner reset admission does not supersede an in-flight valid owner reset or suppress its completion emits', async () => {
+    const recA = {
+      name: 'deck_proj_stale_admission',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-A',
+    };
+    const recB = {
+      ...recA,
+      sessionInstanceId: 'inst-B',
+    };
+    getSessionMock.mockReturnValue(recB);
+
+    let releaseB!: () => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((resolve) => { releaseB = resolve; }));
+
+    handleWebCommand({ type: 'session.send', session: recB.name, text: '/handoff', commandId: 'cmd-b-valid' }, serverLink as any);
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    // Stale A admission (handoff + clearTransportConversation) arrives while B's valid reset is in flight.
+    const staleHandoff = handoffSessionConversation(recA as any, serverLink as any);
+    const staleClear = clearTransportConversation(recA as any, serverLink as any);
+
+    releaseB();
+    await expect(staleHandoff).rejects.toThrow(/ownership changed/i);
+    await expect(staleClear).rejects.toThrow(/ownership changed/i);
+    await flushAsync();
+    await flushAsync();
+
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith(
+      recB.name,
+      'usage.update',
+      expect.objectContaining({ inputTokens: 0, cacheTokens: 0, outputTokens: 0 }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      recB.name,
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      recB.name,
+      'session.state',
+      { state: 'idle' },
+      expect.objectContaining({ source: 'daemon' }),
+    );
+  });
+
+  it('dispatches continuation after process /handoff, isolates send failures from Clear failed, and skips failed resets or stale/incognito sessions', async () => {
+    vi.mocked(sendKeysDelayedEnter).mockClear();
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_proc_handoff',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-proc-1',
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_proc_handoff', text: '/handoff', commandId: 'cmd-proc-cont-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_proc_handoff',
+      COMPACT_HIJACK_CONTINUATION_PROMPT,
+      expect.objectContaining({ verbatim: true }),
+    );
+
+    // Failed reset must NOT dispatch continuation
+    vi.mocked(sendKeysDelayedEnter).mockClear();
+    relaunchSessionWithSettingsMock.mockRejectedValueOnce(new Error('relaunch failed'));
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_proc_handoff', text: '/handoff', commandId: 'cmd-proc-fail-reset' }, serverLink as any);
+    await flushAsync();
+    expect(sendKeysDelayedEnter).not.toHaveBeenCalled();
+
+    // Failed continuation dispatch must NOT emit Clear failed or error command.ack
+    emitMock.mockClear();
+    vi.mocked(sendKeysDelayedEnter).mockRejectedValueOnce(new Error('tmux send failed'));
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_proc_handoff', text: '/handoff', commandId: 'cmd-proc-fail-cont' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_proc_handoff', 'command.ack', { commandId: 'cmd-proc-fail-cont', status: 'accepted' });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_proj_proc_handoff',
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED }),
+      expect.anything(),
+    );
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_proj_proc_handoff',
+      'command.ack',
+      expect.objectContaining({ commandId: 'cmd-proc-fail-cont', status: 'error' }),
+    );
+
+    // Stale instance / deleted / incognito sessions never receive continuation
+    vi.mocked(sendKeysDelayedEnter).mockClear();
+    await dispatchHandoffContinuation('deck_proj_proc_handoff', undefined, 'inst-stale');
+    getSessionMock.mockReturnValue(undefined);
+    await dispatchHandoffContinuation('deck_proj_proc_handoff');
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_incog',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      incognito: true,
+    });
+    await dispatchHandoffContinuation('deck_proj_incog');
+    expect(sendKeysDelayedEnter).not.toHaveBeenCalled();
   });
 });

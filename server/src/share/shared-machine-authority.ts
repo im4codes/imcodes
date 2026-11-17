@@ -1,8 +1,12 @@
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
+import { isSharedOrContributedServer, isWholeServerShareUser } from '../security/server-share-boundary.js';
 import { signJwt, verifyJwt } from '../security/crypto.js';
+import { isUserActive } from '../security/user-status.js';
 import {
+  OWNER_MACHINE_AUTHORITY_TYPE,
   SHARED_MACHINE_AUTHORITY_TYPE,
+  type OwnerMachineAuthorityClaims,
   type SharedMachineAuthorityClaims,
 } from '../../../shared/shared-machine-authority.js';
 import type { ShareTarget } from '../../../shared/tab-sharing.js';
@@ -43,6 +47,30 @@ export function issueSharedMachineAuthority(
   signingKey: string,
 ): string {
   return signJwt(claims as unknown as Record<string, unknown>, signingKey, AUTHORITY_TTL_SECONDS);
+}
+
+export function issueOwnerMachineAuthority(
+  claims: OwnerMachineAuthorityClaims,
+  signingKey: string,
+): string {
+  return signJwt(claims as unknown as Record<string, unknown>, signingKey, AUTHORITY_TTL_SECONDS);
+}
+
+async function isVerifiedRealServerOwner(
+  db: Database,
+  serverId: string,
+  userId: string,
+  now: number,
+): Promise<boolean> {
+  if (!serverId || !userId) return false;
+  const server = await db.queryOne<{ user_id: string }>(
+    'SELECT user_id FROM servers WHERE id = $1 LIMIT 1',
+    [serverId],
+  );
+  if (!server || server.user_id !== userId) return false;
+  if (await isWholeServerShareUser(db, serverId, userId, now)) return false;
+  if (!await isUserActive(db, userId)) return false;
+  return true;
 }
 
 type SessionBinding = { projectName: string; parentSessionName: string | null; subSessionId: string | null };
@@ -103,13 +131,39 @@ export async function issueSharedMachineAuthorityForSession(
   }, input.signingKey);
 }
 
+export async function issueOwnerMachineAuthorityForSession(
+  db: Database,
+  input: {
+    actorUserId: string;
+    sourceServerId: string;
+    sessionName: string;
+    actionId: string;
+    signingKey: string;
+    now?: number;
+  },
+): Promise<string | null> {
+  const now = input.now ?? Date.now();
+  if (!input.sessionName) return null;
+  if (!await isVerifiedRealServerOwner(db, input.sourceServerId, input.actorUserId, now)) return null;
+  const binding = await readSessionBinding(db, input.sourceServerId, input.sessionName);
+  return issueOwnerMachineAuthority({
+    type: OWNER_MACHINE_AUTHORITY_TYPE,
+    sub: input.actorUserId,
+    sourceServerId: input.sourceServerId,
+    sessionName: input.sessionName,
+    projectName: binding?.projectName ?? '',
+    actionId: input.actionId,
+  }, input.signingKey);
+}
+
 export type SharedMachineAuthorityDecision =
   | { kind: 'absent' }
   | { kind: 'invalid' }
+  | { kind: 'owner'; actorUserId: string; sessionName: string; projectName: string }
   | { kind: 'participant'; actorUserId: string; sessionName: string; projectName: string };
 
 /**
- * Verify the server-minted turn authority and re-read the live share grant.
+ * Verify the server-minted turn authority and re-read the live share grant or owner identity.
  * Invalid presence never falls back to source-owner authority.
  */
 export async function resolveSharedMachineAuthority(
@@ -118,19 +172,43 @@ export async function resolveSharedMachineAuthority(
     token: string | undefined;
     signingKey: string;
     authenticatedSourceServerId: string;
+    sourceOwnerUserId?: string;
     now: number;
   },
 ): Promise<SharedMachineAuthorityDecision> {
   if (!input.token) return { kind: 'absent' };
   const raw = verifyJwt(input.token, input.signingKey);
-  const shareTarget = parseTarget(raw?.shareTarget);
-  if (!raw || raw.type !== SHARED_MACHINE_AUTHORITY_TYPE
-    || typeof raw.sub !== 'string' || !raw.sub
+  if (!raw || typeof raw.sub !== 'string' || !raw.sub
     || typeof raw.sourceServerId !== 'string'
     || raw.sourceServerId !== input.authenticatedSourceServerId
     || typeof raw.sessionName !== 'string' || !raw.sessionName
-    || typeof raw.projectName !== 'string' || !raw.projectName
-    || typeof raw.actionId !== 'string' || !raw.actionId
+    || typeof raw.projectName !== 'string'
+    || typeof raw.actionId !== 'string' || !raw.actionId) {
+    return { kind: 'invalid' };
+  }
+  if (raw.type === OWNER_MACHINE_AUTHORITY_TYPE) {
+    if (input.sourceOwnerUserId && raw.sub !== input.sourceOwnerUserId) {
+      return { kind: 'invalid' };
+    }
+    if (!await isVerifiedRealServerOwner(db, input.authenticatedSourceServerId, raw.sub, input.now)) {
+      return { kind: 'invalid' };
+    }
+    if (raw.projectName) {
+      const binding = await readSessionBinding(db, input.authenticatedSourceServerId, raw.sessionName);
+      if (binding && binding.projectName !== raw.projectName) {
+        return { kind: 'invalid' };
+      }
+    }
+    return {
+      kind: 'owner',
+      actorUserId: raw.sub,
+      sessionName: raw.sessionName,
+      projectName: raw.projectName,
+    };
+  }
+  const shareTarget = parseTarget(raw.shareTarget);
+  if (raw.type !== SHARED_MACHINE_AUTHORITY_TYPE
+    || !raw.projectName
     || !shareTarget || shareTarget.serverId !== input.authenticatedSourceServerId) {
     return { kind: 'invalid' };
   }
@@ -162,12 +240,16 @@ export async function resolveMachineOperationalUser(
     sourceOwnerUserId: string;
     now: number;
   },
-): Promise<{ userId: string; delegatedActorUserId?: string } | null> {
+): Promise<{ userId: string; delegatedActorUserId?: string; authorityKind: 'absent' | 'owner' | 'participant' } | null> {
   const delegated = await resolveSharedMachineAuthority(db, input);
   if (delegated.kind === 'invalid') return null;
-  return delegated.kind === 'participant'
-    ? { userId: input.sourceOwnerUserId, delegatedActorUserId: delegated.actorUserId }
-    : { userId: input.sourceOwnerUserId };
+  if (delegated.kind === 'participant') {
+    return { userId: input.sourceOwnerUserId, delegatedActorUserId: delegated.actorUserId, authorityKind: 'participant' };
+  }
+  if (delegated.kind === 'owner') {
+    return { userId: input.sourceOwnerUserId, authorityKind: 'owner' };
+  }
+  return { userId: input.sourceOwnerUserId, authorityKind: 'absent' };
 }
 
 /**
@@ -234,6 +316,15 @@ export async function admitMachineAction(
   // An invalid / expired / foreign turn authority never falls back to the owner.
   if (!operational) return { ok: false, reason: MACHINE_DENIAL_REASON.NO_ACCESS, accessSource: null };
   const delegatedActorUserId = operational.delegatedActorUserId;
+  // A shared or group-contributed source host must never use absent-header owner credentials
+  // to operate/execute against other devices or without explicit per-turn owner or participant authority.
+  if (
+    operational.authorityKind === 'absent'
+    && input.authenticatedSourceServerId
+    && await isSharedOrContributedServer(db, input.authenticatedSourceServerId, input.now)
+  ) {
+    return { ok: false, reason: MACHINE_DENIAL_REASON.NO_ACCESS, accessSource: null };
+  }
   const deny = (reason: MachineDenialReason, accessSource: string | null): MachineActionAdmission => ({
     ok: false, reason, accessSource, ...(delegatedActorUserId ? { delegatedActorUserId } : {}),
   });

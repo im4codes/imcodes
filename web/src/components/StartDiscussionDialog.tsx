@@ -1,6 +1,7 @@
 import { useState, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { saveUserPref } from '../api.js';
+import { isSessionAgentTypeSelectable } from './session-agent-options.js';
 
 const AGENTS = [
   { id: 'claude-code', label: 'Claude Code', models: ['opus[1M]', 'sonnet'] },
@@ -246,8 +247,15 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
                           });
                         }}
                       >
-                        {AGENTS.map((a) => (
-                          <option key={a.id} value={a.id}>{a.label}</option>
+                        {AGENTS.filter((a) => isSessionAgentTypeSelectable(a.id) || a.id === p.agentType).map((a) => (
+                          <option
+                            key={a.id}
+                            value={a.id}
+                            disabled={!isSessionAgentTypeSelectable(a.id)}
+                            hidden={!isSessionAgentTypeSelectable(a.id)}
+                          >
+                            {a.label}
+                          </option>
                         ))}
                       </select>
 

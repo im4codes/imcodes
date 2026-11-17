@@ -45,6 +45,7 @@ describe('remote desktop auto-unlock owner notification', () => {
     const [payload] = dispatchPush.mock.calls[0] as unknown as [Record<string, unknown>];
     expect(payload).toMatchObject({
       userId: ownerId,
+      serverId,
       data: { serverId, type: REMOTE_DESKTOP_AUDIT_EVENT.AUTO_UNLOCK_SUCCEEDED },
     });
     expect(String(payload.body)).toContain('office-workstation');

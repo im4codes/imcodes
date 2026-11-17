@@ -1,3 +1,5 @@
+import { AgySubagentTracker, stableJson } from '../agy-subagents.js';
+import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -21,17 +23,7 @@ import {
   PROVIDER_ERROR_CODES,
   SESSION_OWNERSHIP,
 } from '../transport-provider.js';
-import {
-  SDK_SUBAGENT_DETAIL_KIND,
-  SDK_SUBAGENT_PROVIDERS,
-  SDK_SUBAGENT_PROVIDER_KINDS,
-  SDK_SUBAGENT_SCHEMA_VERSION,
-  SDK_SUBAGENT_STATUS,
-  buildSdkSubagentSafeDetail,
-  makeAgySubagentCanonicalKey,
-  type SdkSubagentDetail,
-  type SdkSubagentNormalizedStatus,
-} from '../../../shared/sdk-subagent-status.js';
+import { isSdkRuntimeSubagentEventName } from '../../../shared/sdk-subagent-status.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
@@ -41,7 +33,8 @@ import {
   AGY_CLI_FLAG,
   AGY_CLI_PATH_ENV,
   AGY_DEFAULT_MODEL_ID,
-  AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX,
+  AGY_NATIVE_START_NOT_ATTEMPTED,
+  isAgyHistoricalErrorCandidate,
   AGY_RESULT_STATUS,
   AGY_SDK_PROVIDER_ID,
   AGY_STEP_STATE,
@@ -69,6 +62,8 @@ import {
 } from '../../../shared/memory-ws.js';
 import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agy-usage-quota.js';
 import { AgyHistoryReader, hashAgyPrompt } from '../agy-native-history.js';
+import { AgyContextUsage } from '../agy-context-usage.js';
+import { inIncognitoContext } from '../../../shared/session-incognito-context.js';
 import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
 
 const MODEL_CACHE_TTL_MS = 10 * 60_000;
@@ -78,7 +73,7 @@ const STDERR_TAIL_BYTES = 2_048;
 const AUTH_FAILURE_PATTERN = /auth|log(?:ged)?\s*in|credential|unauthori[sz]ed|license|permission denied|401\b|403\b/i;
 const RATE_LIMIT_PATTERN = /quota|rate.?limit|too many requests|resource.?exhausted|429\b/i;
 
-interface AgyUsage {
+interface AgyUsage extends Record<string, unknown> {
   input_tokens?: number;
   output_tokens?: number;
   thinking_tokens?: number;
@@ -92,8 +87,13 @@ interface AgySessionState {
   env?: Record<string, string>;
   mcpEnv?: Record<string, string>;
   model?: string;
+  /** Launch model of the captured child; model above is the next selection. */
+  childModel?: string;
   /** agy conversation id; durable resume handle (persisted by the daemon as providerResumeId). */
   conversationId?: string;
+  beforeNativeSessionStart?: () => Promise<void>;
+  nativeStartInFlight?: Promise<void>;
+  cancelGeneration: number;
   child: ChildProcess | null;
   /** User turns written to stdin that have not produced a `result` yet. */
   inflightTurns: number;
@@ -101,12 +101,14 @@ interface AgySessionState {
   currentMessageId: string | null;
   currentText: string;
   sawToolCall: boolean;
-  /** Versioned key for the stable contract delivered to the current agy process. */
+  contextUsage: AgyContextUsage;
+  compactionWatermark: AgyCompactionWatermark;
   sessionSystemTextInjected?: string;
   stderrTail: string;
-  toolSteps: Map<number, string>;
-  mayHaveHistoricalQuota: boolean;
-  /** A quota result is being checked against durable history; cancellation wins over this read. */
+  toolSteps: Map<string, { id: string; name: string; inputKey?: string }>;
+  nextSyntheticToolStep?: number;
+  mayHaveHistoricalError: boolean;
+  /** An error result is being checked against durable history; cancellation wins over this read. */
   historyReadInFlight: boolean;
   pendingInputs: Array<{ promptHash: string; sentAt: number }>;
   /** Evidence is reset by the streamed user_input boundary, not send(): inputs can queue. */
@@ -121,15 +123,7 @@ interface AgySessionState {
   lastStatusSignature?: string;
   latestStepUsage?: AgyUsage;
   turnOutputTokens?: number;
-  runtimeSubagentStartedAtByKey?: Map<string, number>;
-  runtimeSubagentToolCalls?: Map<string, {
-    canonicalKey: string;
-    agentName?: string;
-    agentPath?: string;
-    model?: string;
-    prompt?: string;
-    startedAtMs: number;
-  }>;
+  subagents?: AgySubagentTracker;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -149,52 +143,6 @@ function asNumber(value: unknown): number | undefined {
 function buildAgyMemoryMcpEnv(config: SessionConfig): Record<string, string> | undefined {
   const env = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME]?.env;
   return env && Object.keys(env).length > 0 ? env : undefined;
-}
-
-function isAgySubagentTool(name: string): boolean {
-  const normalized = name.toLowerCase().replace(/[-_]/g, '');
-  return normalized === 'invokesubagent'
-    || normalized === 'browsersubagent'
-    || normalized === 'managesubagents'
-    || normalized === 'subagent'
-    || normalized === 'agent';
-}
-
-function parseAgySubagentInput(input: unknown): {
-  agentName?: string;
-  agentPath?: string;
-  model?: string;
-  prompt?: string;
-} {
-  const rec = asRecord(input);
-  if (Array.isArray(rec.Subagents) && rec.Subagents.length > 0) {
-    const first = asRecord(rec.Subagents[0]);
-    const role = asString(first.Role) ?? asString(first.role);
-    const typeName = asString(first.TypeName) ?? asString(first.type);
-    const prompt = asString(first.Prompt) ?? asString(first.prompt);
-    const model = asString(first.Model) ?? asString(first.model);
-    const names = rec.Subagents.map((s) => {
-      const item = asRecord(s);
-      return asString(item.Role) ?? asString(item.TypeName) ?? asString(item.role) ?? asString(item.type);
-    }).filter(Boolean);
-    return {
-      agentName: names.length > 1 ? `(${names.length}) ${names.join(', ')}` : (role ?? typeName ?? 'Subagent'),
-      agentPath: typeName ?? role,
-      model,
-      prompt,
-    };
-  }
-  const role = asString(rec.Role) ?? asString(rec.role);
-  const typeName = asString(rec.TypeName) ?? asString(rec.type) ?? asString(rec.subagent_type);
-  const name = asString(rec.name) ?? asString(rec.Name);
-  const prompt = asString(rec.Prompt) ?? asString(rec.prompt) ?? asString(rec.description);
-  const model = asString(rec.Model) ?? asString(rec.model);
-  return {
-    agentName: role ?? typeName ?? name,
-    agentPath: typeName ?? role ?? name,
-    model,
-    prompt,
-  };
 }
 
 /**
@@ -241,6 +189,12 @@ export function resolveAgyBinary(config?: ProviderConfig | { binaryPath?: string
   const direct = typeof config?.binaryPath === 'string' ? config.binaryPath.trim() : '';
   const raw = direct || process.env[AGY_CLI_PATH_ENV]?.trim() || AGY_CLI_BINARY;
   const resolved = resolveAgyPathForSdk(raw);
+  // The AG Windows path resolver already unwraps npm shims to their JS entry.
+  // Keep that entry as an argument when spawning Node, never lose it by
+  // treating node.exe alone (or a .js file) as the original CLI executable.
+  if (process.platform === 'win32' && /\.[cm]?js$/i.test(resolved)) {
+    return { executable: process.execPath, prependArgs: [resolved] };
+  }
   return resolveExecutableForSpawn(resolved);
 }
 
@@ -299,10 +253,12 @@ export class AgySdkProvider implements TransportProvider {
 
   async connect(config: ProviderConfig): Promise<void> {
     this.config = config;
-    this.mcpRegistration = await ensureAgyMcpConfigHasImcodesEntry(agyMcpEnsureOptionsFromConfig(config)).catch((err) => {
-      logger.warn({ err }, 'Failed to ensure Antigravity MCP configuration');
-      return null;
-    });
+    if (!inIncognitoContext()) {
+      this.mcpRegistration = await ensureAgyMcpConfigHasImcodesEntry(agyMcpEnsureOptionsFromConfig(config)).catch((err) => {
+        logger.warn({ err }, 'Failed to ensure Antigravity MCP configuration');
+        return null;
+      });
+    }
     const { executable, prependArgs } = this.resolveBinary();
     try {
       await execFileAsync(executable, [...prependArgs, '--help'], { timeout: 15_000, env: this.spawnEnv() });
@@ -322,11 +278,21 @@ export class AgySdkProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     const states = [...this.sessions.values()];
     this.sessions.clear();
-    await Promise.all([this.historyReader.dispose(), ...states.map((state) => this.terminateChild(state))]);
+    await Promise.all([
+      this.historyReader.dispose(),
+      ...states.map((state) => this.terminateChild(state)),
+    ]);
     this.config = null;
   }
 
   async createSession(config: SessionConfig): Promise<string> {
+    if (config.incognito === true || inIncognitoContext()) {
+      throw this.makeError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        'Antigravity incognito mode requires Antigravity CLI >= 1.5.0 with ACP telemetry isolation; the legacy stream-json adapter does not support incognito mode.',
+        false,
+      );
+    }
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const prior = this.sessions.get(routeId);
     const existing = config.fresh ? undefined : prior;
@@ -339,19 +305,22 @@ export class AgySdkProvider implements TransportProvider {
         || (typeof (config as { model?: string }).model === 'string' && (config as { model?: string }).model)
         || existing?.model || AGY_DEFAULT_MODEL_ID,
       conversationId: config.resumeId ?? existing?.conversationId,
+      beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
+      cancelGeneration: (prior?.cancelGeneration ?? 0) + 1,
       child: existing?.child ?? null,
+      childModel: existing?.childModel,
       inflightTurns: existing?.inflightTurns ?? 0,
       cancelled: false,
       currentMessageId: null,
       currentText: '',
       sawToolCall: false,
-      // A resumed conversation may have an old or missing contract. Keep no
-      // optimistic marker: the first turn must compare the current payload and
-      // re-seed the contract when needed.
+      // Text estimates survive a process resume, but never a fresh conversation.
+      contextUsage: existing?.contextUsage ?? new AgyContextUsage(),
+      compactionWatermark: existing?.compactionWatermark ?? new AgyCompactionWatermark(),
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
       stderrTail: '',
       toolSteps: new Map(),
-      mayHaveHistoricalQuota: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
+      mayHaveHistoricalError: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
       historyReadInFlight: existing?.historyReadInFlight ?? false,
       pendingInputs: [],
     };
@@ -364,12 +333,13 @@ export class AgySdkProvider implements TransportProvider {
       existing.cwd = state.cwd;
       existing.env = state.env;
       existing.mcpEnv = state.mcpEnv;
+      existing.beforeNativeSessionStart = state.beforeNativeSessionStart;
       existing.model = state.model;
       return routeId;
     }
     this.sessions.set(routeId, state);
     if (state.conversationId) {
-      this.emitSessionInfo(routeId, { resumeId: state.conversationId, ...(state.model ? { model: state.model } : {}) });
+      this.emitSessionInfo(routeId, { resumeId: state.conversationId });
     }
     return routeId;
   }
@@ -398,21 +368,42 @@ export class AgySdkProvider implements TransportProvider {
     attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
   ): Promise<void> {
-    recordAgyQuotaActivity();
     const state = this.sessions.get(sessionId);
     if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Session ${sessionId} not found`, false);
+    recordAgyQuotaActivity();
+    const generationBeforeProbe = state.cancelGeneration;
+    await this.checkSessionCompaction(sessionId);
+    if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generationBeforeProbe) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG context owner changed', false);
+    }
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
     const sessionSystemText = getProviderSystemTextParts(normalized).sessionSystemText;
     const sessionContractKey = sessionSystemContractKey(sessionSystemText);
-    const includeSessionSystemText = shouldInjectSessionSystemContract(
-      state.sessionSystemTextInjected,
-      sessionSystemText,
-    );
+    const willRestart = !state.child || state.child.killed || state.child.exitCode !== null || state.childModel !== state.model;
+    const includeSessionSystemText = shouldInjectSessionSystemContract(willRestart ? undefined : state.sessionSystemTextInjected, sessionSystemText);
     const prompt = composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
     if (!prompt.trim()) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Cannot send an empty message to agy', false);
     }
 
+    // The daemon must durably invalidate its unused proof BEFORE spawn or
+    // stdin. Awaiting may race Stop/end/rebind, so re-check the captured owner.
+    state.cancelled = false;
+    const generation = state.cancelGeneration;
+    if (state.child && state.inflightTurns === 0 && state.childModel !== state.model) {
+      await this.terminateChild(state);
+      if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generation || state.cancelled) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG model restart was superseded', false, { [AGY_NATIVE_START_NOT_ATTEMPTED]: true });
+      }
+    }
+    if ((!state.child || state.child.killed || state.child.exitCode !== null) && state.beforeNativeSessionStart) {
+      const pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
+      try { await pending; }
+      finally { if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined; }
+      if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generation || state.cancelled) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG start was superseded', false, { [AGY_NATIVE_START_NOT_ATTEMPTED]: true });
+      }
+    }
     const child = this.ensureChild(sessionId, state);
     if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) {
       state.child = null;
@@ -420,6 +411,7 @@ export class AgySdkProvider implements TransportProvider {
     }
     state.cancelled = false;
     if (includeSessionSystemText) state.sessionSystemTextInjected = sessionContractKey;
+    state.contextUsage.beginPrompt(prompt);
     state.inflightTurns += 1;
     const input = { promptHash: hashAgyPrompt(prompt), sentAt: Date.now() };
     state.pendingInputs.push(input);
@@ -439,6 +431,7 @@ export class AgySdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.cancelled = true;
+    state.cancelGeneration += 1;
     if (!state.child || state.child.killed) return;
     this.emitStatus(sessionId, state, { status: null, label: null });
     await this.terminateChild(state);
@@ -453,6 +446,7 @@ export class AgySdkProvider implements TransportProvider {
     if (!capturedChild || capturedChild.exitCode != null) {
       // A physical exit does not authorize a late asynchronous history result.
       state.cancelled = true;
+      state.cancelGeneration += 1;
       state.child = null;
       this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });
@@ -467,13 +461,24 @@ export class AgySdkProvider implements TransportProvider {
     state.model = agentId;
     // --model is a launch flag: drop an idle process so the next send resumes with the new model.
     if (state.child && state.inflightTurns === 0) void this.terminateChild(state);
-    if (state.conversationId) this.emitSessionInfo(sessionId, { resumeId: state.conversationId, model: agentId });
+  }
+
+  async checkSessionCompaction(sessionId: string): Promise<boolean> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return false;
+    const env = this.spawnEnv(state.env, state.mcpEnv);
+    const changed = await state.compactionWatermark.check(env.HOME || env.USERPROFILE, state.conversationId);
+    if (this.sessions.get(sessionId) !== state || state.cancelled) return false;
+    if (changed) {
+      state.sessionSystemTextInjected = undefined;
+      state.contextUsage.resetToSummary(state.compactionWatermark.summaryTokens);
+    }
+    return changed;
   }
 
   refreshSessionSystemText(sessionId: string): void {
     const state = this.sessions.get(sessionId);
-    if (!state) return;
-    state.sessionSystemTextInjected = undefined;
+    if (state) state.sessionSystemTextInjected = undefined;
   }
 
   // ── Callbacks ──────────────────────────────────────────────────────────────
@@ -637,10 +642,9 @@ export class AgySdkProvider implements TransportProvider {
       detached: process.platform !== 'win32',
     });
     state.child = child;
+    state.childModel = state.model;
     state.stderrTail = '';
-    // A restarted agy process cannot be assumed to retain the contract marker;
-    // force the next turn to carry the current session-level instructions.
-    state.sessionSystemTextInjected = undefined;
+
 
     child.stderr?.on('data', (chunk: Buffer) => {
       state.stderrTail = (state.stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_BYTES);
@@ -664,7 +668,7 @@ export class AgySdkProvider implements TransportProvider {
       const detail = `${(err as Error)?.message ?? ''} ${state.stderrTail}`.trim();
       const authFailure = AUTH_FAILURE_PATTERN.test(detail);
       state.child = null;
-      state.sessionSystemTextInjected = undefined;
+
       this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });
       const code = (err as NodeJS.ErrnoException).code;
@@ -686,7 +690,7 @@ export class AgySdkProvider implements TransportProvider {
       const hadTurns = state.inflightTurns > 0;
       const historyReadInFlight = state.historyReadInFlight;
       const tail = state.stderrTail.trim();
-      state.sessionSystemTextInjected = undefined;
+
       this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });
       if (state.cancelled || !hadTurns || historyReadInFlight) return;
@@ -706,45 +710,9 @@ export class AgySdkProvider implements TransportProvider {
 
   private clearOpenToolSteps(sessionId: string, state: AgySessionState): void {
     if (state.toolSteps.size === 0) return;
-    for (const [, id] of state.toolSteps) {
-      const subagentInfo = state.runtimeSubagentToolCalls?.get(id);
-      let detail: SdkSubagentDetail | undefined;
-      if (subagentInfo) {
-        detail = buildSdkSubagentSafeDetail({
-          kind: SDK_SUBAGENT_DETAIL_KIND,
-          summary: subagentInfo.agentName ? `Antigravity sub-agent ${subagentInfo.agentName}` : 'Antigravity sub-agent',
-          input: {
-            action: 'invoke_subagent',
-            ...(subagentInfo.prompt ? { description: subagentInfo.prompt } : {}),
-          },
-          meta: {
-            isSdkSubagent: true,
-            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
-            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
-            canonicalKey: subagentInfo.canonicalKey,
-            normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
-            rawStatus: 'complete',
-            active: false,
-            terminal: true,
-            parentSessionId: state.conversationId ?? sessionId,
-            parentToolUseId: id,
-            parentItemId: id,
-            agentPath: subagentInfo.agentPath ?? id,
-            ...(subagentInfo.agentName ? { agentName: subagentInfo.agentName } : {}),
-            ...(subagentInfo.model ? { model: subagentInfo.model } : {}),
-            startedAtMs: subagentInfo.startedAtMs,
-            backgrounded: true,
-          },
-        }, { allowRaw: false });
-        state.runtimeSubagentToolCalls?.delete(id);
-      }
-      const tool: ToolCallEvent = {
-        id,
-        name: subagentInfo ? 'Agent' : 'tool',
-        status: 'complete',
-        ...(detail ? { detail } : {}),
-      };
+    for (const [, entry] of state.toolSteps) {
+      // Background children settle only on explicit child snapshots, not parent turn end.
+      const tool: ToolCallEvent = { id: entry.id, name: 'tool', status: 'complete' };
       for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
     }
     state.toolSteps.clear();
@@ -767,6 +735,9 @@ export class AgySdkProvider implements TransportProvider {
     const child = state.child;
     state.child = null;
     this.resetTurnState(state);
+    for (const event of state.subagents?.interrupt() ?? []) {
+      for (const cb of this.toolCallCallbacks) cb(state.routeId, event);
+    }
     this.emitStatus(state.routeId, state, { status: null, label: null });
     if (!child) return;
     try { child.stdin?.end(); } catch { /* already closed */ }
@@ -785,6 +756,13 @@ export class AgySdkProvider implements TransportProvider {
       return; // agy prints non-JSON diagnostics (e.g. `error: …`) on the same stream
     }
     const event = asRecord(parsed);
+    if (isSdkRuntimeSubagentEventName(event.event)) {
+      if (state.cancelled) return;
+      for (const child of (state.subagents ??= new AgySubagentTracker(state.conversationId ?? sessionId)).snapshot(event)) {
+        for (const cb of this.toolCallCallbacks) cb(sessionId, child);
+      }
+      return;
+    }
     switch (event.event) {
       case AGY_STREAM_EVENT.INIT:
         this.handleInit(sessionId, state, asRecord(event));
@@ -802,88 +780,17 @@ export class AgySdkProvider implements TransportProvider {
   private noteConversationId(sessionId: string, state: AgySessionState, id: string | undefined): void {
     if (!id || state.conversationId === id) return;
     state.conversationId = id;
-    this.emitSessionInfo(sessionId, { resumeId: id, ...(state.model ? { model: state.model } : {}) });
+    const model = state.childModel ?? state.model;
+    this.emitSessionInfo(sessionId, { resumeId: id, ...(model ? { model } : {}) });
   }
 
   private handleInit(sessionId: string, state: AgySessionState, event: Record<string, unknown>): void {
-    this.noteConversationId(sessionId, state, asString(event.conversation_id));
-  }
-
-  private syncAgyManagedSubagents(sessionId: string, state: AgySessionState, output: string): void {
-    try {
-      const parsed = JSON.parse(output);
-      const items = Array.isArray(parsed) ? parsed : (Array.isArray((parsed as Record<string, unknown>)?.subagents) ? (parsed as Record<string, unknown>).subagents : null);
-      if (!Array.isArray(items)) return;
-      for (const item of items) {
-        if (!item || typeof item !== 'object') continue;
-        const subagent = item as Record<string, unknown>;
-        const conversationId = asString(subagent.conversationId)
-          ?? asString(subagent.conversation_id)
-          ?? asString(subagent.id);
-        if (!conversationId) continue;
-        const role = asString(subagent.role) ?? asString(subagent.Role);
-        const type = asString(subagent.type) ?? asString(subagent.TypeName);
-        const agentName = role ?? type ?? 'Subagent';
-        const rawState = (asString(subagent.state) ?? 'running').toLowerCase();
-        const stateDetail = asString(subagent.stateDetail) ?? asString(subagent.state_detail);
-        const canonicalKey = makeAgySubagentCanonicalKey(state.conversationId ?? state.routeId, conversationId);
-
-        const normalizedStatus: SdkSubagentNormalizedStatus =
-          /^(completed|complete|idle|done|success)$/.test(rawState)
-            ? SDK_SUBAGENT_STATUS.COMPLETE
-            : /^(failed|error|errored)$/.test(rawState)
-              ? SDK_SUBAGENT_STATUS.ERROR
-              : /^(canceling|canceled|cancelled|interrupted|stopped)$/.test(rawState)
-                ? SDK_SUBAGENT_STATUS.INTERRUPTED
-                : SDK_SUBAGENT_STATUS.RUNNING;
-        const terminal = normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
-          || normalizedStatus === SDK_SUBAGENT_STATUS.ERROR
-          || normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED;
-
-        const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
-        const startedAtMs = startedAtByKey.get(canonicalKey) ?? Date.now();
-        if (!terminal) startedAtByKey.set(canonicalKey, startedAtMs);
-
-        const detail = buildSdkSubagentSafeDetail({
-          kind: SDK_SUBAGENT_DETAIL_KIND,
-          summary: `Antigravity sub-agent ${agentName}`,
-          input: {
-            action: 'agy-manage-subagents',
-            ...(stateDetail ? { description: stateDetail } : {}),
-          },
-          ...(stateDetail ? { output: stateDetail } : {}),
-          meta: {
-            isSdkSubagent: true,
-            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
-            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
-            canonicalKey,
-            normalizedStatus,
-            rawStatus: rawState,
-            active: !terminal,
-            terminal,
-            parentSessionId: state.conversationId ?? sessionId,
-            parentItemId: conversationId,
-            agentPath: conversationId,
-            agentName,
-            startedAtMs,
-            backgrounded: true,
-          },
-        }, { allowRaw: false });
-
-        const subagentTool: ToolCallEvent = {
-          id: canonicalKey,
-          name: 'Agent',
-          status: terminal ? (normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error') : 'running',
-          ...(detail.input ? { input: detail.input } : {}),
-          ...(detail.output ? { output: detail.output } : {}),
-          detail,
-        };
-        for (const cb of this.toolCallCallbacks) cb(sessionId, subagentTool);
-      }
-    } catch {
-      // Ignore non-JSON output
-    }
+    const id = asString(event.conversation_id);
+    const alreadyKnown = !!id && state.conversationId === id;
+    this.noteConversationId(sessionId, state, id);
+    // A resumed process keeps its ID, but its newly acknowledged launch model
+    // still needs publishing. Never publish a model before native init.
+    if (alreadyKnown) this.emitSessionInfo(sessionId, { resumeId: id, model: state.childModel ?? state.model });
   }
 
   private handleStep(sessionId: string, state: AgySessionState, step: Record<string, unknown>): void {
@@ -917,6 +824,9 @@ export class AgySdkProvider implements TransportProvider {
       if (stepType === AGY_STEP_TYPE.SYSTEM_ERROR || /^(ERROR|FAILED|CANCELLED)$/i.test(stepState ?? '') || hasErrorDetails) {
         evidence.sawError = true;
       }
+      if (stepType === AGY_STEP_TYPE.SYSTEM_ERROR && isAgyHistoricalErrorCandidate(asString(step.text_delta) ?? '')) {
+        state.mayHaveHistoricalError = true;
+      }
       if (stepIndex === undefined || !Number.isInteger(stepIndex) || stepIndex <= evidence.userStepIndex) {
         evidence.completedResponseStepIndex = undefined;
       } else if (stepIndex >= evidence.latestStepIndex) {
@@ -937,7 +847,7 @@ export class AgySdkProvider implements TransportProvider {
         ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
         ...(cacheTokens !== undefined ? { cache_read_tokens: cacheTokens } : {}),
       };
-      state.latestStepUsage = stepUsage;
+      state.latestStepUsage = { ...state.latestStepUsage, ...stepUsage };
       if (outputTokens !== undefined) {
         state.turnOutputTokens = (state.turnOutputTokens ?? 0) + outputTokens;
       }
@@ -965,6 +875,8 @@ export class AgySdkProvider implements TransportProvider {
         }
       }
       state.currentText += text;
+      state.contextUsage.addText(text);
+      this.emitUsage(sessionId, state, state.currentMessageId, {}, false);
       // Transport relay and web ChatView render delta.delta directly as the display
       // text for this messageId, so delta.delta MUST be the cumulative running total.
       const delta: MessageDelta = {
@@ -978,101 +890,51 @@ export class AgySdkProvider implements TransportProvider {
     }
 
     if (stepType === AGY_STEP_TYPE.TOOL) {
-      const stepIndex = asNumber(step.step_index) ?? -1;
+      const rawStepIndex = asNumber(step.step_index);
       const info = asRecord(step.tool_info);
       const name = asString(step.tool_name) ?? asString(info.name) ?? 'tool';
-      let id = state.toolSteps.get(stepIndex);
-      if (!id) {
-        id = `${state.conversationId ?? state.routeId}:${stepIndex}`;
-        state.toolSteps.set(stepIndex, id);
+      const failed = /^(ERROR|FAILED|CANCELLED)$/.test(stepState ?? '');
+      const done = stepState === AGY_STEP_STATE.DONE || failed;
+      const toolCallId = asString(step.tool_call_id) ?? asString(info.tool_call_id) ?? asString(info.id);
+      const inputKey = stableJson(info.parameters);
+      const stepKey = resolveAgyToolStepKey(state, {
+        rawStepIndex,
+        toolCallId,
+        name,
+        inputKey,
+      });
+      let existingStep = state.toolSteps.get(stepKey);
+      if (!existingStep || (rawStepIndex === undefined && existingStep.name !== name)) {
+        const suffix = rawStepIndex ?? toolCallId ?? stepKey;
+        existingStep = {
+          id: `${state.conversationId ?? state.routeId}:${suffix}`,
+          name,
+          ...(inputKey !== undefined ? { inputKey } : {}),
+        };
+        state.toolSteps.set(stepKey, existingStep);
+      } else if (existingStep.inputKey === undefined && inputKey !== undefined) {
+        existingStep.inputKey = inputKey;
       }
+      const id = existingStep.id;
       state.sawToolCall = true;
-      const done = stepState === AGY_STEP_STATE.DONE;
-      const output = asString(info.output);
+      const output = typeof info.output === 'string' ? info.output : info.output !== undefined ? JSON.stringify(info.output) : undefined;
       const tool: ToolCallEvent = {
         id,
         name,
-        status: done ? 'complete' : 'running',
+        status: failed ? 'error' : done ? 'complete' : 'running',
         input: info.parameters,
         ...(done && output !== undefined ? { output } : {}),
       };
 
-      if (isAgySubagentTool(name)) {
-        const inputParsed = parseAgySubagentInput(info.parameters);
-        const existing = state.runtimeSubagentToolCalls?.get(id);
-        const agentName = existing?.agentName ?? inputParsed.agentName;
-        const agentPath = existing?.agentPath ?? inputParsed.agentPath ?? id;
-        const model = existing?.model ?? inputParsed.model ?? state.model;
-        const prompt = existing?.prompt ?? inputParsed.prompt;
-        const canonicalKey = existing?.canonicalKey
-          ?? makeAgySubagentCanonicalKey(state.conversationId ?? state.routeId, id);
-
-        const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
-        const startedAtMs = existing?.startedAtMs ?? startedAtByKey.get(canonicalKey) ?? Date.now();
-        if (!done && !existing) {
-          startedAtByKey.set(canonicalKey, startedAtMs);
-          const toolCalls = state.runtimeSubagentToolCalls ??= new Map();
-          toolCalls.set(id, {
-            canonicalKey,
-            agentName,
-            agentPath,
-            model,
-            prompt,
-            startedAtMs,
-          });
-        }
-        const isError = Boolean(
-          done && output && (
-            output.toLowerCase().includes('error:')
-            || output.toLowerCase().startsWith('error')
-            || output.toLowerCase().includes('failed')
-          )
-        );
-        const normalizedStatus: SdkSubagentNormalizedStatus = !done
-          ? SDK_SUBAGENT_STATUS.RUNNING
-          : isError
-            ? SDK_SUBAGENT_STATUS.ERROR
-            : SDK_SUBAGENT_STATUS.COMPLETE;
-
-        const detail = buildSdkSubagentSafeDetail({
-          kind: SDK_SUBAGENT_DETAIL_KIND,
-          summary: agentName ? `Antigravity sub-agent ${agentName}` : 'Antigravity sub-agent',
-          input: {
-            action: name,
-            ...(prompt ? { description: prompt } : {}),
-          },
-          ...(done && output !== undefined ? { output } : {}),
-          meta: {
-            isSdkSubagent: true,
-            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
-            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
-            canonicalKey,
-            normalizedStatus,
-            rawStatus: !done ? 'running' : isError ? 'error' : 'complete',
-            active: !done,
-            terminal: done,
-            parentSessionId: state.conversationId ?? sessionId,
-            parentToolUseId: id,
-            parentItemId: id,
-            agentPath,
-            ...(agentName ? { agentName } : {}),
-            ...(model ? { model } : {}),
-            startedAtMs,
-            backgrounded: true,
-          },
-        }, { allowRaw: false });
-        tool.detail = detail;
+      const tracker = state.subagents ??= new AgySubagentTracker(state.conversationId ?? sessionId);
+      const children = tracker.tool(tool);
+      for (const event of children.length ? children : [tool]) {
+        for (const cb of this.toolCallCallbacks) cb(sessionId, event);
       }
 
-      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
-
-      if (done && name === 'manage_subagents' && output) {
-        this.syncAgyManagedSubagents(sessionId, state, output);
-      }
 
       if (done) {
-        state.toolSteps.delete(stepIndex);
+        state.toolSteps.delete(stepKey);
         this.emitStatus(sessionId, state, {
           status: state.toolSteps.size > 0 ? 'tool_running' : 'thinking',
           label: state.toolSteps.size > 0 ? 'Running tool...' : 'Thinking...',
@@ -1092,7 +954,7 @@ export class AgySdkProvider implements TransportProvider {
     let recovered = false;
     const error = asString(result.error) ?? '';
     if (input && !state.cancelled && result.status === AGY_RESULT_STATUS.ERROR
-      && error.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX) && !asString(result.response)?.trim()
+      && isAgyHistoricalErrorCandidate(error) && !asString(result.response)?.trim()
       && state.conversationId && state.conversationId === asString(result.conversation_id)
       && !state.turnEvidence?.sawError && state.toolSteps.size === 0) {
       const env = this.spawnEnv(state.env, state.mcpEnv);
@@ -1120,15 +982,15 @@ export class AgySdkProvider implements TransportProvider {
     const streamed = state.currentText;
     const response = asString(result.response)?.trimEnd();
     const evidence = state.turnEvidence;
-    // AG can aggregate a quota error from an older conversation step into the
+    // AG can aggregate a quota/API error from an older conversation step into the
     // terminal result of a later successful turn (upstream #1048). Do not trust
     // nonempty response text alone: partial output on a real failure is common.
     // Require a new user boundary, a matching final DONE response, no subsequent
     // step/open tool or current error, and the same conversation. No replay,
     // conversation reset, quota probe or suppression of an unproven error.
-    const historicalQuotaResult = recovered || result.status === AGY_RESULT_STATUS.ERROR
-      && state.mayHaveHistoricalQuota
-      && (asString(result.error) ?? '').startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)
+    const historicalErrorResult = recovered || result.status === AGY_RESULT_STATUS.ERROR
+      && state.mayHaveHistoricalError
+      && isAgyHistoricalErrorCandidate(error)
       && !!response?.trim()
       && !!evidence
       && (response === streamed.trimEnd() || response === evidence.responseText.trimEnd())
@@ -1162,11 +1024,12 @@ export class AgySdkProvider implements TransportProvider {
     state.latestStepUsage = undefined;
     state.turnOutputTokens = undefined;
 
+    const contextUsage = state.contextUsage.normalize(turnUsage);
     this.emitUsage(sessionId, state, messageId, turnUsage, true);
 
-    if (result.status !== AGY_RESULT_STATUS.SUCCESS && !historicalQuotaResult) {
+    if (result.status !== AGY_RESULT_STATUS.SUCCESS && !historicalErrorResult) {
       const message = asString(result.error) ?? 'agy turn failed';
-      if (message.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)) state.mayHaveHistoricalQuota = true;
+      if (isAgyHistoricalErrorCandidate(message)) state.mayHaveHistoricalError = true;
       const code = AUTH_FAILURE_PATTERN.test(message)
         ? PROVIDER_ERROR_CODES.AUTH_FAILED
         : RATE_LIMIT_PATTERN.test(message)
@@ -1206,12 +1069,13 @@ export class AgySdkProvider implements TransportProvider {
       timestamp: Date.now(),
       status: 'complete',
       metadata: {
-        ...(state.model ? { model: state.model } : {}),
+        ...((state.childModel ?? state.model) ? { model: state.childModel ?? state.model } : {}),
         ...(state.conversationId ? { conversationId: state.conversationId } : {}),
         usage: {
-          input_tokens: turnUsage.input_tokens,
-          output_tokens: turnUsage.output_tokens,
-          cache_read_input_tokens: turnUsage.cache_read_tokens,
+          input_tokens: contextUsage.input_tokens,
+          output_tokens: contextUsage.output_tokens,
+          cache_read_input_tokens: contextUsage.cache_read_input_tokens,
+          ...(contextUsage.context_usage_estimated ? { context_usage_estimated: true } : {}),
         },
       },
     };
@@ -1230,16 +1094,13 @@ export class AgySdkProvider implements TransportProvider {
     finalized?: boolean,
   ): void {
     if (this.usageCallbacks.size === 0) return;
-    if (usage.input_tokens === undefined && usage.output_tokens === undefined) return;
+    const contextUsage = state.contextUsage.normalize(usage);
+    if (contextUsage.input_tokens === undefined && contextUsage.output_tokens === undefined) return;
     const update: ProviderUsageUpdate = {
       messageId,
       finalized: Boolean(finalized),
-      usage: {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_input_tokens: usage.cache_read_tokens,
-      },
-      ...(state.model ? { model: state.model } : {}),
+      usage: contextUsage,
+      ...((state.childModel ?? state.model) ? { model: state.childModel ?? state.model } : {}),
     };
     for (const cb of this.usageCallbacks) cb(sessionId, update);
   }
@@ -1268,4 +1129,83 @@ export class AgySdkProvider implements TransportProvider {
     if (details !== undefined) (err as any).details = details;
     return err;
   }
+}
+
+/**
+ * Resolve the stable `state.toolSteps` key for an incoming TOOL step update.
+ * Explicit wire identities (`step_index`, `tool_call_id`) take precedence; when
+ * a new wire key appears for a uniquely compatible pending anonymous call
+ * (during either ACTIVE progress/replay or DONE), the anonymous entry is
+ * upgraded/migrated in place so its emitted event/subagent ID stays identical
+ * and no stale `anon:*` alias remains behind.
+ */
+function resolveAgyToolStepKey(
+  state: AgySessionState,
+  opts: {
+    rawStepIndex: number | undefined;
+    toolCallId: string | undefined;
+    name: string;
+    inputKey: string | undefined;
+  },
+): string {
+  const { rawStepIndex, toolCallId, name, inputKey } = opts;
+  const indexKey = rawStepIndex !== undefined ? `step:${rawStepIndex}` : undefined;
+  const callKey = toolCallId ? `call:${toolCallId}` : undefined;
+
+  if (indexKey && state.toolSteps.has(indexKey)) return indexKey;
+  if (callKey && state.toolSteps.has(callKey)) {
+    if (indexKey) {
+      const existing = state.toolSteps.get(callKey)!;
+      state.toolSteps.delete(callKey);
+      state.toolSteps.set(indexKey, existing);
+      return indexKey;
+    }
+    return callKey;
+  }
+
+  const primaryExplicitKey = indexKey ?? callKey;
+  if (primaryExplicitKey) {
+    const anonOfName = [...state.toolSteps.entries()].filter(
+      ([k, v]) => k.startsWith('anon:') && v.name === name,
+    );
+    let upgradeCandidate: [string, { id: string; name: string; inputKey?: string }] | undefined;
+    if (inputKey !== undefined) {
+      const exact = anonOfName.filter(([, v]) => v.inputKey === inputKey);
+      if (exact.length === 1) {
+        upgradeCandidate = exact[0];
+      } else if (exact.length === 0) {
+        const compat = anonOfName.filter(([, v]) => v.inputKey === undefined);
+        if (compat.length === 1) upgradeCandidate = compat[0];
+      }
+    } else {
+      if (anonOfName.length === 1) upgradeCandidate = anonOfName[0];
+    }
+    if (upgradeCandidate) {
+      const [anonKey, anonEntry] = upgradeCandidate;
+      state.toolSteps.delete(anonKey);
+      if (anonEntry.inputKey === undefined && inputKey !== undefined) {
+        anonEntry.inputKey = inputKey;
+      }
+      state.toolSteps.set(primaryExplicitKey, anonEntry);
+    }
+    return primaryExplicitKey;
+  }
+
+  const nextSynthetic = (): string => {
+    const n = (state.nextSyntheticToolStep ?? 0) + 1;
+    state.nextSyntheticToolStep = n;
+    return `anon:${n}`;
+  };
+  const anonMatches = [...state.toolSteps.entries()].filter(
+    ([k, v]) => k.startsWith('anon:') && v.name === name,
+  );
+  if (inputKey !== undefined) {
+    const exact = anonMatches.find(([, v]) => v.inputKey === inputKey);
+    if (exact) return exact[0];
+    const unknownInputMatches = anonMatches.filter(([, v]) => v.inputKey === undefined);
+    if (unknownInputMatches.length === 1) return unknownInputMatches[0][0];
+    return nextSynthetic();
+  }
+  if (anonMatches.length > 0) return anonMatches[0][0];
+  return nextSynthetic();
 }

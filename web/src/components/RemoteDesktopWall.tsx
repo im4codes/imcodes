@@ -20,7 +20,6 @@ import {
   rememberMinimizeOrigin,
   type RemoteDesktopMinimizeOrigin,
 } from './RemoteDesktopMinimizedDock.js';
-import { RemoteDesktopInstallEntry } from './RemoteDesktopInstallEntry.js';
 import { RemoteDesktopWallTile } from './RemoteDesktopWallTile.js';
 import './remote-desktop-workspace.css';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
@@ -77,6 +76,7 @@ export function RemoteDesktopWall({
   onClose,
 }: RemoteDesktopWallProps) {
   const { t } = useTranslation();
+  const [maximized, setMaximized] = useState(false);
   const [snapshot, setSnapshot] = useState<RemoteDesktopWallSnapshot | null>(null);
   const [wallError, setWallError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -191,7 +191,6 @@ export function RemoteDesktopWall({
       <header class="remote-desktop-workspace-header remote-desktop-wall-header">
         <strong>{t('remote_desktop.workspace_wall')}</strong>
         <div class="remote-desktop-workspace-actions">
-          <RemoteDesktopInstallEntry buttonClass="remote-desktop-workspace-chrome-button" compact />
           {onConnectById && <button
             class="remote-desktop-workspace-chrome-button"
             type="button"
@@ -328,6 +327,9 @@ export function RemoteDesktopWall({
           minW={540}
           minH={360}
           className="remote-desktop-wall-shell"
+          enableMaximize
+          isMaximized={maximized}
+          onToggleMaximized={() => setMaximized((current) => !current)}
           hideTitleBar
           dragHandleSelector=".remote-desktop-wall-header"
         >{content}</FloatingPanel>

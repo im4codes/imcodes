@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../test/helpers/task-pair-fixture.js';
 /**
  * @vitest-environment jsdom
  *
@@ -56,7 +57,7 @@ let clock = 0;
 
 function save(taskId: string, over: Record<string, unknown> = {}) {
   clock += 1;
-  return store.savePair(PROJECT, {
+  return putTaskPairFixture(store, PROJECT, {
     taskId, brain: BRAIN, executor: `deck_sub_${taskId}_x`, auditor: `deck_sub_${taskId}_a`,
     title: `Pair ${taskId}`, status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
     previousAuditors: [], createdAt: 1, updatedAt: 1_000 + clock, brief: '# brief', executorPool: 'primary',

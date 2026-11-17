@@ -591,27 +591,34 @@ describe('repeated supervision heartbeat and WAITING presentation', () => {
   });
 });
 
-vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text, onUrlClick }: { text: string; onUrlClick?: (url: string) => void }) => {
-    chatMarkdownRenderSpy(text);
-    const url = text.match(/https?:\/\/\S+/)?.[0];
-    if (url) {
-      return (
-        <a
-          class="chat-external-link"
-          href={url}
-          onClick={(e) => {
-            e.preventDefault();
-            onUrlClick?.(url);
-          }}
-        >
-          {url}
-        </a>
-      );
-    }
-    return <div>{text}</div>;
-  },
-}));
+vi.mock('../../src/components/ChatMarkdown.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/components/ChatMarkdown.js')>('../../src/components/ChatMarkdown.js');
+  return {
+    ChatMarkdown: (props: Parameters<typeof actual.ChatMarkdown>[0]) => {
+      chatMarkdownRenderSpy(props.text);
+      if (props.onCloudDocClick) {
+        return <actual.ChatMarkdown {...props} />;
+      }
+      const { text, onUrlClick } = props;
+      const url = text.match(/https?:\/\/\S+/)?.[0];
+      if (url) {
+        return (
+          <a
+            class="chat-external-link"
+            href={url}
+            onClick={(e) => {
+              e.preventDefault();
+              onUrlClick?.(url);
+            }}
+          >
+            {url}
+          </a>
+        );
+      }
+      return <div>{text}</div>;
+    },
+  };
+});
 
 vi.mock('../../src/components/FileBrowser.js', () => ({
   FileBrowser: () => null,
@@ -2751,6 +2758,55 @@ describe('ChatView', () => {
     expect(container.querySelector('.external-link-url')?.textContent).toBe('https://example.com/release-notes');
   });
 
+  it('copies the complete external URL using only an icon without opening or closing the dialog', async () => {
+    const url = 'https://example.com/%E6%96%87%E4%BB%B6.zip?X-Amz-Signature=' + 'abc123'.repeat(80) + '&key=a%2Bb#download';
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    try {
+      const { container } = render(<ChatView events={[{
+        eventId: 'copy-external-url', type: 'assistant.text', ts: 1000, payload: { text: url },
+      }] as any} loading={false} sessionId="deck_main_brain" />);
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      const button = container.querySelector('.external-link-copy') as HTMLButtonElement;
+      expect(button).toBeTruthy();
+      expect(button.getAttribute('aria-label')).toBe('common.copy');
+      expect(button.textContent).toBe('');
+      expect(button.querySelector('svg')).toBeTruthy();
+      fireEvent.click(button);
+      await waitFor(() => expect(button.getAttribute('aria-label')).toBe('common.copied'));
+      expect(clipboardWriteText).toHaveBeenCalledWith(url);
+      expect(open).not.toHaveBeenCalled();
+      expect(container.querySelector('.external-link-dialog')).toBeTruthy();
+      expect(container.querySelector('.external-link-warning')).toBeTruthy();
+      const cancel = [...container.querySelectorAll('.external-link-btn')].find(el => el.textContent === 'chat.external_link_cancel')!;
+      fireEvent.click(cancel);
+      expect(container.querySelector('.external-link-dialog')).toBeNull();
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      expect(container.querySelector('.external-link-copy')?.getAttribute('aria-label')).toBe('common.copy');
+    } finally { open.mockRestore(); }
+  });
+
+  it('does not claim a failed clipboard write succeeded or navigate away', async () => {
+    const originalExecCommand = document.execCommand;
+    const fallback = vi.fn().mockReturnValue(false);
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: fallback });
+    clipboardWriteText.mockRejectedValueOnce(new Error('clipboard denied'));
+    try {
+      const { container } = render(<ChatView events={[{
+        eventId: 'failed-external-copy', type: 'assistant.text', ts: 1000, payload: { text: 'https://example.com/retry' },
+      }] as any} loading={false} sessionId="deck_main_brain" />);
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      const button = container.querySelector('.external-link-copy') as HTMLButtonElement;
+      fireEvent.click(button);
+      await waitFor(() => expect(fallback).toHaveBeenCalledWith('copy'));
+      expect(button.getAttribute('aria-label')).toBe('common.copy');
+      expect(container.querySelector('.external-link-dialog')).toBeTruthy();
+      fireEvent.click(button);
+      await waitFor(() => expect(button.getAttribute('aria-label')).toBe('common.copied'));
+    } finally {
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand });
+    }
+  });
+
   it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {
     const initialEvents = [
       {
@@ -3254,6 +3310,105 @@ describe('ChatView', () => {
       });
     } finally {
       if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
+    }
+  });
+
+  it('renders CloudDoc quote chips in user messages and pairs CloudDoc filenames/IDs in assistant replies without triggering local file preview', () => {
+    const onCloudDocClick = vi.fn();
+    const onPreviewFile = vi.fn();
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-clouddoc',
+            type: 'user.message',
+            ts: new Date('2026-04-17T12:34:00Z').getTime(),
+            payload: { text: '[CloudDoc: 无标题表格.xlsx | id=cdoc_503c1c6e391e458b9e56] 帮我填一下' },
+          },
+          {
+            eventId: 'evt-assistant-clouddoc',
+            type: 'assistant.text',
+            ts: new Date('2026-04-17T12:35:00Z').getTime(),
+            payload: {
+              text: '已改名为 `芝加哥机房配件箱设备清单.xlsx`（`id=cdoc_503c1c6e391e458b9e56`，版本 `v2`）。另附本地文件 `/tmp/local.xlsx`。',
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        serverId="srv-1"
+        ws={{ fsReadFile: vi.fn() } as any}
+        onPreviewFile={onPreviewFile}
+        onCloudDocClick={onCloudDocClick}
+      />,
+    );
+
+    const chip = container.querySelector('.chat-user .chat-cloud-doc-chip') as HTMLElement | null;
+    expect(chip).toBeTruthy();
+    expect(chip?.textContent).toContain('无标题表格.xlsx');
+    expect(container.querySelector('.chat-user .chat-dl-btn')).toBeNull();
+
+    const cloudLinks = Array.from(container.querySelectorAll('.chat-assistant .chat-cloud-doc-link'));
+    expect(cloudLinks.map((el) => el.textContent)).toEqual([
+      '芝加哥机房配件箱设备清单.xlsx',
+      'id=cdoc_503c1c6e391e458b9e56',
+    ]);
+
+    // Only /tmp/local.xlsx should keep the local path action & download icon
+    const assistantDlBtns = Array.from(container.querySelectorAll('.chat-assistant .chat-dl-btn'));
+    expect(assistantDlBtns).toHaveLength(1);
+    const localLink = container.querySelector('.chat-assistant .chat-path-link') as HTMLElement | null;
+    expect(localLink?.textContent).toBe('/tmp/local.xlsx');
+
+    fireEvent.click(chip!);
+    fireEvent.click(cloudLinks[0]!);
+    fireEvent.click(cloudLinks[1]!);
+    expect(onCloudDocClick).toHaveBeenCalledTimes(3);
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(1, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(2, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(3, 'cdoc_503c1c6e391e458b9e56');
+    expect(onPreviewFile).not.toHaveBeenCalled();
+
+    fireEvent.click(localLink!);
+    expect(onPreviewFile).toHaveBeenCalledTimes(1);
+    expect(onPreviewFile.mock.calls[0]?.[0]).toMatchObject({ path: '/tmp/local.xlsx' });
+  });
+
+  it('hides split file panel toggle and right file browser when hideFilePanel is true', () => {
+    const mockWs = {
+      fsReadFile: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const findFilePanelToggle = (root: HTMLElement) =>
+      Array.from(root.querySelectorAll('button.chat-panel-toggle')).find((btn) => btn.textContent?.trim() === '⊞') ?? null;
+
+    localStorage.setItem('chatFilePanelOpen:deck_minichat_fp', '1');
+    try {
+      const { container: normalContainer } = render(
+        <ChatView
+          events={[]}
+          loading={false}
+          sessionId="deck_minichat_fp"
+          ws={mockWs}
+        />,
+      );
+      expect(findFilePanelToggle(normalContainer)).toBeTruthy();
+      expect(normalContainer.querySelector('.chat-split')).toBeTruthy();
+
+      const { container: hiddenContainer } = render(
+        <ChatView
+          events={[]}
+          loading={false}
+          sessionId="deck_minichat_fp"
+          ws={mockWs}
+          hideFilePanel
+        />,
+      );
+      expect(findFilePanelToggle(hiddenContainer)).toBeNull();
+      expect(hiddenContainer.querySelector('.chat-split')).toBeNull();
+    } finally {
+      localStorage.removeItem('chatFilePanelOpen:deck_minichat_fp');
     }
   });
 });
