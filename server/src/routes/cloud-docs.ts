@@ -45,6 +45,7 @@ import {
   deleteCloudDocFolderTree,
   deleteCloudDocRecord,
   deleteRecentDocument,
+  formatCloudDocOwnerName,
   getCloudDocById,
   getCloudDocFolderById,
   getCloudDocShareById,
@@ -2487,6 +2488,33 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       Number.isFinite(limitParam) ? limitParam : CLOUD_DOCS_RECENT_DEFAULT_LIMIT,
     );
 
+    const ownerNamePromises = new Map<string, Promise<string | null>>();
+    const teamNamePromises = new Map<string, Promise<string | null>>();
+    const resolveOwnerDisplayName = (ownerId: string | null | undefined): Promise<string | null> => {
+      if (!ownerId) return Promise.resolve(null);
+      let cached = ownerNamePromises.get(ownerId);
+      if (!cached) {
+        cached = c.env.DB.queryOne<{ id: string; status: string; username: string | null; display_name: string | null }>(
+          'SELECT id, status, username, display_name FROM users WHERE id = $1',
+          [ownerId],
+        ).then((user) => (user && user.status === 'active' ? formatCloudDocOwnerName(user) : null));
+        ownerNamePromises.set(ownerId, cached);
+      }
+      return cached;
+    };
+    const resolveTeamDisplayName = (teamId: string | null | undefined): Promise<string | null> => {
+      if (!teamId) return Promise.resolve(null);
+      let cached = teamNamePromises.get(teamId);
+      if (!cached) {
+        cached = c.env.DB.queryOne<{ name: string | null }>(
+          'SELECT name FROM teams WHERE id = $1',
+          [teamId],
+        ).then((team) => team?.name ?? null);
+        teamNamePromises.set(teamId, cached);
+      }
+      return cached;
+    };
+
     const items: RecentDocumentItem[] = await Promise.all(rows.map(async (row) => {
       const base = rowToRecentDocumentBase(row);
 
@@ -2512,6 +2540,9 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
           accessReason: null,
           role: access.role,
           allowDownload: access.allowDownload,
+          isOwner: access.isOwner,
+          ownerName: access.ownerName,
+          sharedTeamName: access.sharedTeamName,
         };
       }
 
@@ -2542,6 +2573,13 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         ? (access.reason === 'server_not_found' ? 'server_not_found' : 'access_denied')
         : (!serverOnline ? 'server_offline' : null);
 
+      const [ownerName, sharedTeamName] = access.allowed
+        ? await Promise.all([
+            resolveOwnerDisplayName(access.ownerUserId),
+            resolveTeamDisplayName(access.sharedTeamId),
+          ])
+        : [undefined, undefined];
+
       return {
         ...base,
         serverName: serverRow?.name ?? base.serverName,
@@ -2549,6 +2587,13 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         serverOnline,
         accessReason,
         ...(access.allowed && access.role ? { role: access.role } : {}),
+        ...(access.allowed
+          ? {
+              isOwner: access.isOwner,
+              ownerName: ownerName ?? null,
+              sharedTeamName: sharedTeamName ?? null,
+            }
+          : {}),
       };
     }));
 

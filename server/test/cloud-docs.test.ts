@@ -66,6 +66,21 @@ function createInMemoryCloudDocsDb() {
   const docs = new Map<string, CloudDocRow>();
   const recents = new Map<string, RecentDocumentRow>();
   const shares = new Map<string, CloudDocShareRow>();
+  const documentShares: Array<{
+    id: string;
+    server_id: string;
+    target_kind: 'file' | 'folder';
+    target_path: string;
+    share_mode: 'user' | 'team';
+    target_user_id: string;
+    role: 'viewer' | 'editor';
+    allow_download: boolean;
+    participant_label: string | null;
+    expires_at: number | null;
+    revoked_at: number | null;
+    redeemed_by_user_id: string | null;
+    updated_at: number;
+  }> = [];
 
   let failNextDocInsertMode: 'none' | 'pre_commit' | 'ambiguous' = 'none';
   let failNextDocCommitMode: 'none' | 'pre_commit' | 'ambiguous' = 'none';
@@ -159,6 +174,31 @@ function createInMemoryCloudDocsDb() {
 
       if (s.includes('FROM server_shares') || s.includes('FROM sub_session_shares')) {
         return [] as T[];
+      }
+
+      if (s.includes('FROM team_members WHERE user_id = $1')) {
+        const userId = params[0] as string;
+        const rows: Array<{ team_id: string }> = [];
+        for (const key of teamMembers.keys()) {
+          const [tid, uid] = key.split(':');
+          if (uid === userId && tid) rows.push({ team_id: tid });
+        }
+        return rows as unknown as T[];
+      }
+
+      if (s.includes('FROM document_shares WHERE server_id = $1')) {
+        const [serverId, now, userId] = params as [string, number, string];
+        return documentShares.filter((r) =>
+          r.server_id === serverId
+          && r.revoked_at === null
+          && (r.expires_at === null || r.expires_at > now)
+          && (
+            r.target_user_id === userId
+            || r.redeemed_by_user_id === userId
+            || r.target_user_id === '*'
+            || r.target_user_id.startsWith('team:')
+          ),
+        ) as unknown as T[];
       }
 
       return [] as T[];
@@ -604,6 +644,7 @@ function createInMemoryCloudDocsDb() {
     shares,
     sessions,
     sessionShares,
+    documentShares,
     setFailNextDocInsert: (v: boolean) => { failNextDocInsertMode = v ? 'pre_commit' : 'none'; },
     setFailNextDocInsertMode: (mode: 'none' | 'pre_commit' | 'ambiguous') => { failNextDocInsertMode = mode; },
     setFailNextDocCommit: (v: boolean) => { failNextDocCommitMode = v ? 'pre_commit' : 'none'; },
@@ -2435,5 +2476,166 @@ describe('cloud docs & recent documents', () => {
     expect((mobileEditClaims.editorConfig as { customization: Record<string, unknown> }).customization).toEqual(
       mobileEditBody.config.editorConfig.customization,
     );
+  });
+
+  it('returns isOwner, ownerName, and sharedTeamName in GET /api/recent-documents without leaking on denied items', async () => {
+    const ownedRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'docx', name: 'Owned.docx' }),
+    });
+    const { doc: ownedDoc } = (await ownedRes.json()) as { doc: { id: string } };
+
+    const directRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'xlsx', name: 'DirectShared.xlsx' }),
+    });
+    const { doc: directDoc } = (await directRes.json()) as { doc: { id: string } };
+
+    const folderRes = await app.request('/api/cloud-docs/folders', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Group Folder' }),
+    });
+    const { folder } = (await folderRes.json()) as { folder: { id: string } };
+
+    const teamRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'xlsx', name: 'TeamShared.xlsx', folderId: folder.id }),
+    });
+    const { doc: teamDoc } = (await teamRes.json()) as { doc: { id: string } };
+
+    const directShareRes = await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'doc',
+        targetId: directDoc.id,
+        shareMode: 'user',
+        targetUserId: 'user-bob',
+        role: 'editor',
+      }),
+    });
+    expect(directShareRes.status).toBe(201);
+    const { share: directShare } = (await directShareRes.json()) as { share: { id: string } };
+
+    const teamShareRes = await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'folder',
+        targetId: folder.id,
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        role: 'viewer',
+      }),
+    });
+    expect(teamShareRes.status).toBe(201);
+
+    // Record Cloud Docs in Recent
+    expect((await app.request(`/api/cloud-docs/${ownedDoc.id}/onlyoffice/config`, { headers: bearerHeader('owner-1') })).status).toBe(200);
+    expect((await app.request(`/api/cloud-docs/${directDoc.id}/onlyoffice/config`, { headers: bearerHeader('user-bob') })).status).toBe(200);
+    expect((await app.request(`/api/cloud-docs/${teamDoc.id}/onlyoffice/config`, { headers: bearerHeader('user-bob') })).status).toBe(200);
+
+    // Add team-shared server_file grant and record server_file recents for owner-1 and user-bob
+    memDb.documentShares.push({
+      id: 'ds-team-1',
+      server_id: 'srv-1',
+      target_kind: 'file',
+      target_path: '/repo/TeamSheet.xlsx',
+      share_mode: 'team',
+      target_user_id: 'team:team-1',
+      role: 'editor',
+      allow_download: true,
+      participant_label: null,
+      expires_at: null,
+      revoked_at: null,
+      redeemed_by_user_id: null,
+      updated_at: Date.now(),
+    });
+    expect((await app.request('/api/recent-documents/record', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceKind: 'server_file', serverId: 'srv-1', filePath: '/repo/TeamSheet.xlsx', title: 'TeamSheet.xlsx' }),
+    })).status).toBe(200);
+    expect((await app.request('/api/recent-documents/record', {
+      method: 'POST',
+      headers: { ...bearerHeader('user-bob'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceKind: 'server_file', serverId: 'srv-1', filePath: '/repo/TeamSheet.xlsx', title: 'TeamSheet.xlsx' }),
+    })).status).toBe(200);
+
+    type RecentResp = {
+      items: Array<{
+        sourceKind: string;
+        cloudDocId?: string | null;
+        title: string;
+        accessible: boolean;
+        role?: string;
+        isOwner?: boolean;
+        ownerName?: string | null;
+        sharedTeamName?: string | null;
+      }>;
+    };
+
+    const ownerRecent = (await (await app.request('/api/recent-documents', { headers: bearerHeader('owner-1') })).json()) as RecentResp;
+    const ownerCloud = ownerRecent.items.find((i) => i.cloudDocId === ownedDoc.id);
+    const ownerSrv = ownerRecent.items.find((i) => i.sourceKind === 'server_file');
+    expect(ownerCloud).toMatchObject({
+      accessible: true,
+      isOwner: true,
+      ownerName: 'Alice',
+      sharedTeamName: null,
+      role: 'editor',
+    });
+    expect(ownerSrv).toMatchObject({
+      accessible: true,
+      isOwner: true,
+      ownerName: 'Alice',
+      sharedTeamName: null,
+      role: 'editor',
+    });
+
+    const bobRecent = (await (await app.request('/api/recent-documents', { headers: bearerHeader('user-bob') })).json()) as RecentResp;
+    const bobDirect = bobRecent.items.find((i) => i.cloudDocId === directDoc.id);
+    const bobTeam = bobRecent.items.find((i) => i.cloudDocId === teamDoc.id);
+    const bobSrv = bobRecent.items.find((i) => i.sourceKind === 'server_file');
+    expect(bobDirect).toMatchObject({
+      accessible: true,
+      isOwner: false,
+      ownerName: 'Alice',
+      sharedTeamName: null,
+      role: 'editor',
+    });
+    expect(bobTeam).toMatchObject({
+      accessible: true,
+      isOwner: false,
+      ownerName: 'Alice',
+      sharedTeamName: 'Ops Group',
+      role: 'viewer',
+    });
+    expect(bobSrv).toMatchObject({
+      accessible: true,
+      isOwner: false,
+      ownerName: 'Alice',
+      sharedTeamName: 'Ops Group',
+      role: 'editor',
+    });
+
+    // Revoking share + removing Bob from team strips ownerName/sharedTeamName/isOwner on denied items
+    expect((await app.request(`/api/cloud-docs/shares/${directShare.id}`, {
+      method: 'DELETE',
+      headers: bearerHeader('owner-1'),
+    })).status).toBe(200);
+    memDb.teamMembers.delete('team-1:user-bob');
+
+    const bobDenied = (await (await app.request('/api/recent-documents', { headers: bearerHeader('user-bob') })).json()) as RecentResp;
+    for (const item of bobDenied.items) {
+      expect(item.accessible).toBe(false);
+      expect(item.isOwner).toBeUndefined();
+      expect(item.ownerName).toBeUndefined();
+      expect(item.sharedTeamName).toBeUndefined();
+    }
   });
 });

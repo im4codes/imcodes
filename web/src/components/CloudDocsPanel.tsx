@@ -1025,7 +1025,9 @@ export function CloudDocsPanel({
       : recentItems.filter((item) =>
           item.title.toLowerCase().includes(normalizedSearch)
           || (item.serverName ?? '').toLowerCase().includes(normalizedSearch)
-          || (item.filePath ?? '').toLowerCase().includes(normalizedSearch),
+          || (item.filePath ?? '').toLowerCase().includes(normalizedSearch)
+          || (item.ownerName ?? '').toLowerCase().includes(normalizedSearch)
+          || (item.sharedTeamName ?? '').toLowerCase().includes(normalizedSearch),
         );
     const filtered = searched.filter((item) => matchesTypeFilter(item.title));
     return [...filtered].sort((a, b) => (
@@ -2847,6 +2849,22 @@ export function CloudDocsPanel({
                         ? t('cloud_docs.source.cloud_doc', 'Cloud Doc')
                         : (item.serverName || item.serverId || t('cloud_docs.source.server_file', 'Server'))}
                     </span>
+                    {item.accessible && item.isOwner === false && item.role && (
+                      <span class="cloud-docs-badge is-cloud">
+                        {item.role === 'editor'
+                          ? t('cloud_docs.share.role_editor', 'Editor')
+                          : t('cloud_docs.share.role_viewer', 'Viewer')}
+                      </span>
+                    )}
+                    {item.accessible && item.ownerName && (
+                      <span>{item.ownerName}</span>
+                    )}
+                    {item.accessible && item.sharedTeamName && (
+                      <span class="cloud-docs-team-chip">
+                        <PrincipalIcon mode="team" />
+                        <span>{item.sharedTeamName}</span>
+                      </span>
+                    )}
                     {item.filePath && <span class="cloud-docs-path" title={item.filePath}>{item.filePath}</span>}
                     {!item.accessible && (
                       <span class="cloud-docs-badge is-warn">
