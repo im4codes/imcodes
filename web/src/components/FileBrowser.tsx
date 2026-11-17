@@ -5,6 +5,7 @@ import { openMacosFullDiskAccessSettings } from '../api/machines.js';
 import { formatByteSize } from '../util/byte-size.js';
 import {
   FILE_BROWSER_FILTER_DEBOUNCE_MS,
+  FILE_BROWSER_FILTER_MAX_QUERY_CHARS,
   FILE_BROWSER_SORT_DIRECTIONS,
   FILE_BROWSER_SORT_KEYS,
   applyFileBrowserView,
@@ -769,6 +770,19 @@ export function FileBrowser({
   const [sharedShowCreate, setSharedShowCreate] = useState(false);
   const sharedFolderEpochRef = useRef(0);
   const externalShareToken = useMemo(() => detectExternalDocShareToken(), []);
+  const [navSearchInput, setNavSearchInput] = useState('');
+  const [navSearchCommitNonce, setNavSearchCommitNonce] = useState(0);
+  const [navSearchState, setNavSearchState] = useState<{
+    status: 'idle' | 'loading' | 'done' | 'error';
+    results: string[];
+    error?: string;
+  }>({ status: 'idle', results: [] });
+  const navSearchInputElRef = useRef<HTMLInputElement | null>(null);
+  const navSearchCompositionCleanupRef = useRef<(() => void) | null>(null);
+  const navSearchComposingRef = useRef(false);
+  const navSearchRequestIdRef = useRef<string | null>(null);
+  const navSearchBasePathRef = useRef<string>('');
+  const navSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
@@ -1057,6 +1071,12 @@ export function FileBrowser({
         pendingRef.current.clear();
         for (const timer of timersRef.current.values()) clearTimeout(timer);
         timersRef.current.clear();
+        navSearchRequestIdRef.current = null;
+        if (navSearchTimerRef.current) {
+          clearTimeout(navSearchTimerRef.current);
+          navSearchTimerRef.current = null;
+        }
+        setNavSearchState((prev) => (prev.status === 'loading' ? { status: 'idle', results: [] } : prev));
         clearAllPendingPreviewRequests();
         pendingCreateFileRef.current.clear();
         pendingRenameRef.current.clear();
@@ -1540,6 +1560,24 @@ export function FileBrowser({
         onDirectoryCreated?.(createdPath);
         return;
       }
+
+      if (msg.type === 'file.search_response') {
+        if (!msg.requestId || msg.requestId !== navSearchRequestIdRef.current) return;
+        if (navSearchTimerRef.current) {
+          clearTimeout(navSearchTimerRef.current);
+          navSearchTimerRef.current = null;
+        }
+        if (!mountedRef.current) return;
+        if (msg.error) {
+          setNavSearchState({ status: 'error', results: [], error: msg.error });
+        } else {
+          setNavSearchState({
+            status: 'done',
+            results: Array.isArray(msg.results) ? msg.results : [],
+          });
+        }
+        return;
+      }
     });
   }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, finishPreviewError, getActivePreviewCycle, onDirectoryCreated, sessionName, startPath, showHidden, highlightPath, t, ws]);
 
@@ -1547,6 +1585,7 @@ export function FileBrowser({
     filePath: string,
     preferDiff = false,
     requestedViewMode?: HtmlPreviewViewMode,
+    preserveBrowserView = false,
   ) => {
     const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
     setActiveSharedDocServerId(undefined);
@@ -1560,21 +1599,25 @@ export function FileBrowser({
     // user's expanded tree. If the file's parent already exists in the current
     // tree, reveal/select it in-place. Only re-root when the preview came from
     // outside the current tree (for example an external chat path).
-    const parentDir = getParentDir(filePath);
-    if (parentDir && parentDir !== currentLabelRef.current) {
-      const parentNodePath = findNodePath(dataRef.current, parentDir);
-      if (parentNodePath) {
-        setExpandedPaths((prev) => {
-          const next = new Set(prev);
-          for (const nodeId of parentNodePath) next.add(nodeId);
-          return next;
-        });
-        setCurrentLabel(parentDir);
-        fetchDir(parentDir);
-      } else {
-        navigateToRef.current(parentDir);
+    // When previewing from quick search results (`preserveBrowserView`), keep
+    // the active search results and multi-select checkboxes untouched.
+    if (!preserveBrowserView) {
+      const parentDir = getParentDir(filePath);
+      if (parentDir && parentDir !== currentLabelRef.current) {
+        const parentNodePath = findNodePath(dataRef.current, parentDir);
+        if (parentNodePath) {
+          setExpandedPaths((prev) => {
+            const next = new Set(prev);
+            for (const nodeId of parentNodePath) next.add(nodeId);
+            return next;
+          });
+          setCurrentLabel(parentDir);
+          fetchDir(parentDir);
+        } else {
+          navigateToRef.current(parentDir);
+        }
+        setSelectedPaths(new Set([filePath]));
       }
-      setSelectedPaths(new Set([filePath]));
     }
     if (onPreviewFile) {
       onPreviewFile({
@@ -1741,19 +1784,40 @@ export function FileBrowser({
     requestCreateFile(newEntry.parentPath, newEntryName, newDocType);
   }, [newDocType, newEntry, newEntryName, requestCreateFile, requestMkdir]);
 
+  const clearNavSearch = useCallback(() => {
+    if (navSearchTimerRef.current !== null) {
+      clearTimeout(navSearchTimerRef.current);
+      navSearchTimerRef.current = null;
+    }
+    navSearchRequestIdRef.current = null;
+    navSearchBasePathRef.current = '';
+    navSearchComposingRef.current = false;
+    setNavSearchInput('');
+    setNavSearchState({ status: 'idle', results: [] });
+  }, []);
+
+  useEffect(() => () => {
+    if (navSearchTimerRef.current !== null) {
+      clearTimeout(navSearchTimerRef.current);
+      navSearchTimerRef.current = null;
+    }
+    navSearchRequestIdRef.current = null;
+  }, []);
+
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
     // A filter belongs to the directory it was typed in; the sort stays.
     setFilterInput('');
     setAppliedFilter('');
     appliedFilterRef.current = '';
+    clearNavSearch();
     loadedRef.current.clear();
     setData([{ id: newPath, name: newPath, isDir: true, children: [] }]);
     setExpandedPaths(new Set([newPath]));
     setSelectedPaths(new Set());
     setCurrentLabel(newPath);
     fetchDir(newPath);
-  }, [fetchDir]);
+  }, [clearNavSearch, fetchDir]);
 
   const navigateTo = useCallback((newPath: string) => {
     // Trim forward entries if we navigated back before
@@ -1807,6 +1871,7 @@ export function FileBrowser({
     if (ws !== prevWsRef.current) {
       prevWsRef.current = ws;
       // Clear stale state from previous ws instance
+      clearNavSearch();
       loadedRef.current.clear();
       pendingRef.current.clear();
       clearAllPendingPreviewRequests();
@@ -1821,7 +1886,7 @@ export function FileBrowser({
       setError(null);
     }
     fetchDir(startPath);
-  }, [clearAllPendingPreviewRequests, fetchDir, includeFiles, listView, serverId, showHidden, startPath]);
+  }, [clearAllPendingPreviewRequests, clearNavSearch, fetchDir, includeFiles, listView, serverId, showHidden, startPath]);
 
   // Opening a File Browser is the only eager direct-file action.  This creates
   // an inert tab+daemon lease (no path, handle, session scope, or file
@@ -2111,9 +2176,9 @@ export function FileBrowser({
     }
   }, [mode, isMulti, onSelectedPathChange]);
 
-  const handlePreview = useCallback((filePath: string) => {
+  const handlePreview = useCallback((filePath: string, preserveBrowserView = false) => {
     if (preview.status !== 'loading' || (preview as { path: string }).path !== filePath) {
-      fetchPreview(filePath);
+      fetchPreview(filePath, false, undefined, preserveBrowserView);
     }
   }, [fetchPreview, preview]);
 
@@ -2331,12 +2396,159 @@ export function FileBrowser({
     emptyText: emptyFilterText,
   } : undefined), [createdUnavailable, emptyFilterText, forceExpanded, listDetailsPresent, listView, nowMinute, showingDrives, uiLocale, visibleColumns]);
 
-  const treeRows = viewData.map((root) => (
+  // Show drive picker / home button on Windows daemons.
+  // Detected by current path looking like a Windows path or label being the localized "This PC".
+  const thisPcLabel = t('file_browser.this_pc');
+  const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === thisPcLabel;
+  const isAtDrives = currentLabel === thisPcLabel;
+  const showNavSearch = !listView && !showSharedDocs;
+  const navSearchQuery = navSearchInput.trim();
+  const navSearchActive = showNavSearch && navSearchQuery.length > 0;
+  const canRemoteNavSearch = showNavSearch
+    && !showingDrives
+    && !isAtDrives
+    && !externalShareToken
+    && ws.connected !== false
+    && typeof ws.send === 'function';
+
+  // Preact leaves `onCompositionStart`/`onCompositionEnd` camelCased when `'oncompositionstart' in el` is false,
+  // missing lowercase native DOM events. Attach native listeners synchronously via callback ref.
+  const attachNavSearchInputRef = useCallback((el: HTMLInputElement | null) => {
+    if (navSearchInputElRef.current === el) return;
+    navSearchCompositionCleanupRef.current?.();
+    navSearchCompositionCleanupRef.current = null;
+    navSearchInputElRef.current = el;
+    if (!el) return;
+    const onCompositionStart = () => { navSearchComposingRef.current = true; };
+    const onCompositionEnd = () => {
+      navSearchComposingRef.current = false;
+      setNavSearchInput(el.value);
+      setNavSearchCommitNonce((n) => n + 1);
+    };
+    el.addEventListener('compositionstart', onCompositionStart);
+    el.addEventListener('compositionend', onCompositionEnd);
+    navSearchCompositionCleanupRef.current = () => {
+      el.removeEventListener('compositionstart', onCompositionStart);
+      el.removeEventListener('compositionend', onCompositionEnd);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!navSearchActive) {
+      if (navSearchTimerRef.current !== null) {
+        clearTimeout(navSearchTimerRef.current);
+        navSearchTimerRef.current = null;
+      }
+      navSearchRequestIdRef.current = null;
+      navSearchBasePathRef.current = '';
+      setNavSearchState((prev) => (prev.status === 'idle' && prev.results.length === 0 ? prev : { status: 'idle', results: [] }));
+      return;
+    }
+    if (!canRemoteNavSearch) {
+      if (navSearchTimerRef.current !== null) {
+        clearTimeout(navSearchTimerRef.current);
+        navSearchTimerRef.current = null;
+      }
+      navSearchRequestIdRef.current = null;
+      return;
+    }
+    if (navSearchComposingRef.current) return;
+    const timer = setTimeout(() => {
+      if (navSearchComposingRef.current || !mountedRef.current) return;
+      const basePath = currentLabelRef.current;
+      const requestId = `fbs-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      navSearchRequestIdRef.current = requestId;
+      navSearchBasePathRef.current = basePath;
+      if (navSearchTimerRef.current !== null) {
+        clearTimeout(navSearchTimerRef.current);
+      }
+      navSearchTimerRef.current = setTimeout(() => {
+        if (navSearchRequestIdRef.current === requestId && mountedRef.current) {
+          navSearchRequestIdRef.current = null;
+          navSearchTimerRef.current = null;
+          setNavSearchState({ status: 'error', results: [], error: tRef.current('file_browser.search_timeout', 'Search timed out') });
+        }
+      }, 5000);
+      setNavSearchState((prev) => ({ status: 'loading', results: prev.results }));
+      if (typeof ws.send === 'function') {
+        Reflect.apply(ws.send, ws, [{
+          type: 'file.search',
+          requestId,
+          query: navSearchQuery,
+          projectDir: basePath,
+          ...(scopedSessionName ? { sessionName: scopedSessionName } : {}),
+        }]);
+      }
+    }, FILE_BROWSER_FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [canRemoteNavSearch, currentLabel, navSearchActive, navSearchCommitNonce, navSearchQuery, scopedSessionName, ws]);
+
+  const navRemoteItems = useMemo(() => {
+    if (!navSearchActive || !canRemoteNavSearch) return [];
+    const base = navSearchBasePathRef.current || currentLabel;
+    const useBackslash = base.includes('\\');
+    const sep = useBackslash ? '\\' : '/';
+    const cleanBase = base.length > 1 && !/^[A-Za-z]:\\$/.test(base)
+      ? base.replace(/[/\\]+$/, '')
+      : base;
+    const out: Array<{
+      id: string;
+      name: string;
+      dirLabel: string;
+      isDir: boolean;
+      hidden: boolean;
+    }> = [];
+    for (const raw of navSearchState.results) {
+      const isDir = raw.endsWith('/');
+      if (!includeFiles && !isDir) continue;
+      const rel = isDir ? raw.slice(0, -1) : raw;
+      if (!rel) continue;
+      const parts = rel.split('/').filter(Boolean);
+      const hidden = parts.some((seg) => seg.startsWith('.'));
+      if (!showHidden && hidden) continue;
+      const name = parts[parts.length - 1] ?? rel;
+      const parentParts = parts.slice(0, -1);
+      const dirLabel = parentParts.length > 0 ? parentParts.join(sep) : '';
+      const relNative = useBackslash ? parts.join('\\') : parts.join('/');
+      const fullPath = cleanBase.endsWith(sep)
+        ? `${cleanBase}${relNative}`
+        : `${cleanBase}${sep}${relNative}`;
+      out.push({ id: fullPath, name, dirLabel, isDir, hidden });
+    }
+    return out;
+  }, [canRemoteNavSearch, currentLabel, includeFiles, navSearchActive, navSearchState.results, showHidden]);
+
+  const navSearchFilterTerms = useMemo(
+    () => (navSearchActive && !canRemoteNavSearch ? parseFileBrowserFilter(navSearchQuery) : []),
+    [canRemoteNavSearch, navSearchActive, navSearchQuery],
+  );
+  const navLocalFallback = useMemo(() => {
+    if (!navSearchActive || canRemoteNavSearch || !rootNode) return null;
+    const { nodes, forceExpanded } = applyFileBrowserView(
+      rootNode.children ?? [],
+      navSearchFilterTerms,
+      effectiveSort,
+      (node) => node.id,
+    );
+    return {
+      data: [{ ...rootNode, children: nodes }] as FsNode[],
+      forceExpanded,
+    };
+  }, [canRemoteNavSearch, effectiveSort, navSearchActive, navSearchFilterTerms, rootNode]);
+  const effectiveTreeData = navLocalFallback ? navLocalFallback.data : viewData;
+  const effectiveExpandedPaths = useMemo(() => {
+    if (!navLocalFallback || navLocalFallback.forceExpanded.size === 0) return expandedPaths;
+    const next = new Set(expandedPaths);
+    for (const id of navLocalFallback.forceExpanded) next.add(id);
+    return next;
+  }, [expandedPaths, navLocalFallback]);
+
+  const treeRows = effectiveTreeData.map((root) => (
     <FsTreeNode
       key={root.id}
       node={root}
       listColumns={listColumns}
-      expandedPaths={expandedPaths}
+      expandedPaths={effectiveExpandedPaths}
       selectedPaths={selectedPaths}
       alreadySet={alreadySet}
       mode={mode}
@@ -2349,6 +2561,69 @@ export function FileBrowser({
       previewPath={previewPath}
     />
   ));
+  const navSearchTreeBody = (() => {
+    if (!navSearchActive || listView) return null;
+    if (!canRemoteNavSearch) {
+      if (navLocalFallback && (navLocalFallback.data[0]?.children?.length ?? 0) === 0) {
+        return <div class="fb-search-status">{t('file_browser.filter_empty', { query: navSearchQuery })}</div>;
+      }
+      return treeRows;
+    }
+    if (navSearchState.status === 'error') {
+      return <div class="fb-search-error" role="alert">{navSearchState.error || t('file_browser.search_error', 'Search failed')}</div>;
+    }
+    if (navSearchState.status === 'loading' && navRemoteItems.length === 0) {
+      return <div class="fb-search-status">{t('file_browser.searching', 'Searching...')}</div>;
+    }
+    if (navSearchState.status === 'done' && navRemoteItems.length === 0) {
+      return <div class="fb-search-status">{t('file_browser.filter_empty', { query: navSearchQuery })}</div>;
+    }
+    return (
+      <div class="fb-search-results" role="list">
+        {navRemoteItems.map((item) => {
+          const isSelected = selectedPaths.has(item.id);
+          const isAlready = alreadySet.has(item.id);
+          const isPreviewing = previewPath === item.id;
+          const gitCode = modifiedFiles.get(item.id);
+          const gitClass = gitCode ? gitStatusClass(gitCode) : null;
+          return (
+            <div
+              key={item.id}
+              role="listitem"
+              class={`fb-node fb-search-item${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isPreviewing ? ' previewing' : ''}${gitClass ? ` git-${gitClass}` : ''}`}
+              title={item.id}
+              onClick={() => {
+                if (item.isDir) {
+                  if (!isMulti) handleSelect(item.id, true);
+                  navigateTo(item.id);
+                  return;
+                }
+                if (!isMulti) handleSelect(item.id, false);
+                if (mode !== 'dir-only') handlePreview(item.id, true);
+              }}
+            >
+              {isMulti && (
+                <input
+                  type="checkbox"
+                  class="fb-node-check"
+                  checked={isSelected}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={() => handleSelect(item.id, item.isDir)}
+                />
+              )}
+              <span class="fb-node-icon">{item.isDir ? '📁' : '📄'}</span>
+              <div class="fb-search-item-text">
+                <span class="fb-node-name">{item.name}</span>
+                {item.dirLabel && <span class="fb-search-item-dir">{item.dirLabel}</span>}
+              </div>
+              {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
+              {isAlready && <span class="fb-node-badge">↑</span>}
+            </div>
+          );
+        })}
+      </div>
+    );
+  })();
   // The table: filter and column controls stay put; the header and the rows scroll together, sideways when the container is
   // narrower than the columns need, and the header stays on top while the rows scroll down.
   const tree = listView ? (
@@ -2378,7 +2653,7 @@ export function FileBrowser({
     </div>
   ) : (
     <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
-      {treeRows}
+      {navSearchTreeBody ?? treeRows}
     </div>
   );
 
@@ -2997,12 +3272,6 @@ export function FileBrowser({
     return [{ label, path: label }];
   }, [currentLabel]);
 
-  // Show drive picker / home button on Windows daemons.
-  // Detected by current path looking like a Windows path or label being the localized "This PC".
-  const thisPcLabel = t('file_browser.this_pc');
-  const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === thisPcLabel;
-  const isAtDrives = currentLabel === thisPcLabel;
-
   // Sentinels, not paths: the daemon resolves each to wherever it really lives
   // on the remote machine (a relocated Downloads, a localized XDG directory).
   const quickAccessTargets = [
@@ -3061,7 +3330,52 @@ export function FileBrowser({
             title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
           >{isAtDrives ? '🏠' : '💾'}</button>
         )}
-        <div class="fb-nav-spacer" />
+        {showNavSearch ? (
+          <div class="fb-nav-search">
+            <input
+              ref={attachNavSearchInputRef}
+              type="text"
+              class="fb-nav-search-input"
+              data-testid="fb-nav-search-input"
+              value={navSearchInput}
+              maxLength={FILE_BROWSER_FILTER_MAX_QUERY_CHARS}
+              placeholder={t('file_browser.filter_placeholder')}
+              aria-label={t('file_browser.filter_label')}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellcheck={false}
+              enterKeyHint="search"
+              onInput={(e) => {
+                if ((e as unknown as InputEvent).isComposing) navSearchComposingRef.current = true;
+                const value = (e.currentTarget as HTMLInputElement).value;
+                setNavSearchInput(value);
+                if (!value) {
+                  clearNavSearch();
+                }
+              }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Escape' && !e.isComposing && navSearchInput) {
+                  e.preventDefault();
+                  clearNavSearch();
+                }
+              }}
+            />
+            {navSearchInput && (
+              <button
+                type="button"
+                class="fb-nav-search-clear"
+                data-testid="fb-nav-search-clear"
+                title={t('file_browser.filter_clear')}
+                aria-label={t('file_browser.filter_clear')}
+                onClick={clearNavSearch}
+              >✕</button>
+            )}
+          </div>
+        ) : (
+          <div class="fb-nav-spacer" />
+        )}
         <button
           class={`fb-nav-btn${error ? ' fb-nav-btn-error' : ''}`}
           title={error || 'Refresh'}
