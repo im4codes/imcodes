@@ -174,7 +174,7 @@ function executionActionSummary(action: CronAction | null, t: (key: string) => s
 
 function fmtTime(ts: number | null): string {
   if (!ts) return '—';
-  return new Date(ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  return new Date(ts).toLocaleString();
 }
 
 function formatDateTimeLocalInput(ts: number | null | undefined): string {
