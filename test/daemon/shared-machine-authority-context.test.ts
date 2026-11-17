@@ -143,11 +143,29 @@ describe('process shared machine authority context', () => {
     bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
     const restarted = { sessionInstanceId: 'instance-2', runtimeEpoch: 'epoch-2' };
     bindProcessSharedMachineActivity(SESSION, restarted, owner, { now: 2_000 });
-    // Restarting with a different sessionInstanceId should be CLOSED (fail closed) if it was previously bound to something else,
-    // or just re-evaluated.
-    // The previous test expected OPEN, but with strict identity invalidation it should probably be CLOSED/new window behaviour.
-    // Let's assert CLOSED to ensure strict security.
-    expect(readProcessSharedMachineAuthority(SESSION, restarted, 2_001)).toEqual(CLOSED);
+    expect(readProcessSharedMachineAuthority(SESSION, restarted, 2_001)).toEqual(OPEN);
+  });
+
+  it('same instance + epoch mismatch (missing participant proof) stays CLOSED', () => {
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok1'), { now: 1_000 });
+      const sameInstanceEpochMismatch = { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-2' };
+      // Owner activity here without proof should be closed because the window is participant bound
+      bindProcessSharedMachineActivity(SESSION, sameInstanceEpochMismatch, owner, { now: 2_000 });
+      expect(readProcessSharedMachineAuthority(SESSION, sameInstanceEpochMismatch, 2_001)).toEqual(CLOSED);
+  });
+
+  it('same instance + participant proof rebinds', () => {
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok1'), { now: 1_000 });
+      const sameInstanceEpochMismatch = { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-2' };
+      bindProcessSharedMachineActivity(SESSION, sameInstanceEpochMismatch, participant('alice', 'tok2'), { now: 2_000 });
+      expect(readProcessSharedMachineAuthority(SESSION, sameInstanceEpochMismatch, 2_001)).toEqual({ required: true, authority: 'tok2' });
+  });
+
+  it('mixed/owner cannot inherit participant authority', () => {
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok1'), { now: 1_000 });
+      // Same identity, but owner activity mixes in
+      bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 2_000 });
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 2_001)).toEqual(CLOSED);
   });
 
   it('ignores an idle signal that is only the tail of the previous turn', () => {

@@ -97,12 +97,18 @@ export function bindProcessSharedMachineActivity(
   // do we allow continuity. Otherwise, restart the window.
   if (window && window.identity && identity && !sameIdentity(window.identity, identity)) {
     const isRestart = window.identity.sessionInstanceId === identity.sessionInstanceId;
-    if (isRestart && activity.kind === SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT && activity.authority) {
-        window.identity = identity;
-        window.authority = activity.authority;
+    if (isRestart) {
+        if (activity.kind === SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT && activity.authority) {
+            window.identity = identity;
+            window.authority = activity.authority;
+        } else {
+            // Same instance, invalid rebind -> refuse to bind to this context.
+            return NO_BINDING;
+        }
     } else {
-        // Identity mismatch and not a valid rebind: refuse to bind to this context.
-        return NO_BINDING;
+        // Different instance -> restart window, treat as a fresh context.
+        windows.delete(sessionName);
+        window = undefined;
     }
   }
   if (window && quietAndIdle(window, now, opts.sessionRunning ?? false)) window = undefined;
