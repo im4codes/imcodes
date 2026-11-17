@@ -252,7 +252,7 @@ const KIMI_PROFILE: AcpCliProviderProfile = {
   },
 };
 
-interface KimiSdkSessionState {
+export interface KimiSdkSessionState {
   routeId: string;
   sessionName?: string;
   projectName?: string;
@@ -419,7 +419,7 @@ export class KimiSdkProvider implements TransportProvider {
 
   protected readonly profile: AcpCliProviderProfile;
 
-  private config: ProviderConfig | null = null;
+  protected config: ProviderConfig | null = null;
   private sessions = new Map<string, KimiSdkSessionState>();
   /** Reverse lookup so `sessionUpdate` notifications can find the right state
    *  by ACP sessionId (which we only learn after newSession/loadSession). */
@@ -535,8 +535,19 @@ export class KimiSdkProvider implements TransportProvider {
     return Boolean(state.incognito || this.profile.perSessionTransport);
   }
 
-  private connectionForState(state: KimiSdkSessionState): ClientSideConnection | null {
+  protected connectionForState(state: KimiSdkSessionState): ClientSideConnection | null {
     return this.usesIsolatedTransport(state) ? (state.isolatedTransport?.connection ?? null) : this.connection;
+  }
+
+  protected isSessionConnectionCurrent(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    connection: ClientSideConnection,
+  ): boolean {
+    return this.sessions.get(sessionId) === state
+      && !state.cancelled
+      && !this.isDisconnecting
+      && this.connectionForState(state) === connection;
   }
 
   private initPromiseForState(state: KimiSdkSessionState): Promise<void> | null {
@@ -2767,7 +2778,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  private async resumeOrLoadAcpSession(
+  protected async resumeOrLoadAcpSession(
     sessionId: string,
     state: KimiSdkSessionState,
     connection: ClientSideConnection,

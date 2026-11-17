@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import type { ClientSideConnection } from '@agentclientprotocol/sdk';
 import type {
   ProviderConfig, ProviderDelegationNotification, ProviderModelList, SessionConfig, TransportProvider,
 } from '../transport-provider.js';
@@ -14,8 +15,14 @@ import {
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 import { execFileOffMain } from '../../util/exec-helper.js';
 import logger from '../../util/logger.js';
+import {
+  agyConversationDbPath,
+  isValidAgyConversationId,
+  recoverAgyConversationDbIfCorrupt,
+} from '../agy-db-recovery.js';
+import { resolveAgySourceHome } from '../agy-incognito-isolation.js';
 import { AgySdkProvider, resolveAgyBinary } from './agy-sdk.js';
-import { KimiSdkProvider, type AcpCliProviderProfile } from './kimi-sdk.js';
+import { KimiSdkProvider, type AcpCliProviderProfile, type KimiSdkSessionState } from './kimi-sdk.js';
 
 const PROFILE: AcpCliProviderProfile = {
   id: AGY_SDK_PROVIDER_ID,
@@ -147,6 +154,66 @@ export class AgyAcpProvider extends KimiSdkProvider {
 
   notifyActiveDelegation(sessionId: string, notification: ProviderDelegationNotification): Promise<AgentDelegationNotificationResult> {
     return this.queueActiveAcpPrompt(sessionId, notification);
+  }
+
+  protected override async resumeOrLoadAcpSession(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    connection: ClientSideConnection,
+    metaSystemText?: string,
+  ): Promise<void> {
+    try {
+      await super.resumeOrLoadAcpSession(sessionId, state, connection, metaSystemText);
+      return;
+    } catch (error) {
+      if (
+        !this.profile.resumeWithoutReplay
+        || state.incognito
+        || state.cancelled
+        || typeof state.acpSessionId !== 'string'
+        || !isValidAgyConversationId(state.acpSessionId)
+        || !this.isSessionConnectionCurrent(sessionId, state, connection)
+      ) {
+        throw error;
+      }
+
+      const home = resolveAgySourceHome(
+        state.env,
+        this.config?.env as Record<string, string> | undefined,
+      );
+      const dbPath = agyConversationDbPath(home, state.acpSessionId);
+      if (!dbPath) throw error;
+
+      const recovery = await recoverAgyConversationDbIfCorrupt(dbPath);
+      if (!recovery.recovered) {
+        if (recovery.reason !== 'healthy' && recovery.reason !== 'missing') {
+          logger.warn(
+            {
+              provider: this.id,
+              sessionId,
+              acpSessionId: state.acpSessionId,
+              recoveryReason: recovery.reason,
+            },
+            'Antigravity conversation DB self-heal did not recover database',
+          );
+        }
+        throw error;
+      }
+
+      logger.info(
+        {
+          provider: this.id,
+          sessionId,
+          acpSessionId: state.acpSessionId,
+        },
+        'Recovered corrupt Antigravity conversation DB; retrying session/resume once',
+      );
+
+      if (!this.isSessionConnectionCurrent(sessionId, state, connection)) {
+        throw error;
+      }
+      await super.resumeOrLoadAcpSession(sessionId, state, connection, metaSystemText);
+    }
   }
 }
 
