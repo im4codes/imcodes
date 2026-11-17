@@ -8,6 +8,7 @@ import { createPortal } from 'preact/compat';
 import { useEffect, useRef } from 'preact/hooks';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
+import { clearAllSupervisionTaskConsoleCaches } from '../src/supervision-task-console-cache.js';
 import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
 import {
   SUBSESSION_DESKTOP_DOCK_SIDE,
@@ -9255,11 +9256,20 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     ];
     useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
 
+    clearAllSupervisionTaskConsoleCaches();
+
     try {
       const { App } = await importApp();
       render(<App />);
       const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
       await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Wait for SupervisionTaskPairSnapshotBridge to settle its initial disconnected/unavailable
+      // publication before injecting the test's synthetic snapshot; under slow CI coverage load
+      // that effect can otherwise run after line assignment and overwrite __imcodesTaskPairSnapshot.
+      await waitFor(() => {
+        expect((window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot?.authorityUnavailable).toBe(true);
+      });
 
       const snapshot = {
         authoritative: true,
@@ -9332,9 +9342,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
       });
     } finally {
+      clearAllSupervisionTaskConsoleCaches();
       delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
     }
-  });
+  }, 15000);
 
   it('blocks tab-switching shortcuts when terminal subwindow header chrome has focus, while preserving chat subwindow navigation', async () => {
     useSubSessionsState.subSessions = [

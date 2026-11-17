@@ -2692,10 +2692,15 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       rafRetryCountRef.current = 0;
       resizeObserverPassCountRef.current = 0;
     }
+    const isDocumentHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
     // Hidden/collapsed panes report 0px row rects, which commitMeasuredRows would
-    // clamp to 1px and poison cached heights when returning from background.
-    if (clientHeight <= 0) {
-      lastCommitClientHeightRef.current = clientHeight;
+    // clamp to 1px and poison already-measured heights when returning from background.
+    // Still allow the very first unmeasured commit when visible so an initial layout
+    // establishes its baseline signature before any non-rendered update arrives.
+    if (isDocumentHidden || (clientHeight <= 0 && (lastCommitClientHeightRef.current > 0 || heightsRef.current.size > 0))) {
+      if (clientHeight <= 0) {
+        lastCommitClientHeightRef.current = clientHeight;
+      }
       return;
     }
     const wasAtBottom = wasAtBottomRef.current;
