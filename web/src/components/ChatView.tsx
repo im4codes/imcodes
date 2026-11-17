@@ -2638,11 +2638,14 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // that frame showed a 15-42px gap/reverse jump.
   const lastCommitSignatureRef = useRef('');
   const lastExternalSignatureRef = useRef('');
+  const lastExternalItemsRef = useRef<ViewItem[] | null>(null);
   const lastCommitClientHeightRef = useRef(0);
   const syncLayoutPassCountRef = useRef(0);
   const rafRetryCountRef = useRef(0);
+  const resizeObserverPassCountRef = useRef(0);
   const pendingLayoutRafRef = useRef<number | null>(null);
   const MAX_VIRTUAL_LAYOUT_RAF_RETRIES = 2;
+  const MAX_VIRTUAL_RESIZE_OBSERVER_PASSES = 6;
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const observedNodesRef = useRef<Set<HTMLElement>>(new Set());
   const latestLayoutHandlersRef = useRef({
@@ -2669,7 +2672,9 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     if (!enabled) {
       syncLayoutPassCountRef.current = 0;
       rafRetryCountRef.current = 0;
+      resizeObserverPassCountRef.current = 0;
       lastExternalSignatureRef.current = '';
+      lastExternalItemsRef.current = null;
       if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(pendingLayoutRafRef.current);
         pendingLayoutRafRef.current = null;
@@ -2680,10 +2685,18 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     if (!root) return;
     const clientHeight = root.clientHeight;
     const externalSignature = `${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}:${clientHeight}:${resetKey ?? ''}:${resumeGeneration}:${revealKey ?? ''}`;
-    if (externalSignature !== lastExternalSignatureRef.current) {
+    if (externalSignature !== lastExternalSignatureRef.current || items !== lastExternalItemsRef.current) {
       lastExternalSignatureRef.current = externalSignature;
+      lastExternalItemsRef.current = items;
       syncLayoutPassCountRef.current = 0;
       rafRetryCountRef.current = 0;
+      resizeObserverPassCountRef.current = 0;
+    }
+    // Hidden/collapsed panes report 0px row rects, which commitMeasuredRows would
+    // clamp to 1px and poison cached heights when returning from background.
+    if (clientHeight <= 0) {
+      lastCommitClientHeightRef.current = clientHeight;
+      return;
     }
     const wasAtBottom = wasAtBottomRef.current;
     const changed = commitMeasuredRows(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
@@ -2738,6 +2751,12 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     const observed = observedNodesRef.current;
     observed.clear();
     const observer = new ResizeObserver((entries) => {
+      if (root.clientHeight <= 0) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      // Bound ResizeObserver-driven re-layout per external signature/items epoch so
+      // oscillating row heights (CSS zoom, subpixel rounding, scrollbar toggles)
+      // after background resume settle instead of spinning layoutVersion forever.
+      if (resizeObserverPassCountRef.current >= MAX_VIRTUAL_RESIZE_OBSERVER_PASSES) return;
       const { commitMeasuredRows: commitRows, captureViewportAnchor: captureAnchor, onMeasuredLayout: handleMeasured } =
         latestLayoutHandlersRef.current;
       const wasAtBottom = wasAtBottomRef.current;
@@ -2748,6 +2767,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       // the measurement. That used to classify a pinned stream as a reader
       // anchor, then fight ChatView's follow pass on the next frame.
       if (!changed) return;
+      resizeObserverPassCountRef.current += 1;
       handleMeasured?.(root, wasAtBottom);
       scrollTopRef.current = root.scrollTop;
       captureAnchor();

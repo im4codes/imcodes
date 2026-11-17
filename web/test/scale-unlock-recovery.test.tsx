@@ -414,5 +414,288 @@ describe('scale & desktop unlock recovery', () => {
       rectSpy.mockRestore();
       delete (HTMLElement.prototype as any).clientHeight;
     });
+
+    it('bounds active ResizeObserver oscillation after visibilitychange resume and replenishes on item/viewport changes', async () => {
+      const observersByTarget = new Map<HTMLElement, { cb: ResizeObserverCallback; observer: ResizeObserver }>();
+      const observedTargets = new Set<HTMLElement>();
+
+      class ActiveResizeObserver {
+        cb: ResizeObserverCallback;
+        observe = vi.fn((target: Element) => {
+          const el = target as HTMLElement;
+          if (el.dataset?.virtualKey) {
+            observedTargets.add(el);
+            observersByTarget.set(el, { cb: this.cb, observer: this as unknown as ResizeObserver });
+          }
+        });
+        unobserve = vi.fn((target: Element) => {
+          const el = target as HTMLElement;
+          observedTargets.delete(el);
+          observersByTarget.delete(el);
+        });
+        disconnect = vi.fn(() => {
+          for (const [el, entry] of observersByTarget.entries()) {
+            if (entry.observer === (this as unknown as ResizeObserver)) {
+              observersByTarget.delete(el);
+              observedTargets.delete(el);
+            }
+          }
+        });
+        constructor(cb: ResizeObserverCallback) {
+          this.cb = cb;
+        }
+      }
+      vi.stubGlobal('ResizeObserver', ActiveResizeObserver);
+
+      let currentClientHeight = 600;
+      let firstKey: string | null = null;
+      let targetKey: string | null = null;
+      let currentTargetHeight = 42;
+      let totalTargetRectReads = 0;
+
+      const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+        const vk = this?.dataset?.virtualKey;
+        if (vk) {
+          if (!firstKey) firstKey = vk;
+          else if (!targetKey && vk !== firstKey) targetKey = vk;
+          if (vk === targetKey) {
+            totalTargetRectReads += 1;
+            return { top: 0, bottom: currentTargetHeight, height: currentTargetHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+          }
+          return { top: 0, bottom: 42, height: 42, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+        }
+        return { top: 0, bottom: currentClientHeight, height: currentClientHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+      });
+      Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => currentClientHeight });
+
+      const rafQueue: FrameRequestCallback[] = [];
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        rafQueue.push(cb);
+        return rafQueue.length;
+      });
+      vi.stubGlobal('cancelAnimationFrame', vi.fn());
+
+      let visibilityState: DocumentVisibilityState = 'visible';
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => visibilityState,
+      });
+
+      const makeEvents = (count: number, lastText?: string) => Array.from({ length: count }, (_, i) => ({
+        eventId: `ev-${i}`,
+        type: 'user.message',
+        sessionId: 'desk-main',
+        ts: 1000 + i,
+        epoch: 1,
+        seq: i + 1,
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: i === count - 1 && lastText ? lastText : `message ${i}` },
+      })) as any[];
+
+      let nowMs = 10_000;
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+
+      const view = render(<ChatView events={makeEvents(40)} loading={false} sessionId="desk-main" visible={true} />);
+      while (rafQueue.length > 0) {
+        const cb = rafQueue.shift()!;
+        await act(async () => { cb(16); });
+      }
+
+      // Background -> foreground resume
+      visibilityState = 'hidden';
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      nowMs += 5_000;
+      visibilityState = 'visible';
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      while (rafQueue.length > 0) {
+        const cb = rafQueue.shift()!;
+        await act(async () => { cb(32); });
+      }
+
+      expect(observedTargets.size).toBeGreaterThan(0);
+      const targetEl = Array.from(observedTargets).find((el) => el.dataset.virtualKey === targetKey)
+        ?? Array.from(observedTargets)[0]!;
+      const getVirtualObserver = () => observersByTarget.get(targetEl)!;
+      expect(getVirtualObserver()).toBeTruthy();
+
+      // Simulate an active browser ResizeObserver delivering 1px/zoom-like oscillating row
+      // heights across 40 consecutive layout deliveries on the resumed pane.
+      // Only a bounded prefix should trigger re-layout/re-reads; after budget exhaustion it must settle.
+      let reMeasureCycles = 0;
+      for (let i = 0; i < 40; i += 1) {
+        currentTargetHeight = i % 2 === 0 ? 56 : 42;
+        const readsBefore = totalTargetRectReads;
+        await act(async () => {
+          const { cb, observer } = getVirtualObserver();
+          cb([{ target: targetEl } as unknown as ResizeObserverEntry], observer);
+        });
+        while (rafQueue.length > 0) {
+          const cb = rafQueue.shift()!;
+          await act(async () => { cb((i + 3) * 16); });
+        }
+        if (totalTargetRectReads > readsBefore) {
+          reMeasureCycles += 1;
+        }
+      }
+
+      expect(reMeasureCycles).toBeGreaterThan(0);
+      expect(reMeasureCycles).toBeLessThanOrEqual(8);
+
+      // Genuine item update (streaming text on same count/last key) replenishes ResizeObserver budget.
+      currentTargetHeight = 72;
+      const readsBeforeStream = totalTargetRectReads;
+      await act(async () => {
+        view.rerender(<ChatView events={makeEvents(40, 'streamed update')} loading={false} sessionId="desk-main" visible={true} />);
+      });
+      currentTargetHeight = 84;
+      await act(async () => {
+        const { cb, observer } = getVirtualObserver();
+        cb([{ target: targetEl } as unknown as ResizeObserverEntry], observer);
+      });
+      expect(totalTargetRectReads).toBeGreaterThan(readsBeforeStream);
+
+      // Genuine viewport height change also replenishes ResizeObserver budget.
+      for (let i = 0; i < 10; i += 1) {
+        currentTargetHeight = i % 2 === 0 ? 50 : 64;
+        await act(async () => {
+          const { cb, observer } = getVirtualObserver();
+          cb([{ target: targetEl } as unknown as ResizeObserverEntry], observer);
+        });
+      }
+      currentClientHeight = 720;
+      await act(async () => {
+        view.rerender(<ChatView events={makeEvents(41)} loading={false} sessionId="desk-main" visible={true} />);
+      });
+      const readsBeforeViewportRo = totalTargetRectReads;
+      currentTargetHeight = 96;
+      await act(async () => {
+        const { cb, observer } = getVirtualObserver();
+        cb([{ target: targetEl } as unknown as ResizeObserverEntry], observer);
+      });
+      expect(totalTargetRectReads).toBeGreaterThan(readsBeforeViewportRo);
+
+      nowSpy.mockRestore();
+      rectSpy.mockRestore();
+      delete (HTMLElement.prototype as any).clientHeight;
+      delete (document as any).visibilityState;
+    });
+
+    it('ignores ResizeObserver deliveries while hidden or collapsed (clientHeight === 0) and resumes measurement once visible', async () => {
+      const observersByTarget = new Map<HTMLElement, { cb: ResizeObserverCallback; observer: ResizeObserver }>();
+      const observedTargets = new Set<HTMLElement>();
+
+      class ActiveResizeObserver {
+        cb: ResizeObserverCallback;
+        observe = vi.fn((target: Element) => {
+          const el = target as HTMLElement;
+          if (el.dataset?.virtualKey) {
+            observedTargets.add(el);
+            observersByTarget.set(el, { cb: this.cb, observer: this as unknown as ResizeObserver });
+          }
+        });
+        unobserve = vi.fn((target: Element) => {
+          const el = target as HTMLElement;
+          observedTargets.delete(el);
+          observersByTarget.delete(el);
+        });
+        disconnect = vi.fn(() => {
+          for (const [el, entry] of observersByTarget.entries()) {
+            if (entry.observer === (this as unknown as ResizeObserver)) {
+              observersByTarget.delete(el);
+              observedTargets.delete(el);
+            }
+          }
+        });
+        constructor(cb: ResizeObserverCallback) {
+          this.cb = cb;
+        }
+      }
+      vi.stubGlobal('ResizeObserver', ActiveResizeObserver);
+
+      let currentClientHeight = 600;
+      let firstKey: string | null = null;
+      let targetKey: string | null = null;
+      let currentTargetHeight = 42;
+      let totalTargetRectReads = 0;
+
+      const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+        const vk = this?.dataset?.virtualKey;
+        if (vk) {
+          if (!firstKey) firstKey = vk;
+          else if (!targetKey && vk !== firstKey) targetKey = vk;
+          if (vk === targetKey) {
+            totalTargetRectReads += 1;
+            return { top: 0, bottom: currentTargetHeight, height: currentTargetHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+          }
+          return { top: 0, bottom: 42, height: 42, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+        }
+        return { top: 0, bottom: currentClientHeight, height: currentClientHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+      });
+      Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => currentClientHeight });
+
+      let visibilityState: DocumentVisibilityState = 'visible';
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => visibilityState,
+      });
+
+      const makeEvents = (count: number) => Array.from({ length: count }, (_, i) => ({
+        eventId: `ev-col-${i}`,
+        type: 'user.message',
+        sessionId: 'desk-main',
+        ts: 2000 + i,
+        epoch: 1,
+        seq: i + 1,
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `message ${i}` },
+      })) as any[];
+
+      const view = render(<ChatView events={makeEvents(40)} loading={false} sessionId="desk-main" visible={true} />);
+      const targetEl = Array.from(observedTargets).find((el) => el.dataset.virtualKey === targetKey)
+        ?? Array.from(observedTargets)[0]!;
+      const getVirtualObserver = () => observersByTarget.get(targetEl)!;
+      expect(getVirtualObserver()).toBeTruthy();
+
+      // While hidden (visibilityState === 'hidden' or clientHeight === 0), ResizeObserver must not measure 0->1px.
+      visibilityState = 'hidden';
+      currentClientHeight = 0;
+      currentTargetHeight = 0;
+      const readsWhileHiddenStart = totalTargetRectReads;
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        const { cb, observer } = getVirtualObserver();
+        cb([{ target: targetEl } as unknown as ResizeObserverEntry], observer);
+      });
+      expect(totalTargetRectReads).toBe(readsWhileHiddenStart);
+
+      // Rapid visibilitychange + persisted pageshow coalesce and restore normal measurement cleanly.
+      visibilityState = 'visible';
+      currentClientHeight = 600;
+      currentTargetHeight = 64;
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        const pageshow = new Event('pageshow') as PageTransitionEvent;
+        Object.defineProperty(pageshow, 'persisted', { value: true });
+        window.dispatchEvent(pageshow);
+        view.rerender(<ChatView events={makeEvents(40)} loading={false} sessionId="desk-main" visible={true} />);
+      });
+      const readsBeforeVisibleRo = totalTargetRectReads;
+      currentTargetHeight = 90;
+      await act(async () => {
+        const { cb, observer } = getVirtualObserver();
+        cb([{ target: targetEl } as unknown as ResizeObserverEntry], observer);
+      });
+      expect(totalTargetRectReads).toBeGreaterThan(readsBeforeVisibleRo);
+
+      rectSpy.mockRestore();
+      delete (HTMLElement.prototype as any).clientHeight;
+      delete (document as any).visibilityState;
+    });
   });
 });
