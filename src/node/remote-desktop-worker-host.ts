@@ -735,6 +735,9 @@ export class RemoteDesktopWorkerHost {
       sent = await this.writeToWorker(replacement, command);
     }
     if (!sent) {
+      if (command.type === REMOTE_DESKTOP_MSG.STOP || command.type === REMOTE_DESKTOP_MSG.CANCEL) {
+        this.untrack(command.sessionId, command.type === REMOTE_DESKTOP_MSG.STOP ? 'controller_stop' : 'controller_cancel');
+      }
       return true;
     }
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
