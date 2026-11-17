@@ -1,3 +1,9 @@
+import {
+  BindCoordinator,
+  type BindCoordinatorDeps,
+  type CookiesChangeEventLike,
+  type LaunchAgentIssue,
+} from './bind.js';
 import { buildAppMenuTemplate, type MenuItemOptionsLike } from './menu.js';
 import {
   attachWindowSecurityGuards,
@@ -21,6 +27,7 @@ export interface ShellWindowLike extends TrustedWindowLike {
   on(event: 'closed', listener: () => void): unknown;
   webContents: TrustedWindowLike['webContents'] & SecurityWebContentsLike & {
     session: SecuritySessionLike & {
+      cookies?: CookiesChangeEventLike;
       clearStorageData?(options?: { origin?: string }): Promise<void>;
     };
     on(event: 'did-navigate', listener: () => void): unknown;
@@ -47,7 +54,7 @@ export interface PcAppShellDeps {
   openExternal: (url: string) => Promise<void> | void;
   showSaveDialogSync: (win: ShellWindowLike, defaultPath: string) => string | undefined;
   showMessageBox: (win: ShellWindowLike, options: {
-    type: 'info' | 'question' | 'warning';
+    type: 'info' | 'question' | 'warning' | 'error';
     title: string;
     message: string;
     detail?: string;
@@ -55,20 +62,34 @@ export interface PcAppShellDeps {
     defaultId?: number;
     cancelId?: number;
   }) => Promise<{ response: number }>;
+  showNotification?: (options: { title: string; body: string }) => void;
   promptAddServer?: () => Promise<ServerPromptInput | null>;
   onBindFallback?: (trustedOrigin: string | null) => Promise<void> | void;
+  bindDeps?: Partial<
+    Omit<
+      BindCoordinatorDeps,
+      | 'platform'
+      | 'getCurrentTrustedOrigin'
+      | 'onDidNavigateTrustedOrigin'
+      | 'showMessageBox'
+      | 'showNotification'
+      | 'onStateChanged'
+    >
+  >;
   externalDocsHosts?: readonly string[];
 }
 
 export interface PcAppShellInstance {
   store: ServerStore;
   controller: TrustedOriginController;
+  bind: BindCoordinator;
   getWindow: () => ShellWindowLike | null;
   ensureWindow: () => Promise<ShellWindowLike>;
   addAndSelectServer: (rawUrl: string, label?: string) => Promise<string>;
   selectServer: (origin: string) => Promise<string>;
   removeServer: (origin: string) => Promise<boolean>;
   rebuildMenu: () => void;
+  checkLaunchAgent: () => Promise<LaunchAgentIssue>;
 }
 
 /**
@@ -79,6 +100,18 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
   const store = new ServerStore(deps.userDataDir);
   let mainWindow: ShellWindowLike | null = null;
   const controller = new TrustedOriginController(store, () => mainWindow);
+  const bind = new BindCoordinator({
+    ...(deps.bindDeps ?? {}),
+    platform: deps.platform,
+    getCurrentTrustedOrigin: () => controller.currentTrustedOrigin(),
+    onDidNavigateTrustedOrigin: (listener) => controller.onDidNavigateTrustedOrigin(listener),
+    showMessageBox: async (options) => {
+      const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : await ensureWindow();
+      return deps.showMessageBox(win, options);
+    },
+    showNotification: deps.showNotification ?? (() => {}),
+    onStateChanged: () => rebuildMenu(),
+  });
 
   const openDocsSafely = (url: string) => {
     if (isAllowedExternalUrl(url, deps.externalDocsHosts)) {
@@ -151,21 +184,14 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       await deps.onBindFallback(origin);
       return;
     }
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      await deps.showMessageBox(mainWindow, {
-        type: 'info',
-        title: 'Bind This Machine',
-        message: origin
-          ? `Ready to bind ${origin} in Phase B.`
-          : 'Select a saved server first before binding this machine.',
-        buttons: ['OK'],
-        defaultId: 0,
-      });
-    }
+    await bind.triggerManualBind();
   };
 
   const handleClearSession = async () => {
     const origin = controller.currentTrustedOrigin();
+    if (origin) {
+      bind.clearAskedState(origin);
+    }
     await controller.clearSession(origin ?? undefined);
     if (origin && mainWindow && !mainWindow.isDestroyed()) {
       await mainWindow.loadURL(origin);
@@ -178,6 +204,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       appName: deps.appName,
       servers: store.list(),
       activeOrigin: controller.getActiveOrigin(),
+      boundServer: bind.getBoundSummary(),
       onSelectServer: (origin) => void handleSelectServer(origin),
       onAddServer: () => void handleAddServer(),
       onRemoveServer: (origin) => void handleRemoveServer(origin),
@@ -236,6 +263,10 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       controller.notifyDidNavigate();
     });
 
+    if (win.webContents.session.cookies) {
+      bind.attachCookies(win.webContents.session.cookies);
+    }
+
     win.on('closed', () => {
       if (mainWindow === win) {
         mainWindow = null;
@@ -251,6 +282,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
   return {
     store,
     controller,
+    bind,
     getWindow: () => mainWindow,
     ensureWindow,
     addAndSelectServer: async (rawUrl, label) => {
@@ -267,5 +299,6 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       return removed;
     },
     rebuildMenu,
+    checkLaunchAgent: () => bind.checkLaunchAgentOnStartup(),
   };
 }
