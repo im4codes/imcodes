@@ -1091,9 +1091,10 @@ vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
 }));
 vi.mock('../src/components/RemoteDesktopWall.js', () => ({
   REMOTE_DESKTOP_WALL_WINDOW_ID: 'remote-desktop-wall',
-  RemoteDesktopWall: ({ zIndex, onFocus, onClose, onConnectById }: any) => (
+  RemoteDesktopWall: ({ minimized, zIndex, onFocus, onClose, onConnectById }: any) => (
     <div data-testid="remote-desktop-wall" style={{ zIndex }} onMouseDown={onFocus}>
       remote-desktop-wall
+      <span>remote-desktop-wall-minimized:{String(Boolean(minimized))}</span>
       <button onClick={() => onConnectById?.()}>remote-desktop-wall-connect-by-id</button>
       <button onClick={() => onClose?.([])}>remote-desktop-wall-close</button>
     </div>
@@ -9040,12 +9041,21 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(document.activeElement).toBe(reopenedSub2Input);
       });
 
-      // Blocking guards: IME composing / xterm must NOT fire Ctrl+0
+      // Blocking guards: IME composing / active shortcut recording must NOT fire Ctrl+0
       const imeEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, isComposing: true, bubbles: true, cancelable: true });
       window.dispatchEvent(imeEvt);
       expect(imeEvt.defaultPrevented).toBe(false);
       expect(screen.getByTestId('sub-session-window-sub-quick-1')).toBeTruthy();
 
+      const recorder = document.createElement('button');
+      recorder.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorder);
+      const recEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      recorder.dispatchEvent(recEvt);
+      expect(recEvt.defaultPrevented).toBe(false);
+      recorder.remove();
+
+      // Ctrl+0 inside .xterm-helper-textarea DOES trigger return-to-main-window and minimizes open sub-sessions
       const xterm = document.createElement('div');
       xterm.className = 'xterm';
       const xtermArea = document.createElement('textarea');
@@ -9055,11 +9065,22 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       xtermArea.focus();
       const termEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
       xtermArea.dispatchEvent(termEvt);
-      expect(termEvt.defaultPrevented).toBe(false);
+      expect(termEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+      });
       xterm.remove();
 
+      // Re-open sub-quick-1 and sub-quick-2 before testing Ctrl+0 from sub-session composer
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('true'));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
+      const sub2Reopened = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true'));
+
       // Ctrl+0 closes all open sub-session windows and prevents default
-      sub2Input.focus();
+      sub2Reopened.focus();
       const closeAllEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
       sub2Input.dispatchEvent(closeAllEvt);
       expect(closeAllEvt.defaultPrevented).toBe(true);
@@ -9115,6 +9136,112 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       });
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('triggers subSessionCloseAll in Remote Desktop (windowed & fullscreen), Remote Desktop Wall, and floating panel inputs, minimizing supported windows and closing overlays while keeping nav shortcuts blocked', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      { id: 'sub-rd-1', sessionName: 'deck_sub_rd_1', parentSession: 'deck_alpha_brain', label: 'RD1', description: '', cwd: '/work/alpha', type: 'claude-code', runtimeType: 'transport', state: 'idle', serverId: 'srv-1' },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const originalPlatform = navigator.platform;
+    const origFsEl = Object.getOwnPropertyDescriptor(document, 'fullscreenElement');
+    const origExitFs = Object.getOwnPropertyDescriptor(document, 'exitFullscreen');
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Linux x86_64' });
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+      const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(mainInput));
+
+      // Open sub-session, ControlledNodes -> RemoteDesktopWorkspace + RemoteDesktopWall, and CloudDocs
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-rd-1').getAttribute('data-visible')).toBe('true'));
+
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+      fireEvent.click(screen.getByText('controlled-nodes-panel'));
+      const rdWorkspace = await screen.findByTestId('remote-desktop-workspace');
+      expect(screen.getByText('remote-desktop-minimized:false')).toBeTruthy();
+
+      fireEvent.click(screen.getByText('controlled-nodes-wall'));
+      expect(await screen.findByTestId('remote-desktop-wall')).toBeTruthy();
+      expect(screen.getByText('remote-desktop-wall-minimized:false')).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId('desktop-cloud-docs-btn'));
+      expect(await screen.findByTestId('floating-panel-cloud-docs')).toBeTruthy();
+
+      // Inside Remote Desktop surface / fullscreen: Alt+k and Ctrl+1 remain blocked, while Ctrl+0 exits fullscreen, minimizes RD + Wall + sub-sessions, and closes CloudDocs + ControlledNodes
+      const rdSurface = document.createElement('canvas');
+      rdSurface.className = 'remote-desktop-canvas';
+      rdSurface.setAttribute('data-remote-desktop-surface', 'true');
+      rdSurface.tabIndex = 0;
+      rdWorkspace.appendChild(rdSurface);
+      rdSurface.focus();
+
+      const exitFullscreen = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: rdWorkspace });
+      Object.defineProperty(document, 'exitFullscreen', { configurable: true, value: exitFullscreen });
+
+      const navInRdEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(navInRdEvt);
+      expect(navInRdEvt.defaultPrevented).toBe(false);
+
+      const quickSubInRdEvt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(quickSubInRdEvt);
+      expect(quickSubInRdEvt.defaultPrevented).toBe(false);
+
+      const ctrl0InFullscreenRd = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(ctrl0InFullscreenRd);
+      expect(ctrl0InFullscreenRd.defaultPrevented).toBe(true);
+      expect(exitFullscreen).toHaveBeenCalledTimes(1);
+
+      await waitFor(() => {
+        expect(screen.getByText('remote-desktop-minimized:true')).toBeTruthy();
+        expect(screen.getByText('remote-desktop-wall-minimized:true')).toBeTruthy();
+        expect(screen.getByTestId('sub-session-window-sub-rd-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        expect(screen.queryByTestId('floating-panel-cloud-docs')).toBeNull();
+        expect(document.activeElement).toBe(mainInput);
+      });
+
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: null });
+      rdSurface.remove();
+
+      // Customize subSessionCloseAll to Alt+Shift+x -> works inside a panel <input> too, while plain Ctrl+0 is ignored
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-close-all-alt-shift-x'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      fireEvent.click(screen.getByTestId('desktop-cloud-docs-btn'));
+      const cloudDocsReopened = await screen.findByTestId('floating-panel-cloud-docs');
+      const panelInput = document.createElement('input');
+      cloudDocsReopened.appendChild(panelInput);
+      panelInput.focus();
+
+      const plainCtrl0 = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      panelInput.dispatchEvent(plainCtrl0);
+      expect(plainCtrl0.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('floating-panel-cloud-docs')).toBeTruthy();
+
+      const customEvt = new KeyboardEvent('keydown', { key: 'X', code: 'KeyX', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      panelInput.dispatchEvent(customEvt);
+      expect(customEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.queryByTestId('floating-panel-cloud-docs')).toBeNull();
+        expect(document.activeElement).toBe(mainInput);
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+      if (origFsEl) Object.defineProperty(document, 'fullscreenElement', origFsEl);
+      else delete (document as { fullscreenElement?: Element | null }).fullscreenElement;
+      if (origExitFs) Object.defineProperty(document, 'exitFullscreen', origExitFs);
+      else delete (document as { exitFullscreen?: () => Promise<void> }).exitFullscreen;
     }
   }, 15000);
 

@@ -2360,8 +2360,8 @@
           "desc": "Cambiar a la pestaña de sesión a la derecha"
         },
         "subsession_close_all": {
-          "title": "Cerrar todas las subsesiones",
-          "desc": "Minimizar todas las ventanas de subsesión abiertas"
+          "title": "Volver a la ventana principal",
+          "desc": "Minimiza las ventanas abiertas que admiten minimizar (subsesiones, Escritorio remoto, Muro de escritorios) y cierra otras superposiciones flotantes"
         }
       },
       "subsession_quick": {

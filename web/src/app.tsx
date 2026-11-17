@@ -104,6 +104,7 @@ import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
   canHandleGlobalNavigationShortcut,
+  canHandleReturnToMainWindowShortcut,
   cycleOrderedId,
   formatShortcutKeycaps,
   hasDomBlockingOverlay,
@@ -7899,6 +7900,52 @@ function InternalMainApp() {
   minimizeSubSessionWindowRef.current = minimizeSubSessionWindow;
   const closeAllSubSessionWindowsRef = useRef(closeAllSubSessionWindows);
   closeAllSubSessionWindowsRef.current = closeAllSubSessionWindows;
+  const remoteDesktopWorkspaceOpenRef = useRef(remoteDesktopWorkspace.open);
+  remoteDesktopWorkspaceOpenRef.current = remoteDesktopWorkspace.open;
+  const remoteDesktopWorkspaceMinimizedRef = useRef(remoteDesktopWorkspaceMinimized);
+  remoteDesktopWorkspaceMinimizedRef.current = remoteDesktopWorkspaceMinimized;
+  const remoteDesktopWallOpenRef = useRef(remoteDesktopWallOpen);
+  remoteDesktopWallOpenRef.current = remoteDesktopWallOpen;
+  const remoteDesktopWallMinimizedRef = useRef(remoteDesktopWallMinimized);
+  remoteDesktopWallMinimizedRef.current = remoteDesktopWallMinimized;
+  const returnToMainWindow = useCallback(() => {
+    if (isMobileRef.current) return;
+    if (typeof document !== 'undefined' && document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+      void document.exitFullscreen().catch(() => {});
+    }
+    closeAllSubSessionWindowsRef.current();
+    if (remoteDesktopWorkspaceOpenRef.current && !remoteDesktopWorkspaceMinimizedRef.current) {
+      setRemoteDesktopWorkspaceMinimized(true);
+    }
+    if (remoteDesktopWallOpenRef.current && !remoteDesktopWallMinimizedRef.current) {
+      setRemoteDesktopWallMinimized(true);
+    }
+    setShowDesktopFileBrowser(false);
+    setShowDesktopLocalWebPreview(false);
+    setShowDiscussionsPage(false);
+    setDiscussionInitialId(null);
+    setDiscussionInitialTab('team');
+    setShowRepoPage(false);
+    setPreviewFileRequest(null);
+    setShowCronManager(false);
+    setShowSharedContextManagement(false);
+    setShowControlledNodes(false);
+    setShowCloudDocs(false);
+    setShowSharedContextDiagnostics(false);
+    setShowSettingsPage(false);
+    setShowUsageSummaryPage(false);
+    setShowAdminPage(false);
+    setRemoteDesktopGuestAccess(null);
+    if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+      if (document.activeElement.closest('.remote-desktop-workspace-window, .remote-desktop-wall-window, .subsession-window')) {
+        document.activeElement.blur();
+      }
+    }
+    lastAutoFocusedRef.current = null;
+    setSubQuickFocusTick((prev) => prev + 1);
+  }, []);
+  const returnToMainWindowRef = useRef(returnToMainWindow);
+  returnToMainWindowRef.current = returnToMainWindow;
   hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
   const hasBlockingMobileGestureOverlayRef = useRef(false);
   hasBlockingMobileGestureOverlayRef.current = hasBlockingComposerOverlay
@@ -8019,6 +8066,19 @@ function InternalMainApp() {
         : matchTaskPairSplitQuickShortcut(e, resolvedTaskPairSplitModifiersRef.current);
       if (!matched && !quickSubMatch && !pairSplitMatch) return;
 
+      if (matched?.action === 'subSessionCloseAll') {
+        if (!canHandleReturnToMainWindowShortcut(e.target, document.activeElement, {
+          isMobile,
+          isComposing: isImeComposingKeyEvent(e),
+        })) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        returnToMainWindowRef.current();
+        return;
+      }
+
       const subId = focusedSubIdRef.current;
       const subRecord = subId ? subSessionsRef.current.find((item) => item.id === subId) : undefined;
       const targetViewMode = resolveFocusedKeyboardViewMode({
@@ -8092,12 +8152,6 @@ function InternalMainApp() {
       }
 
       if (!matched) return;
-      if (matched.action === 'subSessionCloseAll') {
-        e.preventDefault();
-        e.stopPropagation();
-        closeAllSubSessionWindowsRef.current();
-        return;
-      }
       const shortcutKeycaps = formatShortcutKeycaps(matched.chord, isMacPlatform());
       if (matched.action === 'serverPrev' || matched.action === 'serverNext') {
         if (!navigateServerByStep(matched.action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;

@@ -812,6 +812,39 @@ export function canHandleGlobalNavigationShortcut(
 }
 
 /**
+ * Determine whether the global "return to main window" shortcut (`subSessionCloseAll`)
+ * should run. Unlike general navigation shortcuts, it stays active inside Remote Desktop
+ * (windowed and fullscreen), Remote Desktop Wall, `.xterm` terminals, and floating-panel
+ * editors/inputs, blocking only mobile, IME composition, and active shortcut recording.
+ */
+export function canHandleReturnToMainWindowShortcut(
+  target: EventTarget | null,
+  activeElement: Element | null,
+  options: {
+    isMobile: boolean;
+    isComposing?: boolean;
+  },
+): boolean {
+  if (options.isMobile || options.isComposing) return false;
+  const targetEl = target instanceof Element ? target : null;
+  if (typeof targetEl?.closest === 'function' && targetEl.closest('[data-shortcut-recording="true"]')) {
+    return false;
+  }
+  if (
+    typeof (activeElement as HTMLElement | null)?.closest === 'function'
+    && activeElement?.closest('[data-shortcut-recording="true"]')
+  ) {
+    return false;
+  }
+  const doc = (activeElement?.ownerDocument ?? (target instanceof Node ? target.ownerDocument : undefined))
+    ?? (typeof document !== 'undefined' ? document : undefined);
+  if (doc?.querySelector('[data-shortcut-recording="true"]')) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Authoritatively resolve whether keyboard handling (navigation shortcuts or key passthrough)
  * targets `'terminal'` or `'chat'`, preventing a focused terminal sub-session window from
  * ever falling back to the underlying main session's `'chat'` mode.
