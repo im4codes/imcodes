@@ -70,9 +70,6 @@ outboundRoutes.post('/', async (c) => {
     sourceOwnerUserId: serverRow.userId,
     now: Date.now(),
   });
-  if (authority.kind === 'participant') {
-    return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
-  }
   if (authority.kind === 'invalid') {
     return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
   }

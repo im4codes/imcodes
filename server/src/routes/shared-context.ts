@@ -387,7 +387,7 @@ function buildSharedMemoryResponse(
 }
 
 sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
   const userId = authority.actorUserId;
   const memoryId = c.req.param('memoryId');
@@ -399,7 +399,7 @@ sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
 });
 
 sharedContextRoutes.get('/personal-memory', async (c) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
   const userId = authority.actorUserId;
   const projectId = c.req.query('projectId')?.trim();
@@ -495,7 +495,7 @@ sharedContextRoutes.get('/personal-memory', async (c) => {
 });
 
 sharedContextRoutes.post('/memory/search', async (c) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
   const userId = authority.actorUserId;
   const body = await readJsonBody<{
@@ -705,7 +705,7 @@ async function getOrRepairProjectionContentHash(
 }
 
 sharedContextRoutes.post('/memory/citations', async (c) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
   const userId = authority.actorUserId;
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
@@ -771,7 +771,7 @@ sharedContextRoutes.post('/memory/citations', async (c) => {
 });
 
 sharedContextRoutes.get('/memory/citations/:citationId', async (c) => {
-  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  const authority = await resolveDaemonCallerAuthority(c);
   if (!authority.ok) return daemonScopeFailure(c, authority);
   const userId = authority.actorUserId;
   const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
@@ -1564,14 +1564,13 @@ sharedContextRoutes.post('/document-bindings/:bindingId/deactivate', async (c) =
 sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   const serverId = c.req.param('id')!;
   const authority = await resolveDaemonCallerAuthority(c, {
-    denyParticipant: true,
     targetServerId: serverId,
     allowOwnerCrossServer: false,
   });
   if (!authority.ok) return daemonScopeFailure(c, authority);
   const userId = authority.actorUserId;
   const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  if (role === 'none' && authority.kind !== 'participant_daemon') return c.json({ error: 'forbidden' }, 403);
   const runtimeConfigRow = await c.env.DB.queryOne<{ shared_context_runtime_config: Record<string, unknown> | string | null }>(
     'SELECT shared_context_runtime_config FROM servers WHERE id = $1',
     [serverId],

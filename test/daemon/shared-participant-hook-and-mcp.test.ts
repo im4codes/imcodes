@@ -28,6 +28,39 @@ vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: vi.fn(() => undefined),
 }));
 
+const mockStopSessionNow = vi.fn(() => true);
+const mockRestartSessionNow = vi.fn(async () => true);
+const mockListSessionModelsNow = vi.fn(async () => ({
+  status: 'ok' as const,
+  target: 'deck_shared_main',
+  currentModel: 'sonnet',
+  currentThinking: 'medium',
+  supportedModels: ['sonnet'],
+  supportedThinking: ['medium'],
+}));
+const mockSwitchSessionModelNow = vi.fn(async () => ({
+  status: 'ok' as const,
+  target: 'deck_shared_main',
+  model: 'sonnet',
+}));
+vi.mock('../../src/daemon/command-handler.js', () => ({
+  stopSessionNow: (...args: unknown[]) => mockStopSessionNow(...args as []),
+  restartSessionNow: (...args: unknown[]) => mockRestartSessionNow(...args as []),
+  listSessionModelsNow: (...args: unknown[]) => mockListSessionModelsNow(...args as []),
+  switchSessionModelNow: (...args: unknown[]) => mockSwitchSessionModelNow(...args as []),
+}));
+
+const mockDispatchHookSend = vi.fn(async ({ targetRecords }: { targetRecords: Array<{ name: string }> }) => ({
+  dispatchId: 'disp-participant-1',
+  delivered: targetRecords.map((target) => target.name),
+  queued: [],
+  errors: [],
+  messages: targetRecords.map((target) => ({ target: target.name, messageId: 'msg-participant-1' })),
+}));
+vi.mock('../../src/daemon/send-tool.js', () => ({
+  dispatchHookSend: (...args: unknown[]) => mockDispatchHookSend(...args as [{ targetRecords: Array<{ name: string }> }]),
+}));
+
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({ timelineEmitter: { emit: vi.fn(), on: vi.fn() } }));
 vi.mock('../../src/daemon/watcher-controls.js', () => ({ refreshSessionWatcher: vi.fn() }));
 vi.mock('../../src/context/memory-recall-client.js', () => ({
@@ -142,28 +175,48 @@ describe('hook-server shared participant isolation', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  it('denies MEMORY_MCP_DAEMON_RPC_PATH during participant turns without invoking tool handlers, while allowing owner turns', async () => {
-    const blocked = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_shared_main', {
-      tool: 'search_memory',
-      input: { query: 'hello' },
+  it('allows MEMORY_MCP_DAEMON_RPC_PATH server/session/identity/history/pair/send/project tools during participant turns while keeping save_preference owner-only', async () => {
+    for (const [tool, input] of [
+      ['session_identity_get', {}],
+      ['session_identity_set', { identityScope: 'session', content: 'Updated role' }],
+      ['session_identity_clear', { identityScope: 'session' }],
+      ['session_identity_refresh', { all: false }],
+      ['session_history', { kind: 'text', limit: 10 }],
+      ['send_message', { to: 'deck_shared_sub', message: 'hi sibling' }],
+      ['pair_create', { title: 'Test', brief: 'Brief' }],
+      ['search_memory', { query: 'hello' }],
+      ['memory_injection_set', { enabled: false }],
+    ] as const) {
+      const res = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_shared_main', {
+        tool,
+        input,
+      });
+      expect(res.status, tool).toBe(200);
+      expect(res.body, tool).toMatchObject({ ok: true, result: { status: 'ok' } });
+    }
+    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(9);
+
+    const blockedPref = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_shared_main', {
+      tool: 'save_preference',
+      input: { text: 'prefer concise answers' },
     });
-    expect(blocked.status).toBe(200);
-    expect(blocked.body).toMatchObject({
+    expect(blockedPref.status).toBe(200);
+    expect(blockedPref.body).toMatchObject({
       ok: true,
       result: { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN },
     });
-    expect(invokeMemoryMcpTool).not.toHaveBeenCalled();
+    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(9);
 
-    const allowed = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_private_main', {
-      tool: 'search_memory',
-      input: { query: 'hello' },
+    const ownerPref = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_private_main', {
+      tool: 'save_preference',
+      input: { text: 'prefer concise answers' },
     });
-    expect(allowed.status).toBe(200);
-    expect(allowed.body).toMatchObject({ ok: true, result: { status: 'ok' } });
-    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(1);
+    expect(ownerPref.status).toBe(200);
+    expect(ownerPref.body).toMatchObject({ ok: true, result: { status: 'ok' } });
+    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(10);
   });
 
-  it('blocks participant turns from switching models or reading models of other sessions, while allowing self read', async () => {
+  it('allows participant turns to list and switch models on self and other sessions with owner parity', async () => {
     const selfList = await requestHook(port, 'POST', MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH, 'deck_shared_main', {
       from: 'deck_shared_main',
       to: 'deck_shared_main',
@@ -174,34 +227,45 @@ describe('hook-server shared participant isolation', () => {
       from: 'deck_shared_main',
       to: 'deck_private_main',
     });
-    expect(otherList.status).toBe(403);
-    expect(otherList.body.error).toBe('shared_participant_forbidden');
+    expect(otherList.status).toBe(200);
 
     const selfSet = await requestHook(port, 'POST', MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, 'deck_shared_main', {
       from: 'deck_shared_main',
       to: 'deck_shared_main',
       model: 'opus',
     });
-    expect(selfSet.status).toBe(403);
-    expect(selfSet.body.error).toBe('shared_participant_forbidden');
-    expect(switchSessionModel).not.toHaveBeenCalled();
+    expect(selfSet.status).toBe(200);
+
+    const siblingSet = await requestHook(port, 'POST', MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, 'deck_shared_main', {
+      from: 'deck_shared_main',
+      to: 'deck_shared_sub',
+      model: 'opus',
+    });
+    expect(siblingSet.status).toBe(200);
+    expect(switchSessionModel).toHaveBeenCalledTimes(2);
   });
 
-  it('blocks participant turns from resetting self, restarting other sessions, or closing sessions', async () => {
-    const crossRestart = await requestHook(port, 'POST', MEMORY_MCP_SESSION_RESTART_HOOK_PATH, 'deck_shared_main', {
+  it('allows participant turns to reset self, restart sibling sessions, and close sessions while preserving project scope', async () => {
+    const crossProjectRestart = await requestHook(port, 'POST', MEMORY_MCP_SESSION_RESTART_HOOK_PATH, 'deck_shared_main', {
       from: 'deck_shared_main',
       to: 'deck_private_main',
       reset: false,
     });
-    expect(crossRestart.status).toBe(403);
-    expect(crossRestart.body.error).toBe('shared_participant_forbidden');
+    // Cross-project targets still fail project-scope lookup with 404 (same as owner), not shared_participant_forbidden.
+    expect(crossProjectRestart.status).toBe(404);
+
+    const siblingRestart = await requestHook(port, 'POST', MEMORY_MCP_SESSION_RESTART_HOOK_PATH, 'deck_shared_main', {
+      from: 'deck_shared_main',
+      to: 'deck_shared_sub',
+      reset: true,
+    });
+    expect(siblingRestart.status).toBe(202);
 
     const resetSelf = await requestHook(port, 'POST', MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH, 'deck_shared_main', {
       from: 'deck_shared_main',
       targets: [{ target: 'deck_shared_main', reset: true }],
     });
-    expect(resetSelf.status).toBe(403);
-    expect(resetSelf.body.error).toBe('shared_participant_forbidden');
+    expect(resetSelf.status).toBe(202);
 
     const selfSoftRestart = await requestHook(port, 'POST', MEMORY_MCP_SESSION_RESTART_HOOK_PATH, 'deck_shared_main', {
       from: 'deck_shared_main',
@@ -214,26 +278,34 @@ describe('hook-server shared participant isolation', () => {
       from: 'deck_shared_main',
       target: 'deck_shared_sub',
     });
-    expect(closeRes.status).toBe(403);
-    expect(closeRes.body.error).toBe('shared_participant_forbidden');
-    expect(closeSession).not.toHaveBeenCalled();
+    expect(closeRes.status).toBe(200);
+    expect(closeSession).toHaveBeenCalledWith('deck_shared_main', { target: 'deck_shared_sub' });
   });
 
-  it('blocks participant turns from /stop or /send /stop on sibling sessions', async () => {
+  it('allows participant turns to /send, /stop, and /send /stop on sibling sessions with owner parity', async () => {
+    const sendRes = await requestHook(port, 'POST', '/send', 'deck_shared_main', {
+      from: 'deck_shared_main',
+      to: 'deck_shared_sub',
+      message: 'coordinate work',
+    });
+    expect(sendRes.status).toBe(200);
+    expect(mockDispatchHookSend).toHaveBeenCalledTimes(1);
+
     const stopRes = await requestHook(port, 'POST', '/stop', 'deck_shared_main', {
       from: 'deck_shared_main',
       to: 'deck_shared_sub',
     });
-    expect(stopRes.status).toBe(403);
-    expect(stopRes.body.error).toBe('shared_participant_forbidden');
+    expect(stopRes.status).toBe(200);
+    expect(stopRes.body).toMatchObject({ ok: true, stopped: true, target: 'deck_shared_sub' });
 
     const sendStopRes = await requestHook(port, 'POST', '/send', 'deck_shared_main', {
       from: 'deck_shared_main',
       to: 'deck_shared_sub',
       message: '/stop',
     });
-    expect(sendStopRes.status).toBe(403);
-    expect(sendStopRes.body.error).toBe('shared_participant_forbidden');
+    expect(sendStopRes.status).toBe(200);
+    expect(sendStopRes.body).toMatchObject({ ok: true, stopped: true, target: 'deck_shared_sub' });
+    expect(mockStopSessionNow).toHaveBeenCalledTimes(2);
   });
 
   it('scopes /sessions/live to caller projectName when x-imcodes-session resolves a session record', async () => {

@@ -17,7 +17,11 @@ import { isLocalHookRequest } from './hook-request-guard.js';
 import { hookClaimAllowed } from './hook-session-credential.js';
 import { HOOK_SESSION_CREDENTIAL_ERROR } from '../../shared/hook-session-credential.js';
 import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
-import { RETIRED_SUPERVISION_MCP_MESSAGE, RETIRED_SUPERVISION_MCP_TOOL_SET } from '../../shared/memory-mcp-contracts.js';
+import {
+  MEMORY_MCP_TOOL_NAMES,
+  RETIRED_SUPERVISION_MCP_MESSAGE,
+  RETIRED_SUPERVISION_MCP_TOOL_SET,
+} from '../../shared/memory-mcp-contracts.js';
 import http from 'http';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -717,9 +721,6 @@ async function handleSend(
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
-  if (readSenderParticipantTurn(from) && result.targets.some((target) => target.name !== from)) {
-    return { status: 403, body: { ok: false, error: 'shared_participant_forbidden' } };
-  }
   if (body.supervision && result.targets.length !== 1) {
     return { status: 400, body: { ok: false, error: 'supervision binding requires one exact target' } };
   }
@@ -733,9 +734,6 @@ async function handleSend(
   // this environment." while its running turn kept going). Exact-match only:
   // messages that merely contain "/stop" stay ordinary text.
   if (message.trim() === '/stop') {
-    if (readSenderParticipantTurn(from) && result.targets.some((target) => target.name !== from)) {
-      return { status: 403, body: { ok: false, error: 'shared_participant_forbidden' } };
-    }
     // Lazy import — same heavy-module-cycle rationale as handleStop below.
     const { stopSessionNow } = await import('./command-handler.js');
     const stopped: string[] = [];
@@ -856,9 +854,6 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
-  }
-  if (readSenderParticipantTurn(from) && result.targets.some((target) => target.name !== from)) {
-    return { status: 403, body: { ok: false, error: 'shared_participant_forbidden' } };
   }
   // Lazy import: command-handler pulls in the whole daemon graph, so importing
   // it eagerly here would create a heavy module cycle (and broke hook-server's
@@ -1118,14 +1113,16 @@ export async function startHookServer(
           providerId: session.providerId ?? session.agentType,
           transport: 'in_process',
         });
-        if (readSenderParticipantTurn(session.name)) {
+        // Only strictly user-personal preferences stay isolated from shared-session participant turns;
+        // server, session, identity, history, project memory, pair, and send operations match owner parity.
+        if (body.tool === MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE && readSenderParticipantTurn(session.name)) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             ok: true,
             result: {
               status: 'error',
               reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
-              message: 'personal memory tools are not available during a shared-session participant turn',
+              message: 'personal preference tools are not available during a shared-session participant turn',
             },
           }));
           return;
@@ -1479,11 +1476,6 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'session model caller identity is unavailable' }));
           return;
         }
-        if (readSenderParticipantTurn(from) && (isSet || to !== from)) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'shared_participant_forbidden' }));
-          return;
-        }
         const { listSessionModelsNow, switchSessionModelNow } = await import('./command-handler.js');
         let result;
         if (isSet) {
@@ -1570,11 +1562,6 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'session restart caller identity is unavailable' }));
           return;
         }
-        if (readSenderParticipantTurn(from) && items.some((item) => item!.target !== from || item!.reset === true)) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'shared_participant_forbidden' }));
-          return;
-        }
         const targetRecords: SessionRecord[] = [];
         for (const item of items) {
           const targetRecord = getSession(item!.target);
@@ -1652,11 +1639,6 @@ export async function startHookServer(
         if (!from || authenticatedSender !== from || !target) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'invalid exact-session close request' }));
-          return;
-        }
-        if (readSenderParticipantTurn(from)) {
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'shared_participant_forbidden' }));
           return;
         }
         const close = options.closeSession ?? (async (callerName, request) => {
