@@ -101,8 +101,8 @@ export function bindProcessSharedMachineActivity(
         window.identity = identity;
         window.authority = activity.authority;
     } else {
-        windows.delete(sessionName);
-        window = undefined;
+        // Identity mismatch and not a valid rebind: refuse to bind to this context.
+        return NO_BINDING;
     }
   }
   if (window && quietAndIdle(window, now, opts.sessionRunning ?? false)) window = undefined;
@@ -248,7 +248,8 @@ export function readProcessSharedMachineAuthority(
   }
   // Owner-only activity is the ordinary unrestricted path; on shared hosts it carries its server-signed owner token.
   if (window.participants.size === 0) {
-    const ownerAuthority = sameIdentity(window.identity, identity) ? window.ownerAuthority : null;
+    if (!sameIdentity(window.identity, identity)) return { required: true, authority: null };
+    const ownerAuthority = window.ownerAuthority;
     return ownerAuthority
       ? { required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: ownerAuthority }
       : { required: false, authority: null };

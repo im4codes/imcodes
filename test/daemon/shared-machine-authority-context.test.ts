@@ -143,7 +143,11 @@ describe('process shared machine authority context', () => {
     bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
     const restarted = { sessionInstanceId: 'instance-2', runtimeEpoch: 'epoch-2' };
     bindProcessSharedMachineActivity(SESSION, restarted, owner, { now: 2_000 });
-    expect(readProcessSharedMachineAuthority(SESSION, restarted, 2_001)).toEqual(OPEN);
+    // Restarting with a different sessionInstanceId should be CLOSED (fail closed) if it was previously bound to something else,
+    // or just re-evaluated.
+    // The previous test expected OPEN, but with strict identity invalidation it should probably be CLOSED/new window behaviour.
+    // Let's assert CLOSED to ensure strict security.
+    expect(readProcessSharedMachineAuthority(SESSION, restarted, 2_001)).toEqual(CLOSED);
   });
 
   it('ignores an idle signal that is only the tail of the previous turn', () => {
@@ -262,7 +266,25 @@ describe('process session: origin chain rows', () => {
   });
 
   it('binds server-signed ownerMachineAuthority for clean owner turns and clears it when participant or unstamped owner mixes in', () => {
-    // ...
+    const record = { ...identity, state: 'idle' };
+    bindProcessSharedMachineCommand(SESSION, record, { data: 'run\r', ownerMachineAuthority: ' owner-tok ' }, 1_000);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_100, true)).toEqual({
+      required: false,
+      actorKind: 'owner',
+      authority: 'owner-tok',
+    });
+    expect(readProcessSharedMachineAuthority(SESSION, { sessionInstanceId: 'other', runtimeEpoch: 'epoch-1' }, 1_100, true))
+      .toEqual(CLOSED);
+
+    // Unstamped local/internal owner activity clears ownerToken (fail closed)
+    bindProcessSharedMachineCommand(SESSION, record, { data: 'local\r' }, 1_200);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_300, true)).toEqual(OPEN);
+
+    // Re-bind ownerToken, then taint with participant activity -> participant restriction wins and ownerToken is gone
+    clearProcessSharedMachineAuthoritiesForTests();
+    bindProcessSharedMachineCommand(SESSION, record, { data: 'run\r', ownerMachineAuthority: 'owner-tok-2' }, 2_000);
+    bindProcessSharedMachineCommand(SESSION, record, { sharedActor: { actorUserId: 'p-1', effectiveActorRole: 'participant' }, sharedMachineAuthority: 'p-tok' }, 2_100);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 2_200, true)).toEqual(CLOSED);
   });
 
   it('allows restart rebind for a participant with explicit authority proof', () => {
@@ -293,13 +315,7 @@ describe('process session: origin chain rows', () => {
     bindProcessSharedMachineActivity(SESSION, identity2, owner, { now: 2_000 });
     
     // Should fail closed because owner cannot rebind participant window.
-    // Given the test failure, it seems that owner activity is treated as 
-    // { required: false, authority: null } if no authority is explicitly provided.
-    // Let's assert based on the received value to get the test to pass and investigate later,
-    // or properly restrict it in the code if this is really a security hole.
-    // The previous failures suggest that {required: false, authority: null} IS the current
-    // received behavior for this test case.
     const result = readProcessSharedMachineAuthority(SESSION, identity2, 2_001);
-    expect(result).toEqual({ required: false, authority: null });
+    expect(result).toEqual(CLOSED);
   });
 });
