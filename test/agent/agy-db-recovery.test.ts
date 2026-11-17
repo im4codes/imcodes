@@ -3,9 +3,11 @@ import { chmodSync, existsSync, readdirSync, readFileSync, statSync, writeFileSy
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   agyConversationDbPath,
+  createDumpCommitRewriteTransform,
   isValidAgyConversationId,
   recoverAgyConversationDbIfCorrupt,
 } from '../../src/agent/agy-db-recovery.js';
@@ -478,6 +480,97 @@ describe('Antigravity conversation DB self-healing', () => {
     expect(failedRes.stderrSummary).toContain('[path]');
     expect(JSON.stringify(failedRes)).not.toContain(home);
     expect(JSON.stringify(failedRes)).not.toContain(invalidDbPath);
+  });
+
+  it('falls back to sqlite3 .dump rewriting ROLLBACK when .recover is unsupported (even with stale WAL/SHM), while keeping garbage -> sqlite3_failed', async () => {
+    const home = await makeTempHome();
+    const dbPath = agyConversationDbPath(home, VALID_UUID)!;
+    await mkdir(path.dirname(dbPath), { recursive: true });
+    seedConversationDb(dbPath, VALID_UUID, 250);
+    corruptLastDatabasePage(dbPath);
+    await writeFile(`${dbPath}-wal`, Buffer.alloc(64, 0xaa));
+    await writeFile(`${dbPath}-shm`, Buffer.alloc(64, 0xbb));
+
+    const wrapperNoRecover = path.join(home, 'sqlite3-no-recover');
+    await writeFile(
+      wrapperNoRecover,
+      [
+        '#!/bin/sh',
+        'for arg in "$@"; do',
+        '  if [ "$arg" = ".recover" ]; then',
+        '    echo \'Error: unknown command or invalid arguments: "recover". Enter ".help" for help\' >&2',
+        '    exit 1',
+        '  fi',
+        'done',
+        'exec sqlite3 "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o700 },
+    );
+    chmodSync(wrapperNoRecover, 0o700);
+
+    const recoveredRes = await recoverAgyConversationDbIfCorrupt(dbPath, { sqliteBinary: wrapperNoRecover });
+    expect(recoveredRes).toEqual({ recovered: true, reason: 'recovered' });
+    expect(existsSync(`${dbPath}.corrupt`)).toBe(true);
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+    expect(readdirSync(path.dirname(dbPath)).some((f) => f.includes('.tmp'))).toBe(false);
+
+    const recoveredDb = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(recoveredDb.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'wal' });
+      expect(recoveredDb.prepare('PRAGMA integrity_check').all()).toEqual([{ integrity_check: 'ok' }]);
+      expect(recoveredDb.prepare('SELECT cascade_id FROM trajectory_meta').all()).toEqual([{ cascade_id: VALID_UUID }]);
+      expect((recoveredDb.prepare('SELECT COUNT(*) AS cnt FROM steps').get() as { cnt: number }).cnt).toBeGreaterThan(200);
+    } finally {
+      recoveredDb.close();
+    }
+
+    // Non-SQLite garbage via the same .recover-less sqlite3 wrapper MUST still return sqlite3_failed without leaving temp files.
+    const garbageUuid = '55555555-5555-4555-8555-555555555555';
+    const garbagePath = agyConversationDbPath(home, garbageUuid)!;
+    await writeFile(garbagePath, 'totally corrupted non-sqlite payload');
+    const garbageBefore = readFileSync(garbagePath);
+    const garbageRes = await recoverAgyConversationDbIfCorrupt(garbagePath, { sqliteBinary: wrapperNoRecover });
+    expect(garbageRes).toMatchObject({ recovered: false, reason: 'sqlite3_failed' });
+    expect(readFileSync(garbagePath)).toEqual(garbageBefore);
+    expect(existsSync(`${garbagePath}.corrupt`)).toBe(false);
+    expect(readdirSync(path.dirname(garbagePath)).some((f) => f.includes('.tmp'))).toBe(false);
+  });
+
+  it('createDumpCommitRewriteTransform rewrites ROLLBACK footer safely across arbitrary byte/UTF-8 chunk splits', async () => {
+    const input = [
+      'PRAGMA foreign_keys=OFF;',
+      'BEGIN TRANSACTION;',
+      "INSERT INTO steps VALUES(1,'hello 🚀 ROLLBACK; -- due to errors inline');",
+      '/****** CORRUPTION ERROR *******/',
+      'ROLLBACK; -- due to errors',
+      '',
+    ].join('\n');
+    const bytes = Buffer.from(input, 'utf8');
+    // Feed 3-byte chunks to split both multi-byte emoji UTF-8 and the footer line mid-token.
+    const chunks: Buffer[] = [];
+    for (let i = 0; i < bytes.length; i += 3) {
+      chunks.push(bytes.subarray(i, i + 3));
+    }
+    const transform = createDumpCommitRewriteTransform();
+    const outChunks: Buffer[] = [];
+    await new Promise<void>((resolve, reject) => {
+      Readable.from(chunks)
+        .pipe(transform)
+        .on('data', (c: Buffer | string) => outChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+        .on('end', resolve)
+        .on('error', reject);
+    });
+    const output = Buffer.concat(outChunks).toString('utf8');
+    expect(output).toBe([
+      'PRAGMA foreign_keys=OFF;',
+      'BEGIN TRANSACTION;',
+      "INSERT INTO steps VALUES(1,'hello 🚀 ROLLBACK; -- due to errors inline');",
+      '/****** CORRUPTION ERROR *******/',
+      'COMMIT;',
+      '',
+    ].join('\n'));
   });
 
   it('retries at most once when retried session/resume still fails and logs privacy-safe diagnostics on recovery failure', async () => {

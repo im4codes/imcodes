@@ -3,8 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { chmod, copyFile, rename, rm, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import type { Readable } from 'node:stream';
+import { Transform, type Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
 const DEFAULT_RECOVERY_TIMEOUT_MS = 60_000;
@@ -177,13 +178,60 @@ interface RecoverStreamFailure {
   allowOutputVerification?: boolean;
 }
 
-async function runSqliteRecoverStream(
+type SqliteRecoveryStreamResult =
+  | { ok: true; stderrSummary?: string }
+  | RecoverStreamFailure;
+
+/**
+ * Streaming line-boundary transform that rewrites sqlite3 `.dump`'s corruption
+ * footer `ROLLBACK; -- due to errors` to `COMMIT;` without buffering the dump.
+ */
+export function createDumpCommitRewriteTransform(): Transform {
+  const decoder = new StringDecoder('utf8');
+  let lineRemainder = '';
+
+  const rewriteLine = (line: string): string => {
+    const hasCr = line.endsWith('\r');
+    const stripped = hasCr ? line.slice(0, -1) : line;
+    if (stripped === 'ROLLBACK; -- due to errors') {
+      return hasCr ? 'COMMIT;\r' : 'COMMIT;';
+    }
+    return line;
+  };
+
+  return new Transform({
+    transform(chunk: Buffer | string, _encoding, callback) {
+      const text = lineRemainder + (typeof chunk === 'string' ? chunk : decoder.write(chunk));
+      const parts = text.split('\n');
+      lineRemainder = parts.pop() ?? '';
+      if (parts.length > 0) {
+        this.push(`${parts.map(rewriteLine).join('\n')}\n`);
+      }
+      callback();
+    },
+    flush(callback) {
+      const tail = lineRemainder + decoder.end();
+      if (tail.length > 0) {
+        this.push(rewriteLine(tail));
+      }
+      callback();
+    },
+  });
+}
+
+function isRecoverCommandUnsupported(failure: RecoverStreamFailure): boolean {
+  if (failure.failedStep !== 'recover' || !failure.allowOutputVerification) return false;
+  return /unknown command.*recover|invalid arguments.*recover/i.test(failure.stderrSummary ?? '');
+}
+
+async function runSqliteStreamPipeline(
   dbPath: string,
   tmpPath: string,
   sqliteBinary: string,
+  mode: 'recover' | 'dump',
   timeoutMs: number,
-): Promise<{ ok: true } | RecoverStreamFailure> {
-  const recoverChild = spawn(sqliteBinary, ['-batch', dbPath, '.recover'], {
+): Promise<SqliteRecoveryStreamResult> {
+  const extractChild = spawn(sqliteBinary, ['-batch', dbPath, `.${mode}`], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -191,9 +239,10 @@ async function runSqliteRecoverStream(
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  const dumpRewrite = mode === 'dump' ? createDumpCommitRewriteTransform() : null;
 
   // Drain auxiliary pipes with bounded stderr tail capture so neither child can block on a full 64KB buffer.
-  const readRecoverStderr = collectStderrTail(recoverChild.stderr);
+  const readExtractStderr = collectStderrTail(extractChild.stderr);
   const readImportStderr = collectStderrTail(importChild.stderr);
   importChild.stdout.resume();
 
@@ -208,41 +257,49 @@ async function runSqliteRecoverStream(
     }
   };
 
+  const destroyStreams = (): void => {
+    extractChild.stdout.destroy();
+    dumpRewrite?.destroy();
+    importChild.stdin.destroy();
+  };
+
   const killChildren = (): void => {
-    safeKill(recoverChild);
+    safeKill(extractChild);
     safeKill(importChild);
   };
 
-  const recoverWait = waitForChildExit(recoverChild);
+  const extractWait = waitForChildExit(extractChild);
   const importWait = waitForChildExit(importChild);
 
-  recoverChild.once('error', () => {
-    recoverChild.stdout.destroy();
-    importChild.stdin.destroy();
+  extractChild.once('error', () => {
+    destroyStreams();
     killChildren();
   });
   importChild.once('error', () => {
-    recoverChild.stdout.destroy();
-    importChild.stdin.destroy();
+    destroyStreams();
     killChildren();
   });
 
   const timer = setTimeout(() => {
     timedOut = true;
-    recoverChild.stdout.destroy();
-    importChild.stdin.destroy();
+    destroyStreams();
     killChildren();
   }, timeoutMs);
   timer.unref?.();
 
-  const pipePromise = pipeline(recoverChild.stdout, importChild.stdin).catch((err) => {
+  const pipePromise = (
+    dumpRewrite
+      ? pipeline(extractChild.stdout, dumpRewrite, importChild.stdin)
+      : pipeline(extractChild.stdout, importChild.stdin)
+  ).catch((err) => {
     pipeError = err;
+    destroyStreams();
     killChildren();
   });
 
   try {
-    const [recoverRes, importRes] = await Promise.all([recoverWait, importWait, pipePromise]);
-    const recoverStderr = sanitizeSqliteStderr(readRecoverStderr());
+    const [extractRes, importRes] = await Promise.all([extractWait, importWait, pipePromise]);
+    const extractStderr = sanitizeSqliteStderr(readExtractStderr());
     const importStderr = sanitizeSqliteStderr(readImportStderr());
 
     if (timedOut) {
@@ -250,43 +307,43 @@ async function runSqliteRecoverStream(
         ok: false,
         reason: 'sqlite3_timeout',
         failedStep: 'recover',
-        exitCode: recoverRes.code ?? importRes.code ?? null,
-        stderrSummary: recoverStderr ?? importStderr,
+        exitCode: extractRes.code ?? importRes.code ?? null,
+        stderrSummary: extractStderr ?? importStderr,
       };
     }
-    if (recoverRes.error?.code === 'ENOENT') {
+    if (extractRes.error?.code === 'ENOENT') {
       return { ok: false, reason: 'sqlite3_enoent', failedStep: 'recover', exitCode: null };
     }
     if (importRes.error?.code === 'ENOENT') {
       return { ok: false, reason: 'sqlite3_enoent', failedStep: 'import', exitCode: null };
     }
-    if (recoverRes.error || importRes.error || pipeError) {
-      const failedStep: 'recover' | 'import' = recoverRes.error ? 'recover' : 'import';
+    if (extractRes.error || importRes.error || pipeError) {
+      const failedStep: 'recover' | 'import' = extractRes.error ? 'recover' : 'import';
       return {
         ok: false,
         reason: 'sqlite3_failed',
         failedStep,
-        exitCode: failedStep === 'recover' ? recoverRes.code : importRes.code,
-        stderrSummary: failedStep === 'recover' ? (recoverStderr ?? importStderr) : (importStderr ?? recoverStderr),
+        exitCode: failedStep === 'recover' ? extractRes.code : importRes.code,
+        stderrSummary: failedStep === 'recover' ? (extractStderr ?? importStderr) : (importStderr ?? extractStderr),
       };
     }
-    if (recoverRes.signal !== null || importRes.signal !== null) {
-      const failedStep: 'recover' | 'import' = recoverRes.signal !== null ? 'recover' : 'import';
+    if (extractRes.signal !== null || importRes.signal !== null) {
+      const failedStep: 'recover' | 'import' = extractRes.signal !== null ? 'recover' : 'import';
       return {
         ok: false,
         reason: 'sqlite3_failed',
         failedStep,
-        exitCode: failedStep === 'recover' ? recoverRes.code : importRes.code,
-        stderrSummary: failedStep === 'recover' ? (recoverStderr ?? importStderr) : (importStderr ?? recoverStderr),
+        exitCode: failedStep === 'recover' ? extractRes.code : importRes.code,
+        stderrSummary: failedStep === 'recover' ? (extractStderr ?? importStderr) : (importStderr ?? extractStderr),
       };
     }
-    if (recoverRes.code !== 0) {
+    if (extractRes.code !== 0) {
       return {
         ok: false,
         reason: 'sqlite3_failed',
         failedStep: 'recover',
-        exitCode: recoverRes.code,
-        stderrSummary: recoverStderr ?? importStderr,
+        exitCode: extractRes.code,
+        stderrSummary: extractStderr ?? importStderr,
         allowOutputVerification: true,
       };
     }
@@ -296,11 +353,11 @@ async function runSqliteRecoverStream(
         reason: 'sqlite3_failed',
         failedStep: 'import',
         exitCode: importRes.code,
-        stderrSummary: importStderr ?? recoverStderr,
+        stderrSummary: importStderr ?? extractStderr,
         allowOutputVerification: true,
       };
     }
-    return { ok: true };
+    return { ok: true, ...(extractStderr || importStderr ? { stderrSummary: extractStderr ?? importStderr } : {}) };
   } finally {
     clearTimeout(timer);
   }
@@ -369,7 +426,18 @@ async function performRecovery(
   };
 
   try {
-    const streamResult = await runSqliteRecoverStream(dbPath, tmpPath, sqliteBinary, timeoutMs);
+    let usedDumpFallback = false;
+    let streamResult = await runSqliteStreamPipeline(dbPath, tmpPath, sqliteBinary, 'recover', timeoutMs);
+    if (!streamResult.ok && isRecoverCommandUnsupported(streamResult)) {
+      await cleanupTemp();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return buildFailureResult('sqlite3_timeout', { failedStep: 'recover' });
+      }
+      usedDumpFallback = true;
+      streamResult = await runSqliteStreamPipeline(dbPath, tmpPath, sqliteBinary, 'dump', remaining);
+    }
+
     if (!streamResult.ok) {
       const tmpStat = streamResult.allowOutputVerification ? await stat(tmpPath).catch(() => null) : null;
       if (!tmpStat?.isFile() || tmpStat.size === 0) {
@@ -379,7 +447,7 @@ async function performRecovery(
           stderrSummary: streamResult.stderrSummary,
         });
       }
-      // Some sqlite3 builds (e.g. macOS 26.7.2) exit non-zero after encountering a corrupt B-tree page
+      // Some sqlite3 builds exit non-zero after encountering a corrupt B-tree page
       // even after writing a valid recovered database; accept only if DatabaseSync verifies integrity + schema.
       const fallbackVerify = await finalizeAndVerifyRecoveredDb(tmpPath);
       if (!fallbackVerify.ok) {
@@ -395,7 +463,11 @@ async function performRecovery(
       }
       const verifyResult = await finalizeAndVerifyRecoveredDb(tmpPath);
       if (!verifyResult.ok) {
-        return buildFailureResult(verifyResult.reason, { failedStep: verifyResult.failedStep });
+        // When `.dump` fallback exits 0 on non-SQLite garbage (producing an empty DB), report sqlite3_failed.
+        return buildFailureResult(usedDumpFallback ? 'sqlite3_failed' : verifyResult.reason, {
+          failedStep: usedDumpFallback ? 'recover' : verifyResult.failedStep,
+          ...(usedDumpFallback && streamResult.stderrSummary ? { stderrSummary: streamResult.stderrSummary } : {}),
+        });
       }
     }
 
