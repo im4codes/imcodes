@@ -93,7 +93,7 @@ import {
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import { readSenderParticipantTurn } from './sender-participant-turn.js';
+import { AMBIGUOUS_PARTICIPANT_ACTOR, readSenderParticipantTurn, type SenderParticipantTurn } from './sender-participant-turn.js';
 import { readProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 
 export { DEFAULT_HOOK_PORT };
@@ -958,6 +958,51 @@ export interface HookServerOptions {
   switchSessionModel?: (sessionName: string, model?: string, thinking?: string) => Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult>;
 }
 
+const PARTICIPANT_SCOPED_MEMORY_TOOLS = new Set<MemoryMcpDaemonToolName>([
+  MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
+  MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+  MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
+  MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
+  MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+]);
+
+function scopeMemoryCallerForParticipantTurn(
+  baseCaller: McpRuntimeCaller,
+  participantTurn: SenderParticipantTurn | boolean | null,
+  tool: MemoryMcpDaemonToolName,
+): McpRuntimeCaller {
+  if (!participantTurn || !PARTICIPANT_SCOPED_MEMORY_TOOLS.has(tool)) {
+    return baseCaller;
+  }
+  const actorUserId = typeof participantTurn === 'object'
+    && participantTurn !== null
+    && typeof participantTurn.actorUserId === 'string'
+    && participantTurn.actorUserId.trim()
+    ? participantTurn.actorUserId.trim()
+    : AMBIGUOUS_PARTICIPANT_ACTOR;
+  const participantAuthority = typeof participantTurn === 'object'
+    && participantTurn !== null
+    && typeof participantTurn.authority === 'string'
+    && participantTurn.authority.trim()
+    ? participantTurn.authority.trim()
+    : null;
+  return Object.freeze({
+    ...baseCaller,
+    userId: actorUserId,
+    namespace: {
+      ...baseCaller.namespace,
+      userId: actorUserId,
+    },
+    isParticipantTurn: true,
+    participantAuthority,
+  });
+}
+
 async function invokeDaemonMemoryMcpTool(
   caller: McpRuntimeCaller,
   tool: MemoryMcpDaemonToolName,
@@ -1103,7 +1148,7 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_server_identity_unavailable' }));
           return;
         }
-        const caller: McpRuntimeCaller = Object.freeze({
+        const baseCaller: McpRuntimeCaller = Object.freeze({
           userId: storedUserId,
           namespace: storedNamespace,
           sessionName: session.name,
@@ -1113,9 +1158,11 @@ export async function startHookServer(
           providerId: session.providerId ?? session.agentType,
           transport: 'in_process',
         });
-        // Only strictly user-personal preferences stay isolated from shared-session participant turns;
-        // server, session, identity, history, project memory, pair, and send operations match owner parity.
-        if (body.tool === MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE && readSenderParticipantTurn(session.name)) {
+        const participantTurn = readSenderParticipantTurn(session.name);
+        // Strictly user-personal preference writes stay isolated from shared-session participant turns;
+        // memory read/write tools are scoped to the participant actor identity rather than owner-private storage,
+        // while server, session, identity, history, pair, and send operations match owner parity.
+        if (body.tool === MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE && participantTurn) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             ok: true,
@@ -1127,6 +1174,7 @@ export async function startHookServer(
           }));
           return;
         }
+        const caller = scopeMemoryCallerForParticipantTurn(baseCaller, participantTurn, body.tool);
         const invoke = options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool;
         const result = await invoke(caller, body.tool, body.input);
         res.writeHead(200, { 'Content-Type': 'application/json' });

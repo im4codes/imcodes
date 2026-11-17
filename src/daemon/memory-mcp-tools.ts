@@ -163,6 +163,7 @@ import type { CapabilityService } from '../../shared/capability-management.js';
 import type { CapabilityRuntimeIdentity } from './capability-mcp-tools.js';
 import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
+import { AMBIGUOUS_PARTICIPANT_ACTOR } from './sender-participant-turn.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
 import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
 import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchOptions, type MemoryMcpSearchResult } from './memory-mcp-search.js';
@@ -1316,14 +1317,18 @@ function projectScopedNamespace(
   const fallbackProjectId = fallbackProjectIdFromRoot(projectRoot);
   const projectId = sessionProjectId ?? callerProjectId ?? fallbackProjectId;
   const base = sessionProjectId ? (session?.contextNamespace ?? caller.namespace) : caller.namespace;
-  if (!projectId) return base;
+  if (!projectId) {
+    return caller.isParticipantTurn ? { ...base, userId: caller.userId } : base;
+  }
   const scope = base.scope === 'user_private' ? 'personal' : base.scope;
-  const userId = base.userId?.trim() || caller.userId;
+  const userId = caller.isParticipantTurn
+    ? caller.userId
+    : (base.userId?.trim() || caller.userId);
   return {
     ...base,
     scope,
     projectId,
-    ...(scope === 'personal' ? { userId } : {}),
+    ...(scope === 'personal' || caller.isParticipantTurn ? { userId } : {}),
   };
 }
 
@@ -1555,14 +1560,22 @@ function sendIdentityProjectRoot(
   return sessionRoot || null;
 }
 
-function canManageProjectionNamespace(projectionNamespace: ContextNamespace, callerNamespace: ContextNamespace, callerUserId: string): boolean {
+function canManageProjectionNamespace(
+  projectionNamespace: ContextNamespace,
+  callerNamespace: ContextNamespace,
+  callerUserId: string,
+  includeLegacyPersonalOwner = true,
+): boolean {
   if (serializeContextNamespace(projectionNamespace) === serializeContextNamespace(callerNamespace)) return true;
   if (projectionNamespace.scope !== 'personal' || callerNamespace.scope !== 'personal') return false;
   if (!projectionNamespace.projectId || projectionNamespace.projectId !== callerNamespace.projectId) return false;
   if ((projectionNamespace.enterpriseId ?? undefined) !== (callerNamespace.enterpriseId ?? undefined)) return false;
   if ((projectionNamespace.workspaceId ?? undefined) !== (callerNamespace.workspaceId ?? undefined)) return false;
   const projectionUserId = projectionNamespace.userId?.trim();
-  return !projectionUserId || projectionUserId === LEGACY_DAEMON_LOCAL_USER_ID || projectionUserId === callerUserId;
+  if (!projectionUserId || projectionUserId === LEGACY_DAEMON_LOCAL_USER_ID) {
+    return includeLegacyPersonalOwner;
+  }
+  return projectionUserId === callerUserId;
 }
 
 async function resolveProjectionRefArg(
@@ -1613,14 +1626,46 @@ async function loadManageableProjection(
 ): Promise<ProcessedContextProjection | ToolResult> {
   const projectId = callerProjectId(scopedCaller);
   if (!projectId) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE);
+  if (scopedCaller.isParticipantTurn && scopedCaller.userId === AMBIGUOUS_PARTICIPANT_ACTOR) {
+    return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'participant identity is ambiguous');
+  }
   const projection = await getProcessedProjectionById(projectionId);
-  if (!projection || !canManageProjectionNamespace(projection.namespace, scopedCaller.namespace, scopedCaller.userId)) {
+  if (
+    !projection
+    || !canManageProjectionNamespace(
+      projection.namespace,
+      scopedCaller.namespace,
+      scopedCaller.userId,
+      !scopedCaller.isParticipantTurn,
+    )
+  ) {
     return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller namespace');
   }
   if (projection.namespace.projectId !== projectId) {
     return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller project');
   }
   return projection;
+}
+
+async function checkObservationMutationScope(
+  observation: ContextObservationRow,
+  scopedCaller: McpRuntimeCaller,
+): Promise<ToolResult | null> {
+  const callerProj = callerProjectId(scopedCaller);
+  const namespaces = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
+  const ns = namespaces.find((n) => n.id === observation.namespaceId);
+  if (callerProj && ns?.projectId && ns.projectId !== callerProj) {
+    return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'observation is outside caller project');
+  }
+  if (scopedCaller.isParticipantTurn) {
+    if (!scopedCaller.userId.trim() || scopedCaller.userId === AMBIGUOUS_PARTICIPANT_ACTOR) {
+      return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'participant identity is ambiguous');
+    }
+    if (!ns || ns.userId !== scopedCaller.userId) {
+      return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'observation is outside participant caller scope');
+    }
+  }
+  return null;
 }
 
 function isToolResultValue(value: ProcessedContextProjection | ToolResult): value is ToolResult {
@@ -1749,10 +1794,17 @@ function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>
 }
 
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
+  const participantSearchOptions: MemoryMcpSearchOptions | undefined = caller.isParticipantTurn
+    ? {
+      requireSharedMachineAuthority: true,
+      loadSharedMachineAuthority: async () => caller.participantAuthority ?? null,
+      ...(deps.memorySearchOptions ?? {}),
+    }
+    : deps.memorySearchOptions;
   const searchMemory: MemoryMcpSearch = deps.searchMemory
-    ?? ((q) => searchMcpMemoryRecall(q, deps.memorySearchOptions));
+    ?? ((q) => searchMcpMemoryRecall(q, participantSearchOptions));
   const listMemorySummaries: MemoryMcpListSummaries = deps.listMemorySummaries
-    ?? ((q) => listMcpMemorySummaries(q, deps.memorySearchOptions));
+    ?? ((q) => listMcpMemorySummaries(q, participantSearchOptions));
   let lastGoodSendSessions: SessionRecord[] | null = null;
   const sendSessions = async (): Promise<SessionRecord[]> => {
     // Keep the in-memory directory before disk refresh. A valid but stale
@@ -2007,7 +2059,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     ?? ((projectionId, mcpCaller, orchDeps) => getMemorySourcesOrchestrated(
       projectionId,
       mcpCaller,
-      { ...(deps.orchestratorDeps ?? {}), ...(orchDeps ?? {}) },
+      {
+        ...(caller.isParticipantTurn
+          ? {
+            loadSharedMachineAuthority: async () => caller.participantAuthority ?? null,
+            ...(!caller.participantAuthority ? { skipCloudLookup: true } : {}),
+          }
+          : {}),
+        ...(deps.orchestratorDeps ?? {}),
+        ...(orchDeps ?? {}),
+      },
     ));
   const saveObservationTool = deps.saveObservation ?? saveObservation;
   const savePreferenceTool = deps.savePreference ?? savePreference;
@@ -2465,7 +2526,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           namespace: scopedCaller.namespace,
           currentEnterpriseId: scopedCaller.namespace.enterpriseId,
           repo: projectId,
-          includeLegacyPersonalOwner: true,
+          includeLegacyPersonalOwner: !caller.isParticipantTurn,
           limit,
         });
         const items = result.items
@@ -2494,7 +2555,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           currentEnterpriseId: scopedCaller.namespace.enterpriseId,
           repo: projectId,
           userId: scopedCaller.userId,
-          includeLegacyPersonalOwner: true,
+          includeLegacyPersonalOwner: !caller.isParticipantTurn,
           projectionClass: listProjectionClassArg(args),
           limit,
         });
@@ -2663,14 +2724,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         if (!observation) {
           return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'observation not found');
         }
-        const callerProj = callerProjectId(scopedCaller);
-        if (callerProj) {
-          const namespaces = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
-          const ns = namespaces.find((n) => n.id === observation.namespaceId);
-          if (ns?.projectId && ns.projectId !== callerProj) {
-            return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'observation is outside caller project');
-          }
-        }
+        const scopeError = await checkObservationMutationScope(observation, scopedCaller);
+        if (scopeError) return scopeError;
         const changed = await getContextStoreClient().run<boolean>('deleteContextObservation', [target.id]);
         if (changed) {
           publishRuntimeMemoryCacheInvalidation({
@@ -2701,17 +2756,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         if (!observation) {
           return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'observation not found');
         }
-        const callerProj = callerProjectId(scopedCaller);
-        if (callerProj) {
-          const namespaces = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
-          const ns = namespaces.find((n) => n.id === observation.namespaceId);
-          if (ns?.projectId && ns.projectId !== callerProj) {
-            return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'observation is outside caller project');
-          }
-        }
+        const scopeError = await checkObservationMutationScope(observation, scopedCaller);
+        if (scopeError) return scopeError;
         const updated = await getContextStoreClient().run<ContextObservationRow | null>('updateContextObservationText', [{
-          id: target.id,
+          observationId: target.id,
           text,
+          updatedByUserId: scopedCaller.userId,
         }]);
         if (!updated) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'observation could not be updated');
         publishRuntimeMemoryCacheInvalidation({
@@ -2758,6 +2808,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, MEMORY_MCP_DISABLED_FLAGS.OBSERVATION_STORE);
       if (gate) return gate;
+      if (caller.isParticipantTurn && (!caller.userId.trim() || caller.userId === AMBIGUOUS_PARTICIPANT_ACTOR)) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'participant identity is ambiguous or unavailable for saving observations');
+      }
       const args = pickAllowedMcpArgs(input, ['content', 'tags', 'turnId', 'idempotencyKey', 'replacesRef']);
       const replacesRef = stringArg(args, 'replacesRef');
       if (replacesRef) {
@@ -2765,9 +2818,18 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const resolvedReplaces = await resolveMemoryRefArg({ ref: replacesRef }, scopedCaller.namespace);
         if (isMemoryRefTarget(resolvedReplaces)) {
           if (resolvedReplaces.kind === 'observation') {
-            await getContextStoreClient().run('deleteContextObservation', [resolvedReplaces.id]).catch(() => {});
-            publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId: resolvedReplaces.id, namespace: scopedCaller.namespace });
+            const observation = await getContextStoreClient().run<ContextObservationRow | null>('getContextObservationById', [resolvedReplaces.id]);
+            if (observation) {
+              const scopeError = await checkObservationMutationScope(observation, scopedCaller);
+              if (scopeError) return scopeError;
+              await getContextStoreClient().run('deleteContextObservation', [resolvedReplaces.id]).catch(() => {});
+              publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId: resolvedReplaces.id, namespace: scopedCaller.namespace });
+            }
           } else {
+            const projection = scopedCaller.isParticipantTurn
+              ? await loadManageableProjection(resolvedReplaces.id, scopedCaller, getProcessedProjectionById)
+              : undefined;
+            if (projection && isToolResultValue(projection)) return projection;
             try {
               await deleteMemory(resolvedReplaces.id);
             } catch {}
@@ -2791,6 +2853,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.preferences, MEMORY_MCP_DISABLED_FLAGS.PREFERENCES);
       if (gate) return gate;
+      if (caller.isParticipantTurn) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'personal preference tools are not available during a shared-session participant turn');
+      }
       return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET]: async () => {

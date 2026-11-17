@@ -62,6 +62,8 @@ export interface MemoryMcpSearchOptions {
   } | null;
   loadCredentials?: () => Promise<MemoryMcpSearchOptions['credentials']>;
   loadSharedMachineAuthority?: () => Promise<string | null>;
+  /** Fail closed on cloud calls when true and no shared-machine authority header is present (e.g. participant turns). */
+  requireSharedMachineAuthority?: boolean;
 }
 
 function localMemoryDegradedReason(error: unknown): string {
@@ -176,6 +178,9 @@ async function searchCloudMemoryRecall(
       return [];
     }
   }
+  if (options.requireSharedMachineAuthority && !sharedMachineAuthority) {
+    return [];
+  }
   const response = await fetchImpl(cloudRecallUrl(credentials.workerUrl, credentials.serverId), {
     method: 'POST',
     headers: {
@@ -235,6 +240,9 @@ async function listCloudMemorySummaries(
     } catch {
       return [];
     }
+  }
+  if (options.requireSharedMachineAuthority && !sharedMachineAuthority) {
+    return [];
   }
   const response = await fetchImpl(cloudPersonalMemoryUrl(credentials.workerUrl, {
     projectId: requestedProjectId,

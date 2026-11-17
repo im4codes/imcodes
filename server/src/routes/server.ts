@@ -601,7 +601,7 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
 async function checkDaemonSelfAccess(
   c: { req: { header: (name: string) => string | undefined }; env: Env; json: (data: unknown, status?: number) => Response },
   serverRow: { serverId: string; userId: string },
-  options: { blockSharedHost?: boolean } = {},
+  options: { blockSharedHost?: boolean; denyParticipant?: boolean } = {},
 ): Promise<Response | null> {
   const authority = await resolveSharedMachineAuthority(c.env.DB, {
     token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
@@ -612,6 +612,9 @@ async function checkDaemonSelfAccess(
   });
   if (authority.kind === 'invalid') {
     return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
+  }
+  if (options.denyParticipant && authority.kind === 'participant') {
+    return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
   }
   if (options.blockSharedHost && authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
     return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
@@ -932,6 +935,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
 serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
+  const denied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true, denyParticipant: true });
+  if (denied) return denied;
   const serverRow = authed.auth;
   const featureFlags = parseMemoryFeatureFlagValuesJson(
     await getUserPref(c.env.DB, serverRow.userId, MEMORY_FEATURE_CONFIG_PREF_KEY),
@@ -993,6 +998,10 @@ serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
 serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
+  // Reject explicit invalid/participant authority headers immediately; defer the DB-backed
+  // shared-host check until after the empty-query fast path so blank searches never hit PostgreSQL.
+  const immediateDenied = await checkDaemonSelfAccess(c, authed.auth, { denyParticipant: true });
+  if (immediateDenied) return immediateDenied;
   const serverRow = authed.auth;
   const body = await c.req.json().catch(() => null);
   // Empty searches are intentionally a no-op (and must not consult feature
@@ -1005,6 +1014,8 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const query = parsed.data.query?.trim() ?? '';
   if (!query) return c.json(sameShapeSearchEnvelope());
+  const sharedHostDenied = await checkDaemonSelfAccess(c, authed.auth, { blockSharedHost: true, denyParticipant: true });
+  if (sharedHostDenied) return sharedHostDenied;
 
   const featureFlags = parseMemoryFeatureFlagValuesJson(
     await getUserPref(c.env.DB, serverRow.userId, MEMORY_FEATURE_CONFIG_PREF_KEY),

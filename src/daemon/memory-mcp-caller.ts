@@ -18,6 +18,10 @@ export interface McpRuntimeCaller {
   serverId: string | null;
   providerId: string | null;
   transport: MemoryMcpTransport;
+  /** True when the daemon invokes memory tools during a shared-session participant turn. */
+  isParticipantTurn?: boolean;
+  /** Server-minted participant authority token (or null when ambiguous/absent) for cloud memory calls. */
+  participantAuthority?: string | null;
 }
 
 export class MemoryMcpCallerEnvError extends Error {

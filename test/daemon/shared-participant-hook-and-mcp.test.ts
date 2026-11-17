@@ -11,11 +11,17 @@ import { MEMORY_MCP_DAEMON_RPC_PATH } from '../../shared/memory-mcp-daemon-rpc.j
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
-const participantTurns = new Set<string>();
-const sessionsMap = new Map<string, { name: string; projectName: string; state: string }>();
+const participantTurns = new Map<string, { actorUserId: string; authority: string | null }>();
+const sessionsMap = new Map<string, {
+  name: string;
+  projectName: string;
+  state: string;
+  contextNamespace?: { scope: 'personal' | 'user_private' | 'project_shared'; projectId: string; userId?: string };
+}>();
 
 vi.mock('../../src/daemon/sender-participant-turn.js', () => ({
-  readSenderParticipantTurn: vi.fn((sessionName: string) => participantTurns.has(sessionName)),
+  AMBIGUOUS_PARTICIPANT_ACTOR: '__ambiguous_participant__',
+  readSenderParticipantTurn: vi.fn((sessionName: string) => participantTurns.get(sessionName) ?? null),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -155,10 +161,20 @@ describe('hook-server shared participant isolation', () => {
     clearQueues();
     participantTurns.clear();
     sessionsMap.clear();
-    participantTurns.add('deck_shared_main');
-    sessionsMap.set('deck_shared_main', { name: 'deck_shared_main', projectName: 'proj-shared', state: 'idle' });
+    participantTurns.set('deck_shared_main', { actorUserId: 'participant_user_1', authority: 'sma.jwt.part.1' });
+    sessionsMap.set('deck_shared_main', {
+      name: 'deck_shared_main',
+      projectName: 'proj-shared',
+      state: 'idle',
+      contextNamespace: { scope: 'personal', projectId: 'proj_shared', userId: 'owner_user_1' },
+    });
     sessionsMap.set('deck_shared_sub', { name: 'deck_shared_sub', projectName: 'proj-shared', state: 'idle' });
-    sessionsMap.set('deck_private_main', { name: 'deck_private_main', projectName: 'proj-private', state: 'idle' });
+    sessionsMap.set('deck_private_main', {
+      name: 'deck_private_main',
+      projectName: 'proj-private',
+      state: 'idle',
+      contextNamespace: { scope: 'personal', projectId: 'proj_private', userId: 'owner_user_1' },
+    });
 
     const started = await startHookServer(onHook, {
       invokeMemoryMcpTool,
@@ -175,8 +191,8 @@ describe('hook-server shared participant isolation', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  it('allows MEMORY_MCP_DAEMON_RPC_PATH server/session/identity/history/pair/send/project tools during participant turns while keeping save_preference owner-only', async () => {
-    for (const [tool, input] of [
+  it('scopes participant memory tool callers to actorUserId while keeping session/identity/pair/send tools at owner parity and save_preference forbidden', async () => {
+    const ownerParityTools = [
       ['session_identity_get', {}],
       ['session_identity_set', { identityScope: 'session', content: 'Updated role' }],
       ['session_identity_clear', { identityScope: 'session' }],
@@ -184,17 +200,69 @@ describe('hook-server shared participant isolation', () => {
       ['session_history', { kind: 'text', limit: 10 }],
       ['send_message', { to: 'deck_shared_sub', message: 'hi sibling' }],
       ['pair_create', { title: 'Test', brief: 'Brief' }],
-      ['search_memory', { query: 'hello' }],
       ['memory_injection_set', { enabled: false }],
-    ] as const) {
+    ] as const;
+
+    for (const [tool, input] of ownerParityTools) {
       const res = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_shared_main', {
         tool,
         input,
       });
       expect(res.status, tool).toBe(200);
       expect(res.body, tool).toMatchObject({ ok: true, result: { status: 'ok' } });
+      const [callerArg] = invokeMemoryMcpTool.mock.calls.at(-1)! as [{ userId: string; namespace: { userId?: string }; isParticipantTurn?: boolean }, string];
+      expect(callerArg.userId, `${tool} keeps owner parity`).toBe('owner_user_1');
+      expect(callerArg.isParticipantTurn, `${tool} does not downgrade operational scope`).toBeUndefined();
     }
-    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(9);
+
+    const participantScopedMemoryTools = [
+      ['search_memory', { query: 'hello' }],
+      ['list_memory_summaries', { limit: 5 }],
+      ['get_memory_sources', { projectionId: 'proj_1' }],
+      ['archive_memory', { projectionId: 'proj_1' }],
+      ['restore_memory', { projectionId: 'proj_1' }],
+      ['delete_memory', { projectionId: 'proj_1' }],
+      ['update_memory', { projectionId: 'proj_1', text: 'edited' }],
+      ['memory_feedback', { projectionId: 'proj_1', feedback: 'relevant' }],
+      ['save_observation', { content: 'fact' }],
+    ] as const;
+
+    for (const [tool, input] of participantScopedMemoryTools) {
+      const res = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_shared_main', {
+        tool,
+        input,
+      });
+      expect(res.status, tool).toBe(200);
+      expect(res.body, tool).toMatchObject({ ok: true, result: { status: 'ok' } });
+      const [callerArg] = invokeMemoryMcpTool.mock.calls.at(-1)! as [{
+        userId: string;
+        namespace: { userId?: string };
+        isParticipantTurn?: boolean;
+        participantAuthority?: string | null;
+      }, string];
+      expect(callerArg.userId, `${tool} caller.userId`).toBe('participant_user_1');
+      expect(callerArg.namespace.userId, `${tool} caller.namespace.userId`).toBe('participant_user_1');
+      expect(callerArg.isParticipantTurn, `${tool} isParticipantTurn`).toBe(true);
+      expect(callerArg.participantAuthority, `${tool} participantAuthority`).toBe('sma.jwt.part.1');
+    }
+
+    // Ambiguous participant turn fails closed with the sentinel actor and null authority on memory calls.
+    participantTurns.set('deck_shared_main', { actorUserId: '__ambiguous_participant__', authority: null });
+    const ambigRes = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_shared_main', {
+      tool: 'search_memory',
+      input: { query: 'secret' },
+    });
+    expect(ambigRes.status).toBe(200);
+    const [ambigCaller] = invokeMemoryMcpTool.mock.calls.at(-1)! as [{
+      userId: string;
+      namespace: { userId?: string };
+      isParticipantTurn?: boolean;
+      participantAuthority?: string | null;
+    }];
+    expect(ambigCaller.userId).toBe('__ambiguous_participant__');
+    expect(ambigCaller.namespace.userId).toBe('__ambiguous_participant__');
+    expect(ambigCaller.isParticipantTurn).toBe(true);
+    expect(ambigCaller.participantAuthority).toBeNull();
 
     const blockedPref = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_shared_main', {
       tool: 'save_preference',
@@ -205,7 +273,7 @@ describe('hook-server shared participant isolation', () => {
       ok: true,
       result: { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN },
     });
-    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(9);
+    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(ownerParityTools.length + participantScopedMemoryTools.length + 1);
 
     const ownerPref = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_private_main', {
       tool: 'save_preference',
@@ -213,7 +281,7 @@ describe('hook-server shared participant isolation', () => {
     });
     expect(ownerPref.status).toBe(200);
     expect(ownerPref.body).toMatchObject({ ok: true, result: { status: 'ok' } });
-    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(10);
+    expect(invokeMemoryMcpTool).toHaveBeenCalledTimes(ownerParityTools.length + participantScopedMemoryTools.length + 2);
   });
 
   it('allows participant turns to list and switch models on self and other sessions with owner parity', async () => {
