@@ -96,10 +96,12 @@ export function bindProcessSharedMachineActivity(
   // ONLY if the new activity carries a explicit rebind token (authority) for the new identity,
   // do we allow continuity. Otherwise, restart the window.
   if (window && window.identity && identity && !sameIdentity(window.identity, identity)) {
-    if (window.identity.sessionInstanceId === identity.sessionInstanceId && activity.authority) {
+    const isRestart = window.identity.sessionInstanceId === identity.sessionInstanceId;
+    if (isRestart && activity.kind === SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT && activity.authority) {
         window.identity = identity;
         window.authority = activity.authority;
     } else {
+        windows.delete(sessionName);
         window = undefined;
     }
   }
