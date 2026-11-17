@@ -9,11 +9,15 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "start": "npm run build && electron ."
+    "start": "npm run build && electron .",
+    "pack:mac": "node ../../scripts/build-pc-app.mjs --platform darwin",
+    "pack:win": "node ../../scripts/build-pc-app.mjs --platform win32",
+    "verify:bundle": "node ../../scripts/build-pc-app.mjs --verify-only"
   },
   "devDependencies": {
     "@types/node": "^24.19.1",
     "electron": "^45.3.3",
+    "electron-builder": "^26.18.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "vitest": "^3.2.7"
   }
