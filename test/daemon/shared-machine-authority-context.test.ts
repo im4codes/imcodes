@@ -146,6 +146,28 @@ describe('process shared machine authority context', () => {
     expect(readProcessSharedMachineAuthority(SESSION, restarted, 2_001)).toEqual(OPEN);
   });
 
+  it('same instance + epoch mismatch (missing participant proof) stays CLOSED', () => {
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok1'), { now: 1_000 });
+      const sameInstanceEpochMismatch = { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-2' };
+      // Owner activity here without proof should be closed because the window is participant bound
+      bindProcessSharedMachineActivity(SESSION, sameInstanceEpochMismatch, owner, { now: 2_000 });
+      expect(readProcessSharedMachineAuthority(SESSION, sameInstanceEpochMismatch, 2_001)).toEqual(CLOSED);
+  });
+
+  it('same instance + participant proof rebinds', () => {
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok1'), { now: 1_000 });
+      const sameInstanceEpochMismatch = { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-2' };
+      bindProcessSharedMachineActivity(SESSION, sameInstanceEpochMismatch, participant('alice', 'tok2'), { now: 2_000 });
+      expect(readProcessSharedMachineAuthority(SESSION, sameInstanceEpochMismatch, 2_001)).toEqual({ required: true, authority: 'tok2' });
+  });
+
+  it('mixed/owner cannot inherit participant authority', () => {
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok1'), { now: 1_000 });
+      // Same identity, but owner activity mixes in
+      bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 2_000 });
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 2_001)).toEqual(CLOSED);
+  });
+
   it('ignores an idle signal that is only the tail of the previous turn', () => {
     bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 5_000 }).typed(5_000);
     releaseProcessSharedMachineAuthority(SESSION, 5_000 + PROCESS_SHARED_MACHINE_IDLE_GUARD_MS - 1);
@@ -270,7 +292,7 @@ describe('process session: origin chain rows', () => {
       authority: 'owner-tok',
     });
     expect(readProcessSharedMachineAuthority(SESSION, { sessionInstanceId: 'other', runtimeEpoch: 'epoch-1' }, 1_100, true))
-      .toEqual(OPEN);
+      .toEqual(CLOSED);
 
     // Unstamped local/internal owner activity clears ownerToken (fail closed)
     bindProcessSharedMachineCommand(SESSION, record, { data: 'local\r' }, 1_200);
@@ -281,5 +303,37 @@ describe('process session: origin chain rows', () => {
     bindProcessSharedMachineCommand(SESSION, record, { data: 'run\r', ownerMachineAuthority: 'owner-tok-2' }, 2_000);
     bindProcessSharedMachineCommand(SESSION, record, { sharedActor: { actorUserId: 'p-1', effectiveActorRole: 'participant' }, sharedMachineAuthority: 'p-tok' }, 2_100);
     expect(readProcessSharedMachineAuthority(SESSION, identity, 2_200, true)).toEqual(CLOSED);
+  });
+
+  it('allows restart rebind for a participant with explicit authority proof', () => {
+    const identity1 = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-1' };
+    const identity2 = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-2' };
+    
+    // 1. Bind participant A at epoch-1
+    bindProcessSharedMachineActivity(SESSION, identity1, participant('alice', 'tok1'), { now: 1_000 });
+    
+    // 2. Bind participant A at same instance, epoch-2 with explicit authority
+    bindProcessSharedMachineActivity(SESSION, identity2, participant('alice', 'tok2'), { now: 2_000 });
+    
+    // 3. Assert epoch-2 is open with new token
+    expect(readProcessSharedMachineAuthority(SESSION, identity2, 2_001)).toEqual({ required: true, authority: 'tok2' });
+
+    // 4. Verify epoch-2 without authority fails closed
+    const identity3 = { sessionInstanceId: 'inst-2', runtimeEpoch: 'epoch-2' };
+    expect(readProcessSharedMachineAuthority(SESSION, identity3, 2_001)).toEqual(CLOSED);
+  });
+
+  it('verifies owner/mixed activity cannot rebind a participant window', () => {
+    const identity1 = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-1' };
+    const identity2 = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-2' };
+    
+    bindProcessSharedMachineActivity(SESSION, identity1, participant('alice', 'tok1'), { now: 1_000 });
+    
+    // Try to rebind with owner activity (no authority token)
+    bindProcessSharedMachineActivity(SESSION, identity2, owner, { now: 2_000 });
+    
+    // Should fail closed because owner cannot rebind participant window.
+    const result = readProcessSharedMachineAuthority(SESSION, identity2, 2_001);
+    expect(result).toEqual(CLOSED);
   });
 });

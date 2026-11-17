@@ -93,7 +93,24 @@ export function bindProcessSharedMachineActivity(
   const now = opts.now ?? Date.now();
   let window = windows.get(sessionName);
   // A restarted runtime or a long-quiet idle session starts a fresh window.
-  if (window && window.identity && identity && !sameIdentity(window.identity, identity)) window = undefined;
+  // ONLY if the new activity carries a explicit rebind token (authority) for the new identity,
+  // do we allow continuity. Otherwise, restart the window.
+  if (window && window.identity && identity && !sameIdentity(window.identity, identity)) {
+    const isRestart = window.identity.sessionInstanceId === identity.sessionInstanceId;
+    if (isRestart) {
+        if (activity.kind === SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT && activity.authority) {
+            window.identity = identity;
+            window.authority = activity.authority;
+        } else {
+            // Same instance, invalid rebind -> refuse to bind to this context.
+            return NO_BINDING;
+        }
+    } else {
+        // Different instance -> restart window, treat as a fresh context.
+        windows.delete(sessionName);
+        window = undefined;
+    }
+  }
   if (window && quietAndIdle(window, now, opts.sessionRunning ?? false)) window = undefined;
   if (!window) {
     // A session that is running when the window opens is running a turn the daemon never saw start
@@ -237,7 +254,8 @@ export function readProcessSharedMachineAuthority(
   }
   // Owner-only activity is the ordinary unrestricted path; on shared hosts it carries its server-signed owner token.
   if (window.participants.size === 0) {
-    const ownerAuthority = sameIdentity(window.identity, identity) ? window.ownerAuthority : null;
+    if (!sameIdentity(window.identity, identity)) return { required: true, authority: null };
+    const ownerAuthority = window.ownerAuthority;
     return ownerAuthority
       ? { required: false, actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER, authority: ownerAuthority }
       : { required: false, authority: null };
