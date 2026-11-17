@@ -1,4 +1,12 @@
-import { app, BrowserWindow, dialog, Menu, shell, type MenuItemConstructorOptions } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  Menu,
+  Notification,
+  shell,
+  type MenuItemConstructorOptions,
+} from 'electron';
 import { createPcAppShell } from './shell.js';
 
 export async function startPcApp(): Promise<void> {
@@ -25,9 +33,18 @@ export async function startPcApp(): Promise<void> {
       dialog.showSaveDialogSync(win as unknown as BrowserWindow, { defaultPath }),
     showMessageBox: (win, options) =>
       dialog.showMessageBox(win as unknown as BrowserWindow, options),
+    showNotification: ({ title, body }) => {
+      if (Notification.isSupported()) {
+        new Notification({ title, body }).show();
+      }
+    },
+    bindDeps: {
+      resourcesPath: process.resourcesPath,
+    },
   });
 
   await pcShell.ensureWindow();
+  await pcShell.checkLaunchAgent();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

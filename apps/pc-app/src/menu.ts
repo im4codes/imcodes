@@ -1,3 +1,4 @@
+import type { BoundServerSummary } from './bind.js';
 import type { SavedServer } from './servers.js';
 
 export interface MenuItemOptionsLike {
@@ -17,6 +18,7 @@ export interface AppMenuOptions {
   appName: string;
   servers: SavedServer[];
   activeOrigin: string | null;
+  boundServer?: BoundServerSummary | null;
   onSelectServer: (origin: string) => void;
   onAddServer: () => void;
   onRemoveServer: (origin: string) => void;
@@ -42,6 +44,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     appName,
     servers,
     activeOrigin,
+    boundServer,
     onSelectServer,
     onAddServer,
     onRemoveServer,
@@ -95,7 +98,9 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
       { type: 'separator' },
       {
         id: 'server:bind-fallback',
-        label: 'Bind This Machine…',
+        label: boundServer
+          ? `Rebind Machine (${boundServer.serverName} · ${boundServer.workerUrl})…`
+          : 'Bind This Machine…',
         enabled: Boolean(activeOrigin),
         click: onBindFallback,
       },
