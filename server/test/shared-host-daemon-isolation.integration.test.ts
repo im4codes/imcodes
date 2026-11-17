@@ -266,6 +266,21 @@ describe('Vector B: Shared/contributed daemon token without shared-machine autho
       });
       expect(ftPrivRes.status, `${host.label} POST /api/server/:M_priv1/upload`).toBe(403);
 
+      // Bare shared-host daemon tokens without authority must be blocked from owner-private memory routes
+      const bareOwnerPrivWrite = await app.request(`/api/server/${host.id}/shared-context/owner-private`, {
+        method: 'POST',
+        headers: { ...hdrs, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ namespace: { scope: 'user_private', userId: OWNER_A }, records: [] }),
+      });
+      expect(bareOwnerPrivWrite.status, `${host.label} bare POST owner-private`).toBe(403);
+
+      const bareOwnerPrivSearch = await app.request(`/api/server/${host.id}/shared-context/owner-private/search`, {
+        method: 'POST',
+        headers: { ...hdrs, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: 'secret' }),
+      });
+      expect(bareOwnerPrivSearch.status, `${host.label} bare POST owner-private/search`).toBe(403);
+
       // Own daemon-local session inventory sync MUST continue working on M_shared / M_team itself
       const ownSessRes = await app.request(`/api/server/${host.id}/sessions`, { headers: hdrs });
       expect(ownSessRes.status, `${host.label} own GET /sessions`).toBe(200);
@@ -295,6 +310,20 @@ describe('Vector A: Participant authority on M_shared is strictly scoped to User
     const partPersonalMemRes = await app.request('/api/shared-context/personal-memory', { headers: partHdrs });
     expect(partPersonalMemRes.status).toBe(200);
     expect((await partPersonalMemRes.json() as { records: unknown[] }).records).toEqual([]);
+    // Server owner-private memory replication/search routes MUST reject participant_daemon authority
+    const partOwnerPrivWrite = await app.request(`/api/server/${M_SHARED}/shared-context/owner-private`, {
+      method: 'POST',
+      headers: { ...partHdrs, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ namespace: { scope: 'user_private', userId: OWNER_A }, records: [] }),
+    });
+    expect(partOwnerPrivWrite.status).toBe(403);
+
+    const partOwnerPrivSearch = await app.request(`/api/server/${M_SHARED}/shared-context/owner-private/search`, {
+      method: 'POST',
+      headers: { ...partHdrs, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'owner-secret' }),
+    });
+    expect(partOwnerPrivSearch.status).toBe(403);
     // Outbound no longer blocks participant turns with shared_participant_forbidden, while still refusing foreign bots
     expect((await app.request('/api/outbound', {
       method: 'POST',

@@ -225,4 +225,46 @@ describe('participant owner-parity vs share-invite denial', () => {
     })).status).toBe(403);
     expect((await app.request('/api/server/srv-shared/share-audit')).status).toBe(403);
   });
+
+  it('serverRoutes owner-private write and search reject participant_daemon and bare shared-host daemon tokens at route level', async () => {
+    const { serverRoutes } = await import('../src/routes/server.js');
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.env = {
+        DB: {
+          queryOne: vi.fn(async () => null),
+          execute: vi.fn(async () => ({ changes: 1 })),
+        } as never,
+        JWT_SIGNING_KEY: 'secret-key-at-least-32-chars-long!',
+      } as never;
+      await next();
+    });
+    app.route('/api/server', serverRoutes);
+
+    const writeRes = await app.request('/api/server/srv-shared/shared-context/owner-private', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer daemon-tok', 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
+      body: JSON.stringify({ namespace: { scope: 'user_private', userId: 'owner-user' }, records: [] }),
+    });
+    expect(writeRes.status).toBe(403);
+    expect(await writeRes.json()).toMatchObject({ reason: 'shared_participant_forbidden' });
+
+    const searchRes = await app.request('/api/server/srv-shared/shared-context/owner-private/search', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer daemon-tok', 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
+      body: JSON.stringify({ query: 'secret' }),
+    });
+    expect(searchRes.status).toBe(403);
+    expect(await searchRes.json()).toMatchObject({ reason: 'shared_participant_forbidden' });
+
+    mockResolveSharedMachineAuthority.mockResolvedValue({ kind: 'absent' });
+    mockIsSharedOrContributedServer.mockResolvedValueOnce(true);
+    const bareRes = await app.request('/api/server/srv-shared/shared-context/owner-private/search', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer daemon-tok', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'secret' }),
+    });
+    expect(bareRes.status).toBe(403);
+    expect(await bareRes.json()).toMatchObject({ reason: 'shared_host_daemon_authority_required' });
+  });
 });
