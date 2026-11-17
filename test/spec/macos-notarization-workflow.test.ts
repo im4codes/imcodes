@@ -7,7 +7,13 @@ import { readSource } from '../helpers/read-source.js';
 
 const { execFileSync } = vi.hoisted(() => ({ execFileSync: vi.fn() }));
 vi.mock('node:child_process', () => ({ execFileSync }));
-import { MACOS_RELEASE_SIGNING_TOOLS, notarizeAndStaple } from '../../scripts/macos-release-signing.mjs';
+import {
+  MACOS_NOTARY_SUBMIT_TIMEOUT,
+  MACOS_RELEASE_SIGNING_TOOLS,
+  buildNotarySubmitArgs,
+  notarizeAndStaple,
+  resolveNotarySubmitTimeout,
+} from '../../scripts/macos-release-signing.mjs';
 
 describe('release workflows use the validated notarization result once', () => {
   it.each(['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml'])(
@@ -145,5 +151,32 @@ describe('notarization gate under CloudKit validation failures', () => {
     expect(commands('submit')).toHaveLength(1);
     expect(commands('staple')).toHaveLength(0);
     expect(commands('validate')).toHaveLength(0);
+  });
+
+  it('bounds notarytool submit --wait with --timeout and process timeout to prevent 40+ min Apple stalls', () => {
+    injectValidationFailure(0);
+    notarizeAndStaple(artifact('dmg'));
+    const submitCall = commands('submit')[0]!;
+    const [, args, opts] = submitCall;
+    expect(args).toContain('--wait');
+    expect(args).toContain('--timeout');
+    expect(args[args.indexOf('--timeout') + 1]).toBe(MACOS_NOTARY_SUBMIT_TIMEOUT);
+    expect((opts as { timeout?: number }).timeout).toBe(16 * 60_000);
+    expect(resolveNotarySubmitTimeout('10m')).toBe('10m');
+    expect(() => resolveNotarySubmitTimeout('forever')).toThrow(/invalid macOS notary timeout/);
+    expect(buildNotarySubmitArgs('/tmp/a.dmg', {
+      apiKeyPath: '/tmp/k.p8',
+      apiKeyId: 'id',
+      apiIssuer: 'iss',
+      submitTimeout: '20m',
+    })).toEqual([
+      'notarytool', 'submit', '/tmp/a.dmg',
+      '--key', '/tmp/k.p8',
+      '--key-id', 'id',
+      '--issuer', 'iss',
+      '--wait',
+      '--timeout', '20m',
+      '--output-format', 'json',
+    ]);
   });
 });

@@ -6,9 +6,10 @@
 // decide something are pure functions so they can be tested without an Apple
 // account; the shell calls around them stay thin on purpose.
 
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { macosArtifactCanCarryNotarizationTicket } from '../src/node/macos-apple-trust.mjs';
 
@@ -168,6 +169,20 @@ function run(tool, args, options = {}) {
   return execFileSync(tool, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...options });
 }
 
+function runAsync(tool, args, options = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(tool, args, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
+      if (error) {
+        if (error.stdout === undefined) error.stdout = stdout;
+        if (error.stderr === undefined) error.stderr = stderr;
+        rejectPromise(error);
+        return;
+      }
+      resolvePromise(stdout);
+    });
+  });
+}
+
 /**
  * Import the release identity into a keychain that exists only for this job.
  *
@@ -284,6 +299,46 @@ export function buildUnstapledNotarizationRecord(input) {
   });
 }
 
+export const MACOS_NOTARY_SUBMIT_TIMEOUT = '15m';
+const NOTARY_TIMEOUT_RE = /^(\d+)\s*([smh])$/iu;
+
+/** Resolve and validate the bounded `notarytool submit --timeout` duration. */
+export function resolveNotarySubmitTimeout(explicitTimeout) {
+  const raw = String(
+    explicitTimeout
+      ?? process.env.IMCODES_MACOS_NOTARY_TIMEOUT
+      ?? MACOS_NOTARY_SUBMIT_TIMEOUT,
+  ).trim();
+  if (!NOTARY_TIMEOUT_RE.test(raw)) {
+    throw new Error(`invalid macOS notary timeout "${raw}" (expected e.g. 15m, 900s, 1h)`);
+  }
+  return raw.toLowerCase();
+}
+
+function notaryTimeoutToMs(timeoutDuration) {
+  const match = NOTARY_TIMEOUT_RE.exec(timeoutDuration);
+  if (!match) return 15 * 60_000;
+  const amount = Number.parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  if (unit === 's') return amount * 1000;
+  if (unit === 'h') return amount * 3600_000;
+  return amount * 60_000;
+}
+
+/** Build deterministic `xcrun notarytool submit` arguments with a bounded wait timeout. */
+export function buildNotarySubmitArgs(uploadPath, input) {
+  const timeout = resolveNotarySubmitTimeout(input.submitTimeout);
+  return [
+    'notarytool', 'submit', uploadPath,
+    '--key', input.apiKeyPath,
+    '--key-id', input.apiKeyId,
+    '--issuer', input.apiIssuer,
+    '--wait',
+    '--timeout', timeout,
+    '--output-format', 'json',
+  ];
+}
+
 /**
  * Notarize a bare executable.
  *
@@ -298,6 +353,17 @@ export function notarizeExecutable(input) {
   }
   const submission = submitForNotarization(input);
   const ticketSha256 = createHash('sha256').update(readFileSync(artifactPath)).digest('hex');
+  return buildUnstapledNotarizationRecord({ submission, ticketSha256, artifactPath });
+}
+
+/** Async counterpart to `notarizeExecutable` so independent components notarize concurrently. */
+export async function notarizeExecutableAsync(input) {
+  const { artifactPath } = input;
+  if (macosArtifactSupportsStapling(artifactPath)) {
+    throw new Error(`${artifactPath} is a staplable format; use notarizeAndStaple`);
+  }
+  const submission = await submitForNotarizationAsync(input);
+  const ticketSha256 = createHash('sha256').update(await readFile(artifactPath)).digest('hex');
   return buildUnstapledNotarizationRecord({ submission, ticketSha256, artifactPath });
 }
 
@@ -342,37 +408,54 @@ export function isTransientStaplerFailure(error) {
 }
 
 function submitForNotarization(input) {
-  const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
+  const { artifactPath } = input;
   const direct = macosArtifactCanBeSubmittedDirectly(artifactPath);
   const uploadPath = direct ? artifactPath : `${artifactPath}.notarize.zip`;
+  const timeout = resolveNotarySubmitTimeout(input.submitTimeout);
+  const submitArgs = buildNotarySubmitArgs(uploadPath, { ...input, submitTimeout: timeout });
+  const processTimeoutMs = notaryTimeoutToMs(timeout) + 60_000;
   try {
     if (!direct) {
       // `--keepParent` so the archive contains the bundle, not its contents.
       run(MACOS_RELEASE_SIGNING_TOOLS.ditto, ['-c', '-k', '--keepParent', artifactPath, uploadPath]);
     }
-    // Retried, because the submission crosses the public internet and a single
-    // TCP connect timeout otherwise destroys a release that has already spent
-    // minutes compiling. Observed exactly that: `HTTPClientError.connectTimeout`
-    // on the second of four components, with the same upload succeeding three
-    // times in a row immediately afterwards.
-    //
-    // Bounded and narrow on purpose. Only a TRANSPORT failure is retried: a
-    // rejection by Apple is a verdict about the artifact and repeating it would
-    // turn a clear "Invalid" into a slow one. And `submit --wait` is safe to
-    // repeat -- each attempt is an independent submission with its own id, so a
-    // retry cannot corrupt a submission that did in fact arrive.
     const attempts = input.submissionAttempts ?? 3;
     let lastError;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
-        return parseNotarizationSubmission(run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
-          'notarytool', 'submit', uploadPath,
-          '--key', apiKeyPath,
-          '--key-id', apiKeyId,
-          '--issuer', apiIssuer,
-          '--wait',
-          '--output-format', 'json',
-        ]));
+        return parseNotarizationSubmission(
+          run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, submitArgs, { timeout: processTimeoutMs }),
+        );
+      } catch (error) {
+        const text = `${error?.stderr ?? ''}${error?.stdout ?? ''}${error?.message ?? ''}`;
+        if (attempt === attempts || !NOTARIZATION_TRANSPORT_FAILURE.test(text)) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  } finally {
+    if (!direct) rmSync(uploadPath, { force: true });
+  }
+}
+
+async function submitForNotarizationAsync(input) {
+  const { artifactPath } = input;
+  const direct = macosArtifactCanBeSubmittedDirectly(artifactPath);
+  const uploadPath = direct ? artifactPath : `${artifactPath}.notarize.zip`;
+  const timeout = resolveNotarySubmitTimeout(input.submitTimeout);
+  const submitArgs = buildNotarySubmitArgs(uploadPath, { ...input, submitTimeout: timeout });
+  const processTimeoutMs = notaryTimeoutToMs(timeout) + 60_000;
+  try {
+    if (!direct) {
+      await runAsync(MACOS_RELEASE_SIGNING_TOOLS.ditto, ['-c', '-k', '--keepParent', artifactPath, uploadPath]);
+    }
+    const attempts = input.submissionAttempts ?? 3;
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return parseNotarizationSubmission(
+          await runAsync(MACOS_RELEASE_SIGNING_TOOLS.xcrun, submitArgs, { timeout: processTimeoutMs }),
+        );
       } catch (error) {
         const text = `${error?.stderr ?? ''}${error?.stdout ?? ''}${error?.message ?? ''}`;
         if (attempt === attempts || !NOTARIZATION_TRANSPORT_FAILURE.test(text)) throw error;

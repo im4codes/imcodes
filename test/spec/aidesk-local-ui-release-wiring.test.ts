@@ -8,6 +8,7 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse as parseYaml } from 'yaml';
 import { readSource } from '../helpers/read-source.js';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -17,17 +18,25 @@ describe('native aiDesk window release wiring', () => {
   const action = read('.github/actions/build-aidesk-ui/action.yml');
 
   it('both release workflows run the one composite action right before the node executable build, after the Windows signing identity is imported, and upload its output', () => {
-    for (const path of ['.github/workflows/build-node-exe.yml', '.github/workflows/ci.yml']) {
-      const workflow = read(path);
-      const stepAt = workflow.indexOf('uses: ./.github/actions/build-aidesk-ui');
-      const buildAt = workflow.indexOf('run: npm run build:node-exe');
-      expect(stepAt, path).toBeGreaterThan(-1);
-      expect(stepAt, path).toBeLessThan(buildAt);
-      expect(workflow.match(/uses: \.\/\.github\/actions\/build-aidesk-ui/gu), path).toHaveLength(1);
-      expect(workflow, path).toContain('dist-node-exe/aidesk-local-ui/**');
-      expect(workflow, path).toContain('windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}');
-      expect(workflow.indexOf('IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT='), path).toBeGreaterThan(-1);
-      expect(workflow.indexOf('IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT='), path).toBeLessThan(stepAt);
+    for (const spec of [
+      { path: '.github/workflows/build-node-exe.yml', jobKey: 'build' },
+      { path: '.github/workflows/ci.yml', jobKey: 'controlled-node-windows' },
+    ]) {
+      const workflow = read(spec.path);
+      const parsed = parseYaml(workflow) as {
+        jobs: Record<string, { steps: Array<{ uses?: string; run?: string; with?: Record<string, unknown> }> }>;
+      };
+      const steps = parsed.jobs[spec.jobKey].steps;
+      const stepIdx = steps.findIndex((s) => s.uses === './.github/actions/build-aidesk-ui');
+      const buildIdx = steps.findIndex((s) => s.run?.includes('npm run build:node-exe'));
+      const importIdx = steps.findIndex((s) => s.run?.includes('IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT='));
+      expect(stepIdx, spec.path).toBeGreaterThan(-1);
+      expect(importIdx, spec.path).toBeGreaterThan(-1);
+      expect(importIdx, spec.path).toBeLessThan(stepIdx);
+      expect(stepIdx, spec.path).toBeLessThan(buildIdx);
+      expect(workflow.match(/uses: \.\/\.github\/actions\/build-aidesk-ui/gu), spec.path).toHaveLength(1);
+      expect(workflow, spec.path).toContain('dist-node-exe/aidesk-local-ui/**');
+      expect(workflow, spec.path).toContain('windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}');
     }
   });
 

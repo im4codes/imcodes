@@ -17,19 +17,38 @@ describe('controlled-node executable release wiring', () => {
 
   it('gates the production image on all three native artifacts including macOS Universal 2', () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+    const parsed = parseYaml(workflow) as {
+      jobs: Record<string, { needs?: string[]; 'runs-on'?: string }>;
+    };
 
-    expect(workflow).toContain('controlled-node-executables:');
-    expect(workflow).toContain('controlled-node-${{ matrix.key }}');
+    for (const jobId of [
+      'controlled-node-linux',
+      'controlled-node-macos',
+      'controlled-node-runtime-macos',
+      'controlled-node-rd-macos',
+      'controlled-node-pkg-macos',
+      'controlled-node-windows',
+      'controlled-node-rd-windows',
+      'controlled-node-pkg-windows',
+    ]) {
+      expect(parsed.jobs[jobId], `missing ${jobId}`).toBeDefined();
+      expect(parsed.jobs.docker.needs).toContain(jobId);
+    }
+    expect(workflow).toContain('name: controlled-node-linux');
+    expect(workflow).toContain('name: controlled-node-macos');
+    expect(workflow).toContain('name: controlled-node-windows');
     expect(workflow).toContain('pattern: controlled-node-*');
     expect(workflow).toContain('node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts');
     expect(workflow).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe');
-    expect(workflow).toContain('dist-node-exe/${{ matrix.artifact }}.manifest.json');
+    expect(workflow).toContain('dist-node-exe/imcodes-node-linux.manifest.json');
+    expect(workflow).toContain('dist-node-exe/imcodes-node-macos.manifest.json');
+    expect(workflow).toContain('dist-node-exe/imcodes-node.exe.manifest.json');
     expect(workflow).toContain('dist-node-exe/computer-use-helper/**');
     expect(workflow).toContain('IMCODES_WINDOWS_SIGNING_PFX_BASE64');
     expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
     expect(workflow).toContain('remote-desktop-worker-artifacts.mjs verify');
     expect(workflow).toContain('npx tsx scripts/qualify-windows-self-upgrade.ts');
-    expect(workflow).toContain('runner: windows-2022');
+    expect(workflow).toContain('runs-on: windows-2022');
     expect(workflow).toContain('node scripts/resolve-libwebrtc-sdk-release.mjs');
     expect(workflow).toContain('resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000');
     expect(workflow).toContain('steps.libwebrtc_sdk_cache.outputs.cache-hit');
@@ -92,7 +111,7 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}');
     expect(workflow).toContain('APP_VERSION=${{ needs.release_version.outputs.app_version }}');
-    expect(workflow).toContain('runner: macos-15');
+    expect(workflow).toContain('runs-on: macos-15');
     const standaloneWorkflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
     expect(standaloneWorkflow).toContain('- os: windows-2022');
     expect(standaloneWorkflow).toContain('node scripts/resolve-libwebrtc-sdk-release.mjs');
@@ -255,34 +274,23 @@ describe('controlled-node executable release wiring', () => {
 
   it('builds the macOS remote-desktop components into the image, and proves they are there', () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
-
-    // The gap this closes: every remote-desktop build step in this job was
-    // guarded `if: runner.os == 'Windows'`, so the image shipped a macOS node
-    // that self-upgrades and then finds nothing to fetch -- the server answers
-    // `remote_desktop_worker_not_built` and macOS remote desktop is simply
-    // unavailable.
-    const componentBuild = workflow.indexOf(
-      'name: Build, sign and notarize the macOS remote-desktop components',
-    );
-    expect(componentBuild).toBeGreaterThan(-1);
-    // Bounded at the NEXT step, not by a character count. A fixed-length
-    // window ran past the end of this step and matched the platform guard of
-    // the one after it, so flipping this step back to Windows -- the exact
-    // regression being guarded -- still passed.
-    const nextStep = workflow.indexOf('\n      - name:', componentBuild);
-    expect(nextStep).toBeGreaterThan(componentBuild);
-    const buildStep = workflow.slice(componentBuild, nextStep);
-    expect(buildStep).toContain("if: runner.os == 'macOS'");
+    const parsed = parseYaml(workflow) as {
+      jobs: Record<string, {
+        'runs-on'?: string;
+        strategy?: { matrix?: { arch?: string[] } };
+        steps: Array<{ name?: string; run?: string; with?: Record<string, unknown> }>;
+      }>;
+    };
+    const rdJob = parsed.jobs['controlled-node-rd-macos'];
+    expect(rdJob).toBeDefined();
+    expect(rdJob['runs-on']).toBe('macos-15');
+    expect(rdJob.strategy?.matrix?.arch).toEqual(['arm64', 'x64']);
+    const buildStepObj = rdJob.steps.find((s) => s.name === 'Build, sign and notarize the macOS remote-desktop components');
+    expect(buildStepObj).toBeDefined();
+    const buildStep = buildStepObj!.run ?? '';
     expect(buildStep).toContain('scripts/build-macos-remote-desktop-release.mjs');
-    // Both architectures, from the shell loop that drives them -- not a
-    // per-arch assertion, because the workflow spells `$arch` once and lets
-    // the loop supply the values.
-    expect(buildStep).toContain('for arch in arm64 x64; do');
     expect(buildStep).toContain('native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json');
     expect(buildStep).toContain('--artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch"');
-
-    // Built from the PUBLISHED, locked SDK. Rebuilding it here would take
-    // hours and would not be the SDK the lock names.
     expect(buildStep).toContain('scripts/install-libwebrtc-sdk.mjs');
     expect(buildStep).toContain('scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock');
 
@@ -495,30 +503,27 @@ describe('controlled-node executable release wiring', () => {
   });
 
   it('signs, notarizes and proves the macOS executable, in that order', () => {
-    // The chain used to be half-built: the release workflow imported a signing
-    // identity and cleaned it up afterwards, with nothing in between that
-    // signed or notarized anything. Every macOS artifact shipped ad-hoc signed
-    // and was refused by Gatekeeper on download, and nothing failed to say so.
-    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
-      const workflow = readFileSync(file, 'utf8');
-      const importIdentity = workflow.indexOf('node scripts/macos-release-signing.mjs import');
-      const notaryKey = workflow.indexOf('IMCODES_MACOS_NOTARY_KEY_BASE64');
-      const build = workflow.indexOf('run: npm run build:node-exe');
-      const notarize = workflow.indexOf('macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos');
-      const runs = workflow.indexOf('./dist-node-exe/imcodes-node-macos --version');
-      const cleanup = workflow.indexOf('node scripts/macos-release-signing.mjs cleanup');
+    for (const spec of [
+      { file: '.github/workflows/ci.yml', jobKey: 'controlled-node-macos' },
+      { file: '.github/workflows/build-node-exe.yml', jobKey: 'build' },
+    ]) {
+      const parsed = parseYaml(readFileSync(spec.file, 'utf8')) as {
+        jobs: Record<string, { steps: Array<{ run?: string; env?: Record<string, unknown> }> }>;
+      };
+      const steps = parsed.jobs[spec.jobKey].steps;
+      const importIdentity = steps.findIndex((s) => s.run?.includes('node scripts/macos-release-signing.mjs import'));
+      const notaryKey = steps.findIndex((s) => JSON.stringify(s.env ?? {}).includes('IMCODES_MACOS_NOTARY_KEY_BASE64'));
+      const build = steps.findIndex((s) => s.run === 'npm run build:node-exe');
+      const notarize = steps.findIndex((s) => s.run?.includes('macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos'));
+      const runs = steps.findIndex((s) => s.run?.includes('./dist-node-exe/imcodes-node-macos --version'));
+      const cleanup = steps.findIndex((s) => s.run?.includes('node scripts/macos-release-signing.mjs cleanup'));
 
-      expect([importIdentity, notaryKey, build, notarize, runs, cleanup].every((at) => at >= 0), file).toBe(true);
-      // The identity has to exist before the build, because the build is what
-      // signs; notarizing has to follow the build, for the obvious reason.
-      expect(importIdentity, file).toBeLessThan(build);
-      expect(notaryKey, file).toBeLessThan(build);
-      expect(build, file).toBeLessThan(notarize);
-      expect(notarize, file).toBeLessThan(cleanup);
-      // Launching the signed binary is the only step that catches a wrong
-      // entitlement set: such a binary signs and notarizes perfectly and then
-      // dies for the user instead.
-      expect(runs, file).toBeLessThan(cleanup);
+      expect([importIdentity, notaryKey, build, notarize, runs, cleanup].every((at) => at >= 0), spec.file).toBe(true);
+      expect(importIdentity, spec.file).toBeLessThan(build);
+      expect(notaryKey, spec.file).toBeLessThan(build);
+      expect(build, spec.file).toBeLessThan(notarize);
+      expect(notarize, spec.file).toBeLessThan(cleanup);
+      expect(runs, spec.file).toBeLessThan(cleanup);
     }
   });
 
@@ -665,7 +670,19 @@ describe('headless compatibility release wiring', () => {
       expect(workflow).toContain('dist-node-exe/${{ steps.compat.outputs.artifact }}.manifest.json');
     }
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
-    expect(workflow).toContain('release_version, controlled-node-executables, controlled-node-compat-executable]');
+    const parsedCi = parseYaml(workflow) as { jobs: { docker: { needs: string[] } } };
+    expect(parsedCi.jobs.docker.needs).toEqual(expect.arrayContaining([
+      'release_version',
+      'controlled-node-linux',
+      'controlled-node-macos',
+      'controlled-node-runtime-macos',
+      'controlled-node-rd-macos',
+      'controlled-node-pkg-macos',
+      'controlled-node-windows',
+      'controlled-node-rd-windows',
+      'controlled-node-pkg-windows',
+      'controlled-node-compat-executable',
+    ]));
     expect(workflow).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217');
     expect(workflow).toContain('controlled-node-compat');
   });

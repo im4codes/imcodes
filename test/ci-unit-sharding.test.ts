@@ -16,13 +16,13 @@ const ci = () => parse(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
 };
 
 describe('bounded parallel daemon CI, with unchanged release safety', () => {
-  it.each([['unit-tests', 6], ['macos-unit-tests', 4]] as const)(
+  it.each([['unit-tests', 8], ['macos-unit-tests', 6]] as const)(
     '%s executes every contiguous shard once, without masking failures', (id, count) => {
       const job = ci().jobs[id]!;
       expect(job.name).toContain(`shard \${{ matrix.shard }}/${count}`);
       expect(job.strategy?.matrix.shard).toEqual(Array.from({ length: count }, (_, i) => i + 1));
       expect(job.strategy?.['fail-fast']).toBe(false);
-      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 12 : 4);
+      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 16 : 6);
       expect(job.steps.filter((step) => step.run?.includes('npm run test:unit')).map((step) => step.run))
         .toEqual([`npm run test:unit -- --shard=\${{ matrix.shard }}/${count}`]);
       expect(job['continue-on-error']).not.toBe(true);
@@ -30,15 +30,15 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     },
   );
 
-  it('configures coverage-shard across 1..6 shards with 30-minute timeout and aggregates all 6 shard artifacts in coverage', () => {
+  it('configures coverage-shard across 1..8 shards with 30-minute timeout and aggregates all 8 shard artifacts in coverage', () => {
     const jobs = ci().jobs;
     const covShard = jobs['coverage-shard']!;
     expect(covShard['timeout-minutes']).toBe(30);
-    expect(covShard.strategy?.['max-parallel']).toBe(6);
-    expect(covShard.strategy?.matrix.shard).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(covShard.strategy?.['max-parallel']).toBe(8);
+    expect(covShard.strategy?.matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(covShard.strategy?.['fail-fast']).toBe(false);
     expect(covShard.steps.filter((step) => step.run?.includes('npm run test:coverage:ci')).map((step) => step.run))
-      .toEqual(['npm run test:coverage:ci -- --shard=${{ matrix.shard }}/6 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default']);
+      .toEqual(['npm run test:coverage:ci -- --shard=${{ matrix.shard }}/8 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default']);
     const covReport = jobs.coverage!;
     expect(covReport.needs).toEqual(['coverage-shard']);
     const downloadedArtifacts = covReport.steps
@@ -51,6 +51,8 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
       'coverage-shard-4',
       'coverage-shard-5',
       'coverage-shard-6',
+      'coverage-shard-7',
+      'coverage-shard-8',
     ]);
   });
 

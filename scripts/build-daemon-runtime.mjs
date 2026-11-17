@@ -384,16 +384,20 @@ function signWindowsBundle(stageDir) {
       .map(({ path }) => path),
   ];
 
-  for (const artifactPath of peFiles) {
+  const listPath = join(tmpdir(), `imcodes-win-sign-list-${process.pid}-${Date.now()}.txt`);
+  writeFileSync(listPath, `${peFiles.join('\n')}\n`, 'utf8');
+  try {
     sh(ps, [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', join(repoRoot, 'scripts', 'windows-sign-release-artifact.ps1'),
       '-Mode', 'Sign',
-      '-ArtifactPath', artifactPath,
+      '-ArtifactListFile', listPath,
       '-CodeSigningCertificateThumbprint', thumbprint,
       '-ExpectedSignerSha256', signerSha256,
       '-TimestampUrl', timestampUrl,
     ]);
+  } finally {
+    rmSync(listPath, { force: true });
   }
   return signerSha256;
 }

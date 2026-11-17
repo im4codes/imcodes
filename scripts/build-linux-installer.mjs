@@ -14,6 +14,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -238,14 +239,16 @@ export async function buildLinuxInstallers(options) {
     // 2. Debian `.deb` via dpkg-deb
     if (!options.skipDeb) {
       const debStage = join(workDir, 'deb-root');
-      const debOptRelease = join(debStage, 'opt', 'imcodes', 'daemon-runtime', 'releases', version);
-      mkdirSync(debOptRelease, { recursive: true });
-      cpSync(releaseDir, debOptRelease, { recursive: true });
+      const debOptReleasesDir = join(debStage, 'opt', 'imcodes', 'daemon-runtime', 'releases');
+      const debOptRelease = join(debOptReleasesDir, version);
+      mkdirSync(debOptReleasesDir, { recursive: true });
+      renameSync(releaseDir, debOptRelease);
 
-      const debVarNode = join(debStage, 'var', 'lib', 'imcodes-node');
+      const debVarLibDir = join(debStage, 'var', 'lib');
+      const debVarNode = join(debVarLibDir, 'imcodes-node');
       if (hasNodeBinary || options.remoteDesktopDir || options.computerUseDir) {
-        mkdirSync(debVarNode, { recursive: true });
-        cpSync(nodeStageDir, debVarNode, { recursive: true });
+        mkdirSync(debVarLibDir, { recursive: true });
+        renameSync(nodeStageDir, debVarNode);
       }
       if (hasNodeBinary) {
         const sysUnitDir = join(debStage, 'etc', 'systemd', 'system');
@@ -326,7 +329,7 @@ export async function buildLinuxInstallers(options) {
       );
 
       const debPath = join(outDir, `imcodes-desktop-${version}-linux-${arch === 'arm64' ? 'arm64' : 'amd64'}.deb`);
-      execFileSync('dpkg-deb', ['--build', '--root-owner-group', debStage, debPath], {
+      execFileSync('dpkg-deb', ['-Zgzip', '--build', '--root-owner-group', debStage, debPath], {
         stdio: 'inherit',
       });
       await writeDesktopInstallerManifest(debPath, {

@@ -9,6 +9,7 @@ import {
   commandResult,
   compileComponents,
   notarizeComponents,
+  notarizeComponentsAsync,
   signComponent,
 } from '../../scripts/build-macos-remote-desktop-release.mjs';
 import {
@@ -309,5 +310,35 @@ describe('macOS remote-desktop release driver', () => {
       '/release/imcodes-remote-desktop-worker',
       '/release/imcodes-remote-desktop-disclosure',
     ]);
+  });
+
+  it('notarizes all components concurrently in notarizeComponentsAsync', async () => {
+    const components = [
+      { kind: 'worker', fileName: 'imcodes-remote-desktop-worker' },
+      { kind: 'launchAgent', fileName: 'imcodes-remote-desktop-launch-agent' },
+      { kind: 'disclosure', fileName: 'imcodes-remote-desktop-disclosure' },
+      { kind: 'virtualDisplayHelper', fileName: 'imcodes-virtual-display-helper' },
+    ];
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const resolvers: Array<() => void> = [];
+    const pending = notarizeComponentsAsync(
+      { artifactRoot: '/release', components, notaryCredentials: {} },
+      {
+        notarizeAsync: ({ artifactPath }: { artifactPath: string }) => new Promise((resolvePromise) => {
+          inFlight += 1;
+          peakInFlight = Math.max(peakInFlight, inFlight);
+          resolvers.push(() => {
+            inFlight -= 1;
+            resolvePromise(unstapledRecord(Buffer.from(artifactPath)));
+          });
+        }),
+      },
+    );
+    await Promise.resolve();
+    expect(peakInFlight).toBe(4);
+    for (const r of resolvers) r();
+    const evidence = await pending;
+    expect(Object.keys(evidence)).toEqual(components.map((c) => c.kind));
   });
 });

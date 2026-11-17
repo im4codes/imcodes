@@ -142,7 +142,9 @@ describe('steps that wait on the network are bounded', () => {
     const docker = ci().jobs.docker!;
     const needs = Array.isArray(docker.needs) ? docker.needs : [docker.needs];
     expect([...needs].sort()).toEqual([
-      'controlled-node-compat-executable', 'controlled-node-executables', 'e2e-tests', 'lint', 'macos-unit-tests', 'release_version', 'secret-scan',
+      'controlled-node-compat-executable', 'controlled-node-linux', 'controlled-node-macos', 'controlled-node-pkg-macos',
+      'controlled-node-pkg-windows', 'controlled-node-rd-macos', 'controlled-node-rd-windows', 'controlled-node-runtime-macos',
+      'controlled-node-windows', 'e2e-tests', 'lint', 'macos-unit-tests', 'release_version', 'secret-scan',
       'server-db-tests', 'server-tests', 'typecheck', 'unit-tests', 'web-chat-perf', 'web-tests-components',
       'web-tests-unit', 'windows-conpty-tests', 'windows-unit-tests',
     ]);

@@ -29,7 +29,7 @@ import {
   buildMacosRemoteDesktopManifest,
   verifyBuiltMacosRemoteDesktopComponent,
 } from './macos-remote-desktop-build.mjs';
-import { notarizeExecutable } from './macos-release-signing.mjs';
+import { notarizeExecutable, notarizeExecutableAsync } from './macos-release-signing.mjs';
 import { isModuleEntry } from './module-entry.mjs';
 // From the packaging module, not the TypeScript originals: this runs as
 // `node scripts/build-macos-remote-desktop-release.mjs` on a build machine,
@@ -136,6 +136,22 @@ export function notarizeComponents(input, dependencies = {}) {
   return evidence;
 }
 
+/** Notarize all independent components concurrently (each uses its own zip & API key). */
+export async function notarizeComponentsAsync(input, dependencies = {}) {
+  const notarize = dependencies.notarizeAsync ?? dependencies.notarize ?? notarizeExecutableAsync;
+  const { artifactRoot, components, notaryCredentials } = input;
+  const entries = await Promise.all(
+    components.map(async (component) => [
+      component.kind,
+      await notarize({
+        artifactPath: join(artifactRoot, component.fileName),
+        ...notaryCredentials,
+      }),
+    ]),
+  );
+  return Object.fromEntries(entries);
+}
+
 /**
  * Run a verification tool and report BOTH streams plus its exit status.
  *
@@ -208,7 +224,9 @@ export async function buildMacosRemoteDesktopRelease(input, dependencies = {}) {
     );
   }
 
-  const evidence = await (dependencies.notarizeAll ?? notarizeComponents)({
+  const notarizeAll = dependencies.notarizeAll
+    ?? (dependencies.notarize ? notarizeComponents : notarizeComponentsAsync);
+  const evidence = await notarizeAll({
     artifactRoot,
     components: plan.components,
     notaryCredentials: input.notaryCredentials,

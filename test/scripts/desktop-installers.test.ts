@@ -430,44 +430,60 @@ ${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
     for (const spec of [
       {
         file: '.github/workflows/build-node-exe.yml',
-        jobKey: 'build',
-        uploadName: 'Upload executable artifact',
+        linuxJobKey: 'build',
+        linuxUploadName: 'Upload executable artifact',
+        macosJobKey: 'build',
+        macosUploadName: 'Upload executable artifact',
+        windowsJobKey: 'build',
+        windowsUploadName: 'Upload executable artifact',
       },
       {
         file: '.github/workflows/ci.yml',
-        jobKey: 'controlled-node-executables',
-        uploadName: 'Upload controlled-node executable',
+        linuxJobKey: 'controlled-node-linux',
+        linuxUploadName: 'Upload controlled-node executable',
+        macosJobKey: 'controlled-node-pkg-macos',
+        macosUploadName: 'Upload macOS installer and manifest artifact',
+        windowsJobKey: 'controlled-node-pkg-windows',
+        windowsUploadName: 'Upload Windows installer and manifest artifact',
       },
     ]) {
       const raw = readFileSync(spec.file, 'utf8');
       const parsed = parseYaml(raw) as {
         jobs: Record<string, { steps: Array<{ name?: string; run?: string; with?: { path?: string } }> }>;
       };
-      const steps = parsed.jobs[spec.jobKey].steps;
-      const names = steps.map((s) => s.name ?? '');
-      expect(names.some((n) => n.includes('Linux unified installers')), spec.file).toBe(true);
-      expect(names.some((n) => n.includes('macOS .pkg installer')), spec.file).toBe(true);
-      expect(names.some((n) => n.includes('Windows Inno Setup')), spec.file).toBe(true);
-      const uploadStep = steps.find((s) => s.name === spec.uploadName);
-      expect(uploadStep?.with?.path, spec.file).toContain('dist-node-exe/installers/**');
-      expect(uploadStep?.with?.path, spec.file).toContain('dist-node-exe/desktop-release*.manifest.json');
+      const linuxSteps = parsed.jobs[spec.linuxJobKey].steps;
+      const macosSteps = parsed.jobs[spec.macosJobKey].steps;
+      const windowsSteps = parsed.jobs[spec.windowsJobKey].steps;
+      expect(linuxSteps.some((s) => (s.name ?? '').includes('Linux unified installers')), spec.file).toBe(true);
+      expect(macosSteps.some((s) => (s.name ?? '').includes('macOS .pkg installer')), spec.file).toBe(true);
+      expect(windowsSteps.some((s) => (s.name ?? '').includes('Windows Inno Setup')), spec.file).toBe(true);
+
+      for (const [steps, uploadName] of [
+        [linuxSteps, spec.linuxUploadName],
+        [macosSteps, spec.macosUploadName],
+        [windowsSteps, spec.windowsUploadName],
+      ] as const) {
+        const uploadStep = steps.find((s) => s.name === uploadName);
+        expect(uploadStep?.with?.path, `${spec.file}:${uploadName}`).toContain('dist-node-exe/installers/**');
+        expect(uploadStep?.with?.path, `${spec.file}:${uploadName}`).toContain('dist-node-exe/desktop-release*.manifest.json');
+      }
 
       // F7: macOS CI workflow refreshes pkg manifest after signing and notarizing
-      const macStep = steps.find((s) => (s.name ?? '').includes('macOS .pkg installer'));
+      const macStep = macosSteps.find((s) => (s.name ?? '').includes('macOS .pkg installer'));
       expect(macStep?.run, spec.file).toContain('--refresh-manifest');
       expect(macStep?.run, spec.file).toContain('--notarized');
 
       // F8: Linux CI workflow avoids dpkg-deb --contents | head SIGPIPE under pipefail
-      const linuxStep = steps.find((s) => (s.name ?? '').includes('Linux unified installers'));
+      const linuxStep = linuxSteps.find((s) => (s.name ?? '').includes('Linux unified installers'));
       expect(linuxStep?.run, spec.file).not.toMatch(/dpkg-deb --contents[^\n]*\|\s*head/u);
       expect(linuxStep?.run, spec.file).toContain('DEB_CONTENTS_TMP=');
     }
 
     const ciWinSteps = (
       parseYaml(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
-        jobs: { 'controlled-node-executables': { steps: Array<{ name?: string; run?: string }> } };
+        jobs: { 'controlled-node-pkg-windows': { steps: Array<{ name?: string; run?: string }> } };
       }
-    ).jobs['controlled-node-executables'].steps;
+    ).jobs['controlled-node-pkg-windows'].steps;
     const ciWinStep = ciWinSteps.find((s) => (s.name ?? '').includes('Windows Inno Setup'));
     expect(ciWinStep?.run).toContain('--require-iscc');
     expect(ciWinStep?.run).toContain('--runtime-dir');

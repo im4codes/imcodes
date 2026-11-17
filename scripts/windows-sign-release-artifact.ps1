@@ -2,8 +2,10 @@ param(
   [ValidateSet('Remove', 'Sign', 'Verify', 'Manifest')]
   [string]$Mode = 'Sign',
 
-  [Parameter(Mandatory = $true)]
-  [string]$ArtifactPath,
+  [Parameter(Mandatory = $false)]
+  [string]$ArtifactPath = '',
+
+  [string]$ArtifactListFile = '',
 
   [string]$CodeSigningCertificateThumbprint = '',
 
@@ -28,7 +30,22 @@ if (-not (Test-Path -LiteralPath $SecurityModulePath -PathType Leaf)) {
 # Get-AuthenticodeSignature so hosted runners and deployed Windows hosts use
 # the same Authenticode implementation.
 Import-Module -Name $SecurityModulePath -ErrorAction Stop
-$ResolvedArtifact = (Resolve-Path -LiteralPath $ArtifactPath).Path
+$RawTargets = @()
+if (-not [string]::IsNullOrWhiteSpace($ArtifactListFile)) {
+  if (-not (Test-Path -LiteralPath $ArtifactListFile -PathType Leaf)) {
+    throw "ArtifactListFile not found: $ArtifactListFile"
+  }
+  $RawTargets = @(Get-Content -LiteralPath $ArtifactListFile -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+} elseif (-not [string]::IsNullOrWhiteSpace($ArtifactPath)) {
+  $RawTargets = @($ArtifactPath)
+} else {
+  throw 'Either -ArtifactPath or -ArtifactListFile is required.'
+}
+if ($RawTargets.Count -eq 0) {
+  throw 'No target artifacts provided.'
+}
+$ResolvedTargets = @($RawTargets | ForEach-Object { (Resolve-Path -LiteralPath $_.Trim()).Path })
+$ResolvedArtifact = $ResolvedTargets[0]
 $KitRoot = 'C:\Program Files (x86)\Windows Kits\10\bin'
 # Newest versioned SDK bin first, then the unversioned fallback. Shared by every
 # SDK tool this script drives so signtool.exe and mt.exe can never be resolved
@@ -129,29 +146,31 @@ if ($Mode -eq 'Sign') {
   if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
     $SignArguments += @('/tr', $TimestampUrl, '/td', 'sha256')
   }
-  $SignArguments += $ResolvedArtifact
+  $SignArguments += $ResolvedTargets
 
   & $SignTool @SignArguments
   if ($LASTEXITCODE -ne 0) { throw 'Windows release-artifact Authenticode signing failed.' }
 }
 
-$Signature = Get-AuthenticodeSignature -LiteralPath $ResolvedArtifact
-if ($Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
-    $null -eq $Signature.SignerCertificate) {
-  throw "Windows release-artifact Authenticode verification failed: $($Signature.Status)"
-}
+foreach ($ResolvedArtifact in $ResolvedTargets) {
+  $Signature = Get-AuthenticodeSignature -LiteralPath $ResolvedArtifact
+  if ($Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+      $null -eq $Signature.SignerCertificate) {
+    throw "Windows release-artifact Authenticode verification failed: $($Signature.Status)"
+  }
 
-$Sha256 = [System.Security.Cryptography.SHA256]::Create()
-try {
-  $ActualSignerSha256 = [BitConverter]::ToString(
-    $Sha256.ComputeHash($Signature.SignerCertificate.RawData)
-  ).Replace('-', '').ToLowerInvariant()
-} finally {
-  $Sha256.Dispose()
-}
-if ($ActualSignerSha256 -cne $ExpectedSignerSha256.ToLowerInvariant()) {
-  throw 'Windows release-artifact signer does not match the compiled release trust anchor.'
-}
+  $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $ActualSignerSha256 = [BitConverter]::ToString(
+      $Sha256.ComputeHash($Signature.SignerCertificate.RawData)
+    ).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $Sha256.Dispose()
+  }
+  if ($ActualSignerSha256 -cne $ExpectedSignerSha256.ToLowerInvariant()) {
+    throw 'Windows release-artifact signer does not match the compiled release trust anchor.'
+  }
 
-& $SignTool verify /pa /all $ResolvedArtifact
-if ($LASTEXITCODE -ne 0) { throw 'Windows release-artifact WinVerifyTrust policy verification failed.' }
+  & $SignTool verify /pa /all $ResolvedArtifact
+  if ($LASTEXITCODE -ne 0) { throw 'Windows release-artifact WinVerifyTrust policy verification failed.' }
+}
