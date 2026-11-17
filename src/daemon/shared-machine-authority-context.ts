@@ -93,7 +93,16 @@ export function bindProcessSharedMachineActivity(
   const now = opts.now ?? Date.now();
   let window = windows.get(sessionName);
   // A restarted runtime or a long-quiet idle session starts a fresh window.
-  if (window && window.identity && identity && !sameIdentity(window.identity, identity)) window = undefined;
+  // ONLY if the new activity carries a explicit rebind token (authority) for the new identity,
+  // do we allow continuity. Otherwise, restart the window.
+  if (window && window.identity && identity && !sameIdentity(window.identity, identity)) {
+    if (window.identity.sessionInstanceId === identity.sessionInstanceId && activity.authority) {
+        window.identity = identity;
+        window.authority = activity.authority;
+    } else {
+        window = undefined;
+    }
+  }
   if (window && quietAndIdle(window, now, opts.sessionRunning ?? false)) window = undefined;
   if (!window) {
     // A session that is running when the window opens is running a turn the daemon never saw start
