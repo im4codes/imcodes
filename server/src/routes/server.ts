@@ -598,11 +598,15 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
  * settings. The daemon refreshes this endpoint at startup, on reconnect, and
  * periodically while running.
  */
-async function checkDaemonSelfAccess(
+type DaemonSelfAccessResult =
+  | { ok: true; authority: Awaited<ReturnType<typeof resolveSharedMachineAuthority>> }
+  | { ok: false; response: Response };
+
+async function resolveDaemonSelfAccess(
   c: { req: { header: (name: string) => string | undefined }; env: Env; json: (data: unknown, status?: number) => Response },
   serverRow: { serverId: string; userId: string },
   options: { blockSharedHost?: boolean; denyParticipant?: boolean } = {},
-): Promise<Response | null> {
+): Promise<DaemonSelfAccessResult> {
   const authority = await resolveSharedMachineAuthority(c.env.DB, {
     token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
     signingKey: c.env.JWT_SIGNING_KEY,
@@ -611,15 +615,24 @@ async function checkDaemonSelfAccess(
     now: Date.now(),
   });
   if (authority.kind === 'invalid') {
-    return c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403);
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'shared_machine_authority_invalid' }, 403) };
   }
   if (options.denyParticipant && authority.kind === 'participant') {
-    return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403) };
   }
   if (options.blockSharedHost && authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
-    return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403) };
   }
-  return null;
+  return { ok: true, authority };
+}
+
+async function checkDaemonSelfAccess(
+  c: { req: { header: (name: string) => string | undefined }; env: Env; json: (data: unknown, status?: number) => Response },
+  serverRow: { serverId: string; userId: string },
+  options: { blockSharedHost?: boolean; denyParticipant?: boolean } = {},
+): Promise<Response | null> {
+  const access = await resolveDaemonSelfAccess(c, serverRow, options);
+  return access.ok ? null : access.response;
 }
 
 serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
@@ -766,13 +779,24 @@ function stripPostgresNulBytes(text: string): string {
 serverRoutes.post('/:id/shared-context/processed', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
-  const denied = await checkDaemonSelfAccess(c, authed.auth);
-  if (denied) return denied;
+  const access = await resolveDaemonSelfAccess(c, authed.auth);
+  if (!access.ok) return access.response;
   const serverRow = authed.auth;
 
   const body = await c.req.json().catch(() => null) as ProcessedContextReplicationBody | null;
   const parsed = processedReplicationSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  // Reject personal-scope replication from participants or bare shared-host daemon tokens
+  // before any DB write so mixed batches cannot upsert partial owner-personal projections.
+  if (parsed.data.projections.some((projection) => projection.namespace.scope === 'personal')) {
+    if (access.authority.kind === 'participant') {
+      return c.json({ error: 'forbidden', reason: 'shared_participant_forbidden' }, 403);
+    }
+    if (access.authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)) {
+      return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
+    }
+  }
 
   const now = Date.now();
   let acceptedCount = 0;
@@ -788,7 +812,11 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     }
     const safeEnterpriseId = isPersonal ? null : (serverRow.teamId ?? projection.namespace.enterpriseId ?? null);
     const safeWorkspaceId = isPersonal ? null : (projection.namespace.workspaceId ?? null);
-    const safeUserId = isPersonal ? serverRow.userId : (projection.namespace.userId ?? null);
+    const safeUserId = isPersonal
+      ? serverRow.userId
+      : (access.authority.kind === 'participant' && (!projection.namespace.userId || projection.namespace.userId === serverRow.userId)
+        ? access.authority.actorUserId
+        : (projection.namespace.userId ?? null));
     let safeContent: unknown;
     let safeSourceEventIds: unknown;
     let contentWasSanitized = false;
@@ -1256,8 +1284,8 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
 serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
-  const denied = await checkDaemonSelfAccess(c, authed.auth);
-  if (denied) return denied;
+  const access = await resolveDaemonSelfAccess(c, authed.auth);
+  if (!access.ok) return access.response;
   const serverRow = authed.auth;
 
   const body = await c.req.json().catch(() => null);
@@ -1266,10 +1294,18 @@ serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
 
   const canonicalRepoId = parsed.data.canonicalRepoId.trim();
   const enterpriseId = serverRow.teamId;
-  const personalRemoteProjection = await c.env.DB.queryOne<{ id: string; updated_at: number }>(
-    "SELECT id, updated_at FROM shared_context_projections WHERE scope = 'personal' AND user_id = $1 AND project_id = $2 ORDER BY updated_at DESC LIMIT 1",
-    [serverRow.userId, canonicalRepoId],
-  );
+  // Never expose owner personal projection existence/freshness to a participant or bare shared-host daemon.
+  const personalLookupUserId = access.authority.kind === 'participant'
+    ? access.authority.actorUserId
+    : (access.authority.kind === 'absent' && await isSharedOrContributedServer(c.env.DB, serverRow.serverId)
+      ? null
+      : serverRow.userId);
+  const personalRemoteProjection = personalLookupUserId
+    ? await c.env.DB.queryOne<{ id: string; updated_at: number }>(
+      "SELECT id, updated_at FROM shared_context_projections WHERE scope = 'personal' AND user_id = $1 AND project_id = $2 ORDER BY updated_at DESC LIMIT 1",
+      [personalLookupUserId, canonicalRepoId],
+    )
+    : null;
   const personalRemoteFreshness = classifyTimestampFreshness(
     personalRemoteProjection?.updated_at,
     Date.now(),

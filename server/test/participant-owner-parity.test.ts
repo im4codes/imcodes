@@ -267,4 +267,137 @@ describe('participant owner-parity vs share-invite denial', () => {
     expect(bareRes.status).toBe(403);
     expect(await bareRes.json()).toMatchObject({ reason: 'shared_host_daemon_authority_required' });
   });
+
+  it('serverRoutes shared-context/processed rejects participant personal writes without DB write while allowing project_shared parity and scoping resolve-namespace to participant actor', async () => {
+    const { serverRoutes } = await import('../src/routes/server.js');
+    const executeSpy = vi.fn(async () => ({ changes: 1 }));
+    const queryOneSpy = vi.fn(async () => null);
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.env = {
+        DB: {
+          queryOne: queryOneSpy,
+          execute: executeSpy,
+        } as never,
+        JWT_SIGNING_KEY: 'secret-key-at-least-32-chars-long!',
+      } as never;
+      await next();
+    });
+    app.route('/api/server', serverRoutes);
+
+    // 1. Participant submitting personal projection (even omitting userId or mixed with shared) -> 403, zero DB writes
+    mockResolveSharedMachineAuthority.mockResolvedValue({
+      kind: 'participant',
+      actorUserId: 'participant-user',
+      sourceServerId: 'srv-shared',
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+    });
+    const partPersonalRes = await app.request('/api/server/srv-shared/shared-context/processed', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer daemon-tok', 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
+      body: JSON.stringify({
+        namespace: { scope: 'personal', projectId: 'proj-1' },
+        projections: [
+          {
+            id: 'proj-shared-ok',
+            namespace: { scope: 'project_shared', projectId: 'proj-1' },
+            class: 'recent_summary',
+            origin: 'chat_compacted',
+            sourceEventIds: [],
+            summary: 'shared team summary',
+            content: {},
+            createdAt: 100,
+            updatedAt: 100,
+          },
+          {
+            id: 'proj-owner-poison',
+            namespace: { scope: 'personal', projectId: 'proj-1' },
+            class: 'durable_memory_candidate',
+            origin: 'chat_compacted',
+            sourceEventIds: [],
+            summary: 'poisoned owner personal memory',
+            content: {},
+            createdAt: 100,
+            updatedAt: 100,
+          },
+        ],
+      }),
+    });
+    expect(partPersonalRes.status).toBe(403);
+    expect(await partPersonalRes.json()).toMatchObject({ reason: 'shared_participant_forbidden' });
+    expect(executeSpy).not.toHaveBeenCalled();
+
+    // 2. Participant submitting project_shared projection succeeds and never attributes user_id to owner-user
+    const partSharedRes = await app.request('/api/server/srv-shared/shared-context/processed', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer daemon-tok', 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'proj-1' },
+        projections: [
+          {
+            id: 'proj-shared-1',
+            namespace: { scope: 'project_shared', projectId: 'proj-1', userId: 'owner-user' },
+            class: 'recent_summary',
+            origin: 'chat_compacted',
+            sourceEventIds: [],
+            summary: 'shared project progress summary',
+            content: {},
+            createdAt: 100,
+            updatedAt: 100,
+          },
+        ],
+      }),
+    });
+    expect(partSharedRes.status).toBe(200);
+    expect(executeSpy).toHaveBeenCalled();
+    const insertParams = executeSpy.mock.calls[0]?.[1] as unknown[];
+    expect(insertParams[5]).toBe('participant-user');
+
+    // 3. Bare shared-host daemon submitting personal projection -> 403, zero DB writes
+    executeSpy.mockClear();
+    mockResolveSharedMachineAuthority.mockResolvedValue({ kind: 'absent' });
+    mockIsSharedOrContributedServer.mockResolvedValueOnce(true);
+    const barePersonalRes = await app.request('/api/server/srv-shared/shared-context/processed', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer daemon-tok', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'personal', projectId: 'proj-1', userId: 'owner-user' },
+        projections: [
+          {
+            id: 'proj-bare-poison',
+            namespace: { scope: 'personal', projectId: 'proj-1', userId: 'owner-user' },
+            class: 'recent_summary',
+            origin: 'chat_compacted',
+            sourceEventIds: [],
+            summary: 'bare shared poison',
+            content: {},
+            createdAt: 100,
+            updatedAt: 100,
+          },
+        ],
+      }),
+    });
+    expect(barePersonalRes.status).toBe(403);
+    expect(await barePersonalRes.json()).toMatchObject({ reason: 'shared_host_daemon_authority_required' });
+    expect(executeSpy).not.toHaveBeenCalled();
+
+    // 4. resolve-namespace with participant authority queries participant-user, never owner-user
+    queryOneSpy.mockClear();
+    mockResolveSharedMachineAuthority.mockResolvedValue({
+      kind: 'participant',
+      actorUserId: 'participant-user',
+      sourceServerId: 'srv-shared',
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+    });
+    const resolvePartRes = await app.request('/api/server/srv-shared/shared-context/resolve-namespace', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer daemon-tok', 'Content-Type': 'application/json', [SHARED_MACHINE_AUTHORITY_HEADER]: 'part-jwt' },
+      body: JSON.stringify({ canonicalRepoId: 'github.com/org/repo' }),
+    });
+    expect(resolvePartRes.status).toBe(200);
+    const personalQueryCall = queryOneSpy.mock.calls.find(([sql]) => typeof sql === 'string' && sql.includes("scope = 'personal'"));
+    expect(personalQueryCall?.[1]).toEqual(['participant-user', 'github.com/org/repo']);
+  });
 });
