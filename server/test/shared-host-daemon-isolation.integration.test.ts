@@ -324,6 +324,76 @@ describe('Vector A: Participant authority on M_shared is strictly scoped to User
       body: JSON.stringify({ query: 'owner-secret' }),
     });
     expect(partOwnerPrivSearch.status).toBe(403);
+
+    // Participant authority MUST NOT write owner personal projections via POST /processed or probe owner personal freshness via /resolve-namespace
+    await db.execute(
+      `INSERT INTO shared_context_projections (
+        id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
+        projection_class, source_event_ids_json, summary, content_json,
+        content_hash, origin, created_at, updated_at, replicated_at
+      ) VALUES ($1, $2, 'personal', NULL, NULL, $3, $4, 'recent_summary', '[]'::jsonb, 'owner private projection summary', '{}'::jsonb, 'hash-owner-only', 'chat_compacted', $5, $5, $5)
+      ON CONFLICT (id) DO NOTHING`,
+      [`proj-owner-only-${tag}`, M_SHARED, OWNER_A, `owner-only-repo-${tag}`, Date.now()],
+    );
+    const partProcPoison = await app.request(`/api/server/${M_SHARED}/shared-context/processed`, {
+      method: 'POST',
+      headers: { ...partHdrs, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'personal', projectId: `owner-only-repo-${tag}` },
+        projections: [{
+          id: `poison-personal-${tag}`,
+          namespace: { scope: 'personal', projectId: `owner-only-repo-${tag}` },
+          class: 'durable_memory_candidate',
+          origin: 'chat_compacted',
+          sourceEventIds: [],
+          summary: 'participant attempted owner personal poisoning',
+          content: {},
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        }],
+      }),
+    });
+    expect(partProcPoison.status).toBe(403);
+    expect(await partProcPoison.json()).toMatchObject({ reason: 'shared_participant_forbidden' });
+    const poisonedRow = await db.queryOne<{ id: string }>(
+      'SELECT id FROM shared_context_projections WHERE id = $1',
+      [`poison-personal-${tag}`],
+    );
+    expect(poisonedRow).toBeNull();
+
+    const partResolveRes = await app.request(`/api/server/${M_SHARED}/shared-context/resolve-namespace`, {
+      method: 'POST',
+      headers: { ...partHdrs, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ canonicalRepoId: `owner-only-repo-${tag}` }),
+    });
+    expect(partResolveRes.status).toBe(200);
+    expect(await partResolveRes.json()).toMatchObject({ remoteProcessedFreshness: 'missing' });
+
+    // Non-personal project_shared replication on M_SHARED with participant authority preserves parity without attributing to Owner A
+    const sharedPartProc = await app.request(`/api/server/${M_SHARED}/shared-context/processed`, {
+      method: 'POST',
+      headers: { ...partHdrs, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: SHARED_PROJ },
+        projections: [{
+          id: `proj-shared-part-${tag}`,
+          namespace: { scope: 'project_shared', projectId: SHARED_PROJ },
+          class: 'recent_summary',
+          origin: 'chat_compacted',
+          sourceEventIds: [],
+          summary: 'shared project processed projection parity',
+          content: {},
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        }],
+      }),
+    });
+    expect(sharedPartProc.status).toBe(200);
+    const sharedPartRow = await db.queryOne<{ user_id: string | null }>(
+      'SELECT user_id FROM shared_context_projections WHERE id = $1',
+      [`proj-shared-part-${tag}`],
+    );
+    expect(sharedPartRow?.user_id).toBe(USER_B);
     // Outbound no longer blocks participant turns with shared_participant_forbidden, while still refusing foreign bots
     expect((await app.request('/api/outbound', {
       method: 'POST',
