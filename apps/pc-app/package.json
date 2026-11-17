@@ -1,0 +1,20 @@
+{
+  "name": "imcodes-pc-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IM.codes PC App V1 Electron shell",
+  "main": "./dist/src/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "start": "npm run build && electron ."
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "electron": "^45.3.3",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vitest": "^3.2.7"
+  }
+}
