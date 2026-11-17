@@ -378,7 +378,7 @@ describe('Antigravity conversation DB self-healing', () => {
 
     // 1. Missing sqlite3 binary
     const enoentRes = await recoverAgyConversationDbIfCorrupt(dbPath, { sqliteBinary: path.join(home, 'missing-sqlite3') });
-    expect(enoentRes).toEqual({ recovered: false, reason: 'sqlite3_enoent' });
+    expect(enoentRes).toMatchObject({ recovered: false, reason: 'sqlite3_enoent', failedStep: 'recover' });
     expect(readFileSync(dbPath)).toEqual(corruptBytes);
     expect(existsSync(`${dbPath}.corrupt`)).toBe(false);
     expect(readdirSync(path.dirname(dbPath)).some((f) => f.includes('.tmp'))).toBe(false);
@@ -388,7 +388,7 @@ describe('Antigravity conversation DB self-healing', () => {
     await writeFile(slowBin, '#!/bin/sh\nsleep 5\n', { mode: 0o700 });
     chmodSync(slowBin, 0o700);
     const timeoutRes = await recoverAgyConversationDbIfCorrupt(dbPath, { sqliteBinary: slowBin, timeoutMs: 150 });
-    expect(timeoutRes).toEqual({ recovered: false, reason: 'sqlite3_timeout' });
+    expect(timeoutRes).toMatchObject({ recovered: false, reason: 'sqlite3_timeout', failedStep: 'recover' });
     expect(readFileSync(dbPath)).toEqual(corruptBytes);
     expect(readdirSync(path.dirname(dbPath)).some((f) => f.includes('.tmp'))).toBe(false);
 
@@ -397,9 +397,87 @@ describe('Antigravity conversation DB self-healing', () => {
     const garbagePath = agyConversationDbPath(home, garbageUuid)!;
     await writeFile(garbagePath, 'totally corrupted non-sqlite payload');
     const garbageRes = await recoverAgyConversationDbIfCorrupt(garbagePath);
-    expect(garbageRes).toEqual({ recovered: false, reason: 'sqlite3_failed' });
+    expect(garbageRes).toMatchObject({ recovered: false, reason: 'sqlite3_failed' });
+    expect(garbageRes.failedStep).toMatch(/^(recover|import)$/);
+    expect(JSON.stringify(garbageRes)).not.toContain(home);
     expect(existsSync(`${garbagePath}.corrupt`)).toBe(false);
     expect(readdirSync(path.dirname(garbagePath)).some((f) => f.includes('.tmp'))).toBe(false);
+  });
+
+  it('recovers when sqlite3 .recover emits valid SQL and exits 1, while failing with privacy-safe diagnostics when exit-1 output is empty/invalid', async () => {
+    const home = await makeTempHome();
+    const validUuid = VALID_UUID;
+    const validDbPath = agyConversationDbPath(home, validUuid)!;
+    await mkdir(path.dirname(validDbPath), { recursive: true });
+    seedConversationDb(validDbPath, validUuid, 220);
+    corruptLastDatabasePage(validDbPath);
+
+    // Wrapper simulating Apple sqlite3 returning exit code 1 after printing recovered SQL + path-bearing stderr
+    const wrapperValidBin = path.join(home, 'sqlite3-exit1-valid');
+    await writeFile(
+      wrapperValidBin,
+      [
+        '#!/bin/sh',
+        'for arg in "$@"; do',
+        '  if [ "$arg" = ".recover" ]; then',
+        '    sqlite3 "$@"',
+        `    echo "Error: database disk image is malformed in ${validDbPath}" >&2`,
+        '    exit 1',
+        '  fi',
+        'done',
+        'exec sqlite3 "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o700 },
+    );
+    chmodSync(wrapperValidBin, 0o700);
+
+    const recoveredRes = await recoverAgyConversationDbIfCorrupt(validDbPath, { sqliteBinary: wrapperValidBin });
+    expect(recoveredRes).toEqual({ recovered: true, reason: 'recovered' });
+    const recoveredDb = new DatabaseSync(validDbPath, { readOnly: true });
+    try {
+      expect(recoveredDb.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'wal' });
+      expect(recoveredDb.prepare('PRAGMA integrity_check').all()).toEqual([{ integrity_check: 'ok' }]);
+      expect((recoveredDb.prepare('SELECT COUNT(*) AS cnt FROM steps').get() as { cnt: number }).cnt).toBeGreaterThan(150);
+    } finally {
+      recoveredDb.close();
+    }
+
+    // Wrapper exiting 1 with empty/invalid output -> must fail with sqlite3_failed + privacy-safe diagnostics
+    const invalidUuid = '44444444-4444-4444-8444-444444444444';
+    const invalidDbPath = agyConversationDbPath(home, invalidUuid)!;
+    seedConversationDb(invalidDbPath, invalidUuid, 120);
+    corruptLastDatabasePage(invalidDbPath);
+
+    const wrapperEmptyBin = path.join(home, 'sqlite3-exit1-empty');
+    await writeFile(
+      wrapperEmptyBin,
+      [
+        '#!/bin/sh',
+        'for arg in "$@"; do',
+        '  if [ "$arg" = ".recover" ]; then',
+        `    echo "SQLITE_CORRUPT at ${invalidDbPath}: page 2 unusable" >&2`,
+        '    exit 1',
+        '  fi',
+        'done',
+        'exec sqlite3 "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o700 },
+    );
+    chmodSync(wrapperEmptyBin, 0o700);
+
+    const failedRes = await recoverAgyConversationDbIfCorrupt(invalidDbPath, { sqliteBinary: wrapperEmptyBin });
+    expect(failedRes).toMatchObject({
+      recovered: false,
+      reason: 'sqlite3_failed',
+      failedStep: 'recover',
+      exitCode: 1,
+    });
+    expect(failedRes.stderrSummary).toContain('SQLITE_CORRUPT');
+    expect(failedRes.stderrSummary).toContain('[path]');
+    expect(JSON.stringify(failedRes)).not.toContain(home);
+    expect(JSON.stringify(failedRes)).not.toContain(invalidDbPath);
   });
 
   it('retries at most once when retried session/resume still fails and logs privacy-safe diagnostics on recovery failure', async () => {
@@ -434,7 +512,9 @@ describe('Antigravity conversation DB self-healing', () => {
       resumeId: garbageUuid,
     });
     await expect(provider.send(sessionId2, 'hello')).rejects.toBeTruthy();
-    expect(warnSpy.mock.calls.some(([fields]) => (fields as Record<string, unknown>)?.recoveryReason === 'sqlite3_failed')).toBe(true);
+    const warnCall = warnSpy.mock.calls.find(([fields]) => (fields as Record<string, unknown>)?.recoveryReason === 'sqlite3_failed');
+    expect(warnCall).toBeTruthy();
+    expect((warnCall?.[0] as Record<string, unknown>)?.recoveryFailedStep).toMatch(/^(recover|import)$/);
     expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(home);
   });
 });

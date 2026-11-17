@@ -193,6 +193,9 @@ export class AgyAcpProvider extends KimiSdkProvider {
               sessionId,
               acpSessionId: state.acpSessionId,
               recoveryReason: recovery.reason,
+              ...(recovery.failedStep ? { recoveryFailedStep: recovery.failedStep } : {}),
+              ...(recovery.exitCode !== undefined ? { recoveryExitCode: recovery.exitCode } : {}),
+              ...(recovery.stderrSummary ? { recoveryDetail: recovery.stderrSummary } : {}),
             },
             'Antigravity conversation DB self-heal did not recover database',
           );
