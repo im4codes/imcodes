@@ -11,6 +11,7 @@ import {
   applyTaskPairSplitModifiers,
   areSubSessionQuickModifiersEqual,
   canHandleGlobalNavigationShortcut,
+  canHandleReturnToMainWindowShortcut,
   chordFromKeyboardEvent,
   cycleOrderedId,
   findShortcutConflicts,
@@ -599,6 +600,60 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(focusComposerElement(composer, { moveCaretToEnd: true })).toBe(true);
     expect(document.activeElement).toBe(composer);
     composer.remove();
+  });
+
+  it('allows return-to-main-window shortcut in remote desktop, fullscreen, xterm, and panel editors, while blocking mobile, IME, and shortcut recording', () => {
+    const remotePanel = document.createElement('div');
+    remotePanel.className = 'remote-desktop-panel';
+    const remoteCanvas = document.createElement('canvas');
+    remoteCanvas.className = 'remote-desktop-canvas';
+    remoteCanvas.setAttribute('data-remote-desktop-surface', 'true');
+    remoteCanvas.tabIndex = 0;
+    remotePanel.appendChild(remoteCanvas);
+    document.body.appendChild(remotePanel);
+    remoteCanvas.focus();
+
+    expect(canHandleReturnToMainWindowShortcut(remoteCanvas, remoteCanvas, { isMobile: false })).toBe(true);
+
+    // Browser fullscreen on Remote Desktop panel remains allowed
+    const origFs = Object.getOwnPropertyDescriptor(document, 'fullscreenElement');
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: remotePanel });
+    try {
+      expect(canHandleReturnToMainWindowShortcut(remoteCanvas, remoteCanvas, { isMobile: false })).toBe(true);
+    } finally {
+      if (origFs) Object.defineProperty(document, 'fullscreenElement', origFs);
+      else delete (document as { fullscreenElement?: Element | null }).fullscreenElement;
+    }
+    remotePanel.remove();
+
+    const xterm = document.createElement('div');
+    xterm.className = 'xterm';
+    const xtermTa = document.createElement('textarea');
+    xtermTa.className = 'xterm-helper-textarea';
+    xterm.appendChild(xtermTa);
+    document.body.appendChild(xterm);
+    xtermTa.focus();
+    expect(canHandleReturnToMainWindowShortcut(xtermTa, xtermTa, { isMobile: false })).toBe(true);
+    xterm.remove();
+
+    const editor = document.createElement('div');
+    editor.className = 'cm-editor';
+    const input = document.createElement('input');
+    editor.appendChild(input);
+    document.body.appendChild(editor);
+    input.focus();
+    expect(canHandleReturnToMainWindowShortcut(input, input, { isMobile: false })).toBe(true);
+    editor.remove();
+
+    // Blocked on mobile, IME composition, and active shortcut recording
+    expect(canHandleReturnToMainWindowShortcut(document.body, document.body, { isMobile: true })).toBe(false);
+    expect(canHandleReturnToMainWindowShortcut(document.body, document.body, { isMobile: false, isComposing: true })).toBe(false);
+
+    const recorder = document.createElement('button');
+    recorder.setAttribute('data-shortcut-recording', 'true');
+    document.body.appendChild(recorder);
+    expect(canHandleReturnToMainWindowShortcut(recorder, recorder, { isMobile: false })).toBe(false);
+    recorder.remove();
   });
 
   it('authoritatively resolves terminal vs chat view mode for focused sub-sessions without falling back to main chat', () => {

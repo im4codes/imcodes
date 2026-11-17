@@ -265,9 +265,57 @@ describe('RemoteDesktopWorkspace', () => {
     expect(closeWorkspace).toHaveBeenCalledTimes(1);
 
     result.rerender(<RemoteDesktopWorkspace {...props} minimized />);
+    expect(manager.releaseInput).toHaveBeenCalledWith('b');
+    expect(screen.getByTestId('panel-a').textContent).toBe('false:false');
+    expect(screen.getByTestId('panel-b').textContent).toBe('true:false');
     const dock = screen.getByRole('button', { name: 'remote_desktop.workspace_restore:2' });
     fireEvent.click(dock);
     expect(restore).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases remote desktop input and exits fullscreen when minimized while fullscreen is active', () => {
+    const exitFullscreen = vi.fn().mockResolvedValue(undefined);
+    const origFsEl = Object.getOwnPropertyDescriptor(document, 'fullscreenElement');
+    const origExitFs = Object.getOwnPropertyDescriptor(document, 'exitFullscreen');
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const view = render(
+      <RemoteDesktopWorkspace
+        state={state}
+        manager={manager}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />,
+    );
+    const workspaceEl = view.container.querySelector('.remote-desktop-workspace') as HTMLDivElement;
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: workspaceEl });
+    Object.defineProperty(document, 'exitFullscreen', { configurable: true, value: exitFullscreen });
+    try {
+      expect(screen.getByTestId('panel-a').textContent).toBe('true:true');
+      view.rerender(
+        <RemoteDesktopWorkspace
+          state={state}
+          manager={manager}
+          minimized
+          onOpenHost={vi.fn()}
+          onActivateTab={vi.fn()}
+          onCloseHost={vi.fn()}
+          onReorderHost={vi.fn()}
+          onCloseWorkspace={vi.fn()}
+        />,
+      );
+      expect(manager.releaseInput).toHaveBeenCalledWith('a');
+      expect(screen.getByTestId('panel-a').textContent).toBe('true:false');
+      expect(exitFullscreen).toHaveBeenCalledTimes(1);
+    } finally {
+      if (origFsEl) Object.defineProperty(document, 'fullscreenElement', origFsEl);
+      else delete (document as { fullscreenElement?: Element | null }).fullscreenElement;
+      if (origExitFs) Object.defineProperty(document, 'exitFullscreen', origExitFs);
+      else delete (document as { exitFullscreen?: () => Promise<void> }).exitFullscreen;
+    }
   });
 
   it('fills its own browser window instead of floating a panel when standalone', () => {

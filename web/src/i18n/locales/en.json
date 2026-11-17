@@ -2352,8 +2352,8 @@
           "desc": "Switch to the session tab on the right"
         },
         "subsession_close_all": {
-          "title": "Close All Sub-Sessions",
-          "desc": "Minimize all open sub-session windows"
+          "title": "Return to Main Window",
+          "desc": "Minimize open windows that support minimizing (sub-sessions, Remote Desktop, Desktop Wall) and close other floating overlays"
         }
       },
       "subsession_quick": {

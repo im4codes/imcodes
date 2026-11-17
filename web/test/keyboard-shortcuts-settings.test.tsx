@@ -67,8 +67,8 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.actions.tab_prev.desc': 'Switch left',
         'settings.shortcuts.actions.tab_next.title': 'Next Tab',
         'settings.shortcuts.actions.tab_next.desc': 'Switch right',
-        'settings.shortcuts.actions.subsession_close_all.title': 'Close All Sub-Sessions',
-        'settings.shortcuts.actions.subsession_close_all.desc': 'Minimize all open sub-session windows',
+        'settings.shortcuts.actions.subsession_close_all.title': 'Return to Main Window',
+        'settings.shortcuts.actions.subsession_close_all.desc': 'Minimize open windows that support minimizing (sub-sessions, Remote Desktop, Desktop Wall) and close other floating overlays',
         'settings.shortcuts.subsession_quick.title': 'Sub-session Quick Shortcuts',
         'settings.shortcuts.subsession_quick.desc': 'Choose modifiers for 1–9 open or minimize.',
         'settings.shortcuts.subsession_quick.open_label': 'Toggle sub-session #',
@@ -135,7 +135,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByText('Next Server')).toBeDefined();
     expect(screen.getByText('Previous Tab')).toBeDefined();
     expect(screen.getByText('Next Tab')).toBeDefined();
-    expect(screen.getByText('Close All Sub-Sessions')).toBeDefined();
+    expect(screen.getByText('Return to Main Window')).toBeDefined();
 
     cleanup();
     render(<KeyboardShortcutsSection isMacOverride={true} />);

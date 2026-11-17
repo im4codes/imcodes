@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { MachineListItem } from '../api/machines.js';
 import type { WsClient } from '../ws-client.js';
@@ -82,6 +82,24 @@ export function RemoteDesktopWorkspace({
   const [maximized, setMaximized] = useState(false);
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const minimizeOriginRef = useRef<RemoteDesktopMinimizeOrigin | null>(null);
+  const wasMinimizedRef = useRef(minimized);
+
+  useEffect(() => {
+    const wasMinimized = wasMinimizedRef.current;
+    wasMinimizedRef.current = minimized;
+    if (!minimized || wasMinimized) return;
+    if (state.activeTabId) {
+      manager.releaseInput(state.activeTabId);
+    }
+    if (
+      typeof document !== 'undefined'
+      && document.fullscreenElement
+      && workspaceRef.current?.contains(document.fullscreenElement)
+      && typeof document.exitFullscreen === 'function'
+    ) {
+      void document.exitFullscreen().catch(() => {});
+    }
+  }, [manager, minimized, state.activeTabId]);
   // Fullscreen on the workspace, not on the active panel: the tab bar has to
   // come with it, or fullscreen becomes a one-way door out of every other
   // machine you had open.
@@ -308,7 +326,7 @@ export function RemoteDesktopWorkspace({
           ws={ws}
           embedded
           active={state.activeTabId === hostKey}
-          inputActive={state.activeTabId === hostKey}
+          inputActive={state.activeTabId === hostKey && !minimized}
           quickData={quickData}
           onClose={() => closeHost(hostKey)}
           onAuthorityLost={() => closeHost(hostKey)}
