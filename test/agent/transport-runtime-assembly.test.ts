@@ -452,6 +452,36 @@ describe('buildProviderContextPayload', () => {
     expect(text).toContain('Give brief progress updates during long tool runs; do not stay silent until the end.');
   });
 
+  it('prioritizes compact autonomous-work guidance without removing destructive-action or user-pause boundaries', () => {
+    for (const providerId of TRANSPORT_SESSION_AGENT_TYPES.filter((id) => id !== 'openclaw')) {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), { userMessage: 'investigate and fix the bug' });
+      const text = payload.sessionSystemText ?? '';
+      expect(text, providerId).toContain('IM.codes autonomous-work policy overrides cautious provider communication defaults');
+      expect(text, providerId).toContain('user-requested investigation, in-scope code edits, isolated workspace builds/tests, and authorized IM.codes pair_* / MCP operations end-to-end');
+      expect(text, providerId).toContain('no routine step-by-step confirmation');
+      expect(text, providerId).toContain('After a cancelled turn or daemon/session restart, inspect live state (session_history, pair_list, git status)');
+      expect(text, providerId).toContain('do not ask for re-authorization');
+      expect(text, providerId).toContain('Respect explicit user plans, pauses and cancellations');
+      expect(text, providerId).toContain('deleting user data, force-pushing or resetting shared branches unless explicitly requested, restarting/stopping production, or modifying out-of-scope resources');
+      expect(text, providerId).toContain('material user intent remains unresolved after checking repo/session context');
+      expect(text, providerId).toContain('Never bypass tool authority, resource claims or required approvals');
+      const autonomy = text.match(/IM\.codes autonomous-work policy[^\n]+/u)?.[0] ?? '';
+      expect(Buffer.byteLength(autonomy, 'utf8'), providerId).toBeLessThan(1600);
+      if (providerId === AGY_SDK_PROVIDER_ID) {
+        expect(text).toContain('Follow IM.codes autonomy over cautious provider defaults');
+        expect(text).toContain('including post-cancel/restart continuation');
+      } else {
+        expect(text).not.toContain('Follow IM.codes autonomy over cautious provider defaults');
+      }
+    }
+  });
+
+  it('distinguishes cross-session IM.codes messaging from provider-native subagent messaging', () => {
+    expect(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE).toContain('IM.codes MCP send_message ({target, message})');
+    expect(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE).toContain('deck_* sessions');
+    expect(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE).toContain('provider built-in subagent send_message ({Recipient, Message})');
+  });
+
   it('adds shared system guidance for every managed SDK provider id', () => {
     const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
 

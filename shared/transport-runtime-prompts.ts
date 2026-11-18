@@ -58,7 +58,7 @@ export const REAL_DEVICE_AUTHORIZATION_GUIDANCE = [
   'Non-destructive work includes reading logs, checking status, running tests or builds, and temporary isolated validation.',
   `Use the exact target with its tool's own schema, authority, resource-claim, reachability, and credential checks; for a controlled_node use ${MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE} with its nodeId.`,
   `When the user has not specified a target, call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST} and, when availability matters, ${VERIFICATION_MACHINE_MCP_TOOLS.VERIFY} before selecting a machine.`,
-  'Deleting, overwriting, migrating ownership, restarting or stopping production, cleaning resources outside this task, or writing default-user data is destructive or irreversible and requires confirmation of the precise scope before execution.',
+  'Deleting user data, destructively overwriting out-of-scope or production files, migrating ownership, restarting or stopping production, cleaning resources outside this task, or writing default-user data is destructive or irreversible and requires confirmation of the precise scope before execution; routine in-scope code edits, isolated workspace builds/tests, and read-only diagnostics do not require extra confirmation.',
   'Never bypass tool authority or resource claims, expose credentials, or fabricate device evidence; report commands, targets, and outcomes exactly.',
 ].join(' ');
 

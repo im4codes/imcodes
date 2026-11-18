@@ -50,6 +50,12 @@ describe('canonical SSH target routing contract', () => {
     expect(rule).toContain('disable host-key verification, guess a nodeId, or bypass resource claims, credential checks, tool authority');
     expect(rule).toContain('With no supplied SSH target, keep the existing controlled-node and no-target discovery rules');
   });
+  it('exempts routine in-scope work while retaining precise destructive-action confirmation', () => {
+    expect(REAL_DEVICE_AUTHORIZATION_GUIDANCE).toContain('Deleting user data, destructively overwriting out-of-scope or production files');
+    expect(REAL_DEVICE_AUTHORIZATION_GUIDANCE).toContain('requires confirmation of the precise scope');
+    expect(REAL_DEVICE_AUTHORIZATION_GUIDANCE).toContain('routine in-scope code edits, isolated workspace builds/tests, and read-only diagnostics do not require extra confirmation');
+    expect(REAL_DEVICE_AUTHORIZATION_GUIDANCE).not.toContain('Deleting, overwriting, migrating ownership');
+  });
   it('is generic prose, not a baked-in target, credential or machine-specific rule', () => {
     expect(rule).not.toMatch(/\b\d{1,3}(?:\.\d{1,3}){3}\b|ai@|ESXi|BEGIN .*PRIVATE KEY|StrictHostKeyChecking=no/);
     expect(rule.length).toBeLessThan(3000);

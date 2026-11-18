@@ -153,6 +153,13 @@ describe('transport runtime: pair participant turn cwd', () => {
     const [payload] = await waitForSends(provider, 1);
     expect(payload!.turnCwd).toBeUndefined();
     expect(payload!.assembledMessage).toContain(`cwd: ${workspace}`);
+    const cwdLine = payload!.assembledMessage.split('\n').find((line) => line.startsWith(`cwd: ${workspace}`));
+    expect(cwdLine).toContain('authoritative pair workspace');
+    expect(cwdLine).toContain('your shell tool still starts in the main checkout on each call');
+    expect(cwdLine).toContain(`cd "${workspace}" &&`);
+    expect(cwdLine).toContain(`git -C "${workspace}"`);
+    expect(cwdLine).toContain(`absolute paths under "${workspace}" to file tools`);
+    expect(cwdLine).toContain('never write in the main checkout');
   });
 
   it('a workspace=dir task: its task directory is the turn cwd, as turnCwd or as the fallback line', async () => {
@@ -170,7 +177,11 @@ describe('transport runtime: pair participant turn cwd', () => {
     expect((await waitForSends(capable, 1))[0]!.turnCwd).toBe(taskDir);
     const incapable = makeProvider(false);
     (await runtimeFor(incapable, EXEC)).send('do the work', 'dir-2');
-    expect((await waitForSends(incapable, 1))[0]!.assembledMessage).toContain(`cwd: ${taskDir}`);
+    const fallback = (await waitForSends(incapable, 1))[0]!;
+    expect(fallback.assembledMessage).toContain(`cwd: ${taskDir}`);
+    expect(fallback.assembledMessage).toContain(`cd "${taskDir}" &&`);
+    expect(fallback.assembledMessage).toContain(`git -C "${taskDir}"`);
+    expect(fallback.assembledMessage).toContain('never write in the main checkout');
   });
 
   it.each([

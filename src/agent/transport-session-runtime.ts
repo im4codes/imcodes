@@ -5024,9 +5024,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         deliveryId: this._activeDispatchEntries.map((entry) => entry.clientMessageId).join('\n'),
         activityGeneration: this.currentActivityGeneration(),
         // A provider that cannot start a turn in another directory is told the
-        // workspace on one line instead (see task-pairs/turn-cwd.ts).
+        // workspace on one line instead; this does not change its shell cwd.
         messagePreamble: pairTurnCwd && !providerTakesTurnCwd
-          ? [`cwd: ${pairTurnCwd}`, messagePreamble].filter(Boolean).join('\n')
+          ? [`cwd: ${pairTurnCwd} (authoritative pair workspace — your shell tool still starts in the main checkout on each call; prefix every command with cd "${pairTurnCwd}" && ... or git -C "${pairTurnCwd}", and pass absolute paths under "${pairTurnCwd}" to file tools; never write in the main checkout)`, messagePreamble].filter(Boolean).join('\n')
           : messagePreamble,
         ...(pairTurnCwd && providerTakesTurnCwd ? { turnCwd: pairTurnCwd } : {}),
         description: isSlashControl ? undefined : this._description,
