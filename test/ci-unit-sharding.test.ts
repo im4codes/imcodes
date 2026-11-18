@@ -96,15 +96,25 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     expect(isRdEnabledForRef('refs/heads/repro/macos-ci')).toBe(true);
 
     const macUnit = jobs['macos-unit-tests']!;
+    expect(macUnit['runs-on']).toBe('macos-15');
     expect(macUnit.strategy?.matrix.shard).toEqual([1, 2, 3]);
     expect(macUnit.strategy?.['max-parallel']).toBe(2);
     expect(macUnit['timeout-minutes']).toBe(45);
     expect(jobs.docker!.needs).toContain('macos-unit-tests');
 
-    // Also inspect sibling mobile-speech workflow macOS job count on dev pushes.
+    const installSmoke = parse(readFileSync('.github/workflows/install-smoke.yml', 'utf8')) as {
+      jobs: Record<string, { strategy?: { matrix?: { os?: string[] } }; steps?: Array<{ if?: string; run?: string }> }>;
+    };
+    const smokeOs = installSmoke.jobs['install-smoke']!.strategy?.matrix?.os ?? [];
+    expect(smokeOs).toContain('macos-15');
+    expect(smokeOs).not.toContain('macos-latest');
+    expect(installSmoke.jobs['install-smoke']!.steps?.some((s) => s.if === "runner.os == 'macOS'")).toBe(true);
+
+    // Also inspect sibling mobile-speech workflow macOS job count on dev pushes (stays on macos-26 for Xcode 26).
     const mobileSpeech = parse(readFileSync('.github/workflows/mobile-speech.yml', 'utf8')) as { jobs: Record<string, Job> };
-    const mobileMacJobs = Object.values(mobileSpeech.jobs).filter((job) => (job['runs-on'] ?? '').startsWith('macos-')).length;
-    expect(mobileMacJobs).toBe(1);
+    const mobileMacJobs = Object.values(mobileSpeech.jobs).filter((job) => (job['runs-on'] ?? '').startsWith('macos-'));
+    expect(mobileMacJobs).toHaveLength(1);
+    expect(mobileMacJobs[0]!['runs-on']).toBe('macos-26');
 
     // Peak simultaneous macOS jobs on a dev push:
     // macos-unit-tests (max-parallel=2) + controlled-node-executables macOS leg (1) + mobile-speech (1) = 4 (< 5 cap).
@@ -112,7 +122,7 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
       (macUnit.strategy?.['max-parallel'] ?? macUnit.strategy!.matrix.shard.length) +
       1 + // controlled-node-executables macos-15 leg
       (isRdEnabledForRef('refs/heads/dev') ? 1 : 0) +
-      mobileMacJobs;
+      mobileMacJobs.length;
     expect(devPlannedMacosConcurrency).toBeLessThanOrEqual(4);
 
     // Windows controlled-node-executables remains disabled on refs/heads/dev.
