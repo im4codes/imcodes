@@ -75,7 +75,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install tmux
       - name: Install dependencies
-        run: npm ci
+        shell: bash
+        run: ./scripts/ci-npm-ci.sh .
       - name: Build daemon (populate dist/)
         run: npm run build
       - name: Pack, global-install the tarball, and verify the CLI
