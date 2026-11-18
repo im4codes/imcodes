@@ -3181,6 +3181,116 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     }
   });
 
+  it('re-emits Running background task status after onComplete across end_turn and max_tokens, clears to null on task finish, and does not clobber a synchronous next turn', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_status_after_complete';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const timeline: Array<{ kind: 'complete' | 'status'; content?: string; status?: string | null; label?: string | null }> = [];
+    let launchNextTurnOnComplete = false;
+    let launchedNextTurn = false;
+    provider.onComplete((sid, m) => {
+      if (sid !== id) return;
+      timeline.push({ kind: 'complete', content: m.content });
+      if (launchNextTurnOnComplete && !launchedNextTurn) {
+        launchedNextTurn = true;
+        launchNextTurnOnComplete = false;
+        void provider.send(id, 'synchronous follow-up turn');
+        const currentState = (provider as any).sessions.get(id);
+        (provider as any).emitStatus(id, currentState, { status: 'thinking', label: 'Thinking...' });
+      }
+    });
+    provider.onStatus((sid, st) => {
+      if (sid === id) timeline.push({ kind: 'status', status: st.status, label: st.label });
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-up')).toBe('sent');
+      await vi.waitFor(() => expect(timeline.some((e) => e.kind === 'complete')).toBe(true), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Seed an active native background task.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/bg-status-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 10', WaitMsBeforeAsync: 500 },
+        toolStatus: 'running',
+      });
+
+      // 1) end_turn settles with onComplete, then re-emits Running background task AFTER onComplete.
+      timeline.length = 0;
+      (provider as any).startAutonomousTurn(id, state);
+      const genEndTurn = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:end-turn`;
+      state.currentText = 'foreground reply while bg running';
+      (state.activePromptGenerations ??= new Set()).add(genEndTurn);
+      (provider as any).settleTurn(id, state, genEndTurn, 'end_turn');
+
+      const completeIdx1 = timeline.findIndex((e) => e.kind === 'complete' && e.content === 'foreground reply while bg running');
+      expect(completeIdx1).toBeGreaterThanOrEqual(0);
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: 'waiting', label: 'Running background task' });
+      expect(timeline.length - 1).toBeGreaterThan(completeIdx1);
+
+      // 2) max_tokens path also emits Running background task AFTER onComplete.
+      timeline.length = 0;
+      (provider as any).startAutonomousTurn(id, state);
+      const genMaxTok = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:max-tokens`;
+      state.currentText = 'truncated reply while bg running';
+      (state.activePromptGenerations ??= new Set()).add(genMaxTok);
+      (provider as any).settleTurn(id, state, genMaxTok, 'max_tokens');
+
+      const completeIdx2 = timeline.findIndex((e) => e.kind === 'complete' && e.content === 'truncated reply while bg running');
+      expect(completeIdx2).toBeGreaterThanOrEqual(0);
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: 'waiting', label: 'Running background task' });
+      expect(timeline.length - 1).toBeGreaterThan(completeIdx2);
+
+      // 3) If onComplete synchronously starts the next turn (promptInFlight === true),
+      //    settleTurn tail must NOT overwrite the new turn's Thinking... with Running background task.
+      timeline.length = 0;
+      launchNextTurnOnComplete = true;
+      (provider as any).startAutonomousTurn(id, state);
+      const genOverlap = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:overlap`;
+      state.currentText = 'reply triggering successor';
+      (state.activePromptGenerations ??= new Set()).add(genOverlap);
+      (provider as any).settleTurn(id, state, genOverlap, 'end_turn');
+
+      expect(launchedNextTurn).toBe(true);
+      const firstCompleteIdx = timeline.findIndex((e) => e.kind === 'complete' && e.content === 'reply triggering successor');
+      expect(firstCompleteIdx).toBeGreaterThanOrEqual(0);
+      // Immediately upon settleTurn returning while the synchronous successor turn is in flight,
+      // settleTurn's tail must NOT overwrite the successor's Thinking... with Running background task.
+      expect(timeline.slice(firstCompleteIdx + 1)).toEqual([
+        { kind: 'status', status: 'thinking', label: 'Thinking...' },
+      ]);
+      await vi.waitFor(() => expect(timeline.some((e) => e.kind === 'complete' && e.content === 'synchronous follow-up turn')).toBe(true), { timeout: 5000 });
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: 'waiting', label: 'Running background task' });
+
+      // 4) Background task completion clears status to null once reactive wakeup finishes.
+      timeline.length = 0;
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 30,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `[Message] timestamp=2026-11-18T00:03:00Z sender=${nativeId}/bg-status-1 content=Task id "${nativeId}/bg-status-1" finished with result:\nCommand exited with code 0.`,
+      });
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 31,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      });
+      expect(timeline.at(-1)).toEqual({ kind: 'status', status: null, label: null });
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
   it('does not reconcile active subagents on transcript-first ERROR/RUNNING manage_subagents(list) or mixed ACP/transcript errors, and reconciles cleanly on terminal DONE', async () => {
     const { provider } = await setup();
     const id = 'deck_test_agy_f2_generic_status';

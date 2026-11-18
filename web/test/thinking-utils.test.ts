@@ -141,6 +141,50 @@ describe('getActiveStatusText', () => {
       { type: 'assistant.text', payload: { text: 'ordinary assistant reply' } },
     ])).toBeNull();
   });
+
+  it('preserves Running background task across usage.update and session.state(running) (ORD 5513..5517)', () => {
+    expect(getActiveStatusText([
+      { type: 'assistant.text', payload: { text: 'final reply' } },
+      { type: 'agent.status', payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ])).toBe('Running background task');
+  });
+
+  it('clears background status immediately on session.state(idle) or session.state(stopped)', () => {
+    expect(getActiveStatusText([
+      { type: 'assistant.text', payload: { text: 'final reply' } },
+      { type: 'agent.status', payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'idle' } },
+    ])).toBeNull();
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'session.state', payload: { state: 'stopped' } },
+    ])).toBeNull();
+  });
+
+  it('does not leak finished tool status across tool.result followed by session.state(running)', () => {
+    expect(getActiveStatusText([
+      { type: 'tool.call', payload: { tool: 'Read' } },
+      { type: 'agent.status', payload: { label: 'Reading file...' } },
+      { type: 'tool.result', payload: { ok: true } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 1, busyReasons: ['runtime_dispatch'] } },
+    ])).toBeNull();
+  });
+
+  it('falls back to Running background task for background_monitor-only running tail unless explicitly cleared with label:null', () => {
+    expect(getActiveStatusText([
+      { type: 'assistant.text', payload: { text: 'final reply' } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ])).toBe('Running background task');
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { label: null } },
+      { type: 'usage.update', payload: { inputTokens: 100 } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ])).toBeNull();
+  });
 });
 
 describe('getTailSessionState', () => {

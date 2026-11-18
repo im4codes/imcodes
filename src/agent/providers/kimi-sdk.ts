@@ -3269,31 +3269,10 @@ export class KimiSdkProvider implements TransportProvider {
       this.emitAgyUsage(sessionId, state, turnUsage, true);
       if (sessionSystemTextToCommit) state.sessionSystemTextInjected = sessionSystemTextToCommit;
 
-      if (stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
-        // Still emit whatever text we accumulated — it's a partial but useful
-        // response — and mark metadata so the UI can show the truncation cause.
-        const msg: AgentMessage = {
-          id: messageId,
-          sessionId,
-          kind: 'text',
-          role: 'assistant',
-          content: text,
-          timestamp: Date.now(),
-          status: 'complete',
-          metadata: {
-            stopReason,
-            ...((this.profile.strictModelSelection ? state.turnModel : state.model)
-              ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
-            ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
-            ...(turnUsage ? { usage: turnUsage } : {}),
-          },
-        };
-        for (const cb of this.completeCallbacks) cb(sessionId, msg);
-        return;
-      }
-
-      // stopReason === 'end_turn' (happy path).
-      if (compactControl && !this.supportsSystemPromptMetaForState(state)) {
+      const isLengthLimited = stopReason === 'max_tokens' || stopReason === 'max_turn_requests';
+      // Still emit whatever text we accumulated on length/turn limits — and mark
+      // metadata so the UI can show the truncation cause — or complete end_turn.
+      if (!isLengthLimited && compactControl && !this.supportsSystemPromptMetaForState(state)) {
         state.sessionSystemTextInjected = undefined;
       }
       const msg: AgentMessage = {
@@ -3305,14 +3284,26 @@ export class KimiSdkProvider implements TransportProvider {
         timestamp: Date.now(),
         status: 'complete',
         metadata: {
-          ...(compactControl ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
+          ...(isLengthLimited
+            ? { stopReason }
+            : compactControl
+              ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' }
+              : {}),
           ...((this.profile.strictModelSelection ? state.turnModel : state.model)
-              ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
+            ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
           ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
           ...(turnUsage ? { usage: turnUsage } : {}),
         },
       };
       for (const cb of this.completeCallbacks) cb(sessionId, msg);
+      if (
+        this.id === AGY_SDK_PROVIDER_ID
+        && this.sessions.get(sessionId) === state
+        && !state.promptInFlight
+        && ((state.agyBackgroundTasks?.size ?? 0) > 0 || state.agyReactive)
+      ) {
+        this.syncAgyStatusAfterTurn(sessionId, state);
+      }
     } finally {
       state.lastActivityAt = Date.now();
       this.refreshIdleHibernateTimer();

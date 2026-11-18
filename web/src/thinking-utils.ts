@@ -29,6 +29,16 @@ const THINKING_SKIP_TYPES = new Set<string>([
   ...TIMELINE_METADATA_EVENT_TYPES,
 ]);
 
+// Non-content telemetry/state signals that should not erase a live agent.status
+// label (unlike tool.call / tool.result / ordinary assistant.text / user.message).
+const STATUS_SKIP_TYPES = new Set<string>([
+  'usage.update',
+  'mode.state',
+  'terminal.snapshot',
+  'command.ack',
+  ...TIMELINE_METADATA_EVENT_TYPES,
+]);
+
 function hasPrecedingUserCancelStop(
   events: Array<{ type: string; payload?: Record<string, unknown> }>,
   idleIndex: number,
@@ -89,17 +99,37 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
  * disappear. Ordinary user/assistant activity still terminates the lookup.
  */
 export function getActiveStatusText(events: Array<{ type: string; payload?: Record<string, unknown> }>): string | null {
+  let backgroundMonitorFallback: string | null = null;
+  let checkedLatestSessionState = false;
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type === 'agent.status') {
       if (e.payload?.label) return String(e.payload.label);
       return null;
     }
-    if (e.type === 'peer_audit.status') continue;
+    if (STATUS_SKIP_TYPES.has(e.type)) continue;
     if (e.type === 'assistant.text' && e.payload?.automation === true && e.payload?.memoryExcluded === true) continue;
-    if (e.type !== 'agent.status') break;
+    if (e.type === 'session.state') {
+      const state = typeof e.payload?.state === 'string' ? e.payload.state : '';
+      if (state === 'idle' || state === 'stopped') return null;
+      if (!checkedLatestSessionState && state !== 'started') {
+        checkedLatestSessionState = true;
+        const reasons = e.payload?.busyReasons;
+        if (
+          state === 'running'
+          && e.payload?.blockingWorkCount === 0
+          && Array.isArray(reasons)
+          && reasons.length > 0
+          && reasons.every((r) => r === 'background_monitor')
+        ) {
+          backgroundMonitorFallback = 'Running background task';
+        }
+      }
+      continue;
+    }
+    break;
   }
-  return null;
+  return backgroundMonitorFallback;
 }
 
 /**
