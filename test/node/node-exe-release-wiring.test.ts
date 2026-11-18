@@ -46,6 +46,7 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('dist-node-exe/computer-use-helper/**');
     expect(workflow).toContain('IMCODES_WINDOWS_SIGNING_PFX_BASE64');
     expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
+    expect(workflow).toContain('node scripts/normalize-controlled-node-artifacts.mjs server/controlled-node-artifacts');
     expect(workflow).toContain('remote-desktop-worker-artifacts.mjs verify');
     expect(workflow).toContain('npx tsx scripts/qualify-windows-self-upgrade.ts');
     expect(workflow).toContain('runs-on: windows-2022');

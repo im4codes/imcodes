@@ -1930,10 +1930,7 @@ jobs:
       - name: Flatten artifact structure
         run: |
           set -euo pipefail
-          if [ -d server/controlled-node-artifacts/dist-node-exe ]; then
-            mv server/controlled-node-artifacts/dist-node-exe/* server/controlled-node-artifacts/
-            rmdir server/controlled-node-artifacts/dist-node-exe
-          fi
+          node scripts/normalize-controlled-node-artifacts.mjs server/controlled-node-artifacts
 
       # actions/upload-artifact -> download-artifact does not reliably
       # preserve the executable bit through its zip transport: the Linux
