@@ -888,20 +888,25 @@ export const TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE: string =
 /** The short form for tool descriptions with a tight byte budget (pair_close carries the full note). */
 export const TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE: string = 'Close each handled pair yourself with pair_close.';
 
+export const TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE: string =
+  'Sub-session isolation & Execution Pool obedience: Brain MUST NEVER assign or reassign a sub-session (executor or auditor) to more than one concurrent open pair (queued, working, in_audit, awaiting_audit, rework, passed, paused); each open pair owns dedicated executor/auditor sub-sessions (only dependsOn pairs waiting on an upstream task may reference it). '
+  + 'When an Execution Pool is configured (executionPoolsState="configured"), call pair_create WITHOUT executor, auditor (except auditor="none" when no audit is needed), executorModel, auditorModel, createExecutor, or createAuditor by default so the daemon picks/provisions strictly from the configured pool and respects each entry\'s executor/auditor role. '
+  + 'Specify an explicit session or model ONLY when the user explicitly instructed that exact session or model (always pick an idle session with inOpenPair=false and respect configured pool roles unless the user explicitly overrode the role).';
+
 /**
  * Brain drives pairs with the MCP tools only. The daemon still PARSES a legacy IMCODES_TASK marker from a Brain (existing
  * sessions keep working) but no Brain-facing text teaches or recommends one.
  */
 export const TASK_PAIR_BRAIN_MCP_ONLY_RULE: string =
   'Brain: close and advance pairs ONLY with the MCP tools; do not write IMCODES_TASK markers yourself (the daemon still parses a legacy marker for compatibility, but it is no longer taught or encouraged for Brain). '
-  + 'pair_create (with title; auditor=<session>|none) creates new work, then pair_dispatch if the result is queued; pair_reassign replaces the executor or auditor (or their models); pair_close (action=done, action=cancel) closes; '
+  + 'pair_create (with title; omit executor/auditor/models by default when an execution pool is configured, or pass auditor=none to skip audit) creates new work, then pair_dispatch if the result is queued; pair_reassign replaces the executor or auditor (or their models) on an existing pair; pair_close (action=done, action=cancel) closes; '
   + 'pair_next_round opens the next round of a passed pair; pair_task_update / pair_task_check edit the brief and its boxes; pair_set_max_concurrency sets your queue limit; pair_resource_claim claims a shared resource. '
   + 'Do not add any IMCODES_TASK marker to a reply -- not even an empty or "no-op" one (there is no such marker; it only clutters the main session; the sole idle-Brain heartbeat-pause exception is NEEDS_DECISION above, never for pair lifecycle). With nothing to handle, just answer. '
   + 'Never use send_message task metadata to create a pair. pair_dispatch auto-queues an existing pair when capacity is unavailable, so there is no need to defer work yourself. '
   + 'A finished pair whose commits are not yet on any branch of the repository is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and pair_close action=done integration=dismiss (or action=cancel) stops the reminders for one you will not merge. '
   + 'pair_close action=done force=true (or accept=true) accepts/ends from any state and marks an audited unpassed pair unaudited; action=cancel ends from any state. '
   + 'No-auditor DONE reports are open and hold their concurrency slot until you decide with pair_close (done or cancel); more work can return them to working. '
-  + 'Naming executor/auditor (pair_create, pair_reassign) replaces the current holder of that role immediately, ignoring the execution pool role config; executorModel/auditorModel steers the next automatic pick but does not replace a current role; when no execution pool is configured, pair_create picks idle same-family secondary-tier sub-sessions and auto-creates missing ones up to the per-project cap unless role models or sessions are named explicitly.';
+  + 'Never reuse a sub-session across concurrent open pairs (each open pair owns dedicated sessions; send_list_targets reports inOpenPair/openPairs and poolRole/poolRoles). When an execution pool is configured, omit executor/auditor/models on pair_create by default so the pool picks role-eligible sessions; explicit overrides are only for explicit user instruction (naming executor/auditor on pair_reassign still replaces that role while forbidding concurrent open-pair reuse), and when no execution pool is configured pair_create picks idle same-family secondary-tier sub-sessions and auto-creates missing ones up to the per-project cap unless role models or sessions are named explicitly.';
 
 /**
  * Owner rule (2026-11-14): when reporting, listing, summarizing, or asking
@@ -2745,6 +2750,7 @@ export function buildTaskPairMarkerContract(): string {
     SESSION_HISTORY_SUPERVISION_GUIDANCE,
     'Waiting costs no model turns: use pair_pause mode=manual for a manual hold, or mode=dependencies with same-project dependsOn ids; pair_resume clears only the manual hold. Dependencies wait for Brain-accepted DONE, not PASS. Paused pairs retain their stage/material/workspace; do not keep replying that you are waiting. pair_create also accepts dependsOn.',
     `Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. With an empty or unconfigured pool the daemon uses idle sub-sessions of the Brain in the SAME provider family that run the secondary model of that family (Anthropic Sonnet, OpenAI Sol, DeepSeek Pro; never another vendor, never the flagship), and pair_create auto-creates missing same-family secondary-tier sub-sessions up to the per-project cap (${TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT}); executor and auditor are different sessions, and when the cap or quota blocks provisioning the daemon tells you how to fix it (create a sub-session, name executor/auditor, or execution_pool_set). Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.`,
+    TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE,
     TASK_PAIR_BRAIN_MCP_ONLY_RULE,
     TASK_PAIR_USER_FACING_TITLE_RULE,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,

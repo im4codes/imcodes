@@ -9,6 +9,7 @@ import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-que
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
+import { BRAIN_PAIRS_SUPERVISED_WORK } from '../../src/daemon/supervision-prompts.js';
 import { TASK_PAIR_BRAIN_CONTRACT_ID } from '../../shared/task-pair.js';
 import { MEMORY_MCP_PROVIDER_IDS } from '../../shared/memory-ws.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
@@ -449,7 +450,7 @@ describe('TransportSessionRuntime memory provenance', () => {
     // The pairs engine no longer advertises the retired send_message-only
     // route. Supervised Brain turns must carry the structured pair_create
     // route instead.
-    const ON_DUTY = 'pair_create_with_brief_and_roles_then_pair_dispatch_if_queued';
+    const ON_DUTY = BRAIN_PAIRS_SUPERVISED_WORK.newWork;
 
     it('re-reads the mode every turn and re-registers the full body whenever the variant changes', async () => {
       const { runtime, nextTurnText } = await brainRuntime('deck_mode_switch_brain');

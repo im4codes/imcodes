@@ -3,6 +3,7 @@ import {
   TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
   TASK_PAIR_BRAIN_MCP_ONLY_RULE,
   TASK_PAIR_NEEDS_DECISION_RULE,
+  TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE,
   TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
   TASK_PAIR_AUDITOR_PROPOSAL_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
@@ -926,5 +927,9 @@ describe('pair contract consistency regressions', () => {
     expect(contract).toContain('Your turns start inside that workspace: never write or commit there');
     expect(contract).toContain('if your shell tool resets to the main checkout on each call');
     expect(contract).toContain('cd or git -C into the workspace path explicitly for read-only checks');
+    expect(contract).toContain(TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE);
+    expect(contract).toContain('NEVER assign or reassign a sub-session (executor or auditor) to more than one concurrent open pair');
+    expect(TASK_PAIR_BRAIN_MCP_ONLY_RULE).toContain('Never reuse a sub-session across concurrent open pairs');
+    expect(TASK_PAIR_BRAIN_MCP_ONLY_RULE).toContain('omit executor/auditor/models on pair_create by default');
   });
 });

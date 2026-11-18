@@ -101,10 +101,12 @@ import {
   evaluateSupervisionObservedIdentity,
   normalizeSupervisionExecutionModel,
   isDefaultSecondaryTierTarget,
+  supervisionExecutionConfigAllowsRole,
   SUPERVISION_NO_POOL_DEFAULT_EXECUTION,
   supervisionSelectedExecutionBindingMatches,
   type SupervisionExecutionBinding,
   type SupervisionExecutionPoolKind,
+  type SupervisionExecutionPoolRole,
   type SupervisionExecutionPoolsConfig,
   type SupervisionObservedExecutionIdentity,
 } from '../../shared/supervision-execution-pool.js';
@@ -268,6 +270,8 @@ export interface SendTargetInfo {
   lastToolCallAt?: number;
   /** Open task-pair memberships, projected without provider calls. */
   openPairs?: Array<{ taskId: string; role: 'brain' | 'executor' | 'auditor'; status: string; round: number; title?: string }>;
+  /** True when the target participates in any concurrent open task pair. */
+  inOpenPair?: boolean;
   /**
    * Present when something other than the user created this session (a pair, or task.autoProvision): who asked for it. Nothing
    * closes such a session by itself; its creator or the Brain closes it with session_close when it is no longer needed.
@@ -291,6 +295,10 @@ export interface SendTargetInfo {
    * task/audit send.
    */
   eligiblePools?: SupervisionExecutionPoolKind[];
+  /** Effective pool role permission across eligible configured pools (or requested pool), or null if outside pool. */
+  poolRole?: SupervisionExecutionPoolRole | null;
+  /** Per-pool configured role permissions keyed by primary/economy when configured. */
+  poolRoles?: Partial<Record<SupervisionExecutionPoolKind, SupervisionExecutionPoolRole>>;
   /** New supervised work may start now, queue behind a busy turn, or not use it. */
   dispatchMode?: 'new_work' | 'queue_only' | 'unavailable';
   /** Present only while no execution pool is configured: this target is a default candidate (same vendor, secondary tier). */
@@ -1113,10 +1121,14 @@ export function listSendTargets(
   // legacy-unconfigured caller; supervised sends independently revalidate the
   // exact target below and never trust this projection as authority.
   const candidates = getSiblingSessions({ ...caller, projectName: callerProjectName }, allSessions)
-    .map((target) => ({
-      target,
-      eligiblePools: eligibleSupervisionPoolsForTarget(executionPools, target),
-    }))
+    .map((target) => {
+      const actual = supervisionObservedIdentityForTarget(target);
+      return {
+        target,
+        eligiblePools: eligibleSupervisionPoolsForTarget(executionPools, target, actual),
+        poolRoles: configuredPoolRolesForTarget(executionPools, target, actual),
+      };
+    })
     .filter(({ eligiblePools }) => requestedPool === undefined || eligiblePools.includes(requestedPool));
   const filtered = query
     ? candidates.filter(({ target }) => [
@@ -1149,7 +1161,7 @@ export function listSendTargets(
     supervisionMode: authoritativeSnapshot.mode,
     autoAudit: isAutomaticSupervisionEnabled(authoritativeSnapshot),
     ...(requestedPool === undefined ? {} : { appliedExecutionPool: requestedPool }),
-    items: filtered.slice(0, limit).map(({ target, eligiblePools }) => toTargetInfo(
+    items: filtered.slice(0, limit).map(({ target, eligiblePools, poolRoles }) => toTargetInfo(
       target,
       availability.get(target.name) ?? {
         availability: DELEGATION_AVAILABILITY.UNKNOWN,
@@ -1159,6 +1171,8 @@ export function listSendTargets(
       // No pool configured: a sub-session of the Brain that the no-pool default would use (same provider family, secondary tier).
       executionPools.state !== 'configured' && isNoPoolDefaultTarget(allSessions, callerProjectName, target),
       input.participantView === true,
+      executionPools.state === 'configured' ? poolRoles : undefined,
+      requestedPool,
     )),
   };
 }
@@ -1229,11 +1243,42 @@ function targetMatchesConfiguredSupervisionPool(
 function eligibleSupervisionPoolsForTarget(
   pools: SupervisionExecutionPoolsConfig,
   target: SessionRecord,
+  actual = supervisionObservedIdentityForTarget(target),
 ): SupervisionExecutionPoolKind[] {
   if (pools.state !== 'configured') return [];
   return (['primary', 'economy'] as const).filter((pool) => (
-    targetMatchesConfiguredSupervisionPool(pools, pool, target)
+    targetMatchesConfiguredSupervisionPool(pools, pool, target, actual)
   ));
+}
+
+function configuredPoolRolesForTarget(
+  pools: SupervisionExecutionPoolsConfig,
+  target: SessionRecord,
+  actual = supervisionObservedIdentityForTarget(target),
+): Partial<Record<SupervisionExecutionPoolKind, SupervisionExecutionPoolRole>> {
+  if (pools.state !== 'configured') return {};
+  const roles: Partial<Record<SupervisionExecutionPoolKind, SupervisionExecutionPoolRole>> = {};
+  for (const pool of ['primary', 'economy'] as const) {
+    const definition = pool === 'primary' ? pools.primaryDevelopmentPool : pools.economyTaskPool;
+    const matches = definition.configs.filter((config) => evaluateSupervisionObservedIdentity({ config, actual, pool }).ok);
+    if (matches.length === 0) continue;
+    const allowExecutor = matches.some((config) => supervisionExecutionConfigAllowsRole(config, 'executor'));
+    const allowAuditor = matches.some((config) => supervisionExecutionConfigAllowsRole(config, 'auditor'));
+    roles[pool] = allowExecutor && allowAuditor ? 'both' : allowExecutor ? 'executor' : 'auditor';
+  }
+  return roles;
+}
+
+function mergeConfiguredPoolRoles(
+  poolRoles: Partial<Record<SupervisionExecutionPoolKind, SupervisionExecutionPoolRole>>,
+  requestedPool?: SupervisionExecutionPoolKind,
+): SupervisionExecutionPoolRole | null {
+  if (requestedPool) return poolRoles[requestedPool] ?? null;
+  const values = Object.values(poolRoles);
+  if (values.length === 0) return null;
+  const allowExecutor = values.some((role) => role === 'executor' || role === 'both');
+  const allowAuditor = values.some((role) => role === 'auditor' || role === 'both');
+  return allowExecutor && allowAuditor ? 'both' : allowExecutor ? 'executor' : 'auditor';
 }
 
 function supervisionTaskIdentityForTarget(target: SessionRecord): PersistedSupervisionTaskAssignmentIdentity | undefined {
@@ -6115,6 +6160,8 @@ function toTargetInfo(
   eligiblePools?: SupervisionExecutionPoolKind[],
   defaultExecution = false,
   participantView = false,
+  poolRoles?: Partial<Record<SupervisionExecutionPoolKind, SupervisionExecutionPoolRole>>,
+  requestedPool?: SupervisionExecutionPoolKind,
 ): SendTargetInfo {
   // Session model discovery keeps its existing policy; Pair metadata is shared equally within the admitted project.
   const model = participantView ? undefined : resolveEffectiveSessionModel(s);
@@ -6148,12 +6195,14 @@ function toTargetInfo(
     lastActiveAt: s.updatedAt,
     ...(activity?.lastMessageAt === undefined ? {} : { lastMessageAt: activity.lastMessageAt }),
     ...(activity?.lastToolCallAt === undefined ? {} : { lastToolCallAt: activity.lastToolCallAt }),
-    ...(openPairs.length === 0 ? {} : { openPairs }),
+    ...(openPairs.length === 0 ? {} : { openPairs, inOpenPair: true }),
     ...(creationMarker ? { autoCreated: { createdBy: creationMarker.createdBy, ...(creationMarker.pairTaskId ? { pairTaskId: creationMarker.pairTaskId } : {}) } } : {}),
     providerFamily: resolvePeerAuditProviderFamily(s),
     availability: availability.availability,
     ...(eligiblePools === undefined ? {} : {
+      inOpenPair: openPairs.length > 0,
       eligiblePools,
+      ...(poolRoles === undefined ? {} : { poolRoles, poolRole: mergeConfiguredPoolRoles(poolRoles, requestedPool) }),
       dispatchMode: eligiblePools.length === 0
         ? 'unavailable' as const
         : dispatchModeOf(availability),

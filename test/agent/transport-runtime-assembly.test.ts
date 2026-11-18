@@ -27,7 +27,7 @@ import {
 import { buildCloudDocOutputContract, buildFileOutputContract } from '../../shared/file-output-contract.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
-import { buildBrainWorkDelegationContractRef } from '../../src/daemon/supervision-prompts.js';
+import { BRAIN_PAIRS_SUPERVISED_WORK, buildBrainWorkDelegationContractRef } from '../../src/daemon/supervision-prompts.js';
 import {
   SESSION_IDENTITY_PROJECT_MAX_CHARS as ID_PROJECT_MAX,
   SESSION_IDENTITY_SESSION_MAX_CHARS as ID_SESSION_MAX,
@@ -324,7 +324,9 @@ describe('buildProviderContextPayload', () => {
     const text = brainSystemText({ automaticSupervisionEnabled: true });
     expect(text).toContain('"automaticSupervision":true');
     expect(text).toContain('"engine":"pairs"');
-    expect(text).toContain('pair_create_with_brief_and_roles_then_pair_dispatch_if_queued');
+    expect(text).toContain(BRAIN_PAIRS_SUPERVISED_WORK.newWork);
+    expect(text).toContain(BRAIN_PAIRS_SUPERVISED_WORK.poolObedience);
+    expect(text).toContain(BRAIN_PAIRS_SUPERVISED_WORK.sessionIsolation);
     expect(text).toContain(TASK_PAIR_SPLIT_UNRELATED_TOKEN);
     expect(text).toContain(TASK_PAIR_SPLIT_UNRELATED_RULE);
     expect(text).toContain(TASK_PAIR_MULTI_PHASE_CRON_TOKEN);

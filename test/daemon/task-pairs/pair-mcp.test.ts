@@ -11,6 +11,8 @@ import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../..
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
+import { SUPERVISION_EXECUTION_CONFIG_DEFAULTS } from '../../../shared/supervision-execution-pool.js';
 
 const PROJECT = 'pair-mcp-project';
 const BRAIN = 'deck_pair_mcp_brain';
@@ -310,6 +312,147 @@ describe('pair MCP projections', () => {
     await expect(auditorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]({ taskId: wrongState, verdict: 'PASS' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: wrongState })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
     removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
+  });
+
+  it('rejects reusing an executor or auditor already in a concurrent open pair while allowing dependsOn', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const exec2 = 'deck_sub_pair_mcp_exec_free';
+    const aud2 = 'deck_sub_pair_mcp_aud_free';
+    const brain = session(BRAIN, 'brain');
+    const exec = session(EXEC, 'w1', 'idle');
+    const aud = session(AUD, 'w2', 'idle');
+    const freeExec = session(exec2, 'w3', 'idle');
+    const freeAud = session(aud2, 'w4', 'idle');
+    upsertSession(brain); upsertSession(exec); upsertSession(aud); upsertSession(freeExec); upsertSession(freeAud);
+    setTaskPairDeliveryDepsForTests({ send: async () => undefined });
+    try {
+      putTaskPairFixture(getTaskPairStore(), PROJECT, pair('open-in-audit', 'in_audit'));
+      const handlers = createMemoryMcpToolHandlers(caller, {
+        sendDeps: { listSessions: () => [brain, exec, aud, freeExec, freeAud] },
+      });
+
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        brief: 'reuse idle executor from open pair', executor: EXEC, auditor: aud2, idempotencyKey: 'reuse-exec',
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: expect.stringContaining('open-in-audit'),
+      });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        brief: 'reuse idle auditor from open pair', executor: exec2, auditor: AUD, idempotencyKey: 'reuse-aud',
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: expect.stringContaining('open-in-audit'),
+      });
+      // Dependency wait referencing the holder pair remains valid.
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        brief: 'depends on holder', executor: EXEC, auditor: AUD, dependsOn: ['open-in-audit'], idempotencyKey: 'dep-ok',
+      })).resolves.toMatchObject({ status: 'ok', state: 'queued' });
+
+      const second = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        brief: 'dedicated sessions', executor: exec2, auditor: aud2, idempotencyKey: 'second-ok',
+      });
+      expect(second).toMatchObject({ status: 'ok', state: 'working' });
+      const secondId = String(second.taskId);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({
+        taskId: secondId, executor: EXEC, idempotencyKey: 'reassign-reuse-exec',
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: expect.stringContaining('open-in-audit'),
+      });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({
+        taskId: secondId, auditor: AUD, idempotencyKey: 'reassign-reuse-aud',
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: expect.stringContaining('open-in-audit'),
+      });
+      expect(getTaskPairStore().getPair(PROJECT, secondId)?.state).toMatchObject({ executor: exec2, auditor: aud2 });
+    } finally {
+      setTaskPairDeliveryDepsForTests(undefined);
+      removeSession(BRAIN); removeSession(EXEC); removeSession(AUD); removeSession(exec2); removeSession(aud2);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
+  it('obeys configured pool entry roles on omitted pair_create roles and when only executor is named, and surfaces inOpenPair/poolRole', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const execCfg = {
+      capabilityId: 'supervision-exec-v1:transport:agy-sdk:google:gemini-4-hydrogen-high',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport' as const,
+      providerFamily: 'google',
+      model: 'gemini-4-hydrogen-high',
+      role: 'executor' as const,
+    };
+    const audCfg = {
+      capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6.2-sol',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport' as const,
+      providerFamily: 'openai',
+      model: 'gpt-6.2-sol',
+      role: 'auditor' as const,
+    };
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: { configs: [execCfg, audCfg], controls: SUPERVISION_EXECUTION_CONFIG_DEFAULTS.primary },
+        economyTaskPool: { configs: [], controls: SUPERVISION_EXECUTION_CONFIG_DEFAULTS.economy },
+      },
+    });
+    const brain: SessionRecord = {
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: snapshot },
+    };
+    const execA: SessionRecord = {
+      ...session('deck_sub_pool_exec_a', 'w1'), parentSession: BRAIN, agentType: 'agy-sdk', runtimeType: 'transport', activeModel: 'gemini-4-hydrogen-high',
+    };
+    const execB: SessionRecord = {
+      ...session('deck_sub_pool_exec_b', 'w2'), parentSession: BRAIN, agentType: 'agy-sdk', runtimeType: 'transport', activeModel: 'gemini-4-hydrogen-high',
+    };
+    const audPool: SessionRecord = {
+      ...session('deck_sub_pool_aud', 'w3'), parentSession: BRAIN, agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-6.2-sol',
+    };
+    const outside: SessionRecord = {
+      ...session('deck_sub_outside_astra', 'w4'), parentSession: BRAIN, agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-6.2-astra',
+    };
+    const all = [brain, execA, execB, audPool, outside];
+    all.forEach(upsertSession);
+    setTaskPairDeliveryDepsForTests({ send: async () => undefined });
+    try {
+      const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => all } });
+      const createdAuto = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Pool auto selection', brief: '# auto', idempotencyKey: 'pool-auto-1',
+      });
+      expect(createdAuto).toMatchObject({ status: 'ok', state: 'working' });
+      const autoPair = getTaskPairStore().getPair(PROJECT, String(createdAuto.taskId))?.state;
+      expect([execA.name, execB.name]).toContain(autoPair?.executor);
+      expect(autoPair?.auditor).toBe(audPool.name);
+
+      const listed = await handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({}) as {
+        status: string;
+        items: Array<{ sessionName: string; inOpenPair?: boolean; poolRole?: string | null; poolRoles?: Record<string, string> }>;
+      };
+      expect(listed.status).toBe('ok');
+      const byName = new Map(listed.items.map((item) => [item.sessionName, item]));
+      expect(byName.get(autoPair!.executor!)).toMatchObject({ inOpenPair: true, poolRole: 'executor', poolRoles: { primary: 'executor' } });
+      expect(byName.get(audPool.name)).toMatchObject({ inOpenPair: true, poolRole: 'auditor', poolRoles: { primary: 'auditor' } });
+      expect(byName.get(outside.name)).toMatchObject({ inOpenPair: false, poolRole: null });
+
+      // Free the auditor by closing the first pair, then name only executor so pool still supplies the auditor.
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(createdAuto.taskId), action: 'done', force: true, idempotencyKey: 'close-auto-1' });
+      const namedExecOmittedAud = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Pool auditor for named executor', brief: '# partial', executor: execB.name, idempotencyKey: 'pool-partial-1',
+      });
+      expect(namedExecOmittedAud).toMatchObject({ status: 'ok', state: 'working' });
+      expect(getTaskPairStore().getPair(PROJECT, String(namedExecOmittedAud.taskId))?.state).toMatchObject({
+        executor: execB.name,
+        auditor: audPool.name,
+      });
+    } finally {
+      setTaskPairDeliveryDepsForTests(undefined);
+      all.forEach((record) => removeSession(record.name));
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
   });
 
 });

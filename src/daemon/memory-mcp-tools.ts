@@ -2021,6 +2021,32 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     await discardCreatedPairSessions(created);
     return sessionNotLiveError(taskId, problems, { pairCancelled: cancelled, nothingDispatched: true });
   };
+  const openPairParticipantConflict = (
+    sessionName: string,
+    currentTaskId: string,
+    dependencies: readonly string[] = [],
+  ): { taskId: string; status: string; role: 'executor' | 'auditor' } | undefined => {
+    for (const holder of getTaskPairStore().pairsForSession(sessionName)) {
+      if (isTerminalTaskPairStatus(holder.state.status)) continue;
+      if (holder.state.taskId === currentTaskId) continue;
+      if (dependencies.includes(holder.state.taskId)) continue;
+      if (holder.state.executor === sessionName) {
+        return { taskId: holder.state.taskId, status: holder.state.status, role: 'executor' };
+      }
+      if (holder.state.auditor === sessionName) {
+        return { taskId: holder.state.taskId, status: holder.state.status, role: 'auditor' };
+      }
+    }
+    return undefined;
+  };
+  const openPairReuseError = (
+    role: 'executor' | 'auditor',
+    sessionName: string,
+    conflict: { taskId: string; status: string; role: 'executor' | 'auditor' },
+  ): ToolResult => error(
+    MCP_ERROR_REASONS.VALIDATION_FAILED,
+    `${role} ${sessionName} is already assigned as ${conflict.role} in open pair ${conflict.taskId} (status: ${conflict.status}). Omit executor/auditor so the configured execution pool selects free idle sessions, or pick an idle session with inOpenPair=false.`,
+  );
   const deliverStructuredPairBriefs = async (project: string, taskId: string, requestEventId: string) => {
     const store = getTaskPairStore();
     if (store.getPair(project, taskId)?.state.status === 'queued') return [];
@@ -3541,14 +3567,24 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const executionPoolValue = rawExecutionPool as SupervisionExecutionPoolKind | undefined;
       const sessions = await sendSessions();
-      return listSendTargets(caller, {
+      const listed = listSendTargets(caller, {
         query: stringArg(args, 'query'),
         limit: numberArg(args, 'limit'),
         executionPool: executionPoolValue,
         participantView: await participantViewRequired(),
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
-      })) as unknown as ToolResult;
+      }));
+      if (listed.status === 'ok') {
+        return {
+          ...listed,
+          items: listed.items.map((item) => ({
+            ...item,
+            inOpenPair: item.inOpenPair ?? Boolean(item.openPairs?.length),
+          })),
+        } as unknown as ToolResult;
+      }
+      return listed as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_LIST]: async (input) => {
       const context = await pairCallerContext();
@@ -3782,6 +3818,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const executorModel = stringArg(args, 'executorModel');
         const auditorModel = stringArg(args, 'auditorModel');
         const executionPool = stringArg(args, 'executionPool') as 'primary' | 'economy' | undefined;
+        for (const [role, named] of [['executor', executorArg], ['auditor', auditorArg]] as const) {
+          if (!named || (role === 'auditor' && named === TASK_PAIR_NO_AUDITOR)) continue;
+          const conflict = openPairParticipantConflict(named, taskId, dependencies);
+          if (conflict) return openPairReuseError(role, named, conflict);
+        }
         // Settle every role the caller did not name: reuse idle sessions, or create the missing ones (the no-pool default rule, or an
         // explicit createExecutor/createAuditor). Failure creates nothing and persists nothing.
         const ensured = await ensurePairSessions({
@@ -3796,6 +3837,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const auditor = auditorArg ?? ensured.auditor;
         if ((auditor !== undefined && auditor === executor) || (executor && executor === brainName) || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && auditor === brainName)) {
           return abort(error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executor, auditor, and Brain must be distinct'));
+        }
+        for (const [role, named] of [['executor', executor], ['auditor', auditor]] as const) {
+          if (!named || (role === 'auditor' && named === TASK_PAIR_NO_AUDITOR)) continue;
+          const conflict = openPairParticipantConflict(named, taskId, dependencies);
+          if (conflict) return abort(openPairReuseError(role, named, conflict));
         }
         const byName = new Map(context.sessions.map((session) => [session.name, getSession(session.name) ?? session]));
         for (const entry of ensured.created) { const record = getSession(entry.session); if (record) byName.set(entry.session, record); }
@@ -3817,7 +3863,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         }
         const busyTarget = executorRecord?.state === 'running'
           || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && byName.get(auditor)?.state === 'running');
-        const transition = dependencies.length > 0 || busyTarget || !executor
+        const transition = dependencies.length > 0 || busyTarget || !executor || !auditor
           ? taskPairService.applyMarker({
               project: context.project,
               writer: brainName,
@@ -3855,9 +3901,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               eventId,
               suppressAutomaticBrief: true,
             });
-        // A pair with no named executor starts through the queue right away (the daemon picks from the pool, or the no-pool default).
+        // Any unsettled role (executor or auditor) starts through the queue right away so the pool or no-pool default picks it.
         if (dependencies.length) await taskPairAutomation.reconcileSuspensions();
-        if (!executor && transition) await taskPairAutomation.runQueue(context.project, brainName);
+        if ((!executor || !auditor) && dependencies.length === 0 && !busyTarget && transition) await taskPairAutomation.runQueue(context.project, brainName);
         const stored = store.getPair(context.project, taskId);
         if (!transition || !stored) return abort(error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair creation was not persisted'));
         // The gate between "persisted" and "dispatched": every assigned session is verified live NOW (it exists, is not stopped/errored,
@@ -4001,11 +4047,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const idempotencyKey = stringArg(args, 'idempotencyKey');
       const replay = getTaskPairStore().hasEvent(structuredPairLifecycleEventId(context.project, taskId, 'REASSIGN', attrs, idempotencyKey));
       if (stored && isTerminalTaskPairStatus(stored.state.status) && !replay) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot reassign terminal pair (${stored.state.status})`);
-      // A named session must exist now: the pair is never pointed at a name that is not a session.
+      // A named session must exist now and must not participate in another concurrent open pair.
       const namedProblems: ReturnType<typeof pairParticipantsNotLive> = [];
       for (const role of ['executor', 'auditor'] as const) {
         const named = attrs[role];
         if (!named || named === TASK_PAIR_NO_AUDITOR || replay) continue;
+        const conflict = openPairParticipantConflict(named, taskId, stored?.state.scheduling?.dependsOn ?? []);
+        if (conflict) return openPairReuseError(role, named, conflict);
         const problem = pairSessionNotLiveReason(getSession(named), () => true);
         if (problem) namedProblems.push({ role, session: named, problem });
       }
