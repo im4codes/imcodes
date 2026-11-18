@@ -96,7 +96,7 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     expect(isRdEnabledForRef('refs/heads/repro/macos-ci')).toBe(true);
 
     const macUnit = jobs['macos-unit-tests']!;
-    expect(macUnit['runs-on']).toBe('macos-15');
+    expect(macUnit['runs-on']).toBe('macos-15-intel');
     expect(macUnit.strategy?.matrix.shard).toEqual([1, 2, 3]);
     expect(macUnit.strategy?.['max-parallel']).toBe(2);
     expect(macUnit['timeout-minutes']).toBe(45);
@@ -106,8 +106,9 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
       jobs: Record<string, { strategy?: { matrix?: { os?: string[] } }; steps?: Array<{ if?: string; run?: string }> }>;
     };
     const smokeOs = installSmoke.jobs['install-smoke']!.strategy?.matrix?.os ?? [];
-    expect(smokeOs).toContain('macos-15');
+    expect(smokeOs).toContain('macos-15-intel');
     expect(smokeOs).not.toContain('macos-latest');
+    expect(smokeOs).not.toContain('macos-15');
     expect(installSmoke.jobs['install-smoke']!.steps?.some((s) => s.if === "runner.os == 'macOS'")).toBe(true);
 
     // Also inspect sibling mobile-speech workflow macOS job count on dev pushes (stays on macos-26 for Xcode 26).
@@ -116,14 +117,15 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     expect(mobileMacJobs).toHaveLength(1);
     expect(mobileMacJobs[0]!['runs-on']).toBe('macos-26');
 
-    // Peak simultaneous macOS jobs on a dev push:
-    // macos-unit-tests (max-parallel=2) + controlled-node-executables macOS leg (1) + mobile-speech (1) = 4 (< 5 cap).
-    const devPlannedMacosConcurrency =
-      (macUnit.strategy?.['max-parallel'] ?? macUnit.strategy!.matrix.shard.length) +
+    // Peak simultaneous macOS arm64 jobs on a dev push:
+    // macos-unit-tests runs on macos-15-intel (0 arm64) + controlled-node-executables macos-15 leg (1) + mobile-speech macos-26 (1) = 2 (<= 2).
+    const isArm64MacRunner = (label?: string) => Boolean(label && label.startsWith('macos-') && !label.endsWith('-intel'));
+    const devPlannedMacosArm64Concurrency =
+      (isArm64MacRunner(macUnit['runs-on']) ? (macUnit.strategy?.['max-parallel'] ?? macUnit.strategy!.matrix.shard.length) : 0) +
       1 + // controlled-node-executables macos-15 leg
-      (isRdEnabledForRef('refs/heads/dev') ? 1 : 0) +
-      mobileMacJobs.length;
-    expect(devPlannedMacosConcurrency).toBeLessThanOrEqual(4);
+      (isRdEnabledForRef('refs/heads/dev') && isArm64MacRunner(rd['runs-on']) ? 1 : 0) +
+      mobileMacJobs.filter((job) => isArm64MacRunner(job['runs-on'])).length;
+    expect(devPlannedMacosArm64Concurrency).toBeLessThanOrEqual(2);
 
     // Windows controlled-node-executables remains disabled on refs/heads/dev.
     const releaseVersionScript = jobs.release_version!.steps.map((s) => s.run ?? '').join('\n');

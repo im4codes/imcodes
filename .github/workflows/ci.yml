@@ -192,8 +192,8 @@ jobs:
 
   macos-unit-tests:
     name: Unit Tests (macOS, shard ${{ matrix.shard }}/3)
-    # macos-latest resolves to the congested macos-26-arm64 pool; pin macos-15 to match the rest of CI.
-    runs-on: macos-15
+    # macos-15 and macos-latest both target GitHub's congested macOS arm64 pool; use macos-15-intel (x86_64) while Controlled Node Executable covers macos-15 arm64.
+    runs-on: macos-15-intel
     # Three disjoint shards run at max-parallel: 2 so peak concurrent macOS jobs stay below GitHub's 5-runner cap.
     timeout-minutes: 45
     strategy:
