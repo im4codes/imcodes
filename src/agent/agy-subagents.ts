@@ -114,6 +114,15 @@ export class AgySubagentTracker {
   private toolChildren = new Map<string, string[]>();
   constructor(private parent: string) {}
 
+  /** Number of child runs that are still genuinely active. */
+  activeCount(): number {
+    let count = 0;
+    for (const child of this.children.values()) {
+      if (child.state === SDK_SUBAGENT_STATUS.RUNNING) count++;
+    }
+    return count;
+  }
+
   isNativeChild(id: string): boolean { return this.nativeChildren.has(id); }
 
   private emit(child: Child, action: string, output?: string): ToolCallEvent {

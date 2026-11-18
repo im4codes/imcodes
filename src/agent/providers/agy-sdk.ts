@@ -534,13 +534,16 @@ export class AgySdkProvider implements TransportProvider {
     if (!state) return null;
     const activeToolCount = state.toolSteps.size;
     const inflight = state.inflightTurns > 0;
-    const activeWorkCount = (inflight ? 1 : 0) + activeToolCount;
+    const backgroundWorkCount = state.subagents?.activeCount() ?? 0;
+    const activeWorkCount = (inflight ? 1 : 0) + activeToolCount + backgroundWorkCount;
     const busyReasons: SessionActivityBusyReason[] = [];
     if (inflight) busyReasons.push('provider_wait');
     if (activeToolCount > 0) busyReasons.push('open_tool_call');
+    if (backgroundWorkCount > 0) busyReasons.push('background_monitor');
     return {
       status: 'current',
       activeWorkCount,
+      ...(backgroundWorkCount > 0 ? { backgroundWorkCount } : {}),
       activeToolCount,
       busyReasons,
       providerDiagnosticGeneration: state.conversationId ?? null,

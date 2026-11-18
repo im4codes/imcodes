@@ -21,6 +21,7 @@ import {
   SDK_SUBAGENT_STATUS,
 } from '../../shared/sdk-subagent-status.js';
 import { AgyHistoryReader } from '../../src/agent/agy-native-history.js';
+import { AgySubagentTracker } from '../../src/agent/agy-subagents.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderError, ProviderUsageUpdate, SessionInfoUpdate } from '../../src/agent/transport-provider.js';
@@ -357,6 +358,27 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(status.providerId).toBe(AGY_SDK_PROVIDER_ID);
     expect(status.connected).toBe(true);
     expect(['ready', 'degraded']).toContain(status.status);
+  });
+
+  it('reports background_monitor only for active native subagents and clears it on completion', async () => {
+    const sid = await provider.createSession({ sessionKey: 'active-work-snapshot', cwd: dir });
+    const state = (provider as any).sessions.get(sid);
+    state.subagents = new AgySubagentTracker('agy-conversation');
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-active', status: 'running' }] });
+
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 1,
+      backgroundWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-active', status: 'completed' }] });
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
   });
 
   it('re-seeds the current IM.codes contract on resume, version changes, clear, and process restart', async () => {
