@@ -124,6 +124,8 @@ ${scopedEnv}
     <key>NODE_OPTIONS</key>
     <string>${xmlEscapeText(input.nodeOptions)}</string>
   </dict>
+  <key>WorkingDirectory</key>
+  <string>${xmlEscapeText(input.home)}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

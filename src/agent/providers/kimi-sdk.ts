@@ -412,6 +412,41 @@ function resolveDefaultAcpCwd(): string {
   return processCwd ?? process.cwd();
 }
 
+const ACP_POSIX_SYSTEM_BIN_DIRS = new Set([
+  '/System/Cryptexes/App/usr/bin',
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+]);
+
+function normalizeAcpPosixPath(rawPath: string | undefined, homeDir: string | undefined): string {
+  const entries = (rawPath ?? '').split(':').filter((entry) => entry.length > 0);
+  const firstSystemIndex = entries.findIndex((entry) => ACP_POSIX_SYSTEM_BIN_DIRS.has(entry));
+  const leading = firstSystemIndex === -1 ? entries : entries.slice(0, firstSystemIndex);
+  const trailing = firstSystemIndex === -1 ? [] : entries.slice(firstSystemIndex);
+  const preferredToolDirs = [
+    homeDir ? path.join(homeDir, '.local', 'bin') : undefined,
+    homeDir ? path.join(homeDir, '.gemini', 'antigravity-cli', 'bin') : undefined,
+    homeDir ? path.join(homeDir, '.npm-global', 'bin') : undefined,
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+  ].filter((entry): entry is string => Boolean(entry));
+  const result: string[] = [];
+  const seen = new Set<string>();
+  const appendUnique = (entry: string): void => {
+    if (!entry || seen.has(entry)) return;
+    seen.add(entry);
+    result.push(entry);
+  };
+  for (const entry of leading) appendUnique(entry);
+  for (const entry of preferredToolDirs) appendUnique(entry);
+  for (const entry of trailing) appendUnique(entry);
+  appendUnique('/usr/bin');
+  appendUnique('/bin');
+  return result.join(':');
+}
+
 function resolveAcpSpawnCwd(preferredCwd?: string): string | undefined {
   const normalizedPreferred = normalizeTransportCwd(preferredCwd);
   if (isExistingDirectory(normalizedPreferred)) return normalizedPreferred;
@@ -2070,7 +2105,7 @@ export class KimiSdkProvider implements TransportProvider {
       ...resolved.prependArgs,
       ...this.buildAcpArgs(config, isolatedFor?.incognitoEnv?.acpFlags),
     ];
-    const env = isolatedFor
+    const env: NodeJS.ProcessEnv = isolatedFor
       ? {
         ...process.env,
         ...((config.env as Record<string, string> | undefined) ?? {}),
@@ -2078,6 +2113,13 @@ export class KimiSdkProvider implements TransportProvider {
         ...(isolatedFor.incognitoEnv?.env ?? {}),
       }
       : { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) };
+    if (spawnCwd) {
+      env.PWD = spawnCwd;
+    }
+    if (process.platform !== 'win32') {
+      const envHome = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME.trim() : undefined;
+      env.PATH = normalizeAcpPosixPath(typeof env.PATH === 'string' ? env.PATH : undefined, envHome);
+    }
     const child = spawn(resolved.executable, args, {
       // Own process group and session on POSIX. A reparented descendant keeps
       // its PGID but loses its PPID, so after the agent parent dies this is the

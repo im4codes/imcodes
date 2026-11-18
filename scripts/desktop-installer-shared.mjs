@@ -1573,6 +1573,8 @@ if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
     <string>start</string>
     <string>--foreground</string>
   </array>
+  <key>WorkingDirectory</key>
+  <string>$EFF_HOME</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

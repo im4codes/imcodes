@@ -3295,6 +3295,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       let boots = (await requests()).filter((r) => r.fixture === 'boot');
       expect(boots).toHaveLength(1);
       expect(boots[0].cwd).toBe(realpathSync(wsA));
+      expect(boots[0].pwd).toBe(realpathSync(wsA));
 
       const firstResumeId = (provider as any).sessions.get(sid)?.acpSessionId;
       expect(firstResumeId).toBe('native-1');
@@ -3336,6 +3337,66 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       expect(boots[3].cwd).toBe(realpathSync(homedir()));
     } finally {
       cwdSpy.mockRestore();
+    }
+  });
+
+  it('sets PWD to spawnCwd and hoists Homebrew/user tool dirs ahead of /usr/bin without shadowing leading caller PATH shims', async () => {
+    const fakeHome = await mkdtemp(path.join(tmpdir(), 'imcodes-acp-path-home-'));
+    const ws = path.join(fakeHome, 'project');
+    await mkdir(ws, { recursive: true });
+    try {
+      const launchdPath = [
+        '/tmp/test-shim',
+        `${fakeHome}/.local/bin`,
+        '/usr/local/bin',
+        '/System/Cryptexes/App/usr/bin',
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
+        '/opt/homebrew/bin',
+      ].join(':');
+      const { provider, requests } = await setup('', {
+        HOME: fakeHome,
+        PWD: '/',
+        PATH: launchdPath,
+      });
+      const done = vi.fn();
+      const errors = vi.fn();
+      provider.onComplete(done);
+      provider.onError(errors);
+
+      const sid = 'deck_test_acp_env_path';
+      await provider.createSession({ sessionKey: sid, sessionName: sid, cwd: ws, agentId: 'model-a' });
+      await provider.send(sid, 'check env');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      const boot = (await requests()).find((r) => r.fixture === 'boot');
+      expect(boot).toBeTruthy();
+      expect(boot.pwd).toBe(realpathSync(ws));
+      if (process.platform !== 'win32') {
+        const entries = String(boot.path ?? '').split(':');
+        expect(entries[0]).toBe('/tmp/test-shim');
+        const cryptexIdx = entries.indexOf('/System/Cryptexes/App/usr/bin');
+        const usrBinIdx = entries.indexOf('/usr/bin');
+        expect(cryptexIdx).toBeGreaterThan(0);
+        expect(usrBinIdx).toBeGreaterThan(cryptexIdx);
+        for (const expectedDir of [
+          path.join(fakeHome, '.local', 'bin'),
+          path.join(fakeHome, '.gemini', 'antigravity-cli', 'bin'),
+          path.join(fakeHome, '.npm-global', 'bin'),
+          '/opt/homebrew/bin',
+          '/usr/local/bin',
+        ]) {
+          const idx = entries.indexOf(expectedDir);
+          expect(idx).toBeGreaterThan(0);
+          expect(idx).toBeLessThan(cryptexIdx);
+          expect(entries.filter((entry) => entry === expectedDir)).toHaveLength(1);
+        }
+      }
+    } finally {
+      await rm(fakeHome, { recursive: true, force: true });
     }
   });
 });

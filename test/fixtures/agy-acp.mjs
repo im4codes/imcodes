@@ -99,7 +99,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         try { fs.unlinkSync(logPath + '.worker-enoent'); } catch {}
         try { fs.unlinkSync(logPath + '.worker-enoent-clear-on-init'); } catch {}
       }
-      record({ fixture: 'boot', pid: process.pid, cwd: process.cwd(), version: process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4' });
+      record({ fixture: 'boot', pid: process.pid, cwd: process.cwd(), pwd: process.env.PWD, path: process.env.PATH, version: process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4' });
       const agentCapabilities = {
         loadSession: true,
         sessionCapabilities: { resume: {}, close: {}, list: {} },

@@ -124,6 +124,7 @@ describe('renderMacosLaunchAgentPlist', () => {
   it('is a launch agent that runs the given program with KeepAlive, escaped, and parses back to the same arguments', () => {
     const xml = renderMacosLaunchAgentPlist(input);
     expect(parsePlistProgramArguments(xml)).toEqual(input.programArguments);
+    expect(xml).toContain('<key>WorkingDirectory</key>\n  <string>/Users/a&amp;b</string>');
     expect(xml).toContain('<key>KeepAlive</key>');
     expect(xml).toContain('/Users/a&amp;b/.imcodes/daemon.log');
     expect(xml).not.toContain('IMCODES_HOME');
