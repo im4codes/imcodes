@@ -1,6 +1,6 @@
 import { TASK_PAIR_DECISION_KIND, type TaskPairDecisionRecord } from '../../../shared/task-pair-decision.js';
 export type { TaskPairDecisionRecord } from '../../../shared/task-pair-decision.js';
-import { TASK_PAIR_SCHEDULING_FIELD, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
+import { isTaskPairSuspended, readPairScheduling, TASK_PAIR_SCHEDULING_FIELD, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_FIELD, type TaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
  * Durable store for marker-driven task pairs (`~/.imcodes/task-pairs.sqlite`).
@@ -643,25 +643,60 @@ export class TaskPairStore {
     ));
   }
 
+  #isDownstreamDependencyWaiting(pair: StoredTaskPair, targetTaskId: string, index: ActivePairIndex): boolean {
+    if (pair.state.status !== 'queued' || !isTaskPairSuspended(pair.state) || pair.state.scheduling?.admitted) return false;
+    const queue = [...(readPairScheduling(pair.state.scheduling)?.dependsOn ?? [])];
+    if (queue.length === 0) return false;
+    const visited = new Set<string>([pair.state.taskId]);
+    while (queue.length > 0) {
+      const depTaskId = queue.shift()!;
+      if (depTaskId === targetTaskId) return true;
+      if (visited.has(depTaskId)) continue;
+      visited.add(depTaskId);
+      const next = index.byKey.get(pairKey(pair.project, depTaskId));
+      if (!next || next.state.status !== 'queued' || !isTaskPairSuspended(next.state)) continue;
+      for (const parentDep of readPairScheduling(next.state.scheduling)?.dependsOn ?? []) {
+        if (!visited.has(parentDep)) queue.push(parentDep);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Lists non-terminal open-pair participant conflicts (including `queued` and `paused`)
+   * for `sessionName`, excluding `exceptTaskId`, explicit upstream `dependsOn`, and
+   * non-executable downstream pairs strictly waiting on `exceptTaskId` via `dependsOn`.
+   */
+  listOpenPairParticipantConflicts(
+    sessionName: string,
+    options: { exceptTaskId?: string; dependsOn?: readonly string[] } = {},
+  ): Array<{ pair: StoredTaskPair; role: 'executor' | 'auditor' }> {
+    if (!sessionName || sessionName === TASK_PAIR_NO_AUDITOR) return [];
+    const { exceptTaskId, dependsOn } = options;
+    const index = this.#ensureActiveIndex();
+    const conflicts: Array<{ pair: StoredTaskPair; role: 'executor' | 'auditor' }> = [];
+    for (const pair of index.bySession.get(sessionName) ?? []) {
+      if (TASK_PAIR_TERMINAL_STATUSES.includes(pair.state.status)) continue;
+      if (pair.state.taskId === exceptTaskId) continue;
+      if (dependsOn?.includes(pair.state.taskId)) continue;
+      if (exceptTaskId && this.#isDownstreamDependencyWaiting(pair, exceptTaskId, index)) continue;
+      if (pair.state.executor === sessionName) conflicts.push({ pair, role: 'executor' });
+      else if (pair.state.auditor === sessionName) conflicts.push({ pair, role: 'auditor' });
+    }
+    return conflicts;
+  }
+
   /**
    * Returns the first conflicting open pair (including `queued` and `paused`)
    * in which `sessionName` is already assigned as `executor` or `auditor`.
-   * Excludes `exceptTaskId` and any explicit upstream `dependsOn` task IDs.
+   * Excludes `exceptTaskId`, explicit upstream `dependsOn`, and downstream
+   * dependency-waiting pairs whose `dependsOn` reaches `exceptTaskId`.
    */
   findOpenPairParticipantConflict(
     sessionName: string,
     options: { exceptTaskId?: string; dependsOn?: readonly string[] } = {},
   ): { pair: StoredTaskPair; role: 'executor' | 'auditor' } | undefined {
-    if (!sessionName || sessionName === TASK_PAIR_NO_AUDITOR) return undefined;
-    const { exceptTaskId, dependsOn } = options;
-    for (const pair of this.#ensureActiveIndex().bySession.get(sessionName) ?? []) {
-      if (TASK_PAIR_TERMINAL_STATUSES.includes(pair.state.status)) continue;
-      if (pair.state.taskId === exceptTaskId) continue;
-      if (dependsOn?.includes(pair.state.taskId)) continue;
-      if (pair.state.executor === sessionName) return { pair, role: 'executor' };
-      if (pair.state.auditor === sessionName) return { pair, role: 'auditor' };
-    }
-    return undefined;
+    return this.listOpenPairParticipantConflicts(sessionName, options)[0];
   }
 
   /** Full-state compare-and-update. No token means INSERT ONLY, never an unguarded overwrite. */

@@ -2271,23 +2271,15 @@ export class TaskPairAutomation implements TaskPairScheduler {
       // than silently substituting an auto-pick.
       const namedParticipantConflict = (session: string | undefined) => {
         if (!session || session === TASK_PAIR_NO_AUDITOR) return undefined;
-        const conflict = store.findOpenPairParticipantConflict(session, {
+        return store.listOpenPairParticipantConflicts(session, {
           exceptTaskId: pair.taskId,
           dependsOn: pair.scheduling?.dependsOn,
-        });
-        if (!conflict) return undefined;
-        const holderState = conflict.pair.state;
-        // A downstream pair waiting on this pair via dependsOn never blocks the
-        // upstream pair itself (otherwise upstream and downstream deadlock).
-        if (holderState.scheduling?.dependsOn?.includes(pair.taskId)) return undefined;
-        if (
-          holderState.status !== 'queued'
-          || isTaskPairSuspended(holderState)
-          || compareQueuedTaskPairs(conflict.pair, stored) < 0
-        ) {
-          return conflict.pair;
-        }
-        return undefined;
+        }).find((conflict) => {
+          const holderState = conflict.pair.state;
+          return holderState.status !== 'queued'
+            || isTaskPairSuspended(holderState)
+            || compareQueuedTaskPairs(conflict.pair, stored) < 0;
+        })?.pair;
       };
       const heldEntry = [pair.executor, pair.auditor]
         .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)

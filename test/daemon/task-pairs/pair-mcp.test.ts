@@ -11,6 +11,7 @@ import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../..
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
 import { defaultHasActiveSupervisionLease, provisionSupervisionTarget } from '../../../src/daemon/supervision-auto-provision.js';
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
@@ -628,6 +629,207 @@ describe('pair MCP projections', () => {
         auditor: audHeld.name,
       });
     } finally {
+      setTaskPairDeliveryDepsForTests(undefined);
+      all.forEach((record) => removeSession(record.name));
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
+  it('allows an upstream pair to auto-pick omitted auditor or executor reserved by its waiting downstream dependsOn pair, without masking unrelated holders', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const execCfg = {
+      capabilityId: 'supervision-exec-v1:transport:agy-sdk:google:gemini-4-hydrogen-high',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport' as const,
+      providerFamily: 'google',
+      model: 'gemini-4-hydrogen-high',
+      role: 'executor' as const,
+    };
+    const audCfg = {
+      capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6.2-sol',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport' as const,
+      providerFamily: 'openai',
+      model: 'gpt-6.2-sol',
+      role: 'auditor' as const,
+    };
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: { configs: [execCfg, audCfg], controls: { leaseMs: 1_800_000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+        economyTaskPool: { configs: [], controls: { leaseMs: 900_000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+      },
+    });
+    const brain: SessionRecord = {
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: snapshot },
+    };
+    const execS: SessionRecord = {
+      ...session('deck_sub_dep_exec', 'w1'), parentSession: BRAIN, agentType: 'agy-sdk', runtimeType: 'transport', activeModel: 'gemini-4-hydrogen-high',
+    };
+    const audS: SessionRecord = {
+      ...session('deck_sub_dep_aud', 'w2'), parentSession: BRAIN, agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-6.2-sol',
+    };
+    const all = [brain, execS, audS];
+    all.forEach(upsertSession);
+    setTaskPairDeliveryDepsForTests({ send: async () => undefined });
+    const automation = new TaskPairAutomation({
+      isBusy: () => false,
+      isLimited: () => false,
+      pickCandidate: (input) => listTaskPairCandidates(input)[0]?.name,
+      provision: async () => undefined,
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    try {
+      const store = getTaskPairStore();
+      // Case 1: upstream U has executor=execS & omitted auditor; downstream D waits on U with executor=execS & auditor=audS.
+      putTaskPairFixture(store, PROJECT, {
+        taskId: 'tsk_dep_up_1',
+        brain: BRAIN,
+        executor: execS.name,
+        title: 'Upstream omitted auditor',
+        brief: '# up 1',
+        status: 'queued',
+        flags: [],
+        flagSides: {},
+        round: 0,
+        blocking: ['P0'],
+        previousAuditors: [],
+        capCounts: {},
+        capRound: 0,
+        createdAt: 10,
+        updatedAt: 10,
+        workspaceKind: 'none',
+      });
+      putTaskPairFixture(store, PROJECT, {
+        taskId: 'tsk_dep_down_1',
+        brain: BRAIN,
+        executor: execS.name,
+        auditor: audS.name,
+        title: 'Downstream reserving auditor',
+        brief: '# down 1',
+        status: 'queued',
+        flags: [],
+        flagSides: {},
+        round: 0,
+        blocking: ['P0'],
+        previousAuditors: [],
+        capCounts: {},
+        capRound: 0,
+        createdAt: 20,
+        updatedAt: 20,
+        scheduling: { epoch: 1, manual: false, dependsOn: ['tsk_dep_up_1'], since: 20, writer: BRAIN },
+        workspaceKind: 'none',
+      });
+
+      await automation.runQueue(PROJECT, BRAIN);
+      await taskPairService.waitForIdle();
+      expect(store.getPair(PROJECT, 'tsk_dep_up_1')?.state).toMatchObject({
+        status: 'working',
+        executor: execS.name,
+        auditor: audS.name,
+      });
+      expect(store.getPair(PROJECT, 'tsk_dep_down_1')?.state.status).toBe('queued');
+
+      // Closing upstream U unlocks downstream D in order with the same dedicated participants.
+      const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => all } });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'tsk_dep_up_1', action: 'done', force: true, idempotencyKey: 'close-dep-up-1' });
+      await automation.reconcileSuspensions();
+      await automation.runQueue(PROJECT, BRAIN);
+      await taskPairService.waitForIdle();
+      expect(store.getPair(PROJECT, 'tsk_dep_down_1')?.state).toMatchObject({
+        status: 'working',
+        executor: execS.name,
+        auditor: audS.name,
+      });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'tsk_dep_down_1', action: 'done', force: true, idempotencyKey: 'close-dep-down-1' });
+
+      // Case 2: upstream U2 has omitted executor & named auditor=audS; downstream D2 waits on U2 reserving execS+audS;
+      // while independent paused-queued H_other ALSO holds execS, the exempted D2 must NOT mask H_other.
+      putTaskPairFixture(store, PROJECT, {
+        taskId: 'tsk_dep_up_2',
+        brain: BRAIN,
+        auditor: audS.name,
+        title: 'Upstream omitted executor',
+        brief: '# up 2',
+        status: 'queued',
+        flags: [],
+        flagSides: {},
+        round: 0,
+        blocking: ['P0'],
+        previousAuditors: [],
+        capCounts: {},
+        capRound: 0,
+        createdAt: 30,
+        updatedAt: 30,
+        workspaceKind: 'none',
+      });
+      putTaskPairFixture(store, PROJECT, {
+        taskId: 'tsk_dep_down_2',
+        brain: BRAIN,
+        executor: execS.name,
+        auditor: audS.name,
+        title: 'Downstream 2',
+        brief: '# down 2',
+        status: 'queued',
+        flags: [],
+        flagSides: {},
+        round: 0,
+        blocking: ['P0'],
+        previousAuditors: [],
+        capCounts: {},
+        capRound: 0,
+        createdAt: 40,
+        updatedAt: 40,
+        scheduling: { epoch: 1, manual: false, dependsOn: ['tsk_dep_up_2'], since: 40, writer: BRAIN },
+        workspaceKind: 'none',
+      });
+      putTaskPairFixture(store, PROJECT, {
+        taskId: 'tsk_independent_holder',
+        brain: BRAIN,
+        executor: execS.name,
+        title: 'Independent paused holder',
+        brief: '# indep',
+        status: 'queued',
+        flags: [],
+        flagSides: {},
+        round: 0,
+        blocking: ['P0'],
+        previousAuditors: [],
+        capCounts: {},
+        capRound: 0,
+        createdAt: 50,
+        updatedAt: 50,
+        scheduling: { epoch: 1, manual: true, dependsOn: [], since: 50, writer: BRAIN },
+        workspaceKind: 'none',
+      });
+
+      // Because H_other independently holds execS, U2 must NOT pick execS even though D2 was exempted.
+      expect(listTaskPairCandidates({
+        brain: BRAIN, role: 'executor', pool: 'primary', exclude: new Set([BRAIN, audS.name]), exceptTaskId: 'tsk_dep_up_2',
+      })).toEqual([]);
+      await automation.runQueue(PROJECT, BRAIN);
+      await taskPairService.waitForIdle();
+      expect(store.getPair(PROJECT, 'tsk_dep_up_2')?.state.status).toBe('queued');
+
+      // Cancelling the unrelated holder (while D2 STILL waits on U2) immediately lets U2 acquire execS and start!
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'tsk_independent_holder', action: 'cancel', idempotencyKey: 'cancel-indep' });
+      await automation.runQueue(PROJECT, BRAIN);
+      await taskPairService.waitForIdle();
+      expect(store.getPair(PROJECT, 'tsk_dep_up_2')?.state).toMatchObject({
+        status: 'working',
+        executor: execS.name,
+        auditor: audS.name,
+      });
+      expect(store.getPair(PROJECT, 'tsk_dep_down_2')?.state.status).toBe('queued');
+    } finally {
+      await taskPairService.waitForIdle();
+      taskPairService.setScheduler(undefined);
       setTaskPairDeliveryDepsForTests(undefined);
       all.forEach((record) => removeSession(record.name));
       if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
