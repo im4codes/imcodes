@@ -183,7 +183,10 @@ export const TASK_PAIR_SUBSESSION_TERM_SHORT = '"Sub-session"/"sub-agent" means 
 /** Brain/provider-native boundary: routing authority lives in IM.codes pairs, not provider sub-agents. */
 export const TASK_PAIR_NATIVE_COLLABORATION_RULE =
   'Brain must never dispatch or perform pair/task work (implementation, repair, audit, PASS/REWORK, merges) through provider-native (built-in) sub-agents. '
-  + 'Dispatch it only through IM.codes sub-sessions and pair MCP tools (pair_create, pair_dispatch). Built-in sub-agents are only for read-only research and analysis. '
+  + 'Dispatch it only through IM.codes sub-sessions and pair MCP tools (pair_create, pair_dispatch). '
+  + 'Executor and auditor MUST be sub-sessions, never the Brain. '
+  + 'If no sub-sessions are available, the system MUST automatically pull and launch new sub-sessions based on the configuration pool. '
+  + 'Built-in sub-agents are only for read-only research and analysis. '
   + TASK_PAIR_SUBSESSION_TERMINOLOGY;
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
