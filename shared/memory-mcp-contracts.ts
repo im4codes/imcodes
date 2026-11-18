@@ -38,7 +38,7 @@ import {
   TASK_PAIR_WORKSPACE_REQUESTS,
   TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY,
 } from './task-pair-workspace.js';
-import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE, TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE, TASK_PAIR_SPLIT_UNRELATED_RULE } from './task-pair.js';
+import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE, TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE, TASK_PAIR_SPLIT_UNRELATED_RULE } from './task-pair.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import { TRANSPORT_EFFORT_LEVELS } from './effort-levels.js';
 import {
@@ -793,7 +793,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
               title: stringSchema('Pair title when present.'),
             }, ['taskId', 'role', 'status', 'round']),
           },
-          inOpenPair: booleanSchema('True when this target currently belongs to any open task pair (Brain must not reuse it for another concurrent open pair).'),
+          inOpenPair: booleanSchema('True if target belongs to any open task pair (do not reuse concurrently).'),
           providerFamily: stringSchema('Observed provider family used by audit/task policy.'),
           availability: stringSchema('Authoritative delegation availability.'),
           eligiblePools: {
@@ -804,11 +804,11 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           poolRole: {
             type: ['string', 'null'],
             enum: ['executor', 'auditor', 'both', null],
-            description: 'Configured execution-pool role permission across eligible pools (or the requested executionPool), or null when not in any configured pool. Absent for legacy-unconfigured callers.',
+            description: 'Pool role permission (or null). Absent when unconfigured.',
           },
           poolRoles: {
             type: 'object',
-            description: 'Configured role permission per pool (primary / economy) for this target. Absent for legacy-unconfigured callers.',
+            description: 'Pool role per pool (primary/economy). Absent when unconfigured.',
             additionalProperties: { type: 'string', enum: ['executor', 'auditor', 'both'] },
           },
           dispatchMode: {
@@ -886,16 +886,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
-    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE + ' ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_SPLIT_UNRELATED_RULE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE + ' ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_SPLIT_UNRELATED_RULE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),
       brief: stringSchema('Complete Markdown task brief, including checkable acceptance and boundaries.'),
       dependsOn: { type: 'array', maxItems: TASK_PAIR_MAX_DEPENDENCIES, items: { type: 'string', minLength: 1 }, description: 'Wait until these same-project tasks reach accepted done.' },
-      executor: stringSchema('Exact executor session name. Omit by default when an Execution Pool is configured (set only on explicit user instruction; never target a session with inOpenPair=true).'),
-      auditor: stringSchema('Exact auditor session name, or none to disable audit. Omit by default when an Execution Pool is configured (set only on explicit user instruction or none to skip audit; never target a session with inOpenPair=true).'),
-      executorModel: stringSchema('Optional explicit executor model. Omit by default when an Execution Pool is configured; set only on explicit user instruction.'),
-      auditorModel: stringSchema('Optional explicit auditor model. Omit by default when an Execution Pool is configured; set only on explicit user instruction.'),
+      executor: stringSchema('Exact executor session (omit when pool configured unless explicitly instructed; never inOpenPair).'),
+      auditor: stringSchema('Exact auditor session, or none (omit when pool configured unless explicitly instructed; never inOpenPair).'),
+      executorModel: stringSchema('Optional explicit executor model (omit when pool configured unless instructed).'),
+      auditorModel: stringSchema('Optional explicit auditor model (omit when pool configured unless instructed).'),
       createExecutor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
       createAuditor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
       executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Optional executor execution pool.' },
@@ -948,7 +948,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
-    description: 'Brain-only structured role/model reassignment. Reuses the REASSIGN state machine, queue admission, participant brief delivery, and durable idempotency events. Rejects assigning any sub-session already participating in another concurrent open pair; obey configured execution-pool roles unless the user explicitly instructed an override.',
+    description: 'Brain-only structured role/model reassignment (REASSIGN state machine, queue admission, brief delivery, idempotency). Rejects concurrent open-pair session reuse; obey pool roles unless explicitly overridden.',
     inputSchema: objectSchema({
       taskId: stringSchema('Existing task-pair id.', { minLength: 1 }),
       executor: stringSchema('Exact replacement executor session.'),

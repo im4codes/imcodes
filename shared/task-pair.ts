@@ -893,6 +893,10 @@ export const TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE: string =
   + 'When an Execution Pool is configured (executionPoolsState="configured"), call pair_create WITHOUT executor, auditor (except auditor="none" when no audit is needed), executorModel, auditorModel, createExecutor, or createAuditor by default so the daemon picks/provisions strictly from the configured pool and respects each entry\'s executor/auditor role. '
   + 'Specify an explicit session or model ONLY when the user explicitly instructed that exact session or model (always pick an idle session with inOpenPair=false and respect configured pool roles unless the user explicitly overrode the role).';
 
+/** Short form for MCP tool schema descriptions with a tight byte budget. */
+export const TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE: string =
+  'Never reuse a sub-session across concurrent open pairs; omit executor/auditor/models by default when an execution pool is configured.';
+
 /**
  * Brain drives pairs with the MCP tools only. The daemon still PARSES a legacy IMCODES_TASK marker from a Brain (existing
  * sessions keep working) but no Brain-facing text teaches or recommends one.
