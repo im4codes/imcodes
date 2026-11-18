@@ -4,6 +4,8 @@ import { parse } from 'yaml';
 
 type Job = {
   name?: string;
+  if?: string;
+  'runs-on'?: string;
   needs?: string[];
   'timeout-minutes'?: number;
   'continue-on-error'?: boolean;
@@ -22,7 +24,7 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
       expect(job.name).toContain(`shard \${{ matrix.shard }}/${count}`);
       expect(job.strategy?.matrix.shard).toEqual(Array.from({ length: count }, (_, i) => i + 1));
       expect(job.strategy?.['fail-fast']).toBe(false);
-      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 4 : 3);
+      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 4 : 2);
       expect(job.steps.filter((step) => step.run?.includes('npm run test:unit')).map((step) => step.run))
         .toEqual([`npm run test:unit -- --shard=\${{ matrix.shard }}/${count}`]);
       expect(job['continue-on-error']).not.toBe(true);
@@ -75,5 +77,49 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     expect(ci().concurrency.group).toBe('ci-${{ github.ref }}');
     expect(ci().concurrency['cancel-in-progress']).not.toMatch(/refs\/heads\/dev/);
     expect(ci().concurrency['cancel-in-progress']).toContain("startsWith(github.ref, 'refs/heads/repro/')");
+  });
+
+  it('caps simultaneous macOS jobs on dev pushes below GitHub 5-runner limit while keeping PR/repro RD builds and Windows dev exclusion', () => {
+    const workflow = ci();
+    const jobs = workflow.jobs;
+    const rd = jobs['macos-remote-desktop-components']!;
+    expect(rd.if).toBe("github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev'");
+    expect(rd['runs-on']).toBe('macos-15');
+    expect(rd['timeout-minutes']).toBe(60);
+
+    const isRdEnabledForRef = (ref: string) =>
+      ref !== 'refs/heads/master' && ref !== 'refs/heads/main' && ref !== 'refs/heads/dev';
+    expect(isRdEnabledForRef('refs/heads/master')).toBe(false);
+    expect(isRdEnabledForRef('refs/heads/main')).toBe(false);
+    expect(isRdEnabledForRef('refs/heads/dev')).toBe(false);
+    expect(isRdEnabledForRef('refs/pull/42/merge')).toBe(true);
+    expect(isRdEnabledForRef('refs/heads/repro/macos-ci')).toBe(true);
+
+    const macUnit = jobs['macos-unit-tests']!;
+    expect(macUnit.strategy?.matrix.shard).toEqual([1, 2, 3]);
+    expect(macUnit.strategy?.['max-parallel']).toBe(2);
+    expect(macUnit['timeout-minutes']).toBe(45);
+    expect(jobs.docker!.needs).toContain('macos-unit-tests');
+
+    // Also inspect sibling mobile-speech workflow macOS job count on dev pushes.
+    const mobileSpeech = parse(readFileSync('.github/workflows/mobile-speech.yml', 'utf8')) as { jobs: Record<string, Job> };
+    const mobileMacJobs = Object.values(mobileSpeech.jobs).filter((job) => (job['runs-on'] ?? '').startsWith('macos-')).length;
+    expect(mobileMacJobs).toBe(1);
+
+    // Peak simultaneous macOS jobs on a dev push:
+    // macos-unit-tests (max-parallel=2) + controlled-node-executables macOS leg (1) + mobile-speech (1) = 4 (< 5 cap).
+    const devPlannedMacosConcurrency =
+      (macUnit.strategy?.['max-parallel'] ?? macUnit.strategy!.matrix.shard.length) +
+      1 + // controlled-node-executables macos-15 leg
+      (isRdEnabledForRef('refs/heads/dev') ? 1 : 0) +
+      mobileMacJobs;
+    expect(devPlannedMacosConcurrency).toBeLessThanOrEqual(4);
+
+    // Windows controlled-node-executables remains disabled on refs/heads/dev.
+    const releaseVersionScript = jobs.release_version!.steps.map((s) => s.run ?? '').join('\n');
+    expect(releaseVersionScript).toContain('if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then');
+    expect(releaseVersionScript).toMatch(
+      /if \[ "\$\{GITHUB_REF\}" = "refs\/heads\/dev" \]; then[\s\S]*?CONTROLLED_NODE_MATRIX='\[\{"key":"linux"[^'\n]*\{"key":"macos"[^'\n]*\]'[\s\S]*?else[\s\S]*?\{"key":"windows"/u,
+    );
   });
 });

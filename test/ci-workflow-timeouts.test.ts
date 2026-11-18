@@ -88,7 +88,7 @@ describe('every CI job ends itself', () => {
     expect(jobsCutOffBeforeTheirWait(workflow)).toEqual(['waits']);
   });
 
-  it('gives macOS Remote Desktop (from SDK) enough headroom for macOS runner queue contention', () => {
+  it('keeps macOS Remote Desktop (from SDK) bounded below the 6 h default with safe execution headroom', () => {
     const ci = parse(readFileSync(join(WORKFLOW_DIR, 'ci.yml'), 'utf8')) as Workflow;
     const macosRemoteDesktop = ci.jobs['macos-remote-desktop-components'];
     expect(macosRemoteDesktop).toBeDefined();

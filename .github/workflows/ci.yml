@@ -193,11 +193,11 @@ jobs:
   macos-unit-tests:
     name: Unit Tests (macOS, shard ${{ matrix.shard }}/3)
     runs-on: macos-latest
-    # The measured 15–19 minute critical path is three disjoint shards, with all platform tests retained.
+    # Three disjoint shards run at max-parallel: 2 so peak concurrent macOS jobs stay below GitHub's 5-runner cap.
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 2
       matrix:
         shard: [1, 2, 3]
     steps:
@@ -225,8 +225,11 @@ jobs:
   # regressions that are almost never architecture-specific.
   macos-remote-desktop-components:
     name: macOS Remote Desktop (from SDK)
+    # controlled-node-executables already builds, signs, notarizes, and verifies both arm64 and x64
+    # macOS remote-desktop components on master/main/dev; keep this check for PRs and repro/**.
+    if: github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev'
     runs-on: macos-15
-    # Covers ~15-25 min GitHub-hosted macOS runner queue behind concurrent macos-unit-tests shards plus ~2-4 min SDK download & build, while still bounding hung runs well below GitHub's 6 h default.
+    # Bounds a hung execution well below GitHub's 6 h default (normal ~2-4 min).
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
