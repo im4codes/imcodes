@@ -208,10 +208,14 @@ describe('Phase A dual-path compatibility probe and 5-scenario state machine', (
     const homeDir = join(root, 'home');
     const plistDir = join(homeDir, 'Library', 'LaunchAgents');
     const homebrewBin = join(root, 'opt', 'homebrew', 'bin');
+    const homebrewPkg = join(root, 'opt', 'homebrew', 'lib', 'node_modules', 'imcodes', 'dist', 'src');
     mkdirSync(plistDir, { recursive: true });
     mkdirSync(homebrewBin, { recursive: true });
+    mkdirSync(homebrewPkg, { recursive: true });
     const fakeNode = join(homebrewBin, 'node');
     writeFileSync(fakeNode, '#!/bin/sh\n', { mode: 0o755 });
+    const fakeEntry = join(homebrewPkg, 'index.js');
+    writeFileSync(fakeEntry, 'console.log("homebrew-npm-installed");\n');
     const plistPath = join(plistDir, 'imcodes.daemon.plist');
     writeFileSync(
       plistPath,
@@ -221,7 +225,7 @@ describe('Phase A dual-path compatibility probe and 5-scenario state machine', (
   <key>ProgramArguments</key>
   <array>
     <string>${fakeNode}</string>
-    <string>/opt/homebrew/lib/node_modules/imcodes/dist/src/index.js</string>
+    <string>${fakeEntry}</string>
     <string>start</string>
     <string>--foreground</string>
   </array>

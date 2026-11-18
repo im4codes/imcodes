@@ -8,6 +8,7 @@
 
 #include "aidesk_ui_support.h"
 
+#include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -77,7 +78,21 @@ void LogLine(const std::string& event) {
 std::string LockDirectory() {
   const char* home = getenv("HOME");
   std::string base = home != nullptr && home[0] == '/' ? home : std::string(NSHomeDirectory().fileSystemRepresentation);
+  while (base.size() > 1 && base.back() == '/') {
+    base.pop_back();
+  }
   return base + "/Library/Application Support/" + kMacosRemoteDesktopWorkerBundleIdentifier;
+}
+
+NSString* ScopeObject() {
+  const std::string dir = LockDirectory();
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH] = {};
+  CC_SHA256(dir.data(), static_cast<CC_LONG>(dir.size()), digest);
+  char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1] = {};
+  for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) {
+    std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
+  }
+  return [NSString stringWithFormat:@"%s:%s", kMacosRemoteDesktopWorkerBundleIdentifier, hex];
 }
 
 NSString* RequestName() {
@@ -224,8 +239,9 @@ UiRoleClaim ClaimUiRole() noexcept {
     // know the request never answers, and this one then carries on as an instance of its own.
     __block BOOL acknowledged = NO;
     NSDistributedNotificationCenter* center = [NSDistributedNotificationCenter defaultCenter];
-    id observer = [center addObserverForName:AckName() object:nil queue:nil usingBlock:^(NSNotification*) { acknowledged = YES; }];
-    [center postNotificationName:RequestName() object:nil userInfo:nil deliverImmediately:YES];
+    NSString* scope = ScopeObject();
+    id observer = [center addObserverForName:AckName() object:scope queue:nil usingBlock:^(NSNotification*) { acknowledged = YES; }];
+    [center postNotificationName:RequestName() object:scope userInfo:nil deliverImmediately:YES];
     const NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:kUiHandOverWaitSeconds];
     while (!acknowledged && [deadline timeIntervalSinceNow] > 0) {
       // blocking-ok: bounded (kUiHandOverWaitSeconds), and before this process has any window or Dock presence
@@ -239,10 +255,11 @@ UiRoleClaim ClaimUiRole() noexcept {
 
 void ObserveUiRequests(void (^handler)(void)) noexcept {
   NSDistributedNotificationCenter* center = [NSDistributedNotificationCenter defaultCenter];
-  [center addObserverForName:RequestName() object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification*) {
+  NSString* scope = ScopeObject();
+  [center addObserverForName:RequestName() object:scope queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification*) {
     LogLine("ui_request_received");
     handler();
-    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:AckName() object:nil userInfo:nil deliverImmediately:YES];
+    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:AckName() object:scope userInfo:nil deliverImmediately:YES];
   }];
 }
 

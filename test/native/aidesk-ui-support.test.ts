@@ -111,4 +111,30 @@ describeMac('aidesk_ui_support: one user-facing instance', () => {
     await new Promise((resolveWait) => setTimeout(resolveWait, 500));
     expect(run('claim', home).stdout).toContain('claim=owner');
   });
+
+  it('hands over within the same HOME when observing, while staying isolated from other HOME directories', async () => {
+    const homeObserved = join(work, 'home-observed');
+    const homeIsolated = join(work, 'home-isolated');
+    const observedOwner = startOwner('claim-observe', homeObserved);
+    const isolatedOwner = startOwner('claim', homeIsolated);
+    try {
+      await until(() => observedOwner.output().includes('claim=owner'));
+      await until(() => isolatedOwner.output().includes('claim=owner'));
+
+      // A different HOME with a non-observing owner must NOT cross-talk with homeObserved's observer.
+      const isolatedSecond = run('claim', homeIsolated);
+      expect(isolatedSecond.status).toBe(0);
+      expect(isolatedSecond.stdout).toContain('claim=unlocked');
+      expect(observedOwner.output()).not.toContain('request_received');
+
+      // A second instance under the exact same HOME hands over cleanly via the scoped notification.
+      const sameHomeSecond = run('claim', homeObserved);
+      expect(sameHomeSecond.status).toBe(0);
+      expect(sameHomeSecond.stdout).toContain('claim=handed_over');
+      await until(() => observedOwner.output().includes('request_received'));
+    } finally {
+      observedOwner.stop();
+      isolatedOwner.stop();
+    }
+  });
 });
