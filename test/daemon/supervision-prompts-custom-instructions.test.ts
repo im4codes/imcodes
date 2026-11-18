@@ -528,6 +528,21 @@ describe('Brain work-delegation contract placement and budget', () => {
     }
   });
 
+  it('requires read-only analysis and concrete planning before pair_create in the pairs Brain contract', () => {
+    const pairsContract = JSON.parse(
+      buildBrainSupervisedWorkDelegationContract('en', { taskPairEngine: 'pairs' }),
+    ) as {
+      default: { route: string; sequence: string[]; mainWindow: string };
+      pairs: { preDispatch: string; poolObedience: string; sessionIsolation: string };
+    };
+    expect(pairsContract.default.route).toBe('imcodes_visible_subsession');
+    expect(pairsContract.default.sequence).toEqual(['analyze_and_plan_readonly', 'pair_create', 'pair_dispatch_if_queued']);
+    expect(pairsContract.default.mainWindow).toBe('coordinate_not_implement');
+    expect(pairsContract.pairs.preDispatch).toBe('readonly_root_cause_and_code_analysis_plus_concrete_plan_before_pair_create');
+    expect(pairsContract.pairs.poolObedience).toBe('strictly_obey_configured_execution_pool_and_entry_roles_by_default_override_only_on_explicit_user_instruction');
+    expect(pairsContract.pairs.sessionIsolation).toBe('never_assign_or_reassign_same_subsession_across_concurrent_open_pairs_each_open_pair_owns_dedicated_sessions');
+  });
+
   it('treats every peer being busy as a queue, never as nothing to delegate to', () => {
     // The load-bearing case. `eligible.availability: 'ready'` plus an exception
     // named for the absence of a READY peer meant a project whose peers were

@@ -308,6 +308,8 @@ describe('task-pair marker grammar', () => {
     for (const rule of [TASK_PAIR_BRIEF_STRUCTURE_RULE, TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE, TASK_PAIR_BOUNDARY_AUDIT_RULE, TASK_PAIR_MERGE_VERIFICATION_RULE]) {
       expect(body).toContain(rule);
     }
+    expect(TASK_PAIR_BRIEF_STRUCTURE_RULE).toContain('concrete facts already verified by Brain\'s read-only inspection');
+    expect(TASK_PAIR_BRIEF_STRUCTURE_RULE).toContain('Direction / Plan (concrete step-by-step implementation plan');
     expect(TASK_PAIR_BRIEF_STRUCTURE_RULE).toContain('Boundary checks');
     expect(TASK_PAIR_BRIEF_STRUCTURE_RULE).toContain('risk-tiered by default');
     expect(TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE).toContain('before implementing');
@@ -362,11 +364,13 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_INTEGRATION_RULE).toContain('"evidence:"');
   });
 
-  it('ships a contract where Brain sets direction and the pair gathers evidence, decides when clear and escalates otherwise', () => {
+  it('ships a contract where Brain analyzes read-only and plans before pair_create, and the pair gathers evidence, decides when clear and escalates otherwise', () => {
     const body = buildTaskPairMarkerContract();
     expect(body).toContain(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE);
-    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('Brain does only a QUICK analysis');
-    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('gives the pair a DIRECTION');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).not.toContain('Brain does only a QUICK analysis');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('Before calling pair_create, Brain MUST perform foundational read-only analysis');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('without editing product code');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('formulate a concrete DIRECTION and PLAN');
     expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('decide for themselves whenever the evidence makes the decision clear');
     expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('report the findings with options and a recommendation to Brain for a new direction');
     expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('analyze further itself, change the direction, or let the pair execute');

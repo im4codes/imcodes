@@ -290,6 +290,7 @@ export function buildBrainSupervisedWorkDelegationContract(
  * with markers, and has nothing to bind or repair.
  */
 export const BRAIN_PAIRS_SUPERVISED_WORK = {
+  preDispatch: 'readonly_root_cause_and_code_analysis_plus_concrete_plan_before_pair_create',
   newWork: 'pair_create_omit_roles_and_models_when_execution_pool_configured_then_pair_dispatch_if_queued',
   poolObedience: 'strictly_obey_configured_execution_pool_and_entry_roles_by_default_override_only_on_explicit_user_instruction',
   sessionIsolation: 'never_assign_or_reassign_same_subsession_across_concurrent_open_pairs_each_open_pair_owns_dedicated_sessions',
@@ -322,7 +323,7 @@ function toTaskPairSupervisedContract(contract: ReturnType<typeof buildBrainSupe
     default: {
       ...rest.default,
       route: 'imcodes_visible_subsession',
-      sequence: ['pair_create', 'pair_dispatch_if_queued'],
+      sequence: ['analyze_and_plan_readonly', 'pair_create', 'pair_dispatch_if_queued'],
       selectBy: rest.default.selectBy.filter((key) => key !== 'auditPolicy'),
     },
     pairs: BRAIN_PAIRS_SUPERVISED_WORK,

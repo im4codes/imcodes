@@ -5,7 +5,7 @@ import catalog from '../../src/daemon/memory-mcp-bootstrap-catalog.json';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
 import { mcpToolSurfaceBytes, MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES } from '../../shared/mcp-tool-surface-budget.js';
 import { MCP_TOOL_GROUPS } from '../../shared/mcp-tool-discovery.js';
-import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_MCP_TOOL_CONTRACTS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 
 async function liveCatalog(mode?: 'static_full') {
   const server = createMemoryMcpServerFromEnv({
@@ -51,5 +51,16 @@ describe('memory MCP bootstrap catalog', () => {
 
     expect(supervisionTools).toEqual(expect.arrayContaining(pairDecisionTools));
     expect(catalog.static_full.map((tool) => tool.name)).toEqual(expect.arrayContaining(pairDecisionTools));
+  });
+
+  it('requires read-only root-cause analysis and concrete planning in the pair_create catalog entry', () => {
+    const pairCreate = catalog.static_full.find((entry) => entry.name === MEMORY_MCP_TOOL_NAMES.PAIR_CREATE) as {
+      description?: string;
+    } | undefined;
+    expect(pairCreate?.description).toContain('inspect root cause/files read-only and plan first');
+    const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE];
+    const brief = (contract.inputSchema as { properties?: { brief?: { description?: string } } }).properties?.brief;
+    expect(contract.description).toContain('inspect root cause/files read-only and plan first');
+    expect(brief?.description).toContain('verified Proven files/logs, step-by-step Plan');
   });
 });

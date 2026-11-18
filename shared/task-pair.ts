@@ -549,23 +549,28 @@ export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
   + 'at REWORK rounds 2, 4, 6… when the pair is not clearly converging.';
 
 /**
- * Division of labour: Brain (usually the stronger model) does quick analysis,
- * sets direction and makes decisions; the pair does the legwork and the
- * verification, decides within that direction, and escalates when it can't.
+ * Division of labour: Brain (usually the stronger model) performs foundational
+ * read-only analysis and planning before creating a pair, sets direction/plan
+ * and makes decisions; the pair does the legwork and verification, decides
+ * within that direction, and escalates when it can't.
  */
 export const TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE: string =
   'Direction before dispatch: Brain (usually the stronger model) owns '
   + 'analysis and decisions; the pair does the legwork and the verification. '
-  + 'Before dispatching, Brain does only a QUICK analysis (read the actual '
-  + 'failure, locate the likely code path, test a cheap hypothesis) and gives '
-  + 'the pair a DIRECTION: what is proven, what is suspected, and what to find '
-  + 'out. Executor and auditor gather the evidence along that direction and '
-  + 'decide for themselves whenever the evidence makes the decision clear. '
-  + 'When it does not, or the evidence points away from the direction, they '
-  + 'report the findings with options and a recommendation to Brain for a '
-  + 'new direction instead of guessing or looping. Brain decides each next '
-  + 'step from task difficulty and pair feedback: analyze further itself, '
-  + 'change the direction, or let the pair execute.';
+  + 'Before calling pair_create, Brain MUST perform foundational read-only '
+  + 'analysis (inspect actual errors/logs, locate exact relevant files, '
+  + 'callers and contracts, and verify cheap hypotheses without editing '
+  + 'product code) and formulate a concrete DIRECTION and PLAN (what is '
+  + 'proven with file/code evidence, what is suspected, step-by-step '
+  + 'implementation plan, module/file boundaries, and key invariants; never '
+  + 'dispatch a blind or vague brief). Executor and auditor gather the '
+  + 'evidence along that direction and plan and decide for themselves '
+  + 'whenever the evidence makes the decision clear. When it does not, or '
+  + 'the evidence points away from the direction, they report the findings '
+  + 'with options and a recommendation to Brain for a new direction instead '
+  + 'of guessing or looping. Brain decides each next step from task '
+  + 'difficulty and pair feedback: analyze further itself, change the '
+  + 'direction, or let the pair execute.';
 
 /**
  * Pair execution discipline learned from slow pairs: stay in your own
@@ -606,9 +611,11 @@ export const TASK_PAIR_EXECUTION_DISCIPLINE_RULE: string =
  */
 export const TASK_PAIR_BRIEF_STRUCTURE_RULE: string =
   'Brief structure (Brain): every pair brief (pair_create) states, in this order: Goal '
-  + '(the user-visible outcome, quoting the request); Proven (facts already '
-  + 'verified, with evidence); Suspected (hypotheses to confirm or refute); '
-  + 'Direction; Acceptance (numbered, checkable items); Boundary checks '
+  + '(the user-visible outcome, quoting the request); Proven (concrete facts '
+  + 'already verified by Brain\'s read-only inspection: exact files, '
+  + 'functions, logs, or state); Suspected (hypotheses to confirm or refute); '
+  + 'Direction / Plan (concrete step-by-step implementation plan, target '
+  + 'files/modules, invariants, and round/pair split when needed); Acceptance (numbered, checkable items); Boundary checks '
   + '(extremes the change must not break: sizes and scale limits, every key '
   + 'or identifier form, defaults and fallbacks, concurrency, restart and '
   + 'upgrade, isolation from real user data); Evidence method and '

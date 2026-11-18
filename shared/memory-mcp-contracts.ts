@@ -886,11 +886,11 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
-    description: 'Brain-only structured creation of a task pair. Persists brief/assignments atomically and delivers briefs with durable receipts; same idempotencyKey replays without duplicate creation/sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE + ' ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_SPLIT_UNRELATED_RULE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+    description: 'Brain-only: inspect root cause/files read-only and plan first, then create a task pair. Persists brief/assignments atomically with durable receipts; same idempotencyKey replays without duplicate creation/sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE + ' ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_SPLIT_UNRELATED_RULE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),
-      brief: stringSchema('Complete Markdown task brief, including checkable acceptance and boundaries.'),
+      brief: stringSchema('Complete Markdown brief: Goal, verified Proven files/logs, step-by-step Plan, checkable Acceptance, Boundaries.'),
       dependsOn: { type: 'array', maxItems: TASK_PAIR_MAX_DEPENDENCIES, items: { type: 'string', minLength: 1 }, description: 'Wait until these same-project tasks reach accepted done.' },
       executor: stringSchema('Exact executor.'),
       auditor: stringSchema('Exact auditor or none.'),
