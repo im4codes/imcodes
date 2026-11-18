@@ -355,6 +355,140 @@ describe('GitHubProvider multi-account gh auth resolution', () => {
     expect(calls.some((c) => c.args[0] === 'auth' && c.args[1] === 'status')).toBe(true);
   });
 
+  it('continues candidate discovery past non-auth failures (429/500), caches the winning account, and restores default error if all fail', async () => {
+    const aliceToken = 'gho_alice_rate_limited_111';
+    const charlieToken = 'gho_charlie_server_err_222';
+    const bobToken = 'gho_bob_org_access_333';
+
+    for (const candidateFailMode of ['429', '500'] as const) {
+      calls = [];
+      resetGhAuthCacheForTests();
+      let statusCalls = 0;
+      const tokenRequests: string[] = [];
+
+      const mockExec = async (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+        calls.push({ file, args, env: opts?.env });
+
+        if (file === 'gh' && args[0] === 'auth' && args[1] === 'token') {
+          const user = args[args.indexOf('--user') + 1];
+          tokenRequests.push(user);
+          if (user === 'my-org') throw makeGhError({ exitCode: 1, stderr: 'unknown user' });
+          if (user === 'alice') return { stdout: `${aliceToken}\n`, stderr: '' };
+          if (user === 'charlie') return { stdout: `${charlieToken}\n`, stderr: '' };
+          if (user === 'bob') return { stdout: `${bobToken}\n`, stderr: '' };
+          throw makeGhError({ exitCode: 1, stderr: 'unknown' });
+        }
+
+        if (file === 'gh' && args[0] === 'auth' && args[1] === 'status') {
+          statusCalls += 1;
+          return {
+            stdout: JSON.stringify({
+              hosts: {
+                'github.com': [
+                  { login: 'rockkoca', state: 'success', active: true },
+                  { login: 'alice', state: 'success', active: false },
+                  { login: 'charlie', state: 'success', active: false },
+                  { login: 'bob', state: 'success', active: false },
+                ],
+              },
+            }),
+            stderr: '',
+          };
+        }
+
+        if (file === 'gh' && args[0] === 'api') {
+          const tok = opts?.env?.GH_TOKEN;
+          if (!tok) {
+            throw makeGhError({ exitCode: 1, stderr: 'gh: Not Found (HTTP 404)' });
+          }
+          if (tok === aliceToken) {
+            throw makeGhError({
+              exitCode: 1,
+              stderr: candidateFailMode === '429'
+                ? 'HTTP 429 API rate limit exceeded'
+                : 'HTTP 500 Internal Server Error',
+            });
+          }
+          if (tok === charlieToken) {
+            throw makeGhError({ exitCode: 1, stderr: 'HTTP 502 Bad Gateway' });
+          }
+          if (tok === bobToken) {
+            return { stdout: '[]', stderr: '' };
+          }
+        }
+
+        throw new Error(`Unexpected call: ${file}`);
+      };
+
+      setRepoExecFile({ offMain: mockExec, offMainIdempotent: mockExec });
+      const provider = new GitHubProvider('my-org', 'priv-repo', '/tmp/project');
+
+      const first = await provider.listActions();
+      expect(first.items).toEqual([]);
+      expect(statusCalls).toBe(1);
+      expect(tokenRequests).toEqual(['my-org', 'alice', 'charlie', 'bob']);
+
+      // Subsequent call uses cached bob token without rediscovery
+      const second = await provider.listActions();
+      expect(second.items).toEqual([]);
+      expect(statusCalls).toBe(1);
+      expect(tokenRequests).toEqual(['my-org', 'alice', 'charlie', 'bob']);
+    }
+
+    // When all candidate accounts fail (e.g. 429 then 500), restore original defaultErr and redact tokens
+    calls = [];
+    resetGhAuthCacheForTests();
+    const failAllExec = async (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+      calls.push({ file, args, env: opts?.env });
+      if (file === 'gh' && args[0] === 'auth' && args[1] === 'token') {
+        const user = args[args.indexOf('--user') + 1];
+        if (user === 'alice') return { stdout: `${aliceToken}\n`, stderr: '' };
+        if (user === 'charlie') return { stdout: `${charlieToken}\n`, stderr: '' };
+        throw makeGhError({ exitCode: 1, stderr: 'unknown' });
+      }
+      if (file === 'gh' && args[0] === 'auth' && args[1] === 'status') {
+        return {
+          stdout: JSON.stringify({
+            hosts: {
+              'github.com': [
+                { login: 'alice', state: 'success', active: false },
+                { login: 'charlie', state: 'success', active: false },
+              ],
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (file === 'gh' && args[0] === 'api') {
+        const tok = opts?.env?.GH_TOKEN;
+        if (!tok) {
+          throw makeGhError({ exitCode: 4, stderr: `authentication failed for ${aliceToken}` });
+        }
+        if (tok === aliceToken) {
+          throw makeGhError({ exitCode: 1, stderr: 'HTTP 429 API rate limit exceeded' });
+        }
+        throw makeGhError({ exitCode: 1, stderr: 'HTTP 500 Internal Server Error' });
+      }
+      throw new Error(`Unexpected call: ${file}`);
+    };
+
+    setRepoExecFile({ offMain: failAllExec, offMainIdempotent: failAllExec });
+    const failProvider = new GitHubProvider('my-org', 'inaccessible-repo', '/tmp/project');
+
+    let caught: (Error & { code?: string }) | undefined;
+    try {
+      await failProvider.listActions();
+    } catch (e) {
+      caught = e as Error & { code?: string };
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.code).toBe('unauthorized');
+    expect(caught!.message).not.toContain(aliceToken);
+    expect(caught!.message).toContain('[REDACTED]');
+    expect(caught!.message).not.toContain('429');
+    expect(caught!.message).not.toContain('500');
+  });
+
   it('redacts GitHub tokens from thrown error messages in listActions and getActionDetail', async () => {
     const leakedToken = 'gho_super_secret_leaked_token_XYZ987';
     const patToken = 'github_pat_another_secret_token_ABC123';

@@ -148,15 +148,15 @@ function buildTokenEnv(token: string): NodeJS.ProcessEnv {
 }
 
 function sanitizeErrorTokens(err: unknown, tokens: string[]): unknown {
-  if (!err || typeof err !== 'object' || tokens.length === 0) return err;
+  if (!err || typeof err !== 'object') return err;
   const e = err as { stderr?: string; message?: string };
   if (typeof e.stderr === 'string') {
-    let next = e.stderr;
+    let next = redactGhTokens(e.stderr);
     for (const t of tokens) next = redactGhTokens(next, t);
     e.stderr = next;
   }
   if (typeof e.message === 'string') {
-    let next = e.message;
+    let next = redactGhTokens(e.message);
     for (const t of tokens) next = redactGhTokens(next, t);
     e.message = next;
   }
@@ -244,10 +244,9 @@ export async function withGhOwnerAuth<T>(
       const result = await runGh(buildTokenEnv(token));
       setCachedEntry(key, token, login);
       return result;
-    } catch (err) {
-      if (!isAuthOrNotFoundError(err)) {
-        throw sanitizeErrorTokens(err, triedTokens);
-      }
+    } catch {
+      // Treat any candidate failure (404/401/429/5xx/etc.) as a candidate miss so
+      // remaining accounts are still tried; all-candidate failure throws defaultErr below.
     }
   }
 
