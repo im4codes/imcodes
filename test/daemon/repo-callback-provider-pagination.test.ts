@@ -1,10 +1,11 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultRepoCallbackConfig } from '../../shared/repo-callback.js';
 import { CallbackTaskStore } from '../../src/daemon/callback-task-store.js';
 import { RepoCallbackMonitor } from '../../src/daemon/repo-callback-monitor.js';
+import { resetGhAuthCacheForTests } from '../../src/repo/gh-auth.js';
 import { GitHubProvider } from '../../src/repo/github-provider.js';
 import { GitLabProvider } from '../../src/repo/gitlab-provider.js';
 import type { RepoContext } from '../../src/repo/types.js';
@@ -20,6 +21,13 @@ vi.mock('../../src/repo/repo-exec.js', () => ({
 
 beforeEach(() => {
   repoExecMock.mockReset();
+  resetGhAuthCacheForTests();
+  vi.stubEnv('GH_TOKEN', 'test-pagination-token');
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  resetGhAuthCacheForTests();
 });
 
 function makeSession(projectDir = '/tmp/repo-gh'): SessionRecord {

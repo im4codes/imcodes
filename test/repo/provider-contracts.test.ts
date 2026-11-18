@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { execFileMock } = vi.hoisted(() => ({
   execFileMock: vi.fn(),
@@ -8,6 +8,7 @@ vi.mock('node:child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
+import { resetGhAuthCacheForTests } from '../../src/repo/gh-auth.js';
 import { GitHubProvider } from '../../src/repo/github-provider.js';
 import { GitLabProvider } from '../../src/repo/gitlab-provider.js';
 
@@ -27,6 +28,13 @@ function rejectExec(error: unknown) {
 describe('GitHubProvider contracts', () => {
   beforeEach(() => {
     execFileMock.mockReset();
+    resetGhAuthCacheForTests();
+    vi.stubEnv('GH_TOKEN', 'test-contract-token');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetGhAuthCacheForTests();
   });
 
   it('guards owner and repo names before shelling out', () => {

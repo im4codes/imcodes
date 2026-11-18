@@ -20,6 +20,7 @@ import type { RepoProvider, ListOptions, CommitListOptions } from './provider.js
 import { DEFAULT_PAGE_SIZE } from './provider.js';
 import { detectRepo } from './detector.js';
 import { repoExecFile as execFileAsync } from './repo-exec.js';
+import { redactGhTokens, withGhOwnerAuth } from './gh-auth.js';
 
 
 /** Translate gh CLI failures into typed RepoError. */
@@ -56,6 +57,15 @@ export class GitHubProvider implements RepoProvider {
     return detectRepo(projectDir);
   }
 
+  private execGh(
+    args: string[],
+    opts: { cwd?: string; timeout?: number; maxBuffer?: number },
+  ): Promise<{ stdout: string; stderr: string }> {
+    return withGhOwnerAuth(this.owner, this.projectDir, (envOverride) =>
+      execFileAsync('gh', args, envOverride ? { ...opts, env: envOverride } : opts),
+    );
+  }
+
   /* ------------------------------------------------------------------ */
   /*  listIssues                                                         */
   /* ------------------------------------------------------------------ */
@@ -72,7 +82,7 @@ export class GitHubProvider implements RepoProvider {
     const jq = `{rawCount: length, items: [.[] | select(.html_url | contains("/issues/")) | {id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000)}]}`;
 
     try {
-      const { stdout } = await execFileAsync('gh', [
+      const { stdout } = await this.execGh([
         'api',
         `/repos/${this.owner}/${this.repo}/issues?state=${state}&per_page=${perPage}&page=${page}`,
         '-q', jq,
@@ -106,7 +116,7 @@ export class GitHubProvider implements RepoProvider {
     const jq = `[.[] | {number, title, state: (if .merged_at then "merged" elif .state == "closed" then "closed" else "open" end), author: .user.login, head: .head.ref, base: .base.ref, url: .html_url, createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000), reviewDecision: null, draft: .draft, labels: [.labels[].name]}]`;
 
     try {
-      const { stdout } = await execFileAsync('gh', [
+      const { stdout } = await this.execGh([
         'api',
         `/repos/${this.owner}/${this.repo}/pulls?state=${state}&per_page=${perPage}&page=${page}`,
         '-q', jq,
@@ -130,7 +140,7 @@ export class GitHubProvider implements RepoProvider {
     try {
       // Fetch branches, current branch, and default branch in parallel
       const [branchesResult, currentResult, defaultResult] = await Promise.all([
-        execFileAsync('gh', [
+        this.execGh([
           'api',
           `/repos/${this.owner}/${this.repo}/branches?per_page=100`,
           '-q', `[.[] | {name, lastCommitDate: (.commit.commit.committer.date // null | if . then fromdateiso8601 * 1000 else null end)}]`,
@@ -140,7 +150,7 @@ export class GitHubProvider implements RepoProvider {
           'branch', '--show-current',
         ], { cwd: this.projectDir, timeout: 3000 }).catch(() => ({ stdout: '' })),
 
-        execFileAsync('gh', [
+        this.execGh([
           'api',
           `/repos/${this.owner}/${this.repo}`,
           '-q', '.default_branch',
@@ -191,7 +201,7 @@ export class GitHubProvider implements RepoProvider {
     ];
 
     try {
-      const { stdout } = await execFileAsync('gh', args, {
+      const { stdout } = await this.execGh(args, {
         cwd: this.projectDir,
         timeout: 15000,
       });
@@ -217,7 +227,7 @@ export class GitHubProvider implements RepoProvider {
     const jq = `[.workflow_runs[] | {id, name, status: (if .status == "completed" then (if .conclusion == "success" then "success" elif .conclusion == "failure" then "failure" elif .conclusion == "cancelled" then "cancelled" else "failure" end) elif .status == "in_progress" then "running" else "queued" end), branch: .head_branch, commitSha: .head_sha[:7], commitMessage: .display_title, actor: .actor.login, url: .html_url, createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000), duration: (if .status == "completed" then (((.updated_at | fromdateiso8601) - (.created_at | fromdateiso8601))) else null end), runNumber: .run_number, event: .event, conclusion: .conclusion, runAttempt: .run_attempt, workflowPath: .path, headCommitMessage: (.head_commit.message // null)}]`;
 
     try {
-      const { stdout } = await execFileAsync('gh', [
+      const { stdout } = await this.execGh([
         'api',
         `/repos/${this.owner}/${this.repo}/actions/runs?per_page=${perPage}&page=${page}`,
         '-q', jq,
@@ -227,7 +237,7 @@ export class GitHubProvider implements RepoProvider {
       return { items, page, hasMore: items.length === perPage, projectDir: this.projectDir };
     } catch (err) {
       const code = translateError(err);
-      const stderr = (err as any)?.stderr ?? '';
+      const stderr = redactGhTokens((err as any)?.stderr ?? '');
       const error = new Error(`gh error: ${code}${stderr ? ` — ${stderr.slice(0, 200)}` : ''}`);
       (error as any).code = code;
       throw error;
@@ -242,7 +252,7 @@ export class GitHubProvider implements RepoProvider {
     const jq = `{runId: ${runId}, jobs: [.jobs[] | {id, name, status: (if .status == "completed" then (if .conclusion == "success" then "success" elif .conclusion == "failure" then "failure" elif .conclusion == "cancelled" then "cancelled" else "failure" end) elif .status == "in_progress" then "running" else "queued" end), conclusion: (.conclusion // null), startedAt: (.started_at | if . then fromdateiso8601 * 1000 else null end), completedAt: (.completed_at | if . then fromdateiso8601 * 1000 else null end), url: .html_url, steps: [(.steps // [])[] | {number, name, status: (if .status == "completed" then (if .conclusion == "success" then "success" elif .conclusion == "failure" then "failure" elif .conclusion == "cancelled" then "cancelled" else "failure" end) elif .status == "in_progress" then "running" else "queued" end), conclusion: (.conclusion // null), startedAt: (.started_at | if . then fromdateiso8601 * 1000 else null end), completedAt: (.completed_at | if . then fromdateiso8601 * 1000 else null end)}]}]}`;
 
     try {
-      const { stdout } = await execFileAsync('gh', [
+      const { stdout } = await this.execGh([
         'api',
         `/repos/${this.owner}/${this.repo}/actions/runs/${runId}/jobs?per_page=100`,
         '-q', jq,
@@ -251,7 +261,7 @@ export class GitHubProvider implements RepoProvider {
       return JSON.parse(stdout);
     } catch (err) {
       const code = translateError(err);
-      const stderr = (err as any)?.stderr ?? '';
+      const stderr = redactGhTokens((err as any)?.stderr ?? '');
       const error = new Error(`gh error: ${code}${stderr ? ` — ${stderr.slice(0, 200)}` : ''}`);
       (error as any).code = code;
       throw error;
@@ -266,7 +276,7 @@ export class GitHubProvider implements RepoProvider {
     const jq = `{sha: .sha, shortSha: .sha[:7], message: (.commit.message | split("\n") | .[0]), author: (.commit.author.name // .author.login // "unknown"), date: (.commit.author.date | fromdateiso8601 * 1000), url: .html_url, body: (.commit.message | split("\n") | .[1:] | join("\n") | ltrimstr("\n")), stats: {additions: .stats.additions, deletions: .stats.deletions, filesChanged: .stats.total}, files: [.files[:100][] | {filename, status, additions, deletions}], hasMoreFiles: ((.files | length) > 100)}`;
 
     try {
-      const { stdout } = await execFileAsync('gh', [
+      const { stdout } = await this.execGh([
         'api',
         `/repos/${this.owner}/${this.repo}/commits/${sha}`,
         '-q', jq,
@@ -289,7 +299,7 @@ export class GitHubProvider implements RepoProvider {
     const jq = `{number, title, state: (if .merged_at then "merged" elif .state == "closed" then "closed" else "open" end), author: .user.login, head: .head.ref, base: .base.ref, url: .html_url, createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000), reviewDecision: null, draft: .draft, labels: [.labels[].name], body: .body, additions, deletions, changedFiles: .changed_files, comments: .comments, mergeable: .mergeable, mergeableState: .mergeable_state}`;
 
     try {
-      const { stdout } = await execFileAsync('gh', [
+      const { stdout } = await this.execGh([
         'api',
         `/repos/${this.owner}/${this.repo}/pulls/${num}`,
         '-q', jq,
@@ -348,12 +358,12 @@ export class GitHubProvider implements RepoProvider {
 
     try {
       const [issueResult, commentsResult] = await Promise.all([
-        execFileAsync('gh', [
+        this.execGh([
           'api',
           `/repos/${this.owner}/${this.repo}/issues/${num}`,
           '-q', issueJq,
         ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 }),
-        execFileAsync('gh', [
+        this.execGh([
           'api',
           `/repos/${this.owner}/${this.repo}/issues/${num}/comments?per_page=20`,
           '-q', commentsJq,
