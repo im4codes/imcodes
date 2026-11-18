@@ -1,7 +1,7 @@
 import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { reclaimOrphanedAgyIncognitoHomes } from './agy-incognito-isolation.js';
-import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, normalizeAgyModelId } from '../../shared/agy-agent.js';
 import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
@@ -2974,17 +2974,16 @@ function healPersistedAgySessionModel(record: SessionRecord): SessionRecord {
     || transportRuntimes.has(record.name)) {
     return record;
   }
-  const explicitModel = record.requestedModel?.trim() || undefined;
-  const targetActiveModel = explicitModel
-    ?? (record.activeModel === 'gemini-4-carbon-medium' || record.modelDisplay === 'gemini-4-carbon-medium'
-      ? AGY_DEFAULT_MODEL_ID
-      : undefined);
-  if (!targetActiveModel
-    || (record.activeModel === targetActiveModel && record.modelDisplay === targetActiveModel)) {
+  const explicitModel = normalizeAgyModelId(record.requestedModel);
+  const targetActiveModel = explicitModel ?? AGY_DEFAULT_MODEL_ID;
+  if (record.requestedModel === explicitModel
+    && record.activeModel === targetActiveModel
+    && record.modelDisplay === targetActiveModel) {
     return record;
   }
   const healed: SessionRecord = {
     ...record,
+    requestedModel: explicitModel,
     activeModel: targetActiveModel,
     modelDisplay: targetActiveModel,
   };
@@ -3334,6 +3333,8 @@ export async function restoreTransportSessions(
         // codex branch above. Without this, a restored session passed the raw alias and
         // the SDK rejected it ("model (fable) may not exist"). Idempotent for ids.
         requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
+      } else if (s.providerId === AGY_SDK_PROVIDER_ID) {
+        requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
       }
       const runtime = new TransportSessionRuntime(
         provider,
@@ -3897,6 +3898,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     // Resolve the picker alias (e.g. "fable") to the documented API id at launch —
     // symmetric with the restore path and command-handler's model-change path.
     requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
+  } else if (agentType === AGY_SDK_PROVIDER_ID) {
+    requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
   }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would

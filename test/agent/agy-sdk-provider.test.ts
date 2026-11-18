@@ -13,7 +13,14 @@ import {
   encodeAgyUserLine,
   parseAgyModelList,
 } from '../../src/agent/providers/agy-sdk.js';
-import { AGY_CLI_FLAG, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import {
+  AGY_CLI_FLAG,
+  AGY_FALLBACK_MODEL_IDS,
+  AGY_SDK_PROVIDER_ID,
+  isAgyModelId,
+  normalizeAgyModelId,
+  resolveEffectiveAgyModelId,
+} from '../../shared/agy-agent.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_PROVIDERS,
@@ -195,6 +202,10 @@ describe('agy-sdk helpers', () => {
     expect(args).toContain(AGY_CLI_FLAG.SKIP_PERMISSIONS);
     expect(args.slice(args.indexOf(AGY_CLI_FLAG.CONVERSATION), args.indexOf(AGY_CLI_FLAG.CONVERSATION) + 2)).toEqual(['--conversation', 'c1']);
     expect(args.slice(args.indexOf(AGY_CLI_FLAG.MODEL), args.indexOf(AGY_CLI_FLAG.MODEL) + 2)).toEqual(['--model', 'm1']);
+    expect(args.slice(args.indexOf(AGY_CLI_FLAG.SETTINGS), args.indexOf(AGY_CLI_FLAG.SETTINGS) + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'm1' }),
+    ]);
     expect(args[args.length - 1]).toBe(AGY_CLI_FLAG.PRINT_STDIN);
     expect(buildAgyArgs({})).not.toContain(AGY_CLI_FLAG.CONVERSATION);
   });
@@ -230,12 +241,59 @@ describe('agy-sdk helpers', () => {
     ]);
   });
 
-  it('defaults fresh and resumed launch argv to Hydrogen High without overwriting explicit models', () => {
-    for (const opts of [{}, { model: '' }, { conversationId: 'persisted-1' }]) {
+  it('defaults fresh and resumed launch argv to Hydrogen High and overrides settings.json in memory without overwriting explicit models', () => {
+    for (const opts of [{}, { model: '' }, { model: 'agy-sdk' }, { conversationId: 'persisted-1' }]) {
       const args = buildAgyArgs(opts);
       expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-hydrogen-high']);
+      expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2)).toEqual(['--effort', 'high']);
+      expect(args.slice(args.indexOf('--settings'), args.indexOf('--settings') + 2)).toEqual([
+        '--settings',
+        JSON.stringify({ model: 'gemini-4-hydrogen-high', effort: 'high' }),
+      ]);
       expect(args.at(-1)).toBe(AGY_CLI_FLAG.PRINT_STDIN);
     }
+
+    const mediumArgs = buildAgyArgs({ model: 'Gemini 4 Hydrogen (Medium)' });
+    expect(mediumArgs.slice(mediumArgs.indexOf('--model'), mediumArgs.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-hydrogen-medium']);
+    expect(mediumArgs.slice(mediumArgs.indexOf('--effort'), mediumArgs.indexOf('--effort') + 2)).toEqual(['--effort', 'medium']);
+    expect(mediumArgs.slice(mediumArgs.indexOf('--settings'), mediumArgs.indexOf('--settings') + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'gemini-4-hydrogen-medium', effort: 'medium' }),
+    ]);
+  });
+
+  it('normalizes AGY display names, bare families, neon tiers, and backend placeholders without touching custom ids', () => {
+    expect(AGY_FALLBACK_MODEL_IDS).toContain('gemini-4-neon-high');
+    expect(AGY_FALLBACK_MODEL_IDS).toContain('gemini-4-neon-medium');
+    expect(AGY_FALLBACK_MODEL_IDS).toContain('gemini-4-neon-low');
+    expect(isAgyModelId('gemini-4-neon-high')).toBe(true);
+    expect(isAgyModelId('gemini-neon-medium')).toBe(true);
+
+    expect(normalizeAgyModelId(undefined)).toBeUndefined();
+    expect(normalizeAgyModelId('')).toBeUndefined();
+    expect(normalizeAgyModelId('agy')).toBeUndefined();
+    expect(normalizeAgyModelId('agy-sdk')).toBeUndefined();
+    expect(normalizeAgyModelId(' AGY-SDK ')).toBeUndefined();
+    expect(resolveEffectiveAgyModelId('agy-sdk')).toBe('gemini-4-hydrogen-high');
+
+    expect(normalizeAgyModelId('Gemini 4 Hydrogen (Medium)')).toBe('gemini-4-hydrogen-medium');
+    expect(normalizeAgyModelId('Gemini 4 Hydrogen')).toBe('gemini-4-hydrogen-high');
+    expect(normalizeAgyModelId('Gemini 4 Neon (Low)')).toBe('gemini-4-neon-low');
+    expect(normalizeAgyModelId('Gemini 3.8 Flash')).toBe('gemini-3.8-flash-high');
+    expect(normalizeAgyModelId('Claude Opus 5.5 (Medium)')).toBe('claude-opus-5-5-medium');
+    expect(normalizeAgyModelId('Claude Sonnet 5.5')).toBe('claude-sonnet-5-5-high');
+    expect(normalizeAgyModelId('GPT-OSS 120B (Medium)')).toBe('gpt-oss-120b-medium');
+    expect(normalizeAgyModelId('GPT-OSS 120B')).toBe('gpt-oss-120b-medium');
+    expect(normalizeAgyModelId('gpt-oss-120b')).toBe('gpt-oss-120b-medium');
+    expect(normalizeAgyModelId('gemini-4-hydrogen')).toBe('gemini-4-hydrogen-high');
+    expect(normalizeAgyModelId('gemini-4-neon')).toBe('gemini-4-neon-high');
+    expect(normalizeAgyModelId('claude-opus-5-5')).toBe('claude-opus-5-5-high');
+
+    // Explicit lower tiers & test stubs pass through intact
+    expect(normalizeAgyModelId('gemini-4-hydrogen-medium')).toBe('gemini-4-hydrogen-medium');
+    expect(normalizeAgyModelId('gemini-4-carbon-medium')).toBe('gemini-4-carbon-medium');
+    expect(normalizeAgyModelId('model-a')).toBe('model-a');
+    expect(normalizeAgyModelId('invalid')).toBe('invalid');
   });
 
   it('encodes one NDJSON user line', () => {
@@ -965,6 +1023,39 @@ describe('AgySdkProvider (fake agy process)', () => {
     const second = launches()[1];
     expect(second.slice(second.indexOf('--model'), second.indexOf('--model') + 2)).toEqual(['--model', 'claude-sonnet-5-5-low']);
     expect(second).toContain('--conversation');
+  });
+
+  it('normalizes agy-sdk / display names in createSession and setSessionAgentId and passes --settings to CLI without writing disk settings.json', async () => {
+    const agyConfigDir = path.join(dir, '.gemini', 'antigravity-cli');
+    mkdirSync(agyConfigDir, { recursive: true });
+    const settingsPath = path.join(agyConfigDir, 'settings.json');
+    const diskSettings = JSON.stringify({ model: 'Gemini 4 Hydrogen (Medium)', effort: 'medium' });
+    writeFileSync(settingsPath, diskSettings);
+
+    const sid = await provider.createSession({ sessionKey: 's-norm', cwd: dir, agentId: 'agy-sdk' });
+    await provider.send(sid, 'one');
+    await waitFor(() => completes.length === 1);
+
+    const first = launches()[0];
+    expect(first.slice(first.indexOf('--model'), first.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-hydrogen-high']);
+    expect(first.slice(first.indexOf('--settings'), first.indexOf('--settings') + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'gemini-4-hydrogen-high', effort: 'high' }),
+    ]);
+
+    // Bare backend name in setSessionAgentId is ignored; display name normalizes cleanly
+    provider.setSessionAgentId(sid, 'agy-sdk');
+    provider.setSessionAgentId(sid, 'Gemini 4 Carbon (Medium)');
+    await provider.send(sid, 'two');
+    await waitFor(() => completes.length === 2);
+
+    const second = launches()[1];
+    expect(second.slice(second.indexOf('--model'), second.indexOf('--model') + 2)).toEqual(['--model', 'gemini-4-carbon-medium']);
+    expect(second.slice(second.indexOf('--settings'), second.indexOf('--settings') + 2)).toEqual([
+      '--settings',
+      JSON.stringify({ model: 'gemini-4-carbon-medium', effort: 'medium' }),
+    ]);
+    expect(readFileSync(settingsPath, 'utf8')).toBe(diskSettings);
   });
 
   it('lists models from `agy models` with caching', async () => {

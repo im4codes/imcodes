@@ -4195,4 +4195,55 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('normalizes agy-sdk, settings display names, and bare family slugs in AgyAcpProvider.createSession and applySessionModel while overriding upstream default', async () => {
+    const { provider, requests } = await setup('upstream-carbon-default', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const emitted: string[] = [];
+    const done = vi.fn();
+    provider.onSessionInfo((_sid, info) => {
+      if (info.model) emitted.push(info.model);
+    });
+    provider.onComplete(done);
+
+    // 1. Bare backend placeholder 'agy-sdk' falls back to AGY_DEFAULT_MODEL_ID ('gemini-4-hydrogen-high')
+    await provider.createSession({
+      sessionKey: 'deck_test_acp_norm_default',
+      sessionName: 'deck_test_acp_norm_default',
+      cwd: process.cwd(),
+      agentId: 'agy-sdk',
+      fresh: true,
+    });
+    await provider.send('deck_test_acp_norm_default', 'turn-1');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+
+    // 2. Display name normalizes to canonical slug in applySessionModel
+    expect(await provider.applySessionModel('deck_test_acp_norm_default', 'Gemini 4 Hydrogen (Medium)')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    await provider.send('deck_test_acp_norm_default', 'turn-2');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-4-hydrogen-medium');
+
+    // 3. Bare family slug in createSession normalizes with '-high' suffix
+    await provider.createSession({
+      sessionKey: 'deck_test_acp_norm_family',
+      sessionName: 'deck_test_acp_norm_family',
+      cwd: process.cwd(),
+      agentId: 'gemini-4-neon',
+      fresh: true,
+    });
+    await provider.send('deck_test_acp_norm_family', 'turn-3');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(done.mock.calls[2]?.[1].metadata.model).toBe('gemini-4-neon-high');
+
+    const setModelIds = (await requests())
+      .filter((r) => r.method === 'session/set_model')
+      .map((r) => r.params.modelId);
+    expect(setModelIds).toEqual([
+      'gemini-4-hydrogen-high',
+      'gemini-4-hydrogen-medium',
+      'gemini-4-neon-high',
+    ]);
+    expect(emitted).not.toContain('agy-sdk');
+    expect(emitted).not.toContain('gemini-4-carbon-medium');
+  });
 });

@@ -35,6 +35,8 @@ import {
   AGY_DEFAULT_MODEL_ID,
   AGY_NATIVE_START_NOT_ATTEMPTED,
   isAgyHistoricalErrorCandidate,
+  normalizeAgyModelId,
+  resolveEffectiveAgyModelId,
   AGY_RESULT_STATUS,
   AGY_SDK_PROVIDER_ID,
   AGY_STEP_STATE,
@@ -151,12 +153,17 @@ function buildAgyMemoryMcpEnv(config: SessionConfig): Record<string, string> | u
  * approval channel, so without it every write tool would stall the turn.
  */
 export function buildAgyArgs(opts: { conversationId?: string; model?: string }): string[] {
+  const effectiveModel = resolveEffectiveAgyModelId(opts.model);
+  const effortMatch = /-(low|medium|high|xhigh)$/i.exec(effectiveModel);
+  const effort = effortMatch?.[1]?.toLowerCase();
   return [
     AGY_CLI_FLAG.INPUT_FORMAT, AGY_CLI_FLAG.STREAM_JSON,
     AGY_CLI_FLAG.OUTPUT_FORMAT, AGY_CLI_FLAG.STREAM_JSON,
     AGY_CLI_FLAG.SKIP_PERMISSIONS,
     ...(opts.conversationId ? [AGY_CLI_FLAG.CONVERSATION, opts.conversationId] : []),
-    AGY_CLI_FLAG.MODEL, opts.model || AGY_DEFAULT_MODEL_ID,
+    AGY_CLI_FLAG.MODEL, effectiveModel,
+    ...(effort ? [AGY_CLI_FLAG.EFFORT, effort] : []),
+    AGY_CLI_FLAG.SETTINGS, JSON.stringify({ model: effectiveModel, ...(effort ? { effort } : {}) }),
     // Must stay last: `-p`/`--print` without `=` would swallow the next argv as its prompt.
     AGY_CLI_FLAG.PRINT_STDIN,
   ];
@@ -301,9 +308,11 @@ export class AgySdkProvider implements TransportProvider {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
       mcpEnv: buildAgyMemoryMcpEnv(config) ?? existing?.mcpEnv,
-      model: (typeof config.agentId === 'string' && config.agentId)
-        || (typeof (config as { model?: string }).model === 'string' && (config as { model?: string }).model)
-        || existing?.model || AGY_DEFAULT_MODEL_ID,
+      model: normalizeAgyModelId(
+        (typeof config.agentId === 'string' && config.agentId)
+          || (typeof (config as { model?: string }).model === 'string' && (config as { model?: string }).model)
+          || undefined,
+      ) ?? normalizeAgyModelId(existing?.model) ?? AGY_DEFAULT_MODEL_ID,
       conversationId: config.resumeId ?? existing?.conversationId,
       beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
       cancelGeneration: (prior?.cancelGeneration ?? 0) + 1,
@@ -471,8 +480,9 @@ export class AgySdkProvider implements TransportProvider {
 
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
-    if (!state || !agentId || state.model === agentId) return;
-    state.model = agentId;
+    const nextModel = normalizeAgyModelId(agentId);
+    if (!state || !nextModel || state.model === nextModel) return;
+    state.model = nextModel;
     // --model is a launch flag: drop an idle process so the next send resumes with the new model.
     if (state.child && state.inflightTurns === 0) void this.terminateChild(state);
   }

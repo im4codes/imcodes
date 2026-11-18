@@ -647,4 +647,148 @@ describe('AG provider-switch failure recovery', () => {
       'gemini-4-argon-high',
     ]);
   });
+
+  it('heals agy-sdk requestedModel, settings display names, and polluted neon/hydrogen-medium defaults while honoring explicit lower tiers', async () => {
+    await acp('upstream-carbon-default');
+    const pollutedName = names[0];
+    const explicitMediumName = names[1];
+    const displaySubName = 'deck_sub_display_norm_test';
+    try {
+      await launchTransportSession({
+        name: pollutedName,
+        projectName: 'realproj',
+        role: 'brain',
+        agentType: AGY_SDK_PROVIDER_ID,
+        projectDir: home,
+        identityPrompt: 'fixture',
+        requestedModel: 'agy-sdk',
+        fresh: true,
+      });
+      await send(pollutedName, 'turn-1-polluted');
+      const pollutedNativeId = store.getSession(pollutedName)!.providerResumeId!;
+
+      await launchTransportSession({
+        name: explicitMediumName,
+        projectName: 'realproj',
+        role: 'w1',
+        agentType: AGY_SDK_PROVIDER_ID,
+        projectDir: home,
+        identityPrompt: 'fixture',
+        requestedModel: 'gemini-4-hydrogen-medium',
+        fresh: true,
+      });
+      await send(explicitMediumName, 'turn-1-medium');
+      const explicitMediumNativeId = store.getSession(explicitMediumName)!.providerResumeId!;
+
+      await launchTransportSession({
+        name: displaySubName,
+        projectName: 'realproj',
+        role: 'w1',
+        agentType: AGY_SDK_PROVIDER_ID,
+        projectDir: home,
+        identityPrompt: 'fixture',
+        requestedModel: 'Gemini 4 Neon (Medium)',
+        fresh: true,
+      });
+      await send(displaySubName, 'turn-1-neon');
+      const displaySubNativeId = store.getSession(displaySubName)!.providerResumeId!;
+
+      // Initial launch already normalized requestedModel & forced gemini-4-hydrogen-high for agy-sdk
+      expect(store.getSession(pollutedName)?.requestedModel).toBeUndefined();
+      expect(store.getSession(pollutedName)).toMatchObject({
+        activeModel: 'gemini-4-hydrogen-high',
+        modelDisplay: 'gemini-4-hydrogen-high',
+      });
+      expect(store.getSession(explicitMediumName)).toMatchObject({
+        requestedModel: 'gemini-4-hydrogen-medium',
+        activeModel: 'gemini-4-hydrogen-medium',
+        modelDisplay: 'gemini-4-hydrogen-medium',
+      });
+      expect(store.getSession(displaySubName)).toMatchObject({
+        requestedModel: 'gemini-4-neon-medium',
+        activeModel: 'gemini-4-neon-medium',
+        modelDisplay: 'gemini-4-neon-medium',
+      });
+
+      // Simulate persisted store pollution across daemon restart:
+      // 1) requestedModel='agy-sdk' & activeModel='gemini-4-neon-high'
+      // 2) unspecified requestedModel polluted with 'gemini-4-hydrogen-medium' / 'Gemini 4 Hydrogen (Medium)'
+      await stopTransportRuntimeSession(pollutedName);
+      await stopTransportRuntimeSession(explicitMediumName);
+      await stopTransportRuntimeSession(displaySubName);
+
+      store.upsertSession({
+        ...store.getSession(pollutedName)!,
+        requestedModel: 'agy-sdk',
+        activeModel: 'gemini-4-neon-high',
+        modelDisplay: 'Gemini 4 Hydrogen (Medium)',
+      });
+      store.upsertSession({
+        ...store.getSession(explicitMediumName)!,
+        requestedModel: 'gemini-4-hydrogen-medium',
+        activeModel: 'gemini-4-hydrogen-medium',
+        modelDisplay: 'gemini-4-hydrogen-medium',
+      });
+      store.upsertSession({
+        ...store.getSession(displaySubName)!,
+        requestedModel: undefined,
+        activeModel: 'gemini-4-hydrogen-medium',
+        modelDisplay: 'Gemini 4 Hydrogen (Medium)',
+      });
+      await store.flushStore({ requireWrite: true });
+      await store.loadStore({ probe: false });
+
+      await restoreFromStore();
+      await rebuildSubSessions([{
+        id: 'display_norm_test',
+        type: AGY_SDK_PROVIDER_ID,
+        providerId: AGY_SDK_PROVIDER_ID,
+        cwd: home,
+        providerSessionId: store.getSession(displaySubName)!.providerSessionId,
+        providerResumeId: displaySubNativeId,
+        requestedModel: 'agy-sdk',
+        activeModel: 'gemini-4-neon-high',
+      }]);
+
+      expect(store.getSession(pollutedName)?.requestedModel).toBeUndefined();
+      expect(store.getSession(pollutedName)).toMatchObject({
+        activeModel: 'gemini-4-hydrogen-high',
+        modelDisplay: 'gemini-4-hydrogen-high',
+      });
+      expect(store.getSession(explicitMediumName)).toMatchObject({
+        requestedModel: 'gemini-4-hydrogen-medium',
+        activeModel: 'gemini-4-hydrogen-medium',
+        modelDisplay: 'gemini-4-hydrogen-medium',
+      });
+      expect(store.getSession(displaySubName)?.requestedModel).toBeUndefined();
+      expect(store.getSession(displaySubName)).toMatchObject({
+        activeModel: 'gemini-4-hydrogen-high',
+        modelDisplay: 'gemini-4-hydrogen-high',
+      });
+
+      await restoreTransportSessions(AGY_SDK_PROVIDER_ID, { interSessionDelayMs: 0 });
+      await send(pollutedName, 'after restore polluted');
+      await send(explicitMediumName, 'after restore explicit medium');
+      await send(displaySubName, 'after restore healed sub');
+
+      const setModels = rows()
+        .filter((row) => row.method === 'session/set_model')
+        .map((row) => ({ sessionId: row.params.sessionId, modelId: row.params.modelId }));
+      expect(setModels.some((c) => c.modelId === 'agy-sdk')).toBe(false);
+      expect(setModels.filter((c) => c.sessionId === pollutedNativeId).map((c) => c.modelId)).toEqual([
+        'gemini-4-hydrogen-high',
+        'gemini-4-hydrogen-high',
+      ]);
+      expect(setModels.filter((c) => c.sessionId === explicitMediumNativeId).map((c) => c.modelId)).toEqual([
+        'gemini-4-hydrogen-medium',
+        'gemini-4-hydrogen-medium',
+      ]);
+      expect(setModels.filter((c) => c.sessionId === displaySubNativeId).map((c) => c.modelId)).toEqual([
+        'gemini-4-neon-medium',
+        'gemini-4-hydrogen-high',
+      ]);
+    } finally {
+      await stopTransportRuntimeSession(displaySubName).catch(() => {});
+    }
+  });
 });
