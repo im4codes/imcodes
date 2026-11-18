@@ -245,7 +245,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import { hasPinnedPanelServerProvenance, type PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import { canSharedActorControlSession, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import { canSharedActorControlSession, isShareScopedState, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
 import {
   clearSharedTabRestoreMarker,
   findRememberedSharedEntry,
