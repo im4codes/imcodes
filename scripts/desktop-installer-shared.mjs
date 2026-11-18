@@ -336,6 +336,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+escape_xml_text() {
+  printf '%s' "$1" | sed -e 's/&/\\&amp;/g' -e 's/</\\&lt;/g' -e 's/>/\\&gt;/g' -e 's/"/\\&quot;/g' -e "s/'/\\&apos;/g"
+}
+
 normalize_lexical_posix() {
   raw="$1"
   case "$raw" in
@@ -1559,6 +1563,8 @@ if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
   mkdir -p "$(dirname -- "$AUTOSTART_PATH")"
   auto_tmp="$AUTOSTART_PATH.tmp.$$"
   if [ "$PLATFORM" = "darwin" ]; then
+    xml_current_link="$(escape_xml_text "$CURRENT_LINK")"
+    xml_eff_home="$(escape_xml_text "$EFF_HOME")"
     cat > "$auto_tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1568,13 +1574,13 @@ if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
   <string>imcodes.daemon</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$CURRENT_LINK/bin/node</string>
-    <string>$CURRENT_LINK/package/dist/src/index.js</string>
+    <string>$xml_current_link/bin/node</string>
+    <string>$xml_current_link/package/dist/src/index.js</string>
     <string>start</string>
     <string>--foreground</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>$EFF_HOME</string>
+  <string>$xml_eff_home</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -1646,6 +1652,7 @@ EOF
     mv -f "$desk_tmp" "$DESKTOP_PATH"
   fi
 elif [ "$PLATFORM" = "darwin" ] && [ -x "$NODE_ROOT/imcodes-node" ]; then
+  xml_node_root="$(escape_xml_text "$NODE_ROOT")"
   if [ ! -e "$NODE_SERVICE_PATH" ]; then
     mkdir -p "$(dirname -- "$NODE_SERVICE_PATH")"
     cat > "$NODE_SERVICE_PATH.tmp.$$" <<EOF
@@ -1654,7 +1661,7 @@ elif [ "$PLATFORM" = "darwin" ] && [ -x "$NODE_ROOT/imcodes-node" ]; then
 <plist version="1.0">
 <dict>
   <key>Label</key><string>cc.imcodes.node</string>
-  <key>ProgramArguments</key><array><string>$NODE_ROOT/imcodes-node</string></array>
+  <key>ProgramArguments</key><array><string>$xml_node_root/imcodes-node</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardErrorPath</key><string>/var/log/imcodes-node.err.log</string>
@@ -1672,7 +1679,7 @@ EOF
 <plist version="1.0">
 <dict>
   <key>Label</key><string>cc.imcodes.node.watchdog</string>
-  <key>ProgramArguments</key><array><string>$NODE_ROOT/imcodes-node</string><string>--health-watchdog</string></array>
+  <key>ProgramArguments</key><array><string>$xml_node_root/imcodes-node</string><string>--health-watchdog</string></array>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>60</integer>
   <key>ProcessType</key><string>Background</string>

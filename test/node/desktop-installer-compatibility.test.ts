@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -36,6 +36,8 @@ import {
   installImcodesCliWrapper,
 } from '../../src/node/imcodes-cli-wrapper.js';
 import { discoverCodingDaemonRuntime } from '../../src/node/local-daemon-control.js';
+// @ts-expect-error ESM script module
+import { renderPosixPhaseARunnerScript } from '../../scripts/desktop-installer-shared.mjs';
 
 const tempDirs: string[] = [];
 
@@ -782,5 +784,103 @@ describe('AC 2: discoverCodingDaemonRuntime current/ alignment & imcodes CLI thi
     expect(() =>
       assertSafeNodeIsolatedTargetPath(join(relLink, 'state'), 'linux', root, isoRoot, 'container'),
     ).not.toThrow();
+  });
+
+  it('XML-escapes WorkingDirectory and ProgramArguments in macOS LaunchAgent/LaunchDaemon plists emitted by the POSIX runner', () => {
+    const root = makeTempDir();
+    const fakeRealHome = join(root, 'fake-real-home');
+    mkdirSync(fakeRealHome, { recursive: true });
+
+    const runnerScript = join(root, 'phase-a-darwin.sh');
+    writeFileSync(
+      runnerScript,
+      renderPosixPhaseARunnerScript({
+        platform: 'darwin',
+        version: '0.1.2',
+        cliWrapperContent: '#!/bin/sh\nexit 0\n',
+      }),
+      { mode: 0o700 },
+    );
+
+    const xmlEscape = (v: string) =>
+      v
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&apos;');
+
+    const verifyPlist = (plistPath: string, expectedWorkingDir: string | null, expectedArg0: string) => {
+      const xml = readFileSync(plistPath, 'utf8');
+      expect(xml).toContain(`<string>${xmlEscape(expectedArg0)}</string>`);
+      if (expectedWorkingDir !== null) {
+        expect(xml).toContain(`<key>WorkingDirectory</key>\n  <string>${xmlEscape(expectedWorkingDir)}</string>`);
+      }
+      const pyCheck = spawnSync(
+        'python3',
+        [
+          '-c',
+          'import json, plistlib, sys; d=plistlib.load(open(sys.argv[1], "rb")); print(json.dumps({"wd": d.get("WorkingDirectory"), "args": d.get("ProgramArguments")}))',
+          plistPath,
+        ],
+        { encoding: 'utf8', timeout: 5000 },
+      );
+      expect(pyCheck.status).toBe(0);
+      const parsed = JSON.parse(pyCheck.stdout) as { wd: string | null; args: string[] };
+      expect(parsed.args[0]).toBe(expectedArg0);
+      if (expectedWorkingDir !== null) {
+        expect(parsed.wd).toBe(expectedWorkingDir);
+      }
+    };
+
+    // Positive control: standard paths
+    const normalIso = join(root, 'normal-iso');
+    const normalHome = join(normalIso, 'home');
+    mkdirSync(normalHome, { recursive: true });
+    const normalRun = spawnSync(
+      '/bin/sh',
+      [runnerScript, '--isolated-root', normalIso, '--home', normalHome, '--no-service-control'],
+      { encoding: 'utf8', env: { ...process.env, HOME: fakeRealHome } },
+    );
+    expect(normalRun.status).toBe(0);
+    verifyPlist(
+      join(normalHome, 'Library', 'LaunchAgents', 'imcodes.daemon.plist'),
+      normalHome,
+      join(normalIso, 'daemon-runtime', 'current', 'bin', 'node'),
+    );
+
+    // Regression counterexample: paths containing XML special characters (&, <, >, ", ')
+    const specialIso = join(root, 'iso-a&<b>"c\'d');
+    const specialHome = join(specialIso, 'home-a&<b>"c\'d');
+    const specialNodeRoot = join(specialIso, 'controlled-node');
+    mkdirSync(specialHome, { recursive: true });
+    mkdirSync(specialNodeRoot, { recursive: true });
+    const specialNodeExe = join(specialNodeRoot, 'imcodes-node');
+    writeFileSync(specialNodeExe, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const specialRun = spawnSync(
+      '/bin/sh',
+      [runnerScript, '--isolated-root', specialIso, '--home', specialHome, '--no-service-control'],
+      { encoding: 'utf8', env: { ...process.env, HOME: fakeRealHome } },
+    );
+    expect(specialRun.status).toBe(0);
+
+    verifyPlist(
+      join(specialHome, 'Library', 'LaunchAgents', 'imcodes.daemon.plist'),
+      specialHome,
+      join(specialIso, 'daemon-runtime', 'current', 'bin', 'node'),
+    );
+    verifyPlist(
+      join(specialNodeRoot, 'cc.imcodes.node.plist'),
+      null,
+      specialNodeExe,
+    );
+    verifyPlist(
+      join(specialNodeRoot, 'cc.imcodes.node.watchdog.plist'),
+      null,
+      specialNodeExe,
+    );
+    expect(existsSync(join(fakeRealHome, '.imcodes'))).toBe(false);
+    expect(existsSync(join(fakeRealHome, 'Library'))).toBe(false);
   });
 });
