@@ -63,6 +63,10 @@ vi.mock('../src/api/usage-summary.js', () => ({
 
 import { UsageFooter } from '../src/components/UsageFooter.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import { getActiveStatusText, getActiveThinkingTs, getTailSessionStateInfo, hasActiveToolCall } from '../src/thinking-utils.js';
+import { hasActiveTimelineTurn, hasPendingUserSend } from '../src/timeline-running.js';
+import { getLatestTransportActivityDetail } from '../src/transport-activity-status.js';
+import { resolveTimelineBackedSessionState } from '../src/session-live-status.js';
 
 function expectRobotAvatar(root: ParentNode | null | undefined) {
   const avatar = root?.querySelector('.session-live-status-robot-avatar') as HTMLImageElement | null;
@@ -830,5 +834,98 @@ describe('UsageFooter', () => {
       />,
     );
     expect(container.textContent ?? '').not.toContain('Agent idle');
+  });
+
+  it('renders Running background task in real UsageFooter for post-complete background_monitor sequence, and yields to foreground activity, explicit clear, and idle', () => {
+    const renderFromTimeline = (events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>, opts?: { sessionState?: string; passTransportDetail?: boolean }) => {
+      const statusText = getActiveStatusText(events);
+      const activeThinkingTs = getActiveThinkingTs(events as any);
+      const activeToolCall = hasActiveToolCall(events);
+      const activeTimelineTurn = hasActiveTimelineTurn(events as any);
+      const pendingUserSend = hasPendingUserSend(events as any);
+      const transportActivityDetail = opts?.passTransportDetail === false ? undefined : getLatestTransportActivityDetail(events as any);
+      const tailInfo = getTailSessionStateInfo(events);
+      const liveState = resolveTimelineBackedSessionState({
+        timelineState: tailInfo.state,
+        sessionState: opts?.sessionState ?? 'running',
+        activeThinking: !!activeThinkingTs,
+        activeToolCall,
+        activeTransportTurn: activeTimelineTurn,
+        timelineStateTs: tailInfo.ts,
+        timelineLastEventTs: events.at(-1)?.ts ?? null,
+      });
+      return render(
+        <UsageFooter
+          usage={{ inputTokens: 100, cacheTokens: 0, contextWindow: 1_000_000 }}
+          sessionName="deck_test_bg_footer"
+          agentType="agy-sdk"
+          sessionState={liveState}
+          statusText={statusText}
+          activeThinkingTs={activeThinkingTs}
+          activeToolCall={activeToolCall}
+          activeTimelineTurn={activeTimelineTurn}
+          pendingUserSend={pendingUserSend}
+          transportActivityDetail={transportActivityDetail}
+          now={10_000}
+        />,
+      );
+    };
+
+    // 1) Real ORD 5513..5517 tail: assistant.text -> agent.status('Running background task') -> usage.update -> session.state(running, background_monitor)
+    const bgEvents = [
+      { type: 'assistant.text', ts: 1000, payload: { text: 'final reply' } },
+      { type: 'agent.status', ts: 1001, payload: { status: 'waiting', label: 'Running background task' } },
+      { type: 'usage.update', ts: 1002, payload: { inputTokens: 100 } },
+      { type: 'session.state', ts: 1003, payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, activeToolCount: 0, busyReasons: ['background_monitor'] } },
+    ];
+    const fullView = renderFromTimeline(bgEvents, { passTransportDetail: true });
+    expect(fullView.container.querySelector('.session-live-status-text')?.textContent).toBe('Running background task');
+    expect(fullView.container.querySelector('.session-live-status-inline.waiting')).toBeTruthy();
+    fullView.unmount();
+
+    // Pinned-panel path (omits transportActivityDetail) also displays Running background task.
+    const pinnedView = renderFromTimeline(bgEvents, { passTransportDetail: false });
+    expect(pinnedView.container.querySelector('.session-live-status-text')?.textContent).toBe('Running background task');
+    pinnedView.unmount();
+
+    // 2) Negative control: new foreground user prompt + thinking overrides back to thinking/working, never stale background text.
+    const nextTurnView = renderFromTimeline([
+      ...bgEvents,
+      { type: 'user.message', ts: 2000, payload: { text: 'next prompt' } },
+      { type: 'assistant.thinking', ts: 2001, payload: { text: 'reasoning' } },
+      { type: 'session.state', ts: 2002, payload: { state: 'running', blockingWorkCount: 1, activeWorkCount: 2, busyReasons: ['runtime_dispatch', 'background_monitor'] } },
+    ]);
+    expect(nextTurnView.container.querySelector('.session-live-status-text')?.textContent).toContain('thinking');
+    expect(nextTurnView.container.querySelector('.session-live-status-text')?.textContent).not.toBe('Running background task');
+    nextTurnView.unmount();
+
+    // 3) Negative control: tool.result + runtime_dispatch running does not show stale tool label or background label.
+    const toolDoneView = renderFromTimeline([
+      { type: 'tool.call', ts: 3000, payload: { tool: 'Read' } },
+      { type: 'agent.status', ts: 3001, payload: { label: 'Reading file...' } },
+      { type: 'tool.result', ts: 3002, payload: { ok: true } },
+      { type: 'session.state', ts: 3003, payload: { state: 'running', blockingWorkCount: 1, busyReasons: ['runtime_dispatch'] } },
+    ]);
+    expect(toolDoneView.container.querySelector('.session-live-status-text')?.textContent).toBe('Agent working...');
+    toolDoneView.unmount();
+
+    // 4) Negative control: explicit agent.status({ label: null }) clear preserves working/non-background state rather than leaking label.
+    const explicitClearView = renderFromTimeline([
+      { type: 'agent.status', ts: 4000, payload: { label: null } },
+      { type: 'usage.update', ts: 4001, payload: { inputTokens: 100 } },
+      { type: 'session.state', ts: 4002, payload: { state: 'running', blockingWorkCount: 0, activeWorkCount: 1, busyReasons: ['background_monitor'] } },
+    ]);
+    expect(explicitClearView.container.querySelector('.session-live-status-text')?.textContent).toBe('Agent working...');
+    explicitClearView.unmount();
+
+    // 5) Negative control: session.state(idle) clears background status immediately.
+    const idleView = renderFromTimeline([
+      ...bgEvents,
+      { type: 'session.state', ts: 5000, payload: { state: 'idle' } },
+    ], { sessionState: 'idle' });
+    const idleInline = idleView.container.querySelector('.session-live-status-inline.idle');
+    expect(idleInline).toBeTruthy();
+    expect(idleInline?.getAttribute('aria-label')).toBe('Agent idle — waiting for input');
+    expect(idleView.container.querySelector('.session-live-status-text')).toBeNull();
   });
 });

@@ -130,6 +130,12 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   const stopRequested = input.stopRequested === true;
   const statusText = normalizeDetail(input.statusText);
   const activityDetail = normalizeDetail(input.transportActivityDetail);
+  const isBackgroundMonitorWaiting = !activeToolCall
+    && !activeThinking
+    && !pendingUserSend
+    && Boolean(statusText)
+    && (activityDetail === 'background_monitor'
+      || (!activityDetail && statusText === 'Running background task'));
   const rawErrorDetail = normalizeDetail(input.sessionStateError)
     ?? (state === 'error' ? normalizeDetail(input.transportActivityDetail) : null)
     ?? normalizeDetail(input.sessionError);
@@ -177,6 +183,8 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   } else if (activeThinking) {
     mode = 'thinking';
   } else if (activityDetail?.startsWith(CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX)) {
+    mode = 'waiting';
+  } else if (isBackgroundMonitorWaiting) {
     mode = 'waiting';
   } else if (running || activeTransportTurn) {
     mode = 'running';

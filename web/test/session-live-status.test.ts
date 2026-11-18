@@ -300,4 +300,61 @@ describe('session-live-status', () => {
     expect(liveStatus.visualMode).toBe('idle');
     expect(liveStatus.sweep).toBe(false);
   });
+
+  it('surfaces background-monitor waiting label while keeping busy/sweep live and prioritizing foreground signals', () => {
+    const bgWithDetail = deriveSessionLiveStatus({
+      sessionState: 'running',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: true,
+      pendingUserSend: false,
+      statusText: 'Running background task',
+      transportActivityDetail: 'background_monitor',
+    });
+    expect(bgWithDetail.mode).toBe('waiting');
+    expect(bgWithDetail.visualMode).toBe('waiting');
+    expect(bgWithDetail.busy).toBe(true);
+    expect(bgWithDetail.sweep).toBe(true);
+
+    const bgWithoutDetail = deriveSessionLiveStatus({
+      sessionState: 'running',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: false,
+      pendingUserSend: false,
+      statusText: 'Running background task',
+    });
+    expect(bgWithoutDetail.mode).toBe('waiting');
+    expect(bgWithoutDetail.visualMode).toBe('waiting');
+    expect(bgWithoutDetail.busy).toBe(true);
+
+    // Foreground pending send, active thinking/tool, or foreground dispatch reason take precedence.
+    expect(deriveSessionLiveStatus({
+      sessionState: 'running',
+      pendingUserSend: true,
+      statusText: 'Running background task',
+      transportActivityDetail: 'background_monitor',
+    }).visualMode).toBe('running');
+    expect(deriveSessionLiveStatus({
+      sessionState: 'running',
+      activeThinking: true,
+      statusText: 'Running background task',
+      transportActivityDetail: 'background_monitor',
+    }).visualMode).toBe('thinking');
+    expect(deriveSessionLiveStatus({
+      sessionState: 'running',
+      statusText: 'Running background task',
+      transportActivityDetail: 'runtime_dispatch',
+    }).visualMode).toBe('running');
+    expect(deriveSessionLiveStatus({
+      sessionState: 'stopping',
+      statusText: 'Running background task',
+      transportActivityDetail: 'background_monitor',
+    }).visualMode).toBe('stopping');
+    expect(deriveSessionLiveStatus({
+      sessionState: 'error',
+      statusText: 'Running background task',
+      transportActivityDetail: 'background_monitor',
+    }).visualMode).toBe('error');
+  });
 });
