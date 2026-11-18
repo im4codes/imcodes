@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
-  existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { isDirectInvocation, resolveNpmCliJs } from '../../src/util/node-datachannel-repair.mjs';
 import { buildBashNodeDatachannelRepair } from '../../src/util/node-datachannel-repair-script.js';
@@ -179,10 +179,186 @@ describe('node-datachannel optional dependency decoupling', () => {
     );
   });
 
-  it('triggers bounded best-effort repair in scripts/ci-npm-ci.sh when node-datachannel is absent', () => {
-    const ciScript = readFileSync(join(process.cwd(), 'scripts', 'ci-npm-ci.sh'), 'utf8');
-    expect(ciScript).toContain('node_modules/node-datachannel/package.json');
-    expect(ciScript).toContain('node src/util/node-datachannel-repair.mjs');
-    expect(ciScript).toContain('repair_attempt" -le 2');
+  function resolveBashBin(): string | null {
+    if (process.platform !== 'win32') return 'bash';
+    for (const candidate of [
+      'C:\\Program Files\\Git\\bin\\bash.exe',
+      'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+    ]) {
+      if (existsSync(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  function setupIsolatedCiProject(options: {
+    declareOptionalDep: boolean;
+    ciInstallsDep: boolean;
+    failInstallAttempts: number;
+  }) {
+    const parentDir = mkdtempSync(join(tmpdir(), 'imcodes-ci-ndc-parent-'));
+    cleanup.push(parentDir);
+
+    // Put a decoy package.json in parentDir to prove ci-npm-ci.sh passes the
+    // project working directory explicitly rather than falling back to
+    // DEFAULT_PACKAGE_ROOT (which resolves to parentDir when run from src/util).
+    writeFileSync(join(parentDir, 'package.json'), JSON.stringify({
+      name: 'decoy-parent',
+      private: true,
+      optionalDependencies: { 'node-datachannel': '^0.0.0-decoy' },
+    }));
+
+    const projectDir = join(parentDir, 'project with spaces');
+    const binDir = join(parentDir, 'bin');
+    const npmLogPath = join(parentDir, 'npm-calls.jsonl');
+    const attemptCountPath = join(parentDir, 'install-attempts.txt');
+    const fakeNpmJs = join(parentDir, 'fake-npm.cjs');
+    const fakeNodeWrapper = join(binDir, 'node');
+    const fakeNpmWrapper = join(binDir, 'npm');
+
+    mkdirSync(join(projectDir, 'scripts'), { recursive: true });
+    mkdirSync(join(projectDir, 'src', 'util'), { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+
+    writeFileSync(
+      join(projectDir, 'scripts', 'ci-npm-ci.sh'),
+      readFileSync(join(process.cwd(), 'scripts', 'ci-npm-ci.sh'), 'utf8'),
+    );
+    chmodSync(join(projectDir, 'scripts', 'ci-npm-ci.sh'), 0o755);
+    writeFileSync(
+      join(projectDir, 'src', 'util', 'node-datachannel-repair.mjs'),
+      readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8'),
+    );
+    writeFileSync(join(projectDir, 'package.json'), JSON.stringify({
+      name: 'isolated-ci-project',
+      private: true,
+      ...(options.declareOptionalDep
+        ? { optionalDependencies: { 'node-datachannel': '^0.32.3' } }
+        : {}),
+    }));
+
+    writeFileSync(fakeNpmJs, [
+      "const { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs');",
+      "const { join } = require('node:path');",
+      "const args = process.argv.slice(2);",
+      "const subcmd = args[0] || '';",
+      "const logFile = process.env.TEST_NPM_LOG;",
+      "appendFileSync(logFile, JSON.stringify({ subcmd, args, cwd: process.cwd() }) + '\\n');",
+      "function writeWorkingDep(root) {",
+      "  const depDir = join(root, 'node_modules', 'node-datachannel');",
+      "  mkdirSync(depDir, { recursive: true });",
+      "  writeFileSync(join(depDir, 'package.json'), JSON.stringify({ name: 'node-datachannel', version: '0.32.3', type: 'module', main: './index.js' }));",
+      "  writeFileSync(join(depDir, 'index.js'), 'export default { ok: true };\\n');",
+      "}",
+      "if (subcmd === 'ci') {",
+      `  if (${JSON.stringify(options.ciInstallsDep)}) writeWorkingDep(process.cwd());`,
+      "  process.exit(0);",
+      "}",
+      "if (subcmd === 'install') {",
+      "  const countFile = process.env.TEST_ATTEMPT_COUNT;",
+      "  const prev = existsSync(countFile) ? Number(readFileSync(countFile, 'utf8')) : 0;",
+      "  const cur = prev + 1;",
+      "  writeFileSync(countFile, String(cur));",
+      `  if (cur <= ${JSON.stringify(options.failInstallAttempts)}) process.exit(1);`,
+      "  const prefixIdx = args.indexOf('--prefix');",
+      "  const targetRoot = prefixIdx >= 0 ? args[prefixIdx + 1] : process.cwd();",
+      "  writeWorkingDep(targetRoot);",
+      "  process.exit(0);",
+      "}",
+      "process.exit(0);",
+    ].join('\n'));
+
+    writeFileSync(fakeNpmWrapper, `#!/usr/bin/env sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeNpmJs)} "$@"\n`);
+    chmodSync(fakeNpmWrapper, 0o755);
+
+    const nodeBinDir = dirname(process.execPath);
+    // Ensure `node` inside bash resolves to process.execPath even in minimal environments.
+    if (!existsSync(fakeNodeWrapper)) {
+      writeFileSync(fakeNodeWrapper, `#!/usr/bin/env sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+      chmodSync(fakeNodeWrapper, 0o755);
+    }
+
+    const bashBin = resolveBashBin()!;
+    const result = spawnSync(bashBin, [join(projectDir, 'scripts', 'ci-npm-ci.sh'), projectDir], {
+      cwd: parentDir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}${delimiter}${nodeBinDir}${delimiter}${process.env.PATH ?? ''}`,
+        CI_NPM_CI_MAX_ATTEMPTS: '1',
+        IMCODES_NPM_CLI: fakeNpmJs,
+        TEST_NPM_LOG: npmLogPath,
+        TEST_ATTEMPT_COUNT: attemptCountPath,
+      },
+    });
+
+    const calls = existsSync(npmLogPath)
+      ? readFileSync(npmLogPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { subcmd: string; args: string[]; cwd: string })
+      : [];
+
+    return { parentDir, projectDir, result, calls };
+  }
+
+  const bashBin = resolveBashBin();
+
+  it.skipIf(!bashBin)('repairs missing node-datachannel on attempt 1 targeting explicit project dir and stops retrying', () => {
+    const { parentDir, projectDir, result, calls } = setupIsolatedCiProject({
+      declareOptionalDep: true,
+      ciInstallsDep: false,
+      failInstallAttempts: 0,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('WARNING: optional dependency node-datachannel is missing after npm ci');
+    expect(result.stdout).toContain('node-datachannel repair succeeded on attempt 1');
+    expect(calls.map((c) => c.subcmd)).toEqual(['ci', 'install']);
+    const installCall = calls[1];
+    expect(installCall.args).toContain('node-datachannel@^0.32.3');
+    expect(installCall.args[installCall.args.indexOf('--prefix') + 1]).toBe(resolve(projectDir));
+    expect(existsSync(join(projectDir, 'node_modules', 'node-datachannel', 'package.json'))).toBe(true);
+    expect(existsSync(join(parentDir, 'node_modules'))).toBe(false);
+  });
+
+  it.skipIf(!bashBin)('retries once on first repair failure and succeeds on attempt 2', () => {
+    const { projectDir, result, calls } = setupIsolatedCiProject({
+      declareOptionalDep: true,
+      ciInstallsDep: false,
+      failInstallAttempts: 1,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('node-datachannel repair succeeded on attempt 2');
+    expect(calls.map((c) => c.subcmd)).toEqual(['ci', 'install', 'install']);
+    expect(existsSync(join(projectDir, 'node_modules', 'node-datachannel', 'package.json'))).toBe(true);
+  });
+
+  it.skipIf(!bashBin)('bounds failed repair to 2 attempts and exits 0 best-effort', () => {
+    const { projectDir, result, calls } = setupIsolatedCiProject({
+      declareOptionalDep: true,
+      ciInstallsDep: false,
+      failInstallAttempts: 5,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain('node-datachannel repair succeeded');
+    expect(calls.map((c) => c.subcmd)).toEqual(['ci', 'install', 'install']);
+    expect(existsSync(join(projectDir, 'node_modules', 'node-datachannel', 'package.json'))).toBe(false);
+  });
+
+  it.skipIf(!bashBin)('skips repair when node-datachannel is already installed or not declared', () => {
+    const installed = setupIsolatedCiProject({
+      declareOptionalDep: true,
+      ciInstallsDep: true,
+      failInstallAttempts: 0,
+    });
+    expect(installed.result.status).toBe(0);
+    expect(installed.calls.map((c) => c.subcmd)).toEqual(['ci']);
+
+    const undeclared = setupIsolatedCiProject({
+      declareOptionalDep: false,
+      ciInstallsDep: false,
+      failInstallAttempts: 0,
+    });
+    expect(undeclared.result.status).toBe(0);
+    expect(undeclared.calls.map((c) => c.subcmd)).toEqual(['ci']);
   });
 });
