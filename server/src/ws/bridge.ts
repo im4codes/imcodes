@@ -1247,7 +1247,7 @@ export class TimelineOutboundQueue {
       // Synchronous completions are drained iteratively (never recursively)
       // and only up to a bounded batch/time budget per turn, then the pump
       // yields so one congested socket cannot starve the event loop.
-      if (sent >= TIMELINE_QUEUE_PUMP_BATCH || performance.now() > deadline) {
+      if (sent > 0 && (sent >= TIMELINE_QUEUE_PUMP_BATCH || performance.now() > deadline)) {
         this.schedulePump(ws, onGap);
         return;
       }

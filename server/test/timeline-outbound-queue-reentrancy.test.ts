@@ -261,4 +261,76 @@ describe('TimelineOutboundQueue backlog coalescing, trim, and gap semantics', ()
     expect(queue.isIdle()).toBe(true);
     queue.dispose();
   });
+
+  it('guarantees at least one frame per pump even after a >4ms pause before sent===0 while still yielding synchronous batches after sent>0', async () => {
+    const queue = new TimelineOutboundQueue();
+    const sentTags: string[] = [];
+    const pendingCallbacks: Array<(error?: Error) => void> = [];
+    const asyncWs = {
+      readyState: 1,
+      bufferedAmount: 0,
+      send(data: string, _opts: unknown, callback?: (error?: Error) => void) {
+        sentTags.push(JSON.parse(data).tag);
+        if (callback) pendingCallbacks.push(callback);
+      },
+    };
+    const make = (tag: string, seq: number) => ({
+      data: JSON.stringify({ tag }),
+      sessionId: 's',
+      epoch: 1,
+      seq,
+      priority: 'coalescible' as const,
+    });
+
+    queue.enqueue(asyncWs as never, make('f1', 1), () => {});
+    queue.enqueue(asyncWs as never, make('f2', 2), () => {});
+    queue.enqueue(asyncWs as never, make('f3', 3), () => {});
+    expect(sentTags).toEqual(['f1']);
+    expect(pendingCallbacks).toHaveLength(1);
+
+    let nowCalls = 0;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+      nowCalls += 1;
+      return nowCalls * 10;
+    });
+    try {
+      // Simulates >4ms GC/scheduler pause between deadline setup and the first loop check:
+      // pump() must still dispatch f2 instead of yielding with sent===0 and stranding pendingCallbacks.
+      pendingCallbacks.shift()!();
+      expect(sentTags).toEqual(['f1', 'f2']);
+      expect(pendingCallbacks).toHaveLength(1);
+
+      while (pendingCallbacks.length > 0) pendingCallbacks.shift()!();
+      expect(sentTags).toEqual(['f1', 'f2', 'f3']);
+      expect(queue.isIdle()).toBe(true);
+
+      // Boundary check: synchronous send completion still yields when sent > 0 && performance.now() > deadline.
+      const syncSent: string[] = [];
+      const syncQueue = new TimelineOutboundQueue();
+      const syncWs = {
+        readyState: 1,
+        bufferedAmount: 0,
+        send(data: string, _opts: unknown, callback?: (error?: Error) => void) {
+          const tag = JSON.parse(data).tag as string;
+          syncSent.push(tag);
+          if (tag === 's1') {
+            syncQueue.enqueue(syncWs as never, make('s2', 11), () => {});
+            syncQueue.enqueue(syncWs as never, make('s3', 12), () => {});
+          }
+          callback?.();
+        },
+      };
+
+      syncQueue.enqueue(syncWs as never, make('s1', 10), () => {});
+      expect(syncSent).toEqual(['s1']);
+      expect(syncQueue.isIdle()).toBe(false);
+
+      await vi.waitFor(() => expect(syncQueue.isIdle()).toBe(true), { timeout: 5_000, interval: 1 });
+      expect(syncSent).toEqual(['s1', 's2', 's3']);
+      syncQueue.dispose();
+    } finally {
+      nowSpy.mockRestore();
+      queue.dispose();
+    }
+  });
 });
