@@ -131,6 +131,7 @@ import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import type { ProviderActiveWorkSnapshot, ToolTerminalReason, ToolTerminalStatus } from '../../../shared/session-activity-types.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
+import { readPersistedAgySystemPrompt, resolveAgyResumeSystemPromptMeta } from '../agy-persisted-system-prompt.js';
 import {
   canonicalizeTransportCwd,
   normalizeTransportCwd,
@@ -1271,6 +1272,11 @@ export class KimiSdkProvider implements TransportProvider {
       state.currentText = ''; state.currentMessageId = null;
       this.steeringRunTerminals.get(state)?.complete();
     }
+  }
+
+  private resolveEffectiveHomeDir(state: KimiSdkSessionState): string {
+    const env = { ...process.env, ...(this.config?.env as Record<string, string> | undefined), ...state.env };
+    return env.HOME || env.USERPROFILE || homedir();
   }
 
   private async startAgyBridge(sessionId: string, state: KimiSdkSessionState, childId?: string): Promise<void> {
@@ -2786,16 +2792,20 @@ export class KimiSdkProvider implements TransportProvider {
             try {
               const useMeta = this.supportsSystemPromptMetaForState(state);
               const trimmedSystemText = sessionSystemOptions?.sessionSystemText?.trim() || undefined;
-              const shouldClearMeta = useMeta && !trimmedSystemText && Boolean(state.sessionSystemTextMetaDelivered);
-              const metaToSend = useMeta
-                ? (trimmedSystemText ?? (shouldClearMeta ? '' : undefined))
+              const plan = useMeta
+                ? resolveAgyResumeSystemPromptMeta({
+                    persistedPrompt: this.id === AGY_SDK_PROVIDER_ID && state.acpSessionId && !state.incognito
+                      ? readPersistedAgySystemPrompt(this.resolveEffectiveHomeDir(state), state.acpSessionId)
+                      : null,
+                    trimmedSystemText,
+                    hasDeliveredMeta: Boolean(state.sessionSystemTextMetaDelivered),
+                  })
                 : undefined;
+              const metaToSend = plan?.metaToSend;
               await this.resumeOrLoadAcpSession(sessionId, state, connection, metaToSend);
-              if (useMeta) {
-                state.sessionSystemTextInjected = trimmedSystemText
-                  ? sessionSystemContractKey(trimmedSystemText)
-                  : undefined;
-                state.sessionSystemTextMetaDelivered = Boolean(trimmedSystemText);
+              if (plan) {
+                state.sessionSystemTextInjected = plan.nextInjectedKey;
+                state.sessionSystemTextMetaDelivered = plan.nextMetaDelivered;
               }
             } catch (err) {
               if (isWorkerSpawnMissingExecutableError(err)) throw err;
@@ -2831,9 +2841,18 @@ export class KimiSdkProvider implements TransportProvider {
           const needsSetOrRefresh = targetKey !== undefined && state.sessionSystemTextInjected !== targetKey;
           const needsClear = targetKey === undefined && Boolean(state.sessionSystemTextMetaDelivered);
           if (needsSetOrRefresh || needsClear) {
-            await this.resumeOrLoadAcpSession(sessionId, state, connection, trimmedSystemText ?? '');
-            state.sessionSystemTextInjected = targetKey;
-            state.sessionSystemTextMetaDelivered = Boolean(trimmedSystemText);
+            const plan = resolveAgyResumeSystemPromptMeta({
+              persistedPrompt: this.id === AGY_SDK_PROVIDER_ID && state.acpSessionId && !state.incognito
+                ? readPersistedAgySystemPrompt(this.resolveEffectiveHomeDir(state), state.acpSessionId)
+                : null,
+              trimmedSystemText,
+              hasDeliveredMeta: Boolean(state.sessionSystemTextMetaDelivered),
+            });
+            if (plan.shouldSendMeta) {
+              await this.resumeOrLoadAcpSession(sessionId, state, connection, plan.metaToSend);
+            }
+            state.sessionSystemTextInjected = plan.nextInjectedKey;
+            state.sessionSystemTextMetaDelivered = plan.nextMetaDelivered;
           }
         }
 

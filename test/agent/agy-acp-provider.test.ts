@@ -4,6 +4,9 @@ import { ACP_ERROR_PHASE } from '../../shared/provider-error-codes.js';
 import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
+import { readPersistedAgySystemPrompt } from '../../src/agent/agy-persisted-system-prompt.js';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile, rename } from 'node:fs/promises';
@@ -3532,6 +3535,225 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       }
     } finally {
       await rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  function encodeProtobufVarint(n: number): Buffer {
+    const out: number[] = [];
+    let val = n;
+    while (val >= 0x80) {
+      out.push((val & 0x7f) | 0x80);
+      val = Math.floor(val / 128);
+    }
+    out.push(val);
+    return Buffer.from(out);
+  }
+
+  async function writeAgyMetadataBlobDb(
+    homeDir: string,
+    acpSessionId: string,
+    blobData: Buffer,
+  ): Promise<string> {
+    const dir = path.join(homeDir, '.gemini', 'antigravity-cli', 'conversations');
+    await mkdir(dir, { recursive: true });
+    const dbPath = path.join(dir, `${acpSessionId}.db`);
+    suppressSqliteExperimentalWarning();
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec('CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)');
+      db.prepare('INSERT OR REPLACE INTO trajectory_metadata_blob (id, data) VALUES (?, ?)').run('main', blobData);
+    } finally {
+      db.close();
+    }
+    return dbPath;
+  }
+
+  function buildPersistedSystemPromptBlob(promptText: string): Buffer {
+    const payload = Buffer.from(promptText, 'utf8');
+    const marker = Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1');
+    const prefix = Buffer.from('08011a086d65746164617461', 'hex');
+    const suffix = Buffer.from('1001', 'hex');
+    return Buffer.concat([prefix, marker, encodeProtobufVarint(payload.length), payload, suffix]);
+  }
+
+  it('omits session/resume _meta when SQLite trajectory_metadata_blob already persisted acp_system_prompt (Scenario A)', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    const debugSpy = vi.spyOn(logger, 'debug');
+    const warnSpy = vi.spyOn(logger, 'warn');
+    const errorSpy = vi.spyOn(logger, 'error');
+    try {
+      const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+      const identity = '<imcodes-agent-identity>\nSECRET_SLOT_A_IDENTITY_101\n</imcodes-agent-identity>';
+      const persistedPrompt = `${'OUTER_SYSTEM_CONTRACT_V1 '.repeat(2400)}\n${identity}`;
+      await writeAgyMetadataBlobDb(root, 'persisted-slot-a', buildPersistedSystemPromptBlob(persistedPrompt));
+
+      const id = await route(provider, 'deck_test_slot_a_resume', { resumeId: 'persisted-slot-a' });
+      const complete = vi.fn();
+      provider.onComplete(complete);
+
+      // Cold session/resume after hibernation or daemon upgrade (outer contract tweaked, identity unchanged)
+      const upgradedOuterPrompt = `${'OUTER_SYSTEM_CONTRACT_V2 '.repeat(2400)}\n${identity}`;
+      const p1 = normalizeProviderPayload('wake from hibernation');
+      p1.sessionSystemText = upgradedOuterPrompt;
+      p1.context = { ...p1.context, sessionSystemText: upgradedOuterPrompt };
+      await provider.send(id, p1);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+      // Live syncMetaOnLoaded after refreshSessionSystemText while identity is still unchanged
+      provider.refreshSessionSystemText(id);
+      const p2 = normalizeProviderPayload('turn after refresh');
+      p2.sessionSystemText = upgradedOuterPrompt;
+      p2.context = { ...p2.context, sessionSystemText: upgradedOuterPrompt };
+      await provider.send(id, p2);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+      const reqs = await requests();
+      const resumes = reqs.filter((x) => x.method === 'session/resume');
+      expect(resumes).toHaveLength(1);
+      expect(resumes[0]?.params?.sessionId).toBe('persisted-slot-a');
+      expect(resumes[0]?.params?._meta).toBeUndefined();
+
+      const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+      expect(prompts).toEqual(['wake from hibernation', 'turn after refresh']);
+      for (const promptText of prompts) {
+        expect(promptText).not.toContain('OUTER_SYSTEM_CONTRACT');
+        expect(promptText).not.toContain('SECRET_SLOT_A_IDENTITY_101');
+      }
+
+      for (const spy of [infoSpy, debugSpy, warnSpy, errorSpy]) {
+        for (const call of spy.mock.calls) {
+          expect(JSON.stringify(call)).not.toContain('SECRET_SLOT_A_IDENTITY_101');
+        }
+      }
+    } finally {
+      infoSpy.mockRestore();
+      debugSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('sends only updated <imcodes-agent-identity> block via _meta when Slot A already persisted outer prompt (Scenario B)', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const outerContract = 'OUTER_CONTRACT_55KB_PADDING '.repeat(2200);
+    const idV1 = '<imcodes-agent-identity>\nIDENTITY_V1\n</imcodes-agent-identity>';
+    const idV2 = '<imcodes-agent-identity>\nIDENTITY_V2_UPDATED\n</imcodes-agent-identity>';
+    await writeAgyMetadataBlobDb(root, 'persisted-slot-b', buildPersistedSystemPromptBlob(`${outerContract}\n${idV1}`));
+
+    const id = await route(provider, 'deck_test_slot_b_identity_delta', { resumeId: 'persisted-slot-b' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const makePayload = (msg: string, sys: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      return p;
+    };
+
+    // Cold resume with updated <imcodes-agent-identity>: only sends the delta identity block
+    await provider.send(id, makePayload('turn-1-delta', `${outerContract}\n${idV2}`));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    // Mid-session identity cleared while outer contract remains: sends empty identity override only
+    await provider.send(id, makePayload('turn-2-clear-identity', outerContract));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const reqs = await requests();
+    const resumes = reqs.filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(2);
+    expect(resumes[0]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: idV2 } },
+    });
+    expect(resumes[1]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: '<imcodes-agent-identity>\n</imcodes-agent-identity>' } },
+    });
+    for (const resumeReq of resumes) {
+      expect(resumeReq?.params?._meta?.antigravity?.systemPrompt?.append).not.toContain('OUTER_CONTRACT_55KB_PADDING');
+    }
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['turn-1-delta', 'turn-2-clear-identity']);
+  });
+
+  it('delivers full _meta on session/resume when SQLite trajectory_metadata_blob lacks acp_system_prompt (Scenario C)', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    // Legacy ~812-byte metadata blob without acp_system_prompt field
+    await writeAgyMetadataBlobDb(root, 'legacy-no-slot-a', Buffer.alloc(812, 0x20));
+
+    const id = await route(provider, 'deck_test_legacy_db_resume', { resumeId: 'legacy-no-slot-a' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const fullSystemText = `${'LEGACY_FULL_SYSTEM_CONTRACT '.repeat(200)}\n<imcodes-agent-identity>LEGACY_V1</imcodes-agent-identity>`;
+    const p = normalizeProviderPayload('legacy resume turn');
+    p.sessionSystemText = fullSystemText;
+    p.context = { ...p.context, sessionSystemText: fullSystemText };
+    await provider.send(id, p);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const reqs = await requests();
+    const resumeReq = reqs.find((x) => x.method === 'session/resume');
+    expect(resumeReq?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: fullSystemText } },
+    });
+    const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts).toEqual(['legacy resume turn']);
+  });
+
+  it('safely returns null from readPersistedAgySystemPrompt on traversal, missing/empty/corrupt DB, and busy lock', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-agy-blob-bounds-'));
+    try {
+      expect(readPersistedAgySystemPrompt('', 'valid-id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '.')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '..')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, '../escape')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'nested/id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'win\\id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'null\0id')).toBeNull();
+      expect(readPersistedAgySystemPrompt(root, 'does-not-exist')).toBeNull();
+
+      // Valid round-trip (>128 bytes multi-byte varint + UTF-8)
+      const roundTripText = '中文边界测试 '.repeat(40);
+      await writeAgyMetadataBlobDb(root, 'valid-utf8', buildPersistedSystemPromptBlob(roundTripText));
+      expect(readPersistedAgySystemPrompt(root, 'valid-utf8')).toBe(roundTripText);
+
+      // Empty table (no 'main' row)
+      const dir = path.join(root, '.gemini', 'antigravity-cli', 'conversations');
+      suppressSqliteExperimentalWarning();
+      const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+      const emptyDb = new DatabaseSync(path.join(dir, 'empty-row.db'));
+      emptyDb.exec('CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)');
+      emptyDb.close();
+      expect(readPersistedAgySystemPrompt(root, 'empty-row')).toBeNull();
+
+      // Truncated varint / length exceeding buffer
+      const marker = Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1');
+      await writeAgyMetadataBlobDb(root, 'truncated-varint', Buffer.concat([marker, Buffer.from([0x80])]));
+      expect(readPersistedAgySystemPrompt(root, 'truncated-varint')).toBeNull();
+
+      await writeAgyMetadataBlobDb(root, 'truncated-payload', Buffer.concat([marker, encodeProtobufVarint(50), Buffer.from('short')]));
+      expect(readPersistedAgySystemPrompt(root, 'truncated-payload')).toBeNull();
+
+      // Invalid UTF-8 bytes inside payload
+      await writeAgyMetadataBlobDb(root, 'bad-utf8', Buffer.concat([marker, encodeProtobufVarint(2), Buffer.from([0xff, 0xfe])]));
+      expect(readPersistedAgySystemPrompt(root, 'bad-utf8')).toBeNull();
+
+      // Busy lock (EXCLUSIVE transaction held while busy_timeout=0)
+      const lockDbPath = path.join(dir, 'valid-utf8.db');
+      const lockingDb = new DatabaseSync(lockDbPath);
+      try {
+        lockingDb.exec('BEGIN EXCLUSIVE');
+        expect(readPersistedAgySystemPrompt(root, 'valid-utf8')).toBeNull();
+        lockingDb.exec('ROLLBACK');
+      } finally {
+        lockingDb.close();
+      }
+      // After lock release, reading succeeds again (no leaked handle / corruption)
+      expect(readPersistedAgySystemPrompt(root, 'valid-utf8')).toBe(roundTripText);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });
