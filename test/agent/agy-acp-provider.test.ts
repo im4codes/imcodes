@@ -4135,4 +4135,64 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    { name: 'f1 missing + wrong f7 before opaque [f7(wrong), f4, f10]', order: 'f7wrong-f4-f10' as const, keepGit: false },
+    { name: 'f1 missing + wrong f7 after opaque [f4, f10, f7(wrong)]', order: 'f4-f10-f7wrong' as const, keepGit: false },
+    { name: 'f1 missing + matching f7 [f4, f10, f7(match)]', order: 'f4-f10-f7match' as const, keepGit: false },
+    { name: 'both f1 and f7 missing [f4, f10]', order: 'f4-f10' as const, keepGit: false },
+    { name: 'f1 present with git + f7 missing [f4, f1(git), f10]', order: 'f4-f1git-f10' as const, keepGit: true },
+  ])('preserves opaque fields and Slot A across missing/reordered workspace fields ($name)', async ({ order, keepGit }) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-agy-ws-matrix-'));
+    try {
+      const projDir = path.join(root, 'proj');
+      await mkdir(projDir, { recursive: true });
+      const targetUri = pathToFileURL(realpathSync(projDir)).href.replace(/\/+$/, '');
+      const persistedPrompt = `${'MATRIX_SLOT_A_55KB_CONTRACT '.repeat(2050)}\n<imcodes-agent-identity>MATRIX_ID</imcodes-agent-identity>`;
+
+      const f4 = encodeLenDelimitedField(4, Buffer.from('opaque-f4-payload', 'utf8'));
+      const f10Payload = Buffer.concat([
+        Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1'),
+        encodeProtobufVarint(Buffer.byteLength(persistedPrompt, 'utf8')),
+        Buffer.from(persistedPrompt, 'utf8'),
+      ]);
+      const f10 = encodeLenDelimitedField(10, f10Payload);
+      const f7Wrong = encodeLenDelimitedField(7, Buffer.from('file:///wrong/old', 'utf8'));
+      const f7Match = encodeLenDelimitedField(7, Buffer.from(targetUri, 'utf8'));
+      const f1Git = buildWorkspaceInfoSlice(targetUri, { repo: 'im4codes/imcodes', branch: 'dev' });
+
+      const chunksByOrder: Record<typeof order, Buffer[]> = {
+        'f7wrong-f4-f10': [f7Wrong, f4, f10],
+        'f4-f10-f7wrong': [f4, f10, f7Wrong],
+        'f4-f10-f7match': [f4, f10, f7Match],
+        'f4-f10': [f4, f10],
+        'f4-f1git-f10': [f4, f1Git, f10],
+      };
+
+      const sessionId = `matrix-${order}`;
+      const dbPath = await writeAgyMetadataBlobDb(root, sessionId, Buffer.concat(chunksByOrder[order]));
+
+      expect(reconcilePersistedAgyWorkspace(root, sessionId, projDir)).toBe(true);
+      const afterFirst = readBlobRow(dbPath);
+      const parsed = readTopLevelWorkspaceEntries(afterFirst);
+
+      expect(parsed.f1Uris).toEqual([targetUri]);
+      expect(parsed.f7Uris).toEqual([targetUri]);
+      if (keepGit) {
+        expect(parsed.f1Slices[0]?.equals(f1Git)).toBe(true);
+      }
+
+      const f4Offset = afterFirst.indexOf(f4);
+      const f10Offset = afterFirst.indexOf(f10);
+      expect(f4Offset).toBeGreaterThanOrEqual(0);
+      expect(f10Offset).toBeGreaterThan(f4Offset);
+      expect(readPersistedAgySystemPrompt(root, sessionId)).toBe(persistedPrompt);
+
+      // Strictly idempotent on second run (zero write, identical bytes)
+      expect(reconcilePersistedAgyWorkspace(root, sessionId, projDir)).toBe(false);
+      expect(readBlobRow(dbPath).equals(afterFirst)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

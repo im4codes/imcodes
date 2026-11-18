@@ -193,6 +193,8 @@ export function sanitizeAgyTrajectoryWorkspaceBlob(buf: Uint8Array, targetUri: s
     }
   }
 
+  const prefixParts: Buffer[] = [];
+  const suffixParts: Buffer[] = [];
   const uriBytes = Buffer.from(normalizedTargetUri, 'utf8');
   if (!keptField1) {
     const minimalWorkspaceInfo = encodeLenDelimited(
@@ -200,15 +202,15 @@ export function sanitizeAgyTrajectoryWorkspaceBlob(buf: Uint8Array, targetUri: s
       Buffer.concat([encodeLenDelimited(1, uriBytes), encodeLenDelimited(3, Buffer.alloc(0))]),
     );
     if (f1SlotIdx !== -1) parts[f1SlotIdx] = minimalWorkspaceInfo;
-    else parts.unshift(minimalWorkspaceInfo);
+    else prefixParts.push(minimalWorkspaceInfo);
   }
   if (!keptField7) {
     const workspaceUriEntry = encodeLenDelimited(7, uriBytes);
     if (f7SlotIdx !== -1) parts[f7SlotIdx] = workspaceUriEntry;
-    else parts.push(workspaceUriEntry);
+    else suffixParts.push(workspaceUriEntry);
   }
 
-  return Buffer.concat(parts);
+  return Buffer.concat([...prefixParts, ...parts, ...suffixParts]);
 }
 
 /**
