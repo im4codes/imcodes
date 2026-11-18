@@ -141,4 +141,73 @@ describe('AG native child lifecycle adapter', () => {
     expect(sendKnown[0].detail?.meta).toMatchObject({ agentPath: 'real-child', active: true });
   });
 
+  it('tracks activeCount including waiting/waiting_for_dependents, reconciles missing nativeChildren on manage_subagents(list), and never completes on errors', () => {
+    const tracker = new AgySubagentTracker('parent');
+    expect(tracker.activeCount()).toBe(0);
+
+    // Waiting/waiting_for_dependents map to RUNNING and contribute to activeCount().
+    tracker.snapshot({
+      subagents: [
+        { conversationId: 'child-wait', status: 'waiting_for_dependents', role: 'Waiter' },
+        { conversationId: 'child-wait2', status: 'waiting', role: 'Waiter2' },
+        { conversationId: 'child-done', status: 'completed', role: 'Done' },
+      ],
+    });
+    expect(tracker.activeCount()).toBe(2);
+
+    // Unbound placeholder launch must NOT be prematurely completed by manage_subagents(list).
+    tracker.tool({ id: 'unbound-launch', name: 'invoke_subagent', status: 'running', input: { Role: 'Unbound' } });
+    expect(tracker.activeCount()).toBe(3);
+
+    // Authoritative error / unparseable non-list output must never complete running subagents.
+    expect(tracker.tool({
+      id: 'list-err',
+      name: 'manage_subagents',
+      status: 'error',
+      input: { Action: 'list' },
+      output: '[]',
+    })).toEqual([]);
+    expect(tracker.tool({
+      id: 'list-prose-err',
+      name: 'manage_subagents',
+      status: 'complete',
+      input: { Action: 'list' },
+      output: 'Error: control plane unavailable',
+    })).toEqual([]);
+    expect(tracker.activeCount()).toBe(3);
+
+    // Prose-wrapped single-element array keeps child-wait running and reconciles absent native child-wait2 to COMPLETE.
+    const partialList = tracker.tool({
+      id: 'list-partial',
+      name: 'manage_subagents',
+      status: 'complete',
+      input: { Action: 'list' },
+      output: 'Created At: native\nYou have 1 active subagent(s):\n' + JSON.stringify([{ conversationId: 'child-wait', status: 'running' }]),
+    });
+    expect(partialList.find((e) => e.detail?.meta?.agentPath === 'child-wait2')?.detail?.meta).toMatchObject({
+      active: false,
+      terminal: true,
+      normalizedStatus: S.COMPLETE,
+    });
+    expect(partialList.find((e) => e.detail?.meta?.agentPath === 'child-wait')?.detail?.meta?.active).toBe(true);
+    expect(tracker.activeCount()).toBe(2); // child-wait + unbound-launch
+
+    // Empty explicit list reconciles remaining native child-wait to COMPLETE while leaving unbound-launch intact.
+    const emptyList = tracker.tool({
+      id: 'list-empty',
+      name: 'manage_subagents',
+      status: 'complete',
+      input: { Action: 'list' },
+      output: JSON.stringify({ subagents: [] }),
+    });
+    expect(emptyList).toHaveLength(1);
+    expect(emptyList[0].detail?.meta).toMatchObject({
+      agentPath: 'child-wait',
+      active: false,
+      terminal: true,
+      normalizedStatus: S.COMPLETE,
+    });
+    expect(tracker.activeCount()).toBe(1);
+  });
+
 });

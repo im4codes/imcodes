@@ -21,6 +21,7 @@ import {
   SDK_SUBAGENT_STATUS,
 } from '../../shared/sdk-subagent-status.js';
 import { AgyHistoryReader } from '../../src/agent/agy-native-history.js';
+import { AgySubagentTracker } from '../../src/agent/agy-subagents.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderError, ProviderUsageUpdate, SessionInfoUpdate } from '../../src/agent/transport-provider.js';
@@ -1324,5 +1325,80 @@ describe('AgySdkProvider (fake agy process)', () => {
     });
     expect(state.toolSteps.size).toBe(0);
     expect(state.subagents.interrupt()).toEqual([]);
+  });
+
+  it('reports background_monitor only for active native subagents and clears it on completion', async () => {
+    const sid = await provider.createSession({ sessionKey: 'active-work-snapshot', cwd: dir });
+    const state = (provider as any).sessions.get(sid);
+    state.subagents = new AgySubagentTracker('agy-conversation');
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-active', status: 'running' }] });
+
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 1,
+      backgroundWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-active', status: 'completed' }] });
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('retries beforeNativeSessionStart once when AG start owner changed occurs', async () => {
+    let attempts = 0;
+    const sid = await provider.createSession({
+      sessionKey: 'retry-owner-changed',
+      cwd: dir,
+      beforeNativeSessionStart: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('AG start owner changed');
+      },
+    });
+    await provider.send(sid, 'hello');
+    await waitFor(() => completes.length === 1);
+    expect(attempts).toBe(2);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('interrupts active subagents, clears open tool steps, and clears status on child exit or cancel', async () => {
+    const sid = await provider.createSession({ sessionKey: 'child-exit-cleanup', cwd: dir });
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus((s, st) => { if (s === sid) statuses.push({ status: st.status, label: st.label }); });
+
+    await provider.send(sid, 'warm');
+    await waitFor(() => completes.length === 1);
+
+    const state = (provider as any).sessions.get(sid);
+    state.subagents = new AgySubagentTracker(state.conversationId ?? sid);
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-live', status: 'running' }] });
+    state.toolSteps.set('step:99', { id: 'tool-99', name: 'Bash' });
+    state.inflightTurns = 1;
+    (provider as any).emitStatus(sid, state, { status: 'tool_running', label: 'Running Bash...' });
+
+    const beforeTools = tools.length;
+    state.child.kill('SIGKILL');
+    await waitFor(() => statuses.at(-1)?.status === null && state.toolSteps.size === 0);
+
+    const newTools = tools.slice(beforeTools).map(([, evt]) => evt);
+    expect(newTools.some((evt) => evt.id === 'tool-99' && evt.status === 'complete')).toBe(true);
+    expect(newTools.some((evt) => evt.detail?.meta?.agentPath === 'child-live' && evt.detail?.meta?.normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED)).toBe(true);
+    expect(provider.getActiveWorkSnapshot(sid)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+
+    // When child is already gone, cancel() still interrupts active subagents and emits null status.
+    state.child = null;
+    state.subagents.snapshot({ subagents: [{ conversationId: 'child-after-exit', status: 'running' }] });
+    (provider as any).emitStatus(sid, state, { status: 'thinking', label: 'Thinking...' });
+    await provider.cancel(sid);
+    expect(statuses.at(-1)).toEqual({ status: null, label: null });
+    expect(state.subagents.activeCount()).toBe(0);
+    expect(tools.some(([, evt]) => evt.detail?.meta?.agentPath === 'child-after-exit' && evt.detail?.meta?.normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED)).toBe(true);
   });
 });

@@ -397,9 +397,20 @@ export class AgySdkProvider implements TransportProvider {
       }
     }
     if ((!state.child || state.child.killed || state.child.exitCode !== null) && state.beforeNativeSessionStart) {
-      const pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
-      try { await pending; }
-      finally { if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined; }
+      let pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
+      try {
+        await pending;
+      } catch (e: any) {
+        if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined;
+        if (e.message === 'AG start owner changed') {
+          pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
+          await pending;
+        } else {
+          throw e;
+        }
+      } finally {
+        if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined;
+      }
       if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generation || state.cancelled) {
         throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG start was superseded', false, { [AGY_NATIVE_START_NOT_ATTEMPTED]: true });
       }
@@ -432,7 +443,11 @@ export class AgySdkProvider implements TransportProvider {
     if (!state) return;
     state.cancelled = true;
     state.cancelGeneration += 1;
-    if (!state.child || state.child.killed) return;
+    if (!state.child || state.child.killed) {
+      state.child = null;
+      this.cleanupChildState(sessionId, state);
+      return;
+    }
     this.emitStatus(sessionId, state, { status: null, label: null });
     await this.terminateChild(state);
     // The next send resumes the same conversation via --conversation; agy persisted it.
@@ -448,8 +463,7 @@ export class AgySdkProvider implements TransportProvider {
       state.cancelled = true;
       state.cancelGeneration += 1;
       state.child = null;
-      this.resetTurnState(state);
-      this.emitStatus(sessionId, state, { status: null, label: null });
+      this.cleanupChildState(sessionId, state);
       return Promise.resolve();
     }
     return confirmChildStop(capturedChild, () => this.cancel(sessionId), () => this.sessions.get(sessionId) === state);
@@ -522,13 +536,16 @@ export class AgySdkProvider implements TransportProvider {
     if (!state) return null;
     const activeToolCount = state.toolSteps.size;
     const inflight = state.inflightTurns > 0;
-    const activeWorkCount = (inflight ? 1 : 0) + activeToolCount;
+    const backgroundWorkCount = state.subagents?.activeCount() ?? 0;
+    const activeWorkCount = (inflight ? 1 : 0) + activeToolCount + backgroundWorkCount;
     const busyReasons: SessionActivityBusyReason[] = [];
     if (inflight) busyReasons.push('provider_wait');
     if (activeToolCount > 0) busyReasons.push('open_tool_call');
+    if (backgroundWorkCount > 0) busyReasons.push('background_monitor');
     return {
       status: 'current',
       activeWorkCount,
+      ...(backgroundWorkCount > 0 ? { backgroundWorkCount } : {}),
       activeToolCount,
       busyReasons,
       providerDiagnosticGeneration: state.conversationId ?? null,
@@ -663,14 +680,20 @@ export class AgySdkProvider implements TransportProvider {
         logger.warn({ sessionId }, 'Failed to handle agy output');
       });
     });
+    let childCleanedUp = false;
+    const cleanupForChild = () => {
+      if (childCleanedUp || state.child !== child || this.sessions.get(sessionId) !== state) return;
+      childCleanedUp = true;
+      this.cleanupChildState(sessionId, state);
+    };
     child.once('error', (err) => {
       if (state.child !== child) return;
       const detail = `${(err as Error)?.message ?? ''} ${state.stderrTail}`.trim();
       const authFailure = AUTH_FAILURE_PATTERN.test(detail);
       state.child = null;
+      childCleanedUp = true;
 
-      this.resetTurnState(state);
-      this.emitStatus(sessionId, state, { status: null, label: null });
+      this.cleanupChildState(sessionId, state);
       const code = (err as NodeJS.ErrnoException).code;
       this.emitError(
         sessionId,
@@ -691,8 +714,7 @@ export class AgySdkProvider implements TransportProvider {
       const historyReadInFlight = state.historyReadInFlight;
       const tail = state.stderrTail.trim();
 
-      this.resetTurnState(state);
-      this.emitStatus(sessionId, state, { status: null, label: null });
+      cleanupForChild();
       if (state.cancelled || !hadTurns || historyReadInFlight) return;
       logger.warn({ sessionId, code, signal }, 'agy process exited with turns in flight');
       const authFailure = AUTH_FAILURE_PATTERN.test(tail);
@@ -704,6 +726,10 @@ export class AgySdkProvider implements TransportProvider {
           : 'The agy process exited before finishing the turn',
         !authFailure,
       );
+    });
+    child.once('close', () => {
+      rl.close();
+      cleanupForChild();
     });
     return child;
   }
@@ -731,14 +757,19 @@ export class AgySdkProvider implements TransportProvider {
     this.clearOpenToolSteps(state.routeId, state);
   }
 
+  private cleanupChildState(sessionId: string, state: AgySessionState): void {
+    this.resetTurnState(state);
+    for (const event of state.subagents?.interrupt() ?? []) {
+      for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+    }
+    state.lastStatusSignature = undefined;
+    this.emitStatus(sessionId, state, { status: null, label: null });
+  }
+
   private async terminateChild(state: AgySessionState): Promise<void> {
     const child = state.child;
     state.child = null;
-    this.resetTurnState(state);
-    for (const event of state.subagents?.interrupt() ?? []) {
-      for (const cb of this.toolCallCallbacks) cb(state.routeId, event);
-    }
-    this.emitStatus(state.routeId, state, { status: null, label: null });
+    this.cleanupChildState(state.routeId, state);
     if (!child) return;
     try { child.stdin?.end(); } catch { /* already closed */ }
     await killProcessTree(child, { gracefulMs: KILL_GRACE_MS, ownsProcessGroup: process.platform !== 'win32' });

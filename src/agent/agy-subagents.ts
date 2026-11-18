@@ -41,21 +41,29 @@ function textLaunchResult(text: string): unknown {
   const id = bare?.[0] ?? labelled?.[1];
   return id ? { conversationId: id } : undefined;
 }
-function parseAgySnapshotRows(value: unknown, allowTextLaunch: boolean): { rows: Record<string, unknown>[]; hasContainerHint: boolean } {
+function parseAgySnapshotRows(
+  value: unknown,
+  allowTextLaunch: boolean,
+): { rows: Record<string, unknown>[]; hasContainerHint: boolean; hasExplicitList: boolean } {
   let parsedValue = value;
   if (typeof parsedValue === 'string') {
     const text = parsedValue;
     try { parsedValue = JSON.parse(text); } catch {
       // AG native tool results can wrap their JSON snapshot in prose.
       let parsed = false;
-      for (const [open, close] of [['{', '}'], ['[', ']']]) {
+      const objStart = text.indexOf('{');
+      const arrStart = text.indexOf('[');
+      const pairs: Array<[string, string]> = arrStart >= 0 && (objStart < 0 || arrStart < objStart)
+        ? [['[', ']'], ['{', '}']]
+        : [['{', '}'], ['[', ']']];
+      for (const [open, close] of pairs) {
         const start = text.indexOf(open), end = text.lastIndexOf(close);
         if (start < 0 || end < start) continue;
-        try { parsedValue = JSON.parse(text.slice(start, end + 1)); parsed = true; break; } catch { /* try the array snapshot */ }
+        try { parsedValue = JSON.parse(text.slice(start, end + 1)); parsed = true; break; } catch { /* try the alternate snapshot delimiter */ }
       }
       if (!parsed) {
         parsedValue = allowTextLaunch ? textLaunchResult(text) : undefined;
-        if (!parsedValue) return { rows: [], hasContainerHint: false };
+        if (!parsedValue) return { rows: [], hasContainerHint: false, hasExplicitList: false };
       }
     }
   }
@@ -70,7 +78,11 @@ function parseAgySnapshotRows(value: unknown, allowTextLaunch: boolean): { rows:
   }
   if (Array.isArray(obj.subagents) || Array.isArray(obj.agents)) hasContainerHint = true;
   const list = Array.isArray(parsedValue) ? parsedValue : [obj.subagents, obj.agents, obj.members, obj.results].find(Array.isArray);
-  return { rows: (list ?? [obj]).map(record), hasContainerHint };
+  return {
+    rows: (list ?? [obj]).map(record),
+    hasContainerHint,
+    hasExplicitList: Array.isArray(parsedValue) || Array.isArray(list),
+  };
 }
 export function extractAgySubagentEvidenceChildIds(value: unknown): string[] {
   const { rows, hasContainerHint } = parseAgySnapshotRows(value, true);
@@ -93,7 +105,7 @@ function status(value: unknown): SdkSubagentNormalizedStatus | undefined {
   if (/^(complete|completed|done|success|idle|finished)$/.test(v)) return SDK_SUBAGENT_STATUS.COMPLETE;
   if (/^(error|failed|failure|errored)$/.test(v)) return SDK_SUBAGENT_STATUS.ERROR;
   if (/^(cancelled|canceled|interrupted|killed|stopped)$/.test(v)) return SDK_SUBAGENT_STATUS.INTERRUPTED;
-  if (/^(running|active|pending|queued|in_progress|working|thinking)$/.test(v)) return SDK_SUBAGENT_STATUS.RUNNING;
+  if (/^(running|active|pending|queued|in_progress|working|thinking|waiting|waiting_for_dependents)$/.test(v)) return SDK_SUBAGENT_STATUS.RUNNING;
   return undefined;
 }
 const extractToolTarget = (row: Record<string, unknown>): string | undefined => string(
@@ -113,6 +125,15 @@ export class AgySubagentTracker {
   private nativeChildren = new Set<string>();
   private toolChildren = new Map<string, string[]>();
   constructor(private parent: string) {}
+
+  /** Number of child runs that are still genuinely active. */
+  activeCount(): number {
+    let count = 0;
+    for (const child of this.children.values()) {
+      if (child.state === SDK_SUBAGENT_STATUS.RUNNING) count++;
+    }
+    return count;
+  }
 
   isNativeChild(id: string): boolean { return this.nativeChildren.has(id); }
 
@@ -134,11 +155,22 @@ export class AgySubagentTracker {
   }
 
   snapshot(value: unknown, action = 'manage_subagents', toolId?: string, defaultState?: SdkSubagentNormalizedStatus): ToolCallEvent[] {
-    const rows = parseAgySnapshotRows(value, Boolean(defaultState)).rows;
+    return this.applySnapshot(value, action, toolId, defaultState).events;
+  }
+
+  private applySnapshot(
+    value: unknown,
+    action = 'manage_subagents',
+    toolId?: string,
+    defaultState?: SdkSubagentNormalizedStatus,
+  ): { events: ToolCallEvent[]; seenIds: Set<string>; hasExplicitList: boolean } {
+    const { rows, hasExplicitList } = parseAgySnapshotRows(value, Boolean(defaultState));
     const result: ToolCallEvent[] = [];
+    const seenIds = new Set<string>();
     for (const [index, row] of rows.entries()) {
       const id = string(row.conversationId, row.conversation_id, row.ConversationId, row.agentId, row.agent_id, row.agentPath, row.agent_path, row.id);
       if (!id) continue;
+      seenIds.add(id);
       const normalized = status(row.state ?? row.status ?? row.Status) ?? defaultState;
       if (!normalized) continue;
       let slots = toolId ? this.toolChildren.get(toolId) : undefined;
@@ -166,7 +198,7 @@ export class AgySubagentTracker {
       this.children.set(id, child);
       result.push(this.emit(child, action, string(row.stateDetail, row.state_detail)));
     }
-    return result;
+    return { events: result, seenIds, hasExplicitList };
   }
 
   tool(tool: ToolCallEvent): ToolCallEvent[] {
@@ -188,7 +220,22 @@ export class AgySubagentTracker {
       return [];
     }
     const launchResult = /^(invokesubagent|browsersubagent)$/.test(name) || name === 'swarm' && /^(add|start|create)$/.test(action);
-    const snapshot = this.snapshot(tool.output, action, tool.id, launchResult ? tool.status === 'error' ? SDK_SUBAGENT_STATUS.ERROR : SDK_SUBAGENT_STATUS.RUNNING : undefined);
+    const { events: snapshot, seenIds, hasExplicitList } = this.applySnapshot(
+      tool.output,
+      action,
+      tool.id,
+      launchResult ? tool.status === 'error' ? SDK_SUBAGENT_STATUS.ERROR : SDK_SUBAGENT_STATUS.RUNNING : undefined,
+    );
+    if (name === 'managesubagents' && action.toLowerCase() === 'list' && tool.status === 'complete' && hasExplicitList) {
+      const reconciled = [...snapshot];
+      for (const child of this.children.values()) {
+        if (!this.nativeChildren.has(child.id)) continue;
+        if (child.state !== SDK_SUBAGENT_STATUS.RUNNING || seenIds.has(child.id)) continue;
+        child.state = SDK_SUBAGENT_STATUS.COMPLETE;
+        reconciled.push(this.emit(child, action));
+      }
+      if (reconciled.length) return reconciled;
+    }
     if (snapshot.length) return snapshot;
     const result: ToolCallEvent[] = [];
     for (let i = 0; i < candidates.length; i++) {

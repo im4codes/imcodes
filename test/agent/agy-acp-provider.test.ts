@@ -1203,7 +1203,7 @@ describe('AG native ACP', () => {
       }, { timeout: 5000 });
       expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
       expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
-      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getStatus()).toBe('tool_running');
 
       // Completion SYSTEM_MESSAGE + reactive PLANNER_RESPONSE settles back to idle.
       await appendFile(
@@ -1264,7 +1264,7 @@ describe('AG native ACP', () => {
       }, { timeout: 5000 });
       expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
       expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
-      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getStatus()).toBe('tool_running');
 
       await appendFile(
         file,
@@ -1279,7 +1279,7 @@ describe('AG native ACP', () => {
       await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0), { timeout: 5000 });
       await vi.waitFor(() => expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(0), { timeout: 5000 });
       expect(runtime.getStatus()).toBe('idle');
-      expect(statuses).not.toContain('tool_running');
+      expect(statuses).toContain('tool_running');
     } finally {
       await runtime.kill();
     }
@@ -1800,6 +1800,7 @@ rl.on('line', (line) => {
         busyReasons: ['background_monitor'],
       });
       expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('tool_running');
 
       expect(runtime.send('plain append while bg runs', 'bg-plain-1', undefined, undefined, {
         deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
@@ -2795,5 +2796,252 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       'gemini-4-hydrogen-high',
       'gemini-4-hydrogen-high',
     ]);
+  });
+
+  it('keeps AG reactive/native-output long tasks non-idle across multi-step tool calls, protects active long native turns from silent recovery, and returns to idle cleanly', async () => {
+    const { provider, root } = await setup('native-child-log');
+    const id = 'deck_test_agy_reactive_native_long';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    runtime.setProviderSessionId(id);
+
+    const done = vi.fn();
+    provider.onComplete(done);
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+    expect(runtime.send('launch', 'turn-1')).toBe('sent');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+
+    // 1) Reactive [Message] wakeup sets agyReactive and stays non-idle even across useAgyNativeOutput and native tool steps.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 50,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-16T00:00:00Z sender=worker-a content=wake parent',
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyReactive).toBe(true);
+      expect(runtime.getStatus()).not.toBe('idle');
+    }, { timeout: 5000 });
+    expect(runtime.getActivitySnapshot().backgroundKeepsSessionRunning).toBe(true);
+    expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+    (provider as any).useAgyNativeOutput(state);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    const prevActivityAt = state.lastActivityAt;
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 51,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000 } }],
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyNativeToolOrder?.length).toBeGreaterThan(0);
+    }, { timeout: 5000 });
+    expect(state.lastActivityAt).toBeGreaterThanOrEqual(prevActivityAt);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    // Empty final non-tool-call PLANNER_RESPONSE settles reactive turn cleanly back to idle.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 52,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      }) + '\n',
+    );
+    await vi.waitFor(() => {
+      expect(state.agyReactive).toBe(false);
+      expect(runtime.getStatus()).toBe('idle');
+    }, { timeout: 5000 });
+
+    // 2) cancel() during reactive turn clears agyReactive and settles to idle.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 53,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-16T00:01:00Z sender=worker-b content=wake again',
+      }) + '\n',
+    );
+    await vi.waitFor(() => expect(state.agyReactive).toBe(true), { timeout: 5000 });
+    await provider.cancel(id);
+    expect(state.agyReactive).toBe(false);
+    expect(runtime.getStatus()).toBe('idle');
+
+    // 3) During an in-flight native turn with active native tool calls, getActiveWorkSnapshot reports activeToolCount > 0
+    // and recoverSilentActiveTurn does not falsely settle the active long native turn at the short threshold.
+    state.promptInFlight = true;
+    state.agyReactive = true;
+    state.agyNativeToolOrder = [{ name: 'run_command', interactive: false }];
+    (runtime as any).setStatus('tool_running');
+    expect(provider.getActiveWorkSnapshot(id)?.activeToolCount).toBeGreaterThan(0);
+    expect(runtime.recoverSilentActiveTurn({ nowMs: Date.now() + 10_000, staleMs: 5_000 })).toBe(false);
+    expect(runtime.getStatus()).toBe('tool_running');
+    state.agyNativeToolOrder = [];
+    state.promptInFlight = false;
+    state.agyReactive = false;
+    (provider as any).syncAgyStatusAfterTurn(id, state);
+    expect(runtime.getStatus()).toBe('idle');
+    await runtime.kill();
+  });
+
+  it('ignores IsDaemon run_command background ids, reconciles empty manage_task(list), and ignores errored manage_task(list)', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_daemon_and_list';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ content: m.content }); });
+
+    try {
+      expect(runtime.send('warm', 'warm-daemon')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // IsDaemon: true must NOT enter agyBackgroundTasks or hold runtime running.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/daemon-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'npm run dev', IsDaemon: true, WaitMsBeforeAsync: 500 },
+        toolStatus: 'complete',
+      });
+      expect(state.agyBackgroundTasks?.size ?? 0).toBe(0);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Non-daemon background task holds runtime tool_running.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/stale-bg-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 30', WaitMsBeforeAsync: 500 },
+        toolStatus: 'running',
+      });
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Errored manage_task(list) must NOT clear agyBackgroundTasks.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'No running tasks',
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'error',
+      });
+      expect(state.agyBackgroundTasks?.has(`${nativeId}/stale-bg-1`)).toBe(true);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Successful empty manage_task(list) reconciles stale ids and drops cleanly back to idle.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'No running tasks.',
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+      expect(state.agyBackgroundTasks?.size ?? 0).toBe(0);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('handles child transcript RUNNING guard, empty-content terminal, SYSTEM_ERROR, and ACP failure subagent interrupt + idle cleanup', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_child_errors_and_crash';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => { if (sid === id) events.push(evt); });
+
+    try {
+      expect(runtime.send('launch', 'child-check-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+      const state = (provider as any).sessions.get(id);
+
+      // Register three native children through handleSessionUpdate (real invoke_subagent ACP batch result):
+      // 1 finishes with empty content after a RUNNING chunk, 1 fails with SYSTEM_ERROR, 1 stays running until ACP crash.
+      (provider as any).handleSessionUpdate({
+        sessionId: state.acpSessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'launch-batch-child-check',
+          title: 'Run invoke_subagent',
+          status: 'completed',
+          rawInput: { Subagents: [{ Role: 'EmptyDone' }, { Role: 'ErrChild' }, { Role: 'CrashChild' }] },
+          rawOutput: JSON.stringify({
+            subagents: [
+              { conversationId: 'child-empty-done', status: 'running' },
+              { conversationId: 'child-err', status: 'running' },
+              { conversationId: 'child-crash', status: 'running' },
+            ],
+          }),
+        },
+      });
+      await vi.waitFor(() => expect(state.agySubagents?.activeCount()).toBe(3), { timeout: 5000 });
+
+      // 1) Child PLANNER_RESPONSE with status RUNNING must NOT close prematurely.
+      (provider as any).handleAgyTranscriptRow(id, state, 'child-empty-done', {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'RUNNING',
+        content: 'partial chunk',
+      });
+      expect(state.agySubagents.activeCount()).toBe(3);
+
+      // 2) Child PLANNER_RESPONSE DONE with empty content completes and closes bridge.
+      (provider as any).handleAgyTranscriptRow(id, state, 'child-empty-done', {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      });
+      expect(events.find((e) => e.detail?.meta?.agentPath === 'child-empty-done' && e.detail?.meta?.terminal)?.detail?.meta?.normalizedStatus).toBe('complete');
+      expect(state.agySubagents.activeCount()).toBe(2);
+
+      // 3) Child SYSTEM_ERROR emits error and closes bridge.
+      (provider as any).handleAgyTranscriptRow(id, state, 'child-err', {
+        step_index: 1,
+        type: 'SYSTEM_ERROR',
+        status: 'ERROR',
+        content: 'subagent crashed',
+      });
+      const errEvt = events.find((e) => e.detail?.meta?.agentPath === 'child-err' && e.detail?.meta?.terminal);
+      expect(errEvt?.status).toBe('error');
+      expect(errEvt?.detail?.meta?.normalizedStatus).toBe('error');
+      expect(state.agySubagents.activeCount()).toBe(1);
+
+      // 4) Simulate ACP failure/exit while agyReactive and child-crash are active -> interrupts subagent & resets to idle.
+      state.agyReactive = true;
+      (provider as any).syncAgyStatusAfterTurn(id, state);
+      expect(runtime.getStatus()).not.toBe('idle');
+
+      const hadActive = (provider as any).clearSessionWorkAfterFailure(id);
+      expect(hadActive).toBe(true);
+      expect(state.agyReactive).toBe(false);
+      expect(state.agySubagents.activeCount()).toBe(0);
+      expect(events.some((e) => e.detail?.meta?.agentPath === 'child-crash' && e.detail?.meta?.normalizedStatus === 'interrupted')).toBe(true);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
   });
 });

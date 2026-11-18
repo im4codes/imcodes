@@ -2197,13 +2197,17 @@ function buildTransportSessionStatePayload(
   // During running/streaming, command-handler's 'queued' event is the sole queue-update
   // authority. This keeps queued messages visible in the UI until the drained turn completes.
   const activity = runtime.getDiagnosticSnapshot();
-  const effectiveState = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
+  const effectiveState = mapped === 'idle' && (activity.blockingWorkCount > 0 || activity.backgroundKeepsSessionRunning)
+    ? 'running'
+    : mapped;
   const providerError = runtime.lastProviderError;
   const payload: Record<string, unknown> = { state: effectiveState };
   if (effectiveState === 'running') {
     payload.activityGeneration = activity.activityGeneration;
     payload.blockingWorkCount = activity.blockingWorkCount;
-    payload.activeWorkCount = activity.blockingWorkCount;
+    payload.activeWorkCount = activity.blockingWorkCount > 0
+      ? activity.blockingWorkCount
+      : (activity.backgroundKeepsSessionRunning ? activity.backgroundWorkCount : 0);
     payload.activeToolCount = activity.activeToolCount;
     payload.busyReasons = activity.busyReasons;
     if (activity.capacityRetry) payload.capacityRetry = activity.capacityRetry;
