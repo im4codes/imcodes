@@ -6,7 +6,12 @@ import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-que
 import { readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
-import { readPersistedAgySystemPrompt } from '../../src/agent/agy-persisted-system-prompt.js';
+import {
+  readPersistedAgySystemPrompt,
+  reconcilePersistedAgyWorkspace,
+  sanitizeAgyTrajectoryWorkspaceBlob,
+} from '../../src/agent/agy-persisted-system-prompt.js';
+import { pathToFileURL } from 'node:url';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile, rename } from 'node:fs/promises';
@@ -3869,5 +3874,265 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       'turn-5-keep-reverted-outer-refresh',
     ]);
     expect(rebuildPrompts).toEqual(['turn-6-after-rebuild']);
+  });
+
+  function encodeLenDelimitedField(fieldNum: number, payload: Uint8Array): Buffer {
+    return Buffer.concat([
+      encodeProtobufVarint(fieldNum * 8 + 2),
+      encodeProtobufVarint(payload.length),
+      payload,
+    ]);
+  }
+
+  function buildWorkspaceInfoSlice(uri: string, gitMeta?: { repo: string; branch: string }): Buffer {
+    const inner: Buffer[] = [encodeLenDelimitedField(1, Buffer.from(uri, 'utf8'))];
+    if (gitMeta) {
+      inner.push(
+        encodeLenDelimitedField(
+          3,
+          Buffer.concat([
+            encodeLenDelimitedField(1, Buffer.from(gitMeta.repo, 'utf8')),
+            encodeLenDelimitedField(2, Buffer.from(gitMeta.branch, 'utf8')),
+          ]),
+        ),
+      );
+    }
+    return encodeLenDelimitedField(1, Buffer.concat(inner));
+  }
+
+  function readTopLevelWorkspaceEntries(blob: Uint8Array): { f1Slices: Buffer[]; f1Uris: string[]; f7Uris: string[]; otherFieldNums: number[] } {
+    const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+    const readVar = (start: number): { val: number; next: number } => {
+      let off = start;
+      let val = 0;
+      let shift = 0;
+      while (off < buf.length) {
+        const b = buf[off++]!;
+        val += (b & 0x7f) * 2 ** shift;
+        if ((b & 0x80) === 0) return { val, next: off };
+        shift += 7;
+      }
+      throw new Error('truncated varint');
+    };
+    const f1Slices: Buffer[] = [];
+    const f1Uris: string[] = [];
+    const f7Uris: string[] = [];
+    const otherFieldNums: number[] = [];
+    let off = 0;
+    while (off < buf.length) {
+      const start = off;
+      const tag = readVar(off);
+      off = tag.next;
+      const field = Math.floor(tag.val / 8);
+      const wire = tag.val & 7;
+      if (wire === 0) {
+        while ((buf[off++]! & 0x80) !== 0) { /* advance */ }
+      } else if (wire === 1) {
+        off += 8;
+      } else if (wire === 2) {
+        const len = readVar(off);
+        off = len.next;
+        const payload = buf.subarray(off, off + len.val);
+        off += len.val;
+        if (field === 1) {
+          f1Slices.push(Buffer.from(buf.subarray(start, off)));
+          let pOff = 0;
+          while (pOff < payload.length) {
+            let pTagVal = 0;
+            let pShift = 0;
+            while (pOff < payload.length) {
+              const b = payload[pOff++]!;
+              pTagVal += (b & 0x7f) * 2 ** pShift;
+              if ((b & 0x80) === 0) break;
+              pShift += 7;
+            }
+            const pField = Math.floor(pTagVal / 8);
+            const pWire = pTagVal & 7;
+            if (pWire === 2) {
+              let pLen = 0;
+              let lShift = 0;
+              while (pOff < payload.length) {
+                const b = payload[pOff++]!;
+                pLen += (b & 0x7f) * 2 ** lShift;
+                if ((b & 0x80) === 0) break;
+                lShift += 7;
+              }
+              const sub = payload.subarray(pOff, pOff + pLen);
+              pOff += pLen;
+              if (pField === 1) f1Uris.push(sub.toString('utf8'));
+            }
+          }
+        } else if (field === 7) {
+          f7Uris.push(payload.toString('utf8'));
+        } else {
+          otherFieldNums.push(field);
+        }
+      } else if (wire === 5) {
+        off += 4;
+      }
+    }
+    return { f1Slices, f1Uris, f7Uris, otherFieldNums };
+  }
+
+  function readBlobRow(dbPath: string): Buffer {
+    suppressSqliteExperimentalWarning();
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get() as { data: Uint8Array };
+      return Buffer.from(row.data);
+    } finally {
+      db.close();
+    }
+  }
+
+  it('strips wrong root file:/// workspace from SQLite trajectory_metadata_blob before session/resume while preserving matching git metadata and Slot A prompt', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const projDir = path.join(root, 'proj');
+    await mkdir(projDir, { recursive: true });
+    const targetUri = pathToFileURL(realpathSync(projDir)).href.replace(/\/+$/, '');
+
+    const identity = '<imcodes-agent-identity>\nWS_ALIGN_ID_1\n</imcodes-agent-identity>';
+    const persistedPrompt = `${'SLOT_A_55KB_OUTER '.repeat(2300)}\n${identity}`;
+    const f1Wrong = buildWorkspaceInfoSlice('file:///');
+    const f1Proj = buildWorkspaceInfoSlice(targetUri, { repo: 'im4codes/imcodes', branch: 'dev' });
+    const f4 = encodeLenDelimitedField(4, Buffer.from('preserve-f4-bytes', 'utf8'));
+    const f10Payload = Buffer.concat([
+      Buffer.from('\x0a\x11acp_system_prompt\x12', 'latin1'),
+      encodeProtobufVarint(Buffer.byteLength(persistedPrompt, 'utf8')),
+      Buffer.from(persistedPrompt, 'utf8'),
+    ]);
+    const f10 = encodeLenDelimitedField(10, f10Payload);
+    const f15Fixed64 = Buffer.concat([encodeProtobufVarint(15 * 8 + 1), Buffer.from('0102030405060708', 'hex')]);
+    const f18Fixed32 = Buffer.concat([encodeProtobufVarint(18 * 8 + 5), Buffer.from('0a0b0c0d', 'hex')]);
+    const f7Wrong = encodeLenDelimitedField(7, Buffer.from('file:///', 'utf8'));
+    const f7Proj = encodeLenDelimitedField(7, Buffer.from(targetUri, 'utf8'));
+
+    const initialBlob = Buffer.concat([f1Wrong, f1Proj, f4, f7Wrong, f7Proj, f10, f15Fixed64, f18Fixed32]);
+    const dbPath = await writeAgyMetadataBlobDb(root, 'align-root-slash', initialBlob);
+
+    await provider.createSession({
+      sessionKey: 'deck_test_align_slash',
+      sessionName: 'deck_test_align_slash',
+      cwd: projDir,
+      agentId: 'model-a',
+      resumeId: 'align-root-slash',
+    });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const payload = normalizeProviderPayload('align check');
+    payload.sessionSystemText = persistedPrompt;
+    payload.context = { ...payload.context, sessionSystemText: persistedPrompt };
+    await provider.send('deck_test_align_slash', payload);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const updatedBlob = readBlobRow(dbPath);
+    const parsed = readTopLevelWorkspaceEntries(updatedBlob);
+    expect(parsed.f1Uris).toEqual([targetUri]);
+    expect(parsed.f7Uris).toEqual([targetUri]);
+    expect(parsed.f1Slices[0]?.equals(f1Proj)).toBe(true);
+    expect(updatedBlob.includes(f4)).toBe(true);
+    expect(updatedBlob.includes(f10)).toBe(true);
+    expect(updatedBlob.includes(f15Fixed64)).toBe(true);
+    expect(updatedBlob.includes(f18Fixed32)).toBe(true);
+    expect(readPersistedAgySystemPrompt(root, 'align-root-slash')).toBe(persistedPrompt);
+
+    // Slot A prompt preserved -> session/resume also omits duplicate _meta
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]?.params?._meta).toBeUndefined();
+  });
+
+  it('replaces completely mismatched persisted workspace URIs with project cwd on session/resume', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const projDir = path.join(root, 'new-project');
+    await mkdir(projDir, { recursive: true });
+    const targetUri = pathToFileURL(realpathSync(projDir)).href.replace(/\/+$/, '');
+
+    const initialBlob = Buffer.concat([
+      buildWorkspaceInfoSlice('file:///wrong/old'),
+      encodeLenDelimitedField(4, Buffer.from('f4-meta', 'utf8')),
+      encodeLenDelimitedField(7, Buffer.from('file:///wrong/old', 'utf8')),
+      encodeLenDelimitedField(7, Buffer.from('file:///home/ai', 'utf8')),
+    ]);
+    const dbPath = await writeAgyMetadataBlobDb(root, 'align-old-only', initialBlob);
+
+    await provider.createSession({
+      sessionKey: 'deck_test_align_old',
+      sessionName: 'deck_test_align_old',
+      cwd: projDir,
+      agentId: 'model-a',
+      resumeId: 'align-old-only',
+    });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+    await provider.send('deck_test_align_old', 'hello aligned');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const parsed = readTopLevelWorkspaceEntries(readBlobRow(dbPath));
+    expect(parsed.f1Uris).toEqual([targetUri]);
+    expect(parsed.f7Uris).toEqual([targetUri]);
+    expect(readBlobRow(dbPath).includes(Buffer.from('f4-meta', 'utf8'))).toBe(true);
+    expect((await requests()).some((x) => x.method === 'session/resume')).toBe(true);
+  });
+
+  it('is idempotent on aligned DBs, normalizes symlinks and special-char paths, skips root /, and survives corrupt blobs', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-agy-ws-bounds-'));
+    try {
+      const realProj = path.join(root, 'real', '测试 dir');
+      await mkdir(realProj, { recursive: true });
+      const symlinkProj = path.join(root, 'proj-link');
+      symlinkSync(realProj, symlinkProj);
+      const expectedUri = pathToFileURL(realpathSync(realProj)).href.replace(/\/+$/, '');
+      expect(expectedUri).toContain('%E6%B5%8B%E8%AF%95%20dir');
+
+      const f1Wrong = buildWorkspaceInfoSlice('file:///home/ai');
+      const f4 = encodeLenDelimitedField(4, Buffer.from('keep-f4', 'utf8'));
+      const f7Wrong = encodeLenDelimitedField(7, Buffer.from('file:///home/ai', 'utf8'));
+      const dbPath = await writeAgyMetadataBlobDb(root, 'symlink-case', Buffer.concat([f1Wrong, f4, f7Wrong]));
+
+      // Root '/' must never rewrite DB
+      expect(reconcilePersistedAgyWorkspace(root, 'symlink-case', '/')).toBe(false);
+      expect(sanitizeAgyTrajectoryWorkspaceBlob(Buffer.concat([f1Wrong, f4, f7Wrong]), 'file:///')).toBeNull();
+      expect(readTopLevelWorkspaceEntries(readBlobRow(dbPath)).f1Uris).toEqual(['file:///home/ai']);
+
+      // Reconcile via symlink path writes canonical realpath + URL-encoded special chars
+      expect(reconcilePersistedAgyWorkspace(root, 'symlink-case', symlinkProj)).toBe(true);
+      const alignedBytes = readBlobRow(dbPath);
+      expect(readTopLevelWorkspaceEntries(alignedBytes).f1Uris).toEqual([expectedUri]);
+      expect(readTopLevelWorkspaceEntries(alignedBytes).f7Uris).toEqual([expectedUri]);
+
+      // Second call is strictly idempotent (zero write needed -> returns false, identical bytes)
+      expect(reconcilePersistedAgyWorkspace(root, 'symlink-case', symlinkProj)).toBe(false);
+      expect(readBlobRow(dbPath).equals(alignedBytes)).toBe(true);
+
+      // Corrupt/truncated blobs return null / false without modifying DB
+      const corruptBytes = Buffer.from([0x0b, 0xff, 0x80]); // wire type 3 unsupported + truncated
+      const corruptPath = await writeAgyMetadataBlobDb(root, 'corrupt-blob', corruptBytes);
+      expect(sanitizeAgyTrajectoryWorkspaceBlob(corruptBytes, expectedUri)).toBeNull();
+      expect(reconcilePersistedAgyWorkspace(root, 'corrupt-blob', realProj)).toBe(false);
+      expect(readBlobRow(corruptPath).equals(corruptBytes)).toBe(true);
+
+      // Still does not block session/resume when DB blob is corrupt
+      const { provider, root: providerHome, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+      const corruptSessionProj = path.join(providerHome, 'proj-ok');
+      await mkdir(corruptSessionProj, { recursive: true });
+      await writeAgyMetadataBlobDb(providerHome, 'corrupt-resume-id', corruptBytes);
+      await provider.createSession({
+        sessionKey: 'deck_test_corrupt_resume',
+        sessionName: 'deck_test_corrupt_resume',
+        cwd: corruptSessionProj,
+        agentId: 'model-a',
+        resumeId: 'corrupt-resume-id',
+      });
+      const complete = vi.fn();
+      provider.onComplete(complete);
+      await provider.send('deck_test_corrupt_resume', 'resume despite corrupt blob');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect((await requests()).some((x) => x.method === 'session/resume')).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

@@ -133,6 +133,7 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
 import {
   readPersistedAgySystemPrompt,
+  reconcilePersistedAgyWorkspace,
   resolveAgyResumeSystemPromptMeta,
   type AgySlotBIdentityOverride,
 } from '../agy-persisted-system-prompt.js';
@@ -2807,12 +2808,18 @@ export class KimiSdkProvider implements TransportProvider {
             // Resume an existing session (survives across CLI restarts via
             // ~/.kimi/tmp/<project>/chats/<id>.json).
             try {
+              const effectiveHomeDir = this.id === AGY_SDK_PROVIDER_ID && !state.incognito
+                ? this.resolveEffectiveHomeDir(state)
+                : undefined;
+              if (effectiveHomeDir && state.cwd) {
+                reconcilePersistedAgyWorkspace(effectiveHomeDir, state.acpSessionId, state.cwd);
+              }
               const useMeta = this.supportsSystemPromptMetaForState(state);
               const trimmedSystemText = sessionSystemOptions?.sessionSystemText?.trim() || undefined;
               const plan = useMeta
                 ? resolveAgyResumeSystemPromptMeta({
-                    persistedPrompt: this.id === AGY_SDK_PROVIDER_ID && state.acpSessionId && !state.incognito
-                      ? readPersistedAgySystemPrompt(this.resolveEffectiveHomeDir(state), state.acpSessionId)
+                    persistedPrompt: effectiveHomeDir
+                      ? readPersistedAgySystemPrompt(effectiveHomeDir, state.acpSessionId)
                       : null,
                     trimmedSystemText,
                     hasDeliveredMeta: Boolean(state.sessionSystemTextMetaDelivered),
