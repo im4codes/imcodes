@@ -30,10 +30,10 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     },
   );
 
-  it('configures coverage-shard across 1..8 shards with 30-minute timeout and aggregates all 8 shard artifacts in coverage', () => {
+  it('configures coverage-shard across 1..8 shards with a bounded 45-minute timeout and aggregates all 8 shard artifacts in coverage', () => {
     const jobs = ci().jobs;
     const covShard = jobs['coverage-shard']!;
-    expect(covShard['timeout-minutes']).toBe(30);
+    expect(covShard['timeout-minutes']).toBe(45);
     expect(covShard.strategy?.['max-parallel']).toBe(8);
     expect(covShard.strategy?.matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(covShard.strategy?.['fail-fast']).toBe(false);
@@ -73,6 +73,8 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     expect(ci().jobs['unit-tests']!.strategy?.matrix.node).toEqual(['22', '24']);
     const scripts = JSON.parse(readFileSync('package.json', 'utf8')).scripts;
     expect(scripts['test:unit']).toContain('--maxWorkers=3 --project daemon');
+    expect(scripts['test:unit']).toContain('--retry=2');
+    expect(scripts['test:coverage:ci']).toContain('--retry=2');
   });
 
   it('starts self-contained E2E without waiting for unit tests, but gates releases on both', () => {

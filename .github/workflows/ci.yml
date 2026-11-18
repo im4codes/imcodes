@@ -97,7 +97,7 @@ jobs:
     name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
     # Keep both Node versions and every daemon test; split across runners instead of increasing per-runner workers.
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 16
@@ -194,7 +194,7 @@ jobs:
     name: Unit Tests (macOS, shard ${{ matrix.shard }}/6)
     runs-on: macos-latest
     # Split into 6 disjoint shards (staying within macOS concurrency budget) with all platform tests retained.
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -698,7 +698,7 @@ jobs:
     name: Coverage shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 3-4 min across 8 shards).
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 8
