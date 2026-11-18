@@ -899,7 +899,7 @@ export const TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE: string =
  */
 export const TASK_PAIR_BRAIN_MCP_ONLY_RULE: string =
   'Brain: close and advance pairs ONLY with the MCP tools; do not write IMCODES_TASK markers yourself (the daemon still parses a legacy marker for compatibility, but it is no longer taught or encouraged for Brain). '
-  + 'pair_create (with title; omit executor/auditor/models by default when an execution pool is configured, or pass auditor=none to skip audit) creates new work, then pair_dispatch if the result is queued; pair_reassign replaces the executor or auditor (or their models) on an existing pair; pair_close (action=done, action=cancel) closes; '
+  + 'pair_create (with title; omit executor/auditor/models by default when an execution pool is configured, or pass auditor=<session>|none for explicit user override/no-audit) creates new work, then pair_dispatch if the result is queued; pair_reassign replaces the executor or auditor (or their models) on an existing pair; pair_close (action=done, action=cancel) closes; '
   + 'pair_next_round opens the next round of a passed pair; pair_task_update / pair_task_check edit the brief and its boxes; pair_set_max_concurrency sets your queue limit; pair_resource_claim claims a shared resource. '
   + 'Do not add any IMCODES_TASK marker to a reply -- not even an empty or "no-op" one (there is no such marker; it only clutters the main session; the sole idle-Brain heartbeat-pause exception is NEEDS_DECISION above, never for pair lifecycle). With nothing to handle, just answer. '
   + 'Never use send_message task metadata to create a pair. pair_dispatch auto-queues an existing pair when capacity is unavailable, so there is no need to defer work yourself. '

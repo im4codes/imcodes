@@ -12,7 +12,6 @@ import { removeSession, upsertSession } from '../../../src/store/session-store.j
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
-import { SUPERVISION_EXECUTION_CONFIG_DEFAULTS } from '../../../shared/supervision-execution-pool.js';
 
 const PROJECT = 'pair-mcp-project';
 const BRAIN = 'deck_pair_mcp_brain';
@@ -25,7 +24,7 @@ const caller: McpRuntimeCaller = {
 };
 
 function session(name: string, role: SessionRecord['role'], state: SessionRecord['state'] = 'idle'): SessionRecord {
-  return { name, projectName: PROJECT, role, agentType: 'codex-sdk', projectDir: '/tmp/pair-mcp', state, restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 2 } as SessionRecord;
+  return { name, projectName: PROJECT, role, agentType: 'codex-sdk', projectDir: '/tmp/pair-mcp', state, restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 2, sessionInstanceId: `instance_${name}`, runtimeEpoch: `epoch_${name}` } as SessionRecord;
 }
 
 function pair(taskId: string, status: TaskPairState['status']): TaskPairState {
@@ -394,8 +393,8 @@ describe('pair MCP projections', () => {
       mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
       executionPools: {
         state: 'configured',
-        primaryDevelopmentPool: { configs: [execCfg, audCfg], controls: SUPERVISION_EXECUTION_CONFIG_DEFAULTS.primary },
-        economyTaskPool: { configs: [], controls: SUPERVISION_EXECUTION_CONFIG_DEFAULTS.economy },
+        primaryDevelopmentPool: { configs: [execCfg, audCfg], controls: { leaseMs: 1_800_000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+        economyTaskPool: { configs: [], controls: { leaseMs: 900_000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
       },
     });
     const brain: SessionRecord = {
