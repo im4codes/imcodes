@@ -42,6 +42,7 @@ export interface EnsurePairSessionsInput {
   project: string;
   taskId: string;
   title?: string;
+  dependsOn?: readonly string[];
   executor?: string;
   auditor?: string;
   executorModel?: string;
@@ -149,6 +150,8 @@ export async function ensurePairSessions(input: EnsurePairSessionsInput, injecte
       const idle = listTaskPairCandidates({
         brain: input.brain, role: 'executor', pool: 'primary',
         exclude: new Set([input.brain, ...named]),
+        exceptTaskId: input.taskId,
+        dependsOn: input.dependsOn,
       }, deps).length;
       const count = planDefaultCreations({ unsettledRoles: unsettled.length, idleDefaultSessions: idle, capRoom: capRoom - wanted.length });
       // The roles served by an idle session are picked later by the normal pick; the LAST `count` roles get a created one.

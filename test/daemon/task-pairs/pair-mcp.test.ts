@@ -11,6 +11,8 @@ import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../..
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { defaultHasActiveSupervisionLease, provisionSupervisionTarget } from '../../../src/daemon/supervision-auto-provision.js';
+import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
 
 const PROJECT = 'pair-mcp-project';
@@ -445,6 +447,185 @@ describe('pair MCP projections', () => {
       expect(getTaskPairStore().getPair(PROJECT, String(namedExecOmittedAud.taskId))?.state).toMatchObject({
         executor: execB.name,
         auditor: audPool.name,
+      });
+    } finally {
+      setTaskPairDeliveryDepsForTests(undefined);
+      all.forEach((record) => removeSession(record.name));
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
+  it('never steals or reuses idle sessions belonging to a paused/queued pair in pool picking, provisioning, or lease checks', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const execCfg = {
+      capabilityId: 'supervision-exec-v1:transport:agy-sdk:google:gemini-4-hydrogen-high',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport' as const,
+      providerFamily: 'google',
+      model: 'gemini-4-hydrogen-high',
+      role: 'executor' as const,
+    };
+    const audCfg = {
+      capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6.2-sol',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport' as const,
+      providerFamily: 'openai',
+      model: 'gpt-6.2-sol',
+      role: 'auditor' as const,
+    };
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: { configs: [execCfg, audCfg], controls: { leaseMs: 1_800_000, maxSpawned: 4, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+        economyTaskPool: { configs: [], controls: { leaseMs: 900_000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+      },
+    });
+    const brain: SessionRecord = {
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: snapshot },
+    };
+    const execHeld: SessionRecord = {
+      ...session('deck_sub_q_exec_held', 'w1'), parentSession: BRAIN, agentType: 'agy-sdk', runtimeType: 'transport', activeModel: 'gemini-4-hydrogen-high',
+    };
+    const audHeld: SessionRecord = {
+      ...session('deck_sub_q_aud_held', 'w2'), parentSession: BRAIN, agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-6.2-sol',
+    };
+    const execFree: SessionRecord = {
+      ...session('deck_sub_q_exec_free', 'w3'), parentSession: BRAIN, agentType: 'agy-sdk', runtimeType: 'transport', activeModel: 'gemini-4-hydrogen-high',
+    };
+    const all = [brain, execHeld, audHeld, execFree];
+    all.forEach(upsertSession);
+    setTaskPairDeliveryDepsForTests({ send: async () => undefined });
+    try {
+      putTaskPairFixture(getTaskPairStore(), PROJECT, {
+        taskId: 'tsk_paused_queued_holder',
+        brain: BRAIN,
+        executor: execHeld.name,
+        auditor: audHeld.name,
+        title: 'Paused queued holder',
+        brief: '# hold',
+        status: 'queued',
+        flags: [],
+        flagSides: {},
+        round: 0,
+        blocking: ['P0'],
+        previousAuditors: [],
+        capCounts: {},
+        capRound: 0,
+        createdAt: 10,
+        updatedAt: 20,
+        scheduling: { epoch: 1, manual: true, dependsOn: [], since: 20, writer: BRAIN },
+        workspaceKind: 'none',
+      });
+
+      // Slot predicate stays false for queued pairs, while open-pair lease & candidate checks protect both reserved sessions.
+      expect(getTaskPairStore().isParticipantOfOpenPair(execHeld.name)).toBe(false);
+      await expect(defaultHasActiveSupervisionLease(execHeld.name)).resolves.toBe(true);
+      await expect(defaultHasActiveSupervisionLease(audHeld.name)).resolves.toBe(true);
+
+      const execCandidates = listTaskPairCandidates({
+        brain: BRAIN, role: 'executor', pool: 'primary', exclude: new Set([BRAIN]), exceptTaskId: 'tsk_other',
+      });
+      expect(execCandidates.map((s) => s.name)).toEqual([execFree.name]);
+      const ownCandidates = listTaskPairCandidates({
+        brain: BRAIN, role: 'executor', pool: 'primary', exclude: new Set([BRAIN]), exceptTaskId: 'tsk_paused_queued_holder',
+      });
+      expect(ownCandidates.map((s) => s.name).sort()).toEqual([execFree.name, execHeld.name].sort());
+
+      const reusedProvision = await provisionSupervisionTarget({
+        parentSessionName: BRAIN,
+        pool: 'primary',
+        requestedCapabilityId: execCfg.capabilityId,
+        idempotencyKey: 'prov-should-not-reuse-held',
+        pairTaskId: 'tsk_other',
+      }, {
+        listSessions: () => [brain, execHeld, audHeld],
+        getSession: (name) => [brain, execHeld, audHeld].find((s) => s.name === name),
+        startSubSession: async () => { throw new Error('stop_before_spawn'); },
+      });
+      expect(reusedProvision).toMatchObject({ ok: false, reason: 'launch_failed' });
+
+      const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => all } });
+      // Auto pair_create omitting both roles MUST stay queued (never steal execHeld or audHeld; no free auditor exists yet).
+      const autoBoth = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Independent auto pair', brief: '# auto', workspace: 'none', idempotencyKey: 'q-auto-both',
+      });
+      expect(autoBoth).toMatchObject({ status: 'ok', state: 'queued' });
+      const autoBothState = getTaskPairStore().getPair(PROJECT, String(autoBoth.taskId))?.state;
+      expect([autoBothState?.executor, autoBothState?.auditor].filter((name) => name === execHeld.name || name === audHeld.name)).toEqual([]);
+      expect(autoBothState?.status).toBe('queued');
+
+      // Partial pair_create naming execFree and omitting auditor stays queued without stealing audHeld.
+      const partialNoSteal = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Partial pair must not steal queued auditor', brief: '# partial-2', executor: execFree.name, workspace: 'none', idempotencyKey: 'q-partial-2',
+      });
+      expect(partialNoSteal).toMatchObject({ status: 'ok', state: 'queued' });
+      const partialState = getTaskPairStore().getPair(PROJECT, String(partialNoSteal.taskId))?.state;
+      expect(partialState).toMatchObject({ executor: execFree.name });
+      expect(partialState?.auditor).toBeUndefined();
+
+      // With execFree now owned by queued partialNoSteal, a second pair naming execFree is rejected as concurrent open-pair reuse.
+      const reuseQueued = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Reuse queued execFree', brief: '# dup', executor: execFree.name, workspace: 'none', idempotencyKey: 'q-reuse-free',
+      });
+      expect(reuseQueued).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+
+      // Cancel pending autoBoth/partialNoSteal, add a free auditor audFree, and verify auto pair_create picks ONLY [execFree, audFree].
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(autoBoth.taskId), action: 'cancel', idempotencyKey: 'cancel-both' });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(partialNoSteal.taskId), action: 'cancel', idempotencyKey: 'cancel-partial' });
+      const audFree: SessionRecord = {
+        ...session('deck_sub_q_aud_free', 'w4'), parentSession: BRAIN, agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-6.2-sol',
+      };
+      upsertSession(audFree);
+      all.push(audFree);
+      const autoWithFreeAud = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Auto pair with free pool sessions', brief: '# auto-free', workspace: 'none', idempotencyKey: 'q-auto-free',
+      });
+      expect(autoWithFreeAud).toMatchObject({ status: 'ok', state: 'working' });
+      expect(getTaskPairStore().getPair(PROJECT, String(autoWithFreeAud.taskId))?.state).toMatchObject({
+        executor: execFree.name,
+        auditor: audFree.name,
+      });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(autoWithFreeAud.taskId), action: 'done', force: true, idempotencyKey: 'close-auto-free' });
+      removeSession(execFree.name);
+      removeSession(audFree.name);
+
+      // Downstream dependsOn pair MAY reference the holder's participants.
+      const dependent = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Dependent downstream', brief: '# dep', executor: execHeld.name, auditor: audHeld.name,
+        dependsOn: ['tsk_paused_queued_holder'], workspace: 'none', idempotencyKey: 'q-dep',
+      });
+      expect(dependent).toMatchObject({ status: 'ok', state: 'queued' });
+
+      // Resuming the paused queued holder itself immediately resumes and dispatches with its own reserved participants.
+      const resumed = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]({ taskId: 'tsk_paused_queued_holder' });
+      expect(resumed).toMatchObject({ status: 'ok', state: 'working' });
+      expect(getTaskPairStore().getPair(PROJECT, 'tsk_paused_queued_holder')?.state).toMatchObject({
+        status: 'working',
+        executor: execHeld.name,
+        auditor: audHeld.name,
+      });
+
+      // Closing holder leaves dependent in queued holding execHeld/audHeld, so another auto pair still stays queued without stealing them.
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'tsk_paused_queued_holder', action: 'done', force: true, idempotencyKey: 'close-holder' });
+      const whileDepQueued = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Fresh pair while dependent queued', brief: '# dep-holds', workspace: 'none', idempotencyKey: 'q-while-dep',
+      });
+      expect(whileDepQueued).toMatchObject({ status: 'ok', state: 'queued' });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(whileDepQueued.taskId), action: 'cancel', idempotencyKey: 'cancel-while-dep' });
+
+      // Closing dependent frees both participants, so a fresh auto pair_create starts working with [execHeld, audHeld].
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(dependent.taskId), action: 'cancel', idempotencyKey: 'close-dep' });
+      const afterClose = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Fresh pair after holder close', brief: '# free', workspace: 'none', idempotencyKey: 'q-after-close',
+      });
+      expect(afterClose).toMatchObject({ status: 'ok', state: 'working' });
+      expect(getTaskPairStore().getPair(PROJECT, String(afterClose.taskId))?.state).toMatchObject({
+        executor: execHeld.name,
+        auditor: audHeld.name,
       });
     } finally {
       setTaskPairDeliveryDepsForTests(undefined);

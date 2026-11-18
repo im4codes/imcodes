@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 import {
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
+  TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_TERMINAL_STATUSES,
   type TaskPairBrainNoticeStatus,
@@ -640,6 +641,27 @@ export class TaskPairStore {
       && TASK_PAIR_PARTICIPANT_STATUSES.includes(pair.state.status)
       && (pair.state.executor === sessionName || pair.state.auditor === sessionName)
     ));
+  }
+
+  /**
+   * Returns the first conflicting open pair (including `queued` and `paused`)
+   * in which `sessionName` is already assigned as `executor` or `auditor`.
+   * Excludes `exceptTaskId` and any explicit upstream `dependsOn` task IDs.
+   */
+  findOpenPairParticipantConflict(
+    sessionName: string,
+    options: { exceptTaskId?: string; dependsOn?: readonly string[] } = {},
+  ): { pair: StoredTaskPair; role: 'executor' | 'auditor' } | undefined {
+    if (!sessionName || sessionName === TASK_PAIR_NO_AUDITOR) return undefined;
+    const { exceptTaskId, dependsOn } = options;
+    for (const pair of this.#ensureActiveIndex().bySession.get(sessionName) ?? []) {
+      if (TASK_PAIR_TERMINAL_STATUSES.includes(pair.state.status)) continue;
+      if (pair.state.taskId === exceptTaskId) continue;
+      if (dependsOn?.includes(pair.state.taskId)) continue;
+      if (pair.state.executor === sessionName) return { pair, role: 'executor' };
+      if (pair.state.auditor === sessionName) return { pair, role: 'auditor' };
+    }
+    return undefined;
   }
 
   /** Full-state compare-and-update. No token means INSERT ONLY, never an unguarded overwrite. */

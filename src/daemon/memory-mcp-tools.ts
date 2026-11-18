@@ -2026,18 +2026,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     currentTaskId: string,
     dependencies: readonly string[] = [],
   ): { taskId: string; status: string; role: 'executor' | 'auditor' } | undefined => {
-    for (const holder of getTaskPairStore().pairsForSession(sessionName)) {
-      if (isTerminalTaskPairStatus(holder.state.status)) continue;
-      if (holder.state.taskId === currentTaskId) continue;
-      if (dependencies.includes(holder.state.taskId)) continue;
-      if (holder.state.executor === sessionName) {
-        return { taskId: holder.state.taskId, status: holder.state.status, role: 'executor' };
-      }
-      if (holder.state.auditor === sessionName) {
-        return { taskId: holder.state.taskId, status: holder.state.status, role: 'auditor' };
-      }
-    }
-    return undefined;
+    const conflict = getTaskPairStore().findOpenPairParticipantConflict(sessionName, {
+      exceptTaskId: currentTaskId,
+      dependsOn: dependencies,
+    });
+    return conflict
+      ? { taskId: conflict.pair.state.taskId, status: conflict.pair.state.status, role: conflict.role }
+      : undefined;
   };
   const openPairReuseError = (
     role: 'executor' | 'auditor',
@@ -3826,7 +3821,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         // Settle every role the caller did not name: reuse idle sessions, or create the missing ones (the no-pool default rule, or an
         // explicit createExecutor/createAuditor). Failure creates nothing and persists nothing.
         const ensured = await ensurePairSessions({
-          brain: brainName, project: context.project, taskId, title,
+          brain: brainName, project: context.project, taskId, title, dependsOn: dependencies,
           executor: executorArg, auditor: auditorArg, executorModel, auditorModel,
           createExecutor: createSpecArg(args, 'createExecutor'), createAuditor: createSpecArg(args, 'createAuditor'),
         });

@@ -85,6 +85,9 @@ export interface SupervisionAutoProvisionRequest {
   forceCreate?: boolean;
   /** Why the created session exists, recorded in its creation marker (default: explicit_create). */
   createdReason?: TaskPairCreatedSessionReason;
+  /** Task-pair context used to prevent reusing a session assigned to another non-terminal open pair. */
+  pairTaskId?: string;
+  pairDependsOn?: readonly string[];
 }
 
 export type SupervisionAutoProvisionResult =
@@ -241,10 +244,14 @@ function readyChildren(
   config: SupervisionExecutionConfig,
   now: number,
   identityPrompt?: string,
+  canReuseChild?: (session: SessionRecord) => boolean,
 ): SessionRecord[] {
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), now);
   return matchingChildren(sessions, parent, config, identityPrompt)
-    .filter((session) => sessionIsReady(session, availability.get(session.name)?.availability))
+    .filter((session) => (
+      sessionIsReady(session, availability.get(session.name)?.availability)
+      && (!canReuseChild || canReuseChild(session))
+    ))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -325,12 +332,13 @@ export async function defaultHasActiveSupervisionLease(
   sessionName: string,
   registryOverride?: Pick<SupervisionTaskRegistry, 'list'>,
 ): Promise<boolean> {
-  // On the `pairs` engine a session is leased while it is the executor or
-  // auditor of an open pair, so pool controls keep bounding provisioning.
+  // On the `pairs` engine a session is leased while it is assigned to any
+  // non-terminal open pair (including queued/paused), so pool reaping never
+  // discards an owned participant before it starts.
   const pairs = await import('./task-pairs/engine.js');
   if (!registryOverride && pairs.isPairsEngineSession(sessionName)) {
     const { getTaskPairStore } = await import('./task-pairs/store.js');
-    return getTaskPairStore().isParticipantOfOpenPair(sessionName);
+    return Boolean(getTaskPairStore().findOpenPairParticipantConflict(sessionName));
   }
   const registry = registryOverride
     ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
@@ -416,6 +424,7 @@ async function provisionConfig(
     | 'stopSubSession' | 'hasActiveSupervisionLease' | 'countActiveSupervisionAssignments'
     | 'wait' | 'readyTimeoutMs' | 'cooldownMs' | 'idleReapMs'>>,
   selectedPool: SupervisionProvisionPool,
+  canReuseChild?: (session: SessionRecord) => boolean,
 ): Promise<SupervisionAutoProvisionResult> {
   const requestedIdentityHash = provisionedIdentityHash(request.identityPrompt) ?? '';
   const force = request.forceCreate === true;
@@ -428,7 +437,7 @@ async function provisionConfig(
     const now = deps.now();
     // Forced: only the session THIS key already made counts as ready; any other idle session is none of this call's business.
     const forcedName = force ? attemptIdentity(request, config).sessionName : undefined;
-    const existingReady = readyChildren(deps.listSessions(), parent, config, now, request.identityPrompt)
+    const existingReady = readyChildren(deps.listSessions(), parent, config, now, request.identityPrompt, canReuseChild)
       .find((candidate) => forcedName === undefined || candidate.name === forcedName);
     if (existingReady) {
       return {
@@ -846,6 +855,16 @@ export async function provisionSupervisionTarget(
   }
 
   const sessions = deps.listSessions();
+  const pairs = await import('./task-pairs/engine.js');
+  const openPairStore = pairs.isPairsEngineProject(parent.projectName)
+    ? (await import('./task-pairs/store.js')).getTaskPairStore()
+    : undefined;
+  const canReuseChild = openPairStore
+    ? (session: SessionRecord): boolean => !openPairStore.findOpenPairParticipantConflict(session.name, {
+        exceptTaskId: request.pairTaskId,
+        dependsOn: request.pairDependsOn,
+      })
+    : undefined;
   const audited = request.auditedSessionName ? deps.getSession(request.auditedSessionName) : undefined;
   if (request.auditedSessionName && !audited) {
     return {
@@ -858,7 +877,7 @@ export async function provisionSupervisionTarget(
   if (!audited) {
     const ready = request.forceCreate
       ? undefined
-      : configs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
+      : configs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt, canReuseChild))[0];
     if (ready) {
       const config = configs.find((candidate) => configMatchesSession(candidate, ready, request.identityPrompt))!;
       return {
@@ -873,7 +892,7 @@ export async function provisionSupervisionTarget(
       const reason = status === 'limited' ? 'provider_limited' : 'provider_offline';
       return { ok: false, reason, evidence: failureEvidence(selectedPool, reason, config) };
     }
-    return provisionConfig(parent, request, config, deps, selectedPool);
+    return provisionConfig(parent, request, config, deps, selectedPool, canReuseChild);
   }
 
   const auditedFamily = resolvePeerAuditProviderFamily(audited);
@@ -881,7 +900,7 @@ export async function provisionSupervisionTarget(
   const sameConfigs = configs.filter((config) => config.providerFamily === auditedFamily);
   const crossReady = request.forceCreate
     ? undefined
-    : crossConfigs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
+    : crossConfigs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt, canReuseChild))[0];
   if (crossReady) {
     const config = crossConfigs.find((candidate) => configMatchesSession(candidate, crossReady, request.identityPrompt))!;
     return {
@@ -903,7 +922,7 @@ export async function provisionSupervisionTarget(
   let crossFailure: SupervisionProvisionFailureReason | undefined;
   let crossEvidence: SupervisionProvisioningEvidence | undefined;
   if (provisionableCross) {
-    const provisioned = await provisionConfig(parent, request, provisionableCross, deps, selectedPool);
+    const provisioned = await provisionConfig(parent, request, provisionableCross, deps, selectedPool, canReuseChild);
     if (provisioned.ok) return { ...provisioned, auditRoutingReason: 'cross_vendor_preferred' };
     crossFailure = provisioned.reason;
     crossEvidence = provisioned.evidence;
@@ -922,7 +941,7 @@ export async function provisionSupervisionTarget(
 
   const sameReady = request.forceCreate
     ? undefined
-    : sameConfigs.flatMap((config) => readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt))
+    : sameConfigs.flatMap((config) => readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt, canReuseChild))
       .filter((session) => session.name !== audited.name)[0];
   if (sameReady) {
     const config = sameConfigs.find((candidate) => configMatchesSession(candidate, sameReady, request.identityPrompt))!;
@@ -945,7 +964,7 @@ export async function provisionSupervisionTarget(
   if (sameConfig) {
     const status = configurationAvailability(deps.listSessions(), parent, sameConfig, deps.now());
     if (status === 'available') {
-      const provisioned = await provisionConfig(parent, request, sameConfig, deps, selectedPool);
+      const provisioned = await provisionConfig(parent, request, sameConfig, deps, selectedPool, canReuseChild);
       if (provisioned.ok && provisioned.target.name !== audited.name) {
         return {
           ...provisioned,

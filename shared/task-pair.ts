@@ -895,7 +895,7 @@ export const TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE: string =
 
 /** Short form for MCP tool schema descriptions with a tight byte budget. */
 export const TASK_PAIR_SESSION_ISOLATION_AND_POOL_SHORT_RULE: string =
-  'Never reuse a sub-session across concurrent open pairs; omit executor/auditor/models by default when an execution pool is configured.';
+  'No cross-pair reuse; omit executor/auditor/models when pool set.';
 
 /**
  * Brain drives pairs with the MCP tools only. The daemon still PARSES a legacy IMCODES_TASK marker from a Brain (existing

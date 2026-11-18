@@ -624,7 +624,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
   }
 
-  async #queueProvision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude?: ReadonlySet<string>; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }): Promise<string | undefined> {
+  async #queueProvision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude?: ReadonlySet<string>; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string; dependsOn?: readonly string[] }): Promise<string | undefined> {
     const { exclude: _exclude, ...provisionInput } = input;
     return this.#withQueueTimeout(this.#provision(provisionInput), 'provision', input.taskId);
   }
@@ -910,12 +910,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
     logger.info({ project, taskId: pair.taskId, reason }, 'task-pair: queue skipped pair');
   }
 
-  #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string; avoidProviderFamily?: string }): string | undefined {
+  #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string; avoidProviderFamily?: string; exceptTaskId?: string; dependsOn?: readonly string[] }): string | undefined {
     if (this.#deps.pickCandidate) return this.#deps.pickCandidate(input);
     return listTaskPairCandidates(input)[0]?.name;
   }
 
-  async #provision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }): Promise<string | undefined> {
+  async #provision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string; dependsOn?: readonly string[] }): Promise<string | undefined> {
     if (this.#deps.provision) return this.#deps.provision(input);
     const config = roleEligibleProvisionConfig(input);
     if (!config) return undefined;
@@ -923,6 +923,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const result = await provisionSupervisionTarget({
       parentSessionName: input.brain,
       pool: input.role === 'auditor' ? 'primary' : input.pool,
+      pairTaskId: input.taskId,
+      pairDependsOn: input.dependsOn,
       // Owner rule: a named model is provisioned as-is even when it is not a
       // pool member -- manual_explicit is the only provenance that bypasses
       // the "pool must be configured" gate, so it must carry the full config
@@ -1894,13 +1896,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // failover is to keep going, not to wait on that specific model.
     const requestedModel = opts.dueToLimit ? undefined : pair.auditorModel;
     const avoidProviderFamily = opts.dueToLimit && hadRealAuditor ? providerFamilyOfSession(pair.auditor!) : undefined;
-    const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel, avoidProviderFamily };
+    const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel, avoidProviderFamily, exceptTaskId: pair.taskId, dependsOn: pair.scheduling?.dependsOn };
     const picked = this.#pick(pickInput);
     const next = picked ?? await this.#provision({ ...pickInput, taskId });
     if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, taskId)?.revision !== stored.revision) return false;
     // Injectable pickers are used by tests and integrations, so enforce the
     // same idle/non-reserved contract here as the default pool picker.
-    if (next && (exclude.has(next) || this.#busy(next))) {
+    if (next && (exclude.has(next) || this.#busy(next) || !!store.findOpenPairParticipantConflict(next, { exceptTaskId: pair.taskId, dependsOn: pair.scheduling?.dependsOn }))) {
       this.#retainAuditorNotice(project, stored,
         `No idle auditor is available; retained ${pair.auditor ?? '(none)'} and left pair status ${pair.status}.`,
         `auditor-reassignment-held:${pair.round}:no-idle-candidate`);
@@ -1979,7 +1981,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const exclude = new Set<string>([pair.brain, pair.executor!, ...(pair.auditor ? [pair.auditor] : [])]);
     const requestedModel = opts.dueToLimit ? undefined : pair.executorModel;
     const avoidProviderFamily = opts.dueToLimit ? providerFamilyOfSession(pair.executor!) : undefined;
-    const pickInput = { brain: pair.brain, role: 'executor' as const, pool, exclude, project, requestedModel, avoidProviderFamily };
+    const pickInput = { brain: pair.brain, role: 'executor' as const, pool, exclude, project, requestedModel, avoidProviderFamily, exceptTaskId: pair.taskId, dependsOn: pair.scheduling?.dependsOn };
     const next = this.#pick(pickInput) ?? await this.#provision({ ...pickInput, taskId });
     if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, taskId)?.revision !== stored.revision) return false;
     if (!next) {
@@ -2046,10 +2048,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
       await this.#flagNoPoolAndNotify(project, taskId, pair.brain);
       return;
     }
-    const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
+    const pool = pair.executorPool === 'economy' ? 'economy' as const : 'primary' as const;
     const exclude = new Set<string>([pair.brain, ...(pair.auditor ? [pair.auditor] : [])]);
-    const next = this.#pick({ brain: pair.brain, role: 'executor', pool, exclude, project, requestedModel })
-      ?? await this.#provision({ brain: pair.brain, role: 'executor', pool, project, taskId, requestedModel });
+    const pickInput = { brain: pair.brain, role: 'executor' as const, pool, exclude, project, requestedModel, exceptTaskId: pair.taskId, dependsOn: pair.scheduling?.dependsOn };
+    const next = this.#pick(pickInput)
+      ?? await this.#provision({ ...pickInput, taskId });
     if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, taskId)?.revision !== stored.revision) return;
     if (!next) {
       this.#flagOnce(
@@ -2263,15 +2266,34 @@ export class TaskPairAutomation implements TaskPairScheduler {
         continue;
       }
       // A session named explicitly on QUEUE (executor=/auditor=) is reserved
-      // even while queued. If it is held by another pair or busy right now,
-      // this pair waits for it rather than silently substituting an auto-pick
-      // -- the owner named that session on purpose.
-      const namedParticipantHeld = (session: string | undefined): boolean => !!session
-        && session !== TASK_PAIR_NO_AUDITOR
-        && getTaskPairStore().isParticipantOfOpenPair(session, pair.taskId);
-      const heldSession = [pair.executor, pair.auditor]
+      // even while queued. If it is held by another pair (active, suspended, or
+      // ahead in queue order) or busy right now, this pair waits for it rather
+      // than silently substituting an auto-pick.
+      const namedParticipantConflict = (session: string | undefined) => {
+        if (!session || session === TASK_PAIR_NO_AUDITOR) return undefined;
+        const conflict = store.findOpenPairParticipantConflict(session, {
+          exceptTaskId: pair.taskId,
+          dependsOn: pair.scheduling?.dependsOn,
+        });
+        if (!conflict) return undefined;
+        const holderState = conflict.pair.state;
+        // A downstream pair waiting on this pair via dependsOn never blocks the
+        // upstream pair itself (otherwise upstream and downstream deadlock).
+        if (holderState.scheduling?.dependsOn?.includes(pair.taskId)) return undefined;
+        if (
+          holderState.status !== 'queued'
+          || isTaskPairSuspended(holderState)
+          || compareQueuedTaskPairs(conflict.pair, stored) < 0
+        ) {
+          return conflict.pair;
+        }
+        return undefined;
+      };
+      const heldEntry = [pair.executor, pair.auditor]
         .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
-        .find((session) => namedParticipantHeld(session));
+        .map((session) => ({ session, holder: namedParticipantConflict(session) }))
+        .find((entry) => !!entry.holder);
+      const heldSession = heldEntry?.session;
       const busyReasonsOf = (session: string | false | undefined): string => {
         if (!session || this.#deps.isBusy) return '';
         const reasons = describeSessionBusy(session, this.#deps.busyProbe);
@@ -2281,10 +2303,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
         .find((session) => this.#busy(session));
       if (heldSession || busySession) {
-        const holder = heldSession
-          ? getTaskPairStore().listActivePairs().find((candidate) => candidate.state.taskId !== pair.taskId
-            && (candidate.state.executor === heldSession || candidate.state.auditor === heldSession))
-          : undefined;
+        const holder = heldEntry?.holder;
         const detail = heldSession
           ? buildHeldWaitReason(heldSession, holder?.state, this.#now())
           : `waiting for ${busySession} (session busy${busyReasonsOf(busySession)})`;
@@ -2312,15 +2331,15 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const expected = store.getPair(project, pair.taskId);
       if (!expected || expected.state.brain !== brain || expected.state.status !== 'queued' || isTaskPairSuspended(expected.state)) continue;
       pair = expected.state;
-      const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
+      const pool = pair.executorPool === 'economy' ? 'economy' as const : 'primary' as const;
       const executor = pair.executor
-        ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel })
-        ?? await this.#queueProvision({ brain, role: 'executor', pool, project, taskId: pair.taskId, requestedModel: pair.executorModel });
+        ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel, exceptTaskId: pair.taskId, dependsOn: pair.scheduling?.dependsOn })
+        ?? await this.#queueProvision({ brain, role: 'executor', pool, project, taskId: pair.taskId, requestedModel: pair.executorModel, dependsOn: pair.scheduling?.dependsOn });
       if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, pair.taskId)?.revision !== expected?.revision) continue;
       const auditor = pair.auditor
         ?? (executor
-          ? this.#pick({ brain, role: 'auditor', pool: 'primary', exclude: new Set([brain, executor]), project, requestedModel: pair.auditorModel })
-            ?? await this.#queueProvision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel })
+          ? this.#pick({ brain, role: 'auditor', pool: 'primary', exclude: new Set([brain, executor]), project, requestedModel: pair.auditorModel, exceptTaskId: pair.taskId, dependsOn: pair.scheduling?.dependsOn })
+            ?? await this.#queueProvision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel, dependsOn: pair.scheduling?.dependsOn })
           : undefined);
       if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, pair.taskId)?.revision !== expected?.revision) continue;
       if (!executor || !auditor || executor === auditor) {

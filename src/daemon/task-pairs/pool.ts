@@ -249,6 +249,10 @@ export function listTaskPairCandidates(input: {
    * the only option.
    */
   avoidProviderFamily?: string;
+  /** Pair id whose own existing assignment is allowed during pick/dispatch. */
+  exceptTaskId?: string;
+  /** Upstream pair ids awaited via dependsOn (owned sessions stay allowed for downstream waiting). */
+  dependsOn?: readonly string[];
 }, deps: TaskPairPoolDeps = {}): SessionRecord[] {
   const sessions = (deps.listSessions ?? (() => listSessions()))();
   const parent = sessions.find((session) => session.name === input.brain) ?? (deps.getSession ?? getSession)(input.brain);
@@ -288,7 +292,7 @@ export function listTaskPairCandidates(input: {
       && !isWorking(session.name)
       && availability.get(session.name)?.availability === DELEGATION_AVAILABILITY.READY
       && !hasPending(session.name)
-      && !store.isParticipantOfOpenPair(session.name)
+      && !store.findOpenPairParticipantConflict(session.name, { exceptTaskId: input.exceptTaskId, dependsOn: input.dependsOn })
     ))
     .sort((a, b) => {
       // Tier policy is only an automatic preference. Named models return
