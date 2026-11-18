@@ -584,7 +584,6 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
     TASK_PAIR_VALIDATION_REPORT_RULE,
     TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
     TASK_PAIR_INTERSESSION_SEND_RULE,
-    TASK_PAIR_INTERSESSION_SEND_RULE,
     `${NO_LEGACY_ARTIFACTS} If the material cannot be reached (executor limited/offline, workspace unreadable), write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0 or REWORK.`,
     contracts(pair.blocking),
   ].join('\n');
