@@ -150,3 +150,39 @@ describe('buildBashNodeDatachannelRepair', () => {
     expect(repairLog).toContain('node-datachannel repair succeeded');
   });
 });
+
+describe('node-datachannel optional dependency decoupling', () => {
+  it('keeps direct-file-transfer-worker free of compile-time node-datachannel imports', () => {
+    const workerSource = readFileSync(join(process.cwd(), 'src', 'daemon', 'direct-file-transfer-worker.ts'), 'utf8');
+    expect(workerSource).not.toMatch(/import\(\s*['"]node-datachannel['"]\s*\)/);
+    expect(workerSource).not.toMatch(/from\s+['"]node-datachannel['"]/);
+
+    const tmpDir = mkdtempSync(join(tmpdir(), 'imcodes-missing-ndc-tsc-'));
+    cleanup.push(tmpDir);
+    const isolatedTsconfigPath = join(tmpDir, 'tsconfig.missing-ndc.json');
+    const rootDir = process.cwd();
+    writeFileSync(isolatedTsconfigPath, JSON.stringify({
+      extends: join(rootDir, 'tsconfig.json'),
+      compilerOptions: {
+        paths: {
+          'node-datachannel': [join(tmpDir, '__missing_optional_dep__')],
+        },
+      },
+      include: [join(rootDir, 'src', 'daemon', 'direct-file-transfer-worker.ts')],
+    }, null, 2));
+
+    const tscBin = join(rootDir, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
+    execFileSync(
+      tscBin,
+      ['-p', isolatedTsconfigPath, '--noEmit'],
+      { cwd: rootDir, stdio: 'pipe', shell: process.platform === 'win32' },
+    );
+  });
+
+  it('triggers bounded best-effort repair in scripts/ci-npm-ci.sh when node-datachannel is absent', () => {
+    const ciScript = readFileSync(join(process.cwd(), 'scripts', 'ci-npm-ci.sh'), 'utf8');
+    expect(ciScript).toContain('node_modules/node-datachannel/package.json');
+    expect(ciScript).toContain('node src/util/node-datachannel-repair.mjs');
+    expect(ciScript).toContain('repair_attempt" -le 2');
+  });
+});

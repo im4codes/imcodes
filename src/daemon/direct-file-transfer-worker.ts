@@ -279,10 +279,77 @@ function senderFor(senderId: string): WorkerControlSender {
   return created;
 };
 
-type NodeDataChannel = typeof import('node-datachannel');
-type PeerConnection = import('node-datachannel').PeerConnection;
-type DataChannel = import('node-datachannel').DataChannel;
-type NodeDataChannelIceServer = string | import('node-datachannel').IceServer;
+type NodeDataChannelDescriptionType = 'offer' | 'answer' | 'pranswer' | 'rollback';
+
+interface NodeDataChannelIceServerConfig {
+  hostname: string;
+  port: number;
+  username?: string;
+  password?: string;
+  relayType?: 'TurnUdp' | 'TurnTcp' | 'TurnTls';
+}
+
+type NodeDataChannelIceServer = string | NodeDataChannelIceServerConfig;
+
+interface NodeDataChannelRtcConfig {
+  iceServers: NodeDataChannelIceServer[];
+  maxMessageSize?: number;
+}
+
+interface NodeDataChannelSelectedCandidateInfo {
+  address: string;
+  port: number;
+  type: string;
+  transportType: string;
+}
+
+interface DataChannel {
+  getLabel(): string;
+  getId(): number;
+  getProtocol(): string;
+  close(): void;
+  sendMessage(msg: string): boolean;
+  sendMessageBinary(buffer: Buffer | Uint8Array): boolean;
+  isOpen(): boolean;
+  bufferedAmount(): number;
+  maxMessageSize(): number;
+  setBufferedAmountLowThreshold(newSize: number): void;
+  onOpen(cb: () => void): void;
+  onClosed(cb: () => void): void;
+  onError(cb: (err: string) => void): void;
+  onBufferedAmountLow(cb: () => void): void;
+  onMessage(cb: (msg: string | Buffer | ArrayBuffer) => void): void;
+}
+
+interface PeerConnection {
+  close(): void;
+  setLocalDescription(type?: NodeDataChannelDescriptionType): void;
+  setRemoteDescription(sdp: string, type: NodeDataChannelDescriptionType): void;
+  localDescription(): { type: NodeDataChannelDescriptionType; sdp: string } | null;
+  remoteDescription(): { type: NodeDataChannelDescriptionType; sdp: string } | null;
+  addRemoteCandidate(candidate: string, mid: string): void;
+  createDataChannel(label: string, config?: unknown): DataChannel;
+  state(): string;
+  iceState(): string;
+  signalingState(): string;
+  gatheringState(): string;
+  onLocalDescription(cb: (sdp: string, type: NodeDataChannelDescriptionType) => void): void;
+  onLocalCandidate(cb: (candidate: string, mid: string) => void): void;
+  onStateChange(cb: (state: string) => void): void;
+  onIceStateChange(cb: (state: string) => void): void;
+  onSignalingStateChange(cb: (state: string) => void): void;
+  onGatheringStateChange(cb: (state: string) => void): void;
+  onDataChannel(cb: (dc: DataChannel) => void): void;
+  rtt(): number;
+  getSelectedCandidatePair(): { local: NodeDataChannelSelectedCandidateInfo; remote: NodeDataChannelSelectedCandidateInfo } | null;
+  maxMessageSize(): number;
+}
+
+interface NodeDataChannel {
+  initLogger(level: 'Verbose' | 'Debug' | 'Info' | 'Warning' | 'Error' | 'Fatal' | 'None', cb?: (level: string, message: string) => void): void;
+  cleanup(): void;
+  PeerConnection: new (peerName: string, config: NodeDataChannelRtcConfig) => PeerConnection;
+}
 
 interface PendingLeaseCandidate {
   requestId: string;
@@ -1002,7 +1069,8 @@ export async function initializeDirectFileTransfer(): Promise<boolean> {
   if (loadAttempted) return rtc !== null;
   loadAttempted = true;
   try {
-    rtc = await import('node-datachannel');
+    const nodeDataChannelSpecifier: string = 'node-datachannel';
+    rtc = (await import(nodeDataChannelSpecifier)) as NodeDataChannel;
     // Native transport diagnostics can include SDP/candidate material.  Keep
     // this lifecycle signal structural rather than forwarding that payload.
     rtc.initLogger('Warning', () => logger.debug({ event: 'direct_file_v2.native_warning' }, 'node-datachannel warning'));

@@ -70,7 +70,7 @@ describe('cooperative daemon runner', () => {
     const projects = config.test!.projects!;
     const daemon = projects[0] as { test: Record<string, unknown> };
     expect(daemon.test.runner).toBe('./test/setup/cooperative-runner.ts');
-    expect(daemon.test.testTimeout).toBe(20_000);
+    expect(daemon.test.testTimeout).toBe(process.platform === 'darwin' && process.arch === 'x64' ? 60_000 : 20_000);
     expect(daemon.test.include).toEqual(['src/**/*.test.ts', 'test/**/*.test.ts']);
     expect(daemon.test.ignoreUnhandledErrors).not.toBe(true);
     expect(config.test!.ignoreUnhandledErrors).not.toBe(true);

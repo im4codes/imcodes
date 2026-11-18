@@ -39,3 +39,17 @@ while true; do
   sleep "$sleep_for"
   attempt=$(( attempt + 1 ))
 done
+
+if [ -f package.json ] && grep -q '"node-datachannel"' package.json && [ ! -f node_modules/node-datachannel/package.json ]; then
+  echo "WARNING: optional dependency node-datachannel is missing after npm ci; attempting best-effort repair..." >&2
+  repair_attempt=1
+  while [ "$repair_attempt" -le 2 ]; do
+    if node src/util/node-datachannel-repair.mjs || true; then
+      if [ -f node_modules/node-datachannel/package.json ]; then
+        echo "node-datachannel repair succeeded on attempt ${repair_attempt}"
+        break
+      fi
+    fi
+    repair_attempt=$(( repair_attempt + 1 ))
+  done
+fi
