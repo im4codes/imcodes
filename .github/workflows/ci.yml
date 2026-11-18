@@ -226,8 +226,8 @@ jobs:
   macos-remote-desktop-components:
     name: macOS Remote Desktop (from SDK)
     runs-on: macos-15
-    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.5 min, max 2.2).
-    timeout-minutes: 20
+    # Covers ~15-25 min GitHub-hosted macOS runner queue behind concurrent macos-unit-tests shards plus ~2-4 min SDK download & build, while still bounding hung runs well below GitHub's 6 h default.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

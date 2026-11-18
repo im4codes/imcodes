@@ -87,6 +87,15 @@ describe('every CI job ends itself', () => {
     const workflow: Workflow = { jobs: { waits: { 'timeout-minutes': 30, steps: [{ run: 'node scripts/resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000' }] } } };
     expect(jobsCutOffBeforeTheirWait(workflow)).toEqual(['waits']);
   });
+
+  it('gives macOS Remote Desktop (from SDK) enough headroom for macOS runner queue contention', () => {
+    const ci = parse(readFileSync(join(WORKFLOW_DIR, 'ci.yml'), 'utf8')) as Workflow;
+    const macosRemoteDesktop = ci.jobs['macos-remote-desktop-components'];
+    expect(macosRemoteDesktop).toBeDefined();
+    expect(typeof macosRemoteDesktop!['timeout-minutes']).toBe('number');
+    expect(macosRemoteDesktop!['timeout-minutes'] as number).toBeGreaterThanOrEqual(60);
+    expect(macosRemoteDesktop!['timeout-minutes'] as number).toBeLessThan(GITHUB_MAX_JOB_MINUTES);
+  });
 });
 
 describe('runner context is only used where a runner exists', () => {
