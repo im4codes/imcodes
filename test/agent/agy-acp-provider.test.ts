@@ -3044,4 +3044,230 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       await runtime.kill();
     }
   });
+
+  it('settles runtime cleanly to idle when native ACP end_turn records an ack before delayed reactive transcript arrives, preserves background/prompt work, and avoids duplicate onComplete', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_f1_ack_idle';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ content: m.content }); });
+
+    try {
+      expect(runtime.send('warm', 'ack-warm-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+      const beforeReactiveCompleted = completed.length;
+
+      // Case 1: SYSTEM_MESSAGE wakeup makes agyReactive=true; ACP native autonomous end_turn arrives FIRST,
+      // then delayed matching transcript PLANNER_RESPONSE arrives and consumes agyNativeAcks[0].
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 20,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-18T00:00:00Z sender=worker-ack content=wake',
+      });
+      expect(state.agyReactive).toBe(true);
+      expect(runtime.getStatus()).not.toBe('idle');
+
+      // Native autonomous ACP end_turn settles while agyReactive=true (status stays running, ack pushed).
+      (provider as any).startAutonomousTurn(id, state);
+      const gen1 = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:acp-1`;
+      state.currentText = 'NATIVE-ACP-FIRST-DONE';
+      (state.activePromptGenerations ??= new Set()).add(gen1);
+      (provider as any).settleTurn(id, state, gen1, 'end_turn');
+      expect(completed).toHaveLength(beforeReactiveCompleted + 1);
+      expect(completed.at(-1)?.content).toBe('NATIVE-ACP-FIRST-DONE');
+      expect(state.agyNativeAcks).toHaveLength(1);
+      expect(runtime.getStatus()).not.toBe('idle');
+
+      // Delayed transcript PLANNER_RESPONSE arrives with matching text: consumes ack without duplicate onComplete,
+      // and transitions runtime cleanly to idle (zero remaining work).
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 21,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'NATIVE-ACP-FIRST-DONE',
+      });
+      expect(state.agyReactive).toBe(false);
+      expect(state.agyNativeAcks).toHaveLength(0);
+      expect(completed).toHaveLength(beforeReactiveCompleted + 1);
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 0,
+        backgroundWorkCount: 0,
+        busyReasons: [],
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Case 2: Same ACP-first + delayed ack sequence while a real non-daemon background task IS still active:
+      // status must remain tool_running until the background task finishes.
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/bg-keep-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'npm test', WaitMsBeforeAsync: 500 },
+        toolStatus: 'running',
+      });
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 22,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: '[Message] timestamp=2026-11-18T00:01:00Z sender=worker-ack-2 content=wake2',
+      });
+      (provider as any).startAutonomousTurn(id, state);
+      const gen2 = state.autonomousTurnGeneration as number;
+      state.currentMessageId = `${nativeId}:acp-2`;
+      state.currentText = 'NATIVE-ACP-WITH-BG';
+      (state.activePromptGenerations ??= new Set()).add(gen2);
+      (provider as any).settleTurn(id, state, gen2, 'end_turn');
+      expect(completed).toHaveLength(beforeReactiveCompleted + 2);
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 23,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'NATIVE-ACP-WITH-BG',
+      });
+      expect(completed).toHaveLength(beforeReactiveCompleted + 2);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Background task completion clears cleanly to idle.
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 24,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `[Message] timestamp=2026-11-18T00:02:00Z sender=${nativeId}/bg-keep-1 content=Task id "${nativeId}/bg-keep-1" finished with result:\nCommand exited with code 0.`,
+      });
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 25,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+      });
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Case 3: Successor foreground prompt in flight must not be cleared when delayed ack row arrives,
+      // and foreground claim clearing agyReactive while !promptInFlight must settle cleanly to idle.
+      state.agyReactive = true;
+      state.promptInFlight = true;
+      (provider as any).emitStatus(id, state, { status: 'thinking', label: 'Thinking...' });
+      state.agyNativeAcks = [{ generation: 99, text: 'DELAYED-ACK' }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 26,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'DELAYED-ACK',
+      });
+      expect(state.promptInFlight).toBe(true);
+      expect(state.lastStatusSignature).not.toBe(JSON.stringify({ status: null, label: null }));
+      state.promptInFlight = false;
+      state.agyPendingResponses?.clear();
+      state.agyNativeAcks = [];
+      state.agyReactive = true;
+      (provider as any).syncAgyStatusAfterTurn(id, state);
+      expect(runtime.getStatus()).not.toBe('idle');
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 27,
+        type: 'USER_INPUT',
+        status: 'DONE',
+        content: 'user cleared reactive',
+      });
+      expect(state.agyReactive).toBe(false);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('does not reconcile active subagents on transcript-first ERROR/RUNNING manage_subagents(list) or mixed ACP/transcript errors, and reconciles cleanly on terminal DONE', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_f2_generic_status';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push({ content: m.content }); });
+    provider.onToolCall((sid, evt) => { if (sid === id) events.push(evt); });
+
+    try {
+      expect(runtime.send('warm', 'f2-warm')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // Seed one running native child.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'f2-launch',
+          title: 'Run invoke_subagent',
+          status: 'completed',
+          rawInput: { Subagents: [{ Role: 'WorkerKeep' }] },
+          rawOutput: JSON.stringify({ conversationId: 'child-keep', status: 'running' }),
+        },
+      });
+      await vi.waitFor(() => expect(state.agySubagents?.activeCount()).toBe(1), { timeout: 5000 });
+      const beforeEvents = events.length;
+
+      // 1) Transcript-first GENERIC status:ERROR with content:'[]' (no pending ACP event) MUST NOT complete child-keep.
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 10, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 11,
+        type: 'GENERIC',
+        status: 'ERROR',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(1);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.normalizedStatus === 'complete')).toBe(false);
+
+      // 2) Transcript-first GENERIC status:RUNNING with content:'[]' MUST NOT complete child-keep.
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 12, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 13,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(1);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.normalizedStatus === 'complete')).toBe(false);
+
+      // 3) Mixed order: ACP tool_call complete with empty output, followed by transcript GENERIC status:ERROR content:'[]':
+      // transcript ERROR still wins and MUST NOT complete child-keep.
+      (provider as any).handleSessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'f2-list-acp-empty',
+          title: 'Run manage_subagents',
+          status: 'completed',
+          rawInput: { Action: 'list' },
+        },
+      });
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 14, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 15,
+        type: 'GENERIC',
+        status: 'ERROR',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(1);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.normalizedStatus === 'complete')).toBe(false);
+
+      // 4) Positive control: transcript-first GENERIC status:DONE content:'[]' reconciles child-keep to COMPLETE.
+      state.agyNativeToolOrder = [{ name: 'manage_subagents', input: { Action: 'list' }, step: 16, index: 0 }];
+      (provider as any).handleAgyTranscriptRow(id, state, nativeId, {
+        step_index: 17,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: '[]',
+      });
+      expect(state.agySubagents.activeCount()).toBe(0);
+      expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.agentPath === 'child-keep' && e.detail?.meta?.normalizedStatus === 'complete')).toBe(true);
+    } finally {
+      await runtime.kill();
+    }
+  });
 });
