@@ -243,10 +243,11 @@ import {
   collectRecentSummarySyncCandidates,
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
-import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, MUSE_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, MUSE_MODEL_IDS, looksLikeCodexModelId, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { resolveCodexModelIds } from '../agent/codex-model-resolution.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
@@ -3592,10 +3593,12 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
         if (preset) return { models: getPresetAvailableModelIds(preset) };
       }
       const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
-      const models = sdkRuntime.availableModels?.length
-        ? sdkRuntime.availableModels
-        : record.codexAvailableModels?.length ? record.codexAvailableModels : [...CODEX_MODEL_IDS];
-      return { models: [...models] };
+      const models = resolveCodexModelIds({
+        dynamicModels: sdkRuntime.models?.length ? sdkRuntime.models.map((model) => model.id) : sdkRuntime.availableModels,
+        persistedModels: record.codexAvailableModels,
+        requestedModels: [record.requestedModel, record.activeModel],
+      });
+      return { models };
     }
     case 'grok-sdk': {
       const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
@@ -3730,7 +3733,7 @@ async function applyTransportModelSwitch(
     const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
     const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
     const availableModels = validated?.models ?? [];
-    if (!availableModels.includes(requestedModel)) {
+    if (!availableModels.includes(requestedModel) && !looksLikeCodexModelId(requestedModel)) {
       return refuse(
         SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
         `Unknown Codex model: ${requestedModel}`,
