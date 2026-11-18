@@ -243,7 +243,7 @@ import {
   collectRecentSummarySyncCandidates,
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
-import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, MUSE_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, looksLikeCodexModelId, MUSE_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
@@ -3547,7 +3547,7 @@ async function applyTransportModelSwitch(
     const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
     const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
     const availableModels = validated?.models ?? [];
-    if (!availableModels.includes(requestedModel)) {
+    if (!availableModels.includes(requestedModel) && (Boolean(record.ccPreset) || !looksLikeCodexModelId(requestedModel))) {
       return refuse(
         SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
         `Unknown Codex model: ${requestedModel}`,

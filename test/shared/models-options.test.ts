@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AGY_FALLBACK_MODEL_IDS, isAgyModelId } from '../../shared/agy-agent.js';
-import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, GEMINI_MODEL_IDS, looksLikeCodexModelId, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, DEFAULT_CODEX_SESSION_MODEL, GEMINI_MODEL_IDS, looksLikeCodexModelId, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
 
 describe('normalizeClaudeCodeModelId', () => {
   it('maps opus alias to opus[1M]', () => {
@@ -64,6 +64,10 @@ describe('provider model classification', () => {
   });
   it.each(['codex-mini-latest', 'gpt-6.2-sol'])('keeps real Codex model %s', (model) => {
     expect(looksLikeCodexModelId(model)).toBe(true);
+  });
+  it('includes gpt-6.2-sol in CODEX_MODEL_IDS while preserving the default Codex session model first', () => {
+    expect(CODEX_MODEL_IDS[0]).toBe(DEFAULT_CODEX_SESSION_MODEL);
+    expect(CODEX_MODEL_IDS).toContain('gpt-6.2-sol');
   });
   it.each(['high', 'medium', 'low'])('includes Carbon %s in both AGY catalogs', (tier) => {
     const model = `gemini-4-carbon-${tier}`;

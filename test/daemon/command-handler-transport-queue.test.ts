@@ -86,6 +86,7 @@ const {
   updateQueuedTaskIntentMock,
   removeQueuedTaskIntentMock,
   getQwenRuntimeConfigMock,
+  getCodexRuntimeConfigMock,
   searchLocalMemoryMock,
   searchLocalMemoryAuthorizedMock,
   searchLocalMemorySemanticMock,
@@ -103,6 +104,7 @@ const {
   getProviderMock,
   ensureProviderConnectedMock,
   getPresetModelCatalogMock,
+  getPresetMock,
   loadPresetsMock,
   lookupAttachmentMock,
   buildSessionListMock,
@@ -159,6 +161,8 @@ const {
   getProviderMock: vi.fn(),
   ensureProviderConnectedMock: vi.fn(),
   getPresetModelCatalogMock: vi.fn(),
+  getPresetMock: vi.fn().mockResolvedValue(undefined),
+  getCodexRuntimeConfigMock: vi.fn().mockResolvedValue({}),
   loadPresetsMock: vi.fn().mockResolvedValue([]),
   lookupAttachmentMock: vi.fn(() => undefined),
   buildSessionListMock: vi.fn(async () => []),
@@ -288,6 +292,10 @@ vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
   getQwenRuntimeConfig: getQwenRuntimeConfigMock,
 }));
 
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: getCodexRuntimeConfigMock,
+}));
+
 vi.mock('../../src/agent/provider-registry.js', () => ({
   getProvider: getProviderMock,
   ensureProviderConnected: ensureProviderConnectedMock,
@@ -295,6 +303,7 @@ vi.mock('../../src/agent/provider-registry.js', () => ({
 
 vi.mock('../../src/daemon/cc-presets.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/daemon/cc-presets.js')>(),
+  getPreset: getPresetMock,
   getPresetModelCatalog: getPresetModelCatalogMock,
   loadPresets: loadPresetsMock,
 }));
@@ -558,6 +567,8 @@ describe('handleWebCommand transport queue behavior', () => {
     resetMemoryFeatureConfigStoreForTests();
     supervisionDecideMock.mockResolvedValue({ decision: 'complete', reason: 'ok', confidence: 0.9 });
     getQwenRuntimeConfigMock.mockResolvedValue({});
+    getCodexRuntimeConfigMock.mockResolvedValue({});
+    getPresetMock.mockResolvedValue(undefined);
     historyWorkerDispatchMock.mockReset();
     shouldUseHistoryWorkerMock.mockReset();
     shouldUseHistoryWorkerMock.mockReturnValue(false);
@@ -5512,6 +5523,87 @@ describe('handleWebCommand transport queue behavior', () => {
     it('rejects thinking control for agents without effort support', async () => {
       getSessionMock.mockReturnValue({ name: 'deck_sub_unsupported_effort', projectName: 'p', role: 'w1', agentType: 'cursor-headless', runtimeType: 'transport', state: 'idle' });
       await expect(switchSessionThinkingNow('deck_sub_unsupported_effort', 'high')).resolves.toMatchObject({ ok: false, code: 'thinking_unsupported' });
+    });
+
+    it('allows switching a non-preset codex-sdk session to gpt-6.2-sol even when stale runtime catalog omits it', async () => {
+      const setAgentId = vi.fn();
+      getCodexRuntimeConfigMock.mockResolvedValue({ availableModels: ['gpt-6.1-sol', 'gpt-6-sol'] });
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_codex_62',
+        projectName: 'p',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'running',
+        activeModel: 'gpt-6.1-sol',
+        codexAvailableModels: ['gpt-6.1-sol', 'gpt-6-sol'],
+      });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-codex-62', setAgentId, pendingCount: 0 });
+
+      const result = await switchSessionModelNow('deck_sub_codex_62', 'gpt-6.2-sol');
+
+      expect(result).toMatchObject({
+        ok: true,
+        sessionName: 'deck_sub_codex_62',
+        agentType: 'codex-sdk',
+        model: 'gpt-6.2-sol',
+        previousModel: 'gpt-6.1-sol',
+        applied: 'live',
+      });
+      expect(setAgentId).toHaveBeenCalledWith('gpt-6.2-sol');
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+        name: 'deck_sub_codex_62',
+        requestedModel: 'gpt-6.2-sol',
+        activeModel: 'gpt-6.2-sol',
+      }));
+    });
+
+    it('still rejects bare codex-sdk and unknown models on non-preset codex-sdk sessions, and keeps ccPreset strictly gated', async () => {
+      const setAgentId = vi.fn();
+      getCodexRuntimeConfigMock.mockResolvedValue({ availableModels: ['gpt-6.1-sol', 'gpt-6-sol'] });
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_codex_gate',
+        projectName: 'p',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'running',
+        codexAvailableModels: ['gpt-6.1-sol', 'gpt-6-sol'],
+      });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-codex-gate', setAgentId, pendingCount: 0 });
+
+      await expect(switchSessionModelNow('deck_sub_codex_gate', 'codex-sdk')).resolves.toMatchObject({
+        ok: false,
+        code: 'unknown_model',
+        error: 'Unknown Codex model: codex-sdk',
+      });
+      await expect(switchSessionModelNow('deck_sub_codex_gate', 'nonexistent-model')).resolves.toMatchObject({
+        ok: false,
+        code: 'unknown_model',
+        error: 'Unknown Codex model: nonexistent-model',
+      });
+
+      getPresetMock.mockResolvedValue({
+        name: 'custom-codex-preset',
+        env: {},
+        availableModels: ['custom-preset-model'],
+      });
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_codex_preset',
+        projectName: 'p',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'running',
+        ccPreset: 'custom-codex-preset',
+        codexAvailableModels: ['custom-preset-model'],
+      });
+      await expect(switchSessionModelNow('deck_sub_codex_preset', 'gpt-6.2-sol')).resolves.toMatchObject({
+        ok: false,
+        code: 'unknown_model',
+        error: 'Unknown Codex model: gpt-6.2-sol',
+      });
+      expect(setAgentId).not.toHaveBeenCalled();
     });
   });
 
