@@ -736,6 +736,10 @@ export class RemoteDesktopWorkerHost {
     }
     if (!sent) {
       if (command.type === REMOTE_DESKTOP_MSG.STOP || command.type === REMOTE_DESKTOP_MSG.CANCEL) {
+        const connection = socket ? this.workerConnectionBySocket.get(socket) : undefined;
+        if (connection?.workerPid) {
+          (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(connection.workerPid);
+        }
         this.untrack(command.sessionId, command.type === REMOTE_DESKTOP_MSG.STOP ? 'controller_stop' : 'controller_cancel');
       }
       return true;
