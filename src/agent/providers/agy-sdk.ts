@@ -397,9 +397,21 @@ export class AgySdkProvider implements TransportProvider {
       }
     }
     if ((!state.child || state.child.killed || state.child.exitCode !== null) && state.beforeNativeSessionStart) {
-      const pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
-      try { await pending; }
-      finally { if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined; }
+      let pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
+      try {
+        await pending;
+      } catch (e: any) {
+        if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined;
+        if (e.message === 'AG start owner changed') {
+          // Retry
+          pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
+          await pending;
+        } else {
+          throw e;
+        }
+      } finally {
+        if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined;
+      }
       if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generation || state.cancelled) {
         throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG start was superseded', false, { [AGY_NATIVE_START_NOT_ATTEMPTED]: true });
       }
