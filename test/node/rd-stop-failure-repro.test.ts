@@ -48,37 +48,50 @@ describe('RemoteDesktopWorkerHost instability', () => {
         const host = new RemoteDesktopWorkerHost(() => {}, {
             platform: 'win32',
             artifact,
+            trustedSignerSha256: 'c'.repeat(64),
             terminateProcess,
-            launch: () => {
-                // Directly inject the socket and connection when launch is called
-                (host as any).socket = socket;
-                (host as any).workerConnectionBySocket.set(socket, { workerPid: 1234 });
-            }
         });
-        
-        // Remove direct injection here, as it's done in launch
-
-
+        // Inject an already-authenticated connection. This keeps the test
+        // focused on failed STOP cleanup rather than the named-pipe handshake.
+        (host as any).socket = socket;
+        (host as any).workerConnectionBySocket.set(socket, {
+            generation: 1,
+            workerPid: 1234,
+            correlationId: 'test-correlation',
+            startedAt: Date.now(),
+        });
 
         // Set up a tracked session
-        const sessionId = 'session_test';
+        const sessionId = 'session_test_123456';
         const core = (host as any).core;
-        core.tracked.set(sessionId, {
+        core.track({
+            requestId: 'request_12345678',
             sessionId,
-            metadata: { }
+            capability: 'c'.repeat(43),
+            expiresAt: Date.now() + 60_000,
+            leaseExpiresAt: Date.now() + 60_000,
+            daemonGeneration: 1,
+            mode: 'view',
+            inputEpoch: 0,
+            iceServers: [],
+        }, {
+            virtualRetryAttempted: false,
+            usesVirtualDisplay: false,
+            secureConsoleRetryAttempted: false,
+            correlationId: 'test-correlation',
+            startedAt: Date.now(),
         });
 
 
         // Try to stop
         await host.handle({
             type: REMOTE_DESKTOP_MSG.STOP,
-            requestId: 'req_1',
+            requestId: 'request_12345678',
             sessionId,
-            capability: 'cap_1'
+            capability: 'c'.repeat(43),
         });
 
-        // Assert that untrack was called (or at least check the state)
-        // AND assert that worker was reaped
+        // A failed write must still reap the detached worker process.
         expect(terminateProcess).toHaveBeenCalledWith(1234);
     });
 });

@@ -705,6 +705,13 @@ export class RemoteDesktopWorkerHost {
     }
     const socket = this.socket;
     if (!socket || socket.destroyed) return false;
+    // Capture the authenticated worker identity before writing. A failed STOP
+    // write destroys the socket and retires its connection bookkeeping; the
+    // worker can nevertheless remain alive behind a detached launcher. Reap
+    // that exact process below so a broken pipe cannot leave a session's
+    // worker orphaned.
+    const connection = this.workerConnectionBySocket.get(socket);
+    const workerPid = connection?.workerPid;
     let sent = await this.writeToWorker(
       socket,
       command,
@@ -740,6 +747,7 @@ export class RemoteDesktopWorkerHost {
         if (connection?.workerPid) {
           (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(connection.workerPid);
         }
+        if (command.type === REMOTE_DESKTOP_MSG.STOP) this.reapWorkerProcess(workerPid);
         this.untrack(command.sessionId, command.type === REMOTE_DESKTOP_MSG.STOP ? 'controller_stop' : 'controller_cancel');
       }
       return true;
