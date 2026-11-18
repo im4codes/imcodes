@@ -90,6 +90,9 @@ export const AGY_FALLBACK_MODEL_IDS = [
   'gemini-4-hydrogen-high',
   'gemini-4-hydrogen-medium',
   'gemini-4-hydrogen-low',
+  'gemini-4-carbon-high',
+  'gemini-4-carbon-medium',
+  'gemini-4-carbon-low',
   'gemini-4-argon-medium',
   'gemini-4-argon-high',
   'gemini-4-argon-low',
@@ -108,16 +111,16 @@ export const AGY_FALLBACK_MODEL_IDS = [
 export const AGY_DEFAULT_MODEL_ID = 'gemini-4-hydrogen-high' as const;
 
 /**
- * True when `model` is an Antigravity/AGY model (gemini-4-hydrogen-*, gemini-3.8-flash-*, gemini-4-argon-*,
+ * True when `model` is an Antigravity/AGY model (gemini-4-hydrogen-*, gemini-3.8-flash-*, gemini-4-argon-*, gemini-4-carbon-*,
  * or an explicit agy fallback/alias model id).
  */
 export function isAgyModelId(model: string | null | undefined): boolean {
   const trimmed = model?.trim().toLowerCase();
   if (!trimmed) return false;
   if (trimmed === 'agy' || trimmed === AGY_SDK_PROVIDER_ID) return true;
-  if (/^gemini-(?:4-hydrogen|4-argon|3\.8-flash)(?:-(?:high|medium|low))?$/i.test(trimmed)) return true;
+  if (/^gemini-(?:4-hydrogen|4-argon|4-carbon|3\.8-flash)(?:-(?:high|medium|low))?$/i.test(trimmed)) return true;
   if (/^gemini-(?:4|3\.8)(?:$|[-_.])/i.test(trimmed)) return true;
-  if (/^gemini-(?:flash|argon|hydrogen)(?:$|[-_.])/i.test(trimmed)) return true;
+  if (/^gemini-(?:flash|argon|hydrogen|carbon)(?:$|[-_.])/i.test(trimmed)) return true;
   return false;
 }
 

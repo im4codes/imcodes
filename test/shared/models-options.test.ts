@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_CODE_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
+import { AGY_FALLBACK_MODEL_IDS, isAgyModelId } from '../../shared/agy-agent.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, GEMINI_MODEL_IDS, looksLikeCodexModelId, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
 
 describe('normalizeClaudeCodeModelId', () => {
   it('maps opus alias to opus[1M]', () => {
@@ -53,5 +54,22 @@ describe('mergeModelSuggestions', () => {
       'gemini-2.5-pro',
       'gemini-3',
     ]);
+  });
+});
+
+// Backend identifiers are not literal launchable model ids.
+describe('provider model classification', () => {
+  it.each(['codex-sdk', 'CODEX-SDK', ' codex-sdk '])('rejects bare backend %s as a Codex model', (model) => {
+    expect(looksLikeCodexModelId(model)).toBe(false);
+  });
+  it.each(['codex-mini-latest', 'gpt-6.2-sol'])('keeps real Codex model %s', (model) => {
+    expect(looksLikeCodexModelId(model)).toBe(true);
+  });
+  it.each(['high', 'medium', 'low'])('includes Carbon %s in both AGY catalogs', (tier) => {
+    const model = `gemini-4-carbon-${tier}`;
+    expect(AGY_MODEL_IDS).toContain(model);
+    expect(AGY_FALLBACK_MODEL_IDS).toContain(model);
+    expect(isAgyModelId(model)).toBe(true);
+    expect(isAgyModelId(`gemini-carbon-${tier}`)).toBe(true);
   });
 });

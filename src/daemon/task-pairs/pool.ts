@@ -27,7 +27,7 @@ import {
   resolveDelegationTargets,
 } from '../../../shared/delegation-availability.js';
 import { resolvePeerAuditProviderFamily } from '../../../shared/peer-audit.js';
-import { getSessionRuntimeType } from '../../../shared/agent-types.js';
+import { CODEX_FAMILY, getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { inferSharedContextRuntimeBackend } from '../../../shared/shared-context-runtime-config.js';
 import { AGY_SDK_PROVIDER_ID, isAgyModelId } from '../../../shared/agy-agent.js';
 import {
@@ -356,6 +356,8 @@ export function resolveRequestedModelProvisionConfig(requestedModel: string): Su
   let agentType: string | undefined;
   if (isAgyModelId(requestedModel)) {
     agentType = AGY_SDK_PROVIDER_ID;
+  } else if ((CODEX_FAMILY as readonly string[]).includes(requestedModel.trim().toLowerCase())) {
+    agentType = CODEX_FAMILY[0];
   } else {
     agentType = inferSharedContextRuntimeBackend(requestedModel);
   }

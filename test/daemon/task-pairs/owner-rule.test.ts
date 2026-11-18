@@ -14,7 +14,7 @@ import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../..
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
-import { roleEligibleProvisionConfig, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
+import { resolveRequestedModelProvisionConfig, roleEligibleProvisionConfig, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
 
 const PROJECT = 'ownerproj';
@@ -307,4 +307,25 @@ describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= t
     expect(sent).toEqual([]);
   });
 
+});
+
+describe('requested bare backend provisioning', () => {
+  it.each([
+    ['agy', 'agy-sdk', 'google', 'gemini-4-hydrogen-high'],
+    ['agy-sdk', 'agy-sdk', 'google', 'gemini-4-hydrogen-high'],
+    [' AGY-SDK ', 'agy-sdk', 'google', 'gemini-4-hydrogen-high'],
+    ['codex', 'codex-sdk', 'openai', 'gpt-6-sol'],
+    ['codex-sdk', 'codex-sdk', 'openai', 'gpt-6-sol'],
+    [' CODEX-SDK ', 'codex-sdk', 'openai', 'gpt-6-sol'],
+    ['codex-mini-latest', 'codex-sdk', 'openai', 'codex-mini-latest'],
+    ['gemini-4-carbon-high', 'agy-sdk', 'google', 'gemini-4-carbon-high'],
+  ])('provisions %s using a launchable model', (requested, agentType, providerFamily, model) => {
+    const expected = { agentType, providerFamily, runtimeType: 'transport', model,
+      capabilityId: `supervision-exec-v1:transport:${agentType}:${providerFamily}:${model}` };
+    expect(resolveRequestedModelProvisionConfig(requested)).toEqual(expected);
+    expect(roleEligibleProvisionConfig({ brain: BRAIN, role: 'executor', pool: 'primary', requestedModel: requested }, { getSession: () => undefined })).toEqual(expected);
+  });
+  it('still rejects fictional model ids', () => {
+    expect(resolveRequestedModelProvisionConfig('nonexistent-fictional-model')).toBeUndefined();
+  });
 });

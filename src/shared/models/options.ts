@@ -1,3 +1,5 @@
+import { AGY_FALLBACK_MODEL_IDS } from '../../../shared/agy-agent.js';
+
 // `fable` = Claude Fable 5 (Mythos-class, GA 2026-06-09) — Anthropic's most
 // capable widely released model, the new top tier above Opus. Listed first so
 // the picker surfaces the strongest model at the top.
@@ -37,6 +39,7 @@ export type CodexModelId = typeof CODEX_MODEL_IDS[number];
  * static fallback list.
  */
 export function looksLikeCodexModelId(value: string): boolean {
+  if (/^codex-sdk$/i.test(value.trim())) return false;
   return /^(gpt-\d|o\d(?:$|[-_.])|codex[-_])/i.test(value.trim());
 }
 
@@ -59,24 +62,8 @@ export const MUSE_MODEL_IDS = [
 ] as const;
 export type MuseModelId = typeof MUSE_MODEL_IDS[number];
 
-export const AGY_MODEL_IDS = [
-  'gemini-4-hydrogen-high',
-  'gemini-4-hydrogen-medium',
-  'gemini-4-hydrogen-low',
-  'gemini-4-argon-medium',
-  'gemini-4-argon-high',
-  'gemini-4-argon-low',
-  'gemini-3.8-flash-high',
-  'gemini-3.8-flash-medium',
-  'gemini-3.8-flash-low',
-  'claude-opus-5-5-medium',
-  'claude-opus-5-5-high',
-  'claude-opus-5-5-low',
-  'claude-sonnet-5-5-medium',
-  'claude-sonnet-5-5-high',
-  'claude-sonnet-5-5-low',
-  'gpt-oss-120b-medium',
-] as const;
+// Share the fallback catalog so picker and provisioning suggestions stay aligned.
+export const AGY_MODEL_IDS = AGY_FALLBACK_MODEL_IDS;
 export type AgyModelId = typeof AGY_MODEL_IDS[number];
 
 export function mergeModelSuggestions(...groups: ReadonlyArray<readonly string[]>): string[] {

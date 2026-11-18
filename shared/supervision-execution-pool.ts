@@ -1,6 +1,7 @@
-import { getSessionRuntimeType, isClaudeCodeFamily } from './agent-types.js';
+import { CODEX_FAMILY, getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from './agent-types.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit.js';
-import { normalizeClaudeCodeModelId } from '../src/shared/models/options.js';
+import { AGY_CLI_BINARY, AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from './agy-agent.js';
+import { DEFAULT_CODEX_SESSION_MODEL, normalizeClaudeCodeModelId } from '../src/shared/models/options.js';
 import {
   doesSharedContextBackendSupportPresets,
   normalizeSharedContextRuntimeBackend,
@@ -335,7 +336,7 @@ function text(value: unknown): string | undefined {
 }
 
 /**
- * Collapse a vendor-versioned model onto its canonical pool identity.
+ * Normalize backend aliases to launchable defaults, and vendor-versioned Claude models to pool identities.
  *
  * Pool configs are written in the canonical picker namespace (`opus[1M]`) while
  * the daemon OBSERVES a versioned id (`claude-opus-5`, `claude-opus-5[1m]`).
@@ -343,12 +344,19 @@ function text(value: unknown): string | undefined {
  * at `identity_mismatch` permanently. Normalizing BOTH sides fixes that without
  * hardcoding today's live ids -- a future `claude-opus-6` keeps binding.
  *
- * Gated on the Claude Code family on purpose: `claude-code-sdk` also hosts
+ * Claude family folding is gated on the Claude Code family on purpose: `claude-code-sdk` also hosts
  * third-party models (MiniMax-M3, qwen3.8-27b), and those must pass through
  * verbatim rather than be folded into a Claude family bucket.
  */
 export function normalizeSupervisionExecutionModel(agentType: string, model: string): string {
   const trimmed = model.trim();
+  const lower = trimmed.toLowerCase();
+  if (agentType === AGY_SDK_PROVIDER_ID && (lower === AGY_CLI_BINARY || lower === AGY_SDK_PROVIDER_ID)) {
+    return AGY_DEFAULT_MODEL_ID;
+  }
+  if (isCodexFamily(agentType) && (CODEX_FAMILY as readonly string[]).includes(lower)) {
+    return DEFAULT_CODEX_SESSION_MODEL;
+  }
   if (!trimmed || !isClaudeCodeFamily(agentType)) return trimmed;
   return normalizeClaudeCodeModelId(trimmed) ?? trimmed;
 }

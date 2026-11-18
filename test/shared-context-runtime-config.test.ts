@@ -284,3 +284,14 @@ describe('shared-context-runtime-config', () => {
     });
   });
 });
+
+describe('bare Codex backend in model field', () => {
+  it('does not infer a backend from codex-sdk as if it were a model', () => {
+    expect(inferSharedContextRuntimeBackend('codex-sdk')).toBeUndefined();
+  });
+  it.each([undefined, 'codex-sdk', 'claude-code-sdk'])('falls back to a valid model with backend %s', (backend) => {
+    const result = normalizeSharedContextRuntimeConfig({ primaryContextBackend: backend, primaryContextModel: 'codex-sdk' });
+    expect(result.primaryContextModel).toBe(getDefaultSharedContextModelForBackend(result.primaryContextBackend!));
+    expect(result.primaryContextModel).not.toBe('codex-sdk');
+  });
+});

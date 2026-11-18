@@ -620,3 +620,34 @@ describe('automatic supervision execution-pool gate', () => {
     }
   });
 });
+
+describe('bare backend model normalization', () => {
+  it.each(['agy', 'agy-sdk', ' AGY-SDK ', 'AGY'])('normalizes AGY alias %s', (model) => {
+    expect(normalizeSupervisionExecutionModel('agy-sdk', model)).toBe('gemini-4-hydrogen-high');
+  });
+  it.each(['codex', 'codex-sdk', ' CODEX-SDK ', 'CODEX'])('normalizes Codex alias %s', (model) => {
+    for (const agentType of ['codex-sdk', 'codex']) {
+      expect(normalizeSupervisionExecutionModel(agentType, model)).toBe('gpt-6-sol');
+    }
+  });
+  it.each(['MiniMax-M3', 'qwen3.8-27b', 'codex-mini-latest'])('preserves real/preset model %s', (model) => {
+    for (const agentType of ['claude-code-sdk', 'codex-sdk', 'agy-sdk']) {
+      expect(normalizeSupervisionExecutionModel(agentType, model)).toBe(model);
+    }
+  });
+  it('does not rewrite aliases hosted on another backend', () => {
+    expect(normalizeSupervisionExecutionModel('codex-sdk', 'agy-sdk')).toBe('agy-sdk');
+    expect(normalizeSupervisionExecutionModel('agy-sdk', 'codex-sdk')).toBe('codex-sdk');
+  });
+  it.each([
+    ['agy-sdk', 'google', 'agy-sdk', 'gemini-4-hydrogen-high'],
+    ['codex-sdk', 'openai', 'codex-sdk', 'gpt-6-sol'],
+  ])('canonicalizes persisted %s configs and capability ids', (agentType, providerFamily, model, expected) => {
+    const config = normalizeSupervisionExecutionConfig({
+      agentType, providerFamily, runtimeType: 'transport', model,
+      capabilityId: `supervision-exec-v1:transport:${agentType}:${providerFamily}:${model}`,
+    });
+    expect(config?.model).toBe(expected);
+    expect(config?.capabilityId).toBe(`supervision-exec-v1:transport:${agentType}:${providerFamily}:${expected}`);
+  });
+});
