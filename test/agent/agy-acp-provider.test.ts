@@ -3,11 +3,11 @@ import { agyNativeStartNotAttemptedError } from '../../src/agent/agy-session-per
 import { ACP_ERROR_PHASE } from '../../shared/provider-error-codes.js';
 import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile, rename } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
 import { AgySdkProvider, resolveAgyBinary } from '../../src/agent/providers/agy-sdk.js';
@@ -3268,6 +3268,74 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       expect(events.slice(beforeEvents).some((e) => e.detail?.meta?.agentPath === 'child-keep' && e.detail?.meta?.normalizedStatus === 'complete')).toBe(true);
     } finally {
       await runtime.kill();
+    }
+  });
+
+  it('spawns per-session ACP server in state.cwd (never /) under launchd cwd=/, handles nonexistent cwd safely, and recycles on cwd change preserving resumeId', async () => {
+    const { provider, requests, root } = await setup();
+    const wsA = path.join(root, 'workspace-a');
+    const wsB = path.join(root, 'workspace-b');
+    await mkdir(wsA, { recursive: true });
+    await mkdir(wsB, { recursive: true });
+
+    const done = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(done);
+    provider.onError(errors);
+
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/');
+    try {
+      // 1) Explicit valid workspace cwd wins even when daemon process.cwd() === '/'.
+      const sid = 'deck_test_acp_cwd';
+      await provider.createSession({ sessionKey: sid, sessionName: sid, cwd: wsA, agentId: 'model-a' });
+      await provider.send(sid, 'turn in wsA');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      let boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(1);
+      expect(boots[0].cwd).toBe(realpathSync(wsA));
+
+      const firstResumeId = (provider as any).sessions.get(sid)?.acpSessionId;
+      expect(firstResumeId).toBe('native-1');
+
+      // 2) Moving an existing idle perSessionTransport session to a different valid cwd recycles child while preserving resumeId.
+      await provider.createSession({ sessionKey: sid, sessionName: sid, cwd: wsB, agentId: 'model-a' });
+      await provider.send(sid, 'turn in wsB');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      const allReqs = await requests();
+      boots = allReqs.filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(2);
+      expect(boots[1].pid).not.toBe(boots[0].pid);
+      expect(boots[1].cwd).toBe(realpathSync(wsB));
+      expect(allReqs.some((r) => r.method === 'session/resume' && r.params?.sessionId === 'native-1' && r.params?.cwd === wsB)).toBe(true);
+
+      // 3) Omitted cwd or non-existent synthetic cwd under process.cwd() === '/' falls back safely to homedir (never '/' or ENOENT).
+      const sidOmitted = 'deck_test_acp_omitted_cwd';
+      await provider.createSession({ sessionKey: sidOmitted, sessionName: sidOmitted, agentId: 'model-a' });
+      expect((provider as any).sessions.get(sidOmitted)?.cwd).toBe(realpathSync(homedir()));
+      await provider.send(sidOmitted, 'turn omitted cwd');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
+
+      const sidMissing = 'deck_test_acp_missing_cwd';
+      await provider.createSession({
+        sessionKey: sidMissing,
+        sessionName: sidMissing,
+        cwd: path.join(root, 'synthetic-missing-dir'),
+        agentId: 'model-a',
+      });
+      await provider.send(sidMissing, 'turn missing cwd');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(4), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(4);
+      expect(boots[2].cwd).toBe(realpathSync(homedir()));
+      expect(boots[3].cwd).toBe(realpathSync(homedir()));
+    } finally {
+      cwdSpy.mockRestore();
     }
   });
 });

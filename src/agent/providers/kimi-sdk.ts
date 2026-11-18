@@ -59,6 +59,7 @@ import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { realpathSync, statSync } from 'node:fs';
 import { once } from 'node:events';
+import { homedir } from 'node:os';
 import { Readable, Writable } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -391,6 +392,34 @@ interface IsolatedAcpTransport extends AcpTransportSlot {
   incognitoEnv?: AgyIncognitoEnv;
   sourceHome?: string;
   executableFingerprint?: AcpExecutableFingerprint | null;
+  spawnedCwd?: string;
+}
+
+function isExistingDirectory(dir?: string): dir is string {
+  if (!dir) return false;
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function resolveDefaultAcpCwd(): string {
+  const processCwd = normalizeTransportCwd(process.cwd());
+  if (processCwd && processCwd !== '/') return processCwd;
+  const home = normalizeTransportCwd(homedir());
+  if (isExistingDirectory(home)) return home;
+  return processCwd ?? process.cwd();
+}
+
+function resolveAcpSpawnCwd(preferredCwd?: string): string | undefined {
+  const normalizedPreferred = normalizeTransportCwd(preferredCwd);
+  if (isExistingDirectory(normalizedPreferred)) return normalizedPreferred;
+  const processCwd = normalizeTransportCwd(process.cwd());
+  if (processCwd && processCwd !== '/' && isExistingDirectory(processCwd)) return processCwd;
+  const home = normalizeTransportCwd(homedir());
+  if (isExistingDirectory(home)) return home;
+  return undefined;
 }
 
 interface ActivePromptAdmission {
@@ -803,7 +832,7 @@ export class KimiSdkProvider implements TransportProvider {
       sessionName: config.sessionName ?? existing?.sessionName,
       projectName: config.projectName ?? existing?.projectName,
       serverId: config.serverId ?? existing?.serverId,
-      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
+      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? resolveDefaultAcpCwd(),
       env: config.env ?? existing?.env,
       contextNamespace: config.contextNamespace ?? existing?.contextNamespace,
       model: explicitAgentId ?? inheritedModel ?? profileDefaultModel,
@@ -2027,6 +2056,7 @@ export class KimiSdkProvider implements TransportProvider {
         ? { refresh: true }
         : undefined,
     );
+    const spawnCwd = resolveAcpSpawnCwd(isolatedFor?.state.cwd);
     const fingerprint = captureExecutableFingerprint(resolved.executable, resolved.prependArgs[0]);
     if (!isolatedFor) {
       this.sharedHasStartedOnce = true;
@@ -2034,6 +2064,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.pendingSharedRecycle = false;
     } else {
       isolatedFor.transport.executableFingerprint = fingerprint;
+      isolatedFor.transport.spawnedCwd = spawnCwd;
     }
     const args = [
       ...resolved.prependArgs,
@@ -2054,6 +2085,7 @@ export class KimiSdkProvider implements TransportProvider {
       // workers of the incident were unreachable on PPID=1.
       detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
+      ...(spawnCwd ? { cwd: spawnCwd } : {}),
       env,
       windowsHide: true,
     });
@@ -2645,7 +2677,13 @@ export class KimiSdkProvider implements TransportProvider {
           && !existingTransport.child.killed
           && existingTransport.child.exitCode === null,
         );
-        if (alive && this.hasExecutableFingerprintChanged(existingTransport?.executableFingerprint)) {
+        const targetSpawnCwd = isExistingDirectory(state.cwd) ? state.cwd : undefined;
+        const cwdChanged = Boolean(
+          existingTransport?.spawnedCwd
+          && targetSpawnCwd
+          && targetSpawnCwd !== existingTransport.spawnedCwd,
+        );
+        if (alive && (this.hasExecutableFingerprintChanged(existingTransport?.executableFingerprint) || cwdChanged)) {
           await this.disposeIsolatedSession(state, { bestEffortCloseSession: true, preserveResumeId: true });
         }
         if (
@@ -2983,7 +3021,7 @@ export class KimiSdkProvider implements TransportProvider {
         await this.initPromise;
         try {
           const result: NewSessionResponse = await this.connection.newSession({
-            cwd: normalizeTransportCwd(process.cwd()) ?? process.cwd(),
+            cwd: resolveDefaultAcpCwd(),
             mcpServers: [],
           });
           this.cacheModelsFromSessionResponse(result);
