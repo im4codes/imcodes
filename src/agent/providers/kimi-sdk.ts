@@ -404,12 +404,27 @@ function isExistingDirectory(dir?: string): dir is string {
   }
 }
 
-function resolveDefaultAcpCwd(): string {
+function canonicalExistingDirectory(dir?: string): string | undefined {
+  const normalized = normalizeTransportCwd(dir);
+  if (!isExistingDirectory(normalized)) return undefined;
+  try {
+    return normalizeTransportCwd(realpathSync(normalized)) ?? normalized;
+  } catch {
+    return normalized;
+  }
+}
+
+function resolveFallbackExistingAcpCwd(): string | undefined {
   const processCwd = normalizeTransportCwd(process.cwd());
-  if (processCwd && processCwd !== '/') return processCwd;
-  const home = normalizeTransportCwd(homedir());
-  if (isExistingDirectory(home)) return home;
-  return processCwd ?? process.cwd();
+  if (processCwd && processCwd !== '/') {
+    const canonicalProcessCwd = canonicalExistingDirectory(processCwd);
+    if (canonicalProcessCwd) return canonicalProcessCwd;
+  }
+  return canonicalExistingDirectory(homedir());
+}
+
+function resolveDefaultAcpCwd(): string {
+  return resolveFallbackExistingAcpCwd() ?? normalizeTransportCwd(process.cwd()) ?? process.cwd();
 }
 
 const ACP_POSIX_SYSTEM_BIN_DIRS = new Set([
@@ -448,13 +463,7 @@ function normalizeAcpPosixPath(rawPath: string | undefined, homeDir: string | un
 }
 
 function resolveAcpSpawnCwd(preferredCwd?: string): string | undefined {
-  const normalizedPreferred = normalizeTransportCwd(preferredCwd);
-  if (isExistingDirectory(normalizedPreferred)) return normalizedPreferred;
-  const processCwd = normalizeTransportCwd(process.cwd());
-  if (processCwd && processCwd !== '/' && isExistingDirectory(processCwd)) return processCwd;
-  const home = normalizeTransportCwd(homedir());
-  if (isExistingDirectory(home)) return home;
-  return undefined;
+  return canonicalExistingDirectory(preferredCwd) ?? resolveFallbackExistingAcpCwd();
 }
 
 interface ActivePromptAdmission {
@@ -2719,7 +2728,7 @@ export class KimiSdkProvider implements TransportProvider {
           && !existingTransport.child.killed
           && existingTransport.child.exitCode === null,
         );
-        const targetSpawnCwd = isExistingDirectory(state.cwd) ? state.cwd : undefined;
+        const targetSpawnCwd = canonicalExistingDirectory(state.cwd);
         const cwdChanged = Boolean(
           existingTransport?.spawnedCwd
           && targetSpawnCwd

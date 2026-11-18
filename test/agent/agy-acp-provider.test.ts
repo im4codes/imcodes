@@ -3,7 +3,7 @@ import { agyNativeStartNotAttemptedError } from '../../src/agent/agy-session-per
 import { ACP_ERROR_PHASE } from '../../shared/provider-error-codes.js';
 import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile, rename } from 'node:fs/promises';
@@ -3335,6 +3335,31 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       expect(boots).toHaveLength(4);
       expect(boots[2].cwd).toBe(realpathSync(homedir()));
       expect(boots[3].cwd).toBe(realpathSync(homedir()));
+      // 4) Symlinked workspace canonicalization (macOS /tmp -> /private/tmp, /var -> /private/var):
+      //    boot.cwd and boot.pwd both match realpathSync(realWs), and switching from symlinkWs to realWs does NOT respawn.
+      const realWs = path.join(root, 'workspace-real');
+      const symlinkWs = path.join(root, 'workspace-symlink');
+      await mkdir(realWs, { recursive: true });
+      symlinkSync(realWs, symlinkWs, 'dir');
+
+      const sidSym = 'deck_test_acp_symlink_cwd';
+      await provider.createSession({ sessionKey: sidSym, sessionName: sidSym, cwd: symlinkWs, agentId: 'model-a' });
+      await provider.send(sidSym, 'turn via symlinkWs');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(5), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(5);
+      expect(boots[4].cwd).toBe(realpathSync(realWs));
+      expect(boots[4].pwd).toBe(realpathSync(realWs));
+
+      await provider.createSession({ sessionKey: sidSym, sessionName: sidSym, cwd: realWs, agentId: 'model-a' });
+      await provider.send(sidSym, 'turn via realWs alias');
+      await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(6), { timeout: 5000 });
+      expect(errors).not.toHaveBeenCalled();
+
+      boots = (await requests()).filter((r) => r.fixture === 'boot');
+      expect(boots).toHaveLength(5);
     } finally {
       cwdSpy.mockRestore();
     }
