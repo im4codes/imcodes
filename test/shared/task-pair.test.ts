@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
+  TASK_PAIR_BRAIN_MCP_ONLY_RULE,
+  TASK_PAIR_NEEDS_DECISION_RULE,
+  TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
   TASK_PAIR_AUDITOR_PROPOSAL_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
@@ -889,5 +892,39 @@ describe('history-based child supervision contract', () => {
     expect(contract).toContain('without waking it');
     expect(contract).toContain('silence or a last invocation does not prove completion');
     expect(contract).toContain('not heartbeat polling');
+  });
+});
+
+
+describe('pair contract consistency regressions', () => {
+  it('requires the MCP namespace for inter-session sends rather than provider-native or stale delegation tools', () => {
+    const contract = buildTaskPairMarkerContract();
+    expect(contract).toContain('IM.codes imcodes-memory MCP send_message');
+    expect(contract).toContain('{target: "<deck_* sessionName>", message: "..."}');
+    expect(contract).toContain('mcp_imcodes-memory_send_message');
+    expect(contract).toContain('load send_message via mcp_tool_search');
+    expect(contract).toContain('provider built-in subagent send_message ({Recipient, Message})');
+    expect(contract).toContain('stale delegation_reply from an earlier daemon epoch');
+  });
+
+  it('keeps NEEDS_DECISION the sole idle-Brain exception without teaching lifecycle markers', () => {
+    expect(TASK_PAIR_NEEDS_DECISION_RULE).toContain('sole Brain-only heartbeat-pause marker exception');
+    expect(TASK_PAIR_BRAIN_MCP_ONLY_RULE).toContain('sole idle-Brain heartbeat-pause exception');
+    expect(TASK_PAIR_BRAIN_MCP_ONLY_RULE).toContain('never for pair lifecycle');
+    expect(TASK_PAIR_BRAIN_MCP_ONLY_RULE).not.toMatch(/<!--\s*IMCODES_TASK/);
+  });
+
+  it('labels legacy parser compatibility and documents actual capped no-pool creation', () => {
+    const contract = buildTaskPairMarkerContract();
+    expect(contract).toContain('legacy parser compatibility');
+    expect(contract).toContain('IMCODES_TASK_END');
+    expect(contract).toContain('pair_create carries new briefs');
+    expect(contract).toContain(`per-project cap (${TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT})`);
+    expect(contract).toContain('auto-creates missing same-family secondary-tier sub-sessions');
+    expect(contract).not.toContain('no session is created');
+    expect(contract).not.toContain('no execution pool configured must name the role models or sessions explicitly');
+    expect(contract).toContain('Your turns start inside that workspace: never write or commit there');
+    expect(contract).toContain('if your shell tool resets to the main checkout on each call');
+    expect(contract).toContain('cd or git -C into the workspace path explicitly for read-only checks');
   });
 });

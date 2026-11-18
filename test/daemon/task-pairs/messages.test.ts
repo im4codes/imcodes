@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { scanTaskPairMarkers, type TaskPairState } from '../../../shared/task-pair.js';
-import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildExecutorHandoffMessage, buildIntegrationDriftDigest, buildNoBriefLine, buildNudgeMessage, buildUntitledTaskTitleRequest } from '../../../src/daemon/task-pairs/messages.js';
+import { applyTaskPairMarker, scanTaskPairMarkers, type TaskPairState } from '../../../shared/task-pair.js';
+import { buildAuditorProposalNudgeMessage, buildDoneReminderMessage, buildLegacyImportCorrectionMessage, buildExecutorPairBrief, buildExecutorResendMessage, buildDispatchTrailer, buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildExecutorHandoffMessage, buildIntegrationDriftDigest, buildNoBriefLine, buildNudgeMessage, buildUntitledTaskTitleRequest } from '../../../src/daemon/task-pairs/messages.js';
 
 function basePair(overrides: Partial<TaskPairState> = {}): TaskPairState {
   return {
@@ -112,5 +112,69 @@ describe('daemon-authored marker examples parse when copied verbatim onto their 
     );
     expect(digest).toContain('- tsk_with_title "Fix login retry": head abc1234');
     expect(digest).toContain('- tsk_untitled: head def7654');
+  });
+});
+
+
+describe('pair prompt consistency regressions', () => {
+  it('keeps an applied REWORK closed while requesting missing proposals from the executor', () => {
+    const pair = basePair({ material: { path: '/workspace', at: 1 } });
+    const verdict = scanTaskPairMarkers('<!-- IMCODES_TASK REWORK tsk_x blocking=P0 p0=1 -->').markers[0]!;
+    const applied = applyTaskPairMarker(pair, verdict, {
+      writer: pair.auditor!, fallbackBrain: pair.brain, now: 2, source: 'marker', turnText: '[P0] Broken invariant.',
+    });
+    expect(applied.pair?.status).toBe('rework');
+    expect(applied.intents.some((intent) => intent.kind === 'auditor_proposal_nudge')).toBe(true);
+    const text = buildAuditorProposalNudgeMessage(applied.pair!);
+    expect(text).toContain('ALREADY been applied (status: rework)');
+    expect(text).toContain('directly to deck_sub_exec');
+    expect(text).toContain('Do not resend PASS or REWORK');
+    expect(text).toContain('commits fixes and emits a new READY_FOR_AUDIT');
+    expect(text).toContain('this reminder is capped to once for round 1.');
+    expect(text).not.toContain('resend the verdict');
+    expect(text).not.toContain('`');
+    expect(applyTaskPairMarker(applied.pair, verdict, {
+      writer: pair.auditor!, fallbackBrain: pair.brain, now: 3, source: 'marker',
+    }).unusual).toBe(true);
+  });
+
+  it('degrades the proposal nudge gracefully when the executor is not assigned', () => {
+    const text = buildAuditorProposalNudgeMessage(basePair({ executor: undefined, status: 'rework' }));
+    expect(text).toContain('directly to the executor');
+    expect(text).not.toContain('undefined');
+    expect(text).not.toContain('`');
+  });
+
+  it('names the MCP namespace and argument shape in every participant delivery path', () => {
+    const pair = basePair();
+    const reportPair = basePair({ workspaceKind: 'none', material: { report: 'validation', at: 1 } });
+    const texts = [
+      buildAuditorProposalNudgeMessage(pair), buildDoneReminderMessage(pair),
+      buildLegacyImportCorrectionMessage(pair), buildExecutorPairBrief(pair),
+      buildExecutorPairBrief(reportPair), buildDispatchTrailer(pair),
+      buildExecutorResendMessage(pair, 'deck_previous_auditor'),
+      ...(['working', 'rework', 'in_audit'] as const).map((status) => buildExecutorHandoffMessage({ ...pair, status }, 'deck_previous_executor', 'handoff')),
+      buildAuditorAssignmentMessage(pair), buildAuditorAssignmentMessage(reportPair),
+      buildAuditRequestMessage(pair, { path: '/workspace', source: 'executor' }),
+      buildAuditRequestMessage(reportPair, { report: 'validation', source: 'executor' }),
+    ];
+    for (const text of texts) {
+      expect(text).toContain('IM.codes imcodes-memory MCP send_message');
+      expect(text).toContain('{target: "<deck_* sessionName>", message: "..."}');
+      expect(text).toContain('provider built-in subagent send_message ({Recipient, Message})');
+      expect(text).toContain('stale delegation_reply from an earlier daemon epoch');
+      expect(text).not.toContain('`');
+    }
+  });
+
+  it.each(['worktree', 'dir'] as const)('gives per-call shell and absolute file guidance for a %s workspace', (kind) => {
+    const path = '/workspace with spaces/pair_tsk_x';
+    const pair = basePair({ workspace: { kind, path, status: 'active', base: 'base-sha', createdAt: 1 } });
+    for (const text of [buildExecutorPairBrief(pair), buildExecutorHandoffMessage(pair, undefined, 'handoff'), buildDispatchTrailer(pair)]) {
+      expect(text).toContain(`cd "${path}" &&`);
+      expect(text).toContain(`git -C "${path}"`);
+      expect(text).toContain(`file tools must use absolute paths under ${path}`);
+      expect(text).toContain('resets to the main checkout');
+    }
   });
 });

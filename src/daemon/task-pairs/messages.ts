@@ -8,6 +8,7 @@ import {
   TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
   TASK_PAIR_AUDITOR_PROPOSAL_RULE,
   TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
+  TASK_PAIR_INTERSESSION_SEND_RULE,
   TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
   TASK_PAIR_VALIDATION_REPORT_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
@@ -81,7 +82,7 @@ export const NO_LEGACY_ARTIFACTS = 'This pair has no assignmentId, auditAttemptI
 
 function materialLine(material: ResolvedTaskPairMaterial | TaskPairState['material'] | undefined): string | undefined {
   if (material?.report && !material.worktree && !material.head && !material.path) {
-    return 'Material: this pair has NO workspace (Brain chose workspace=none), so there is no worktree, directory, HEAD or diff. The material is the executor\'s validation report and evidence, which they send you with send_message: judge the report, and re-check what you can of the evidence it names (commands, machines, outputs); ask them for anything missing.';
+    return 'Material: this pair has NO workspace (Brain chose workspace=none), so there is no worktree, directory, HEAD or diff. The material is the executor\'s validation report and evidence, which they send you with the IM.codes imcodes-memory MCP send_message tool ({target: "<deck_* sessionName>", message: "..."}): judge the report, and re-check what you can of the evidence it names (commands, machines, outputs); ask them for anything missing.';
   }
   if (material?.path && !material.worktree && !material.head) {
     return `Material: task directory ${material.path}. Read the files there directly; there is no git HEAD.`;
@@ -122,7 +123,8 @@ export function buildCorrectionMessage(pair: TaskPairState, judgement: TaskPairV
 export function buildDoneReminderMessage(pair: TaskPairState): string {
   return [
     header(pair),
-    `DONE without a PASS is not complete. Send your validation to auditor ${pair.auditor ?? '(being assigned)'} with send_message, then write ${readyMarker(pair)}. ${pairHasNoWorktree(pair) ? "After the auditor's PASS, report to Brain in your closing reply and write DONE; this pair has nothing to commit or merge." : "After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev."}`,
+    `DONE without a PASS is not complete. Send your validation to auditor ${pair.auditor ?? '(being assigned)'} with the IM.codes imcodes-memory MCP send_message tool, then write ${readyMarker(pair)}. ${pairHasNoWorktree(pair) ? "After the auditor's PASS, report to Brain in your closing reply and write DONE; this pair has nothing to commit or merge." : "After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev."}`,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -239,11 +241,13 @@ export function buildRoundBaseMismatchAuditorMessage(pair: TaskPairState, head: 
 }
 
 export function buildAuditorProposalNudgeMessage(pair: TaskPairState): string {
+  const targetExecutor = pair.executor ?? 'the executor';
   return [
     header(pair),
-    'Your REWORK did not include a concrete proposal in the findings.',
+    'Your REWORK did not include a concrete proposal in the findings; the verdict has ALREADY been applied (status: rework).',
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
-    `Keep the existing blocking set and resend the verdict; this reminder is capped to once for round ${pair.round}.`,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
+    `Send the missing concrete proposal(s) directly to ${targetExecutor} via the IM.codes imcodes-memory MCP send_message tool (target=${pair.executor ?? '<executor session>'}). Do not resend PASS or REWORK now -- no audit round is open until the executor commits fixes and emits a new READY_FOR_AUDIT; this reminder is capped to once for round ${pair.round}.`,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -435,7 +439,8 @@ export function buildLegacyImportCorrectionMessage(pair: TaskPairState): string 
   return [
     header(pair),
     'Correction: this task was imported from the old supervision engine as passed, but it never had an audit PASS. Disregard any earlier "PASS received: local commit" message for it and do not commit it yet.',
-    `Send your validation to ${auditor} with send_message, then write ${readyMarker(pair)}. After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev.`,
+    `Send your validation to ${auditor} with the IM.codes imcodes-memory MCP send_message tool, then write ${readyMarker(pair)}. After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev.`,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -484,6 +489,7 @@ export function buildNudgeMessage(pair: TaskPairState, side: 'executor' | 'audit
     lines.push(TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE);
     const where = materialLine(pair.material);
     if (where) lines.push(where);
+    lines.push(TASK_PAIR_INTERSESSION_SEND_RULE);
     lines.push(`${NO_LEGACY_ARTIFACTS} If the material cannot be reached, write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0.`);
     if (pair.round > 1 && pair.lastVerdict?.verb === 'REWORK') {
       lines.push(`Re-audit (round ${pair.round}): check only closure of the previous blocking classes (${formatTaskPairSeverityCounts(pair.lastVerdict.counts)}) plus regressions; do not raise new non-blocking items to REWORK.`);
@@ -492,13 +498,14 @@ export function buildNudgeMessage(pair: TaskPairState, side: 'executor' | 'audit
     const next = pair.status === 'passed'
       ? `PASS received: commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write ${marker('DONE', pair.taskId)}; Brain merges into dev and pushes dev.`
       : pair.status === 'awaiting_audit'
-        ? `DONE without a PASS is not complete: send your validation to auditor ${pair.auditor}, then write ${readyMarker(pair)}.`
+        ? `DONE without a PASS is not complete: send your validation to auditor ${pair.auditor} with the IM.codes imcodes-memory MCP send_message tool, then write ${readyMarker(pair)}.`
         : pair.status === 'rework'
-          ? `Address the auditor's blocking findings for their whole class, resend, then write ${marker('READY_FOR_AUDIT', pair.taskId)}.`
+          ? `Address the auditor's blocking findings for their whole class, resend your validation via the IM.codes imcodes-memory MCP send_message tool, then write ${marker('READY_FOR_AUDIT', pair.taskId)}.`
           : pair.auditor === 'none'
             ? `Continue the task; commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write ${marker('DONE', pair.taskId)}; Brain merges into dev and pushes dev.`
-            : `Continue the task. When ready, send your validation to auditor ${pair.auditor}, then write ${readyMarker(pair)}.`;
+            : `Continue the task. When ready, send your validation to auditor ${pair.auditor} with the IM.codes imcodes-memory MCP send_message tool, then write ${readyMarker(pair)}.`;
     lines.push(`Idle with no progress. ${next} If stuck write ${marker('BLOCKED', pair.taskId, 'note="..."')}. ${NO_LEGACY_ARTIFACTS}`);
+    lines.push(TASK_PAIR_INTERSESSION_SEND_RULE);
   }
   if (unresolvedHint) lines.push(unresolvedHint);
   lines.push(contracts(pair.blocking));
@@ -516,6 +523,7 @@ export function buildAuditorHandoffMessage(pair: TaskPairState): string {
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_VALIDATION_REPORT_RULE,
     TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     blockingSummaryLine(pair),
     ...(where ? [where] : []),
     `${NO_LEGACY_ARTIFACTS} If the material cannot be reached, write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0.`,
@@ -552,11 +560,12 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
       `Audit request, round ${Math.max(1, pair.round)}, from executor ${pair.executor} (blocking=${pair.blocking.join(',')}).`,
       ...nonGitReviewLines(material),
       ...(warning ? [warning] : []),
-      `Their validation (full suites for code) comes from them via send_message. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
+      `Their validation (full suites for code) comes from them via the IM.codes imcodes-memory MCP send_message tool. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
       TASK_PAIR_AUDITOR_PROPOSAL_RULE,
       TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
       TASK_PAIR_VALIDATION_REPORT_RULE,
       TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
+      TASK_PAIR_INTERSESSION_SEND_RULE,
       `${NO_LEGACY_ARTIFACTS} If the material cannot be reached (executor limited/offline, workspace unreadable), write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0 or REWORK.`,
       contracts(pair.blocking),
     ].join('\n');
@@ -569,11 +578,13 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
     `Audit request, round ${Math.max(1, pair.round)}, from executor ${pair.executor} (blocking=${pair.blocking.join(',')}).`,
     `${where}${material.source === 'workspace' ? ' (resolved by the daemon from the executor session)' : ''}`,
     ...(warning ? [warning] : []),
-    `Their validation (full suites for code) comes from them via send_message. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
+    `Their validation (full suites for code) comes from them via the IM.codes imcodes-memory MCP send_message tool. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_VALIDATION_REPORT_RULE,
     TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     `${NO_LEGACY_ARTIFACTS} If the material cannot be reached (executor limited/offline, workspace unreadable), write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0 or REWORK.`,
     contracts(pair.blocking),
   ].join('\n');
@@ -601,8 +612,9 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
     workplaceLine(pair),
     pair.auditor === TASK_PAIR_NO_AUDITOR
       ? `No audit window for this pair -- do proportionate self-validation instead (full suites for code), then commit locally in the worktree (never push any branch). Report straight to Brain in the same closing reply as your ${marker('DONE', pair.taskId)}: what changed, your worktree path and HEAD (or file paths for non-code work), and your validation result. Brain merges commits into dev and pushes dev; the daemon relays that reply to Brain as the completion notice, so write it as if Brain will read only that.`
-      : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. ${afterPassLine(pair)}`,
+      : `When done, send the auditor your validation (full suites for code) with the IM.codes imcodes-memory MCP send_message tool and write ${readyMarker(pair)}; the daemon relays that to the auditor. ${afterPassLine(pair)}`,
     TASK_PAIR_WORKSPACE_RULES,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     TASK_PAIR_VALIDATION_REPORT_RULE,
     TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
     NO_LEGACY_ARTIFACTS,
@@ -657,12 +669,12 @@ function afterPassLine(pair: TaskPairState): string {
  */
 function workplaceLine(pair: TaskPairState): string {
   if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE) {
-    return `This pair has NO workspace (Brain chose workspace=none): the daemon created no worktree and no directory. Work wherever the brief says (a remote machine, a service, a read-only inspection of the project); do not create a worktree, and keep scratch files in a temp directory outside the project main checkout. Send your validation report and evidence to the auditor with send_message and write ${marker('READY_FOR_AUDIT', pair.taskId)} with no worktree, path or head: your report is the audit material.`;
+    return `This pair has NO workspace (Brain chose workspace=none): the daemon created no worktree and no directory. Work wherever the brief says (a remote machine, a service, a read-only inspection of the project); do not create a worktree, and keep scratch files in a temp directory outside the project main checkout. Send your validation report and evidence to the auditor with the IM.codes imcodes-memory MCP send_message tool and write ${marker('READY_FOR_AUDIT', pair.taskId)} with no worktree, path or head: your report is the audit material.`;
   }
   const workspace = pair.workspace;
   const nonGit = workspace?.status === 'active' ? workspace.nonGit : undefined;
   if (workspace && nonGit?.mode === 'cow') {
-    return `Work in the copy-on-write CLONE of the project the daemon made for this pair: ${workspace.path} (the project ${nonGit.projectRoot} is not a git repository, so there is no git here). Heavy directories such as node_modules were not cloned: install or link what you need. The project itself is not touched while you work: the daemon finds your changed files by comparing the clone with the manifest it took, sends the auditor a per-file diff against the original, and after PASS copies your changes back at DONE (any file the project changed meanwhile is refused and reported, never overwritten; overwritten files are backed up). Write READY_FOR_AUDIT with path=${workspace.path}. This absolute path is authoritative; never use cwd or write into ${nonGit.projectRoot}.`;
+    return `Work in the copy-on-write CLONE of the project the daemon made for this pair: ${workspace.path} (the project ${nonGit.projectRoot} is not a git repository, so there is no git here). Heavy directories such as node_modules were not cloned: install or link what you need. The project itself is not touched while you work: the daemon finds your changed files by comparing the clone with the manifest it took, sends the auditor a per-file diff against the original, and after PASS copies your changes back at DONE (any file the project changed meanwhile is refused and reported, never overwritten; overwritten files are backed up). Write READY_FOR_AUDIT with path=${workspace.path}. This absolute path is authoritative; never use cwd or write into ${nonGit.projectRoot}. On runtimes whose shell resets to the main checkout on each call, prefix every shell command with cd "${workspace.path}" && ... (or use git -C "${workspace.path}"), and file tools must use absolute paths under ${workspace.path}.`;
   }
   if (workspace && nonGit?.mode === 'in_place') {
     return `Work DIRECTLY in the project directory: ${nonGit.projectRoot}. It is not a git repository and this machine could not make it one or clone it (${nonGit.fallbackReason ?? 'no reason recorded'}), so there is no isolated copy and no undo: make deliberate edits and keep a list of every file you change. ${workspace.path} is only for scratch, evidence and deliverables. Write READY_FOR_AUDIT with path=${nonGit.projectRoot} files=<comma separated changed files>. Pairs on this project run one at a time unless Brain passed parallel=true.`;
@@ -673,9 +685,10 @@ function workplaceLine(pair: TaskPairState): string {
     const revision = workspace.kind === 'worktree'
       ? `${where}, base ${workspace.base ?? pair.material?.base ?? 'unknown'}; latest head ${latestHead ?? 'unknown'}`
       : `base ${workspace.base ?? pair.material?.base ?? 'unknown'}; latest head ${latestHead ?? 'unknown'}`;
+    const runtimeGuidance = ` On runtimes whose shell resets to the main checkout on each call, prefix every shell command with cd "${workspace.path}" && ... (or use git -C "${workspace.path}"), and file tools must use absolute paths under ${workspace.path}.`;
     const line = workspace.kind === 'dir'
-      ? `Work in the task directory the daemon created for this pair: ${workspace.path} (${revision}). This absolute path is authoritative; never use cwd or the project main checkout. Write your results there.`
-      : `Work in the worktree the daemon created for this pair: ${workspace.path} (${revision}; ${workspace.branch ? 'keep committing on that branch' : 'make a local branch there if useful'}, commit locally, never push any branch, report the worktree path plus HEAD, and let Brain merge into dev and push dev). This absolute path is authoritative; never use cwd or the project main checkout.`;
+      ? `Work in the task directory the daemon created for this pair: ${workspace.path} (${revision}). This absolute path is authoritative; never use cwd or the project main checkout. Write your results there.${runtimeGuidance}`
+      : `Work in the worktree the daemon created for this pair: ${workspace.path} (${revision}; ${workspace.branch ? 'keep committing on that branch' : 'make a local branch there if useful'}, commit locally, never push any branch, report the worktree path plus HEAD, and let Brain merge into dev and push dev). This absolute path is authoritative; never use cwd or the project main checkout.${runtimeGuidance}`;
     const moved = workspace.previousPaths?.length
       ? ` The previous executor's worktree was moved here from ${workspace.previousPaths[workspace.previousPaths.length - 1]}; that old path no longer exists, and any material naming it now resolves to this path.`
       : '';
@@ -836,7 +849,8 @@ function readyMarker(pair: TaskPairState): string {
 export function buildExecutorResendMessage(pair: TaskPairState, previousAuditor: string | undefined): string {
   return [
     header(pair),
-    `Your auditor changed${previousAuditor ? ` from ${previousAuditor}` : ''} to ${pair.auditor}. Resend your validation to ${pair.auditor} with send_message, then write ${readyMarker(pair)} if you have not already.`,
+    `Your auditor changed${previousAuditor ? ` from ${previousAuditor}` : ''} to ${pair.auditor}. Resend your validation to ${pair.auditor} with the IM.codes imcodes-memory MCP send_message tool, then write ${readyMarker(pair)} if you have not already.`,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -845,10 +859,10 @@ export function buildExecutorResendMessage(pair: TaskPairState, previousAuditor:
 export function buildExecutorHandoffMessage(pair: TaskPairState, previousExecutor: string | undefined, reason: string): string {
   const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `, auditor ${pair.auditor}` : '';
   const next = pair.status === 'rework'
-    ? `Address the auditor's blocking findings for their whole class, resend, then write ${marker('READY_FOR_AUDIT', pair.taskId)}.`
+    ? `Address the auditor's blocking findings for their whole class, resend your validation via the IM.codes imcodes-memory MCP send_message tool, then write ${marker('READY_FOR_AUDIT', pair.taskId)}.`
     : pair.status === 'in_audit' || pair.status === 'awaiting_audit'
-      ? `The audit is already underway on your predecessor's material. If you need to change it materially, tell the auditor and write ${marker('READY_FOR_AUDIT', pair.taskId)} again once it is updated.`
-      : `Continue the task. When ready, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}.`;
+      ? `The audit is already underway on your predecessor's material. If you need to change it materially, tell the auditor via the IM.codes imcodes-memory MCP send_message tool and write ${marker('READY_FOR_AUDIT', pair.taskId)} again once it is updated.`
+      : `Continue the task. When ready, send the auditor your validation (full suites for code) with the IM.codes imcodes-memory MCP send_message tool and write ${readyMarker(pair)}.`;
   return [
     header(pair),
     `You are now the executor of this task${previousExecutor ? `, taking over from ${previousExecutor}` : ''} (${reason}). Round ${Math.max(1, pair.round)}, status ${pair.status}${auditor}.`,
@@ -856,6 +870,7 @@ export function buildExecutorHandoffMessage(pair: TaskPairState, previousExecuto
     workplaceLine(pair),
     next,
     TASK_PAIR_WORKSPACE_RULES,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     NO_LEGACY_ARTIFACTS,
     contracts(pair.blocking),
   ].join('\n');
@@ -870,6 +885,7 @@ export function buildDispatchTrailer(pair: TaskPairState): string {
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? [TASK_PAIR_AUDITOR_PROPOSAL_RULE] : []),
   ].join('\n');
 }
@@ -879,12 +895,14 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
     header(pair),
     TASK_PAIR_TITLE_RULE,
     pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE
-      ? `You are the auditor of this task for executor ${pair.executor}. This pair has NO workspace (Brain chose workspace=none): there is no worktree, directory, HEAD or diff. On READY_FOR_AUDIT the material is the report and evidence the executor sends you with send_message; judge it by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}), re-check what you can of the evidence it names, and write PASS or REWORK with severity counts.`
-      : `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
+      ? `You are the auditor of this task for executor ${pair.executor}. This pair has NO workspace (Brain chose workspace=none): there is no worktree, directory, HEAD or diff. On READY_FOR_AUDIT the material is the report and evidence the executor sends you with the IM.codes imcodes-memory MCP send_message tool; judge it by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}), re-check what you can of the evidence it names, and write PASS or REWORK with severity counts.`
+      : `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation via the IM.codes imcodes-memory MCP send_message tool; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_VALIDATION_REPORT_RULE,
     TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
+    TASK_PAIR_INTERSESSION_SEND_RULE,
     TASK_PAIR_CHECKLIST_RULE,
     blockingSummaryLine(pair),
     NO_LEGACY_ARTIFACTS,
