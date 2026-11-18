@@ -75,31 +75,38 @@ export function readPersistedAgySystemPrompt(homeDir: string, acpSessionId: stri
   }
 }
 
+export type AgySlotBIdentityOverride = string | null | undefined;
+
 export interface AgyResumeSystemPromptPlan {
   shouldSendMeta: boolean;
   metaToSend: string | undefined;
   nextInjectedKey: string | undefined;
   nextMetaDelivered: boolean;
+  nextSlotBOverride: AgySlotBIdentityOverride;
 }
 
 /**
  * Decides what `_meta.antigravity.systemPrompt.append` (if any) to send on `session/resume`.
- * When SQLite already persisted `acp_system_prompt` (Slot A), regular resumes omit `_meta`
- * so `agy acp` does not stack a second Slot B system prompt; only mid-session
- * `<imcodes-agent-identity>` changes emit the compact identity block delta.
+ * Tracks both SQLite Slot A (`persistedPrompt`) and the live transport's current Slot B
+ * dynamic override (`activeSlotBOverride`) so regular resumes omit `_meta`, mid-session
+ * identity changes send only the compact identity delta, and reverting Slot B back to Slot A
+ * (or clearing an added override) issues the required resume override before updating cache.
  */
 export function resolveAgyResumeSystemPromptMeta(params: {
   persistedPrompt: string | null;
   trimmedSystemText: string | undefined;
   hasDeliveredMeta: boolean;
+  activeSlotBOverride?: AgySlotBIdentityOverride;
 }): AgyResumeSystemPromptPlan {
-  const { persistedPrompt, trimmedSystemText, hasDeliveredMeta } = params;
+  const { persistedPrompt, trimmedSystemText, hasDeliveredMeta, activeSlotBOverride } = params;
   if (!trimmedSystemText) {
+    const needClear = hasDeliveredMeta || activeSlotBOverride !== undefined;
     return {
-      shouldSendMeta: hasDeliveredMeta,
-      metaToSend: hasDeliveredMeta ? '' : undefined,
+      shouldSendMeta: needClear,
+      metaToSend: needClear ? '' : undefined,
       nextInjectedKey: undefined,
       nextMetaDelivered: false,
+      nextSlotBOverride: undefined,
     };
   }
 
@@ -110,26 +117,25 @@ export function resolveAgyResumeSystemPromptMeta(params: {
       metaToSend: trimmedSystemText,
       nextInjectedKey,
       nextMetaDelivered: true,
-    };
-  }
-
-  if (persistedPrompt === trimmedSystemText) {
-    return {
-      shouldSendMeta: false,
-      metaToSend: undefined,
-      nextInjectedKey,
-      nextMetaDelivered: true,
+      nextSlotBOverride: undefined,
     };
   }
 
   const persistedIdentity = extractAgentIdentityBlock(persistedPrompt);
+  const effectiveIdentity = activeSlotBOverride === undefined
+    ? persistedIdentity
+    : (activeSlotBOverride ?? undefined);
   const nextIdentity = extractAgentIdentityBlock(trimmedSystemText);
-  if ((persistedIdentity !== undefined || nextIdentity !== undefined) && persistedIdentity !== nextIdentity) {
+
+  if (effectiveIdentity !== nextIdentity) {
+    const metaToSend = nextIdentity
+      ?? (persistedIdentity !== undefined ? EMPTY_AGENT_IDENTITY_BLOCK : '');
     return {
       shouldSendMeta: true,
-      metaToSend: nextIdentity ?? EMPTY_AGENT_IDENTITY_BLOCK,
+      metaToSend,
       nextInjectedKey,
       nextMetaDelivered: true,
+      nextSlotBOverride: nextIdentity ?? null,
     };
   }
 
@@ -138,5 +144,6 @@ export function resolveAgyResumeSystemPromptMeta(params: {
     metaToSend: undefined,
     nextInjectedKey,
     nextMetaDelivered: true,
+    nextSlotBOverride: activeSlotBOverride,
   };
 }

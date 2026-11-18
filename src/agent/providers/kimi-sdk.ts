@@ -131,7 +131,11 @@ import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import type { ProviderActiveWorkSnapshot, ToolTerminalReason, ToolTerminalStatus } from '../../../shared/session-activity-types.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
-import { readPersistedAgySystemPrompt, resolveAgyResumeSystemPromptMeta } from '../agy-persisted-system-prompt.js';
+import {
+  readPersistedAgySystemPrompt,
+  resolveAgyResumeSystemPromptMeta,
+  type AgySlotBIdentityOverride,
+} from '../agy-persisted-system-prompt.js';
 import {
   canonicalizeTransportCwd,
   normalizeTransportCwd,
@@ -335,6 +339,8 @@ interface KimiSdkSessionState {
   sessionSystemTextInjected?: string;
   /** True when the current live ACP session has received systemPrompt via `_meta.antigravity.systemPrompt.append`. */
   sessionSystemTextMetaDelivered?: boolean;
+  /** Dynamic Slot B identity override active on the current live ACP transport (`null` = cleared). */
+  agySlotBIdentityOverride?: AgySlotBIdentityOverride;
   /** True once initial out-of-band `_meta` system text has been added to `agyContextUsage`. */
   agyContextUsageMetaSeeded?: boolean;
   /** Most recent ACP `usage_update.tokens` for this session — captured here so
@@ -670,6 +676,7 @@ export class KimiSdkProvider implements TransportProvider {
       state.modelApplyRequest = undefined;
       state.sessionSystemTextInjected = undefined;
       state.sessionSystemTextMetaDelivered = undefined;
+      state.agySlotBIdentityOverride = undefined;
       state.agyContextUsageMetaSeeded = undefined;
       if (opts?.removeSession && this.sessions.get(state.routeId) === state) {
         this.sessions.delete(state.routeId);
@@ -908,6 +915,15 @@ export class KimiSdkProvider implements TransportProvider {
       lastActivityAt: Date.now(),
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
       sessionSystemTextMetaDelivered: existing?.sessionSystemTextMetaDelivered,
+      agySlotBIdentityOverride: (
+        this.profile.perSessionTransport
+        && !config.fresh
+        && !shouldDisposePrior
+        && Boolean(existing?.isolatedTransport?.connection)
+        && existing?.acpSessionId === (config.resumeId ?? existing?.acpSessionId)
+      )
+        ? existing?.agySlotBIdentityOverride
+        : undefined,
       agyForeground: this.id === AGY_SDK_PROVIDER_ID && existing?.acpSessionId === (config.resumeId ?? existing?.acpSessionId) && existing?.agyForeground?.authoritative
         ? Object.assign(new AgyForegroundOwnership(),{authoritative:true}) : undefined,
       ...(incognito ? {
@@ -2191,6 +2207,7 @@ export class KimiSdkProvider implements TransportProvider {
         if (state) {
           state.sessionSystemTextInjected = undefined;
           state.sessionSystemTextMetaDelivered = undefined;
+          state.agySlotBIdentityOverride = undefined;
           state.agyContextUsageMetaSeeded = undefined;
         }
         if (this.clearSessionWorkAfterFailure(sid)) {
@@ -2799,6 +2816,7 @@ export class KimiSdkProvider implements TransportProvider {
                       : null,
                     trimmedSystemText,
                     hasDeliveredMeta: Boolean(state.sessionSystemTextMetaDelivered),
+                    activeSlotBOverride: state.agySlotBIdentityOverride,
                   })
                 : undefined;
               const metaToSend = plan?.metaToSend;
@@ -2806,6 +2824,7 @@ export class KimiSdkProvider implements TransportProvider {
               if (plan) {
                 state.sessionSystemTextInjected = plan.nextInjectedKey;
                 state.sessionSystemTextMetaDelivered = plan.nextMetaDelivered;
+                state.agySlotBIdentityOverride = plan.nextSlotBOverride;
               }
             } catch (err) {
               if (isWorkerSpawnMissingExecutableError(err)) throw err;
@@ -2847,12 +2866,14 @@ export class KimiSdkProvider implements TransportProvider {
                 : null,
               trimmedSystemText,
               hasDeliveredMeta: Boolean(state.sessionSystemTextMetaDelivered),
+              activeSlotBOverride: state.agySlotBIdentityOverride,
             });
             if (plan.shouldSendMeta) {
               await this.resumeOrLoadAcpSession(sessionId, state, connection, plan.metaToSend);
             }
             state.sessionSystemTextInjected = plan.nextInjectedKey;
             state.sessionSystemTextMetaDelivered = plan.nextMetaDelivered;
+            state.agySlotBIdentityOverride = plan.nextSlotBOverride;
           }
         }
 
@@ -3008,6 +3029,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.modeApplied = false;
     state.sessionSystemTextInjected = trimmedSystemText ? sessionSystemContractKey(trimmedSystemText) : undefined;
     state.sessionSystemTextMetaDelivered = Boolean(trimmedSystemText);
+    state.agySlotBIdentityOverride = undefined;
     state.agyContextUsageMetaSeeded = false;
     this.registerAcpRoute(state.acpSessionId, sessionId);
     this.cacheModelsFromSessionResponse(result);
@@ -4005,6 +4027,7 @@ export class KimiSdkProvider implements TransportProvider {
         state.modelApplyRequest = undefined;
         state.sessionSystemTextInjected = undefined;
         state.sessionSystemTextMetaDelivered = undefined;
+        state.agySlotBIdentityOverride = undefined;
         state.agyContextUsageMetaSeeded = undefined;
       }
       this.cachedModels = null;
@@ -4257,6 +4280,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (!this.profile.steeringPrompts) state.activePromptAdmissions.clear();
     state.loaded = false;
     state.modeApplied = false;
+    state.agySlotBIdentityOverride = undefined;
     state.confirmedModel = undefined;
     state.modelApplyRequest = undefined;
     state.steeringTerminal = undefined;

@@ -3756,4 +3756,118 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    {
+      label: 'Slot A with identity: A -> B -> B(outer refresh) -> A -> A(outer refresh) -> rebuild(A)',
+      initialIdentity: '<imcodes-agent-identity>\nIDENTITY_A\n</imcodes-agent-identity>',
+      revertAppend: '<imcodes-agent-identity>\nIDENTITY_A\n</imcodes-agent-identity>',
+      sessionId: 'slot-a-revert-with-id',
+    },
+    {
+      label: 'Slot A without identity: none -> B -> B(outer refresh) -> none -> none(outer refresh) -> rebuild(none)',
+      initialIdentity: undefined,
+      revertAppend: '',
+      sessionId: 'slot-a-revert-no-id',
+    },
+  ])('reverts Slot B override back to Slot A baseline cleanly ($label)', async ({ initialIdentity, revertAppend, sessionId }) => {
+    const outerV1 = 'OUTER_SYSTEM_CONTRACT_V1 '.repeat(2200);
+    const outerV2 = 'OUTER_SYSTEM_CONTRACT_V2 '.repeat(2200);
+    const outerV3 = 'OUTER_SYSTEM_CONTRACT_V3 '.repeat(2200);
+    const identityB = '<imcodes-agent-identity>\nIDENTITY_B_DYNAMIC\n</imcodes-agent-identity>';
+
+    const buildSystemText = (outer: string, idBlock?: string) => (idBlock ? `${outer}\n${idBlock}` : outer);
+    const persistedText = buildSystemText(outerV1, initialIdentity);
+
+    const { provider, root, binary, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    await writeAgyMetadataBlobDb(root, sessionId, buildPersistedSystemPromptBlob(persistedText));
+
+    const routeName = `deck_test_${sessionId}`;
+    await route(provider, routeName, { resumeId: sessionId });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(routeName, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Cold resume at baseline -> omits _meta
+    await sendTurn('turn-1-baseline', persistedText, 1);
+    expect((await requests()).filter((x) => x.method === 'session/resume').map((x) => x.params?._meta ?? null)).toEqual([null]);
+
+    // 2. Live update to B -> sends B delta
+    await sendTurn('turn-2-apply-b', buildSystemText(outerV1, identityB), 2);
+    expect((await requests()).filter((x) => x.method === 'session/resume').map((x) => x.params?._meta?.antigravity?.systemPrompt?.append ?? null)).toEqual([
+      null,
+      identityB,
+    ]);
+
+    // 3. Outer contract refresh + refreshSessionSystemText while B unchanged -> no extra resume RPC
+    provider.refreshSessionSystemText(routeName);
+    await sendTurn('turn-3-keep-b-outer-refresh', buildSystemText(outerV2, identityB), 3);
+    expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(2);
+
+    // 4. Revert back to Slot A baseline -> MUST send resume override to clear/replace B in Slot B
+    await sendTurn('turn-4-revert-to-a', buildSystemText(outerV2, initialIdentity), 4);
+    expect((await requests()).filter((x) => x.method === 'session/resume').map((x) => x.params?._meta?.antigravity?.systemPrompt?.append ?? null)).toEqual([
+      null,
+      identityB,
+      revertAppend,
+    ]);
+
+    // 5. Outer contract refresh + refreshSessionSystemText while reverted baseline unchanged -> no extra resume RPC
+    provider.refreshSessionSystemText(routeName);
+    await sendTurn('turn-5-keep-reverted-outer-refresh', buildSystemText(outerV3, initialIdentity), 5);
+    expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(3);
+
+    // 6. Transport rebuild on a fresh provider instance (simulating daemon restart / hibernation wake) ->
+    //    activeSlotBIdentityOverride resets to undefined, cold resume at baseline omits _meta again
+    const logAfterRebuild = path.join(root, 'rpc-rebuild.jsonl');
+    const providerAfterRebuild = new AgyAcpProvider();
+    resources.push({ provider: providerAfterRebuild, root });
+    await providerAfterRebuild.connect({
+      binaryPath: binary,
+      env: {
+        HOME: root,
+        AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+        AGY_ACP_FIXTURE_LOG: logAfterRebuild,
+        AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1',
+      },
+    });
+    const rebuildComplete = vi.fn();
+    providerAfterRebuild.onComplete(rebuildComplete);
+    await providerAfterRebuild.createSession({
+      sessionKey: routeName,
+      sessionName: routeName,
+      cwd: process.cwd(),
+      agentId: 'model-a',
+      resumeId: sessionId,
+    });
+    const pRebuild = normalizeProviderPayload('turn-6-after-rebuild');
+    pRebuild.sessionSystemText = buildSystemText(outerV3, initialIdentity);
+    pRebuild.context = { ...pRebuild.context, sessionSystemText: pRebuild.sessionSystemText };
+    await providerAfterRebuild.send(routeName, pRebuild);
+    await vi.waitFor(() => expect(rebuildComplete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const rebuildReqs = (await readFile(logAfterRebuild, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    const rebuildResumes = rebuildReqs.filter((x) => x.method === 'session/resume');
+    expect(rebuildResumes).toHaveLength(1);
+    expect(rebuildResumes[0]?.params?._meta).toBeUndefined();
+
+    // Prompts stay clean across both transports (never leaking system contract or identity)
+    const initialPrompts = (await requests()).filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    const rebuildPrompts = rebuildReqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(initialPrompts).toEqual([
+      'turn-1-baseline',
+      'turn-2-apply-b',
+      'turn-3-keep-b-outer-refresh',
+      'turn-4-revert-to-a',
+      'turn-5-keep-reverted-outer-refresh',
+    ]);
+    expect(rebuildPrompts).toEqual(['turn-6-after-rebuild']);
+  });
 });
