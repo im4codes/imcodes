@@ -191,16 +191,16 @@ jobs:
   # ── macOS daemon unit tests ─────────────────────────────────────────────
 
   macos-unit-tests:
-    name: Unit Tests (macOS, shard ${{ matrix.shard }}/3)
+    name: Unit Tests (macOS, shard ${{ matrix.shard }}/6)
     # macos-15 and macos-latest both target GitHub's congested macOS arm64 pool; use macos-15-intel (x86_64) while Controlled Node Executable covers macos-15 arm64.
     runs-on: macos-15-intel
-    # Three disjoint shards run at max-parallel: 2 so peak concurrent macOS jobs stay below GitHub's 5-runner cap.
+    # Six disjoint shards run at max-parallel: 6 on Intel macOS runners with --maxWorkers=2 to cut per-shard runtime and CPU contention.
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 6
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -213,7 +213,7 @@ jobs:
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit -- --shard=${{ matrix.shard }}/3
+      - run: npm run test:unit:macos -- --shard=${{ matrix.shard }}/6
 
   # ── macOS remote-desktop components (built from the immutable SDK) ────────
 

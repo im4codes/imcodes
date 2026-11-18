@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -72,7 +72,7 @@ describe('macOS generation-owned virtual display', () => {
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     expect(run.stdout).toContain('macos virtual display adapter counterfactual ok');
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('compiles the core and private backend for arm64 and x86_64', async () => {
     if (process.platform !== 'darwin') return;
@@ -93,5 +93,5 @@ describe('macOS generation-owned virtual display', () => {
         expect(compile.status, `${architecture}/${source}: ${compile.stdout}\n${compile.stderr}`).toBe(0);
       }
     }
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

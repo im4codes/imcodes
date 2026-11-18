@@ -85,5 +85,5 @@ describe('context-store panel query performance', () => {
     expect(projects.length).toBeLessThanOrEqual(200);
     expect(elapsedMs).toBeLessThan(300);
     resetContextStoreForTests();
-  });
+  }, 60_000);
 });

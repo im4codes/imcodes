@@ -106,12 +106,14 @@ function rawBootstrap(env: Record<string, string>): {
 
 describe('memory MCP lightweight bootstrap', () => {
   it.each([{ method: 'server/discover', id: 0 }, { method: 'future/unknown', id: 'probe' }])('rejects pre-initialize protocol probe $method promptly so legacy negotiation can continue', async ({ method, id }) => {
-    const { child, messages } = rawBootstrap({ IMCODES_MEMORY_MCP_TEST_DELAY_MS: '6000' });
+    const isIntelMac = process.platform === 'darwin' && process.arch === 'x64';
+    const { child, messages } = rawBootstrap({ IMCODES_MEMORY_MCP_TEST_DELAY_MS: isIntelMac ? '10000' : '6000' });
     const started = Date.now();
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params: {} })}\n`);
-    const reply = await waitFor(() => messages.find(message => message.id === id), 2_000);
+    const probeBudgetMs = isIntelMac ? 6_000 : 2_000;
+    const reply = await waitFor(() => messages.find(message => message.id === id), probeBudgetMs);
     expect(reply).toMatchObject({ error: { code: -32601, message: 'Method not found' } });
-    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(Date.now() - started).toBeLessThan(probeBudgetMs);
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'future/notification', params: {} })}\n`);
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'initialize', method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'probe-fallback', version: '1' } } })}\n`);
     const initReply = await waitFor(() => messages.find(message => message.id === 'initialize'));
@@ -130,21 +132,22 @@ describe('memory MCP lightweight bootstrap', () => {
     expect(source.indexOf("import('./daemon/memory-mcp-bootstrap.js')"))
       .toBeLessThan(source.indexOf("import('./cli.js')"));
 
-    const { client, transport } = connect({ IMCODES_MEMORY_MCP_TEST_DELAY_MS: '6000' });
+    const isIntelMac = process.platform === 'darwin' && process.arch === 'x64';
+    const { client, transport } = connect({ IMCODES_MEMORY_MCP_TEST_DELAY_MS: isIntelMac ? '10000' : '6000' });
     const startedAt = Date.now();
     await client.connect(transport);
     const initial = await client.listTools();
     // Source-mode includes the tsx loader; the shipped JS path is much faster.
     // This bound is still below the deliberately blocked backend and far below
     // the MCP clients' 30s CONNECT_TIMEOUT.
-    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    expect(Date.now() - startedAt).toBeLessThan(isIntelMac ? 7_000 : 4_000);
     expect(initial.tools.some((tool) => tool.name === 'mcp_tool_search')).toBe(true);
     expect(initial.tools.length).toBeGreaterThan(35);
 
     await waitForFixtureCatalog(client);
     await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'ready' } }))
       .resolves.toMatchObject({ structuredContent: { echoed: 'ready' } });
-  }, 20_000);
+  }, 25_000);
 
   it('keeps stdio connected and automatically replaces a backend that crashes during startup', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-reconnect-'));

@@ -18,15 +18,16 @@ const ci = () => parse(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
 };
 
 describe('bounded parallel daemon CI, with unchanged release safety', () => {
-  it.each([['unit-tests', 4], ['macos-unit-tests', 3]] as const)(
+  it.each([['unit-tests', 4], ['macos-unit-tests', 6]] as const)(
     '%s executes every contiguous shard once, without masking failures', (id, count) => {
       const job = ci().jobs[id]!;
       expect(job.name).toContain(`shard \${{ matrix.shard }}/${count}`);
       expect(job.strategy?.matrix.shard).toEqual(Array.from({ length: count }, (_, i) => i + 1));
       expect(job.strategy?.['fail-fast']).toBe(false);
-      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 4 : 2);
+      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 4 : 6);
+      const script = id === 'macos-unit-tests' ? 'test:unit:macos' : 'test:unit';
       expect(job.steps.filter((step) => step.run?.includes('npm run test:unit')).map((step) => step.run))
-        .toEqual([`npm run test:unit -- --shard=\${{ matrix.shard }}/${count}`]);
+        .toEqual([`npm run ${script} -- --shard=\${{ matrix.shard }}/${count}`]);
       expect(job['continue-on-error']).not.toBe(true);
       expect(job.steps.find((step) => step.run?.includes('npm run test:unit'))?.['continue-on-error']).not.toBe(true);
     },
@@ -57,6 +58,7 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
     expect(ci().jobs['unit-tests']!.strategy?.matrix.node).toEqual(['22', '24']);
     const scripts = JSON.parse(readFileSync('package.json', 'utf8')).scripts;
     expect(scripts['test:unit']).toContain('--maxWorkers=3 --project daemon');
+    expect(scripts['test:unit:macos']).toContain('--maxWorkers=2 --project daemon');
   });
 
   it('starts self-contained E2E without waiting for unit tests, but gates releases on both', () => {
@@ -97,8 +99,8 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
 
     const macUnit = jobs['macos-unit-tests']!;
     expect(macUnit['runs-on']).toBe('macos-15-intel');
-    expect(macUnit.strategy?.matrix.shard).toEqual([1, 2, 3]);
-    expect(macUnit.strategy?.['max-parallel']).toBe(2);
+    expect(macUnit.strategy?.matrix.shard).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(macUnit.strategy?.['max-parallel']).toBe(6);
     expect(macUnit['timeout-minutes']).toBe(45);
     expect(jobs.docker!.needs).toContain('macos-unit-tests');
 

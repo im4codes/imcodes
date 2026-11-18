@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -245,7 +245,7 @@ describe('macOS virtual-display authority', () => {
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     expect(run.stdout).toContain('macos virtual display authority counterfactual ok');
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('gates the single real-display experiment behind all ten guards', async () => {
     const script = read('scripts/macos-remote-desktop-virtual-display-experiment.sh');
@@ -550,7 +550,7 @@ describe('macOS virtual-display authority', () => {
     const tampered = line.replace('uid=501', 'uid=502 uid=501');
     const rejected = await runNative(cli, [], { input: `${tampered}\n` });
     expect(rejected.stdout).toContain('REJECTED');
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('validates at the serializer, not at the builder, the type or the freeze', async () => {
     // The builder is one of the ways a value reaches the serializer, the
@@ -722,7 +722,7 @@ describe('macOS virtual-display authority', () => {
       .stdout.trim().split('\n');
     const expected = [...rejected.map(() => '0'), ...accepted.map(() => '1')];
     expect(answers).toEqual(expected);
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('spells the canonical designated requirement identically in both languages', async () => {
     if (process.platform !== 'darwin') return;
@@ -778,7 +778,7 @@ describe('macOS virtual-display authority', () => {
       expect(canonicalDesignatedRequirement(bundle, team),
         `TypeScript built a requirement from ${bundle}/${team}`).toBe('');
     }
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('refuses the SAME wire violations at both ends, for the same reason', async () => {
     if (process.platform !== 'darwin') return;
@@ -945,7 +945,7 @@ describe('macOS virtual-display authority', () => {
       expect(verdict.ok, `native ACCEPTED ${what}`).toBe(false);
       expect(verdict.why, `native refused ${what} for the wrong reason`).toBe(why);
     }
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('runs the agent ownership and ledger counterfactuals under sanitizers', async () => {
     if (process.platform !== 'darwin') return;
@@ -1055,7 +1055,7 @@ describe('macOS virtual-display authority', () => {
       const run = await runNative(executable, [], { cwd: directory! });
       expect(run.status, `${suite}: ${run.stdout}\n${run.stderr}`).toBe(0);
       expect(run.stdout).toContain(`macos virtual display ${suite} counterfactual ok`);
-    }, 180_000);
+    }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
   }
 
 
@@ -1075,7 +1075,7 @@ describe('macOS virtual-display authority', () => {
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     expect(run.stdout).toContain('macos virtual display grant counterfactual ok');
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('runs the helper supervision counterfactuals under sanitizers', async () => {
     if (process.platform !== 'darwin') return;
@@ -1094,7 +1094,7 @@ describe('macOS virtual-display authority', () => {
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     expect(run.stdout).toContain('macos virtual display supervisor counterfactual ok');
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
 
   it('runs the helper binding, admission and backend counterfactuals under sanitizers', async () => {
@@ -1118,7 +1118,7 @@ describe('macOS virtual-display authority', () => {
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     expect(run.stdout).toContain('macos virtual display helper counterfactual ok');
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('drives the helper from a real run loop instead of a blocking read', async () => {
     const helper = read(`${NATIVE}/macos_virtual_display_helper_main.mm`);

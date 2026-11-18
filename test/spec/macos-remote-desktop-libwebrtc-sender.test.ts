@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -83,7 +83,7 @@ describe('macOS pinned-libwebrtc H.264 sender bridge', () => {
 
     const run = await runNative(executable!, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('compiles the checkout-independent bridge for both release architectures', async () => {
     if (process.platform !== 'darwin') return;
@@ -103,5 +103,5 @@ describe('macOS pinned-libwebrtc H.264 sender bridge', () => {
       ], { cwd: directory! });
       expect(compile.status, `${architecture}\n${compile.stdout}\n${compile.stderr}`).toBe(0);
     }
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

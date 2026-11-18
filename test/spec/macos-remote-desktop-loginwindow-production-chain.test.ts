@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -241,5 +241,5 @@ describe('macOS LoginWindow production chain', () => {
     // Five translation units compiled under ASan and UBSan: seconds on a
     // developer's Mac, but past the project-wide 20s default on a loaded CI
     // runner, which is the only way this has ever failed.
-  }, 90_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

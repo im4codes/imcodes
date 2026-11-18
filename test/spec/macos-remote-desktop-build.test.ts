@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { runNative, runNativeOrThrow } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative, runNativeOrThrow } from './support/native-exec.js';
 import { spawn } from 'node:child_process';
 import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -373,7 +373,7 @@ describe('macOS remote-desktop build spike contract', () => {
     // and it measures ~19s alone, which overruns the 20s default once the rest
     // of the suite is competing for cores. Sized to the real work rather than
     // trimmed, because every source here is one the agent genuinely needs.
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('requires separate native arm64 and Intel x64 CI links', async () => {
     expect(contract.architectures).toEqual([

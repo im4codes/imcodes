@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const COMMON = resolve(ROOT, 'native', 'remote-desktop-common');
 const HARNESS = resolve(ROOT, 'test', 'spec', 'remote-desktop-common-data-channel-payload.cc');
-const NATIVE_TIMEOUT_MS = 60_000;
+const NATIVE_TIMEOUT_MS = NATIVE_COMPILE_TEST_TIMEOUT_MS;
 
 async function findCompiler(): Promise<string> {
   for (const candidate of [process.env.CXX, 'clang++', 'c++', 'g++']) {

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS } from './support/native-exec.js';
 import { readSource } from '../helpers/read-source.js';
 
 /**
@@ -53,7 +54,7 @@ describe('linux remote desktop capability probe', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('behaviorally REDs a compile-clean always-ready substitution', () => {
     const cxx = compiler();
@@ -87,5 +88,5 @@ describe('linux remote desktop capability probe', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

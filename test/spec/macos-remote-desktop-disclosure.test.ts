@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -147,7 +147,7 @@ describe("macOS non-requester-controlled local disclosure", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it("runs readiness, Stop, close, crash, bounds and stale-generation fakes", async () => {
     if (process.platform !== "darwin") return;
@@ -200,5 +200,5 @@ describe("macOS non-requester-controlled local disclosure", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

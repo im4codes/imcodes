@@ -32,6 +32,7 @@
     "test": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run",
     "lint:no-sync-context-store": "node scripts/lint-no-sync-context-store.mjs",
     "test:unit": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --minWorkers=1 --maxWorkers=3 --project daemon",
+    "test:unit:macos": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --minWorkers=1 --maxWorkers=2 --project daemon",
     "test:server": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --project server",
     "test:web": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --project web",
     "test:e2e": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --project e2e",

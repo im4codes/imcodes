@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -102,5 +102,5 @@ describe('macOS ScreenCaptureKit adapter', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

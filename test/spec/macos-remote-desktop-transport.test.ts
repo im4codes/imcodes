@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -121,7 +121,7 @@ describe('macOS remote-desktop transport session adapter', () => {
 
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('runs the pinned transport teardown regression test under ASan and UBSan', async () => {
     if (process.platform !== 'darwin') return;
@@ -198,7 +198,7 @@ describe('macOS remote-desktop transport session adapter', () => {
 
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('compiles the checkout-independent adapter for both release architectures', async () => {
     if (process.platform !== 'darwin') return;
@@ -217,5 +217,5 @@ describe('macOS remote-desktop transport session adapter', () => {
       ], { cwd: directory! });
       expect(compile.status, `${architecture}: ${compile.stdout}\n${compile.stderr}`).toBe(0);
     }
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

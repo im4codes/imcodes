@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -122,7 +122,7 @@ describe('macOS remote-desktop native command, IPC and disclosure seams', () => 
 
     const run = await runNative(executable, [], { cwd: directory! });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('compiles the contract layers for both release architectures', async () => {
     if (process.platform !== 'darwin') return;
@@ -142,5 +142,5 @@ describe('macOS remote-desktop native command, IPC and disclosure seams', () => 
         expect(compile.status, `${architecture} ${path}: ${compile.stderr}`).toBe(0);
       }
     }
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -198,7 +198,7 @@ describe('macOS VideoToolbox H.264 encoder adapter', () => {
       '-o', harnessExecutable!,
     ], { cwd: harnessDirectory! });
     expect(compile.status, `${compile.stdout}\n${compile.stderr}`).toBe(0);
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('runs the injected native adapter harness under ASan and UBSan', async () => {
     if (process.platform !== 'darwin') return;
@@ -206,7 +206,7 @@ describe('macOS VideoToolbox H.264 encoder adapter', () => {
       cwd: harnessDirectory!,
     });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('compiles the production Objective-C++ adapter for both release architectures', async () => {
     if (process.platform !== 'darwin') return;
@@ -220,5 +220,5 @@ describe('macOS VideoToolbox H.264 encoder adapter', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 90_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

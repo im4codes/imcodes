@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS } from './support/native-exec.js';
 
 import {
   AIDESK_AGENT_FRAMEWORKS,
@@ -154,7 +155,7 @@ describe('aiDesk application bundle', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('carries the Computer Use executable, never the upstream bundle', () => {
     const source = readSource('scripts/build-aidesk-app.mjs');

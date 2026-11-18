@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -112,4 +112,4 @@ describe('macOS virtual-display cross-architecture build', () => {
     expect(undefinedSymbols.stdout).not.toMatch(/_CGSConfigureDisplayEnabled/);
     expect(undefinedSymbols.stdout).not.toMatch(/_CGSGetDisplayList/);
     expect(undefinedSymbols.stdout).toMatch(/_dlsym/);
-  }, 120_000);});
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);});

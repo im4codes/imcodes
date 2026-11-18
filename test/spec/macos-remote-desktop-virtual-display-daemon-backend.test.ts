@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
@@ -42,7 +42,7 @@ describe('macOS virtual-display daemon-proxy backend', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('injects the daemon backend into the production session', async () => {
     const worker = readFileSyncSafe(resolve(NATIVE, 'macos_remote_desktop_worker_main.mm'));

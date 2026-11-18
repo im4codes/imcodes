@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -129,5 +129,5 @@ describe('macOS latency-first encoder mode', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 90_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

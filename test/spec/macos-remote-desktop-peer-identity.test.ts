@@ -1,4 +1,4 @@
-import { runNativeOrThrow } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNativeOrThrow } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -35,7 +35,7 @@ describe('macOS remote-desktop native peer identity', async () => {
         rmSync(directory, { recursive: true, force: true });
       }
     },
-    180_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 
   it.skipIf(process.platform !== 'darwin')(
@@ -73,7 +73,7 @@ describe('macOS remote-desktop native peer identity', async () => {
         rmSync(directory, { recursive: true, force: true });
       }
     },
-    180_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 
   it.skipIf(process.platform !== 'darwin')(
@@ -109,7 +109,7 @@ describe('macOS remote-desktop native peer identity', async () => {
         rmSync(directory, { recursive: true, force: true });
       }
     },
-    180_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 
   it('wires only Darwin kernel credentials and Security.framework identity', async () => {

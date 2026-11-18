@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -14,7 +14,7 @@ const SANITIZER_FLAGS = [
   '-fsanitize=address,undefined',
   '-fno-omit-frame-pointer',
 ];
-const NATIVE_CONFORMANCE_TIMEOUT_MS = 60_000;
+const NATIVE_CONFORMANCE_TIMEOUT_MS = NATIVE_COMPILE_TEST_TIMEOUT_MS;
 
 async function findCompiler(): Promise<string> {
   for (const candidate of [process.env.CXX, 'clang++', 'c++', 'g++']) {

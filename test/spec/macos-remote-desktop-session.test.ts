@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -166,6 +166,6 @@ describe('macOS SessionCore composition', () => {
     // capture supervisor, and under full-suite parallelism several native
     // compiles contend for the same cores, so 30s was overrun by scheduling
     // rather than by the work itself.
-    120_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 });

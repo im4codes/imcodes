@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -87,7 +87,7 @@ describe('macOS local permission readiness and onboarding contract', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('runs denied/partial/stale/nonlocal counterfactuals under sanitizers', async () => {
     if (process.platform !== 'darwin') return;
@@ -126,5 +126,5 @@ describe('macOS local permission readiness and onboarding contract', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

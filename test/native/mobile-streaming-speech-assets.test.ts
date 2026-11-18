@@ -1789,8 +1789,8 @@ do {
     print("SPEECH_GAIN_AND_INBOX_VAD:PASS")
 }
 `);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
-  const result = execFileSync(executable, [emptyDir, biasedDir], { encoding: 'utf8', timeout: 20000 });
+  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 120000 });
+  const result = execFileSync(executable, [emptyDir, biasedDir], { encoding: 'utf8', timeout: 90000 });
   for (const name of [
     'RECOGNIZER_DECODER',
     'BG_UNDECODED_SHORT',
@@ -1808,7 +1808,7 @@ do {
   ]) {
     expect(result).toContain(name + ':PASS');
   }
-}, 95000);
+}, 240_000);
 
 it.skipIf(!swiftCompiler)('executes Qwen3Tokenizer U+FFFD rollback boundary guard and buildPromptTokenIds prefix insertion', async () => {
   await setup();
@@ -1912,12 +1912,12 @@ let asrIdx = suffixWithPrefix.firstIndex(of: Int32(Qwen3ASRTokens.asrTextTokenId
 assert(Array(suffixWithPrefix[(asrIdx + 1)...]) == [201, 202, 203], "prefixTokens missing after asrTextTokenId: \\(suffixWithPrefix)")
 print("PROMPT_PREFIX_INSERTION:PASS")
 `);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
-  const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 20000 });
+  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 120000 });
+  const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 90000 });
   for (const name of ['UTF8_ROLLBACK_GUARD', 'HEADER_AND_SHORT_GUARD', 'PROMPT_PREFIX_INSERTION']) {
     expect(result).toContain(name + ':PASS');
   }
-}, 95000);
+}, 240_000);
 
 it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through token prefix rollback, repeated phrases, VAD, disjoint low-RMS cut and final tails', async () => {
   await setup();
@@ -1926,12 +1926,12 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through toke
   expect(state).toContain('mutating func finish(');
   const file = join(root, 'SpeechWindowTests.swift'), executable = join(root, 'speech-window-tests');
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
-  const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
+  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 120000 });
+  const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 90000 });
   for (const name of ['TAIL', 'PREFIX_ROLLBACK_CADENCE', 'REPEATED_PHRASE_PUNCTUATION', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'LONG_TRANSCRIPT', 'VARIABLE_TAP', 'BACKLOG_CHUNKING', 'DISJOINT_LOW_RMS_PARTITION', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH', 'MID_DECODE_CANCEL']) {
     expect(result).toContain(name + ':PASS');
   }
-}, 95000);
+}, 240_000);
 
 it.skipIf(!swiftCompiler)('executes AppDelegate.reconcileCachedOtaBundles to purge stale OTA snapshots, poison rejected version, preserve user prefs, and retain newer valid OTA bundles', async () => {
   await setup();
@@ -2010,9 +2010,9 @@ print("OTA_RECONCILE:PASS")
   const swiftFile = join(root, 'OtaReconcileTest.swift');
   const binFile = join(root, 'ota-reconcile-test');
   await writeFile(swiftFile, harness);
-  execFileSync(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { encoding: 'utf8', timeout: 60000 });
-  expect(execFileSync(binFile, [root], { encoding: 'utf8', timeout: 10000 }).trim()).toBe('OTA_RECONCILE:PASS');
-}, 65000);
+  execFileSync(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { encoding: 'utf8', timeout: 120000 });
+  expect(execFileSync(binFile, [root], { encoding: 'utf8', timeout: 90000 }).trim()).toBe('OTA_RECONCILE:PASS');
+}, 240_000);
 
 const swiftWindowCases = `
 func check(_ condition: @autoclosure () throws -> Bool, _ message: String) {

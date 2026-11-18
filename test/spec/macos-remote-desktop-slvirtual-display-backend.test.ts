@@ -1,4 +1,4 @@
-import { runNative, type NativeExecResult } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative, type NativeExecResult } from './support/native-exec.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -257,7 +257,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     const run = await compileAndRun(production);
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     expect(run.stdout).toContain('exact-instance backend counterfactuals passed');
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('behaviorally REDs a compile-clean global-availability substitution', async () => {
     const mutant = production.replace(
@@ -270,7 +270,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     expect(`${run.stdout}\n${run.stderr}`).toContain(
       'exact object without destroy must be refused',
     );
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('behaviorally REDs deletion of worker-generation binding', async () => {
     const mutant = production.replace(
@@ -283,7 +283,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     expect(`${run.stdout}\n${run.stderr}`).toContain(
       'mismatched worker generation must be rejected',
     );
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('behaviorally REDs re-invoking exact destroy on every presence retry', async () => {
     const mutant = production.replace(
@@ -296,7 +296,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     expect(`${run.stdout}\n${run.stderr}`).toContain(
       'presence retry must not invoke exact destroy more than once',
     );
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('behaviorally REDs premature release when active evidence is ignored', async () => {
     const mutant = production.replace(
@@ -309,7 +309,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     expect(`${run.stdout}\n${run.stderr}`).toContain(
       'active-only presence must block premature release',
     );
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('behaviorally REDs premature release when visible evidence is ignored', async () => {
     const mutant = production.replace(
@@ -322,7 +322,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     expect(`${run.stdout}\n${run.stderr}`).toContain(
       'visible-only presence must block premature release',
     );
-  }, 180_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('pins the verified OS build, Objective-C encodings and no-CG fallback', async () => {
     expect(runtime).toContain('kVerifiedDarwinBuild[] = "25C56"');
@@ -352,23 +352,25 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
             runtime, arch, directory, 'baseline',
           );
           expect(build.status, `${arch}\n${build.stdout}\n${build.stderr}`).toBe(0);
-          const run = await runArchitecture(executable, arch);
-          expect(
-            run.status,
-            `${arch} on macOS ${identity.productVersion} build ${identity.darwinBuild}` +
-              `\n${run.stdout}\n${run.stderr}`,
-          ).toBe(expectedStatus);
-          if (expectedStatus === 2) {
-            expect(`${run.stdout}\n${run.stderr}`).toContain(
-              'target-host read-only runtime probe unavailable on this OS/build',
-            );
+          if (arch === 'x86_64' || process.arch === 'arm64') {
+            const run = await runArchitecture(executable, arch);
+            expect(
+              run.status,
+              `${arch} on macOS ${identity.productVersion} build ${identity.darwinBuild}` +
+                `\n${run.stdout}\n${run.stderr}`,
+            ).toBe(expectedStatus);
+            if (expectedStatus === 2) {
+              expect(`${run.stdout}\n${run.stderr}`).toContain(
+                'target-host read-only runtime probe unavailable on this OS/build',
+              );
+            }
           }
         }
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
     },
-    120_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 
   it.skipIf(process.platform !== 'darwin')(
@@ -390,10 +392,10 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
       const directory = mkdtempSync(join(tmpdir(), 'imcodes-slvirtual-host-mutant-'));
       try {
         const { executable, build } = await buildRuntimeProbe(
-          mutant, 'arm64', directory, 'global-host-mutant',
+          mutant, HOST_CLANG_ARCH, directory, 'global-host-mutant',
         );
         expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
-        const run = await runArchitecture(executable, 'arm64');
+        const run = await runArchitecture(executable, HOST_CLANG_ARCH);
         expect(run.status).not.toBe(0);
         expect(`${run.stdout}\n${run.stderr}`).toContain(
           'verified-host gate counterexample failed',
@@ -402,7 +404,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
         rmSync(directory, { recursive: true, force: true });
       }
     },
-    120_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 
   it.skipIf(process.platform !== 'darwin')(
@@ -428,10 +430,10 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
       const directory = mkdtempSync(join(tmpdir(), 'imcodes-slvirtual-bare-mutant-'));
       try {
         const { executable, build } = await buildRuntimeProbe(
-          mutant, 'arm64', directory, 'bare-mutant',
+          mutant, HOST_CLANG_ARCH, directory, 'bare-mutant',
         );
         expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
-        const run = await runArchitecture(executable, 'arm64');
+        const run = await runArchitecture(executable, HOST_CLANG_ARCH);
         expect(run.status).not.toBe(0);
         expect(`${run.stdout}\n${run.stderr}`).toContain(
           'post-init mismatch cleanup counterexample failed',
@@ -440,7 +442,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
         rmSync(directory, { recursive: true, force: true });
       }
     },
-    120_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 
   it.skipIf(process.platform !== 'darwin')(
@@ -466,7 +468,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
         rmSync(directory, { recursive: true, force: true });
       }
     },
-    120_000,
+    NATIVE_COMPILE_TEST_TIMEOUT_MS,
   );
 
   it.skipIf(process.platform !== 'darwin')(

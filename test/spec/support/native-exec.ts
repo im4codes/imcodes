@@ -27,7 +27,7 @@ import { vi } from 'vitest';
  * Importing it therefore raises the per-test timeout for the importing file (a test's own explicit timeout still wins), so a new native
  * spec cannot forget it. Guarded by test/spec/native-exec-timeout.test.ts.
  */
-export const NATIVE_COMPILE_TEST_TIMEOUT_MS = 120_000;
+export const NATIVE_COMPILE_TEST_TIMEOUT_MS = process.platform === 'darwin' && process.arch === 'x64' ? 300_000 : 120_000;
 vi.setConfig({ testTimeout: NATIVE_COMPILE_TEST_TIMEOUT_MS });
 
 export interface NativeExecResult {

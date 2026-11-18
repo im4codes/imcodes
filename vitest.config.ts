@@ -60,7 +60,7 @@ export default defineConfig({
           // contention-tolerant default keeps parallel-load starvation from failing a
           // correct test while genuine hangs (>>20s) still fail. Heavy real-worker
           // cases keep their explicit per-test overrides (20_000/30_000), which win.
-          testTimeout: 20000,
+          testTimeout: process.platform === 'darwin' && process.arch === 'x64' ? 60000 : 20000,
         },
       },
       './web/vitest.config.ts',

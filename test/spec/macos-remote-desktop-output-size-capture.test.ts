@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -136,5 +136,5 @@ describe('macOS output-size capture (CGDisplayStream scales in WindowServer)', (
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });

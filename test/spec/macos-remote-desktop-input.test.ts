@@ -1,4 +1,4 @@
-import { runNative } from './support/native-exec.js';
+import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -98,7 +98,7 @@ describe('macOS CGEvent input adapter', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('maps every named key to the virtual key code Apple publishes', async () => {
     if (process.platform !== 'darwin') return;
@@ -149,7 +149,7 @@ describe('macOS CGEvent input adapter', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 
   it('runs the ledger/topology/stuck-input fake under ASan and UBSan', async () => {
     if (process.platform !== 'darwin') return;
@@ -192,5 +192,5 @@ describe('macOS CGEvent input adapter', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, NATIVE_COMPILE_TEST_TIMEOUT_MS);
 });
