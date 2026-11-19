@@ -9,11 +9,17 @@ function normalizeTranscriptCursor(cursor?: AgyTranscriptCursor | number): AgyTr
 
 // A failure deadline, NOT a grace period for ordering or content deduplication.
 export const NATIVE_OUTPUT_DEADLINE_MS = 60_000;
+const NON_SUBAGENT_TOOL_SETTLE_GRACE_MS = 2_000;
 const PREFIX_MIN_LENGTH = 80;
 const PREFIX_PROBE_LENGTH = 160;
 const USER_REQUEST_TAG_RE = /<\/?USER_REQUEST>/gi;
 const TRAILING_META_RE = /^\s*(?:<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)\b[\s\S]*)?$/i;
+const METADATA_BLOCK_RE = /^<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)\b[^>]*>[\s\S]*?<\/\1>/i;
 const TRUNCATION_SUFFIX_RE = /(?:\s*\.{3,}|\s*…|\s*\[truncated\]|\s*<truncated(?:\s+[\d,]+\s+bytes)?\s*>)+$/i;
+const SLASH_COMMAND_TOKEN_RE = /(?:^|[^\p{L}\p{N}_/])(\/[a-z][a-z0-9_-]*)(?=$|[^\p{L}\p{N}_/])/giu;
+const TRAILING_SLASH_TOKEN_RE = /\s*(\/[a-z][a-z0-9_-]*)$/i;
+const ONLY_SLASH_TOKENS_RE = /^(?:\s*\/[a-z][a-z0-9_-]*)+$/i;
+const MAX_SLASH_ECHO_PEEL = 16;
 
 interface PromptAlias {
   text: string;
@@ -33,15 +39,17 @@ interface Prompt {
   bindSeq?: number;
   output?: AgyTranscriptRow;
   lastResponse?: AgyTranscriptRow;
+  lastResponseAt?: number;
   settling?: boolean;
+  settlingSince?: number;
   timedOut?: boolean;
   ready: Promise<void>;
   resolve: () => void;
 }
 
-interface ParsedInputEnvelope {
+interface ParsedInputEnvelopes {
   kind: 'plain' | 'wrapped' | 'invalid';
-  body: string;
+  bodies: string[];
 }
 
 function collapseWhitespace(text: string): string {
@@ -53,40 +61,70 @@ function countUserRequestTags(text: string): number {
   return (text.match(USER_REQUEST_TAG_RE) ?? []).length;
 }
 
-function parseNativeInputEnvelope(content: string): ParsedInputEnvelope {
-  const openMatch = /^\s*<USER_REQUEST>/i.exec(content);
-  if (!openMatch) {
+function parseNativeInputEnvelopes(content: string): ParsedInputEnvelopes {
+  const firstOpen = /^\s*<USER_REQUEST>/i.exec(content);
+  if (!firstOpen) {
     return countUserRequestTags(content) === 0
-      ? { kind: 'plain', body: content }
-      : { kind: 'invalid', body: '' };
+      ? { kind: 'plain', bodies: [content] }
+      : { kind: 'invalid', bodies: [] };
   }
-  const afterOpen = content.slice(openMatch[0].length);
-  USER_REQUEST_TAG_RE.lastIndex = 0;
-  let depth = 1;
-  let match: RegExpExecArray | null;
-  while ((match = USER_REQUEST_TAG_RE.exec(afterOpen)) !== null) {
-    if (match[0].startsWith('</')) {
-      depth--;
-      if (depth === 0) {
-        const innerBody = afterOpen.slice(0, match.index);
-        const remainder = afterOpen.slice(match.index + match[0].length);
-        if (!TRAILING_META_RE.test(remainder)) {
-          return { kind: 'invalid', body: '' };
-        }
-        return { kind: 'wrapped', body: innerBody };
+
+  const bodies: string[] = [];
+  let pos = 0;
+  while (pos < content.length) {
+    const wsMatch = /^\s*/.exec(content.slice(pos));
+    if (wsMatch) pos += wsMatch[0].length;
+    if (pos >= content.length) break;
+
+    const rest = content.slice(pos);
+    const openMatch = /^<USER_REQUEST>/i.exec(rest);
+    if (!openMatch) {
+      const metaMatch = METADATA_BLOCK_RE.exec(rest);
+      if (metaMatch) {
+        pos += metaMatch[0].length;
+        continue;
       }
-    } else {
-      depth++;
+      if (TRAILING_META_RE.test(rest) && countUserRequestTags(rest) === 0) {
+        break;
+      }
+      return { kind: 'invalid', bodies: [] };
+    }
+
+    const afterOpen = content.slice(pos + openMatch[0].length);
+    USER_REQUEST_TAG_RE.lastIndex = 0;
+    let depth = 1;
+    let match: RegExpExecArray | null;
+    let closed = false;
+    while ((match = USER_REQUEST_TAG_RE.exec(afterOpen)) !== null) {
+      if (match[0].startsWith('</')) {
+        depth--;
+        if (depth === 0) {
+          bodies.push(afterOpen.slice(0, match.index));
+          pos += openMatch[0].length + match.index + match[0].length;
+          closed = true;
+          break;
+        }
+      } else {
+        depth++;
+      }
+    }
+
+    if (!closed) {
+      // Antigravity caps oversized USER_INPUT rows and appends a terminal native
+      // truncation marker before the outer closing tag is ever written. Treat that
+      // explicit marker as a truncated wrapped envelope; bare unclosed wrappers
+      // remain invalid.
+      if (TRUNCATION_SUFFIX_RE.test(afterOpen.trim())) {
+        bodies.push(afterOpen);
+        break;
+      }
+      return { kind: 'invalid', bodies: [] };
     }
   }
-  // Antigravity caps oversized USER_INPUT rows and appends a terminal native
-  // truncation marker before the outer closing tag is ever written. Treat that
-  // explicit marker as a truncated wrapped envelope; bare unclosed wrappers
-  // remain invalid.
-  if (TRUNCATION_SUFFIX_RE.test(afterOpen.trim())) {
-    return { kind: 'wrapped', body: afterOpen };
-  }
-  return { kind: 'invalid', body: '' };
+
+  return bodies.length > 0
+    ? { kind: 'wrapped', bodies }
+    : { kind: 'invalid', bodies: [] };
 }
 
 function matchesTruncatedEnvelopePrefix(strippedRow: string, normPrompt: string): boolean {
@@ -125,6 +163,43 @@ export function isTerminalForegroundRow(row: AgyTranscriptRow | undefined): bool
   return Boolean(row.content?.trim());
 }
 
+function isNonSubagentToolFallbackRow(row: AgyTranscriptRow | undefined): boolean {
+  if (!row || row.type !== 'PLANNER_RESPONSE') return false;
+  if (!row.tool_calls?.length) return false;
+  return !row.tool_calls.some(call => typeof call?.name === 'string' && isAgySubagentTool(call.name));
+}
+
+function extractSlashTokens(text: string, target = new Set<string>()): Set<string> {
+  SLASH_COMMAND_TOKEN_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SLASH_COMMAND_TOKEN_RE.exec(text)) !== null) {
+    target.add(match[1].toLowerCase());
+  }
+  return target;
+}
+
+function isOnlyAllowedSlashEcho(tail: string, allowedTokens: Set<string>): boolean {
+  if (allowedTokens.size === 0 || !ONLY_SLASH_TOKENS_RE.test(tail)) return false;
+  const tokens = tail.match(/\/[a-z][a-z0-9_-]*/gi);
+  return Boolean(tokens && tokens.length > 0 && tokens.every(tok => allowedTokens.has(tok.toLowerCase())));
+}
+
+function stripAllowedTrailingSlashEchoVariants(candidate: string, allowedTokens: Set<string>): string[] {
+  if (allowedTokens.size === 0) return [];
+  const variants: string[] = [];
+  let current = candidate.trim();
+  for (let i = 0; i < MAX_SLASH_ECHO_PEEL; i++) {
+    const m = TRAILING_SLASH_TOKEN_RE.exec(current);
+    if (!m) break;
+    if (!allowedTokens.has(m[1].toLowerCase())) break;
+    const next = current.slice(0, m.index).trimEnd();
+    if (!next) break;
+    variants.push(next);
+    current = next;
+  }
+  return variants;
+}
+
 const CONTEXT_INSTRUCTIONS_PREFIX = 'Context instructions:';
 
 function normalizeNewlines(text: string): string {
@@ -151,11 +226,6 @@ function hasContextCompanionRelation(aRaw: string, bRaw: string): boolean {
   return check(aRaw, bRaw) || check(bRaw, aRaw);
 }
 
-function extractBoundBody(content: string): string {
-  const envelope = parseNativeInputEnvelope(content);
-  return envelope.kind === 'wrapped' ? envelope.body : content;
-}
-
 function promptMatchTargets(prompt: Prompt): PromptAlias[] {
   const targets: PromptAlias[] = [];
   if (prompt.text) {
@@ -169,11 +239,66 @@ function promptMatchTargets(prompt: Prompt): PromptAlias[] {
   return targets;
 }
 
-function promptMatchesBoundCompanion(
+function promptAllowedSlashTokens(prompt: Prompt, includeBound = false): Set<string> {
+  const tokens = new Set<string>();
+  for (const t of promptMatchTargets(prompt)) {
+    extractSlashTokens(t.normText, tokens);
+  }
+  if (includeBound && prompt.boundNormBody) {
+    extractSlashTokens(prompt.boundNormBody, tokens);
+  }
+  return tokens;
+}
+
+function matchesTargetOrCompanionWithSlashEcho(
+  candidateBody: string,
+  candidateNorm: string,
+  targets: PromptAlias[],
+  allowedSlashTokens: Set<string>,
+  requireZeroTagCount = false,
+): boolean {
+  const candidateTrim = candidateBody.trim();
+  const matchesTarget = (body: string, trim: string, norm: string, t: PromptAlias): boolean => {
+    if (requireZeroTagCount && t.tagCount !== 0) return false;
+    if (body === t.text || trim === t.text.trim()) return true;
+    if (t.normText.length > 0 && norm === t.normText) return true;
+    if (hasContextCompanionRelation(t.text, body)) return true;
+    if (allowedSlashTokens.size > 0 && t.normText.length > 0) {
+      if (trim.startsWith(t.text.trim()) && t.text.trim().length > 0) {
+        const tail = trim.slice(t.text.trim().length);
+        if (tail.length > 0 && isOnlyAllowedSlashEcho(tail, allowedSlashTokens)) return true;
+      }
+      if (norm.startsWith(t.normText)) {
+        const tail = norm.slice(t.normText.length);
+        if (tail.length > 0 && isOnlyAllowedSlashEcho(tail, allowedSlashTokens)) return true;
+      }
+    }
+    return false;
+  };
+
+  if (targets.some(t => matchesTarget(candidateBody, candidateTrim, candidateNorm, t))) {
+    return true;
+  }
+
+  for (const peeled of stripAllowedTrailingSlashEchoVariants(candidateBody, allowedSlashTokens)) {
+    const peeledNorm = collapseWhitespace(peeled);
+    if (!peeledNorm) continue;
+    if (targets.some(t =>
+      (!requireZeroTagCount || t.tagCount === 0)
+      && (peeled === t.text.trim()
+        || (t.normText.length > 0 && peeledNorm === t.normText)
+        || hasContextCompanionRelation(t.text, peeled)),
+    )) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function promptMatchesBoundCompanionBody(
   prompt: Prompt,
-  content: string,
-  normRaw: string,
-  envelope: ParsedInputEnvelope,
+  candidateBody: string,
+  isPlain: boolean,
 ): boolean {
   const targets = promptMatchTargets(prompt);
   if (prompt.boundBody) {
@@ -184,27 +309,20 @@ function promptMatchesBoundCompanion(
     });
   }
   if (targets.length === 0) return false;
-  const trimmedContent = content.trim();
-  if (targets.some(t => content === t.text || trimmedContent === t.text.trim() || (t.normText.length > 0 && normRaw === t.normText))) {
-    return true;
-  }
-  if (envelope.kind === 'invalid') return false;
 
-  const candidateBody = envelope.kind === 'wrapped' ? envelope.body : content;
   const candidateTrim = candidateBody.trim();
-  const candidateNorm = envelope.kind === 'wrapped' ? collapseWhitespace(candidateBody) : normRaw;
+  const candidateNorm = collapseWhitespace(candidateBody);
   if (!candidateNorm) return false;
 
-  for (const t of targets) {
-    if (candidateBody === t.text || candidateTrim === t.text.trim()) return true;
-    if (t.normText.length > 0 && candidateNorm === t.normText) return true;
-    if (hasContextCompanionRelation(t.text, candidateBody)) return true;
+  const allowedSlashTokens = promptAllowedSlashTokens(prompt, true);
+  if (matchesTargetOrCompanionWithSlashEcho(candidateBody, candidateNorm, targets, allowedSlashTokens)) {
+    return true;
   }
 
   if (!TRUNCATION_SUFFIX_RE.test(candidateTrim)) return false;
   const strippedRow = collapseWhitespace(candidateTrim.replace(TRUNCATION_SUFFIX_RE, ''));
   if (!strippedRow) return false;
-  if (envelope.kind === 'wrapped') {
+  if (!isPlain) {
     return targets.some(t => matchesTruncatedEnvelopePrefix(strippedRow, t.normText));
   }
   return targets.some(t => t.tagCount === 0 && matchesTruncatedPlainPrefix(strippedRow, t.normText));
@@ -356,92 +474,131 @@ export class AgyForegroundOwnership {
     return fallbackGeneration;
   }
 
-  private findMatchingPrompt(content: string | undefined): Prompt | undefined {
-    if (!content) return undefined;
-    const unbound = [...this.prompts.values()].filter(p => p.inputStep === undefined && p.text);
-    if (unbound.length === 0) return undefined;
+  private matchConcatenatedPrompts(
+    body: string,
+    candidates: Prompt[],
+    requireZeroTagCount = false,
+  ): Array<{ prompt: Prompt; boundBody: string }> | undefined {
+    if (candidates.length < 2) return undefined;
+    let remaining = collapseWhitespace(body);
+    if (!remaining) return undefined;
 
-    // 1. Direct raw payload fidelity (exact, trimmed, or whitespace-normalized full equality).
-    // Preserves plain USER_EXPLICIT fixtures/inputs even when the prompt itself contains or
-    // consists of literal <USER_REQUEST>...</USER_REQUEST> tags, in FIFO order.
-    const exactRaw = unbound.find(p =>
-      promptMatchTargets(p).some(t => content === t.text || content.trim() === t.text.trim()),
-    );
-    if (exactRaw) return exactRaw;
+    const used = new Set<Prompt>();
+    const matched: Array<{ prompt: Prompt; boundBody: string }> = [];
+    const combinedAllowedSlashTokens = new Set<string>();
 
-    const normRaw = collapseWhitespace(content);
-    if (!normRaw) return undefined;
+    while (remaining.length > 0) {
+      let bestLen = 0;
+      const bestMatches: Array<{ prompt: Prompt; normBody: string }> = [];
 
-    const normRawMatch = unbound.find(p =>
-      promptMatchTargets(p).some(t => t.normText.length > 0 && normRaw === t.normText),
-    );
-    if (normRawMatch) return normRawMatch;
+      for (const p of candidates) {
+        if (used.has(p)) continue;
+        for (const t of promptMatchTargets(p)) {
+          if (requireZeroTagCount && t.tagCount !== 0) continue;
+          if (!t.normText || !remaining.startsWith(t.normText)) continue;
+          if (t.normText.length > bestLen) {
+            bestLen = t.normText.length;
+            bestMatches.length = 0;
+            bestMatches.push({ prompt: p, normBody: t.normText });
+          } else if (t.normText.length === bestLen) {
+            bestMatches.push({ prompt: p, normBody: t.normText });
+          }
+        }
+      }
 
-    // 2. Native outer envelope extraction and context/prefix fallback.
-    const envelope = parseNativeInputEnvelope(content);
-    if (envelope.kind === 'invalid') return undefined;
-
-    if (envelope.kind === 'wrapped') {
-      const exactWrapped = unbound.find(p =>
-        promptMatchTargets(p).some(t => envelope.body === t.text || envelope.body.trim() === t.text.trim()),
-      );
-      if (exactWrapped) return exactWrapped;
-
-      const normRow = collapseWhitespace(envelope.body);
-      if (!normRow) return undefined;
-
-      const normFull = unbound.find(p =>
-        promptMatchTargets(p).some(t => t.normText.length > 0 && normRow === t.normText),
-      );
-      if (normFull) return normFull;
-
-      const companion = unbound.find(p =>
-        promptMatchTargets(p).some(t => hasContextCompanionRelation(t.text, envelope.body)),
-      );
-      if (companion) return companion;
-
-      const trimmedBody = envelope.body.trim();
-      if (!TRUNCATION_SUFFIX_RE.test(trimmedBody)) return undefined;
-      const strippedRow = collapseWhitespace(trimmedBody.replace(TRUNCATION_SUFFIX_RE, ''));
-      const prefixMatches = unbound.filter(p =>
-        promptMatchTargets(p).some(t => matchesTruncatedEnvelopePrefix(strippedRow, t.normText)),
-      );
-      return selectUnambiguousPrefixMatch(prefixMatches);
+      if (bestMatches.length === 0) break;
+      const chosen = selectUnambiguousPrefixMatch(bestMatches.map(m => m.prompt));
+      if (!chosen) return undefined;
+      const chosenEntry = bestMatches.find(m => m.prompt === chosen)!;
+      used.add(chosen);
+      matched.push({ prompt: chosen, boundBody: chosenEntry.normBody });
+      for (const tok of promptAllowedSlashTokens(chosen)) combinedAllowedSlashTokens.add(tok);
+      remaining = remaining.slice(bestLen).trimStart();
     }
 
-    // envelope.kind === 'plain' (no <USER_REQUEST> tags in content)
+    if (matched.length < 2) return undefined;
+    if (remaining.length > 0 && !isOnlyAllowedSlashEcho(remaining, combinedAllowedSlashTokens)) {
+      return undefined;
+    }
+    return matched;
+  }
+
+  private matchSingleWrappedBody(body: string, unbound: Prompt[]): Array<{ prompt: Prompt; boundBody: string }> {
+    const exactWrapped = unbound.find(p =>
+      promptMatchTargets(p).some(t => body === t.text || body.trim() === t.text.trim()),
+    );
+    if (exactWrapped) return [{ prompt: exactWrapped, boundBody: body }];
+
+    const normRow = collapseWhitespace(body);
+    if (!normRow) return [];
+
+    const normFull = unbound.find(p =>
+      promptMatchTargets(p).some(t => t.normText.length > 0 && normRow === t.normText),
+    );
+    if (normFull) return [{ prompt: normFull, boundBody: body }];
+
+    const companion = unbound.find(p =>
+      promptMatchTargets(p).some(t => hasContextCompanionRelation(t.text, body)),
+    );
+    if (companion) return [{ prompt: companion, boundBody: body }];
+
+    const slashEchoMatches = unbound.filter(p =>
+      matchesTargetOrCompanionWithSlashEcho(body, normRow, promptMatchTargets(p), promptAllowedSlashTokens(p)),
+    );
+    const slashEchoWinner = selectUnambiguousPrefixMatch(slashEchoMatches);
+    if (slashEchoWinner) return [{ prompt: slashEchoWinner, boundBody: body }];
+
+    const concatenated = this.matchConcatenatedPrompts(body, unbound);
+    if (concatenated) return concatenated;
+
+    const trimmedBody = body.trim();
+    if (!TRUNCATION_SUFFIX_RE.test(trimmedBody)) return [];
+    const strippedRow = collapseWhitespace(trimmedBody.replace(TRUNCATION_SUFFIX_RE, ''));
+    const prefixMatches = unbound.filter(p =>
+      promptMatchTargets(p).some(t => matchesTruncatedEnvelopePrefix(strippedRow, t.normText)),
+    );
+    const winner = selectUnambiguousPrefixMatch(prefixMatches);
+    return winner ? [{ prompt: winner, boundBody: body }] : [];
+  }
+
+  private matchPlainBody(content: string, normRaw: string, unbound: Prompt[]): Array<{ prompt: Prompt; boundBody: string }> {
     const plainCandidates = unbound.filter(p => p.tagCount === 0);
-    if (plainCandidates.length === 0) return undefined;
+    if (plainCandidates.length === 0) return [];
+
+    const concatenated = this.matchConcatenatedPrompts(content, plainCandidates, true);
+    if (concatenated) return concatenated;
 
     // Legacy substring wrapper matching applies only to the original primary payload text,
     // never to structured companion aliases (which must match via exact/normalized equality,
-    // strict Context paragraph relation, or explicit truncation markers).
+    // strict Context paragraph relation, slash-echo, concatenation, or explicit truncation markers).
     const exactPlain = plainCandidates.find(p => p.text !== undefined && content.includes(p.text));
-    if (exactPlain) return exactPlain;
+    if (exactPlain) return [{ prompt: exactPlain, boundBody: content }];
 
     const normPlain = plainCandidates.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw.includes(p.normText));
-    if (normPlain) return normPlain;
+    if (normPlain) return [{ prompt: normPlain, boundBody: content }];
 
     const companionPlain = plainCandidates.find(p =>
       promptMatchTargets(p).some(t => hasContextCompanionRelation(t.text, content)),
     );
-    if (companionPlain) return companionPlain;
+    if (companionPlain) return [{ prompt: companionPlain, boundBody: content }];
+
+    const slashEchoMatches = plainCandidates.filter(p =>
+      matchesTargetOrCompanionWithSlashEcho(content, normRaw, promptMatchTargets(p), promptAllowedSlashTokens(p), true),
+    );
+    const slashEchoWinner = selectUnambiguousPrefixMatch(slashEchoMatches);
+    if (slashEchoWinner) return [{ prompt: slashEchoWinner, boundBody: content }];
 
     const trimmedContent = content.trim();
-    if (!TRUNCATION_SUFFIX_RE.test(trimmedContent)) return undefined;
+    if (!TRUNCATION_SUFFIX_RE.test(trimmedContent)) return [];
     const strippedRow = collapseWhitespace(trimmedContent.replace(TRUNCATION_SUFFIX_RE, ''));
     const prefixMatches = plainCandidates.filter(p =>
       promptMatchTargets(p).some(t => t.tagCount === 0 && matchesTruncatedPlainPrefix(strippedRow, t.normText)),
     );
-    return selectUnambiguousPrefixMatch(prefixMatches);
+    const winner = selectUnambiguousPrefixMatch(prefixMatches);
+    return winner ? [{ prompt: winner, boundBody: content }] : [];
   }
 
-  private findBoundCompanionPrompt(content: string | undefined): Prompt | undefined {
-    if (!content) return undefined;
-    const normRaw = collapseWhitespace(content);
-    if (!normRaw) return undefined;
-    const envelope = parseNativeInputEnvelope(content);
-
+  private boundCompanionCandidates(): Prompt[] {
     const candidates: Prompt[] = [];
     const active = this.activeLanePrompt();
     if (active && active.inputStep !== undefined && !active.output && !active.timedOut && active.text) {
@@ -462,8 +619,40 @@ export class AgyForegroundOwnership {
     ) {
       candidates.push(this.retainedLane);
     }
+    return candidates;
+  }
+
+  private findBoundCompanionPrompt(candidateBody: string | undefined, isPlain: boolean): Prompt | undefined {
+    if (!candidateBody) return undefined;
+    const candidates = this.boundCompanionCandidates();
     if (candidates.length === 0) return undefined;
-    return candidates.find(p => promptMatchesBoundCompanion(p, content, normRaw, envelope));
+    return candidates.find(p => promptMatchesBoundCompanionBody(p, candidateBody, isPlain));
+  }
+
+  private bindMatchedPrompt(prompt: Prompt, row: AgyTranscriptRow, boundBody: string): void {
+    this.lane = prompt.generation;
+    prompt.inputStep = row.step_index;
+    if (boundBody) {
+      prompt.boundBody = boundBody;
+      prompt.boundNormBody = collapseWhitespace(boundBody);
+    }
+    prompt.bindSeq = ++this.bindSeq;
+    this.latestBound = { generation: prompt.generation, bindSeq: prompt.bindSeq };
+    this.lastBoundGeneration = Math.max(this.lastBoundGeneration, prompt.generation);
+    if (this.retainedLane && this.retainedLane.generation !== prompt.generation) {
+      const superseded = this.retainedLane;
+      this.retainedLane = undefined;
+      superseded.resolve();
+    }
+  }
+
+  private clearActiveLane(): void {
+    this.lane = undefined;
+    if (this.retainedLane) {
+      const superseded = this.retainedLane;
+      this.retainedLane = undefined;
+      superseded.resolve();
+    }
   }
 
   private getTurnLatest(): { generation: number; row: AgyTranscriptRow } | undefined {
@@ -516,11 +705,17 @@ export class AgyForegroundOwnership {
     }
   }
 
-  private attributeLastResponse(prompt: Prompt): AgyTranscriptRow | undefined {
+  private attributeLastResponse(prompt: Prompt, allowNonSubagentToolFallback = false): AgyTranscriptRow | undefined {
     prompt.settling = true;
-    if (!prompt.output && isTerminalForegroundRow(prompt.lastResponse)) {
+    prompt.settlingSince ??= Date.now();
+    if (
+      !prompt.output
+      && prompt.lastResponse
+      && (isTerminalForegroundRow(prompt.lastResponse)
+        || (allowNonSubagentToolFallback && isNonSubagentToolFallbackRow(prompt.lastResponse)))
+    ) {
       prompt.output = prompt.lastResponse;
-      this.recordLatest(prompt, prompt.lastResponse!);
+      this.recordLatest(prompt, prompt.output);
       if (this.lane === prompt.generation) this.lane = undefined;
       if (this.retainedLane?.generation === prompt.generation) this.retainedLane = undefined;
       prompt.resolve();
@@ -531,47 +726,74 @@ export class AgyForegroundOwnership {
 
   observe(row: AgyTranscriptRow, cursorOrByteEnd?: AgyTranscriptCursor | number): boolean {
     if (row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT') {
-      // The full native log wraps but retains the exact submitted payload.
-      // FIFO unbound requests distinguish repeated identical user messages.
-      const prompt = this.findMatchingPrompt(row.content);
-      if (!prompt) {
-        // Ignore duplicate or Context-instructions companion echoes of the currently
-        // active incomplete bound prompt so they do not wipe the foreground lane.
-        if (this.findBoundCompanionPrompt(row.content)) {
+      const content = row.content ?? '';
+      let unbound = [...this.prompts.values()].filter(p => p.inputStep === undefined && p.text);
+      const normRaw = collapseWhitespace(content);
+
+      // 1. Direct raw payload fidelity (exact, trimmed, or whitespace-normalized full equality).
+      if (content && unbound.length > 0) {
+        const exactRaw = unbound.find(p =>
+          promptMatchTargets(p).some(t => content === t.text || content.trim() === t.text.trim()),
+        ) ?? (normRaw
+          ? unbound.find(p => promptMatchTargets(p).some(t => t.normText.length > 0 && normRaw === t.normText))
+          : undefined);
+        if (exactRaw) {
+          this.bindMatchedPrompt(exactRaw, row, content);
+          this.notifyStateChange();
           return false;
         }
-        this.lane = undefined;
-        if (this.retainedLane) {
-          const superseded = this.retainedLane;
-          this.retainedLane = undefined;
-          superseded.resolve();
+      }
+
+      // 2. Parse single/coalesced wrapped <USER_REQUEST> envelopes or plain text.
+      const envelopes = content ? parseNativeInputEnvelopes(content) : { kind: 'invalid' as const, bodies: [] };
+      if (envelopes.kind === 'invalid') {
+        if (this.findBoundCompanionPrompt(content, true)) return false;
+        this.clearActiveLane();
+        this.notifyStateChange();
+        return false;
+      }
+
+      if (envelopes.kind === 'wrapped') {
+        let stateChanged = false;
+        for (const body of envelopes.bodies) {
+          unbound = unbound.filter(p => p.inputStep === undefined);
+          const matched = unbound.length > 0 ? this.matchSingleWrappedBody(body, unbound) : [];
+          if (matched.length > 0) {
+            for (const entry of matched) {
+              this.bindMatchedPrompt(entry.prompt, row, entry.boundBody);
+            }
+            stateChanged = true;
+          } else if (this.findBoundCompanionPrompt(body, false)) {
+            // Keep active lane intact across companion echoes.
+          } else {
+            this.clearActiveLane();
+            stateChanged = true;
+          }
+        }
+        if (stateChanged) this.notifyStateChange();
+        return false;
+      }
+
+      // envelopes.kind === 'plain'
+      const matchedPlain = normRaw && unbound.length > 0 ? this.matchPlainBody(content, normRaw, unbound) : [];
+      if (matchedPlain.length > 0) {
+        for (const entry of matchedPlain) {
+          this.bindMatchedPrompt(entry.prompt, row, entry.boundBody);
         }
         this.notifyStateChange();
         return false;
       }
-      this.lane = prompt.generation;
-      prompt.inputStep = row.step_index;
-      const boundBody = extractBoundBody(row.content ?? '');
-      if (boundBody) {
-        prompt.boundBody = boundBody;
-        prompt.boundNormBody = collapseWhitespace(boundBody);
+      if (this.findBoundCompanionPrompt(content, true)) {
+        return false;
       }
-      prompt.bindSeq = ++this.bindSeq;
-      this.latestBound = { generation: prompt.generation, bindSeq: prompt.bindSeq };
-      this.lastBoundGeneration = Math.max(this.lastBoundGeneration, prompt.generation);
-      if (this.retainedLane && this.retainedLane.generation !== prompt.generation) {
-        const superseded = this.retainedLane;
-        this.retainedLane = undefined;
-        superseded.resolve();
-      }
-      // Wake active output() waiters via a re-armable state-change notification so they
-      // re-evaluate leader/adoptable state without leaving non-terminal prompts pre-resolved.
+      this.clearActiveLane();
       this.notifyStateChange();
       return false;
     } else if (row.type === 'USER_INPUT') {
       const prompt = this.activeLanePrompt();
       if (prompt && !prompt.output && prompt.lastResponse?.tool_calls?.length) {
         prompt.lastResponse = undefined;
+        prompt.lastResponseAt = undefined;
       }
       return false;
     } else if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) {
@@ -595,6 +817,7 @@ export class AgyForegroundOwnership {
         return false;
       }
       prompt.lastResponse = row;
+      prompt.lastResponseAt = Date.now();
       if (!row.tool_calls?.length || (prompt.settling && isTerminalForegroundRow(row))) {
         prompt.output = row;
         this.recordLatest(prompt, prompt.output);
@@ -603,6 +826,9 @@ export class AgyForegroundOwnership {
         prompt.resolve();
         this.notifyStateChange();
         return true;
+      }
+      if (prompt.settling) {
+        this.notifyStateChange();
       }
       return false;
     }
@@ -613,6 +839,7 @@ export class AgyForegroundOwnership {
     const prompt = this.prompts.get(generation);
     if (!prompt) return undefined;
     prompt.settling = true;
+    prompt.settlingSince ??= Date.now();
     if (prompt.inputStep !== undefined || prompt.output) {
       return this.attributeLastResponse(prompt);
     }
@@ -636,25 +863,66 @@ export class AgyForegroundOwnership {
         if (turnLatest) return turnLatest.row;
       }
       const adoptable = prompt.inputStep === undefined ? this.getAdoptableLane(generation) : undefined;
+      const graceCandidate = prompt.inputStep !== undefined ? prompt : adoptable;
+      const gracePeriodMs = Number.isFinite(this.deadlineMs) && this.deadlineMs > 0
+        ? Math.min(NON_SUBAGENT_TOOL_SETTLE_GRACE_MS, this.deadlineMs)
+        : NON_SUBAGENT_TOOL_SETTLE_GRACE_MS;
+      const graceEndAt = graceCandidate?.settling
+        && graceCandidate.inputStep !== undefined
+        && isNonSubagentToolFallbackRow(graceCandidate.lastResponse)
+        ? Math.max(graceCandidate.settlingSince ?? Date.now(), graceCandidate.lastResponseAt ?? 0) + gracePeriodMs
+        : undefined;
       const stateWait = this.getStateChangePromise();
       const waitPromise = adoptable
         ? Promise.race([prompt.ready, adoptable.ready, stateWait])
         : Promise.race([prompt.ready, stateWait]);
-      const remainingMs = endAt === undefined ? this.deadlineMs : endAt - Date.now();
-      const timedOut = endAt !== undefined && remainingMs <= 0
+      const now = Date.now();
+      const remainingDeadlineMs = endAt === undefined ? this.deadlineMs : endAt - now;
+      const remainingGraceMs = graceEndAt === undefined ? undefined : Math.max(0, graceEndAt - now);
+      const waitMs = remainingGraceMs === undefined
+        ? remainingDeadlineMs
+        : Number.isFinite(remainingDeadlineMs)
+          ? Math.min(remainingDeadlineMs, remainingGraceMs)
+          : remainingGraceMs;
+      const timedOut = waitMs <= 0 && (endAt !== undefined || graceEndAt !== undefined)
         ? true
-        : (await withTimeoutOutcome(waitPromise, remainingMs)).timedOut;
+        : (await withTimeoutOutcome(waitPromise, waitMs)).timedOut;
       if (timedOut) {
         const current = this.prompts.get(generation);
         if (!current) return undefined;
         if (current.output) return current.output;
         if (this.hasBoundSuccessor(generation)) return undefined;
-        if (current.inputStep !== undefined && isTerminalForegroundRow(current.lastResponse)) {
-          return this.attributeLastResponse(current);
+        const settledNow = Date.now();
+        const activeCandidate = current.inputStep !== undefined ? current : adoptable;
+        if (
+          graceEndAt !== undefined
+          && activeCandidate?.settling
+          && activeCandidate.inputStep !== undefined
+          && isNonSubagentToolFallbackRow(activeCandidate.lastResponse)
+        ) {
+          const latestGraceEndAt = Math.max(activeCandidate.settlingSince ?? settledNow, activeCandidate.lastResponseAt ?? 0) + gracePeriodMs;
+          if (settledNow >= latestGraceEndAt) {
+            return this.attributeLastResponse(activeCandidate, true);
+          }
+          if (endAt === undefined || settledNow < endAt) {
+            continue;
+          }
+        }
+        if (endAt !== undefined && settledNow < endAt) {
+          continue;
+        }
+        if (
+          current.inputStep !== undefined
+          && (isTerminalForegroundRow(current.lastResponse) || isNonSubagentToolFallbackRow(current.lastResponse))
+        ) {
+          return this.attributeLastResponse(current, true);
         }
         if (current.inputStep === undefined) {
           const settled = this.settle(generation);
           if (settled) return settled;
+          if (adoptable && isNonSubagentToolFallbackRow(adoptable.lastResponse)) {
+            return this.attributeLastResponse(adoptable, true);
+          }
         }
         current.timedOut = true;
         if (adoptable) {

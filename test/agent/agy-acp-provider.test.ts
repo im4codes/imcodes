@@ -469,6 +469,33 @@ describe('AG native ACP', () => {
     await new Promise(r=>setTimeout(r,200));
     expect(done).toHaveBeenCalledTimes(1);
   });
+  it('settles a bound non-subagent tool-only turn cleanly without failing on native attribution deadline',async()=>{
+    const {provider,root}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'launch');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    await (provider as any).promptTerminals.get(state);
+    const native=state.acpSessionId;
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    await appendFile(file,
+      JSON.stringify({
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }],
+      }) + '\n' +
+      JSON.stringify({
+        step_index: 4,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Command exited with code 0.',
+      }) + '\n');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('');
+    expect(errors).not.toHaveBeenCalled();
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+  });
   it('does not replace delayed native final text with nonempty intermediate tool commentary',async()=>{
     const {provider,requests}=await setup('native-child-commentary');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
     await provider.send(id,'launch');

@@ -994,4 +994,179 @@ describe('AG captured native foreground ownership', () => {
     expect(g2Out?.content).toBe('TAKEOVER OUTPUT');
     expect(takeoverTicks).toBeGreaterThanOrEqual(1);
   });
+
+  it('attributes prompts with AGY slash-command echo suffixes (STEP 351 / STEP 364 repro) while rejecting foreign trailing tokens', async () => {
+    // 1. Exact Mini STEP 351 & STEP 364 repros: prompt mentions /compact and AGY appends ./compact (or /compact).
+    const step351Prompt = '[IM.codes task tsk_4da72bd863 "修复 /compact 测试断言与 d38566a66 契约对齐"] dispatched from the queue: executor deck_sub_1v105b46, auditor deck_sub_1n3g216r.';
+    const owner = new AgyForegroundOwnership(100);
+    owner.beginTurn();
+    owner.register(1, step351Prompt);
+    owner.observe(
+      row(
+        351,
+        'USER_INPUT',
+        `<USER_REQUEST>\n${step351Prompt}/compact\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-19T15:56:37+08:00.\n</ADDITIONAL_METADATA>`,
+        'USER_EXPLICIT',
+      ),
+    );
+    owner.observe(row(352, 'PLANNER_RESPONSE', 'STEP 352 attributed foreground response'));
+    expect((await owner.output(1))?.content).toBe('STEP 352 attributed foreground response');
+
+    // STEP 364 variant: /compact earlier in prompt, appended directly after `]`.
+    const step364Prompt = 'Available commands: /plan, /compact.\n[Contracts: task_pair_markers_v1, audit_convergence_v1 blocking=P0]';
+    owner.beginTurn();
+    owner.register(2, step364Prompt);
+    owner.observe(row(364, 'USER_INPUT', `<USER_REQUEST>\n${step364Prompt}/compact\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    owner.observe(row(365, 'PLANNER_RESPONSE', 'STEP 365 attributed'));
+    expect((await owner.output(2))?.content).toBe('STEP 365 attributed');
+
+    // 2. Multiple echoed slash commands + companion echo with /compact suffix.
+    const ctxPrompt = 'Context instructions:\nUse /plan and /compact responsibly.\n\nExecute migration task';
+    const bareAlias = 'Execute migration task';
+    const multiOwner = new AgyForegroundOwnership(100);
+    multiOwner.beginTurn();
+    multiOwner.register(1, ctxPrompt, false, undefined, [bareAlias]);
+    multiOwner.observe(row(10, 'USER_INPUT', `<USER_REQUEST>\n${bareAlias}/plan/compact\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    multiOwner.observe(row(11, 'USER_INPUT', `<USER_REQUEST>\n${ctxPrompt} /plan /compact\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    multiOwner.observe(row(12, 'PLANNER_RESPONSE', 'multi-slash companion ok'));
+    expect((await multiOwner.output(1))?.content).toBe('multi-slash companion ok');
+
+    // 3. Negative guards: foreign extra words, slash tokens absent from registered prompt, and filesystem paths.
+    for (const [registered, foreign] of [
+      ['hello', '<USER_REQUEST>hello /compact</USER_REQUEST>'],
+      ['hello', '<USER_REQUEST>hello world</USER_REQUEST>'],
+      ['Check /home/k/codedeck path', '<USER_REQUEST>Check /home/k/codedeck path/codedeck</USER_REQUEST>'],
+      ['Run /plan now', '<USER_REQUEST>Run /plan now/compact</USER_REQUEST>'],
+    ]) {
+      const guarded = new AgyForegroundOwnership(20);
+      guarded.beginTurn();
+      guarded.register(1, registered);
+      guarded.observe(row(0, 'USER_INPUT', foreign, 'USER_EXPLICIT'));
+      guarded.observe(row(1, 'PLANNER_RESPONSE', 'FOREIGN OUTPUT'));
+      expect(guarded.hasBoundInput(1)).toBe(false);
+      expect(await guarded.output(1)).toBeUndefined();
+      guarded.clear();
+    }
+  });
+
+  it('parses and binds coalesced multi-USER_REQUEST blocks and single-envelope prompt concatenations cleanly', async () => {
+    // 1. Multi-<USER_REQUEST> coalescing with <ADDITIONAL_METADATA> separators.
+    const oCoalesced = new AgyForegroundOwnership(200);
+    oCoalesced.beginTurn();
+    oCoalesced.register(1, 'first queued prompt');
+    oCoalesced.register(2, 'second queued prompt', true);
+    oCoalesced.observe(
+      row(
+        10,
+        'USER_INPUT',
+        [
+          '<USER_REQUEST>\nfirst queued prompt\n</USER_REQUEST>',
+          '<ADDITIONAL_METADATA>\ntime=1\n</ADDITIONAL_METADATA>',
+          '<USER_REQUEST>\nsecond queued prompt\n</USER_REQUEST>',
+          '<ADDITIONAL_METADATA>\ntime=2\n</ADDITIONAL_METADATA>',
+        ].join('\n'),
+        'USER_EXPLICIT',
+      ),
+    );
+    expect(oCoalesced.hasBoundInput(1)).toBe(true);
+    expect(oCoalesced.hasBoundInput(2)).toBe(true);
+    expect(oCoalesced.hasBoundSuccessor(1)).toBe(true);
+    expect(oCoalesced.resolveAggregateGeneration(1)).toBe(2);
+    oCoalesced.observe(row(11, 'PLANNER_RESPONSE', 'coalesced G2 output'));
+    expect(await oCoalesced.output(1)).toBeUndefined();
+    expect((await oCoalesced.output(2))?.content).toBe('coalesced G2 output');
+
+    // Trailing foreign envelope in a multi-block row still wipes the active lane.
+    const oTrailingForeign = new AgyForegroundOwnership(25);
+    oTrailingForeign.beginTurn();
+    oTrailingForeign.register(1, 'our prompt');
+    oTrailingForeign.observe(
+      row(
+        20,
+        'USER_INPUT',
+        '<USER_REQUEST>our prompt</USER_REQUEST><ADDITIONAL_METADATA>m</ADDITIONAL_METADATA><USER_REQUEST>foreign ide prompt</USER_REQUEST>',
+        'USER_EXPLICIT',
+      ),
+    );
+    expect(oTrailingForeign.hasActiveLane()).toBe(false);
+    expect(oTrailingForeign.observe(row(21, 'PLANNER_RESPONSE', 'FOREIGN OUTPUT'))).toBe(false);
+
+    // Malformed garbage between blocks remains invalid.
+    const oMalformed = new AgyForegroundOwnership(25);
+    oMalformed.beginTurn();
+    oMalformed.register(1, 'first');
+    oMalformed.register(2, 'second', true);
+    oMalformed.observe(row(30, 'USER_INPUT', '<USER_REQUEST>first</USER_REQUEST> stray text <USER_REQUEST>second</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(oMalformed.hasBoundInput(1)).toBe(false);
+    expect(oMalformed.hasBoundInput(2)).toBe(false);
+
+    // 2. Single-envelope concatenation of 2+ unbound prompts (with/without whitespace + slash echo).
+    const oConcat = new AgyForegroundOwnership(200);
+    oConcat.beginTurn();
+    oConcat.register(1, 'fix /compact bug');
+    oConcat.register(2, 'run tests', true);
+    oConcat.observe(row(40, 'USER_INPUT', '<USER_REQUEST>fix /compact bug\nrun tests/compact</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(oConcat.hasBoundInput(1)).toBe(true);
+    expect(oConcat.hasBoundInput(2)).toBe(true);
+    expect(oConcat.resolveAggregateGeneration(1)).toBe(2);
+    oConcat.observe(row(41, 'PLANNER_RESPONSE', 'concatenated output'));
+    expect((await oConcat.output(2))?.content).toBe('concatenated output');
+
+    // Partial concatenation + trailing foreign word must NOT bind.
+    const oConcatForeign = new AgyForegroundOwnership(25);
+    oConcatForeign.beginTurn();
+    oConcatForeign.register(1, 'alpha');
+    oConcatForeign.register(2, 'beta', true);
+    oConcatForeign.observe(row(50, 'USER_INPUT', '<USER_REQUEST>alpha beta extra</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(oConcatForeign.hasBoundInput(1)).toBe(false);
+    expect(oConcatForeign.hasBoundInput(2)).toBe(false);
+  });
+
+  it('settles bound non-subagent tool-only turns cleanly while preserving delayed prose priority and subagent blocking', async () => {
+    // 1. Bound non-subagent run_command turn with empty content and no trailing prose settles cleanly (STEP 546-547 repro).
+    const toolOnly = new AgyForegroundOwnership(40);
+    toolOnly.beginTurn();
+    toolOnly.register(1, 'run check command');
+    toolOnly.observe(row(545, 'USER_INPUT', '<USER_REQUEST>run check command</USER_REQUEST>', 'USER_EXPLICIT'));
+    toolOnly.observe({
+      ...row(546, 'PLANNER_RESPONSE', ''),
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }],
+    });
+    toolOnly.observe({ step_index: 547, type: 'GENERIC', content: 'Command exited with code 0.', status: 'DONE', source: 'SYSTEM' });
+    // Synchronous settle() remains conservative so delayed prose still wins when it arrives.
+    expect(toolOnly.settle(1)).toBeUndefined();
+    const out = await toolOnly.output(1);
+    expect(out?.step_index).toBe(546);
+    expect(out?.content).toBe('');
+    expect(toolOnly.latest?.row.step_index).toBe(546);
+    expect(toolOnly.hasActiveLane()).toBe(false);
+
+    // 2. Delayed prose arriving shortly after settle() still beats the empty tool row.
+    const delayed = new AgyForegroundOwnership(500);
+    delayed.beginTurn();
+    delayed.register(1, 'run check command');
+    delayed.observe(row(1, 'USER_INPUT', '<USER_REQUEST>run check command</USER_REQUEST>', 'USER_EXPLICIT'));
+    delayed.observe({
+      ...row(2, 'PLANNER_RESPONSE', ''),
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }],
+    });
+    expect(delayed.settle(1)).toBeUndefined();
+    const waitOut = delayed.output(1);
+    setTimeout(() => {
+      delayed.observe(row(3, 'PLANNER_RESPONSE', 'delayed final summary'));
+    }, 25);
+    expect((await waitOut)?.content).toBe('delayed final summary');
+
+    // 3. Subagent tool calls remain non-terminal even on deadline.
+    const subagentOnly = new AgyForegroundOwnership(30);
+    subagentOnly.beginTurn();
+    subagentOnly.register(1, 'spawn worker');
+    subagentOnly.observe(row(1, 'USER_INPUT', '<USER_REQUEST>spawn worker</USER_REQUEST>', 'USER_EXPLICIT'));
+    subagentOnly.observe({
+      ...row(2, 'PLANNER_RESPONSE', ''),
+      tool_calls: [{ name: 'invoke_subagent', args: { Role: 'Worker' } }],
+    });
+    expect(subagentOnly.settle(1)).toBeUndefined();
+    expect(await subagentOnly.output(1)).toBeUndefined();
+  });
 });
