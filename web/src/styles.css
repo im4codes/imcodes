@@ -6677,6 +6677,33 @@ html.native-ios-mac .chat-dl-btn {
   font-weight: 650;
 }
 .chat-assistant-status-only .chat-execution-status-chip { margin-top: 0; }
+.chat-assistant-footer { display: flex; flex-direction: column; gap: 2px; }
+.chat-assistant-footer-meta { display: inline-flex; align-items: center; gap: 6px; margin-top: 2px; }
+.chat-assistant-footer-meta .chat-bubble-time { margin-top: 0; }
+.chat-tts-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 5px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+.chat-tts-btn:hover,
+.chat-tts-btn:focus-visible {
+  opacity: 1;
+  color: #e2e8f0;
+  background: rgba(148, 163, 184, 0.14);
+}
+.chat-tts-btn.is-speaking {
+  opacity: 1;
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.14);
+}
 .chat-execution-status-chip.waiting {
   border-color: var(--supervision-waiting-border);
   background: var(--supervision-waiting-bg);

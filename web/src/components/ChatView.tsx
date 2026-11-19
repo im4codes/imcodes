@@ -93,6 +93,17 @@ import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers
 import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
 import { TIMELINE_DELETE_ERROR_CODES } from '@shared/timeline-protocol.js';
 import { requestTimelineMessageDelete, resolveTimelineDeleteTargets, timelineDeleteErrorKey, TimelineDeleteError } from '../timeline-delete.js';
+import {
+  getTtsAutoReadEnabled,
+  getTtsState,
+  isTtsSupported,
+  prepareTextForTts,
+  speakText,
+  stopSpeaking,
+  subscribeTtsPreferences,
+  subscribeTtsState,
+  type TtsPlaybackState,
+} from '../tts.js';
 import { claimRunKey } from './chat-run-keys.js';
 import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, reconcileTopOffset, topOffsetStyle, type ReaderAnchor } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
@@ -315,6 +326,8 @@ interface AssistantBlockProps {
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  ttsSpeaking?: boolean;
+  onToggleSpeak?: (messageId: string, rawText: string) => void;
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
@@ -2933,6 +2946,31 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const pinsEnabled = messagePinsEnabled && !preview && !!serverId && !!sessionId;
   const messagePins = useMessagePins(serverId, sessionId, pinsEnabled);
 
+  const [ttsState, setTtsState] = useState<TtsPlaybackState>(() => getTtsState());
+  const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
+  const ttsSupported = isTtsSupported();
+  const ttsOwnedSessionRef = useRef(false);
+  useEffect(() => subscribeTtsState(setTtsState), []);
+  useEffect(() => subscribeTtsPreferences(() => setTtsAutoRead(getTtsAutoReadEnabled())), []);
+  useEffect(() => {
+    return () => {
+      if (ttsOwnedSessionRef.current) {
+        ttsOwnedSessionRef.current = false;
+        void stopSpeaking();
+      }
+    };
+  }, [sessionId]);
+  const handleToggleSpeak = useCallback((messageId: string, rawText: string) => {
+    const current = getTtsState();
+    if (current.status === 'speaking' && current.activeMessageId === messageId) {
+      ttsOwnedSessionRef.current = false;
+      void stopSpeaking();
+      return;
+    }
+    ttsOwnedSessionRef.current = true;
+    void speakText(rawText, { messageId, lang: locale });
+  }, [locale]);
+
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
@@ -3513,6 +3551,96 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     [sourceEvents, showToolCalls, effectiveRenderLimit],
   );
   const viewItems = derivedTail.items;
+  const assistantBlockTextById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const item of viewItems) {
+      if (item.type === 'assistant-block' && !item.taskPairNotification && item.text) {
+        const blockId = item.eventIds?.[0] ?? item.key;
+        map.set(blockId, parseTimelineDisplayText(item.text));
+      }
+    }
+    return map;
+  }, [viewItems]);
+  const autoReadStateRef = useRef<{ sessionKey: string; seeded: boolean; maxTs: number }>({
+    sessionKey: sessionId ?? '',
+    seeded: false,
+    maxTs: 0,
+  });
+  const seenAutoReadKeysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const currentSessionKey = sessionId ?? '';
+    if (autoReadStateRef.current.sessionKey !== currentSessionKey) {
+      autoReadStateRef.current = { sessionKey: currentSessionKey, seeded: false, maxTs: 0 };
+      seenAutoReadKeysRef.current.clear();
+    }
+    if (!ttsAutoRead || !ttsSupported || preview) {
+      autoReadStateRef.current.seeded = false;
+      seenAutoReadKeysRef.current.clear();
+      return;
+    }
+    const recordSeenBlock = (item: ViewItem) => {
+      if (item.type !== 'assistant-block' || item.taskPairNotification || item.assistantStreaming) return;
+      if (item.eventIds && item.eventIds.length > 0) {
+        for (const eid of item.eventIds) seenAutoReadKeysRef.current.add(eid);
+      } else {
+        seenAutoReadKeysRef.current.add(item.key);
+      }
+      const ts = item.lastTs ?? item.ts ?? 0;
+      if (ts > autoReadStateRef.current.maxTs) autoReadStateRef.current.maxTs = ts;
+    };
+    if (loading || loadingOlder || refreshing || !!historyGap) {
+      for (const item of viewItems) recordSeenBlock(item);
+      return;
+    }
+    if (!autoReadStateRef.current.seeded) {
+      for (const item of viewItems) recordSeenBlock(item);
+      autoReadStateRef.current.seeded = true;
+      return;
+    }
+
+    const sourceEventById = new Map<string, TimelineEvent>();
+    for (const ev of sourceEvents) sourceEventById.set(ev.eventId, ev);
+
+    let latestNewBlock: { id: string; text: string } | null = null;
+    for (const item of viewItems) {
+      if (
+        item.type !== 'assistant-block'
+        || item.taskPairNotification
+        || item.assistantStreaming
+        || item.assistantAutomation === true
+        || !item.text
+      ) {
+        continue;
+      }
+      const ids = item.eventIds && item.eventIds.length > 0 ? item.eventIds : [item.key];
+      const tailSeen = seenAutoReadKeysRef.current.has(ids[ids.length - 1]);
+      const unseenIds = ids.filter((eid) => !seenAutoReadKeysRef.current.has(eid));
+      const hadSeenPrefix = unseenIds.length < ids.length;
+      for (const eid of ids) seenAutoReadKeysRef.current.add(eid);
+      if (tailSeen || unseenIds.length === 0) continue;
+      const ts = item.lastTs ?? item.ts ?? 0;
+      if (ts < autoReadStateRef.current.maxTs) continue;
+      autoReadStateRef.current.maxTs = ts;
+      const rawText = hadSeenPrefix
+        ? unseenIds
+          .map((eid) => sourceEventById.get(eid))
+          .filter((ev): ev is TimelineEvent => !!ev)
+          .map((ev) => projectAssistantEventForDisplay(ev).text)
+          .filter(Boolean)
+          .join('\n\n')
+        : item.text;
+      const displayText = parseTimelineDisplayText(rawText);
+      const blockId = ids[0];
+      if (visible && prepareTextForTts(displayText).length > 0) {
+        latestNewBlock = { id: blockId, text: displayText };
+      }
+    }
+
+    if (latestNewBlock && visible) {
+      ttsOwnedSessionRef.current = true;
+      void speakText(latestNewBlock.text, { messageId: latestNewBlock.id, lang: locale });
+    }
+  }, [viewItems, sourceEvents, sessionId, ttsAutoRead, ttsSupported, preview, loading, loadingOlder, refreshing, historyGap, visible, locale]);
   /** Loaded history the derivation window left out entirely. */
   const hasOlderOutsideWindow = derivedTail.windowStartIndex > 0;
   /**
@@ -5084,12 +5212,13 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               return <SupervisionStatusRun key={item.key} item={item} />;
             }
             if (item.type === 'assistant-block') {
+              const blockId = item.eventIds?.[0] ?? item.key;
               return (
                 <AssistantBlock
                   key={item.key}
                   // The row key is stable across the run losing its oldest event; the DOM
                   // marker stays a real, current event id (the run's first).
-                  eventId={item.eventIds?.[0] ?? item.key}
+                  eventId={blockId}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
                   streaming={item.assistantStreaming === true}
@@ -5106,6 +5235,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   onHtmlPreview={htmlPreviewHandler}
                   onImagePreview={imagePreviewHandler}
                   onOpenLocalWebPreview={onOpenLocalWebPreview}
+                  ttsSpeaking={ttsState.status === 'speaking' && ttsState.activeMessageId === blockId}
+                  onToggleSpeak={!preview && ttsSupported ? handleToggleSpeak : undefined}
                 />
               );
             }
@@ -5183,6 +5314,29 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             >
               {copied ? t('common.copied') : t('common.copy')}
             </button>
+            {(() => {
+              const menu = ctxMenu;
+              if (!menu) return null;
+              const ctxSpeakText = menu.eventId
+                ? (assistantBlockTextById.get(menu.eventId) ?? menu.text)
+                : menu.text;
+              const ctxMessageId = menu.eventId ?? ctxSpeakText;
+              const canSpeakCtx = ttsSupported && prepareTextForTts(ctxSpeakText).length > 0;
+              const isCtxSpeaking = ttsState.status === 'speaking' && ttsState.activeMessageId === ctxMessageId;
+              if (!canSpeakCtx) return null;
+              return (
+                <button
+                  class="chat-sel-btn"
+                  onClick={() => {
+                    handleToggleSpeak(ctxMessageId, ctxSpeakText);
+                    setCtxMenu(null);
+                    if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                  }}
+                >
+                  {isCtxSpeaking ? t('chat.tts_stop') : t('chat.tts_speak')}
+                </button>
+              );
+            })()}
             {onQuote && (
               <button
                 class="chat-sel-btn"
@@ -5217,6 +5371,29 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             >
               {copied ? t('common.copied') : t('common.copy')}
             </button>
+            {(() => {
+              const menu = ctxMenu;
+              if (!menu) return null;
+              const ctxSpeakText = menu.eventId
+                ? (assistantBlockTextById.get(menu.eventId) ?? menu.text)
+                : menu.text;
+              const ctxMessageId = menu.eventId ?? ctxSpeakText;
+              const canSpeakCtx = ttsSupported && prepareTextForTts(ctxSpeakText).length > 0;
+              const isCtxSpeaking = ttsState.status === 'speaking' && ttsState.activeMessageId === ctxMessageId;
+              if (!canSpeakCtx) return null;
+              return (
+                <button
+                  class="chat-sel-btn"
+                  onClick={() => {
+                    handleToggleSpeak(ctxMessageId, ctxSpeakText);
+                    setCtxMenu(null);
+                    if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                  }}
+                >
+                  {isCtxSpeaking ? t('chat.tts_stop') : t('chat.tts_speak')}
+                </button>
+              );
+            })()}
             {onQuote && (
               <>
               <button
@@ -6007,6 +6184,8 @@ const AssistantBlock = memo(function AssistantBlock({
   onHtmlPreview,
   onImagePreview,
   onOpenLocalWebPreview,
+  ttsSpeaking,
+  onToggleSpeak,
 }: AssistantBlockProps) {
   const { t } = useTranslation();
   const status = executionState === SUPERVISION_EXECUTION_STATES.WAITING
@@ -6018,12 +6197,14 @@ const AssistantBlock = memo(function AssistantBlock({
   if (taskPairNotification) {
     return <TaskPairEventChip eventId={eventId ?? 'task-pair-notice'} payload={taskPairNotification} timestamp={ts} sessions={sessions} />;
   }
+  const displayText = parseTimelineDisplayText(text);
+  const canSpeak = !statusOnly && !streaming && !!onToggleSpeak && !!eventId && prepareTextForTts(displayText).length > 0;
   return (
     <div
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {text && <ChatMarkdown text={displayText} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onCloudDocClick={onCloudDocClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
       {status && (
         <span
           class={`chat-execution-status-chip ${status.className}`}
@@ -6036,10 +6217,36 @@ const AssistantBlock = memo(function AssistantBlock({
         </span>
       )}
       {!statusOnly && (
-        <>
+        <div class="chat-assistant-footer">
           <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
-          <ChatTime ts={ts} />
-        </>
+          <div class="chat-assistant-footer-meta">
+            <ChatTime ts={ts} />
+            {canSpeak && (
+              <button
+                type="button"
+                class={`chat-tts-btn${ttsSpeaking ? ' is-speaking' : ''}`}
+                aria-label={t(ttsSpeaking ? 'chat.tts_stop' : 'chat.tts_speak')}
+                title={t(ttsSpeaking ? 'chat.tts_stop' : 'chat.tts_speak')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleSpeak!(eventId!, displayText);
+                }}
+              >
+                {ttsSpeaking ? (
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <rect x="4" y="4" width="8" height="8" rx="1.5" />
+                  </svg>
+                ) : (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  </svg>
+                )}
+              </button>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );

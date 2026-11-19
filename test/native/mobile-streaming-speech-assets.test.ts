@@ -6,7 +6,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
-import { STREAMING_SPEECH_PLUGIN_NAME } from '../../shared/voice-recognition.js';
+import {
+  STREAMING_SPEECH_PLUGIN_NAME,
+  STREAMING_SPEECH_TTS_STATE_EVENT,
+  STREAMING_SPEECH_TTS_STATUS,
+} from '../../shared/voice-recognition.js';
 // @ts-ignore plain build script
 import {
   ANDROID_SPEECH_ASSETS,
@@ -322,6 +326,22 @@ describe('Qwen3-ASR mobile assets', () => {
     const drainSection = ios.slice(ios.indexOf('private func drain('), ios.indexOf('/// The same Capacitor'));
     expect(drainSection).not.toContain('audioLevel');
 
+    // System TTS plugin contract checks (iOS AVSpeechSynthesizer + Android TextToSpeech)
+    for (const methodName of ['speak', 'stopSpeaking', 'isSpeaking']) {
+      expect(ios).toContain(`CAPPluginMethod(name: "${methodName}", returnType: CAPPluginReturnPromise)`);
+      expect(android).toContain(`public void ${methodName}(PluginCall call)`);
+    }
+    expect(ios).toContain('AVSpeechSynthesizerDelegate');
+    expect(ios).toContain('AVSpeechUtteranceDefaultSpeechRate');
+    expect(ios).toContain('session.setCategory(.playback, mode: .default, options: [])');
+    expect(ios).toContain(`notifyListeners("${STREAMING_SPEECH_TTS_STATE_EVENT}"`);
+    expect(ios).toContain(`"${STREAMING_SPEECH_TTS_STATUS.STARTED}"`);
+    expect(ios).toContain(`"${STREAMING_SPEECH_TTS_STATUS.STOPPED}"`);
+    expect(ios).toContain(`"${STREAMING_SPEECH_TTS_STATUS.ERROR}"`);
+    expect(android).toContain('TextToSpeech.getMaxSpeechInputLength()');
+    expect(android).toContain('AudioFocusRequest.Builder');
+    expect(android).toContain(`notifyListeners("${STREAMING_SPEECH_TTS_STATE_EVENT}"`);
+
     expect(qwenAsr).toContain('modelId: String = "aufklarer/Qwen3-ASR-0.6B-MLX-4bit"');
     expect(qwenAsr).toContain('case .small: return .small');
     expect(qwenAsr).toContain('prefixTokens: [Int32] = []');
@@ -473,7 +493,7 @@ public class AudioRecord {
       'com/getcapacitor/JSArray.java': `package com.getcapacitor; public class JSArray extends java.util.ArrayList<Object>{ public JSArray put(Object x){ add(x); return this; } }`,
       'com/getcapacitor/JSObject.java': `package com.getcapacitor; public class JSObject extends java.util.TreeMap<String,Object>{}`,
       'com/getcapacitor/PermissionState.java': `package com.getcapacitor; public enum PermissionState{ GRANTED }`,
-      'com/getcapacitor/PluginCall.java': `package com.getcapacitor; public class PluginCall { public final java.util.concurrent.CountDownLatch done=new java.util.concurrent.CountDownLatch(1); public String error,value; public String getString(String key){ return null; } public void resolve(){ done.countDown(); } public void resolve(JSObject o){ value=o.toString(); resolve(); } public void reject(String e){ error=e; done.countDown(); } public void reject(String e,Exception x){ reject(e); } }`,
+      'com/getcapacitor/PluginCall.java': `package com.getcapacitor; public class PluginCall { public final java.util.concurrent.CountDownLatch done=new java.util.concurrent.CountDownLatch(1); public String error,value; private final java.util.Map<String,Object> args=new java.util.HashMap<>(); public PluginCall setArg(String k,Object v){ args.put(k,v); return this; } public String getString(String key){ Object v=args.get(key); return v instanceof String ? (String)v : null; } public Double getDouble(String key){ Object v=args.get(key); return v instanceof Number ? ((Number)v).doubleValue() : null; } public void resolve(){ done.countDown(); } public void resolve(JSObject o){ value=o.toString(); resolve(); } public void reject(String e){ error=e; done.countDown(); } public void reject(String e,Exception x){ reject(e); } }`,
       'com/getcapacitor/Bridge.java': `package com.getcapacitor;
 public class Bridge {
   private final android.view.View webView;
@@ -484,9 +504,100 @@ public class Bridge {
 public class AssetManager {
   public java.io.InputStream open(String path) throws java.io.IOException { throw new java.io.IOException("unimplemented"); }
 }`,
+      'android/os/Build.java': `package android.os; public class Build { public static class VERSION { public static int SDK_INT = 28; } public static class VERSION_CODES { public static final int O = 26; } }`,
+      'android/os/Bundle.java': `package android.os; public class Bundle {}`,
+      'android/os/Looper.java': `package android.os; public class Looper { private static final Looper MAIN = new Looper(); public static Looper getMainLooper(){ return MAIN; } }`,
+      'android/os/Handler.java': `package android.os; public class Handler { public Handler(Looper l){} public boolean postDelayed(Runnable r, long delay){ return true; } public void removeCallbacks(Runnable r){} public void removeCallbacksAndMessages(Object token){} }`,
+      'android/media/AudioAttributes.java': `package android.media;
+public class AudioAttributes {
+  public static final int USAGE_MEDIA = 1, CONTENT_TYPE_SPEECH = 1;
+  public static class Builder {
+    public Builder setUsage(int u){ return this; }
+    public Builder setContentType(int c){ return this; }
+    public AudioAttributes build(){ return new AudioAttributes(); }
+  }
+}`,
+      'android/media/AudioFocusRequest.java': `package android.media;
+public class AudioFocusRequest {
+  public static class Builder {
+    public Builder(int gain){}
+    public Builder setAudioAttributes(AudioAttributes attrs){ return this; }
+    public Builder setOnAudioFocusChangeListener(AudioManager.OnAudioFocusChangeListener l){ return this; }
+    public AudioFocusRequest build(){ return new AudioFocusRequest(); }
+  }
+}`,
+      'android/media/AudioManager.java': `package android.media;
+public class AudioManager {
+  public static final int AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK = 3, AUDIOFOCUS_REQUEST_GRANTED = 1, STREAM_MUSIC = 3, AUDIOFOCUS_LOSS = -1, AUDIOFOCUS_LOSS_TRANSIENT = -2;
+  public static volatile int focusRequests = 0, focusAbandons = 0;
+  public static void reset(){ focusRequests = 0; focusAbandons = 0; }
+  public interface OnAudioFocusChangeListener { void onAudioFocusChange(int focusChange); }
+  public int requestAudioFocus(AudioFocusRequest req){ focusRequests++; return AUDIOFOCUS_REQUEST_GRANTED; }
+  public int requestAudioFocus(OnAudioFocusChangeListener l, int stream, int hint){ focusRequests++; return AUDIOFOCUS_REQUEST_GRANTED; }
+  public int abandonAudioFocusRequest(AudioFocusRequest req){ focusAbandons++; return AUDIOFOCUS_REQUEST_GRANTED; }
+  public int abandonAudioFocus(OnAudioFocusChangeListener l){ focusAbandons++; return AUDIOFOCUS_REQUEST_GRANTED; }
+}`,
+      'android/speech/tts/UtteranceProgressListener.java': `package android.speech.tts;
+public abstract class UtteranceProgressListener {
+  public abstract void onStart(String utteranceId);
+  public abstract void onDone(String utteranceId);
+  public abstract void onError(String utteranceId);
+  public void onError(String utteranceId, int errorCode){ onError(utteranceId); }
+  public void onStop(String utteranceId, boolean interrupted){}
+}`,
+      'android/speech/tts/TextToSpeech.java': `package android.speech.tts;
+import java.util.*;
+public class TextToSpeech {
+  public static final int SUCCESS = 0, ERROR = -1, QUEUE_FLUSH = 0, QUEUE_ADD = 1, LANG_AVAILABLE = 0;
+  public static volatile int nextInitStatus = SUCCESS;
+  public static volatile int maxInputLen = 4000;
+  public static volatile boolean failSpeakCall = false;
+  public static final List<String> spokenTexts = Collections.synchronizedList(new ArrayList<>());
+  public static final List<Integer> queueModes = Collections.synchronizedList(new ArrayList<>());
+  public static final List<String> utteranceIds = Collections.synchronizedList(new ArrayList<>());
+  public static volatile float lastRate = 1.0f;
+  public static volatile Locale lastLocale = null;
+  public static volatile int stopCalls = 0, shutdownCalls = 0;
+  public static volatile TextToSpeech latest;
+  private UtteranceProgressListener listener;
+  private volatile boolean speaking = false;
+  public static void reset(){
+    nextInitStatus = SUCCESS; maxInputLen = 4000; failSpeakCall = false;
+    spokenTexts.clear(); queueModes.clear(); utteranceIds.clear();
+    lastRate = 1.0f; lastLocale = null; stopCalls = 0; shutdownCalls = 0; latest = null;
+  }
+  public interface OnInitListener { void onInit(int status); }
+  public TextToSpeech(android.content.Context ctx, OnInitListener l){
+    latest = this;
+    if (l != null) l.onInit(nextInitStatus);
+  }
+  public static int getMaxSpeechInputLength(){ return maxInputLen; }
+  public void setAudioAttributes(android.media.AudioAttributes a){}
+  public void setOnUtteranceProgressListener(UtteranceProgressListener l){ this.listener = l; }
+  public int isLanguageAvailable(Locale loc){ return LANG_AVAILABLE; }
+  public int setLanguage(Locale loc){ lastLocale = loc; return LANG_AVAILABLE; }
+  public int setSpeechRate(float r){ lastRate = r; return SUCCESS; }
+  public int speak(CharSequence text, int queueMode, android.os.Bundle params, String utteranceId){
+    if (failSpeakCall) return ERROR;
+    spokenTexts.add(text.toString());
+    queueModes.add(queueMode);
+    utteranceIds.add(utteranceId);
+    speaking = true;
+    return SUCCESS;
+  }
+  public void emitStart(String id){ if (listener != null) listener.onStart(id); }
+  public void emitDone(String id){ speaking = false; if (listener != null) listener.onDone(id); }
+  public void emitStop(String id, boolean interrupted){ speaking = false; if (listener != null) listener.onStop(id, interrupted); }
+  public boolean isSpeaking(){ return speaking; }
+  public int stop(){ stopCalls++; speaking = false; return SUCCESS; }
+  public void shutdown(){ shutdownCalls++; speaking = false; }
+}`,
       'android/content/Context.java': `package android.content;
 public class Context {
+  public static final String AUDIO_SERVICE = "audio";
+  private static final android.media.AudioManager AUDIO_MANAGER = new android.media.AudioManager();
   public Context getApplicationContext(){ return this; }
+  public Object getSystemService(String name){ return AUDIO_SERVICE.equals(name) ? AUDIO_MANAGER : null; }
   public android.content.res.AssetManager getAssets(){ return new android.content.res.AssetManager(); }
   public java.io.File getNoBackupFilesDir(){ return new java.io.File(System.getProperty("java.io.tmpdir"),"speech-private"); }
 }`,
@@ -1017,6 +1128,51 @@ public class Harness {
   p.setBridge(origBridge);
   check(android.view.View.hapticCalls==1, "null bridge/webView still invoked haptic");
   System.out.println("HAPTIC_OK");
+  // System TTS tests: missing engine, chunking, audio focus, events, stop, and shutdown
+  android.speech.tts.TextToSpeech.reset();
+  android.media.AudioManager.reset();
+  Subject ttsFailPlugin = new Subject();
+  android.speech.tts.TextToSpeech.nextInitStatus = android.speech.tts.TextToSpeech.ERROR;
+  PluginCall ttsFail = new PluginCall().setArg("text", "Hello world");
+  ttsFailPlugin.speak(ttsFail);
+  await(ttsFail.done);
+  check(ttsFail.error != null && ttsFail.error.contains("unavailable"), "expected unavailable error, got " + ttsFail.error);
+  check(ttsFailPlugin.events.stream().anyMatch(x -> x.contains("ttsState:") && x.contains("error")), ttsFailPlugin.events);
+  ttsFailPlugin.destroy();
+
+  android.speech.tts.TextToSpeech.reset();
+  android.media.AudioManager.reset();
+  android.speech.tts.TextToSpeech.maxInputLen = 300; // maxLen = 200
+  Subject ttsPlugin = new Subject();
+  StringBuilder longTts = new StringBuilder();
+  for (int i = 0; i < 4; i++) longTts.append("Sentence ").append(i).append(" has enough words to exceed limit safely. ");
+  PluginCall speakCall = new PluginCall().setArg("text", longTts.toString()).setArg("lang", "en-US").setArg("rate", 1.25);
+  ttsPlugin.speak(speakCall);
+  await(speakCall.done);
+  check(speakCall.error == null, speakCall.error);
+  check(android.speech.tts.TextToSpeech.spokenTexts.size() >= 2, "expected chunked TTS output");
+  check(android.speech.tts.TextToSpeech.queueModes.get(0) == android.speech.tts.TextToSpeech.QUEUE_FLUSH, "first chunk must flush");
+  check(android.speech.tts.TextToSpeech.queueModes.get(1) == android.speech.tts.TextToSpeech.QUEUE_ADD, "next chunk must add");
+  check(Math.abs(android.speech.tts.TextToSpeech.lastRate - 1.25f) < 0.001f, "rate mismatch");
+  check(android.media.AudioManager.focusRequests == 1, "expected AudioFocus request");
+  android.speech.tts.TextToSpeech.latest.emitStart(android.speech.tts.TextToSpeech.utteranceIds.get(0));
+  PluginCall isSpeakingCall = new PluginCall();
+  ttsPlugin.isSpeaking(isSpeakingCall);
+  await(isSpeakingCall.done);
+  check(isSpeakingCall.value.contains("speaking=true"), isSpeakingCall.value);
+  android.speech.tts.TextToSpeech.latest.emitDone(android.speech.tts.TextToSpeech.utteranceIds.get(android.speech.tts.TextToSpeech.utteranceIds.size() - 1));
+  check(android.media.AudioManager.focusAbandons == 1, "expected AudioFocus abandon on done");
+  check(ttsPlugin.events.stream().anyMatch(x -> x.contains("status=started")) && ttsPlugin.events.stream().anyMatch(x -> x.contains("status=stopped")), ttsPlugin.events);
+  PluginCall emptySpeak = new PluginCall().setArg("text", "   ");
+  ttsPlugin.speak(emptySpeak);
+  await(emptySpeak.done);
+  check(emptySpeak.error != null, "empty TTS text must reject");
+  PluginCall stopSpeak = new PluginCall();
+  ttsPlugin.stopSpeaking(stopSpeak);
+  await(stopSpeak.done);
+  ttsPlugin.destroy();
+  check(android.speech.tts.TextToSpeech.shutdownCalls >= 1, "destroy must shutdown TTS");
+  System.out.println("TTS_ANDROID_OK");
   SpeechGainTest.main(new String[0]);
  }
 }
@@ -1034,7 +1190,7 @@ public class Harness {
     expect(unitOut).toBe('QWEN3_JAVA_UNIT_TESTS:PASS');
     for (const dtype of ['FLOAT', 'FLOAT16']) {
       const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DortDtype='+dtype, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
-      expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','NO_AGC_OK','SOURCE_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','HAPTIC_OK','SpeechGainTest: ALL 7 TESTS PASSED']);
+      expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','NO_AGC_OK','SOURCE_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','HAPTIC_OK','TTS_ANDROID_OK','SpeechGainTest: ALL 7 TESTS PASSED']);
     }
   }, 95000);
 });

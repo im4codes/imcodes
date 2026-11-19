@@ -561,7 +561,7 @@ final class SpeechCoordinator {
 
 /// The same Capacitor event contract as the existing voice input. No cloud service.
 @objc(StreamingSpeechPlugin)
-public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
+public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDelegate {
     public let identifier = "StreamingSpeechPlugin"
     public let jsName = "StreamingSpeech"
     public let pluginMethods: [CAPPluginMethod] = [
@@ -570,7 +570,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "requestPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "prewarm", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "start", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "speak", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stopSpeaking", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "isSpeaking", returnType: CAPPluginReturnPromise)
     ]
     private lazy var coordinator = SpeechCoordinator { [weak self] event in
         guard let self = self else { return }
@@ -613,6 +616,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var activeMainOwner: UInt64 = 0
     private var startingCall: CAPPluginCall? // main-thread only
     private var warmupWatchdog: DispatchWorkItem? // main-thread only
+    // System TTS synthesizer & utterance generation tracking (main-thread only).
+    private var speechSynthesizer: AVSpeechSynthesizer?
+    private var ttsUtteranceId: UInt64 = 0
+    private var ttsUtteranceMap: [ObjectIdentifier: UInt64] = [:]
+    private var ttsSpeaking = false
     // Resident recognizer model kept across sessions on worker; Metal state is guarded for foreground use.
     private var recognizer: SpeechRecognizer?
 
@@ -644,6 +652,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         warmupWatchdog = nil
         warmHoldIdleWorkItem?.cancel()
         warmHoldIdleWorkItem = nil
+        speechSynthesizer?.delegate = nil
+        speechSynthesizer?.stopSpeaking(at: .immediate)
+        speechSynthesizer = nil
         let retainedRecognizer = recognizer
         if retainedRecognizer != nil {
             coordinator.worker.async {
@@ -941,6 +952,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             guard self.modelAvailable else {
                 call.reject("Offline speech model missing"); return
             }
+            if self.ttsSpeaking || (self.speechSynthesizer?.isSpeaking ?? false) {
+                self.stopTtsPlaybackOnMain(deactivateSession: false)
+            }
             if self.activeMainOwner != 0 || self.startingCall != nil {
                 self.settleStartingCall(errorMessage: "Offline speech superseded by new session")
                 self.endCapture(nil, deactivateSession: false)
@@ -1091,6 +1105,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.settleStartingCall(errorMessage: "Offline speech interrupted during startup")
             }
             self.endCapture(nil)
+            if self.ttsSpeaking || (self.speechSynthesizer?.isSpeaking ?? false) {
+                self.stopTtsPlaybackOnMain(deactivateSession: true)
+            }
         }
     }
     @objc private func didEnterBackground(_ notification: Notification) {
@@ -1100,6 +1117,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.settleStartingCall(errorMessage: "Speech requires a foreground app")
             }
             self.endCapture(nil)
+            if self.ttsSpeaking || (self.speechSynthesizer?.isSpeaking ?? false) {
+                self.stopTtsPlaybackOnMain(deactivateSession: true)
+            }
         }
     }
     @objc private func engineConfigurationChanged(_ notification: Notification) {
@@ -1159,6 +1179,211 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         coordinator.worker.async { [weak self] in
             self?.recognizer?.model.clearInferenceCaches()
             Qwen3ASRModel.clearMetalCache()
+        }
+    }
+
+    // MARK: - System Text-to-Speech (AVSpeechSynthesizer)
+
+    static func mapTtsSpeechRate(_ rate: Double?) -> Float {
+        let minRate = AVSpeechUtteranceMinimumSpeechRate
+        let defaultRate = AVSpeechUtteranceDefaultSpeechRate
+        let maxRate = AVSpeechUtteranceMaximumSpeechRate
+        let raw = rate ?? 1.0
+        let multiplier = raw.isFinite ? min(2.0, max(0.5, raw)) : 1.0
+        if multiplier <= 1.0 {
+            let scaled = minRate + (defaultRate - minRate) * Float(multiplier)
+            return min(maxRate, max(minRate, scaled))
+        }
+        let scaled = defaultRate + (maxRate - defaultRate) * Float(multiplier - 1.0)
+        return min(maxRate, max(minRate, scaled))
+    }
+
+    static func normalizeBcp47LanguageTag(_ lang: String?) -> String? {
+        guard let raw = lang?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        return raw.replacingOccurrences(of: "_", with: "-")
+    }
+
+    static func selectTtsVoice(
+        for lang: String?,
+        from voices: [AVSpeechSynthesisVoice] = AVSpeechSynthesisVoice.speechVoices()
+    ) -> AVSpeechSynthesisVoice? {
+        guard let normalized = normalizeBcp47LanguageTag(lang) else {
+            return nil
+        }
+        let lower = normalized.lowercased()
+        let exactMatches = voices.filter { $0.language.lowercased() == lower }
+        if let bestExact = exactMatches.max(by: { $0.quality.rawValue < $1.quality.rawValue }) {
+            return bestExact
+        }
+        let primarySubtag = lower.split(separator: "-").first.map(String.init) ?? lower
+        let primaryMatches = voices.filter {
+            $0.language.lowercased().split(separator: "-").first.map(String.init) == primarySubtag
+        }
+        if let bestPrimary = primaryMatches.max(by: { $0.quality.rawValue < $1.quality.rawValue }) {
+            return bestPrimary
+        }
+        return AVSpeechSynthesisVoice(language: normalized)
+    }
+
+    private func ensureSpeechSynthesizerOnMain() -> AVSpeechSynthesizer {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let existing = speechSynthesizer {
+            return existing
+        }
+        let created = AVSpeechSynthesizer()
+        created.delegate = self
+        speechSynthesizer = created
+        return created
+    }
+
+    private func configurePlaybackAudioSessionOnAudioQueue() throws {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        cancelWarmHoldDeactivationOnAudioQueue()
+        invalidateEngineOnAudioQueue()
+        audioSessionCategoryConfigured = false
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default, options: [])
+        try session.setActive(true)
+        audioSessionActive = true
+    }
+
+    private func releasePlaybackAudioSessionOnAudioQueue() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        audioSessionCategoryConfigured = false
+        if !tapInstalled && audioSessionActive {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            audioSessionActive = false
+        }
+    }
+
+    private func stopTtsPlaybackOnMain(deactivateSession: Bool) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        ttsUtteranceId &+= 1
+        ttsUtteranceMap.removeAll()
+        let wasSpeaking = ttsSpeaking || (speechSynthesizer?.isSpeaking ?? false)
+        ttsSpeaking = false
+        if let synth = speechSynthesizer, synth.isSpeaking || synth.isPaused {
+            synth.stopSpeaking(at: .immediate)
+        }
+        if wasSpeaking {
+            notifyListeners("ttsState", data: ["status": "stopped"])
+        }
+        audioQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.audioSessionCategoryConfigured = false
+            if deactivateSession {
+                self.releasePlaybackAudioSessionOnAudioQueue()
+            }
+        }
+    }
+
+    @objc public func speak(_ call: CAPPluginCall) {
+        let trimmed = call.getString("text")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else {
+            call.reject("TTS text is required")
+            return
+        }
+        let lang = Self.normalizeBcp47LanguageTag(call.getString("lang"))
+        let rate = call.getDouble("rate")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                call.reject("TTS plugin unavailable")
+                return
+            }
+            if self.activeMainOwner != 0 || self.startingCall != nil {
+                self.settleStartingCall(errorMessage: "Speech recognition stopped for TTS playback")
+                self.endCapture(nil, deactivateSession: true, forceTeardown: true)
+            }
+            self.ttsUtteranceId &+= 1
+            let requestId = self.ttsUtteranceId
+            if let synth = self.speechSynthesizer, synth.isSpeaking || synth.isPaused {
+                synth.stopSpeaking(at: .immediate)
+            }
+
+            self.audioQueue.async { [weak self] in
+                guard let self = self else { return }
+                do {
+                    try self.configurePlaybackAudioSessionOnAudioQueue()
+                } catch {
+                    DispatchQueue.main.async {
+                        if self.ttsUtteranceId == requestId {
+                            self.ttsSpeaking = false
+                            self.notifyListeners("ttsState", data: ["status": "error", "message": error.localizedDescription])
+                            call.reject("System TTS audio session failed", nil, error)
+                        }
+                    }
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    guard self.ttsUtteranceId == requestId else {
+                        call.resolve()
+                        return
+                    }
+                    let synth = self.ensureSpeechSynthesizerOnMain()
+                    if synth.isSpeaking || synth.isPaused {
+                        synth.stopSpeaking(at: .immediate)
+                    }
+                    let utterance = AVSpeechUtterance(string: trimmed)
+                    utterance.rate = Self.mapTtsSpeechRate(rate)
+                    if let voice = Self.selectTtsVoice(for: lang) {
+                        utterance.voice = voice
+                    }
+                    self.ttsUtteranceMap[ObjectIdentifier(utterance)] = requestId
+                    self.ttsSpeaking = true
+                    synth.speak(utterance)
+                    call.resolve()
+                }
+            }
+        }
+    }
+
+    @objc public func stopSpeaking(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { [weak self] in
+            self?.stopTtsPlaybackOnMain(deactivateSession: true)
+            call.resolve()
+        }
+    }
+
+    @objc public func isSpeaking(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { [weak self] in
+            let speaking = (self?.ttsSpeaking ?? false) || (self?.speechSynthesizer?.isSpeaking ?? false)
+            call.resolve(["speaking": speaking])
+        }
+    }
+
+    private func handleUtteranceFinishedOnMain(_ utterance: AVSpeechUtterance) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let owner = ttsUtteranceMap.removeValue(forKey: ObjectIdentifier(utterance))
+        guard owner == ttsUtteranceId else { return }
+        ttsSpeaking = false
+        notifyListeners("ttsState", data: ["status": "stopped"])
+        audioQueue.async { [weak self] in
+            self?.releasePlaybackAudioSessionOnAudioQueue()
+        }
+    }
+
+    public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self,
+                  self.ttsUtteranceMap[ObjectIdentifier(utterance)] == self.ttsUtteranceId else { return }
+            self.ttsSpeaking = true
+            self.notifyListeners("ttsState", data: ["status": "started"])
+        }
+    }
+
+    public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { [weak self] in
+            self?.handleUtteranceFinishedOnMain(utterance)
+        }
+    }
+
+    public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { [weak self] in
+            self?.handleUtteranceFinishedOnMain(utterance)
         }
     }
 }

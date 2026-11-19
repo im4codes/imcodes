@@ -100,7 +100,9 @@
     "show": "显示",
     "hide": "隐藏",
     "this_feature": "此功能",
-    "remove": "删除"
+    "remove": "删除",
+    "on": "开启",
+    "off": "关闭"
   },
   "usageSummary": {
     "title": "Usage",
@@ -654,7 +656,9 @@
     "execution_clone_launch_unknown_error": "未知错误",
     "execution_clone_launch_timeout": "执行克隆启动超时",
     "execution_clone_launch_offline": "连接已断开，执行克隆未发送",
-    "messageQueuedLabel": "已排队"
+    "messageQueuedLabel": "已排队",
+    "tts_speak": "朗读",
+    "tts_stop": "停止朗读"
   },
   "session": {
     "incognito": "无痕会话",
@@ -2383,7 +2387,12 @@
         "disabled": "已禁用",
         "reset_aria": "重置 Mac 内置语音双击修饰键"
       }
-    }
+    },
+    "tts_title": "语音播报",
+    "tts_auto_read": "自动播报新回复",
+    "tts_auto_read_desc": "开启后，当前会话收到新的完整 AI 回复时自动使用系统语音朗读。",
+    "tts_rate": "播报语速",
+    "tts_rate_desc": "调节系统内置 TTS 语音朗读倍速。"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

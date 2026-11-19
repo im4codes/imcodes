@@ -20,6 +20,7 @@ import {
   type VoiceRecognitionEngine,
 } from '../voice-recognition-backend.js';
 import type { PluginListenerHandle } from '@capacitor/core';
+import { stopSpeaking } from '../tts.js';
 
 export {
   getVoiceRecognitionEngine,
@@ -410,7 +411,7 @@ function pauseBackgroundAudio(): void {
   for (const media of document.querySelectorAll<HTMLMediaElement>('audio, video')) {
     try { if (!media.paused) media.pause(); } catch { /* best effort */ }
   }
-  try { globalThis.speechSynthesis?.cancel(); } catch { /* unsupported */ }
+  void stopSpeaking();
 }
 
 async function attachSessionListeners(

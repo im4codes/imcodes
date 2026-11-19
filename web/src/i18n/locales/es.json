@@ -100,7 +100,9 @@
     "show": "Mostrar",
     "hide": "Ocultar",
     "this_feature": "Esta función",
-    "remove": "Eliminar"
+    "remove": "Eliminar",
+    "on": "Activado",
+    "off": "Desactivado"
   },
   "usageSummary": {
     "title": "Usage",
@@ -654,7 +656,9 @@
     "execution_clone_launch_unknown_error": "Error desconocido",
     "execution_clone_launch_timeout": "Se agotó el tiempo para iniciar los clones de ejecución",
     "execution_clone_launch_offline": "Los clones de ejecución no se enviaron porque la conexión está desconectada",
-    "messageQueuedLabel": "En cola"
+    "messageQueuedLabel": "En cola",
+    "tts_speak": "Leer en voz alta",
+    "tts_stop": "Detener lectura"
   },
   "session": {
     "incognito": "Sesión de incógnito",
@@ -2383,7 +2387,12 @@
         "disabled": "Desactivado",
         "reset_aria": "Restablecer tecla modificadora de doble pulsación para voz en Mac"
       }
-    }
+    },
+    "tts_title": "Reproducción de voz",
+    "tts_auto_read": "Leer respuestas nuevas automáticamente",
+    "tts_auto_read_desc": "Lee automáticamente en voz alta las nuevas respuestas completadas con el TTS del sistema.",
+    "tts_rate": "Velocidad de voz",
+    "tts_rate_desc": "Multiplicador de velocidad para la síntesis de voz del sistema."
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

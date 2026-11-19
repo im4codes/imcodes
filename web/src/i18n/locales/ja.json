@@ -100,7 +100,9 @@
     "show": "表示",
     "hide": "隠す",
     "this_feature": "この機能",
-    "remove": "削除"
+    "remove": "削除",
+    "on": "オン",
+    "off": "オフ"
   },
   "usageSummary": {
     "title": "Usage",
@@ -654,7 +656,9 @@
     "execution_clone_launch_unknown_error": "不明なエラー",
     "execution_clone_launch_timeout": "実行クローンの起動がタイムアウトしました",
     "execution_clone_launch_offline": "接続がオフラインのため実行クローンは送信されませんでした",
-    "messageQueuedLabel": "キュー済み"
+    "messageQueuedLabel": "キュー済み",
+    "tts_speak": "読み上げ",
+    "tts_stop": "読み上げ停止"
   },
   "session": {
     "incognito": "シークレットセッション",
@@ -2382,7 +2386,12 @@
         "disabled": "無効",
         "reset_aria": "Mac インライン音声入力の2回押し修飾キーをリセット"
       }
-    }
+    },
+    "tts_title": "音声読み上げ",
+    "tts_auto_read": "新しい返信を自動読み上げ",
+    "tts_auto_read_desc": "有効にすると、現在の会話で完了した新しい AI 返信をシステム TTS で自動再生します。",
+    "tts_rate": "読み上げ速度",
+    "tts_rate_desc": "システム音声合成の再生速度を調整します。"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

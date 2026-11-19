@@ -100,7 +100,9 @@
     "show": "Show",
     "hide": "Hide",
     "this_feature": "This feature",
-    "remove": "Remove"
+    "remove": "Remove",
+    "on": "On",
+    "off": "Off"
   },
   "usageSummary": {
     "title": "Usage",
@@ -654,7 +656,9 @@
     "execution_clone_launch_unknown_error": "Unknown error",
     "execution_clone_launch_timeout": "Execution clone launch timed out",
     "execution_clone_launch_offline": "Execution clones were not sent because the connection is offline",
-    "messageQueuedLabel": "Queued"
+    "messageQueuedLabel": "Queued",
+    "tts_speak": "Read aloud",
+    "tts_stop": "Stop reading"
   },
   "session": {
     "incognito": "Incognito session",
@@ -2383,7 +2387,12 @@
         "disabled": "Disabled",
         "reset_aria": "Reset Mac inline voice double-tap modifier"
       }
-    }
+    },
+    "tts_title": "Voice Playback",
+    "tts_auto_read": "Auto-read new replies",
+    "tts_auto_read_desc": "Automatically read newly completed assistant replies aloud using your device TTS.",
+    "tts_rate": "Speech rate",
+    "tts_rate_desc": "Playback speed multiplier for system text-to-speech."
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

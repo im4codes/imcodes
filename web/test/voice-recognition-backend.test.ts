@@ -49,7 +49,20 @@ describe('shared native voice bridge', () => {
   });
   it('does not assume native registration in browsers or older bridge versions', async () => {
     vi.stubGlobal('Capacitor', undefined);
-    const { getNativeSpeechRecognition } = await import('../src/voice-recognition-backend.js');
+    const { getNativeSpeechRecognition, getNativeSystemTts } = await import('../src/voice-recognition-backend.js');
     expect(getNativeSpeechRecognition()).toBe(bridges.legacy);
+    expect(getNativeSystemTts()).toBeNull();
+  });
+  it('exposes getNativeSystemTts only when StreamingSpeech provides native TTS methods', async () => {
+    vi.stubGlobal('Capacitor', { getPlatform: () => 'ios', isPluginAvailable: (name: string) => name === 'StreamingSpeech' });
+    const modEmpty = await import('../src/voice-recognition-backend.js');
+    expect(modEmpty.getNativeSystemTts()).toBeNull();
+
+    vi.resetModules();
+    Object.assign(bridges.streaming, { speak: vi.fn(), stopSpeaking: vi.fn() });
+    const modReady = await import('../src/voice-recognition-backend.js');
+    expect(modReady.getNativeSystemTts()).toBe(bridges.streaming);
+    delete (bridges.streaming as Record<string, unknown>).speak;
+    delete (bridges.streaming as Record<string, unknown>).stopSpeaking;
   });
 });

@@ -44,6 +44,14 @@ import {
   UI_SCALE_STEP,
   useUiScale,
 } from '../ui-scale.js';
+import {
+  getTtsAutoReadEnabled,
+  getTtsSpeechRate,
+  setTtsAutoReadEnabled,
+  setTtsSpeechRate,
+  subscribeTtsPreferences,
+  TTS_RATE_OPTIONS,
+} from '../tts.js';
 
 interface PushServerItem {
   id: string;
@@ -92,6 +100,15 @@ export function SettingsPage({
   const { t } = useTranslation();
   const [globalFontDelta, setGlobalFontDelta] = useGlobalFontDelta();
   const [uiScale, setUiScale, defaultUiScale] = useUiScale();
+  const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
+  const [ttsRate, setTtsRate] = useState<number>(() => getTtsSpeechRate());
+
+  useEffect(() => {
+    return subscribeTtsPreferences(() => {
+      setTtsAutoRead(getTtsAutoReadEnabled());
+      setTtsRate(getTtsSpeechRate());
+    });
+  }, []);
 
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -667,6 +684,64 @@ export function SettingsPage({
                           {t('chat.font.globalReset', { defaultValue: 'Reset' })}
                         </button>
                       )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="settings-card" data-testid="settings-tts-card">
+                <h2 class="settings-card-heading">
+                  {t('settings.tts_title')}
+                </h2>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                    <div style={{ minWidth: 0, flex: '1 1 180px' }}>
+                      <div style={inlineLabelStyle}>{t('settings.tts_auto_read')}</div>
+                      <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.45 }}>
+                        {t('settings.tts_auto_read_desc')}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={ttsAutoRead}
+                      aria-label={t('settings.tts_auto_read')}
+                      data-testid="settings-tts-auto-read-toggle"
+                      class={ttsAutoRead ? 'settings-btn-primary' : 'settings-btn-secondary'}
+                      style={{ minWidth: 64, padding: '6px 12px', fontSize: '12px' }}
+                      onClick={() => {
+                        const next = !ttsAutoRead;
+                        setTtsAutoReadEnabled(next);
+                        setTtsAutoRead(next);
+                      }}
+                    >
+                      {ttsAutoRead ? t('common.on', { defaultValue: 'On' }) : t('common.off', { defaultValue: 'Off' })}
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                    <div style={{ minWidth: 0, flex: '1 1 180px' }}>
+                      <div style={inlineLabelStyle}>{t('settings.tts_rate')}</div>
+                      <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.45 }}>
+                        {t('settings.tts_rate_desc')}
+                      </div>
+                    </div>
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0, flexWrap: 'wrap' }}>
+                      {TTS_RATE_OPTIONS.map((opt) => (
+                        <button
+                          key={opt}
+                          type="button"
+                          data-testid={`settings-tts-rate-${opt}`}
+                          aria-pressed={ttsRate === opt}
+                          class={ttsRate === opt ? 'settings-btn-primary' : 'settings-btn-secondary'}
+                          style={{ minWidth: 46, padding: '6px 10px', fontSize: '12px' }}
+                          onClick={() => {
+                            setTtsSpeechRate(opt);
+                            setTtsRate(opt);
+                          }}
+                        >
+                          {opt}x
+                        </button>
+                      ))}
                     </div>
                   </div>
                 </div>
