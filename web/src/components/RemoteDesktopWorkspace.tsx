@@ -343,6 +343,7 @@ export function RemoteDesktopWorkspace({
           mainChat={mainChat}
           heightStorageKey={REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY}
           overlayClassName={REMOTE_DESKTOP_OVERLAY_CLASS}
+          visible={!minimized}
         />
       )}
     </div>

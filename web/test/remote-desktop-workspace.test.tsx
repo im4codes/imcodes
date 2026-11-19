@@ -929,4 +929,87 @@ describe('RemoteDesktopWorkspace', () => {
     fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
     expect((await screen.findByTestId('cloud-docs-mini-chat')).style.height).toBe('500px');
   });
+
+  it('replays the floating robot entrance animation when RemoteDesktopWorkspace restores from minimized', () => {
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const session: SessionInfo = {
+      name: 'deck_proj_brain',
+      label: 'MainBrain',
+      project: 'codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/repo',
+    };
+    const mainChat: CloudDocsMainChatContext = {
+      session,
+      sessions: [session],
+      subSessions: [],
+      ws: { connected: true, onMessage: () => () => {}, sendSessionCommand: vi.fn() } as unknown as WsClient,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: {
+        loaded: true,
+        history: [],
+        commands: [],
+        phrases: [],
+        reload: vi.fn(),
+        recordHistory: vi.fn(),
+        addCommand: vi.fn(),
+        updateCommand: vi.fn(),
+        removeCommand: vi.fn(),
+        addPhrase: vi.fn(),
+        removePhrase: vi.fn(),
+      } as unknown as CloudDocsMainChatContext['quickData'],
+    };
+
+    const view = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      minimized={false}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(fab.classList.contains('is-entering')).toBe(true);
+    const endEv = new Event('animationend', { bubbles: false });
+    Object.defineProperty(endEv, 'animationName', { value: 'cloudDocsFabEntrance' });
+    fireEvent(fab, endEv);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+
+    // Minimize hides workspace window cleanly and clears any active entrance flag
+    view.rerender(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      minimized={true}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+
+    // Restore from minimized replays entrance animation
+    view.rerender(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={mainChat}
+      minimized={false}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(fab.classList.contains('is-entering')).toBe(true);
+  });
 });

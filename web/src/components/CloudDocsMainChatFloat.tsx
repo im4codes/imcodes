@@ -45,6 +45,7 @@ interface CloudDocsMainChatFloatProps {
   minHeight?: number;
   maxHeight?: number;
   overlayClassName?: string;
+  visible?: boolean;
 }
 
 function sanitizePositiveHeight(value: unknown): number | null {
@@ -135,6 +136,7 @@ export function CloudDocsMainChatFloat({
   minHeight = DEFAULT_MINI_CHAT_MIN_HEIGHT,
   maxHeight,
   overlayClassName,
+  visible = true,
 }: CloudDocsMainChatFloatProps) {
   const { t } = useTranslation();
   const safeMinHeight = useMemo(
@@ -154,10 +156,34 @@ export function CloudDocsMainChatFloat({
   ));
   const [containerMaxHeight, setContainerMaxHeight] = useState<number | undefined>(undefined);
   const [isResizing, setIsResizing] = useState(false);
+  const [isEntering, setIsEntering] = useState<boolean>(() => visible);
+  const [entranceEpoch, setEntranceEpoch] = useState<number>(() => (visible ? 1 : 0));
+  const prevVisibleRef = useRef<boolean>(visible);
   const anchorRef = useRef<HTMLDivElement | null>(null);
   const miniChatRef = useRef<HTMLDivElement | null>(null);
   const resizeHandleRef = useRef<HTMLDivElement | null>(null);
   const cleanupDragRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    const wasVisible = prevVisibleRef.current;
+    prevVisibleRef.current = visible;
+    if (!visible) {
+      setIsEntering(false);
+      return;
+    }
+    if (!wasVisible && visible) {
+      setEntranceEpoch((epoch) => epoch + 1);
+      setIsEntering(true);
+    }
+  }, [visible]);
+
+  useEffect(() => {
+    if (!isEntering || typeof window === 'undefined') return undefined;
+    const timer = window.setTimeout(() => {
+      setIsEntering(false);
+    }, 950);
+    return () => window.clearTimeout(timer);
+  }, [isEntering, entranceEpoch]);
 
   useEffect(() => {
     setCustomHeight(readStoredMiniChatHeight(heightStorageKey, safeMinHeight, maxHeight));
@@ -597,8 +623,13 @@ export function CloudDocsMainChatFloat({
 
       <button
         type="button"
-        class={`cloud-docs-fab${expanded ? ' active' : ''}${isBusy ? ' busy' : ''}${overlayClassSuffix}`}
+        class={`cloud-docs-fab${expanded ? ' active' : ''}${isBusy ? ' busy' : ''}${isEntering ? ' is-entering' : ''}${overlayClassSuffix}`}
         onClick={() => setExpanded((prev) => !prev)}
+        onAnimationEnd={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (event.animationName && event.animationName !== 'cloudDocsFabEntrance') return;
+          setIsEntering(false);
+        }}
         aria-expanded={expanded}
         aria-label={expanded
           ? t('cloud_docs.ai_chat.collapse', 'Collapse AI chat')
@@ -608,6 +639,8 @@ export function CloudDocsMainChatFloat({
           : t('cloud_docs.ai_chat.open', { session: sessionDisplayName })}
         data-testid="cloud-docs-main-chat-fab"
       >
+        <span class="cloud-docs-fab-aura" aria-hidden="true" />
+        <span class="cloud-docs-fab-ring" aria-hidden="true" />
         <img
           class="cloud-docs-fab-avatar"
           src="/imcodes-robot-avatar.png"

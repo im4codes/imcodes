@@ -2,6 +2,8 @@
  * @vitest-environment jsdom
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { h } from 'preact';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../../src/ws-client.js';
@@ -512,5 +514,73 @@ describe('CloudDocsMainChatFloat', () => {
     expect(removeSpy).toHaveBeenCalledWith('pointermove', expect.any(Function));
     expect(removeSpy).toHaveBeenCalledWith('pointerup', expect.any(Function));
     expect(removeSpy).toHaveBeenCalledWith('pointercancel', expect.any(Function));
+  });
+
+  it('renders sci-fi marquee ring & breathing aura, triggers entrance scale-bounce on mount and visible transitions, and ignores child animationend', () => {
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    const view = render(<CloudDocsMainChatFloat mainChat={mainChat} />);
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    const aura = fab.querySelector('.cloud-docs-fab-aura');
+    const ring = fab.querySelector('.cloud-docs-fab-ring');
+    expect(aura?.getAttribute('aria-hidden')).toBe('true');
+    expect(ring?.getAttribute('aria-hidden')).toBe('true');
+    expect(fab.classList.contains('is-entering')).toBe(true);
+
+    // Child animationend (bubbling from aura/ring) must NOT clear is-entering
+    fireEvent.animationEnd(aura!);
+    expect(fab.classList.contains('is-entering')).toBe(true);
+
+    // Non-entrance animationName on button itself must NOT clear is-entering
+    const unrelatedEv = new Event('animationend', { bubbles: false });
+    Object.defineProperty(unrelatedEv, 'animationName', { value: 'someOtherAnim' });
+    fireEvent(fab, unrelatedEv);
+    expect(fab.classList.contains('is-entering')).toBe(true);
+
+    // Entrance animationend clears is-entering cleanly
+    const entranceEv = new Event('animationend', { bubbles: false });
+    Object.defineProperty(entranceEv, 'animationName', { value: 'cloudDocsFabEntrance' });
+    fireEvent(fab, entranceEv);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+
+    // Hidden -> visible transition replays entrance animation
+    view.rerender(<CloudDocsMainChatFloat mainChat={mainChat} visible={false} />);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+
+    view.rerender(<CloudDocsMainChatFloat mainChat={mainChat} visible={true} />);
+    expect(fab.classList.contains('is-entering')).toBe(true);
+    const replayEndEv = new Event('animationend', { bubbles: false });
+    Object.defineProperty(replayEndEv, 'animationName', { value: 'cloudDocsFabEntrance' });
+    fireEvent(fab, replayEndEv);
+    expect(fab.classList.contains('is-entering')).toBe(false);
+    view.unmount();
+
+    // Mounting initially hidden does NOT set is-entering until visible becomes true
+    const hiddenView = render(<CloudDocsMainChatFloat mainChat={mainChat} visible={false} />);
+    const hiddenFab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(hiddenFab.classList.contains('is-entering')).toBe(false);
+    hiddenView.rerender(<CloudDocsMainChatFloat mainChat={mainChat} visible={true} />);
+    expect(hiddenFab.classList.contains('is-entering')).toBe(true);
+    hiddenView.unmount();
+  });
+
+  it('defines sci-fi FAB CSS keyframes, unclipped busy dot rules, reduced-motion fallback, and avoids backdrop-filter', () => {
+    const stylesPath = process.cwd().endsWith('/web')
+      ? resolve(process.cwd(), 'src/styles.css')
+      : resolve(process.cwd(), 'web/src/styles.css');
+    const css = readFileSync(stylesPath, 'utf8');
+    const fabSection = css.slice(css.indexOf('.cloud-docs-fab {'), css.indexOf('.cloud-docs-mini-chat {'));
+
+    expect(fabSection).toContain('overflow: visible;');
+    expect(fabSection).toContain('.cloud-docs-fab-ring');
+    expect(fabSection).toContain('overflow: hidden;');
+    expect(fabSection).toContain('desktop-cloud-docs-marquee-spin');
+    expect(fabSection).toContain('@keyframes cloudDocsFabAura');
+    expect(fabSection).toContain('@keyframes cloudDocsFabEntrance');
+    expect(fabSection).toContain('scale(1.42)');
+    expect(fabSection).toContain('scale(0.93)');
+    expect(fabSection).toContain('@media (prefers-reduced-motion: reduce)');
+    expect(fabSection).not.toContain('backdrop-filter');
   });
 });

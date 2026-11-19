@@ -20621,32 +20621,132 @@ button.quick-agent-delegation-preset.active {
 .cloud-docs-fab {
   pointer-events: auto;
   position: relative;
+  isolation: isolate;
+  overflow: visible;
   width: 40px;
   height: 40px;
   border-radius: 999px;
-  border: 1px solid rgba(96, 165, 250, 0.42);
-  background: linear-gradient(145deg, #16223a 0%, #0f172a 100%);
-  box-shadow: 0 8px 22px rgba(2, 6, 23, 0.55);
+  border: 0;
+  background: transparent;
+  box-shadow:
+    0 0 14px rgba(34, 211, 238, 0.28),
+    0 0 24px rgba(99, 102, 241, 0.2),
+    0 8px 20px rgba(2, 6, 23, 0.58);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   padding: 0;
-  transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+  transition: transform 140ms ease, box-shadow 140ms ease;
 }
 
-.cloud-docs-fab:hover,
-.cloud-docs-fab.active {
-  transform: translateY(-1px);
-  border-color: rgba(96, 165, 250, 0.8);
-  box-shadow: 0 10px 26px rgba(37, 99, 235, 0.32);
+.cloud-docs-fab-aura {
+  position: absolute;
+  inset: -4px;
+  z-index: 0;
+  border-radius: 999px;
+  pointer-events: none;
+  border: 1.5px solid rgba(56, 189, 248, 0.52);
+  box-shadow:
+    0 0 14px rgba(34, 211, 238, 0.45),
+    inset 0 0 10px rgba(129, 140, 248, 0.25);
+  animation: cloudDocsFabAura 2.4s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+.cloud-docs-fab-ring {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: 999px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.cloud-docs-fab-ring::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 220%;
+  aspect-ratio: 1;
+  z-index: 0;
+  pointer-events: none;
+  background: conic-gradient(
+    from 0deg,
+    #22d3ee,
+    #38bdf8,
+    #818cf8,
+    #c084fc,
+    #67e8f9,
+    #0ea5e9,
+    #a855f7,
+    #22d3ee
+  );
+  transform: translate(-50%, -50%) rotate(0turn);
+  animation: desktop-cloud-docs-marquee-spin 2.6s linear infinite;
+  will-change: transform;
+}
+
+.cloud-docs-fab-ring::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  z-index: 1;
+  border-radius: 999px;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 30% 25%, rgba(103, 232, 249, 0.22), transparent 55%),
+    linear-gradient(155deg, #16233e 0%, #091022 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(165, 243, 252, 0.35),
+    inset 0 -1px 4px rgba(14, 165, 233, 0.25);
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.cloud-docs-fab:hover:not(.is-entering),
+.cloud-docs-fab.active:not(.is-entering) {
+  transform: translateY(-1px) scale(1.05);
+  box-shadow:
+    0 0 18px rgba(34, 211, 238, 0.48),
+    0 0 28px rgba(129, 140, 248, 0.32),
+    0 10px 26px rgba(37, 99, 235, 0.36);
+}
+
+.cloud-docs-fab.active .cloud-docs-fab-ring::after {
+  background:
+    radial-gradient(circle at 30% 25%, rgba(56, 189, 248, 0.34), transparent 60%),
+    linear-gradient(155deg, #1b3158 0%, #0d1934 100%);
+}
+
+.cloud-docs-fab:focus-visible {
+  outline: 2px solid #67e8f9;
+  outline-offset: 3px;
 }
 
 .cloud-docs-fab.busy {
-  border-color: rgba(56, 189, 248, 0.85);
+  box-shadow:
+    0 0 18px rgba(34, 211, 238, 0.5),
+    0 0 30px rgba(56, 189, 248, 0.35),
+    0 8px 22px rgba(2, 6, 23, 0.62);
+}
+
+.cloud-docs-fab.busy .cloud-docs-fab-ring::before {
+  animation-duration: 1.4s;
+}
+
+.cloud-docs-fab.busy .cloud-docs-fab-aura {
+  animation-duration: 1.5s;
+  border-color: rgba(103, 232, 249, 0.78);
+}
+
+.cloud-docs-fab.is-entering {
+  animation: cloudDocsFabEntrance 720ms cubic-bezier(0.22, 1, 0.36, 1) 1 both;
 }
 
 .cloud-docs-fab-avatar {
+  position: relative;
+  z-index: 2;
   width: 26px;
   height: 26px;
   border-radius: 999px;
@@ -20658,17 +20758,65 @@ button.quick-agent-delegation-preset.active {
   position: absolute;
   top: -1px;
   right: -1px;
+  z-index: 3;
   width: 10px;
   height: 10px;
   border-radius: 999px;
   background: #38bdf8;
   border: 2px solid #0f172a;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.85);
   animation: cloudDocsPulse 1.3s ease-in-out infinite;
 }
 
 @keyframes cloudDocsPulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+@keyframes cloudDocsFabAura {
+  0%, 100% {
+    opacity: 0.42;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 0.92;
+    transform: scale(1.18);
+  }
+}
+
+@keyframes cloudDocsFabEntrance {
+  0% {
+    opacity: 0;
+    transform: scale(0.42);
+  }
+  42% {
+    opacity: 1;
+    transform: scale(1.42);
+    filter: brightness(1.35) drop-shadow(0 0 18px rgba(34, 211, 238, 0.85));
+  }
+  72% {
+    transform: scale(0.93);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+    filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cloud-docs-fab.is-entering,
+  .cloud-docs-fab-aura,
+  .cloud-docs-fab-ring::before,
+  .cloud-docs-fab-busy-dot {
+    animation: none;
+  }
+
+  .cloud-docs-fab {
+    box-shadow:
+      0 0 0 2px rgba(34, 211, 238, 0.65),
+      0 8px 20px rgba(2, 6, 23, 0.58);
+  }
 }
 
 .cloud-docs-mini-chat {
