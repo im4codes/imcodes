@@ -33,9 +33,16 @@ export const REMOTE_DESKTOP_OVERLAY_CLASS = 'remote-desktop-file-window';
 export function isPointOverRemoteDesktopOverlay(
   clientX: number,
   clientY: number,
-  elementAtPoint: (x: number, y: number) => Element | null =
-    (x, y) => document.elementFromPoint(x, y),
+  elementAtPoint: (x: number, y: number) => Element | null = (x, y) => (
+    typeof document !== 'undefined' && typeof document.elementFromPoint === 'function'
+      ? document.elementFromPoint(x, y)
+      : null
+  ),
 ): boolean {
   const element = elementAtPoint(clientX, clientY);
-  return Boolean(element?.closest(`.${REMOTE_DESKTOP_OVERLAY_CLASS}`));
+  return Boolean(
+    element
+    && typeof element.closest === 'function'
+    && element.closest(`.${REMOTE_DESKTOP_OVERLAY_CLASS}`),
+  );
 }

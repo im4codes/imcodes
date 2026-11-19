@@ -222,6 +222,40 @@ describe('the file window does not leak pointer input into the desktop', () => {
     const stage = { closest: () => null };
     expect(isPointOverRemoteDesktopOverlay(10, 10, () => stage as unknown as Element)).toBe(false);
     expect(isPointOverRemoteDesktopOverlay(10, 10, () => null)).toBe(false);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => ({} as unknown as Element))).toBe(false);
+  });
+
+  it('returns false safely when document.elementFromPoint is unavailable', () => {
+    const hadDocument = Object.prototype.hasOwnProperty.call(globalThis, 'document');
+    const prevDocDesc = hadDocument ? Object.getOwnPropertyDescriptor(globalThis, 'document') : undefined;
+    if (!hadDocument) {
+      Object.defineProperty(globalThis, 'document', {
+        configurable: true,
+        writable: true,
+        value: { elementFromPoint: undefined },
+      });
+    }
+    const prevFnDesc = Object.getOwnPropertyDescriptor(globalThis.document, 'elementFromPoint');
+    Object.defineProperty(globalThis.document, 'elementFromPoint', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+    try {
+      expect(() => isPointOverRemoteDesktopOverlay(10, 10)).not.toThrow();
+      expect(isPointOverRemoteDesktopOverlay(10, 10)).toBe(false);
+    } finally {
+      if (!hadDocument) {
+        delete (globalThis as Record<string, unknown>).document;
+      } else {
+        if (prevDocDesc) Object.defineProperty(globalThis, 'document', prevDocDesc);
+        if (prevFnDesc) {
+          Object.defineProperty(globalThis.document, 'elementFromPoint', prevFnDesc);
+        } else {
+          delete (globalThis.document as unknown as Record<string, unknown>).elementFromPoint;
+        }
+      }
+    }
   });
 
   it('guards the forwarder before it reaches the remote client', () => {
