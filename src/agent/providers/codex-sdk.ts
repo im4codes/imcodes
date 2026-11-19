@@ -3211,7 +3211,7 @@ export class CodexSdkProvider implements TransportProvider {
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
     state.runtimeActivityGeneration = payload.activityGeneration;
     if (this.isCompactCommand(payload)) {
-      await this.startCompact(sessionId, state);
+      await this.startCompact(sessionId, state, payload);
       return;
     }
     const turnDispatchGeneration = ++state.turnDispatchGeneration;
@@ -4051,6 +4051,20 @@ export class CodexSdkProvider implements TransportProvider {
     state.turnDelegationDispatches = [];
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+      if (
+        !state.incognito
+        && state.threadId
+        && state.loaded
+        && !state.lastInjectedSessionSystemText
+        && desiredSessionSystemText
+      ) {
+        // The thread was loaded without IM.codes sessionSystemText (e.g. via
+        // `setServiceTier` or a bare control command before any normal turn).
+        // Force `ensureThreadLoaded` to re-issue `thread/resume` with the full
+        // `baseInstructions` (official Codex prompt + IM.codes runtime text)
+        // instead of dumping `sessionSystemText` into turn input.
+        state.loaded = false;
+      }
       const shouldInjectStableUpdate = !!(
         state.threadId
         && state.loaded
@@ -4276,9 +4290,9 @@ export class CodexSdkProvider implements TransportProvider {
     return isSessionControlCommandText(payload.userMessage, 'compact');
   }
 
-  private async startCompact(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+  private async startCompact(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
     try {
-      await this.ensureThreadLoaded(sessionId, state);
+      await this.ensureThreadLoaded(sessionId, state, payload);
       this.clearPendingSessionSystemTextUpdate(state);
       this.clearActiveTurnLease(state);
       state.runningCompact = true;
@@ -7104,13 +7118,23 @@ export class CodexSdkProvider implements TransportProvider {
   async setServiceTier(sessionId: string, tier: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) throw new Error('codex_service_tier_unknown_session');
+    const wasLoaded = Boolean(state.threadId && state.loaded);
     await this.ensureThreadLoaded(sessionId, state);
     if (!state.threadId) throw new Error('codex_service_tier_no_thread');
-    await this.requestOnChannel(this.getChannelForSession(state), 'thread/settings/update', {
-      threadId: state.threadId,
-      serviceTier: tier,
-    });
-    this.adoptServiceTier(sessionId, state, tier);
+    try {
+      await this.requestOnChannel(this.getChannelForSession(state), 'thread/settings/update', {
+        threadId: state.threadId,
+        serviceTier: tier,
+      });
+      this.adoptServiceTier(sessionId, state, tier);
+    } finally {
+      if (!wasLoaded && !state.incognito && !state.lastInjectedSessionSystemText) {
+        // `ensureThreadLoaded` ran without a payload (`baseInstructions` had no
+        // IM.codes tail/sessionSystemText). Mark unloaded so the next `send()`
+        // re-establishes full `baseInstructions` via `thread/resume`.
+        state.loaded = false;
+      }
+    }
   }
 
   private runWithPrivacy<T>(sessionId: string, state: CodexSdkSessionState | undefined, fn: () => T): T {

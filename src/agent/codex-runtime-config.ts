@@ -431,7 +431,7 @@ let cache: { expiresAt: number; value: CodexRuntimeConfig } | null = null;
 // ──────────────────────────────────────────────────────────────────────────
 
 interface ModelsCacheData {
-  /** slug → base_instructions */
+  /** slug → base instructions (legacy `base_instructions` or `model_messages.instructions_template`) */
   map: Map<string, string>;
   /** Slugs in the order codex CLI listed them (newest first by convention). */
   order: string[];
@@ -449,11 +449,26 @@ async function loadCodexModelsCache(): Promise<ModelsCacheData> {
   try {
     const raw = await readFile(join(homedir(), '.codex', 'models_cache.json'), 'utf8');
     const parsed = JSON.parse(raw) as {
-      models?: Array<{ slug?: unknown; base_instructions?: unknown }>;
+      models?: Array<{
+        slug?: unknown;
+        base_instructions?: unknown;
+        model_messages?: { instructions_template?: unknown } | null;
+      }>;
     };
-    for (const entry of parsed.models ?? []) {
+    for (const entry of Array.isArray(parsed.models) ? parsed.models : []) {
+      if (!entry || typeof entry !== 'object') continue;
       const slug = typeof entry.slug === 'string' ? entry.slug.trim().toLowerCase() : '';
-      const instructions = typeof entry.base_instructions === 'string' ? entry.base_instructions : '';
+      const legacyBase = typeof entry.base_instructions === 'string' && entry.base_instructions.trim().length > 0
+        ? entry.base_instructions
+        : '';
+      const modelMessages = entry.model_messages && typeof entry.model_messages === 'object'
+        ? entry.model_messages
+        : undefined;
+      const templateBase = typeof modelMessages?.instructions_template === 'string'
+        && modelMessages.instructions_template.trim().length > 0
+        ? modelMessages.instructions_template
+        : '';
+      const instructions = legacyBase || templateBase;
       if (slug && instructions.length > 0 && !map.has(slug)) {
         map.set(slug, instructions);
         order.push(slug);

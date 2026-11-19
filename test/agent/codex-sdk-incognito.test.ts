@@ -838,4 +838,51 @@ args = ["--stdio"]
 
     await provider.disconnect();
   });
+
+  it('never attempts thread/resume for an incognito session after setServiceTier before first send', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'incog-tier-before-send',
+      agentType: 'codex-sdk',
+      cwd: '/tmp/project',
+      agentId: 'gpt-5.4',
+      incognito: true,
+    });
+
+    await provider.setServiceTier('incog-tier-before-send', 'fast');
+    await provider.send('incog-tier-before-send', {
+      userMessage: 'hello incognito',
+      assembledMessage: 'hello incognito',
+      sessionSystemText: 'Incognito runtime rules',
+      systemText: 'Incognito runtime rules',
+      attachments: [],
+      context: {
+        sessionSystemText: 'Incognito runtime rules',
+        systemText: 'Incognito runtime rules',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'incog-tier-before-send' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    const incognitoChild = appServer.children.at(-1)!;
+    expect(incognitoChild.requests.filter((r) => r.method === 'thread/start')).toHaveLength(1);
+    expect(incognitoChild.requests.filter((r) => r.method === 'thread/resume')).toHaveLength(0);
+    const turnStart = incognitoChild.requests.find((r) => r.method === 'turn/start');
+    expect(String(turnStart?.params?.input?.[0]?.text)).toContain('# IM.codes runtime instructions updated:\nIncognito runtime rules');
+    await provider.disconnect();
+  });
 });

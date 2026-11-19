@@ -255,6 +255,76 @@ describe('getCodexRuntimeConfig', () => {
     }
   });
 
+  it('reads model_messages.instructions_template when legacy base_instructions is absent (Codex CLI 0.170+)', async () => {
+    vi.resetModules();
+    const fresh = await import('../../src/agent/codex-runtime-config.js');
+    fsMock.readFile.mockImplementation(async (path: string) => {
+      if (path.endsWith('models_cache.json')) {
+        return JSON.stringify({
+          fetched_at: '2026-11-19T06:00:00Z',
+          models: [
+            {
+              slug: 'gpt-6.2-sol',
+              model_messages: {
+                instructions_template: 'Official GPT-6.2-Sol coding prompt (27 KB)',
+                persistent_instructions: 'Persistent addendum that should not be concatenated',
+              },
+            },
+            {
+              slug: 'gpt-6-luna',
+              base_instructions: '   ',
+              model_messages: {
+                instructions_template: 'Official GPT-6-Luna coding prompt (18 KB)',
+              },
+            },
+            {
+              slug: 'gpt-5.5-legacy',
+              base_instructions: 'Legacy top-level base_instructions takes precedence',
+              model_messages: {
+                instructions_template: 'Should not override non-empty base_instructions',
+              },
+            },
+            {
+              slug: 'empty-entry',
+              model_messages: {
+                instructions_template: '   ',
+              },
+            },
+          ],
+        });
+      }
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    expect(await fresh.getCodexBaseInstructions('gpt-6.2-sol')).toBe('Official GPT-6.2-Sol coding prompt (27 KB)');
+    expect(await fresh.getCodexBaseInstructions('GPT-6-LUNA')).toBe('Official GPT-6-Luna coding prompt (18 KB)');
+    expect(await fresh.getCodexBaseInstructions('gpt-5.5-legacy')).toBe('Legacy top-level base_instructions takes precedence');
+    // Unknown or empty-entry slugs fall back to order[0]'s instructions_template.
+    expect(await fresh.getCodexBaseInstructions('gpt-6.3-unknown')).toBe('Official GPT-6.2-Sol coding prompt (27 KB)');
+    expect(await fresh.getCodexBaseInstructions('empty-entry')).toBe('Official GPT-6.2-Sol coding prompt (27 KB)');
+    expect(await fresh.getCodexBaseInstructions('gpt-6.2-sol')).not.toContain('Persistent addendum');
+  });
+
+  it('returns undefined when models_cache.json only has empty instructions_template and no base_instructions', async () => {
+    vi.resetModules();
+    const fresh = await import('../../src/agent/codex-runtime-config.js');
+    fsMock.readFile.mockImplementation(async (path: string) => {
+      if (path.endsWith('models_cache.json')) {
+        return JSON.stringify({
+          models: [
+            null,
+            { slug: 'no-prompt', model_messages: {} },
+            { slug: 'blank-prompt', base_instructions: '', model_messages: { instructions_template: '  ' } },
+          ],
+        });
+      }
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    expect(await fresh.getCodexBaseInstructions('no-prompt')).toBeUndefined();
+    expect(await fresh.getCodexBaseInstructions('gpt-6.2-sol')).toBeUndefined();
+  });
+
   it('never lets a passive (probe:false) read replace the live catalog a non-forced read returns', async () => {
     // Fresh module: the catalog cache is module state shared across this file.
     vi.resetModules();

@@ -156,6 +156,9 @@ const childProcessMock = vi.hoisted(() => {
           if (msg.method === 'thread/compact/start' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: {} });
           }
+          if (msg.method === 'thread/settings/update' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: {} });
+          }
           if (msg.method === 'thread/read' && typeof msg.id === 'number') {
             const next = threadReadResults.shift();
             if (next) {
@@ -5340,6 +5343,155 @@ describe('CodexSdkProvider', () => {
     const secondTurn = child.requests.filter((req) => req.method === 'turn/start').at(-1);
     expect(secondTurn?.params?.input?.[0]?.text).not.toContain('runtime instructions updated');
     expect(secondTurn?.params?.input?.[0]?.text).not.toContain('identity v2');
+  });
+
+  it('preserves Codex catalog prompt and IM.codes instructions across unloaded /compact and post-compact resume', async () => {
+    codexRuntimeConfigMock.set(['gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6-luna']);
+    try {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({
+        sessionKey: 'route-compact-payload-instructions',
+        cwd: '/tmp/project',
+        agentId: 'gpt-6.2-sol',
+        resumeId: 'thread-compact-payload',
+      });
+
+      const makeCompactOrTurnPayload = (userMessage: string, sessionSystemText: string): ProviderContextPayload => ({
+        userMessage,
+        assembledMessage: userMessage,
+        sessionSystemText,
+        systemText: sessionSystemText,
+        attachments: [],
+        context: {
+          sessionSystemText,
+          systemText: sessionSystemText,
+          requiredAuthoredContext: [],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: [],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: { scope: 'personal', projectId: 'route-compact-payload-instructions' },
+          authoritySource: 'none',
+          freshness: 'missing',
+          fallbackAllowed: true,
+          retryScheduled: false,
+          providerPolicyOutcome: 'allowed',
+          diagnostics: [],
+        },
+        supportClass: 'degraded-message-side-context-mapping',
+        diagnostics: [],
+      });
+
+      await provider.send(
+        'route-compact-payload-instructions',
+        makeCompactOrTurnPayload('/compact', 'IM.codes durable identity v1'),
+      );
+      const child = childProcessMock.children[0]!;
+      const resumesDuringCompact = child.requests.filter((req) => req.method === 'thread/resume');
+      expect(resumesDuringCompact).toHaveLength(1);
+      expect(String(resumesDuringCompact[0]?.params?.baseInstructions)).toContain('[catalog-prompt:gpt-6.2-sol]');
+      expect(String(resumesDuringCompact[0]?.params?.baseInstructions)).toContain('# IM.codes runtime instructions');
+      expect(String(resumesDuringCompact[0]?.params?.baseInstructions)).toContain('IM.codes durable identity v1');
+
+      child.emits({
+        method: 'thread/compacted',
+        params: { threadId: 'thread-compact-payload', turnId: 'compact-turn-1' },
+      });
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-compact-payload-instructions')?.runningCompact === false,
+      );
+
+      await provider.send(
+        'route-compact-payload-instructions',
+        makeCompactOrTurnPayload('continue after compact', 'IM.codes durable identity v2'),
+      );
+      const resumesAfterCompact = child.requests.filter((req) => req.method === 'thread/resume');
+      expect(resumesAfterCompact).toHaveLength(2);
+      const postCompactBase = String(resumesAfterCompact[1]?.params?.baseInstructions);
+      expect(postCompactBase).toContain('[catalog-prompt:gpt-6.2-sol]');
+      expect(postCompactBase).toContain('# IM.codes runtime instructions');
+      expect(postCompactBase).toContain('IM.codes durable identity v2');
+      const turnAfterCompact = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+      expect(String(turnAfterCompact?.params?.input?.[0]?.text)).not.toContain('runtime instructions updated');
+      expect(String(turnAfterCompact?.params?.input?.[0]?.text)).not.toContain('IM.codes durable identity v2');
+      await provider.disconnect();
+    } finally {
+      codexRuntimeConfigMock.reset();
+    }
+  });
+
+  it('re-resumes with full baseInstructions on the next turn when setServiceTier loaded an unloaded thread', async () => {
+    codexRuntimeConfigMock.set(['gpt-6.2-sol']);
+    try {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({
+        sessionKey: 'route-tier-before-send',
+        cwd: '/tmp/project',
+        agentId: 'gpt-6.2-sol',
+        resumeId: 'thread-tier-unloaded',
+      });
+
+      const makePayload = (userMessage: string, sessionSystemText: string): ProviderContextPayload => ({
+        userMessage,
+        assembledMessage: userMessage,
+        sessionSystemText,
+        systemText: sessionSystemText,
+        attachments: [],
+        context: {
+          sessionSystemText,
+          systemText: sessionSystemText,
+          requiredAuthoredContext: [],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: [],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: { scope: 'personal', projectId: 'route-tier-before-send' },
+          authoritySource: 'none',
+          freshness: 'missing',
+          fallbackAllowed: true,
+          retryScheduled: false,
+          providerPolicyOutcome: 'allowed',
+          diagnostics: [],
+        },
+        supportClass: 'degraded-message-side-context-mapping',
+        diagnostics: [],
+      });
+
+      await provider.setServiceTier('route-tier-before-send', 'fast');
+      const child = childProcessMock.children[0]!;
+      expect(child.requests.filter((req) => req.method === 'thread/settings/update')).toHaveLength(1);
+
+      await provider.send('route-tier-before-send', makePayload('first user turn', 'IM.codes tier identity v1'));
+      const resumes = child.requests.filter((req) => req.method === 'thread/resume');
+      expect(resumes).toHaveLength(2);
+      const turnResumeBase = String(resumes[1]?.params?.baseInstructions);
+      expect(turnResumeBase).toContain('[catalog-prompt:gpt-6.2-sol]');
+      expect(turnResumeBase).toContain('# IM.codes runtime instructions');
+      expect(turnResumeBase).toContain('IM.codes tier identity v1');
+
+      const firstTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+      expect(String(firstTurnStart?.params?.input?.[0]?.text)).toBe('first user turn');
+      expect(String(firstTurnStart?.params?.input?.[0]?.text)).not.toContain('runtime instructions updated');
+
+      child.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-tier-unloaded', turn: { id: 'turn-1', status: 'completed', error: null } },
+      });
+      await flush();
+
+      // Subsequent mid-session stable update still injects into turn/start input cleanly.
+      await provider.send('route-tier-before-send', makePayload('second user turn', 'IM.codes tier identity v2'));
+      expect(child.requests.filter((req) => req.method === 'thread/resume')).toHaveLength(2);
+      const secondTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+      expect(String(secondTurnStart?.params?.input?.[0]?.text)).toContain('# IM.codes runtime instructions updated:\nIM.codes tier identity v2');
+      await provider.disconnect();
+    } finally {
+      codexRuntimeConfigMock.reset();
+    }
   });
 
   it('re-sends a changed split stable context when the Codex update turn fails before completion', async () => {
