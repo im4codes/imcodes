@@ -9,6 +9,8 @@ import { SettingsPage } from '../../src/pages/SettingsPage.js';
 import {
   getTtsAutoReadEnabled,
   getTtsSpeechRate,
+  TTS_DEFAULT_RATE,
+  TTS_RATE_OPTIONS,
   __resetTtsForTests,
 } from '../../src/tts.js';
 
@@ -56,6 +58,10 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
     const toggle = screen.getByTestId('settings-tts-auto-read-toggle');
     expect(toggle.getAttribute('aria-checked')).toBe('false');
     expect(getTtsAutoReadEnabled()).toBe(false);
+    expect(TTS_DEFAULT_RATE).toBe(1.1);
+    expect(TTS_RATE_OPTIONS).toEqual([0.9, 1.0, 1.1, 1.25, 1.5]);
+    expect(screen.getByTestId('settings-tts-rate-1.1').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('settings-tts-voice-hint').textContent).toContain('settings.tts_voice_hint');
 
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-checked')).toBe('true');
@@ -82,11 +88,15 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
       expect(json.common?.off, `${locale} common.off`).toBeTruthy();
       expect(json.chat?.tts_speak, `${locale} chat.tts_speak`).toBeTruthy();
       expect(json.chat?.tts_stop, `${locale} chat.tts_stop`).toBeTruthy();
+      expect(json.chat?.tts_autoread_on, `${locale} chat.tts_autoread_on`).toBeTruthy();
+      expect(json.chat?.tts_autoread_off, `${locale} chat.tts_autoread_off`).toBeTruthy();
       expect(json.settings?.tts_title, `${locale} settings.tts_title`).toBeTruthy();
       expect(json.settings?.tts_auto_read, `${locale} settings.tts_auto_read`).toBeTruthy();
       expect(json.settings?.tts_auto_read_desc, `${locale} settings.tts_auto_read_desc`).toBeTruthy();
       expect(json.settings?.tts_rate, `${locale} settings.tts_rate`).toBeTruthy();
       expect(json.settings?.tts_rate_desc, `${locale} settings.tts_rate_desc`).toBeTruthy();
+      expect(json.settings?.tts_voice_hint, `${locale} settings.tts_voice_hint`).toBeTruthy();
+      expect(json.settings?.tts_ios_enhanced_hint, `${locale} settings.tts_ios_enhanced_hint`).toBeTruthy();
     }
   });
 });

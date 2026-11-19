@@ -331,14 +331,19 @@ describe('Qwen3-ASR mobile assets', () => {
       expect(ios).toContain(`CAPPluginMethod(name: "${methodName}", returnType: CAPPluginReturnPromise)`);
       expect(android).toContain(`public void ${methodName}(PluginCall call)`);
     }
+    expect(ios).toContain('CAPPluginMethod(name: "getTtsVoiceQuality", returnType: CAPPluginReturnPromise)');
     expect(ios).toContain('AVSpeechSynthesizerDelegate');
     expect(ios).toContain('AVSpeechUtteranceDefaultSpeechRate');
+    expect(ios).toContain('utterance.postUtteranceDelay = 0.12');
     expect(ios).toContain('session.setCategory(.playback, mode: .default, options: [])');
+    expect(ios).not.toContain('.duckOthers');
     expect(ios).toContain(`notifyListeners("${STREAMING_SPEECH_TTS_STATE_EVENT}"`);
     expect(ios).toContain(`"${STREAMING_SPEECH_TTS_STATUS.STARTED}"`);
     expect(ios).toContain(`"${STREAMING_SPEECH_TTS_STATUS.STOPPED}"`);
     expect(ios).toContain(`"${STREAMING_SPEECH_TTS_STATUS.ERROR}"`);
     expect(android).toContain('TextToSpeech.getMaxSpeechInputLength()');
+    expect(android).toContain('Voice.QUALITY_VERY_HIGH');
+    expect(android).toContain('engine.setVoice(');
     expect(android).toContain('AudioFocusRequest.Builder');
     expect(android).toContain(`notifyListeners("${STREAMING_SPEECH_TTS_STATE_EVENT}"`);
 
@@ -504,7 +509,7 @@ public class Bridge {
 public class AssetManager {
   public java.io.InputStream open(String path) throws java.io.IOException { throw new java.io.IOException("unimplemented"); }
 }`,
-      'android/os/Build.java': `package android.os; public class Build { public static class VERSION { public static int SDK_INT = 28; } public static class VERSION_CODES { public static final int O = 26; } }`,
+      'android/os/Build.java': `package android.os; public class Build { public static class VERSION { public static int SDK_INT = 28; } public static class VERSION_CODES { public static final int LOLLIPOP = 21; public static final int O = 26; } }`,
       'android/os/Bundle.java': `package android.os; public class Bundle {}`,
       'android/os/Looper.java': `package android.os; public class Looper { private static final Looper MAIN = new Looper(); public static Looper getMainLooper(){ return MAIN; } }`,
       'android/os/Handler.java': `package android.os; public class Handler { public Handler(Looper l){} public boolean postDelayed(Runnable r, long delay){ return true; } public void removeCallbacks(Runnable r){} public void removeCallbacksAndMessages(Object token){} }`,
@@ -545,6 +550,22 @@ public abstract class UtteranceProgressListener {
   public void onError(String utteranceId, int errorCode){ onError(utteranceId); }
   public void onStop(String utteranceId, boolean interrupted){}
 }`,
+      'android/speech/tts/Voice.java': `package android.speech.tts;
+import java.util.*;
+public class Voice {
+  public static final int QUALITY_VERY_LOW = 100, QUALITY_LOW = 200, QUALITY_NORMAL = 300, QUALITY_HIGH = 400, QUALITY_VERY_HIGH = 500;
+  private final String name;
+  private final Locale locale;
+  private final int quality;
+  private final boolean networkRequired;
+  public Voice(String name, Locale locale, int quality, boolean networkRequired){
+    this.name = name; this.locale = locale; this.quality = quality; this.networkRequired = networkRequired;
+  }
+  public String getName(){ return name; }
+  public Locale getLocale(){ return locale; }
+  public int getQuality(){ return quality; }
+  public boolean isNetworkConnectionRequired(){ return networkRequired; }
+}`,
       'android/speech/tts/TextToSpeech.java': `package android.speech.tts;
 import java.util.*;
 public class TextToSpeech {
@@ -552,19 +573,23 @@ public class TextToSpeech {
   public static volatile int nextInitStatus = SUCCESS;
   public static volatile int maxInputLen = 4000;
   public static volatile boolean failSpeakCall = false;
+  public static volatile boolean returnNullVoices = false, throwOnGetVoices = false;
+  public static final Set<Voice> nextVoices = Collections.synchronizedSet(new LinkedHashSet<>());
   public static final List<String> spokenTexts = Collections.synchronizedList(new ArrayList<>());
   public static final List<Integer> queueModes = Collections.synchronizedList(new ArrayList<>());
   public static final List<String> utteranceIds = Collections.synchronizedList(new ArrayList<>());
   public static volatile float lastRate = 1.0f;
   public static volatile Locale lastLocale = null;
+  public static volatile Voice lastVoice = null;
   public static volatile int stopCalls = 0, shutdownCalls = 0;
   public static volatile TextToSpeech latest;
   private UtteranceProgressListener listener;
   private volatile boolean speaking = false;
   public static void reset(){
     nextInitStatus = SUCCESS; maxInputLen = 4000; failSpeakCall = false;
+    returnNullVoices = false; throwOnGetVoices = false; nextVoices.clear();
     spokenTexts.clear(); queueModes.clear(); utteranceIds.clear();
-    lastRate = 1.0f; lastLocale = null; stopCalls = 0; shutdownCalls = 0; latest = null;
+    lastRate = 1.0f; lastLocale = null; lastVoice = null; stopCalls = 0; shutdownCalls = 0; latest = null;
   }
   public interface OnInitListener { void onInit(int status); }
   public TextToSpeech(android.content.Context ctx, OnInitListener l){
@@ -576,6 +601,8 @@ public class TextToSpeech {
   public void setOnUtteranceProgressListener(UtteranceProgressListener l){ this.listener = l; }
   public int isLanguageAvailable(Locale loc){ return LANG_AVAILABLE; }
   public int setLanguage(Locale loc){ lastLocale = loc; return LANG_AVAILABLE; }
+  public Set<Voice> getVoices(){ if (throwOnGetVoices) throw new RuntimeException("getVoices unavailable"); return returnNullVoices ? null : nextVoices; }
+  public int setVoice(Voice voice){ lastVoice = voice; return SUCCESS; }
   public int setSpeechRate(float r){ lastRate = r; return SUCCESS; }
   public int speak(CharSequence text, int queueMode, android.os.Bundle params, String utteranceId){
     if (failSpeakCall) return ERROR;
@@ -1143,6 +1170,11 @@ public class Harness {
   android.speech.tts.TextToSpeech.reset();
   android.media.AudioManager.reset();
   android.speech.tts.TextToSpeech.maxInputLen = 300; // maxLen = 200
+  android.speech.tts.TextToSpeech.nextVoices.add(new android.speech.tts.Voice("en-us-net-vhigh", java.util.Locale.US, android.speech.tts.Voice.QUALITY_VERY_HIGH, true));
+  android.speech.tts.TextToSpeech.nextVoices.add(new android.speech.tts.Voice("en-us-off-normal", java.util.Locale.US, android.speech.tts.Voice.QUALITY_NORMAL, false));
+  android.speech.tts.TextToSpeech.nextVoices.add(new android.speech.tts.Voice("en-us-off-vhigh", java.util.Locale.US, android.speech.tts.Voice.QUALITY_VERY_HIGH, false));
+  android.speech.tts.TextToSpeech.nextVoices.add(new android.speech.tts.Voice("en-gb-off-vhigh", java.util.Locale.UK, android.speech.tts.Voice.QUALITY_VERY_HIGH, false));
+  android.speech.tts.TextToSpeech.nextVoices.add(new android.speech.tts.Voice("fr-fr-off-high", java.util.Locale.FRANCE, android.speech.tts.Voice.QUALITY_HIGH, false));
   Subject ttsPlugin = new Subject();
   StringBuilder longTts = new StringBuilder();
   for (int i = 0; i < 4; i++) longTts.append("Sentence ").append(i).append(" has enough words to exceed limit safely. ");
@@ -1150,6 +1182,7 @@ public class Harness {
   ttsPlugin.speak(speakCall);
   await(speakCall.done);
   check(speakCall.error == null, speakCall.error);
+  check(android.speech.tts.TextToSpeech.lastVoice != null && "en-us-off-vhigh".equals(android.speech.tts.TextToSpeech.lastVoice.getName()), "expected offline VERY_HIGH en-US voice, got " + android.speech.tts.TextToSpeech.lastVoice);
   check(android.speech.tts.TextToSpeech.spokenTexts.size() >= 2, "expected chunked TTS output");
   check(android.speech.tts.TextToSpeech.queueModes.get(0) == android.speech.tts.TextToSpeech.QUEUE_FLUSH, "first chunk must flush");
   check(android.speech.tts.TextToSpeech.queueModes.get(1) == android.speech.tts.TextToSpeech.QUEUE_ADD, "next chunk must add");
@@ -1163,6 +1196,36 @@ public class Harness {
   android.speech.tts.TextToSpeech.latest.emitDone(android.speech.tts.TextToSpeech.utteranceIds.get(android.speech.tts.TextToSpeech.utteranceIds.size() - 1));
   check(android.media.AudioManager.focusAbandons == 1, "expected AudioFocus abandon on done");
   check(ttsPlugin.events.stream().anyMatch(x -> x.contains("status=started")) && ttsPlugin.events.stream().anyMatch(x -> x.contains("status=stopped")), ttsPlugin.events);
+
+  // Primary-subtag offline fallback & null/throwing getVoices fallback to setLanguage
+  android.speech.tts.TextToSpeech.lastVoice = null;
+  android.speech.tts.TextToSpeech.lastLocale = null;
+  PluginCall frSpeak = new PluginCall().setArg("text", "Bonjour tout le monde").setArg("lang", "fr-CA");
+  ttsPlugin.speak(frSpeak);
+  await(frSpeak.done);
+  check(android.speech.tts.TextToSpeech.lastVoice != null && "fr-fr-off-high".equals(android.speech.tts.TextToSpeech.lastVoice.getName()), "expected fr-FR primary-subtag offline voice");
+  android.speech.tts.TextToSpeech.latest.emitDone(android.speech.tts.TextToSpeech.utteranceIds.get(android.speech.tts.TextToSpeech.utteranceIds.size() - 1));
+
+  android.speech.tts.TextToSpeech.lastVoice = null;
+  android.speech.tts.TextToSpeech.lastLocale = null;
+  android.speech.tts.TextToSpeech.returnNullVoices = true;
+  PluginCall nullVoicesSpeak = new PluginCall().setArg("text", "Fallback null voices").setArg("lang", "en-US");
+  ttsPlugin.speak(nullVoicesSpeak);
+  await(nullVoicesSpeak.done);
+  check(android.speech.tts.TextToSpeech.lastVoice == null && android.speech.tts.TextToSpeech.lastLocale != null, "null getVoices must fall back to setLanguage");
+  android.speech.tts.TextToSpeech.latest.emitDone(android.speech.tts.TextToSpeech.utteranceIds.get(android.speech.tts.TextToSpeech.utteranceIds.size() - 1));
+
+  android.speech.tts.TextToSpeech.returnNullVoices = false;
+  android.speech.tts.TextToSpeech.throwOnGetVoices = true;
+  android.speech.tts.TextToSpeech.lastVoice = null;
+  android.speech.tts.TextToSpeech.lastLocale = null;
+  PluginCall throwVoicesSpeak = new PluginCall().setArg("text", "Fallback throwing voices").setArg("lang", "en-US");
+  ttsPlugin.speak(throwVoicesSpeak);
+  await(throwVoicesSpeak.done);
+  check(android.speech.tts.TextToSpeech.lastVoice == null && android.speech.tts.TextToSpeech.lastLocale != null, "throwing getVoices must fall back to setLanguage");
+  android.speech.tts.TextToSpeech.latest.emitDone(android.speech.tts.TextToSpeech.utteranceIds.get(android.speech.tts.TextToSpeech.utteranceIds.size() - 1));
+  android.speech.tts.TextToSpeech.throwOnGetVoices = false;
+
   PluginCall emptySpeak = new PluginCall().setArg("text", "   ");
   ttsPlugin.speak(emptySpeak);
   await(emptySpeak.done);

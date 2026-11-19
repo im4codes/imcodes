@@ -573,7 +573,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "speak", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopSpeaking", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "isSpeaking", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "isSpeaking", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getTtsVoiceQuality", returnType: CAPPluginReturnPromise)
     ]
     private lazy var coordinator = SpeechCoordinator { [weak self] event in
         guard let self = self else { return }
@@ -1329,6 +1330,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                     }
                     let utterance = AVSpeechUtterance(string: trimmed)
                     utterance.rate = Self.mapTtsSpeechRate(rate)
+                    utterance.postUtteranceDelay = 0.12
                     if let voice = Self.selectTtsVoice(for: lang) {
                         utterance.voice = voice
                     }
@@ -1353,6 +1355,32 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             let speaking = (self?.ttsSpeaking ?? false) || (self?.speechSynthesizer?.isSpeaking ?? false)
             call.resolve(["speaking": speaking])
         }
+    }
+
+    static func ttsVoiceQualityLabel(_ quality: AVSpeechSynthesisVoiceQuality) -> String {
+        if #available(iOS 16.0, macOS 13.0, *) {
+            if quality == .premium {
+                return "premium"
+            }
+        }
+        if quality == .enhanced {
+            return "enhanced"
+        }
+        return "default"
+    }
+
+    @objc public func getTtsVoiceQuality(_ call: CAPPluginCall) {
+        let requested = Self.normalizeBcp47LanguageTag(call.getString("lang"))
+            ?? Self.normalizeBcp47LanguageTag(Locale.preferredLanguages.first)
+            ?? "en-US"
+        guard let voice = Self.selectTtsVoice(for: requested) else {
+            call.resolve(["quality": "unavailable", "language": requested])
+            return
+        }
+        call.resolve([
+            "quality": Self.ttsVoiceQualityLabel(voice.quality),
+            "language": voice.language
+        ])
     }
 
     private func handleUtteranceFinishedOnMain(_ utterance: AVSpeechUtterance) {

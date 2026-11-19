@@ -658,7 +658,9 @@
     "execution_clone_launch_offline": "接続がオフラインのため実行クローンは送信されませんでした",
     "messageQueuedLabel": "キュー済み",
     "tts_speak": "読み上げ",
-    "tts_stop": "読み上げ停止"
+    "tts_stop": "読み上げ停止",
+    "tts_autoread_on": "新しい返信の自動読み上げを有効にする",
+    "tts_autoread_off": "自動読み上げをオフにして停止"
   },
   "session": {
     "incognito": "シークレットセッション",
@@ -2391,7 +2393,9 @@
     "tts_auto_read": "新しい返信を自動読み上げ",
     "tts_auto_read_desc": "有効にすると、現在の会話で完了した新しい AI 返信をシステム TTS で自動再生します。",
     "tts_rate": "読み上げ速度",
-    "tts_rate_desc": "システム音声合成の再生速度を調整します。"
+    "tts_rate_desc": "システム音声合成の再生速度を調整します。",
+    "tts_voice_hint": "IM.codes は端末内の最も高音質なオフライン音声を優先して使用します。OS のアクセシビリティまたは音声合成設定から拡張音声をダウンロードするとより自然に聞こえます。",
+    "tts_ios_enhanced_hint": "現在は標準 iOS 音声が使用されています。iOS「設定 -> アクセシビリティ -> 読み上げコンテンツ -> 声」から拡張またはプレミアム音声をダウンロードできます。"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

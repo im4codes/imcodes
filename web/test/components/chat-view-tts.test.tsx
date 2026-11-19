@@ -234,4 +234,76 @@ describe('ChatView system TTS integration', () => {
     unmount();
     expect(cancelMock).toHaveBeenCalled();
   });
+
+  it('renders topbar auto-read speaker button right of usage button, stops immediately when toggled off, and skips file-list-only replies', async () => {
+    const { getTtsAutoReadEnabled } = await import('../../src/tts.js');
+    const { ChatView } = await import('../../src/components/ChatView.js');
+
+    const { container, rerender } = render(
+      <ChatView
+        events={[makeAssistantEvent('m-init', 'Initial reply.', 1000)]}
+        loading={false}
+        sessionId="sess-1"
+        visible={true}
+      />,
+    );
+
+    const usageBtn = container.querySelector('.chat-session-usage-btn');
+    const speakerBtn = container.querySelector('.chat-tts-autoread-btn') as HTMLButtonElement | null;
+    expect(usageBtn).toBeTruthy();
+    expect(speakerBtn).toBeTruthy();
+    expect(usageBtn?.nextElementSibling).toBe(speakerBtn);
+    expect(speakerBtn?.getAttribute('aria-pressed')).toBe('false');
+    expect(getTtsAutoReadEnabled()).toBe(false);
+
+    // Toggle on -> aria-pressed=true, persists auto-read=true
+    await act(async () => {
+      fireEvent.click(speakerBtn!);
+    });
+    expect(speakerBtn?.getAttribute('aria-pressed')).toBe('true');
+    expect(getTtsAutoReadEnabled()).toBe(true);
+
+    // File-list-only assistant reply -> not auto-read and has no per-message read button
+    await act(async () => {
+      rerender(
+        <ChatView
+          events={[
+            makeAssistantEvent('m-init', 'Initial reply.', 1000),
+            makeAssistantEvent('m-files', '- `web/src/tts.ts`\n- `web/src/styles.css`', 2000),
+          ]}
+          loading={false}
+          sessionId="sess-1"
+          visible={true}
+        />,
+      );
+    });
+    expect(spoken).toHaveLength(0);
+    expect(screen.getAllByRole('button', { name: 'Read aloud' })).toHaveLength(1);
+
+    // Prose reply -> auto-read triggers while active
+    await act(async () => {
+      rerender(
+        <ChatView
+          events={[
+            makeAssistantEvent('m-init', 'Initial reply.', 1000),
+            makeAssistantEvent('m-files', '- `web/src/tts.ts`\n- `web/src/styles.css`', 2000),
+            makeAssistantEvent('m-prose', 'Build succeeded cleanly.', 3000),
+          ]}
+          loading={false}
+          sessionId="sess-1"
+          visible={true}
+        />,
+      );
+    });
+    expect(spoken.map((u) => u.text)).toEqual(['Build succeeded cleanly.']);
+
+    // Toggle off -> stops active playback immediately
+    const callsBeforeStop = cancelMock.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(speakerBtn!);
+    });
+    expect(speakerBtn?.getAttribute('aria-pressed')).toBe('false');
+    expect(getTtsAutoReadEnabled()).toBe(false);
+    expect(cancelMock.mock.calls.length).toBeGreaterThan(callsBeforeStop);
+  });
 });

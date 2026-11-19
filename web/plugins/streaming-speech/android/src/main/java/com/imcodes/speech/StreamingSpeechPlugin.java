@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
+import android.speech.tts.Voice;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import ai.onnxruntime.OrtException;
@@ -909,17 +910,66 @@ public class StreamingSpeechPlugin extends Plugin {
         req.call.resolve();
     }
 
+    private static int rankTtsVoice(Voice voice, Locale requested, String requestedPrimary) {
+        if (voice == null || voice.getLocale() == null) return -1;
+        Locale vLocale = voice.getLocale();
+        String vLang = vLocale.getLanguage();
+        if (vLang == null || !vLang.equalsIgnoreCase(requestedPrimary)) return -1;
+        String reqCountry = requested.getCountry();
+        String vCountry = vLocale.getCountry();
+        boolean exactMatch = reqCountry == null || reqCountry.isEmpty()
+            ? vLocale.toLanguageTag().equalsIgnoreCase(requested.toLanguageTag())
+            : reqCountry.equalsIgnoreCase(vCountry);
+        boolean offline = !voice.isNetworkConnectionRequired();
+        int quality = voice.getQuality();
+        int qualityTier;
+        if (quality >= Voice.QUALITY_VERY_HIGH) {
+            qualityTier = 4;
+        } else if (quality >= Voice.QUALITY_HIGH) {
+            qualityTier = 3;
+        } else if (quality >= Voice.QUALITY_NORMAL) {
+            qualityTier = 2;
+        } else {
+            qualityTier = 1;
+        }
+        return (exactMatch ? 100 : 0) + (offline ? 20 : 0) + qualityTier;
+    }
+
     private static void applyTtsLanguageLocked(TextToSpeech engine, String rawLang) {
         if (rawLang == null || rawLang.trim().isEmpty()) return;
         String normalized = rawLang.trim().replace('_', '-');
         Locale requested = Locale.forLanguageTag(normalized);
-        if (requested.getLanguage().isEmpty()) return;
+        String primaryLang = requested.getLanguage();
+        if (primaryLang == null || primaryLang.isEmpty()) return;
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                java.util.Set<Voice> voices = engine.getVoices();
+                if (voices != null && !voices.isEmpty()) {
+                    Voice bestVoice = null;
+                    int bestScore = -1;
+                    for (Voice candidate : voices) {
+                        int score = rankTtsVoice(candidate, requested, primaryLang);
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestVoice = candidate;
+                        }
+                    }
+                    if (bestVoice != null && engine.setVoice(bestVoice) == TextToSpeech.SUCCESS) {
+                        return;
+                    }
+                }
+            } catch (Exception ignored) {
+                // Fall back to setLanguage when getVoices/setVoice is unsupported or throws.
+            }
+        }
+
         int availability = engine.isLanguageAvailable(requested);
         if (availability >= TextToSpeech.LANG_AVAILABLE) {
             engine.setLanguage(requested);
             return;
         }
-        Locale primary = new Locale(requested.getLanguage());
+        Locale primary = new Locale(primaryLang);
         if (engine.isLanguageAvailable(primary) >= TextToSpeech.LANG_AVAILABLE) {
             engine.setLanguage(primary);
         }

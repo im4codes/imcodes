@@ -3,6 +3,7 @@ import {
   STREAMING_SPEECH_PLUGIN_NAME,
   STREAMING_SPEECH_TTS_STATE_EVENT,
   type StreamingSpeechTtsStatus,
+  type StreamingSpeechTtsVoiceQuality,
 } from '@shared/voice-recognition.js';
 import { SpeechRecognition, type SpeechRecognitionPlugin } from '@capgo/capacitor-speech-recognition';
 
@@ -17,10 +18,16 @@ export interface NativeTtsStateEvent {
   message?: string;
 }
 
+export interface NativeTtsVoiceQualityInfo {
+  quality: StreamingSpeechTtsVoiceQuality;
+  language?: string;
+}
+
 export interface NativeSystemTts {
   speak: (options: NativeTtsSpeakOptions) => Promise<void>;
   stopSpeaking: () => Promise<void>;
   isSpeaking?: () => Promise<{ speaking: boolean }>;
+  getTtsVoiceQuality?: (options?: { lang?: string }) => Promise<NativeTtsVoiceQualityInfo>;
   addListener?: (
     eventName: typeof STREAMING_SPEECH_TTS_STATE_EVENT,
     listenerFunc: (event: NativeTtsStateEvent) => void,
@@ -33,6 +40,7 @@ export type NativeSpeechRecognition = Pick<SpeechRecognitionPlugin, 'available' 
   speak?: (options: NativeTtsSpeakOptions) => Promise<void>;
   stopSpeaking?: () => Promise<void>;
   isSpeaking?: () => Promise<{ speaking: boolean }>;
+  getTtsVoiceQuality?: (options?: { lang?: string }) => Promise<NativeTtsVoiceQualityInfo>;
 };
 
 export type VoiceRecognitionEngine = 'builtin' | 'system';

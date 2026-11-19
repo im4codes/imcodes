@@ -120,7 +120,7 @@ describe('tts service', () => {
     const listener = vi.fn();
     const unsub = subscribeTtsPreferences(listener);
     expect(getTtsAutoReadEnabled()).toBe(false);
-    expect(getTtsSpeechRate()).toBe(1);
+    expect(getTtsSpeechRate()).toBe(1.1);
 
     setTtsAutoReadEnabled(true);
     expect(getTtsAutoReadEnabled()).toBe(true);
@@ -254,5 +254,82 @@ describe('tts service', () => {
     expect(nativeStopSpeaking).toHaveBeenCalled();
     expect(tts.isTtsSpeaking()).toBe(false);
     await stopListening();
+  });
+
+  it('uses 1.1 default rate and compatible rate options while keeping legacy saved values valid', async () => {
+    const tts = await import('../src/tts.js');
+    expect(tts.TTS_DEFAULT_RATE).toBe(1.1);
+    expect(tts.TTS_RATE_OPTIONS).toEqual([0.9, 1.0, 1.1, 1.25, 1.5]);
+    expect(tts.getTtsSpeechRate()).toBe(1.1);
+
+    localStorage.setItem(tts.TTS_SPEECH_RATE_STORAGE_KEY, '0.8');
+    expect(tts.getTtsSpeechRate()).toBe(0.8);
+  });
+
+  it('folds file paths, filenames, file:// links, technical IDs, and SHAs while preserving normal words', async () => {
+    const { prepareTextForTts, segmentTextForTts } = await import('../src/tts.js');
+
+    expect(
+      prepareTextForTts('修改了 `web/src/tts.ts`、`web/src/styles.css` 和 `ChatView.tsx:4989-4998`。', 'zh-CN'),
+    ).toBe('修改了 相关文件。');
+
+    expect(
+      prepareTextForTts('Updated [tts.ts](file:///Users/k/repo/web/src/tts.ts#L10-L20) in `C:\\src\\app.tsx`.', 'en-US'),
+    ).toBe('Updated file in file.');
+
+    // Adjacent placeholders with `and` collapse into one
+    expect(
+      prepareTextForTts('Updated `web/src/tts.ts` and `web/src/styles.css` today.', 'en-US'),
+    ).toBe('Updated file today.');
+
+    // Pure file lists are skipped; inline prose keeps non-file lines
+    expect(
+      prepareTextForTts('构建已通过。\n- `web/src/tts.ts`\n- `web/src/styles.css`\n- `a8cc27b4b59b90a20560f1160d817f7d3e73914f`', 'zh-CN'),
+    ).toBe('构建已通过。');
+
+    expect(
+      prepareTextForTts('- `web/src/tts.ts`\n- `web/src/styles.css`\ntsk_6b8d2c468d (2315aa88f)', 'zh-CN'),
+    ).toBe('');
+
+    // Preserve technical product names, slashes in prose, normal words (including hex-letter words), and numbers
+    expect(
+      prepareTextForTts('iOS/Android 和 Node.js 与 React API 在 2026 年升级 #6794，defaced 不会误删。', 'zh-CN'),
+    ).toBe('iOS/Android 和 Node.js 与 React API 在 2026 年升级 6794，defaced 不会误删。');
+
+    // Empty parens after stripping IDs & natural operator replacements
+    expect(
+      prepareTextForTts('任务完成 (tsk_6b8d2c468d)，流程 A -> B => C::D && E || F', 'zh-CN'),
+    ).toBe('任务完成，流程 A, B, C D, E, F');
+
+    // Localized placeholders across remaining 5 locales
+    expect(prepareTextForTts('更新了 src/a.ts', 'zh-TW')).toBe('更新了 相關文件');
+    expect(prepareTextForTts('修正しました src/a.ts', 'ja-JP')).toBe('修正しました 関連ファイル');
+    expect(prepareTextForTts('수정됨 src/a.ts', 'ko-KR')).toBe('수정됨 관련 파일');
+    expect(prepareTextForTts('Actualizado src/a.ts', 'es-ES')).toBe('Actualizado archivo');
+    expect(prepareTextForTts('Обновлено src/a.ts', 'ru-RU')).toBe('Обновлено файл');
+
+    // Multi-line unpunctuated prose inserts natural pause punctuation when merging
+    const zhSegs = segmentTextForTts('第一项已完成\n第二项正在测试', 'zh-CN');
+    expect(zhSegs).toEqual([{ text: '第一项已完成。 第二项正在测试', lang: 'zh-CN' }]);
+    const enSegs = segmentTextForTts('First item finished\nSecond item running', 'en-US');
+    expect(enSegs).toEqual([{ text: 'First item finished. Second item running', lang: 'en-US' }]);
+  });
+
+  it('queries native TTS voice quality safely on native platforms and returns null on web', async () => {
+    {
+      const tts = await import('../src/tts.js');
+      expect(await tts.getNativeTtsVoiceQuality('zh-CN')).toBeNull();
+    }
+
+    vi.resetModules();
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      getTtsVoiceQuality: vi.fn().mockResolvedValue({ quality: 'enhanced', language: 'zh-CN' }),
+    };
+    const nativeTts = await import('../src/tts.js');
+    expect(await nativeTts.getNativeTtsVoiceQuality('zh-CN')).toEqual({ quality: 'enhanced', language: 'zh-CN' });
   });
 });

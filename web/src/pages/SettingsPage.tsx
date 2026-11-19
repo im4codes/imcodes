@@ -45,6 +45,7 @@ import {
   useUiScale,
 } from '../ui-scale.js';
 import {
+  getNativeTtsVoiceQuality,
   getTtsAutoReadEnabled,
   getTtsSpeechRate,
   setTtsAutoReadEnabled,
@@ -52,6 +53,10 @@ import {
   subscribeTtsPreferences,
   TTS_RATE_OPTIONS,
 } from '../tts.js';
+import {
+  isIosNativePlatform,
+  type NativeTtsVoiceQualityInfo,
+} from '../voice-recognition-backend.js';
 
 interface PushServerItem {
   id: string;
@@ -97,11 +102,13 @@ export function SettingsPage({
   onDisplayNameChanged,
   onUserAuthUpdated,
 }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const currentLang = i18n?.language;
   const [globalFontDelta, setGlobalFontDelta] = useGlobalFontDelta();
   const [uiScale, setUiScale, defaultUiScale] = useUiScale();
   const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
   const [ttsRate, setTtsRate] = useState<number>(() => getTtsSpeechRate());
+  const [nativeVoiceQuality, setNativeVoiceQuality] = useState<NativeTtsVoiceQualityInfo | null>(null);
 
   useEffect(() => {
     return subscribeTtsPreferences(() => {
@@ -109,6 +116,16 @@ export function SettingsPage({
       setTtsRate(getTtsSpeechRate());
     });
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getNativeTtsVoiceQuality(currentLang).then((info) => {
+      if (!cancelled) setNativeVoiceQuality(info);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentLang]);
 
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -743,6 +760,26 @@ export function SettingsPage({
                         </button>
                       ))}
                     </div>
+                  </div>
+                  <div
+                    data-testid="settings-tts-voice-hint"
+                    style={{
+                      color: '#94a3b8',
+                      fontSize: '12px',
+                      lineHeight: 1.5,
+                      borderTop: '1px solid rgba(148, 163, 184, 0.14)',
+                      paddingTop: 10,
+                    }}
+                  >
+                    <div>{t('settings.tts_voice_hint')}</div>
+                    {isIosNativePlatform()
+                      && nativeVoiceQuality
+                      && nativeVoiceQuality.quality !== 'premium'
+                      && nativeVoiceQuality.quality !== 'enhanced' && (
+                        <div style={{ marginTop: 4, color: '#cbd5e1' }}>
+                          {t('settings.tts_ios_enhanced_hint')}
+                        </div>
+                    )}
                   </div>
                 </div>
               </div>

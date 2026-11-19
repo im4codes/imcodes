@@ -7,14 +7,15 @@ import {
   getNativeSystemTts,
   type NativeSystemTts,
   type NativeTtsStateEvent,
+  type NativeTtsVoiceQualityInfo,
 } from './voice-recognition-backend.js';
 
 export const TTS_AUTO_READ_STORAGE_KEY = 'imcodes_tts_auto_read';
 export const TTS_SPEECH_RATE_STORAGE_KEY = 'imcodes_tts_rate';
-export const TTS_DEFAULT_RATE = 1.0;
+export const TTS_DEFAULT_RATE = 1.1;
 export const TTS_MIN_RATE = 0.5;
 export const TTS_MAX_RATE = 2.0;
-export const TTS_RATE_OPTIONS = [0.8, 1.0, 1.25, 1.5] as const;
+export const TTS_RATE_OPTIONS = [0.9, 1.0, 1.1, 1.25, 1.5] as const;
 export const TTS_MAX_CHUNK_CHARS = 1200;
 
 export type TtsPlaybackStatus = 'idle' | 'speaking';
@@ -162,7 +163,55 @@ export function normalizeTtsLangTag(rawLang?: string | null): string {
  * Strip fenced code blocks, Markdown syntax, URLs, and long hashes so system
  * TTS reads natural prose without speaking raw symbols aloud.
  */
-export function prepareTextForTts(markdownText: string): string {
+const KNOWN_FILE_EXT_PATTERN =
+  'ts|tsx|js|jsx|mjs|cjs|mts|cts|json|css|scss|less|html|htm|md|mdx|yml|yaml|toml|lock|sh|zsh|bash|swift|java|kt|kts|py|rb|go|rs|c|cc|cpp|h|hpp|sql|xml|plist|gradle|properties|env|log|txt|svg|png|jpg|jpeg|webp|onnx|bin|entitlements';
+const LINE_SUFFIX_PATTERN = '(?::\\d+(?::\\d+)?(?:-\\d+(?::\\d+)?)?|#L\\d+(?:-L?\\d+)?)?';
+const TECH_PRODUCT_DOT_NAMES = /^(?:node|next|vue|nuxt|react|three|express|electron|ember|angular|backbone|chart|d3|reveal|highlight|popper|anime|tone|p5|alpine)\.js$/i;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function placeholderForLangTag(rawLang: string): string {
+  const lower = rawLang.trim().replace('_', '-').toLowerCase();
+  if (lower.startsWith('zh-tw') || lower.startsWith('zh-hk') || lower.startsWith('zh-mo') || lower.startsWith('zh-hant')) {
+    return '相關文件';
+  }
+  if (lower.startsWith('zh')) return '相关文件';
+  if (lower.startsWith('ja')) return '関連ファイル';
+  if (lower.startsWith('ko')) return '관련 파일';
+  if (lower.startsWith('es')) return 'archivo';
+  if (lower.startsWith('ru')) return 'файл';
+  return 'file';
+}
+
+function resolveFilePlaceholder(text: string, explicitLang?: string): string {
+  if (explicitLang && explicitLang.trim()) {
+    return placeholderForLangTag(explicitLang);
+  }
+  const docLang = (globalThis as { document?: { documentElement?: { lang?: string } } }).document?.documentElement?.lang ?? '';
+  if (/[\u3040-\u30ff]/.test(text)) return '関連ファイル';
+  if (/[\uac00-\ud7af\u1100-\u11ff]/.test(text)) return '관련 파일';
+  if (/[\u4e00-\u9fff]/.test(text)) {
+    return docLang.toLowerCase().startsWith('zh-tw') || docLang.toLowerCase().startsWith('zh-hk')
+      ? '相關文件'
+      : '相关文件';
+  }
+  if (/[\u0400-\u04ff]/.test(text)) return 'файл';
+  if (docLang.trim()) return placeholderForLangTag(docLang);
+  return 'file';
+}
+
+function isPauseTerminated(value: string): boolean {
+  return /[。！？.!?;；:：，,、]$/.test(value.trim());
+}
+
+/**
+ * Prepare Markdown prose for spoken playback: strip code blocks/markup,
+ * fold technical file paths/IDs into a brief localized placeholder, and
+ * smooth code operators for natural reading.
+ */
+export function prepareTextForTts(markdownText: string, lang?: string): string {
   if (!markdownText) return '';
   let text = markdownText.replace(/\r\n?/g, '\n');
   // Strip HTML comments (including internal markers) and closed/unclosed fenced blocks.
@@ -170,41 +219,107 @@ export function prepareTextForTts(markdownText: string): string {
   text = text.replace(/```[\s\S]*?```/g, '\n');
   text = text.replace(/~~~[\s\S]*?~~~/g, '\n');
   text = text.replace(/^[ \t]*(?:```|~~~)[\s\S]*$/gm, '');
-  // Convert images and links to readable label text only.
+
+  const filePlaceholder = resolveFilePlaceholder(text, lang);
+  const escPlaceholder = escapeRegExp(filePlaceholder);
+
+  // Convert images and file:// links before general links so local paths fold cleanly.
   text = text.replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1');
+  text = text.replace(/\[[^\]]+\]\((?:<file:\/\/[^>]+>|file:\/\/[^)\s]+)\)/gi, filePlaceholder);
+  text = text.replace(/file:\/\/[^\s)\]>]+/gi, filePlaceholder);
   text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
   // Remove autolinks, bare URLs, HTML tags, and long hex hashes/tokens.
   text = text.replace(/<https?:\/\/[^>]+>/gi, '');
   text = text.replace(/https?:\/\/\S+/gi, '');
   text = text.replace(/<[^>]+>/g, '');
-  text = text.replace(/\b(?:0x)?[0-9a-fA-F]{16,}\b/g, '');
   // Strip inline code backticks while preserving short inline code names.
   text = text.replace(/`([^`\n]+)`/g, '$1');
-  // Strip Markdown headings, blockquotes, list markers, rules, and table dividers.
+  // Strip Markdown headings, blockquotes, list markers (and task checkboxes), rules, and table dividers.
   text = text.replace(/^[ \t]*#{1,6}[ \t]+/gm, '');
   text = text.replace(/^[ \t]*(?:>[ \t]?)+/gm, '');
-  text = text.replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]+/gm, '');
+  text = text.replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\]\[[ xX]\]|\[[ xX]\])?[ \t]*/gm, '');
   text = text.replace(/^[ \t]*(?:[-*_][ \t]*){3,}$/gm, '');
   text = text.replace(/^[ \t]*\|?(?:[ \t]*:?-{2,}:?[ \t]*\|)+[ \t]*$/gm, '');
+
+  // Strip technical IDs and commit SHAs while keeping ordinary words and plain numbers intact.
+  text = text.replace(/\b(?:tsk|deck|cb|msg)_[a-z0-9_]{4,}\b/gi, '');
+  text = text.replace(/\b(?:0x)?[0-9a-fA-F]{7,40}\b/g, (match) => {
+    const clean = match.startsWith('0x') || match.startsWith('0X') ? match.slice(2) : match;
+    if (clean.length >= 16) return '';
+    return /\d/.test(clean) && /[a-fA-F]/.test(clean) ? '' : match;
+  });
+
+  // Fold Windows paths, Unix absolute/relative paths, repo-relative paths, and filenames.
+  text = text.replace(
+    new RegExp(`[A-Za-z]:\\\\[^\\s"'\`<>|(){}\\[\\],;，。、；：]*[A-Za-z0-9_\\\\/-]${LINE_SUFFIX_PATTERN}`, 'g'),
+    filePlaceholder,
+  );
+  text = text.replace(
+    new RegExp(`(^|[\\s([{"'“‘:：,，、;；])(?:~\\/|\\/|\\.\\.?\\/)[A-Za-z0-9._-]+(?:\\/[A-Za-z0-9._-]+)*${LINE_SUFFIX_PATTERN}`, 'g'),
+    `$1${filePlaceholder}`,
+  );
+  text = text.replace(
+    new RegExp(
+      `(^|[\\s([{"'“‘:：,，、;；])(?:[A-Za-z0-9._-]+(?:\\/[A-Za-z0-9._-]+){2,}|[A-Za-z0-9._-]+\\/[A-Za-z0-9._-]+\\.(?:${KNOWN_FILE_EXT_PATTERN}))${LINE_SUFFIX_PATTERN}(?=$|[\\s)\\]}>"'”’.,，。、;；:：!?！？])`,
+      'gi',
+    ),
+    `$1${filePlaceholder}`,
+  );
+  text = text.replace(
+    new RegExp(
+      `(^|[\\s([{"'“‘:：,，、;；])([A-Za-z0-9_][A-Za-z0-9._-]*\\.(?:${KNOWN_FILE_EXT_PATTERN}))(${LINE_SUFFIX_PATTERN})(?=$|[\\s)\\]}>"'”’.,，。、;；:：!?！？])`,
+      'gi',
+    ),
+    (full, prefix: string, filename: string) => {
+      if (TECH_PRODUCT_DOT_NAMES.test(filename)) return full;
+      return `${prefix}${filePlaceholder}`;
+    },
+  );
+
+  // Smooth spoken operators and issue numbers before converting table pipes to commas.
+  text = text.replace(/[ \t]*(?:->|=>|&&|\|\|)[ \t]*/g, ', ');
+  text = text.replace(/::/g, ' ');
+  text = text.replace(/(^|[\s([{"'“‘，,、;；:：])#(\d+\b)/g, '$1$2');
   text = text.replace(/\|/g, ', ');
+
   // Unwrap emphasis/strikethrough without mangling snake_case identifiers.
   text = text.replace(/\*\*([^*\n]+)\*\*/g, '$1');
   text = text.replace(/__([^_\n]+)__/g, '$1');
   text = text.replace(/~~([^~\n]+)~~/g, '$1');
   text = text.replace(/\*([^*\n]+)\*/g, '$1');
   text = text.replace(/(^|[\s([{"'“‘])_([^_\n]+)_(?=$|[\s)\].,!?;:"'”’])/g, '$1$2');
-  // Collapse whitespace cleanly.
-  text = text
-    .split('\n')
-    .map((line) => line.replace(/[ \t]{2,}/g, ' ').trim())
-    .filter((line) => line.length > 0)
-    .join('\n')
-    .trim();
 
-  if (!text || !/[\p{L}\p{N}]/u.test(text)) {
+  // Collapse adjacent file placeholders connected by separators, strip empty brackets and dangling punctuation.
+  const adjacentPlaceholderRe = new RegExp(
+    `${escPlaceholder}(?:(?:[ \\t]*(?:[、,;；/&+]|和|与|及|\\band\\b|\\bor\\b)[ \\t]*|[ \\t]+)${escPlaceholder})+`,
+    'gi',
+  );
+  text = text.replace(adjacentPlaceholderRe, filePlaceholder);
+  text = text.replace(/\(\s*[,，;；:：\s]*\)/g, '');
+  text = text.replace(/（\s*[,，;；:：\s]*）/g, '');
+  text = text.replace(/\[\s*[,，;；:：\s]*\]/g, '');
+  text = text.replace(/[ \t]+(?=[,，.。!！?？;；:：、])/g, '');
+  text = text.replace(/,\s*(?:,\s*)+/g, ', ');
+
+  // Collapse whitespace cleanly and drop pure file-list / empty-after-folding lines.
+  const placeholderStripRe = new RegExp(escPlaceholder, 'g');
+  const lines = text
+    .split('\n')
+    .map((line) => line.replace(/^[ \t]*[,，;；]+[ \t]*/, '').replace(/[ \t]*[,，;；]+[ \t]*$/, '').replace(/[ \t]{2,}/g, ' ').trim())
+    .filter((line) => {
+      if (!line) return false;
+      const withoutPlaceholders = line
+        .replace(placeholderStripRe, ' ')
+        .replace(/\b(?:and|or)\b/gi, ' ')
+        .replace(/[和与及]/g, ' ');
+      return /[\p{L}\p{N}]/u.test(withoutPlaceholders);
+    });
+
+  const joined = lines.join('\n').trim();
+  if (!joined || !/[\p{L}\p{N}]/u.test(joined)) {
     return '';
   }
-  return text;
+  return joined;
 }
 
 function detectSegmentLang(text: string, fallbackLang: string): string {
@@ -280,11 +395,17 @@ export function segmentTextForTts(text: string, fallbackLang?: string, maxChunkC
   for (const sentence of rawSentences) {
     const lang = detectSegmentLang(sentence, normalizedFallback);
     const prev = segments[segments.length - 1];
-    if (prev && prev.lang === lang && prev.text.length + 1 + sentence.length <= maxChunkChars) {
-      prev.text = `${prev.text} ${sentence}`;
-    } else {
-      segments.push({ text: sentence, lang });
+    if (prev && prev.lang === lang) {
+      const pausePunct = isPauseTerminated(prev.text)
+        ? ''
+        : (lang.startsWith('zh') || lang.startsWith('ja') ? '。' : '.');
+      const nextText = `${prev.text}${pausePunct} ${sentence}`;
+      if (nextText.length <= maxChunkChars) {
+        prev.text = nextText;
+        continue;
+      }
     }
+    segments.push({ text: sentence, lang });
   }
   return segments;
 }
@@ -311,6 +432,19 @@ export function isTtsSupported(): boolean {
 
 export function isTtsSpeaking(): boolean {
   return state.status === 'speaking';
+}
+
+export async function getNativeTtsVoiceQuality(lang?: string): Promise<NativeTtsVoiceQualityInfo | null> {
+  if (!isNative()) return null;
+  const nativeTts = getNativeSystemTts();
+  if (!nativeTts || typeof nativeTts.getTtsVoiceQuality !== 'function') {
+    return null;
+  }
+  try {
+    return await nativeTts.getTtsVoiceQuality(lang ? { lang } : undefined);
+  } catch {
+    return null;
+  }
 }
 
 function isNativeUnimplementedError(err: unknown): boolean {
@@ -505,7 +639,7 @@ async function runNativeSegments(
  * native system TTS (with Web speechSynthesis fallback for desktop/older shells).
  */
 export async function speakText(text: string, options: SpeakTextOptions = {}): Promise<SpeakTextResult> {
-  const cleaned = prepareTextForTts(text);
+  const cleaned = prepareTextForTts(text, options.lang);
   if (!cleaned) {
     return { started: false, reason: 'empty' };
   }

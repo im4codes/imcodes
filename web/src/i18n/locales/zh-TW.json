@@ -658,7 +658,9 @@
     "execution_clone_launch_offline": "連線已中斷，執行複製會話未送出",
     "messageQueuedLabel": "已排隊",
     "tts_speak": "朗讀",
-    "tts_stop": "停止朗讀"
+    "tts_stop": "停止朗讀",
+    "tts_autoread_on": "開啟自動播報新回覆",
+    "tts_autoread_off": "關閉自動播報並停止朗讀"
   },
   "session": {
     "incognito": "無痕會話",
@@ -2392,7 +2394,9 @@
     "tts_auto_read": "自動播報新回覆",
     "tts_auto_read_desc": "開啟後，目前工作階段收到新的完整 AI 回覆時自動使用系統語音朗讀。",
     "tts_rate": "播報語速",
-    "tts_rate_desc": "調整系統內建 TTS 語音朗讀倍速。"
+    "tts_rate_desc": "調整系統內建 TTS 語音朗讀倍速。",
+    "tts_voice_hint": "IM.codes 會自動優先選用裝置本機最高音質的離線系統語音；可在系統輔助使用或文字轉語音設定中下載高音質／增強語音包以獲得更自然的音色。",
+    "tts_ios_enhanced_hint": "目前語言僅偵測到系統預設語音，可在 iOS「設定 -> 輔助使用 -> 語音內容 -> 聲音」下載「增強版／優質」語音包，讓朗讀更自然流暢。"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

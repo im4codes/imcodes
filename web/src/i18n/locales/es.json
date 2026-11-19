@@ -658,7 +658,9 @@
     "execution_clone_launch_offline": "Los clones de ejecución no se enviaron porque la conexión está desconectada",
     "messageQueuedLabel": "En cola",
     "tts_speak": "Leer en voz alta",
-    "tts_stop": "Detener lectura"
+    "tts_stop": "Detener lectura",
+    "tts_autoread_on": "Activar lectura automática de respuestas",
+    "tts_autoread_off": "Desactivar lectura automática y detener"
   },
   "session": {
     "incognito": "Sesión de incógnito",
@@ -2392,7 +2394,9 @@
     "tts_auto_read": "Leer respuestas nuevas automáticamente",
     "tts_auto_read_desc": "Lee automáticamente en voz alta las nuevas respuestas completadas con el TTS del sistema.",
     "tts_rate": "Velocidad de voz",
-    "tts_rate_desc": "Multiplicador de velocidad para la síntesis de voz del sistema."
+    "tts_rate_desc": "Multiplicador de velocidad para la síntesis de voz del sistema.",
+    "tts_voice_hint": "IM.codes prioriza la voz sin conexión de mayor calidad instalada en tu dispositivo. Puedes descargar voces mejoradas o neuronales en los ajustes de accesibilidad o TTS del sistema.",
+    "tts_ios_enhanced_hint": "Actualmente usas una voz estándar de iOS. Para mayor naturalidad, descarga una voz mejorada o prémium en Ajustes -> Accesibilidad -> Contenido leído -> Voces."
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

@@ -7,3 +7,11 @@ export const STREAMING_SPEECH_TTS_STATUS = {
   ERROR: 'error',
 } as const;
 export type StreamingSpeechTtsStatus = typeof STREAMING_SPEECH_TTS_STATUS[keyof typeof STREAMING_SPEECH_TTS_STATUS];
+export const STREAMING_SPEECH_TTS_VOICE_QUALITY = {
+  PREMIUM: 'premium',
+  ENHANCED: 'enhanced',
+  DEFAULT: 'default',
+  UNAVAILABLE: 'unavailable',
+} as const;
+export type StreamingSpeechTtsVoiceQuality =
+  typeof STREAMING_SPEECH_TTS_VOICE_QUALITY[keyof typeof STREAMING_SPEECH_TTS_VOICE_QUALITY];

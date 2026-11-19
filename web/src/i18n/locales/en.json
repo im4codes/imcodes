@@ -658,7 +658,9 @@
     "execution_clone_launch_offline": "Execution clones were not sent because the connection is offline",
     "messageQueuedLabel": "Queued",
     "tts_speak": "Read aloud",
-    "tts_stop": "Stop reading"
+    "tts_stop": "Stop reading",
+    "tts_autoread_on": "Enable auto-read replies",
+    "tts_autoread_off": "Disable auto-read and stop speaking"
   },
   "session": {
     "incognito": "Incognito session",
@@ -2392,7 +2394,9 @@
     "tts_auto_read": "Auto-read new replies",
     "tts_auto_read_desc": "Automatically read newly completed assistant replies aloud using your device TTS.",
     "tts_rate": "Speech rate",
-    "tts_rate_desc": "Playback speed multiplier for system text-to-speech."
+    "tts_rate_desc": "Playback speed multiplier for system text-to-speech.",
+    "tts_voice_hint": "IM.codes prefers the highest-quality offline voice installed on your device. You can download Enhanced or neural system voices in OS accessibility or TTS settings for more natural playback.",
+    "tts_ios_enhanced_hint": "Currently using a standard iOS voice. For noticeably smoother speech, download an Enhanced or Premium voice in iOS Settings -> Accessibility -> Spoken Content -> Voices."
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

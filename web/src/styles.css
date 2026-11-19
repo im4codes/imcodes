@@ -6486,6 +6486,28 @@ html.native-ios-mac .chat-dl-btn {
   cursor: pointer; font: inherit; font-size: 12px; line-height: 1; white-space: nowrap;
 }
 .chat-session-usage-btn:hover, .chat-session-usage-btn:focus-visible { background: rgba(8, 145, 178, 0.22); border-color: rgba(34, 211, 238, 0.5); }
+.chat-tts-autoread-btn {
+  flex: 0 0 auto; width: auto; min-width: 26px; height: 24px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 6px; color: #94a3b8; background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.24); border-radius: 6px;
+  cursor: pointer; font: inherit; font-size: 12px; line-height: 1; white-space: nowrap;
+  transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+}
+.chat-tts-autoread-btn:hover, .chat-tts-autoread-btn:focus-visible {
+  color: #e2e8f0; background: rgba(8, 145, 178, 0.22); border-color: rgba(34, 211, 238, 0.5);
+}
+.chat-tts-autoread-btn.is-active {
+  color: #38bdf8; background: rgba(14, 165, 233, 0.16); border-color: rgba(56, 189, 248, 0.55);
+}
+.chat-tts-autoread-btn.is-speaking {
+  color: #22d3ee; background: rgba(34, 211, 238, 0.22); border-color: rgba(34, 211, 238, 0.8);
+  animation: chat-tts-autoread-pulse 1.4s ease-in-out infinite;
+}
+@keyframes chat-tts-autoread-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
 .message-pins-panel {
   position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; z-index: 30;
   border: 1px solid rgba(245, 158, 11, 0.28); border-radius: 8px; max-height: min(calc(var(--imcodes-ui-vh, 100vh) * 0.42), 420px);
@@ -16872,6 +16894,7 @@ button.quick-agent-delegation-preset.active {
     .chat-titlebar:has(> .task-pair-status-panel.is-mobile.is-collapsed) { gap: 3px !important; }
     .chat-titlebar:has(> .task-pair-status-panel.is-mobile.is-collapsed) .message-pins-summary { padding-inline: 3px; }
     .chat-titlebar:has(> .task-pair-status-panel.is-mobile.is-collapsed) .chat-session-usage-btn { padding-inline: 3px; min-width: 22px; }
+    .chat-titlebar:has(> .task-pair-status-panel.is-mobile.is-collapsed) .chat-tts-autoread-btn { padding-inline: 3px; min-width: 22px; }
     .chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-collapsed) .chat-top-actions { gap: 3px; }
     .chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-collapsed) .chat-top-actions > .chat-panel-toggle { width: 24px; min-width: 24px; padding-inline: 0; }
     .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-label {
