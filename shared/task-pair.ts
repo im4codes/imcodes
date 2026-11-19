@@ -235,10 +235,147 @@ export const TASK_PAIR_ENDED_PAIR_NOTICE_REASONS: readonly string[] = ['brain-wo
 /** Completion notices to Brain whose subject pair may already be `done` (not `cancelled` or integration-dismissed). */
 export const TASK_PAIR_PASS_DONE_NOTICE_REASON = 'brain-line-pass-done' as const;
 export const TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON = 'brain-non-git-finish' as const;
+export const TASK_PAIR_WAKE_BINDING_TAG = ':wake-v1:' as const;
+
+export interface TaskPairNudgeWakePayload {
+  bindings: Array<{ project: string; taskId: string; epoch: number }>;
+  reason: string;
+  contextId?: string;
+}
+
+/** Decode an embedded `:wake-v1:` binding payload from a daemon-authored nudge ID. */
+export function parseTaskPairNudgeWakePayload(id: string | undefined): TaskPairNudgeWakePayload | undefined {
+  if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;
+  const at = id.lastIndexOf(TASK_PAIR_WAKE_BINDING_TAG);
+  if (at < 0) return undefined;
+  const encoded = id.slice(at + TASK_PAIR_WAKE_BINDING_TAG.length).split(':', 1)[0];
+  if (!encoded) return undefined;
+  try {
+    const data = JSON.parse(decodeURIComponent(encoded)) as {
+      bindings?: Array<{ project?: unknown; taskId?: unknown; epoch?: unknown }>;
+      reason?: unknown;
+      contextId?: unknown;
+    };
+    if (!Array.isArray(data.bindings) || data.bindings.length === 0 || typeof data.reason !== 'string' || !data.reason) {
+      return undefined;
+    }
+    const bindings: Array<{ project: string; taskId: string; epoch: number }> = [];
+    for (const item of data.bindings) {
+      if (
+        !item
+        || typeof item.project !== 'string' || !item.project
+        || typeof item.taskId !== 'string' || !item.taskId
+        || !Number.isSafeInteger(item.epoch)
+      ) {
+        return undefined;
+      }
+      bindings.push({ project: item.project, taskId: item.taskId, epoch: item.epoch as number });
+    }
+    return {
+      bindings,
+      reason: data.reason,
+      ...(typeof data.contextId === 'string' && data.contextId ? { contextId: data.contextId } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Extract `<reason>` from the tail after `task-pair-nudge:<matchedTaskId>:` for a
+ * legacy (non-`wake-v1`) ID. Only exact 2-part (`<reason>:<nonce>`) or 4-part
+ * scoped (`<reason>:scope:<encodedScope>:<nonce>`) tails match; longer multi-colon
+ * tails indicate a colon-containing taskId prefix collision and fail closed.
+ */
+export function extractLegacyTaskPairNudgeReason(tail: string): string | undefined {
+  if (!tail) return undefined;
+  const parts = tail.split(':');
+  if (parts.length === 2) {
+    return parts[0] && parts[1] ? parts[0] : undefined;
+  }
+  if (parts.length === 4 && parts[1] === 'scope') {
+    return parts[0] && parts[2] && parts[3] ? parts[0] : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Return candidate `taskId` strings that a daemon-authored nudge ID could refer to.
+ * For `:wake-v1:` entries this yields the exact embedded binding IDs; for legacy IDs
+ * (which may contain colons) it yields every colon-delimited prefix before a `:`.
+ */
+export function candidateTaskIdsFromNudgeId(id: string | undefined): string[] {
+  if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return [];
+  const wake = parseTaskPairNudgeWakePayload(id);
+  if (wake) {
+    return [...new Set(wake.bindings.map((b) => b.taskId).filter((taskId) => taskId && !taskId.startsWith('__')))];
+  }
+  if (id.includes(TASK_PAIR_WAKE_BINDING_TAG)) return [];
+  const remainder = id.slice(TASK_PAIR_NUDGE_ID_PREFIX.length);
+  if (!remainder || remainder.startsWith('__')) return [];
+  const candidates: string[] = [];
+  let searchFrom = 0;
+  while (candidates.length < 16) {
+    const colon = remainder.indexOf(':', searchFrom);
+    if (colon < 0) break;
+    if (colon > 0) {
+      candidates.push(remainder.slice(0, colon));
+    }
+    searchFrom = colon + 1;
+  }
+  return [...new Set(candidates)];
+}
+
+/**
+ * Check whether a daemon-authored nudge ID unambiguously targets `targetTaskId`,
+ * prioritizing embedded `:wake-v1:` bindings and longest-known-prefix disambiguation
+ * for legacy colon-containing task IDs, and extracting `reason` after the matched prefix.
+ */
+export function matchTaskPairNudgeTarget(
+  id: string | undefined,
+  targetTaskId: string,
+  options: { project?: string; knownTaskIds?: ReadonlySet<string> | Iterable<string> } = {},
+): { matches: boolean; reason?: string } {
+  const cleanTaskId = targetTaskId.trim();
+  if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX) || !cleanTaskId) return { matches: false };
+
+  const wake = parseTaskPairNudgeWakePayload(id);
+  if (wake) {
+    if (wake.bindings.length !== 1) return { matches: false };
+    const binding = wake.bindings[0]!;
+    if (binding.taskId !== cleanTaskId) return { matches: false };
+    if (options.project !== undefined && binding.project !== options.project) return { matches: false };
+    return { matches: true, reason: wake.reason };
+  }
+  if (id.includes(TASK_PAIR_WAKE_BINDING_TAG)) return { matches: false };
+
+  if (options.knownTaskIds) {
+    for (const candidate of options.knownTaskIds) {
+      if (
+        candidate !== cleanTaskId
+        && candidate.length > cleanTaskId.length
+        && id.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}${candidate}:`)
+      ) {
+        return { matches: false };
+      }
+    }
+  }
+
+  const prefix = `${TASK_PAIR_NUDGE_ID_PREFIX}${cleanTaskId}:`;
+  if (!id.startsWith(prefix)) return { matches: false };
+  const reason = extractLegacyTaskPairNudgeReason(id.slice(prefix.length));
+  return reason ? { matches: true, reason } : { matches: false };
+}
 
 /** The `taskId` segment of a daemon-authored pair message id, or undefined when `id` is missing or an aggregate (`__...`). */
 export function taskPairIdFromNudgeId(id: string | undefined): string | undefined {
   if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;
+  const wake = parseTaskPairNudgeWakePayload(id);
+  if (wake) {
+    if (wake.bindings.length !== 1) return undefined;
+    const taskId = wake.bindings[0]!.taskId.trim();
+    return taskId && !taskId.startsWith('__') ? taskId : undefined;
+  }
   const remainder = id.slice(TASK_PAIR_NUDGE_ID_PREFIX.length);
   const separator = remainder.indexOf(':');
   if (separator <= 0) return undefined;
@@ -249,6 +386,8 @@ export function taskPairIdFromNudgeId(id: string | undefined): string | undefine
 /** The `reason` segment of a daemon-authored pair message id, or undefined when `id` is not one. */
 export function taskPairNudgeReasonFromId(id: string | undefined): string | undefined {
   if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;
+  const wake = parseTaskPairNudgeWakePayload(id);
+  if (wake) return wake.reason;
   const parts = id.slice(TASK_PAIR_NUDGE_ID_PREFIX.length).split(':');
   return parts.length >= 3 && parts[1] ? parts[1] : undefined;
 }

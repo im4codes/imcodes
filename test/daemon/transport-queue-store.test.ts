@@ -1776,4 +1776,65 @@ describe('dropTaskPairEntries', () => {
     expect(repeat.removed).toBe(0);
     expect(repeat.snapshot.pendingMessageVersion).toBe(result.snapshot.pendingMessageVersion);
   });
+
+  it('does not confuse colon-containing task IDs (legacy vs legacy:child), preserves Brain notices on colon IDs, and handles wake-v1 bindings cleanly', () => {
+    const sess = 'deck_sub_colon';
+    const recipient = { sessionInstanceId: 'inst-colon', runtimeEpoch: 'epoch-colon' };
+    const enqueue = (id: string) => {
+      store.enqueue({ sessionName: sess, clientMessageId: id, text: `msg ${id}`, recipient, now: 100 });
+      store.markFailed(sess, id, 'expired', 200);
+    };
+    const encodeWake = (bindings: Array<{ project: string; taskId: string; epoch: number }>, reason: string) =>
+      `:wake-v1:${encodeURIComponent(JSON.stringify({ bindings, reason }))}:`;
+
+    // Legacy (non-wake-v1) entries for 'legacy' vs 'legacy:child'
+    enqueue(`${TASK_PAIR_NUDGE_ID_PREFIX}legacy:nudge-executor:1`);
+    enqueue(`${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:nudge-executor:1`);
+    enqueue(`${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`);
+    enqueue(`${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`);
+    for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+      enqueue(`${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${reason}:1`);
+    }
+    // Wake-v1 entries: one for projA legacy:child, one aggregate across two tasks
+    const wakeChildId = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:nudge-executor:${encodeWake([{ project: 'projA', taskId: 'legacy:child', epoch: 0 }], 'nudge-executor')}u1`;
+    const wakeAggId = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:brain-heartbeat:${encodeWake([{ project: 'projA', taskId: 'legacy', epoch: 0 }, { project: 'projA', taskId: 'legacy:child', epoch: 0 }], 'brain-heartbeat')}u2`;
+    enqueue(wakeChildId);
+    enqueue(wakeAggId);
+
+    // 1. Dropping 'legacy' (even without knownTaskIds) removes ONLY legacy:nudge-executor:1,
+    // leaving all legacy:child rows and the multi-binding aggregate intact.
+    const dropLegacy = store.dropTaskPairEntries(sess, 'legacy', {
+      includeFailed: true,
+      project: 'projA',
+      now: 300,
+    });
+    expect(dropLegacy.removed).toBe(1);
+    const remainingIdsAfterLegacy = dropLegacy.snapshot.failedMessageEntries.map((e) => e.clientMessageId);
+    expect(remainingIdsAfterLegacy).not.toContain(`${TASK_PAIR_NUDGE_ID_PREFIX}legacy:nudge-executor:1`);
+    expect(remainingIdsAfterLegacy).toContain(`${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:nudge-executor:1`);
+    expect(remainingIdsAfterLegacy).toContain(wakeChildId);
+    expect(remainingIdsAfterLegacy).toContain(wakeAggId);
+
+    // 2. Dropping 'legacy:child' with Brain completion/ended notices preserved drops ONLY
+    // legacy:child worker nudges and preserves all 4 Brain notices + aggregate wake.
+    const preserveReasons = [
+      ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+    ];
+    const dropChild = store.dropTaskPairEntries(sess, 'legacy:child', {
+      includeFailed: true,
+      preserveReasons,
+      project: 'projA',
+      knownTaskIds: ['legacy', 'legacy:child'],
+      now: 301,
+    });
+    expect(dropChild.removed).toBe(2);
+    expect(dropChild.snapshot.failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+      `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+      `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+      ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${reason}:1`),
+      wakeAggId,
+    ]);
+  });
 });

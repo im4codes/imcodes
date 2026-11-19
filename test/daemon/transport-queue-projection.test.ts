@@ -292,4 +292,139 @@ describe('transport queue projection builder', () => {
       resetTransportQueueStoreForTests();
     }
   });
+
+  it('handles colon-containing legacy & wake-v1 task IDs cleanly (keeps active colon sibling, drops cold-start cancelled colon ID, preserves all 4 Brain notices, fails closed on ambiguity)', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const {
+      TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+      TASK_PAIR_NUDGE_ID_PREFIX,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+    } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_proj_brain',
+        executor: 'deck_sub_exec',
+        auditor: 'deck_sub_aud',
+      };
+      // Short 'legacy' is ACTIVE, colon 'legacy:child' is CANCELLED, colon 'legacy:done' is DONE.
+      // Ambiguous multi-project 'ambig:1' appears in two projects for the same worker with different states.
+      pairStore.savePair('proj', { ...basePair, taskId: 'legacy', status: 'working' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'legacy:child', status: 'cancelled' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'legacy:done', status: 'done' });
+      pairStore.savePair('projA', { ...basePair, taskId: 'ambig:1', status: 'cancelled' });
+      pairStore.savePair('projB', { ...basePair, taskId: 'ambig:1', status: 'working' });
+
+      const qStore = getTransportQueueStore();
+      const recipient = { sessionInstanceId: 'inst-colon', runtimeEpoch: 'epoch-colon' };
+      const addFailed = (sessionName: string, id: string) => {
+        qStore.enqueue({ sessionName, clientMessageId: id, text: `msg ${id}`, recipient, now: 100 });
+        qStore.markFailed(sessionName, id, 'expired', 200);
+      };
+
+      const wakeCancelledChild = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:nudge-executor::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'proj', taskId: 'legacy:child', epoch: 0 }],
+        reason: 'nudge-executor',
+      }))}:u1`;
+
+      // Worker failed rows:
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:work-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:dispatch-nudge:1`);
+      addFailed('deck_sub_exec', wakeCancelledChild);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:work-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}ambig:1:work-nudge:1`);
+
+      const workerSnapshot = buildTransportQueueSnapshot('deck_sub_exec', 'test');
+      expect(workerSnapshot.failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:work-nudge:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}ambig:1:work-nudge:1`,
+      ]);
+
+      // Brain failed rows: legacy:done preserves all 4 Brain notices + brain-line-done-no-auditor, drops worker/wait nudges
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:done-reminder:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`);
+      for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+        addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${reason}:1`);
+      }
+
+      const brainSnapshot = buildTransportQueueSnapshot('deck_proj_brain', 'test');
+      expect(brainSnapshot.failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+        ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:done:${reason}:1`),
+      ]);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
+
+  it('keeps production-shaped snapshot reconciliation bounded across 500 historical pairs', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const { TASK_PAIR_NUDGE_ID_PREFIX } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_perf_brain',
+        executor: 'deck_sub_perf_exec',
+        auditor: 'deck_sub_perf_aud',
+      };
+      for (let i = 0; i < 500; i += 1) {
+        pairStore.savePair('perfproj', { ...basePair, taskId: `tsk_hist_${i}`, status: i % 2 === 0 ? 'done' : 'cancelled' });
+      }
+      for (let i = 0; i < 20; i += 1) {
+        pairStore.savePair('perfproj', { ...basePair, taskId: `tsk_act_${i}`, status: 'working' });
+      }
+
+      const qStore = getTransportQueueStore();
+      const recipient = { sessionInstanceId: 'inst-perf', runtimeEpoch: 'epoch-perf' };
+      qStore.enqueue({ sessionName: 'deck_sub_perf_exec', clientMessageId: 'human-1', text: 'hello', recipient, now: 100 });
+      qStore.markFailed('deck_sub_perf_exec', 'human-1', 'dispatch_failed', 101);
+
+      const t0NoNudge = performance.now();
+      for (let i = 0; i < 50; i += 1) {
+        buildTransportQueueSnapshot('deck_sub_perf_exec', 'test');
+      }
+      const noNudgePerCallMs = (performance.now() - t0NoNudge) / 50;
+
+      // Seed 5 failed nudges for historical terminal pairs + measure single snapshot reconciliation pass
+      for (let i = 0; i < 5; i += 1) {
+        const id = `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_hist_${i}:work-nudge:1`;
+        qStore.enqueue({ sessionName: 'deck_sub_perf_exec', clientMessageId: id, text: 'stale', recipient, now: 102 });
+        qStore.markFailed('deck_sub_perf_exec', id, 'expired', 103);
+      }
+      const t0Reconcile = performance.now();
+      const snap = buildTransportQueueSnapshot('deck_sub_perf_exec', 'test');
+      const reconcileMs = performance.now() - t0Reconcile;
+      expect(snap.failedMessageEntries.map((e) => e.clientMessageId)).toEqual(['human-1']);
+      expect(noNudgePerCallMs).toBeLessThan(10);
+      expect(reconcileMs).toBeLessThan(100);
+      console.info(`[perf] snapshot noNudgePerCallMs=${noNudgePerCallMs.toFixed(3)}ms reconcile5Of520Ms=${reconcileMs.toFixed(3)}ms`);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
 });

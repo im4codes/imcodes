@@ -1295,4 +1295,77 @@ describe('task-pair marker ingestion', () => {
       resetTransportQueueStoreForTests();
     }
   });
+
+  it('keeps active colon-taskId queues intact when a shorter prefix pair closes, and preserves Brain notices when closing a colon taskId', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../../src/daemon/transport-queue-store.js');
+    const {
+      TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+      TASK_PAIR_NUDGE_ID_PREFIX,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+    } = await import('../../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    try {
+      const queueStore = getTransportQueueStore();
+      const addQueueRow = (sessionName: string, id: string, failed = true) => {
+        queueStore.enqueue({ sessionName, clientMessageId: id, text: `msg ${id}`, now: 100 });
+        if (failed) queueStore.markFailed(sessionName, id, 'expired', 200);
+      };
+
+      await say(BRAIN, `Dispatch short.\n<!-- IMCODES_TASK DISPATCH legacy executor=${EXEC} auditor=${AUD} title="Short prefix" -->`);
+      await say(BRAIN, `Dispatch colon.\n<!-- IMCODES_TASK DISPATCH legacy:child executor=${EXEC} auditor=${AUD} title="Colon child" -->`);
+
+      // Seed queues for 'legacy', 'legacy:child' (legacy + wake-v1), wildcard-like 'legacy_other', and same 'legacy' in other project
+      addQueueRow(EXEC, `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:work-nudge:1`, true);
+      addQueueRow(EXEC, `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:work-nudge:1`, false);
+      const wakeChild = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: PROJECT, taskId: 'legacy:child', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:u1`;
+      addQueueRow(EXEC, wakeChild, true);
+      const wakeOtherProj = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'otherproj', taskId: 'legacy', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:u2`;
+      addQueueRow(EXEC, wakeOtherProj, true);
+
+      // Closing 'legacy' leaves 'legacy:child' (queued & failed & wake-v1) and 'otherproj' untouched
+      await say(BRAIN, `Cancel short.\n<!-- IMCODES_TASK CANCEL legacy -->`);
+      expect(queueStore.readSnapshot(EXEC).pendingMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:work-nudge:1`,
+      ]);
+      expect(queueStore.readSnapshot(EXEC).failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        wakeChild,
+        wakeOtherProj,
+      ]);
+
+      // Seed Brain completion & ended notices on 'legacy:child', then close 'legacy:child' via DONE force=true
+      addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:wait-reminder:1`, true);
+      addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`, true);
+      addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`, true);
+      for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+        addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${reason}:1`, true);
+      }
+
+      service.applyMarker({
+        project: PROJECT,
+        writer: BRAIN,
+        marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'legacy:child', attrs: { force: 'true' } },
+        source: 'marker',
+        now: Date.now(),
+        eventId: 'done-colon-child',
+      });
+
+      expect(queueStore.readSnapshot(EXEC).pendingMessageEntries).toEqual([]);
+      expect(queueStore.readSnapshot(EXEC).failedMessageEntries.map((e) => e.clientMessageId)).toEqual([wakeOtherProj]);
+      expect(queueStore.readSnapshot(BRAIN).failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+        ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:child:${reason}:1`),
+      ]);
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
+  });
 });

@@ -96,6 +96,7 @@ import {
 } from './workspace-hygiene.js';
 import { resolveSupervisionWorktreesRoot } from '../supervision-worktree-inspector.js';
 import { isUsableTaskPairTitle, taskPairTitlePlaceholder } from './title-generator.js';
+import { resolveTaskPairNudgeFromIndex } from './wake-authority.js';
 import { getSession, listSessions } from '../../store/session-store.js';
 import { getTransportQueueStore } from '../transport-queue-store.js';
 import { resolveProjectAuthoritativeSupervisionSnapshot } from '../supervision-snapshot.js';
@@ -1100,7 +1101,7 @@ export class TaskPairService {
         stored = store.savePair(input.project, { ...stored.state, resourceClaims: [], resourceCleanup: cleanup, updatedAt: now }, { expectedRevision: stored.revision }); transition.pair = stored.state;
         this.#track(sendTaskPairMessage(stored.state.executor ?? stored.state.brain, stored.state.taskId, 'resource-cleanup', 'Claims released for ' + stored.state.taskId + '. Cleanup checklist: ' + cleanup.checklist.join(' | ')));
       }
-      this.#cleanupTaskPairQueuesOnTerminal(stored.state, now);
+      this.#cleanupTaskPairQueuesOnTerminal(input.project, stored.state, now);
       this.#track(this.endWorkspace(input.project, stored.state.taskId, now));
     }
     if (stored && transition.toStatus === 'passed' && transition.fromStatus !== 'passed') {
@@ -1153,9 +1154,27 @@ export class TaskPairService {
    * Drop stale queued/failed task-pair nudges for participants of a pair that
    * just reached a terminal status, preserving completion/workspace notices.
    */
-  #cleanupTaskPairQueuesOnTerminal(pair: TaskPairState, now: number): void {
+  #cleanupTaskPairQueuesOnTerminal(project: string, pair: TaskPairState, now: number): void {
     try {
       const queueStore = getTransportQueueStore();
+      const pairStore = getTaskPairStore();
+      const matchingTaskIds = pairStore.listTaskIdsMatchingPrefix(pair.taskId);
+      const pairsByTaskId = new Map<string, StoredTaskPair[]>();
+      for (const candidate of pairStore.findPairsByTaskIds(matchingTaskIds)) {
+        const bucket = pairsByTaskId.get(candidate.state.taskId);
+        if (bucket) bucket.push(candidate);
+        else pairsByTaskId.set(candidate.state.taskId, [candidate]);
+      }
+
+      const matcherFor = (sessionName: string) => (rawId: string) => {
+        const attr = resolveTaskPairNudgeFromIndex(rawId, pairsByTaskId, sessionName, project);
+        if (!attr || attr.ambiguous || !attr.pair) return { matches: false };
+        if (attr.pair.project !== project || attr.pair.state.taskId !== pair.taskId) {
+          return { matches: false };
+        }
+        return { matches: true, reason: attr.reason };
+      };
+
       const workerTargets = new Set<string>();
       for (const participant of [pair.executor, pair.auditor]) {
         if (participant && participant !== TASK_PAIR_NO_AUDITOR) {
@@ -1168,6 +1187,9 @@ export class TaskPairService {
           queueStore.dropTaskPairEntries(target, pair.taskId, {
             includeFailed: true,
             preserveReasons: TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+            project,
+            knownTaskIds: matchingTaskIds,
+            matchesEntry: matcherFor(target),
             now,
           });
         }
@@ -1178,6 +1200,9 @@ export class TaskPairService {
         queueStore.dropTaskPairEntries(target, pair.taskId, {
           includeFailed: true,
           preserveReasons: TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+          project,
+          knownTaskIds: matchingTaskIds,
+          matchesEntry: matcherFor(target),
           now,
         });
       }
@@ -1190,6 +1215,9 @@ export class TaskPairService {
             TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
             'brain-line-done-no-auditor',
           ],
+          project,
+          knownTaskIds: matchingTaskIds,
+          matchesEntry: matcherFor(pair.brain),
           now,
         });
       }

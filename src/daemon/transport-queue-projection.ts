@@ -16,11 +16,13 @@ import {
   isTerminalTaskPairStatus,
   TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
   TASK_PAIR_NUDGE_ID_PREFIX,
-  taskPairIdFromNudgeId,
-  taskPairNudgeReasonFromId,
 } from '../../shared/task-pair.js';
-import { getTaskPairStore, type StoredTaskPair } from './task-pairs/store.js';
-import { isDoneBrainCompletionNoticeAllowed } from './task-pairs/wake-authority.js';
+import {
+  buildTaskPairNudgeIndex,
+  isDoneBrainCompletionNoticeAllowed,
+  resolveTaskPairNudgeFromIndex,
+  type TaskPairNudgeAttribution,
+} from './task-pairs/wake-authority.js';
 
 type SupervisionQueueAuthority = {
   taskId: string;
@@ -169,19 +171,21 @@ export function reconcileObsoleteSupervisionQueueFailures(
 export function reconcileObsoleteTaskPairQueueFailures(
   store: TransportQueueStore,
   snapshot: QueueSnapshot,
-  lookupPair: (taskId: string, rawMessageId: string) => StoredTaskPair | undefined,
+  resolveEntry: (rawId: string) => TaskPairNudgeAttribution | undefined,
 ): boolean {
   let changed = false;
   for (const entry of snapshot.failedMessageEntries) {
-    const rawId = entry.commandId ?? entry.clientMessageId;
-    const taskId = taskPairIdFromNudgeId(entry.commandId) ?? taskPairIdFromNudgeId(entry.clientMessageId);
-    if (!taskId) continue;
-    const reason = taskPairNudgeReasonFromId(entry.commandId) ?? taskPairNudgeReasonFromId(entry.clientMessageId);
+    const rawId = entry.commandId && entry.commandId.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)
+      ? entry.commandId
+      : entry.clientMessageId;
+    if (!rawId.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) continue;
+    const attribution = resolveEntry(rawId);
+    if (!attribution || attribution.ambiguous || !attribution.pair) continue;
+    const { pair, reason } = attribution;
     if (reason && TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) continue;
-    const stored = lookupPair(taskId, rawId);
-    if (!stored || !isTerminalTaskPairStatus(stored.state.status)) continue;
-    if (reason && isDoneBrainCompletionNoticeAllowed(stored.state, reason, snapshot.sessionName)) continue;
-    if (reason === 'brain-line-done-no-auditor' && stored.state.status === 'done' && snapshot.sessionName === stored.state.brain) continue;
+    if (!isTerminalTaskPairStatus(pair.state.status)) continue;
+    if (reason && isDoneBrainCompletionNoticeAllowed(pair.state, reason, snapshot.sessionName)) continue;
+    if (reason === 'brain-line-done-no-auditor' && pair.state.status === 'done' && snapshot.sessionName === pair.state.brain) continue;
     store.dismissFailed(snapshot.sessionName, entry.clientMessageId);
     changed = true;
   }
@@ -319,29 +323,16 @@ export function buildTransportQueueSnapshot(
       // projection merely because a stale supervision card was retired.
       snapshot = readGated();
     }
-    if (snapshot.failedMessageEntries.some((entry) => (entry.commandId ?? entry.clientMessageId).startsWith(TASK_PAIR_NUDGE_ID_PREFIX))) {
-      const pairStore = getTaskPairStore();
-      const sessionPairs = pairStore.pairsForSession(sessionName);
+    const failedNudgeIds = snapshot.failedMessageEntries
+      .map((entry) => (entry.commandId && entry.commandId.startsWith(TASK_PAIR_NUDGE_ID_PREFIX) ? entry.commandId : entry.clientMessageId))
+      .filter((id) => id.startsWith(TASK_PAIR_NUDGE_ID_PREFIX));
+    if (failedNudgeIds.length > 0) {
+      const pairsByTaskId = buildTaskPairNudgeIndex(failedNudgeIds);
       const project = record?.projectName;
       const pairChanged = reconcileObsoleteTaskPairQueueFailures(
         store,
         snapshot,
-        (taskId, rawId) => {
-          const activeMatch = sessionPairs
-            .filter((p) => rawId.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}${p.state.taskId}:`))
-            .sort((a, b) => b.state.taskId.length - a.state.taskId.length)[0];
-          if (activeMatch) return activeMatch;
-          if (project) {
-            const exact = pairStore.getPair(project, taskId);
-            if (exact) return exact;
-          }
-          const matches = pairStore.findPairsByTaskId(taskId);
-          return matches.find((p) =>
-            p.state.brain === sessionName
-            || p.state.executor === sessionName
-            || p.state.auditor === sessionName,
-          ) ?? (matches.length === 1 ? matches[0] : undefined);
-        },
+        (rawId) => resolveTaskPairNudgeFromIndex(rawId, pairsByTaskId, sessionName, project),
       );
       if (pairChanged) snapshot = readGated();
     }

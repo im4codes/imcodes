@@ -1,4 +1,4 @@
-import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_OPEN_STATUSES, TASK_PAIR_NO_AUDITOR, type TaskPairStatus, type TaskPairState } from './task-pair.js';
+import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_OPEN_STATUSES, TASK_PAIR_NO_AUDITOR, TASK_PAIR_WAKE_BINDING_TAG, type TaskPairStatus, type TaskPairState } from './task-pair.js';
 import { isUsableTaskPairTitle } from './supervision-task-identity.js';
 /** Scheduling is independent of lifecycle/audit state. Unknown legacy rows run normally. */
 export const TASK_PAIR_SCHEDULING_FIELD = 'scheduling' as const;
@@ -8,7 +8,7 @@ export const TASK_PAIR_MAX_DEPENDENCIES = 32;
 export const TASK_PAIR_DEPENDENCY_GRAPH_LIMIT = 4096;
 export const TASK_PAIR_RESUME_REASON = 'suspension-resume' as const;
 export const TASK_PAIR_DEPENDENCY_FAILURE_REASON = 'dependency-failed' as const;
-export const TASK_PAIR_WAKE_BINDING_TAG = ':wake-v1:' as const;
+export { TASK_PAIR_WAKE_BINDING_TAG };
 export interface TaskPairScheduling {
   epoch: number;
   manual: boolean;

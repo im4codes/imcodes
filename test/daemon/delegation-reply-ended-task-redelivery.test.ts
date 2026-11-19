@@ -405,4 +405,16 @@ describe('task-bound delegation replies across a daemon restart', () => {
       text: '- tsk_missing_integration: head jkl012 (1 commit not in dev), worktree /tmp/d, finished 1h ago',
     })).toBe('authorized');
   });
+
+  it('attributes colon-containing terminal task IDs accurately without misreading child segment as reason', () => {
+    mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
+    mocks.sessions.set('deck_sub_exec', { name: 'deck_sub_exec', projectName: PROJECT });
+    putTaskPairFixture(pairs, PROJECT, pairState('legacy', 'working'));
+    putTaskPairFixture(pairs, PROJECT, pairState('legacy:child', 'done'));
+
+    const passColon = `${taskPairMessageIdPrefix('legacy:child', 'brain-line-pass-done')}uuid-1`;
+    const workerColon = `${taskPairMessageIdPrefix('legacy:child', 'nudge-executor')}uuid-2`;
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: passColon, text: 'done notice' })).toBe('authorized');
+    expect(resolveTransportQueueEntryAdmission('deck_sub_exec', { commandId: workerColon, text: 'keep working' })).toBe('stale');
+  });
 });

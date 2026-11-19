@@ -1,6 +1,6 @@
 import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 import { readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
-import { TASK_PAIR_NUDGE_ID_PREFIX, taskPairNudgeReasonFromId } from '../../shared/task-pair.js';
+import { matchTaskPairNudgeTarget, TASK_PAIR_NUDGE_ID_PREFIX } from '../../shared/task-pair.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -1714,6 +1714,9 @@ export class TransportQueueStore {
     options: {
       includeFailed?: boolean;
       preserveReasons?: readonly string[];
+      project?: string;
+      knownTaskIds?: ReadonlySet<string> | Iterable<string>;
+      matchesEntry?: (rawId: string) => { matches: boolean; reason?: string };
       now?: number;
     } = {},
   ): { removed: number; snapshot: QueueSnapshot } {
@@ -1755,11 +1758,17 @@ export class TransportQueueStore {
         const commandId = readString(row.commandId);
         const status = readString(row.status) as QueueEntryStatus | undefined;
         if (!clientMessageId || !status) continue;
-        if (!clientMessageId.startsWith(prefix) && !(commandId?.startsWith(prefix) ?? false)) continue;
+        const effectiveId = commandId?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX) ? commandId : clientMessageId;
+        const match = options.matchesEntry
+          ? options.matchesEntry(effectiveId)
+          : matchTaskPairNudgeTarget(effectiveId, taskId, {
+              project: options.project,
+              knownTaskIds: options.knownTaskIds,
+            });
+        if (!match.matches) continue;
         const removable = status === 'queued' || (includeFailed && FAILED_QUEUE_ENTRY_STATUSES.has(status));
         if (!removable) continue;
-        const reason = taskPairNudgeReasonFromId(commandId) ?? taskPairNudgeReasonFromId(clientMessageId);
-        if (reason && preserveReasons.has(reason)) continue;
+        if (match.reason && preserveReasons.has(match.reason)) continue;
         const changes = Number(deleteEntry.run(sessionName, clientMessageId).changes ?? 0);
         if (changes > 0) {
           deletePrivateMaterial.run(sessionName, clientMessageId);

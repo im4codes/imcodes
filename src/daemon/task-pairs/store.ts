@@ -312,6 +312,7 @@ export class TaskPairStore {
         PRIMARY KEY (project, task_id)
       );
       CREATE INDEX IF NOT EXISTS task_pairs_status_idx ON task_pairs (status);
+      CREATE INDEX IF NOT EXISTS task_pairs_task_id_idx ON task_pairs (task_id);
       CREATE UNIQUE INDEX IF NOT EXISTS task_pairs_legacy_idx ON task_pairs (legacy_task_id) WHERE legacy_task_id IS NOT NULL;
       CREATE TABLE IF NOT EXISTS task_pair_events (
         id TEXT PRIMARY KEY,
@@ -466,6 +467,33 @@ export class TaskPairStore {
   findPairsByTaskId(taskId: string): StoredTaskPair[] {
     const rows = this.#db.prepare('SELECT * FROM task_pairs WHERE task_id = ?').all(taskId) as Array<Record<string, unknown>>;
     return rows.map((row) => this.#hydrate(row));
+  }
+
+  /** Batched lookup of all pairs (active and terminal) matching any candidate `taskId`. */
+  findPairsByTaskIds(taskIds: readonly string[]): StoredTaskPair[] {
+    const unique = [...new Set(taskIds.map((id) => id.trim()).filter(Boolean))];
+    if (unique.length === 0) return [];
+    const results: StoredTaskPair[] = [];
+    for (let offset = 0; offset < unique.length; offset += 400) {
+      const chunk = unique.slice(offset, offset + 400);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.#db.prepare(`SELECT * FROM task_pairs WHERE task_id IN (${placeholders})`).all(...chunk) as Array<Record<string, unknown>>;
+      for (const row of rows) results.push(this.#hydrate(row));
+    }
+    return results;
+  }
+
+  /**
+   * All known `task_id` strings (active and terminal) equal to `taskId` or prefixed
+   * with `${taskId}:`, using indexed range bounds without SQL `LIKE` wildcards.
+   */
+  listTaskIdsMatchingPrefix(taskId: string): string[] {
+    const clean = taskId.trim();
+    if (!clean) return [];
+    const rows = this.#db.prepare(
+      'SELECT DISTINCT task_id FROM task_pairs WHERE task_id = ? OR (task_id >= ? AND task_id < ?)',
+    ).all(clean, `${clean}:`, `${clean};`) as Array<{ task_id: string }>;
+    return rows.map((row) => String(row.task_id));
   }
 
   getPairByLegacyTaskId(legacyTaskId: string): StoredTaskPair | undefined {

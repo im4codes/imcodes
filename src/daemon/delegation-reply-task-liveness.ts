@@ -1,4 +1,4 @@
-import { isDoneBrainCompletionNoticeAllowed, queuedPairWakeAllowed } from './task-pairs/wake-authority.js';
+import { buildTaskPairNudgeIndex, isDoneBrainCompletionNoticeAllowed, queuedPairWakeAllowed, resolveTaskPairNudgeFromIndex } from './task-pairs/wake-authority.js';
 import { isTaskPairSuspended, TASK_PAIR_WAKE_BINDING_TAG } from '../../shared/task-pair-suspension.js';
 import { isEndedSupervisionTaskStatus } from '../../shared/supervision-config.js';
 import {
@@ -6,8 +6,6 @@ import {
   parseTaskPairBindingId,
   TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
   TASK_PAIR_NUDGE_ID_PREFIX,
-  taskPairIdFromNudgeId,
-  taskPairNudgeReasonFromId,
 } from '../../shared/task-pair.js';
 import type { QueueSupervisionAdmission } from '../../shared/transport-queue-types.js';
 import { getSession } from '../store/session-store.js';
@@ -109,23 +107,23 @@ function resolveQueuedTaskPairNudgeAdmission(
   entry: { clientMessageId?: string; commandId?: string },
 ): QueueSupervisionAdmission {
   if ((entry.commandId ?? entry.clientMessageId ?? '').includes(TASK_PAIR_WAKE_BINDING_TAG)) return 'authorized';
-  const taskId = taskPairIdFromNudgeId(entry.commandId)
-    ?? taskPairIdFromNudgeId(entry.clientMessageId);
-  if (!taskId) {
-    const id = entry.commandId ?? entry.clientMessageId ?? '';
-    if (id.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}__aggregate__:`) && getTaskPairStore().pairsForSession(sessionName).some((p) => p.state.brain === sessionName && p.state.scheduling)) return 'stale';
-    return 'authorized';
-  }
-  // A notice ABOUT the end of a pair (its workspace was kept) is only ever sent after the pair ended.
-  const reason = taskPairNudgeReasonFromId(entry.commandId) ?? taskPairNudgeReasonFromId(entry.clientMessageId);
-  if (reason && TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) return 'authorized';
+  const rawId = entry.commandId?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)
+    ? entry.commandId
+    : entry.clientMessageId ?? '';
+  if (!rawId.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return 'authorized';
+  if (rawId.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}__aggregate__:`) && getTaskPairStore().pairsForSession(sessionName).some((p) => p.state.brain === sessionName && p.state.scheduling)) return 'stale';
+  if (rawId.slice(TASK_PAIR_NUDGE_ID_PREFIX.length).startsWith('__')) return 'authorized';
   const project = getSession(sessionName)?.projectName;
   if (!project) return 'authorized';
   try {
-    const rawId = entry.commandId ?? entry.clientMessageId ?? '';
-    // Legacy ids did not escape ':': match the longest known task prefix.
-    const known = getTaskPairStore().pairsForSession(sessionName).filter((p) => rawId.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}${p.state.taskId}:`)).sort((a, b) => b.state.taskId.length - a.state.taskId.length)[0];
-    const pair = known ?? getTaskPairStore().getPair(project, taskId);
+    const pairsByTaskId = buildTaskPairNudgeIndex([rawId]);
+    const attribution = resolveTaskPairNudgeFromIndex(rawId, pairsByTaskId, sessionName, project);
+    if (!attribution || attribution.ambiguous) return 'authorized';
+    const pair = attribution.pair;
+    const reason = attribution.reason;
+    const taskId = attribution.taskId;
+    // A notice ABOUT the end of a pair (its workspace was kept) is only ever sent after the pair ended.
+    if (reason && TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) return 'authorized';
     if (pair && reason) {
       const completionAllowed = isDoneBrainCompletionNoticeAllowed(pair.state, reason, sessionName);
       if (completionAllowed !== undefined) {
@@ -142,7 +140,7 @@ function resolveQueuedTaskPairNudgeAdmission(
   } catch (error) {
     // Unknown/failed lookups remain conservative: never discard a live nudge
     // solely because the task authority was temporarily unavailable.
-    logger.warn({ error, sessionName, taskId }, 'queued task-pair nudge lookup failed; admitting it');
+    logger.warn({ error, sessionName }, 'queued task-pair nudge lookup failed; admitting it');
     return 'authorized';
   }
 }
