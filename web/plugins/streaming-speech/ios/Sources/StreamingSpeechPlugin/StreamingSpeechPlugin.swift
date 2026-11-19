@@ -766,7 +766,6 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             audioSessionCategoryConfigured = true
         }
-        preferBuiltInMicIfAvailable(session: session)
     }
 
     private func cancelWarmHoldDeactivationOnAudioQueue() {
@@ -865,6 +864,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         // only prepare AVAudioEngine passively when mic permission is already granted,
         // and never activate AVAudioSession while idle.
         guard session.recordPermission == .granted else { return }
+        if audioSessionActive {
+            preferBuiltInMicIfAvailable(session: session)
+        }
         if let existing = engine {
             if !existing.isRunning {
                 existing.prepare()
@@ -1013,6 +1015,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                         try session.setActive(true)
                         self.audioSessionActive = true
                     }
+                    self.preferBuiltInMicIfAvailable(session: session)
                     if session.isInputGainSettable, session.inputGain != 1.0 {
                         try? session.setInputGain(1.0)
                     }

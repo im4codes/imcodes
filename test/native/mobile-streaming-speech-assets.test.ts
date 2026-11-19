@@ -262,8 +262,36 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('options: [.defaultToSpeaker, .allowBluetoothA2DP]');
     expect(ios).toContain('!session.categoryOptions.contains(.allowBluetooth)');
     expect(ios).not.toMatch(/options:\s*\[[^\]]*\.allowBluetooth\b(?!A2DP)/);
-    expect(ios).toContain('$0.portType == .builtInMic');
+    expect(ios).toContain('guard let builtInMic = session.availableInputs?.first(where: { $0.portType == .builtInMic }) else {');
+    expect(ios).toContain('if session.preferredInput?.uid != builtInMic.uid {');
     expect(ios).toContain('try? session.setPreferredInput(builtInMic)');
+    const configureBody = ios.slice(
+      ios.indexOf('private func configureAudioSessionCategoryIfNeeded('),
+      ios.indexOf('private func cancelWarmHoldDeactivationOnAudioQueue('),
+    );
+    expect(configureBody).not.toContain('preferBuiltInMicIfAvailable');
+    const prewarmBody = ios.slice(
+      ios.indexOf('private func prewarmAudioOnAudioQueue('),
+      ios.indexOf('private func installTapAndStartOnAudioQueue('),
+    );
+    expect(prewarmBody).not.toContain('setActive(true)');
+    expect(prewarmBody).toMatch(/if audioSessionActive \{\s*preferBuiltInMicIfAvailable\(session: session\)\s*\}/);
+    const startAudioBody = ios.slice(
+      ios.indexOf('try self.configureAudioSessionCategoryIfNeeded(session: session)'),
+      ios.indexOf('self.coordinator.markStarted(owner: owner)'),
+    );
+    const cfgIdx = startAudioBody.indexOf('try self.configureAudioSessionCategoryIfNeeded(session: session)');
+    const activeIdx = startAudioBody.indexOf('try session.setActive(true)');
+    const activeCloseIdx = startAudioBody.indexOf('self.audioSessionActive = true\n                    }');
+    const micIdx = startAudioBody.indexOf('self.preferBuiltInMicIfAvailable(session: session)');
+    const gainIdx = startAudioBody.indexOf('session.isInputGainSettable');
+    const tapIdx = startAudioBody.indexOf('try self.installTapAndStartOnAudioQueue(owner: owner)');
+    expect(cfgIdx).toBeGreaterThanOrEqual(0);
+    expect(activeIdx).toBeGreaterThan(cfgIdx);
+    expect(activeCloseIdx).toBeGreaterThan(activeIdx);
+    expect(micIdx).toBeGreaterThan(activeCloseIdx);
+    expect(gainIdx).toBeGreaterThan(micIdx);
+    expect(tapIdx).toBeGreaterThan(gainIdx);
     expect(ios).not.toContain('.duckOthers');
     expect(ios).toContain('self.coordinator.markStarted(owner: owner)');
     expect(ios).toContain('guard warmupRemaining == 0');
