@@ -7424,6 +7424,7 @@ describe('handleWebCommand transport queue behavior', () => {
         tools: [
           MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
           MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+          MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
           MEMORY_MCP_TOOL_NAMES.SEND_STOP,
           MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
         ],
