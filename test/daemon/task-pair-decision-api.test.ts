@@ -48,7 +48,13 @@ describe('durable task decisions and human feedback', () => {
     expect(getTaskPairStore().getPair(scope.projectName, state.taskId)!.state).toEqual(before);
     await taskPairService.waitForIdle();
     expect(getTaskPairStore().listPendingDecisionNotifications()).toEqual([]);
-    expect(notifications.some((text) => text.includes('Human feedback') && text.includes('Use test data or wait for production approval?'))).toBe(true);
+    const feedbackNotice = notifications.find((text) => text.includes('Human feedback'));
+    expect(feedbackNotice).toBeDefined();
+    expect(feedbackNotice).toContain('Human feedback recorded for blocked-task (Blocked task) round 1: Use test data. Keep production untouched');
+    expect(feedbackNotice).toContain(
+      '\nOriginal participant blocker question (context only; verify against repo facts, not asserted by the human): Use test data or wait for production approval?',
+    );
+    expect(feedbackNotice).not.toContain('\nQuestion:');
   });
   it('deduplicates a retry even if the task changed after the persisted feedback', () => {
     ask(); const input = reply();

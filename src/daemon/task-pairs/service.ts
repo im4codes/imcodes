@@ -537,7 +537,7 @@ export class TaskPairService {
     store.savePair(input.project, next, { expectedRevision: pair.revision }); return { ok: true, claim: result.claim, pair: next };
   }
 
-  /** Persist a request/final decision and notify the Brain (and both participants for a final decision). */
+  /** Persist a request/final decision and notify the Brain (and both participants for a final decision), excluding the author. */
   recordDecision(input: Omit<TaskPairDecisionRecord, 'id' | 'at'> & { at?: number }): { record: TaskPairDecisionRecord; created: boolean; notified: string[] } {
     const store = getTaskPairStore();
     const pair = store.getPair(input.project, input.taskId);
@@ -563,9 +563,14 @@ export class TaskPairService {
     const targets = input.kind === 'decision'
       ? [pair.state.brain, pair.state.executor, pair.state.auditor]
       : [pair.state.brain];
-    const uniqueTargets = [...new Set(targets.filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR))];
+    const uniqueTargets = [...new Set(targets.filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR && target !== input.author))];
+    const questionLine = input.question
+      ? (input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK
+        ? `\nOriginal participant blocker question (context only; verify against repo facts, not asserted by the human): ${input.question}`
+        : `\nQuestion: ${input.question}`)
+      : '';
     const message = `${input.kind === TASK_PAIR_DECISION_KIND.DECISION ? 'Final decision' : input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK ? 'Human feedback' : 'Decision request'} recorded for ${input.taskId} (${pair.state.title ?? input.taskId}) round ${input.round}: ${input.conclusion}. ${input.summary}`
-      + (input.question ? `\nQuestion: ${input.question}` : '')
+      + questionLine
       + (input.options?.length ? `\nOptions: ${input.options.map((option) => `${option.id}: ${option.label}`).join('; ')}` : '')
       + (input.recommendation ? `\nRecommendation: ${input.recommendation}` : '')
       + (input.requestId ? `\nRelated question: ${input.requestId}` : '')

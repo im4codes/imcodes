@@ -110,15 +110,77 @@ describe('pair decision MCP', () => {
 
   it('persists both notification targets and retries a failed delivery without losing the decision', async () => {
     let attempts = 0;
-    setTaskPairDeliveryDepsForTests({ send: async () => { attempts += 1; if (attempts === 1) throw new Error('temporary'); } });
+    const deliveredTargets: string[] = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('temporary');
+      deliveredTargets.push(target);
+    } });
     const result = taskPairService.recordDecision({ project: 'p', taskId: state.taskId, round: 1, kind: 'decision', conclusion: 'PASS', summary: 'notify both', author: 'brain', at: 10, idempotencyKey: 'notify-1' });
     await taskPairService.waitForIdle();
-    expect(result.notified).toEqual(['brain', 'exec', 'audit']);
-    expect(getTaskPairStore().listPendingDecisionNotifications()).toHaveLength(1);
+    expect(result.notified).toEqual(['exec', 'audit']);
+    const pending = getTaskPairStore().listPendingDecisionNotifications();
+    expect(pending).toHaveLength(1);
+    expect(pending.every((row) => row.target !== 'brain')).toBe(true);
     await taskPairService.retryDecisionNotifications(20);
     expect(getTaskPairStore().listPendingDecisionNotifications()).toHaveLength(0);
-    expect(attempts).toBeGreaterThan(3);
+    expect(attempts).toBe(3);
+    expect(deliveredTargets).not.toContain('brain');
     setTaskPairDeliveryDepsForTests(undefined);
+  });
+
+  it('excludes author from notifications while notifying Brain for non-Brain authors and firing daemon events even when uniqueTargets is empty', async () => {
+    const delivered: Array<{ target: string; text: string }> = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target, text) => { delivered.push({ target, text: String(text) }); } });
+
+    // 1. Brain recording kind=decision notifies executor and auditor only, no decision-brain-notice
+    const brainDecision = taskPairService.recordDecision({
+      project: 'p', taskId: state.taskId, round: 1, kind: 'decision',
+      conclusion: 'Proceed', summary: 'Brain ruling', author: 'brain', at: 10, idempotencyKey: 'auth-brain-dec',
+    });
+    await taskPairService.waitForIdle();
+    expect(brainDecision.notified).toEqual(['exec', 'audit']);
+    expect(delivered.filter((d) => d.target === 'brain')).toHaveLength(0);
+
+    // 2. Non-Brain author ('human') recording kind=decision notifies Brain as well as participants
+    delivered.length = 0;
+    const humanDecision = taskPairService.recordDecision({
+      project: 'p', taskId: state.taskId, round: 1, kind: 'decision',
+      conclusion: 'Human ruling', summary: 'Manual override', author: 'human', at: 11, idempotencyKey: 'auth-human-dec',
+    });
+    await taskPairService.waitForIdle();
+    expect(humanDecision.notified).toEqual(['brain', 'exec', 'audit']);
+    expect(delivered.filter((d) => d.target === 'brain')).toHaveLength(1);
+
+    // 3. Participant recording kind=request notifies Brain only (never self-notifies author)
+    delivered.length = 0;
+    const execRequest = taskPairService.recordDecision({
+      project: 'p', taskId: state.taskId, round: 1, kind: 'request',
+      conclusion: 'Blocked', summary: 'Need ruling', question: 'Missing config?', author: 'exec', at: 12, idempotencyKey: 'auth-exec-req',
+    });
+    await taskPairService.waitForIdle();
+    expect(execRequest.notified).toEqual(['brain']);
+    expect(delivered.map((d) => d.target)).toEqual(['brain']);
+    expect(delivered[0]!.text).toContain('\nQuestion: Missing config?');
+
+    // 4. Empty uniqueTargets (e.g. Brain authoring a request) does not self-notify and still records cleanly
+    delivered.length = 0;
+    const emptyTargets = taskPairService.recordDecision({
+      project: 'p', taskId: state.taskId, round: 1, kind: 'request',
+      conclusion: 'Note', summary: 'Self note', author: 'brain', at: 13, idempotencyKey: 'auth-brain-req',
+    });
+    await taskPairService.waitForIdle();
+    expect(emptyTargets.notified).toEqual([]);
+    expect(delivered).toHaveLength(0);
+
+    // 5. No-auditor task filters out TASK_PAIR_NO_AUDITOR ('none') and Brain self-echo
+    putTaskPairFixture(getTaskPairStore(), 'p', { ...state, taskId: 'no-auditor-task', auditor: 'none' });
+    const noAuditorDecision = taskPairService.recordDecision({
+      project: 'p', taskId: 'no-auditor-task', round: 1, kind: 'decision',
+      conclusion: 'Accept', summary: 'Done', author: 'brain', at: 14, idempotencyKey: 'auth-no-audit',
+    });
+    await taskPairService.waitForIdle();
+    expect(noAuditorDecision.notified).toEqual(['exec']);
   });
 
   it('uses a five-minute fake-clock boundary, throttles reminders, and resets after a decision', () => {
