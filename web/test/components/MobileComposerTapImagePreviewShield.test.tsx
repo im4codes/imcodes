@@ -47,17 +47,21 @@ vi.mock('../../src/hooks/useSwipeBack.js', () => ({
   useSwipeBack: () => ({ current: null }),
 }));
 
-vi.mock('../../src/hooks/useMachines.js', () => ({
-  useMachines: () => ({
-    machines: [],
-    filtered: [],
-    loaded: true,
-    loading: false,
-    error: null,
-    stale: false,
-    refetch: vi.fn(),
-  }),
-}));
+vi.mock('../../src/hooks/useMachines.js', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('../../src/hooks/useMachines.js')>();
+  return {
+    ...orig,
+    useMachines: () => ({
+      machines: [],
+      filtered: [],
+      loaded: true,
+      loading: false,
+      error: null,
+      stale: false,
+      refetch: vi.fn(),
+    }),
+  };
+});
 
 vi.mock('../../src/api.js', () => ({
   uploadFile: vi.fn(),

@@ -48,17 +48,21 @@ vi.mock('../../src/hooks/useSwipeBack.js', () => ({
   useSwipeBack: () => ({ current: null }),
 }));
 
-vi.mock('../../src/hooks/useMachines.js', () => ({
-  useMachines: () => ({
-    machines: [],
-    filtered: [],
-    loaded: true,
-    loading: false,
-    error: null,
-    stale: false,
-    refetch: vi.fn(),
-  }),
-}));
+vi.mock('../../src/hooks/useMachines.js', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('../../src/hooks/useMachines.js')>();
+  return {
+    ...orig,
+    useMachines: () => ({
+      machines: [],
+      filtered: [],
+      loaded: true,
+      loading: false,
+      error: null,
+      stale: false,
+      refetch: vi.fn(),
+    }),
+  };
+});
 
 vi.mock('../../src/api.js', () => ({
   uploadFile: vi.fn(),
@@ -787,7 +791,7 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
       fireEvent.blur(input);
       await vi.advanceTimersByTimeAsync(0);
 
-      // 2. Hold past 115ms: pointerdown starts native capture early -> early first syllable buffered -> 115ms adopts WITHOUT second start(), triggers performHaptic, shows HUD in 'recording' immediately, release sends!
+      // 2. Hold past 175ms: pointerdown starts native capture early -> early first syllable buffered -> 175ms adopts WITHOUT second start(), triggers performHaptic, shows HUD in 'recording' immediately, release sends!
       fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
         clientX: 160, clientY: 500, pointerId: 22, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
       }));
@@ -796,7 +800,7 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
       nativeListeners.listeningState?.({ status: 'started' });
       nativeListeners.partialResults?.({ matches: ['安卓秒录'], isFinal: false });
 
-      await vi.advanceTimersByTimeAsync(115);
+      await vi.advanceTimersByTimeAsync(175);
       await vi.advanceTimersByTimeAsync(0);
       expect(nativeBridge.start).toHaveBeenCalledTimes(2);
       expect(nativeBridge.performHaptic).toHaveBeenCalledTimes(1);

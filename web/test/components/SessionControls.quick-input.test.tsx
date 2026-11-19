@@ -44,37 +44,34 @@ vi.mock('../../src/hooks/useSwipeBack.js', () => ({
   useSwipeBack: () => ({ current: null }),
 }));
 
-vi.mock('../../src/hooks/useMachines.js', () => ({
-  useMachines: (query = '') => {
-    const machines = [
-      { serverId: 'srv-online', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'online-node', displayName: 'Online Node', os: 'windows', online: true, execEnabled: true },
-      ...Array.from({ length: 10 }, (_, index) => ({
-        serverId: `srv-long-${index + 1}`,
-        nodeId: String(1_000_000_100 + index),
-        refName: `long-node-${index + 1}`,
-        displayName: `Long Node ${index + 1}`,
-        os: 'linux',
-        online: true,
-        execEnabled: true,
-      })),
-      { serverId: 'srv-offline', nodeId: CONTROLLED_NODE_ID_MAX, refName: '', displayName: 'Offline Node', os: 'windows', online: false, execEnabled: true },
-    ];
-    const normalized = query.toLocaleLowerCase();
-    return {
+vi.mock('../../src/hooks/useMachines.js', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('../../src/hooks/useMachines.js')>();
+  const machines = [
+    { serverId: 'srv-online', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'online-node', displayName: 'Online Node', os: 'windows', online: true, execEnabled: true },
+    ...Array.from({ length: 10 }, (_, index) => ({
+      serverId: `srv-long-${index + 1}`,
+      nodeId: String(1_000_000_100 + index),
+      refName: `long-node-${index + 1}`,
+      displayName: `Long Node ${index + 1}`,
+      os: 'linux',
+      online: true,
+      execEnabled: true,
+    })),
+    { serverId: 'srv-offline', nodeId: CONTROLLED_NODE_ID_MAX, refName: '', displayName: 'Offline Node', os: 'windows', online: false, execEnabled: true },
+  ];
+  return {
+    ...orig,
+    useMachines: (query = '') => ({
       machines,
-      filtered: machines.filter((machine) => (
-        machine.nodeId.includes(normalized)
-          || machine.refName.includes(normalized)
-          || machine.displayName.toLocaleLowerCase().includes(normalized)
-      )),
+      filtered: orig.filterMachines(machines, query),
       loaded: true,
       loading: false,
       error: null,
       stale: false,
       refetch: vi.fn(),
-    };
-  },
-}));
+    }),
+  };
+});
 
 vi.mock('../../src/api.js', () => ({
   uploadFile: vi.fn(),
