@@ -5572,5 +5572,8 @@
       "release_to_switch_step": "놓아서 전환 (L{{step}})",
       "no_target": "다른 대상 없음"
     }
+  },
+  "tts": {
+    "task_pair_announcement": "작업 {{title}}, {{status}}"
   }
 }

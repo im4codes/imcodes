@@ -332,4 +332,88 @@ describe('tts service', () => {
     const nativeTts = await import('../src/tts.js');
     expect(await nativeTts.getNativeTtsVoiceQuality('zh-CN')).toEqual({ quality: 'enhanced', language: 'zh-CN' });
   });
+
+  it('queues auto-read items FIFO on web/native, caps queue size, and clears on manual interrupt or stop', async () => {
+    const {
+      speakText,
+      stopSpeaking,
+      getTtsState,
+      getTtsQueueLength,
+      setTtsAutoReadEnabled,
+      TTS_MAX_QUEUE_SIZE,
+    } = await import('../src/tts.js');
+
+    // 1. Web FIFO queue
+    const r1 = await speakText('First notice.', { messageId: 'q1', queue: true });
+    const r2 = await speakText('Second notice.', { messageId: 'q2', queue: true });
+    const r3 = await speakText('Third notice.', { messageId: 'q3', queue: true });
+    expect(r1).toEqual({ started: true });
+    expect(r2).toEqual({ started: true, queued: true });
+    expect(r3).toEqual({ started: true, queued: true });
+    expect(spokenUtterances.map((u) => u.text)).toEqual(['First notice.']);
+    expect(getTtsQueueLength()).toBe(2);
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'q1', error: null });
+
+    spokenUtterances[0].onend?.();
+    expect(spokenUtterances.map((u) => u.text)).toEqual(['First notice.', 'Second notice.']);
+    expect(getTtsQueueLength()).toBe(1);
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'q2', error: null });
+
+    spokenUtterances[1].onend?.();
+    expect(spokenUtterances.map((u) => u.text)).toEqual(['First notice.', 'Second notice.', 'Third notice.']);
+    expect(getTtsQueueLength()).toBe(0);
+    expect(getTtsState()).toEqual({ status: 'speaking', activeMessageId: 'q3', error: null });
+
+    spokenUtterances[2].onend?.();
+    expect(getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+
+    // 2. Bounded FIFO cap drops oldest unplayed items
+    await speakText('Active item.', { messageId: 'cap-0', queue: true });
+    for (let i = 1; i <= TTS_MAX_QUEUE_SIZE + 3; i++) {
+      await speakText(`Queued ${i}.`, { messageId: `cap-${i}`, queue: true });
+    }
+    expect(getTtsQueueLength()).toBe(TTS_MAX_QUEUE_SIZE);
+    spokenUtterances[3].onend?.();
+    // Oldest kept item after cap-0 should be Queued 4 (dropped 1, 2, 3)
+    expect(spokenUtterances[4].text).toBe('Queued 4.');
+
+    // 3. Manual non-queued speakText interrupts active item AND clears queue
+    await speakText('Manual read now.', { messageId: 'manual-1' });
+    expect(getTtsQueueLength()).toBe(0);
+    expect(getTtsState().activeMessageId).toBe('manual-1');
+    expect(spokenUtterances.at(-1)?.text).toBe('Manual read now.');
+
+    // 4. setTtsAutoReadEnabled(false) and stopSpeaking() clear queue cleanly
+    await speakText('Queued before disable.', { messageId: 'q-dis', queue: true });
+    expect(getTtsQueueLength()).toBe(1);
+    setTtsAutoReadEnabled(false);
+    expect(getTtsQueueLength()).toBe(0);
+    await stopSpeaking();
+    expect(getTtsState().status).toBe('idle');
+
+    // 5. Native queue draining via stopped events
+    vi.resetModules();
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    let nativeListener: ((event: { status: string; message?: string }) => void) | null = null;
+    const nativeSpeak = vi.fn().mockResolvedValue(undefined);
+    mocks.streamingPlugin = {
+      speak: nativeSpeak,
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      addListener: vi.fn(async (_event: string, cb: (event: { status: string; message?: string }) => void) => {
+        nativeListener = cb;
+        return { remove: vi.fn().mockResolvedValue(undefined) };
+      }),
+    };
+    const nativeTts = await import('../src/tts.js');
+    await nativeTts.speakText('Native first.', { messageId: 'nq1', queue: true });
+    await nativeTts.speakText('Native second.', { messageId: 'nq2', queue: true });
+    expect(nativeSpeak).toHaveBeenCalledTimes(1);
+    expect(nativeTts.getTtsQueueLength()).toBe(1);
+    nativeListener?.({ status: 'stopped' });
+    await vi.waitFor(() => expect(nativeSpeak).toHaveBeenCalledTimes(2));
+    expect(nativeSpeak).toHaveBeenNthCalledWith(2, { text: 'Native second.', lang: 'en-US', rate: 1.1 });
+    nativeListener?.({ status: 'stopped' });
+    await vi.waitFor(() => expect(nativeTts.getTtsState().status).toBe('idle'));
+  });
 });

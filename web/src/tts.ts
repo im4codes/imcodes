@@ -17,6 +17,7 @@ export const TTS_MIN_RATE = 0.5;
 export const TTS_MAX_RATE = 2.0;
 export const TTS_RATE_OPTIONS = [0.9, 1.0, 1.1, 1.25, 1.5] as const;
 export const TTS_MAX_CHUNK_CHARS = 1200;
+export const TTS_MAX_QUEUE_SIZE = 6;
 
 export type TtsPlaybackStatus = 'idle' | 'speaking';
 
@@ -35,12 +36,20 @@ export interface SpeakTextOptions {
   messageId?: string;
   lang?: string;
   rate?: number;
+  queue?: boolean;
 }
 
 export interface SpeakTextResult {
   started: boolean;
+  queued?: boolean;
   reason?: 'empty' | 'unsupported' | 'superseded' | 'error';
   error?: string;
+}
+
+interface QueuedTtsItem {
+  segments: TtsSegment[];
+  messageId: string | null;
+  rate: number;
 }
 
 let state: TtsPlaybackState = {
@@ -54,6 +63,11 @@ let activeWebUtterance: SpeechSynthesisUtterance | null = null;
 let nativeTtsBoundPlugin: NativeSystemTts | null = null;
 let nativeTtsListenerHandle: { remove: () => Promise<void> } | null = null;
 let nativeStateWaiter: ((event: NativeTtsStateEvent) => void) | null = null;
+const pendingQueue: QueuedTtsItem[] = [];
+
+export function getTtsQueueLength(): number {
+  return pendingQueue.length;
+}
 
 const stateListeners = new Set<(next: TtsPlaybackState) => void>();
 const preferenceListeners = new Set<() => void>();
@@ -116,6 +130,9 @@ export function getTtsAutoReadEnabled(): boolean {
 }
 
 export function setTtsAutoReadEnabled(enabled: boolean): void {
+  if (!enabled) {
+    pendingQueue.length = 0;
+  }
   try {
     globalThis.localStorage?.setItem(TTS_AUTO_READ_STORAGE_KEY, enabled ? '1' : '0');
   } catch { /* localStorage may be unavailable */ }
@@ -512,7 +529,12 @@ function speakWithWebSpeech(
     if (playbackGeneration !== gen) return;
     if (index >= segments.length) {
       activeWebUtterance = null;
-      setState({ status: 'idle', activeMessageId: null, error: null });
+      if (pendingQueue.length > 0) {
+        const next = pendingQueue.shift()!;
+        void startQueuedPlayback(next);
+      } else {
+        setState({ status: 'idle', activeMessageId: null, error: null });
+      }
       return;
     }
     const seg = segments[index];
@@ -531,6 +553,7 @@ function speakWithWebSpeech(
         setState({ status: 'idle', activeMessageId: null, error: null });
         return;
       }
+      pendingQueue.length = 0;
       setState({
         status: 'idle',
         activeMessageId: null,
@@ -546,6 +569,7 @@ function speakWithWebSpeech(
     return { started: true };
   } catch (err) {
     activeWebUtterance = null;
+    pendingQueue.length = 0;
     const message = extractErrorMessage(err);
     setState({ status: 'idle', activeMessageId: null, error: message });
     return { started: false, reason: 'error', error: message };
@@ -595,6 +619,7 @@ async function runNativeSegments(
       return speakWithWebSpeech(segments, rate, gen, messageId);
     }
     const message = extractErrorMessage(err);
+    pendingQueue.length = 0;
     setState({ status: 'idle', activeMessageId: null, error: message });
     return { started: false, reason: 'error', error: message };
   }
@@ -614,17 +639,24 @@ async function runNativeSegments(
           result = await completionPromise;
         }
         if (playbackGeneration === gen) {
-          setState({
-            status: 'idle',
-            activeMessageId: null,
-            error: result.status === STREAMING_SPEECH_TTS_STATUS.ERROR
-              ? (result.message ?? 'System TTS playback failed')
-              : null,
-          });
+          if (result.status === STREAMING_SPEECH_TTS_STATUS.ERROR) {
+            pendingQueue.length = 0;
+            setState({
+              status: 'idle',
+              activeMessageId: null,
+              error: result.message ?? 'System TTS playback failed',
+            });
+          } else if (pendingQueue.length > 0) {
+            const next = pendingQueue.shift()!;
+            void startQueuedPlayback(next);
+          } else {
+            setState({ status: 'idle', activeMessageId: null, error: null });
+          }
         }
       } catch (err) {
         if (playbackGeneration === gen) {
           nativeStateWaiter = null;
+          pendingQueue.length = 0;
           setState({ status: 'idle', activeMessageId: null, error: extractErrorMessage(err) });
         }
       }
@@ -632,6 +664,29 @@ async function runNativeSegments(
   }
 
   return { started: true };
+}
+
+function startPlayback(
+  segments: TtsSegment[],
+  rate: number,
+  messageId: string | null,
+): Promise<SpeakTextResult> {
+  const gen = ++playbackGeneration;
+  nativeStateWaiter = null;
+  clearActiveWebUtterance();
+  cancelWebSpeechSynthesis();
+
+  const nativeTts = isNative() ? getNativeSystemTts() : null;
+  if (nativeTts) {
+    setState({ status: 'speaking', activeMessageId: messageId, error: null });
+    return runNativeSegments(nativeTts, segments, rate, gen, messageId);
+  }
+
+  return Promise.resolve(speakWithWebSpeech(segments, rate, gen, messageId));
+}
+
+function startQueuedPlayback(item: QueuedTtsItem): Promise<SpeakTextResult> {
+  return startPlayback(item.segments, item.rate, item.messageId);
 }
 
 /**
@@ -648,20 +703,22 @@ export async function speakText(text: string, options: SpeakTextOptions = {}): P
     return { started: false, reason: 'empty' };
   }
 
-  const gen = ++playbackGeneration;
   const messageId = options.messageId ?? null;
   const rate = clampTtsRate(options.rate ?? getTtsSpeechRate());
-  nativeStateWaiter = null;
-  clearActiveWebUtterance();
-  cancelWebSpeechSynthesis();
 
-  const nativeTts = isNative() ? getNativeSystemTts() : null;
-  if (nativeTts) {
-    setState({ status: 'speaking', activeMessageId: messageId, error: null });
-    return runNativeSegments(nativeTts, segments, rate, gen, messageId);
+  if (options.queue === true && state.status === 'speaking') {
+    pendingQueue.push({ segments, messageId, rate });
+    if (pendingQueue.length > TTS_MAX_QUEUE_SIZE) {
+      pendingQueue.shift();
+    }
+    return { started: true, queued: true };
   }
 
-  return speakWithWebSpeech(segments, rate, gen, messageId);
+  if (options.queue !== true) {
+    pendingQueue.length = 0;
+  }
+
+  return startPlayback(segments, rate, messageId);
 }
 
 function clearActiveWebUtterance(): void {
@@ -674,6 +731,7 @@ function clearActiveWebUtterance(): void {
 
 /** Stop any active Web or native system TTS playback and reset playback state. */
 export async function stopSpeaking(): Promise<void> {
+  pendingQueue.length = 0;
   playbackGeneration += 1;
   clearActiveWebUtterance();
   const pendingWaiter = nativeStateWaiter;
@@ -692,6 +750,7 @@ export async function stopSpeaking(): Promise<void> {
 }
 
 export async function __resetTtsForTests(): Promise<void> {
+  pendingQueue.length = 0;
   playbackGeneration += 1;
   clearActiveWebUtterance();
   nativeStateWaiter = null;

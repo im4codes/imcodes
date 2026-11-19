@@ -105,6 +105,7 @@ import {
   subscribeTtsState,
   type TtsPlaybackState,
 } from '../tts.js';
+import { formatTaskPairTtsAnnouncement } from '../task-pair-tts.js';
 import { claimRunKey } from './chat-run-keys.js';
 import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, reconcileTopOffset, topOffsetStyle, type ReaderAnchor } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
@@ -3579,8 +3580,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       seenAutoReadKeysRef.current.clear();
       return;
     }
-    const recordSeenBlock = (item: ViewItem) => {
-      if (item.type !== 'assistant-block' || item.taskPairNotification || item.assistantStreaming) return;
+    const recordSeenItem = (item: ViewItem) => {
+      if (item.type !== 'assistant-block' || item.assistantStreaming) return;
+      if (item.taskPairNotification) {
+        const announcement = formatTaskPairTtsAnnouncement(t, item.taskPairNotification);
+        if (announcement) {
+          seenAutoReadKeysRef.current.add(`tp:${announcement.dedupKey}`);
+        }
+        const ts = item.lastTs ?? item.ts ?? 0;
+        if (ts > autoReadStateRef.current.maxTs) autoReadStateRef.current.maxTs = ts;
+        return;
+      }
       if (item.eventIds && item.eventIds.length > 0) {
         for (const eid of item.eventIds) seenAutoReadKeysRef.current.add(eid);
       } else {
@@ -3589,12 +3599,23 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       const ts = item.lastTs ?? item.ts ?? 0;
       if (ts > autoReadStateRef.current.maxTs) autoReadStateRef.current.maxTs = ts;
     };
+    const recordSeenTaskPairEvent = (ev: TimelineEvent) => {
+      if (ev.type !== TASK_PAIR_TIMELINE_EVENT) return;
+      const announcement = formatTaskPairTtsAnnouncement(t, ev.payload);
+      if (announcement) {
+        seenAutoReadKeysRef.current.add(`tp:${announcement.dedupKey}`);
+      }
+      const ts = ev.ts ?? 0;
+      if (ts > autoReadStateRef.current.maxTs) autoReadStateRef.current.maxTs = ts;
+    };
     if (loading || loadingOlder || refreshing || !!historyGap) {
-      for (const item of viewItems) recordSeenBlock(item);
+      for (const item of viewItems) recordSeenItem(item);
+      for (const ev of sourceEvents) recordSeenTaskPairEvent(ev);
       return;
     }
     if (!autoReadStateRef.current.seeded) {
-      for (const item of viewItems) recordSeenBlock(item);
+      for (const item of viewItems) recordSeenItem(item);
+      for (const ev of sourceEvents) recordSeenTaskPairEvent(ev);
       autoReadStateRef.current.seeded = true;
       return;
     }
@@ -3602,17 +3623,28 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const sourceEventById = new Map<string, TimelineEvent>();
     for (const ev of sourceEvents) sourceEventById.set(ev.eventId, ev);
 
-    let latestNewBlock: { id: string; text: string } | null = null;
+    const previousMaxTs = autoReadStateRef.current.maxTs;
+    let nextMaxTs = previousMaxTs;
+    const queuedAnnouncements: Array<{ id: string; text: string; ts: number; order: number }> = [];
+    let order = 0;
+
     for (const item of viewItems) {
-      if (
-        item.type !== 'assistant-block'
-        || item.taskPairNotification
-        || item.assistantStreaming
-        || item.assistantAutomation === true
-        || !item.text
-      ) {
+      if (item.type !== 'assistant-block' || item.assistantStreaming) continue;
+      if (item.taskPairNotification) {
+        const announcement = formatTaskPairTtsAnnouncement(t, item.taskPairNotification);
+        if (!announcement) continue;
+        const tpKey = `tp:${announcement.dedupKey}`;
+        const alreadySeen = seenAutoReadKeysRef.current.has(tpKey);
+        seenAutoReadKeysRef.current.add(tpKey);
+        const ts = item.lastTs ?? item.ts ?? 0;
+        if (alreadySeen || ts < previousMaxTs) continue;
+        if (ts > nextMaxTs) nextMaxTs = ts;
+        if (visible && prepareTextForTts(announcement.text, locale).length > 0) {
+          queuedAnnouncements.push({ id: item.key, text: announcement.text, ts, order: order++ });
+        }
         continue;
       }
+      if (item.assistantAutomation === true || !item.text) continue;
       const ids = item.eventIds && item.eventIds.length > 0 ? item.eventIds : [item.key];
       const tailSeen = seenAutoReadKeysRef.current.has(ids[ids.length - 1]);
       const unseenIds = ids.filter((eid) => !seenAutoReadKeysRef.current.has(eid));
@@ -3620,8 +3652,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       for (const eid of ids) seenAutoReadKeysRef.current.add(eid);
       if (tailSeen || unseenIds.length === 0) continue;
       const ts = item.lastTs ?? item.ts ?? 0;
-      if (ts < autoReadStateRef.current.maxTs) continue;
-      autoReadStateRef.current.maxTs = ts;
+      if (ts < previousMaxTs) continue;
+      if (ts > nextMaxTs) nextMaxTs = ts;
       const rawText = hadSeenPrefix
         ? unseenIds
           .map((eid) => sourceEventById.get(eid))
@@ -3633,15 +3665,35 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       const displayText = parseTimelineDisplayText(rawText);
       const blockId = ids[0];
       if (visible && prepareTextForTts(displayText, locale).length > 0) {
-        latestNewBlock = { id: blockId, text: displayText };
+        queuedAnnouncements.push({ id: blockId, text: displayText, ts, order: order++ });
       }
     }
 
-    if (latestNewBlock && visible) {
-      ttsOwnedSessionRef.current = true;
-      void speakText(latestNewBlock.text, { messageId: latestNewBlock.id, lang: locale });
+    for (const ev of sourceEvents) {
+      if (ev.type !== TASK_PAIR_TIMELINE_EVENT) continue;
+      const announcement = formatTaskPairTtsAnnouncement(t, ev.payload);
+      if (!announcement) continue;
+      const tpKey = `tp:${announcement.dedupKey}`;
+      const alreadySeen = seenAutoReadKeysRef.current.has(tpKey);
+      seenAutoReadKeysRef.current.add(tpKey);
+      const ts = ev.ts ?? 0;
+      if (alreadySeen || ts < previousMaxTs) continue;
+      if (ts > nextMaxTs) nextMaxTs = ts;
+      if (visible && prepareTextForTts(announcement.text, locale).length > 0) {
+        queuedAnnouncements.push({ id: ev.eventId, text: announcement.text, ts, order: order++ });
+      }
     }
-  }, [viewItems, sourceEvents, sessionId, ttsAutoRead, ttsSupported, preview, loading, loadingOlder, refreshing, historyGap, visible, locale]);
+
+    autoReadStateRef.current.maxTs = nextMaxTs;
+
+    if (queuedAnnouncements.length > 0 && visible) {
+      queuedAnnouncements.sort((a, b) => (a.ts - b.ts) || (a.order - b.order));
+      ttsOwnedSessionRef.current = true;
+      for (const entry of queuedAnnouncements) {
+        void speakText(entry.text, { messageId: entry.id, lang: locale, queue: true });
+      }
+    }
+  }, [viewItems, sourceEvents, sessionId, ttsAutoRead, ttsSupported, preview, loading, loadingOlder, refreshing, historyGap, visible, locale, t]);
   /** Loaded history the derivation window left out entirely. */
   const hasOlderOutsideWindow = derivedTail.windowStartIndex > 0;
   /**

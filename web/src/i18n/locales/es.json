@@ -5573,5 +5573,8 @@
       "release_to_switch_step": "Suelta para cambiar (L{{step}})",
       "no_target": "Sin otro destino"
     }
+  },
+  "tts": {
+    "task_pair_announcement": "Tarea {{title}}: {{status}}"
   }
 }

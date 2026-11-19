@@ -5583,5 +5583,8 @@
       "release_to_switch_step": "松手切换（第{{step}}级）",
       "no_target": "无其他目标"
     }
+  },
+  "tts": {
+    "task_pair_announcement": "任务「{{title}}」，{{status}}"
   }
 }

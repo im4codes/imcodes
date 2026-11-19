@@ -5572,5 +5572,8 @@
       "release_to_switch_step": "離して切り替え（L{{step}}）",
       "no_target": "他の対象なし"
     }
+  },
+  "tts": {
+    "task_pair_announcement": "タスク「{{title}}」、{{status}}"
   }
 }

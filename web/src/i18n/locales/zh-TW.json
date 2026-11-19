@@ -5573,5 +5573,8 @@
       "release_to_switch_step": "放開切換（第{{step}}級）",
       "no_target": "無其他目標"
     }
+  },
+  "tts": {
+    "task_pair_announcement": "任務「{{title}}」，{{status}}"
   }
 }

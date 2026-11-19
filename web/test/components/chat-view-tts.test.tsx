@@ -6,23 +6,64 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/preact
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TimelineEvent } from '../../src/ws-client.js';
 
+const i18nMock = vi.hoisted(() => ({
+  language: 'en-US',
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => {
-      const dict: Record<string, string> = {
+    t: (key: string, options?: Record<string, unknown>) => {
+      const enDict: Record<string, string> = {
         'chat.tts_speak': 'Read aloud',
         'chat.tts_stop': 'Stop reading',
         'common.copy': 'Copy',
         'common.copied': 'Copied',
+        'taskPair.card_untitled': 'Untitled task',
+        'taskPair.status.working': 'Working',
+        'taskPair.status.in_audit': 'In audit',
+        'taskPair.status.rework': 'Rework',
+        'taskPair.status.rework_round': 'Rework round {{round}}',
+        'taskPair.status.passed': 'Audit passed',
+        'taskPair.status.done': 'Done',
+        'taskPair.status.cancelled': 'Cancelled',
+        'taskPair.flag.blocked': 'Blocked',
+        'taskPair.flag.needs_input': 'Needs input',
+        'tts.task_pair_announcement': 'Task {{title}}: {{status}}',
       };
-      return dict[key] ?? key;
+      const zhDict: Record<string, string> = {
+        ...enDict,
+        'taskPair.card_untitled': '未命名任务',
+        'taskPair.status.working': '进行中',
+        'taskPair.status.in_audit': '审计中',
+        'taskPair.status.rework_round': '第 {{round}} 轮返工',
+        'taskPair.status.passed': '审核通过',
+        'taskPair.status.done': '已完成',
+        'tts.task_pair_announcement': '任务「{{title}}」，{{status}}',
+      };
+      const dict = i18nMock.language.startsWith('zh') ? zhDict : enDict;
+      let text = dict[key] ?? key;
+      if (options) {
+        for (const [k, v] of Object.entries(options)) {
+          text = text.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), String(v));
+        }
+      }
+      return text;
     },
-    i18n: { language: 'en-US', resolvedLanguage: 'en-US' },
+    i18n: {
+      get language() { return i18nMock.language; },
+      get resolvedLanguage() { return i18nMock.language; },
+    },
   }),
 }));
 
 vi.mock('../../src/components/FileBrowser.js', () => ({ FileBrowser: () => null }));
-vi.mock('../../src/api.js', () => ({ downloadAttachment: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../../src/api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/api.js')>();
+  return {
+    ...actual,
+    downloadAttachment: vi.fn().mockResolvedValue(undefined),
+  };
+});
 vi.mock('../../src/hooks/usePref.js', () => ({
   parseBooleanish: () => null,
   usePref: () => ({
@@ -66,6 +107,7 @@ describe('ChatView system TTS integration', () => {
 
   beforeEach(() => {
     localStorage.clear();
+    i18nMock.language = 'en-US';
     spoken = [];
     cancelMock = vi.fn();
     vi.stubGlobal('Capacitor', undefined);
@@ -305,5 +347,95 @@ describe('ChatView system TTS integration', () => {
     expect(speakerBtn?.getAttribute('aria-pressed')).toBe('false');
     expect(getTtsAutoReadEnabled()).toBe(false);
     expect(cancelMock.mock.calls.length).toBeGreaterThan(callsBeforeStop);
+  });
+
+  it('auto-reads live task pair transitions in UI locale, deduplicates same-state cross-source events, isolates history, and queues concurrent text + task events', async () => {
+    const { setTtsAutoReadEnabled } = await import('../../src/tts.js');
+    setTtsAutoReadEnabled(true);
+    const { ChatView } = await import('../../src/components/ChatView.js');
+
+    const makeTaskPairEvent = (id: string, ts: number, payload: Record<string, unknown>): TimelineEvent => ({
+      eventId: id,
+      type: 'task_pair.event',
+      sessionId: 'sess-1',
+      ts,
+      epoch: 1,
+      seq: ts,
+      source: 'daemon',
+      confidence: 'high',
+      payload,
+    } as TimelineEvent);
+
+    const historyEvents: TimelineEvent[] = [
+      makeTaskPairEvent('tp-hist', 1000, { taskId: 'tsk_old', title: 'Old task', verb: 'DONE', toStatus: 'done' }),
+    ];
+
+    const { rerender } = render(
+      <ChatView events={historyEvents} loading={false} sessionId="sess-1" visible={true} />,
+    );
+    expect(spoken).toHaveLength(0);
+
+    // Reconnect / older backfill: still must NOT speak historical task events
+    await act(async () => {
+      rerender(
+        <ChatView
+          events={[
+            makeTaskPairEvent('tp-backfill', 500, { taskId: 'tsk_older', title: 'Backfill task', verb: 'PASS', toStatus: 'passed' }),
+            ...historyEvents,
+          ]}
+          loading={false}
+          sessionId="sess-1"
+          visible={true}
+        />,
+      );
+    });
+    expect(spoken).toHaveLength(0);
+
+    // Live DISPATCH + STARTED + assistant notice for same working status speaks ONCE, queued after concurrent prose reply
+    await act(async () => {
+      rerender(
+        <ChatView
+          events={[
+            ...historyEvents,
+            makeAssistantEvent('live-msg-1', 'Starting the task now.', 2000),
+            makeTaskPairEvent('tp-dispatch', 2001, { taskId: 'tsk_live', title: 'Fix login', verb: 'DISPATCH', toStatus: 'working', round: 0 }),
+            makeTaskPairEvent('tp-started', 2002, { taskId: 'tsk_live', title: 'Fix login', verb: 'STARTED', toStatus: 'working', round: 0 }),
+          ]}
+          loading={false}
+          sessionId="sess-1"
+          visible={true}
+        />,
+      );
+    });
+    // First item starts speaking immediately; second is queued FIFO without interrupting
+    expect(spoken.map((u) => u.text)).toEqual(['Starting the task now.']);
+    await act(async () => { spoken[0].onend?.(); });
+    expect(spoken.map((u) => u.text)).toEqual(['Starting the task now.', 'Task Fix login: Working']);
+    await act(async () => { spoken[1].onend?.(); });
+
+    // Round 1 rework vs Round 2 rework in zh-CN both speak with round numbers, followed by passed -> done
+    i18nMock.language = 'zh-CN';
+    await act(async () => {
+      rerender(
+        <ChatView
+          events={[
+            ...historyEvents,
+            makeAssistantEvent('live-msg-1', 'Starting the task now.', 2000),
+            makeTaskPairEvent('tp-dispatch', 2001, { taskId: 'tsk_live', title: 'Fix login', verb: 'DISPATCH', toStatus: 'working', round: 0 }),
+            makeTaskPairEvent('tp-rework-1', 3000, { taskId: 'tsk_live', title: 'Fix login', verb: 'REWORK', toStatus: 'rework', round: 1 }),
+            makeTaskPairEvent('tp-rework-2', 3100, { taskId: 'tsk_live', title: 'Fix login', verb: 'REWORK', toStatus: 'rework', round: 2 }),
+            makeTaskPairEvent('tp-pass', 3200, { taskId: 'tsk_live', title: 'Fix login', verb: 'PASS', toStatus: 'passed', round: 2 }),
+          ]}
+          loading={false}
+          sessionId="sess-1"
+          visible={true}
+        />,
+      );
+    });
+    expect(spoken.slice(2).map((u) => u.text)).toEqual(['任务「Fix login」，第 1 轮返工']);
+    await act(async () => { spoken[2].onend?.(); });
+    expect(spoken[3].text).toBe('任务「Fix login」，第 2 轮返工');
+    await act(async () => { spoken[3].onend?.(); });
+    expect(spoken[4].text).toBe('任务「Fix login」，审核通过');
   });
 });

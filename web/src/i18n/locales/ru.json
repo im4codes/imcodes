@@ -5572,5 +5572,8 @@
       "release_to_switch_step": "Отпустите для переключения (L{{step}})",
       "no_target": "Нет другой цели"
     }
+  },
+  "tts": {
+    "task_pair_announcement": "Задача {{title}}: {{status}}"
   }
 }

@@ -5583,5 +5583,8 @@
       "release_to_switch_step": "Release to switch (L{{step}})",
       "no_target": "No other target"
     }
+  },
+  "tts": {
+    "task_pair_announcement": "Task {{title}}: {{status}}"
   }
 }
