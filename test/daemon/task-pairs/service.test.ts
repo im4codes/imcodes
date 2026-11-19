@@ -1368,4 +1368,54 @@ describe('task-pair marker ingestion', () => {
       resetTransportQueueStoreForTests();
     }
   });
+
+  it('fails closed on unbound legacy nudges when closing a pair whose taskId and participant also exist in another active project, while still cleaning wake-v1 entries', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../../src/daemon/transport-queue-store.js');
+    const { TASK_PAIR_NUDGE_ID_PREFIX } = await import('../../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    try {
+      const queueStore = getTransportQueueStore();
+      await say(BRAIN, `Dispatch A.\n<!-- IMCODES_TASK DISPATCH legacy:shared executor=${EXEC} auditor=${AUD} title="Project A shared" -->`);
+      service.applyMarker({
+        project: 'otherproj',
+        writer: OTHER_PROJECT_SESSION,
+        marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'legacy:shared', attrs: { executor: EXEC, auditor: AUD, title: 'Project B shared' } },
+        source: 'marker',
+        now: Date.now(),
+        eventId: 'otherproj-shared-dispatch',
+      });
+
+      const legacyQueued = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge:q1`;
+      const legacyFailed = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge:f1`;
+      const wakeProjA = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: PROJECT, taskId: 'legacy:shared', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:wa`;
+      const wakeProjB = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'otherproj', taskId: 'legacy:shared', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:wb`;
+
+      queueStore.enqueue({ sessionName: EXEC, clientMessageId: legacyQueued, text: 'legacy queued', now: 100 });
+      queueStore.enqueue({ sessionName: EXEC, clientMessageId: legacyFailed, text: 'legacy failed', now: 101 });
+      queueStore.markFailed(EXEC, legacyFailed, 'expired', 200);
+      queueStore.enqueue({ sessionName: EXEC, clientMessageId: wakeProjA, text: 'wake A', now: 102 });
+      queueStore.markFailed(EXEC, wakeProjA, 'expired', 201);
+      queueStore.enqueue({ sessionName: EXEC, clientMessageId: wakeProjB, text: 'wake B', now: 103 });
+      queueStore.markFailed(EXEC, wakeProjB, 'expired', 202);
+
+      await say(BRAIN, `Cancel A.\n<!-- IMCODES_TASK CANCEL legacy:shared -->`);
+
+      // Only the wake-v1 entry bound to PROJECT is removed; unbound legacy queued/failed
+      // rows and the otherproj wake-v1 entry are preserved instead of guessing ownership.
+      expect(queueStore.readSnapshot(EXEC).pendingMessageEntries.map((e) => e.clientMessageId)).toEqual([legacyQueued]);
+      expect(queueStore.readSnapshot(EXEC).failedMessageEntries.map((e) => e.clientMessageId)).toEqual([
+        legacyFailed,
+        wakeProjB,
+      ]);
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
+  });
 });

@@ -185,18 +185,13 @@ export function resolveTaskPairNudgeFromIndex(
   let resolved: StoredTaskPair | undefined;
   if (participantMatches.length === 1) {
     resolved = participantMatches[0];
-  } else if (participantMatches.length > 1) {
-    if (!preferredProject) return { taskId: matchedTaskId, reason: targetMatch.reason, ambiguous: true };
-    const projectMatches = participantMatches.filter((pair) => pair.project === preferredProject);
-    if (projectMatches.length !== 1) return { taskId: matchedTaskId, reason: targetMatch.reason, ambiguous: true };
-    resolved = projectMatches[0];
-  } else if (preferredProject) {
-    const projectMatches = candidates.filter((pair) => pair.project === preferredProject);
-    if (projectMatches.length !== 1) return { taskId: matchedTaskId, reason: targetMatch.reason, ambiguous: true };
-    resolved = projectMatches[0];
-  } else if (candidates.length === 1) {
+  } else if (participantMatches.length === 0 && candidates.length === 1) {
     resolved = candidates[0];
   } else {
+    return { taskId: matchedTaskId, reason: targetMatch.reason, ambiguous: true };
+  }
+
+  if (preferredProject && resolved && resolved.project !== preferredProject) {
     return { taskId: matchedTaskId, reason: targetMatch.reason, ambiguous: true };
   }
 

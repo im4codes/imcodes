@@ -427,4 +427,58 @@ describe('transport queue projection builder', () => {
       resetTransportQueueStoreForTests();
     }
   });
+
+  it('does not let SessionRecord.projectName tie-break an ambiguous unbound legacy failure when multiple projects share taskId and participant', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const { TASK_PAIR_NUDGE_ID_PREFIX } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    const recipient = { sessionInstanceId: 'inst-ambig', runtimeEpoch: 'epoch-ambig' };
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_ambig',
+      projectName: 'projA',
+      sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch,
+    });
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_projA_brain',
+        executor: 'deck_sub_ambig',
+        auditor: 'deck_sub_aud',
+      };
+      pairStore.savePair('projA', { ...basePair, taskId: 'legacy:shared', status: 'cancelled' });
+      pairStore.savePair('projB', { ...basePair, brain: 'deck_projB_brain', taskId: 'legacy:shared', status: 'working' });
+
+      const qStore = getTransportQueueStore();
+      const unboundLegacy = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge:1`;
+      const wakeProjA = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'projA', taskId: 'legacy:shared', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:wa`;
+      const wakeProjB = `${TASK_PAIR_NUDGE_ID_PREFIX}legacy:shared:work-nudge::wake-v1:${encodeURIComponent(JSON.stringify({
+        bindings: [{ project: 'projB', taskId: 'legacy:shared', epoch: 0 }],
+        reason: 'work-nudge',
+      }))}:wb`;
+
+      for (const id of [unboundLegacy, wakeProjA, wakeProjB]) {
+        qStore.enqueue({ sessionName: 'deck_sub_ambig', clientMessageId: id, text: `msg ${id}`, recipient, now: 100 });
+        qStore.markFailed('deck_sub_ambig', id, 'expired', 200);
+      }
+
+      const snap = buildTransportQueueSnapshot('deck_sub_ambig', 'test');
+      expect(snap.failedMessageEntries.map((e) => e.clientMessageId)).toEqual([unboundLegacy, wakeProjB]);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
 });

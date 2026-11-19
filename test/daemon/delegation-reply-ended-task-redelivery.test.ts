@@ -416,5 +416,12 @@ describe('task-bound delegation replies across a daemon restart', () => {
     const workerColon = `${taskPairMessageIdPrefix('legacy:child', 'nudge-executor')}uuid-2`;
     expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: passColon, text: 'done notice' })).toBe('authorized');
     expect(resolveTransportQueueEntryAdmission('deck_sub_exec', { commandId: workerColon, text: 'keep working' })).toBe('stale');
+
+    // Ambiguous unbound legacy ID shared across two projects with the same participant
+    // stays conservative ('authorized'), never tie-broken by SessionRecord.projectName.
+    putTaskPairFixture(pairs, PROJECT, { ...pairState('legacy:shared', 'cancelled'), executor: 'deck_sub_exec' });
+    putTaskPairFixture(pairs, 'other-project', { ...pairState('legacy:shared', 'working'), executor: 'deck_sub_exec' });
+    const ambigColon = `${taskPairMessageIdPrefix('legacy:shared', 'nudge-executor')}uuid-3`;
+    expect(resolveTransportQueueEntryAdmission('deck_sub_exec', { commandId: ambigColon, text: 'ambiguous legacy' })).toBe('authorized');
   });
 });
