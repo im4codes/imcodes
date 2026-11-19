@@ -58,6 +58,7 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
   GROK_RUNTIME_AGENT: 'grokRuntimeAgent',
   AGY_RUNTIME_AGENT: 'agyRuntimeAgent',
+  AGY_RUNTIME_SHELL: 'agyRuntimeShell',
   MUSE_RUNTIME_AGENT: 'museRuntimeAgent',
 } as const;
 
@@ -69,6 +70,7 @@ export const SDK_SUBAGENT_TASK_TYPES = {
 
 export const SDK_SUBAGENT_ACTIONS = {
   CODEX_BACKGROUND_SHELL: 'codex-background-shell',
+  AGY_BACKGROUND_TASK: 'agy-background-task',
 } as const;
 
 export const SDK_SUBAGENT_STATUS = {

@@ -36,12 +36,14 @@ vi.mock('react-i18next', () => ({
         'chat.sdk_agents_diagnostics_section': 'Diagnostics',
         'chat.sdk_agents_provider_claude': 'Claude SDK',
         'chat.sdk_agents_provider_codex': 'Codex SDK',
+        'chat.sdk_agents_provider_agy': 'Antigravity',
         'chat.sdk_agents_provider_unknown': 'SDK agent',
         'chat.sdk_agents_task_bash': 'Bash / Shell',
         'chat.sdk_agents_task_agent': 'Agent',
         'chat.sdk_agents_task_background': 'Background task',
         'chat.sdk_agents_status_running': 'Running',
         'chat.sdk_agents_status_complete': 'Complete',
+        'chat.sdk_agents_status_interrupted': 'Interrupted',
         'chat.sdk_agents_status_unknown': 'Unknown',
         'chat.sdk_agents_id': 'ID',
         'chat.sdk_agents_model': 'Model',
@@ -657,5 +659,45 @@ describe('ChatView SDK agents panel', () => {
 
     rerender(<ChatView events={[running]} loading={false} sessionId="deck_agents" visible />);
     expect(screen.getByText('45s')).toBeTruthy();
+  });
+
+  it('displays AGY_RUNTIME_SHELL local_bash background commands in the Agents panel and clears when terminal', () => {
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
+    const agyBashRunning = makeSdkEvent('agy-bash-running', makeMeta({
+      canonicalKey: 'agy:deck_agents:bg_task-7',
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+      taskId: 'conv-1/task-7',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { summary: 'docker compose logs -f' });
+
+    const { container, rerender } = render(
+      <ChatView events={[agyBashRunning]} loading={false} sessionId="deck_agents" />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' })).toBeTruthy();
+    expect(screen.getByText('docker compose logs -f')).toBeTruthy();
+    expect(container.querySelector('.chat-sdk-agent-provider')?.textContent).toBe('Antigravity');
+    expect(container.querySelector('.chat-sdk-agent-task-kind')?.textContent).toBe('Bash / Shell');
+
+    const agyBashStopped = makeSdkEvent('agy-bash-stopped', makeMeta({
+      canonicalKey: 'agy:deck_agents:bg_task-7',
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+      taskId: 'conv-1/task-7',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+      active: false,
+      terminal: true,
+    }), { summary: 'docker compose logs -f', output: 'Session stopped' });
+
+    rerender(<ChatView events={[agyBashRunning, agyBashStopped]} loading={false} sessionId="deck_agents" />);
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' })).toBeTruthy();
+    expect(screen.queryByRole('region', { name: 'Agents' })).toBeNull();
   });
 });

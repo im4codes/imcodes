@@ -454,4 +454,62 @@ describe('deriveSdkSubagentStatusRows', () => {
       diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD,
     }]);
   });
+
+  it('keeps backgrounded AGY_RUNTIME_SHELL active across parent idle and resolves it on matching terminal event', () => {
+    const running = makeEvent('agy-bg-run', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+      canonicalKey: 'agy:conv-1:bg_task-1',
+      taskId: 'conv-1/task-1',
+      taskType: 'local_bash',
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 15_000, summary: 'bash ./sync.sh --all' });
+    const parentIdle: TimelineEvent = {
+      eventId: 'parent-idle',
+      sessionId: 'deck_main_brain',
+      ts: NOW - 10_000,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: { state: 'idle' },
+    };
+
+    const whileRunning = deriveSdkSubagentStatusRows([running, parentIdle], NOW);
+    expect(whileRunning.runningCount).toBe(1);
+    expect(whileRunning.rows).toMatchObject([{
+      canonicalKey: 'agy:conv-1:bg_task-1',
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+      taskType: 'local_bash',
+      backgrounded: true,
+      active: true,
+      terminal: false,
+    }]);
+
+    const finished = makeEvent('agy-bg-done', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+      canonicalKey: 'agy:conv-1:bg_task-1',
+      taskId: 'conv-1/task-1',
+      taskType: 'local_bash',
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }), { ts: NOW - 2_000, summary: 'bash ./sync.sh --all', output: 'Command exited with code 0.' });
+
+    const afterDone = deriveSdkSubagentStatusRows([running, parentIdle, finished], NOW);
+    expect(afterDone.runningCount).toBe(0);
+    expect(afterDone.rows).toMatchObject([{
+      canonicalKey: 'agy:conv-1:bg_task-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }]);
+  });
 });

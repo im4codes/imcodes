@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  SDK_SUBAGENT_ACTIONS,
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   SDK_SUBAGENT_REDACTED_VALUE,
   SDK_SUBAGENT_SAFE_RAW_MAX_TOTAL_BYTES,
   buildSdkSubagentSafeDetail,
@@ -67,6 +69,32 @@ describe('sdk-subagent-status shared contract', () => {
     });
 
     expect(parseSdkSubagentDetail(detail)).toEqual(expect.objectContaining({ kind: 'ok' }));
+  });
+
+  it('accepts explicitly structured Antigravity background shell details', () => {
+    const detail = makeDetail({
+      summary: 'bash ./sync.sh --all',
+      input: {
+        action: SDK_SUBAGENT_ACTIONS.AGY_BACKGROUND_TASK,
+        description: 'bash ./sync.sh --all',
+      },
+      meta: {
+        ...makeDetail().meta,
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+        canonicalKey: 'agy:deck:bg_task-1',
+        taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+        backgrounded: true,
+      },
+    });
+
+    const parsed = parseSdkSubagentDetail(detail);
+    expect(parsed).toEqual(expect.objectContaining({ kind: 'ok' }));
+    if (parsed.kind === 'ok') {
+      expect(parsed.detail.meta.providerKind).toBe(SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL);
+      expect(parsed.detail.meta.taskType).toBe(SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH);
+      expect(parsed.detail.meta.backgrounded).toBe(true);
+    }
   });
 
   it('accepts explicitly structured Muse runtime subagent details', () => {

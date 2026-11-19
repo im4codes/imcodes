@@ -1,7 +1,13 @@
 import logger from '../../src/util/logger.js';
 import { agyNativeStartNotAttemptedError } from '../../src/agent/agy-session-persistence.js';
 import { ACP_ERROR_PHASE } from '../../shared/provider-error-codes.js';
-import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
+} from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -1451,7 +1457,10 @@ rl.on('line', (line) => {
     const state = (provider as any).sessions.get(id);
     const nativeId = state.acpSessionId as string;
     const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
-    const beforeAgentCount = events.filter((e) => e.detail?.kind === SDK_SUBAGENT_DETAIL_KIND).length;
+    const isAgyAgentCard = (e: ToolCallEvent) =>
+      e.detail?.kind === SDK_SUBAGENT_DETAIL_KIND
+      && e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT;
+    const beforeAgentCount = events.filter(isAgyAgentCard).length;
     const update = (u: any) => (provider as any).handleSessionUpdate({ sessionId: nativeId, update: u });
 
     // Case 1: send_message to IM.codes deck_sub_* in parallel with run_command background task & send_list_targets.
@@ -1512,7 +1521,20 @@ rl.on('line', (line) => {
     await vi.waitFor(() => {
       expect(provider.getActiveWorkSnapshot(id)?.busyReasons).toContain('background_monitor');
     }, { timeout: 5000 });
-    expect(events.filter((e) => e.detail?.kind === SDK_SUBAGENT_DETAIL_KIND)).toHaveLength(beforeAgentCount);
+    expect(events.filter(isAgyAgentCard)).toHaveLength(beforeAgentCount);
+    expect(events.filter((e) => e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL)).toMatchObject([{
+      detail: {
+        summary: 'sleep 10',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+          taskId: `${nativeId}/task-999`,
+          taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+          backgrounded: true,
+          active: true,
+        },
+      },
+    }]);
 
     // Case 2: parallel [invoke_subagent, run_command] where run_command's RUNNING row arrives first.
     update({
@@ -4245,5 +4267,180 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     ]);
     expect(emitted).not.toContain('agy-sdk');
     expect(emitted).not.toContain('gemini-4-carbon-medium');
+  });
+
+  it('surfaces AGY background shell tasks in SDK sub-agent panel lifecycle with secret redaction, idempotent starts, and full cleanup', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_shell_panel';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => {
+      if (sid === id && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL) {
+        events.push(evt);
+      }
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-bg-shell')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // 1. Start a background run_command with inline secret token -> sanitized running event + backgroundWorkCount=1
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-1\nTask Description: bash ./sync.sh --all`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'GH_TOKEN=ghp_supersecret123 bash ./sync.sh --all', WaitMsBeforeAsync: 500 },
+        toolStatus: 'complete',
+        toolId: 'acp-tool-1',
+      });
+      expect(events).toHaveLength(1);
+      const startEvt = events[0]!;
+      expect(startEvt.status).toBe('running');
+      expect(startEvt.detail?.meta).toMatchObject({
+        isSdkSubagent: true,
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+        taskId: `${nativeId}/task-1`,
+        taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+        backgrounded: true,
+        active: true,
+        terminal: false,
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        parentToolUseId: 'acp-tool-1',
+      });
+      expect(startEvt.detail?.summary).toContain('bash ./sync.sh --all');
+      expect(JSON.stringify(startEvt)).not.toContain('ghp_supersecret123');
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(1);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // 2. Duplicate start notification for same taskId is idempotent (keeps startedAtMs, no extra event)
+      const firstStartedAt = startEvt.detail?.meta?.startedAtMs;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'other command' },
+        toolStatus: 'running',
+      });
+      expect(events).toHaveLength(1);
+      expect(state.agyBackgroundTasks.get(`${nativeId}/task-1`)?.startedAtMs).toBe(firstStartedAt);
+
+      // 3. Excluded tools (IsDaemon, recurring schedule, invoke_subagent) do NOT create agyRuntimeShell rows
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/daemon-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'npm run dev', IsDaemon: true },
+        toolStatus: 'complete',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/cron-1`,
+        toolName: 'schedule',
+        toolInput: { CronExpression: '*/5 * * * *', Prompt: 'check' },
+        toolStatus: 'complete',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sub-1`,
+        toolName: 'invoke_subagent',
+        toolInput: { Role: 'Researcher', Prompt: 'read' },
+        toolStatus: 'complete',
+      });
+      expect(events).toHaveLength(1);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(1);
+
+      // 4. Completion notification emits matching terminal event on same canonicalKey and clears to 0
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Task id "${nativeId}/task-1" finished with result:\nCommand exited with code 0.`,
+        isSystemMessage: true,
+      });
+      expect(events).toHaveLength(2);
+      expect(events[1]!.id).toBe(startEvt.id);
+      expect(events[1]!.status).toBe('complete');
+      expect(events[1]!.detail?.meta).toMatchObject({
+        canonicalKey: startEvt.detail?.meta?.canonicalKey,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      });
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+
+      // 5. Non-zero exit code emits error terminal event; server restart & cancel emit interrupted terminal events
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-fail`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'false' },
+        toolStatus: 'running',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Task id "${nativeId}/task-fail" finished with result:\nCommand exited with code 1.`,
+        isSystemMessage: true,
+      });
+      expect(events.at(-1)?.status).toBe('error');
+      expect(events.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-restart`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'docker compose logs -f' },
+        toolStatus: 'running',
+      });
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'All your subagents and background tasks have been stopped due to server restart.',
+        isSystemMessage: true,
+      });
+      expect(events.at(-1)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/task-restart`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+        active: false,
+        terminal: true,
+      });
+
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-cancel`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'tail -f app.log' },
+        toolStatus: 'running',
+      });
+      expect(state.agyBackgroundTasks.size).toBe(1);
+      await provider.cancel(id);
+      expect(state.agyBackgroundTasks.size).toBe(0);
+      expect(events.at(-1)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/task-cancel`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+        active: false,
+        terminal: true,
+      });
+
+      // 6. Empty manage_task(list) reconciles stale task with matching complete event
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-stale`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'sleep 20' },
+        toolStatus: 'running',
+      });
+      const staleStart = events.at(-1)!;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: 'No running tasks.',
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+      expect(state.agyBackgroundTasks.size).toBe(0);
+      expect(events.at(-1)?.id).toBe(staleStart.id);
+      expect(events.at(-1)?.status).toBe('complete');
+      expect(events.at(-1)?.detail?.meta).toMatchObject({
+        canonicalKey: staleStart.detail?.meta?.canonicalKey,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      });
+    } finally {
+      await runtime.kill();
+    }
   });
 });

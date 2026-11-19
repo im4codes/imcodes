@@ -145,9 +145,23 @@ import {
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 import {
   buildGenericRuntimeSubagentTool,
+  buildSdkSubagentSafeDetail,
   isSdkRuntimeSubagentEventName,
+  makeAgySubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
+  sanitizeSdkSubagentText,
+  SDK_SUBAGENT_ACTIONS,
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_REDACTED_VALUE,
+  SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   startsWithSdkRuntimeSubagentTag,
+  type SdkSubagentDetail,
+  type SdkSubagentNormalizedStatus,
   type SdkSubagentProvider,
   type SdkSubagentProviderKind,
 } from '../../../shared/sdk-subagent-status.js';
@@ -351,7 +365,7 @@ interface KimiSdkSessionState {
   agyContextUsage?: AgyContextUsage;
   agyCompactionWatermark?: AgyCompactionWatermark;
   agySubagents?: AgySubagentTracker;
-  agyBackgroundTasks?: Set<string>;
+  agyBackgroundTasks?: Map<string, AgyBackgroundTaskEntry>;
   agyBridges?: Map<string, AgyTranscriptBridge>;
   agyPendingNativeTools?: Map<string, ToolCallEvent>;
   agyConsumedNativeTools?: Set<string>;
@@ -1102,10 +1116,12 @@ export class KimiSdkProvider implements TransportProvider {
     if (interrupted.length > 0) {
       this.publishAgySubagents(sessionId, state, interrupted);
     }
+    this.terminalizeAgyBackgroundTasks(sessionId, state, SDK_SUBAGENT_STATUS.INTERRUPTED, 'Session stopped');
     this.closeAgyBridges(state);
   }
 
   private closeAgyBridges(state: KimiSdkSessionState): void {
+    this.terminalizeAgyBackgroundTasks(state.routeId, state, SDK_SUBAGENT_STATUS.INTERRUPTED, 'Session closed');
     for (const bridge of state.agyBridges?.values() ?? []) bridge.close();
     state.agyBridges?.clear(); state.agyBackgroundTasks?.clear(); state.agyReactive = false;
     state.agyPendingResponses?.clear(); state.agyNativeAcks = [];
@@ -1115,6 +1131,82 @@ export class KimiSdkProvider implements TransportProvider {
     state.agyProvisionalAutoMessageId = undefined;
     state.agyPendingNativeTools?.clear(); state.agyConsumedNativeTools?.clear(); state.agyNativeToolOrder = [];
     state.agyRecentAcpOutputs = [];
+  }
+
+  private emitAgyBackgroundTaskEvent(sessionId: string, event: ToolCallEvent): void {
+    for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+  }
+
+  private buildAgyBackgroundShellToolEvent(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    entry: AgyBackgroundTaskEntry,
+    status: SdkSubagentNormalizedStatus,
+    output?: string,
+  ): ToolCallEvent {
+    const active = status === SDK_SUBAGENT_STATUS.RUNNING;
+    const rawStatus = status === SDK_SUBAGENT_STATUS.COMPLETE
+      ? 'completed'
+      : status === SDK_SUBAGENT_STATUS.INTERRUPTED
+        ? 'interrupted'
+        : status === SDK_SUBAGENT_STATUS.ERROR
+          ? 'error'
+          : 'running';
+    const safeOutput = output !== undefined
+      ? sanitizeSdkSubagentText(redactAgyBackgroundCommandSecrets(output))
+      : undefined;
+    const detail = buildSdkSubagentSafeDetail({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary: entry.description,
+      input: {
+        action: SDK_SUBAGENT_ACTIONS.AGY_BACKGROUND_TASK,
+        description: entry.description,
+      },
+      ...(safeOutput ? { output: safeOutput } : {}),
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+        canonicalKey: entry.canonicalKey,
+        normalizedStatus: status,
+        rawStatus,
+        active,
+        terminal: !active,
+        parentSessionId: state.acpSessionId ?? sessionId,
+        ...(entry.toolId ? { parentToolUseId: entry.toolId } : {}),
+        taskId: entry.id,
+        taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+        backgrounded: true,
+        startedAtMs: entry.startedAtMs,
+      },
+    } satisfies SdkSubagentDetail, { allowRaw: false });
+    return {
+      id: entry.canonicalKey,
+      name: 'Bash',
+      status: active ? 'running' : status === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error',
+      ...(detail.input ? { input: detail.input } : {}),
+      ...(detail.output ? { output: detail.output } : {}),
+      detail,
+    };
+  }
+
+  private terminalizeAgyBackgroundTasks(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    status: SdkSubagentNormalizedStatus,
+    output?: string,
+  ): void {
+    const tasks = state.agyBackgroundTasks;
+    if (!tasks || tasks.size === 0) return;
+    const entries = [...tasks.values()];
+    tasks.clear();
+    for (const entry of entries) {
+      this.emitAgyBackgroundTaskEvent(
+        sessionId,
+        this.buildAgyBackgroundShellToolEvent(sessionId, state, entry, status, output),
+      );
+    }
   }
 
   /**
@@ -1151,17 +1243,17 @@ export class KimiSdkProvider implements TransportProvider {
   private updateAgyBackgroundTasks(
     sessionId: string,
     state: KimiSdkSessionState,
-    opts: { text?: string; isSystemMessage?: boolean; toolName?: string; toolInput?: unknown; toolStatus?: string },
+    opts: { text?: string; isSystemMessage?: boolean; toolName?: string; toolInput?: unknown; toolStatus?: string; toolId?: string },
   ): void {
     if (this.id !== AGY_SDK_PROVIDER_ID) return;
-    const tasks = state.agyBackgroundTasks ??= new Set<string>();
+    const tasks = state.agyBackgroundTasks ??= new Map<string, AgyBackgroundTaskEntry>();
     const prevSize = tasks.size;
     const wasReactive = Boolean(state.agyReactive);
     const text = opts.text ?? '';
     let restarted = false;
 
     if (opts.isSystemMessage && AGY_BACKGROUND_TASKS_RESTART_RE.test(text)) {
-      tasks.clear();
+      this.terminalizeAgyBackgroundTasks(sessionId, state, SDK_SUBAGENT_STATUS.INTERRUPTED, 'Server restarted');
       state.agyReactive = false;
       restarted = true;
     } else {
@@ -1170,12 +1262,46 @@ export class KimiSdkProvider implements TransportProvider {
         && !isRecurringAgyScheduleTool(opts.toolName, opts.toolInput)
         && !isDaemonAgyRunCommandTool(opts.toolName, opts.toolInput)
       ) {
-        for (const id of extractAgyBackgroundTaskStartIds(text)) tasks.add(id);
+        for (const id of extractAgyBackgroundTaskStartIds(text)) {
+          if (tasks.has(id)) continue;
+          while (tasks.size >= AGY_BACKGROUND_TASK_MAX_ACTIVE) {
+            const oldestKey = tasks.keys().next().value;
+            if (oldestKey === undefined) break;
+            const oldest = tasks.get(oldestKey);
+            tasks.delete(oldestKey);
+            if (oldest) {
+              this.emitAgyBackgroundTaskEvent(
+                sessionId,
+                this.buildAgyBackgroundShellToolEvent(sessionId, state, oldest, SDK_SUBAGENT_STATUS.INTERRUPTED, 'Evicted due to active background task limit'),
+              );
+            }
+          }
+          const entry: AgyBackgroundTaskEntry = {
+            id,
+            canonicalKey: makeAgySubagentCanonicalKey(state.acpSessionId ?? sessionId, `bg:${id}`),
+            description: extractAgyBackgroundTaskDescription(text, opts),
+            startedAtMs: Date.now(),
+            ...(opts.toolId ? { toolId: opts.toolId } : {}),
+          };
+          tasks.set(id, entry);
+          this.emitAgyBackgroundTaskEvent(
+            sessionId,
+            this.buildAgyBackgroundShellToolEvent(sessionId, state, entry, SDK_SUBAGENT_STATUS.RUNNING),
+          );
+        }
       }
       if (isEmptyManageTaskListResult(text, opts)) {
-        tasks.clear();
+        this.terminalizeAgyBackgroundTasks(sessionId, state, SDK_SUBAGENT_STATUS.COMPLETE, 'No running tasks');
       } else {
-        for (const id of extractAgyBackgroundTaskTerminalIds(text, opts)) tasks.delete(id);
+        for (const { id, status: terminalStatus } of extractAgyBackgroundTaskTerminals(text, opts)) {
+          const entry = tasks.get(id);
+          if (!entry) continue;
+          tasks.delete(id);
+          this.emitAgyBackgroundTaskEvent(
+            sessionId,
+            this.buildAgyBackgroundShellToolEvent(sessionId, state, entry, terminalStatus, text),
+          );
+        }
       }
     }
 
@@ -1380,11 +1506,15 @@ export class KimiSdkProvider implements TransportProvider {
     if (row.type === 'GENERIC' && row.content) {
       const matched = matchAgyGenericRowToNativeTool(state, row);
       const resolvedToolStatus = resolveAgyGenericToolStatus(row.status, matched?.pending?.status);
+      const matchedToolId = matched
+        ? (matched.pending?.id ?? `${state.acpSessionId}:native-tool:${matched.orderEntry.step}:${matched.orderEntry.index}`)
+        : undefined;
       this.updateAgyBackgroundTasks(sessionId, state, {
         text: row.content,
         toolName: matched?.orderEntry.name,
         toolInput: matched?.orderEntry.input,
         toolStatus: resolvedToolStatus,
+        ...(matchedToolId ? { toolId: matchedToolId } : {}),
       });
       if (matched && isAgySubagentTool(matched.orderEntry.name)) {
         const { orderEntry: nativeTool, pending } = matched;
@@ -3788,6 +3918,7 @@ export class KimiSdkProvider implements TransportProvider {
         toolName: merged.title,
         toolInput: merged.rawInput,
         toolStatus: agEvt.status,
+        toolId: merged.toolCallId,
       });
       if (normalizedStatus !== 'running' && outputValue !== undefined && !isAgySubagentTool(merged.title)) {
         const recent = state.agyRecentAcpOutputs ??= [];
@@ -4373,11 +4504,22 @@ function getPrivacySafeErrorCode(error: unknown): string {
   return error instanceof RequestError ? 'acp_request_error' : 'unknown';
 }
 
+interface AgyBackgroundTaskEntry {
+  id: string;
+  canonicalKey: string;
+  description: string;
+  startedAtMs: number;
+  toolId?: string;
+}
+
+const AGY_BACKGROUND_TASK_MAX_ACTIVE = 256;
 const AGY_BACKGROUND_TASKS_RESTART_RE = /All your subagents and background tasks have been stopped due to server restart\./i;
 const AGY_BACKGROUND_TASK_START_RE = /Tool is running as a background task with task id:\s*([A-Za-z0-9._:/-]+)/gi;
+const AGY_BACKGROUND_TASK_DESCRIPTION_RE = /(?:^|\n)\s*Task Description:\s*(.+)/i;
 const AGY_BACKGROUND_TASK_FINISHED_RE = /Task id "([^"]+)" finished/gi;
 const AGY_BACKGROUND_TASK_SENDER_RE = /\bsender=([^\s]+)/gi;
-const AGY_MANAGE_TASK_TERMINAL_RE = /\bTask:\s*([A-Za-z0-9._:/-]+)\b[\s\S]*?\bStatus:\s*(?:DONE|KILLED|FAILED|CANCELLED|ERROR|STOPPED)\b/gi;
+const AGY_MANAGE_TASK_TERMINAL_RE = /\bTask:\s*([A-Za-z0-9._:/-]+)\b[\s\S]*?\bStatus:\s*(DONE|KILLED|FAILED|CANCELLED|ERROR|STOPPED)\b/gi;
+const AGY_BACKGROUND_ENV_SECRET_RE = /\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL|AUTH)[A-Za-z0-9_]*)=('[^']*'|"[^"]*"|\S+)/gi;
 
 const AGY_EMPTY_MANAGE_TASK_LIST_RE = /\bno\s+(?:running|active|background)\s+tasks?\b/i;
 
@@ -4455,6 +4597,37 @@ function isEmptyManageTaskListResult(
   return AGY_EMPTY_MANAGE_TASK_LIST_RE.test(trimmed);
 }
 
+function redactAgyBackgroundCommandSecrets(value: string): string {
+  return value.replace(AGY_BACKGROUND_ENV_SECRET_RE, `$1=${SDK_SUBAGENT_REDACTED_VALUE}`);
+}
+
+function extractAgyBackgroundTaskDescription(
+  text: string,
+  opts: { toolName?: string; toolInput?: unknown },
+): string {
+  const input = asToolInputRecord(opts.toolInput);
+  const textDescription = AGY_BACKGROUND_TASK_DESCRIPTION_RE.exec(text)?.[1];
+  const candidates = [
+    input?.toolSummary,
+    input?.CommandLine,
+    input?.commandLine,
+    input?.command,
+    textDescription,
+    input?.Prompt,
+    input?.prompt,
+    input?.description,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || !candidate.trim()) continue;
+    const sanitized = sanitizeSdkSubagentText(
+      redactAgyBackgroundCommandSecrets(candidate),
+      SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH,
+    );
+    if (sanitized) return sanitized;
+  }
+  return normalizeAgyToolName(opts.toolName ?? '') === 'schedule' ? 'Scheduled task' : 'Bash';
+}
+
 function extractAgyBackgroundTaskStartIds(text: string): string[] {
   const ids: string[] = [];
   for (const match of text.matchAll(AGY_BACKGROUND_TASK_START_RE)) {
@@ -4463,29 +4636,56 @@ function extractAgyBackgroundTaskStartIds(text: string): string[] {
   return ids;
 }
 
-function extractAgyBackgroundTaskTerminalIds(
+function resolveAgyBackgroundSystemTerminalStatus(text: string): SdkSubagentNormalizedStatus {
+  if (/\bCommand exited with code 0\b/i.test(text)) return SDK_SUBAGENT_STATUS.COMPLETE;
+  if (
+    /\bCommand exited with code [1-9]\d*\b/i.test(text)
+    || /Task id "[^"]+" finished with (?:error|failure)\b/i.test(text)
+    || /Task id "[^"]+" (?:failed|errored)\b/i.test(text)
+  ) {
+    return SDK_SUBAGENT_STATUS.ERROR;
+  }
+  if (/Task id "[^"]+" (?:killed|cancelled|canceled|stopped|interrupted)\b/i.test(text)) {
+    return SDK_SUBAGENT_STATUS.INTERRUPTED;
+  }
+  return SDK_SUBAGENT_STATUS.COMPLETE;
+}
+
+function resolveAgyManageTaskTerminalStatus(rawStatus: string | undefined): SdkSubagentNormalizedStatus {
+  const normalized = (rawStatus ?? '').toUpperCase();
+  if (normalized === 'KILLED' || normalized === 'CANCELLED' || normalized === 'STOPPED') {
+    return SDK_SUBAGENT_STATUS.INTERRUPTED;
+  }
+  if (normalized === 'FAILED' || normalized === 'ERROR') {
+    return SDK_SUBAGENT_STATUS.ERROR;
+  }
+  return SDK_SUBAGENT_STATUS.COMPLETE;
+}
+
+function extractAgyBackgroundTaskTerminals(
   text: string,
   opts: { isSystemMessage?: boolean; toolName?: string; toolInput?: unknown; toolStatus?: string },
-): string[] {
-  const ids: string[] = [];
+): Array<{ id: string; status: SdkSubagentNormalizedStatus }> {
+  const results: Array<{ id: string; status: SdkSubagentNormalizedStatus }> = [];
   if (opts.isSystemMessage) {
+    const status = resolveAgyBackgroundSystemTerminalStatus(text);
     for (const match of text.matchAll(AGY_BACKGROUND_TASK_FINISHED_RE)) {
-      if (match[1]) ids.push(match[1]);
+      if (match[1]) results.push({ id: match[1], status });
     }
     for (const match of text.matchAll(AGY_BACKGROUND_TASK_SENDER_RE)) {
-      if (match[1]) ids.push(match[1]);
+      if (match[1]) results.push({ id: match[1], status });
     }
   }
   if (normalizeAgyToolName(opts.toolName ?? '') === 'managetask') {
     const input = asToolInputRecord(opts.toolInput);
     if (input?.Action === 'kill' && typeof input.TaskId === 'string' && opts.toolStatus !== 'error') {
-      ids.push(input.TaskId);
+      results.push({ id: input.TaskId, status: SDK_SUBAGENT_STATUS.INTERRUPTED });
     }
     for (const match of text.matchAll(AGY_MANAGE_TASK_TERMINAL_RE)) {
-      if (match[1]) ids.push(match[1]);
+      if (match[1]) results.push({ id: match[1], status: resolveAgyManageTaskTerminalStatus(match[2]) });
     }
   }
-  return ids;
+  return results;
 }
 
 interface AgyNativeOrderEntry {
