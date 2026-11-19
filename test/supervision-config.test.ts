@@ -17,6 +17,7 @@ import {
   DEFAULT_SUPERVISION_BACKEND,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+  getDefaultSupervisionModelForBackend,
   SUPERVISION_AUDIT_MODES,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
@@ -114,12 +115,18 @@ describe('supervision config helpers', () => {
     expect(getSessionSupervisionSnapshotIssues({ ...snapshot, uiLocale: 'fr' })).toContain('invalid_ui_locale');
   });
 
-  it('defaults automatic supervision and audit to Codex 5.3 Spark', () => {
+  it('defaults automatic supervision and audit to Codex gpt-6-luna without duplicating CODEX_MODEL_IDS', () => {
     const config = normalizeSupervisorDefaultConfig(null);
 
+    expect(DEFAULT_CODEX_AUTOMATION_MODEL).toBe('gpt-6-luna');
+    expect(CODEX_MODEL_IDS).toContain('gpt-6-luna');
+    expect(new Set(CODEX_MODEL_IDS).size).toBe(CODEX_MODEL_IDS.length);
     expect(DEFAULT_SUPERVISION_BACKEND).toBe('codex-sdk');
+    expect(getDefaultSupervisionModelForBackend('codex-sdk')).toBe('gpt-6-luna');
     expect(config.backend).toBe('codex-sdk');
+    expect(config.model).toBe('gpt-6-luna');
     expect(config.model).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+    expect(config.executionPools.state).toBe('legacy_unconfigured');
   });
 
   it('uses 30 seconds as both the default and minimum supervision timeout', () => {

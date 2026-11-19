@@ -1394,8 +1394,8 @@ export function normalizeSupervisorDefaultConfig(
     maxAutoContinueStreak: normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK),
     maxAutoContinueTotal: normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL),
     executionPools: migrateLegacySupervisionExecutionPools({
-      backend: normalizedBackend,
-      model,
+      backend: rawModel ? normalizedBackend : undefined,
+      model: rawModel ? model : undefined,
       executionPools: merged.executionPools,
     }),
     ...(merged.pairEngine === 'pairs' || merged.pairEngine === 'legacy' ? { pairEngine: merged.pairEngine } : {}),

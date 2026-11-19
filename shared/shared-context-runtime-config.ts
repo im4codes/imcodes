@@ -168,6 +168,22 @@ export function normalizeSharedContextPresetValue(
   return trimmed;
 }
 
+const DEPRECATED_CODEX_MODELS = new Set(['gpt-5.3-codex-spark']);
+
+function resolveNormalizedSharedContextModel(
+  backend: SharedContextRuntimeBackend,
+  rawModel: string | undefined,
+  preset: string | undefined,
+): string {
+  if (!rawModel || !isKnownSharedContextModelForBackend(backend, rawModel, preset)) {
+    return getDefaultSharedContextModelForBackend(backend);
+  }
+  if (backend === 'codex-sdk' && DEPRECATED_CODEX_MODELS.has(rawModel.toLowerCase())) {
+    return DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL;
+  }
+  return rawModel;
+}
+
 export interface OptionalSharedContextRuntimeSelection {
   backend?: SharedContextRuntimeBackend;
   model?: string;
@@ -190,9 +206,7 @@ export function normalizeOptionalSharedContextRuntimeSelection(input: {
   if (!backend) return {};
   const preset = normalizeSharedContextPresetValue(backend, input?.preset ?? undefined);
   const rawModel = trimModelValue(input?.model ?? undefined);
-  const model = rawModel && isKnownSharedContextModelForBackend(backend, rawModel, preset)
-    ? rawModel
-    : getDefaultSharedContextModelForBackend(backend);
+  const model = resolveNormalizedSharedContextModel(backend, rawModel, preset);
   return {
     backend,
     model,
@@ -208,9 +222,7 @@ export function normalizeSharedContextRuntimeConfig(
     ?? DEFAULT_PRIMARY_CONTEXT_BACKEND;
   const primaryContextPreset = normalizeSharedContextPresetValue(normalizedPrimaryBackend, input?.primaryContextPreset);
   const rawPrimaryContextModel = trimModelValue(input?.primaryContextModel);
-  const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel, primaryContextPreset)
-    ? rawPrimaryContextModel
-    : getDefaultSharedContextModelForBackend(normalizedPrimaryBackend);
+  const primaryContextModel = resolveNormalizedSharedContextModel(normalizedPrimaryBackend, rawPrimaryContextModel, primaryContextPreset);
   const hasBackupSelection = Boolean(
     input?.backupContextBackend?.trim()
       || input?.backupContextModel?.trim()

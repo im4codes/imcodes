@@ -66,7 +66,7 @@ describe('supervisor defaults cache', () => {
       model: 'qwen3-coder-plus',
       preset: 'Qwen Team',
       backupBackend: 'codex-sdk',
-      backupModel: 'gpt-5.3-codex-spark',
+      backupModel: 'gpt-6-luna',
       timeoutMs: 45_000,
     });
   });

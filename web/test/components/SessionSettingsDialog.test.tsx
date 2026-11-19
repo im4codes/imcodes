@@ -8,7 +8,6 @@ import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testi
 import {
   CLAUDE_CODE_MODEL_IDS,
   CODEX_MODEL_IDS,
-  DEFAULT_CODEX_AUTOMATION_MODEL,
 } from '../../../src/shared/models/options.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
@@ -1333,8 +1332,8 @@ describe('SessionSettingsDialog supervision', () => {
         peerAuditSessions={[makePeerAuditSession({
           sessionName: 'deck_sub_spark',
           label: 'Spark helper',
-          activeModel: DEFAULT_CODEX_AUTOMATION_MODEL,
-          requestedModel: DEFAULT_CODEX_AUTOMATION_MODEL,
+          activeModel: 'gpt-5.3-codex-spark',
+          requestedModel: 'gpt-5.3-codex-spark',
         })]}
         transportConfig={{
           supervision: {
@@ -1376,7 +1375,7 @@ describe('SessionSettingsDialog supervision', () => {
           supervision: expect.objectContaining({
             executionPools: expect.objectContaining({
               economyTaskPool: expect.objectContaining({
-                configs: [expect.objectContaining({ model: DEFAULT_CODEX_AUTOMATION_MODEL })],
+                configs: [expect.objectContaining({ model: 'gpt-5.3-codex-spark' })],
               }),
             }),
           }),

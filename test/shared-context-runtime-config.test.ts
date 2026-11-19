@@ -13,6 +13,7 @@ import {
   isKnownSharedContextModelForBackend,
   normalizeMemoryScoringWeights,
   normalizeMemoryRecallMinScore,
+  normalizeOptionalSharedContextRuntimeSelection,
   normalizeSharedContextRuntimeConfig,
 } from '../shared/shared-context-runtime-config.js';
 
@@ -293,5 +294,71 @@ describe('bare Codex backend in model field', () => {
     const result = normalizeSharedContextRuntimeConfig({ primaryContextBackend: backend, primaryContextModel: 'codex-sdk' });
     expect(result.primaryContextModel).toBe(getDefaultSharedContextModelForBackend(result.primaryContextBackend!));
     expect(result.primaryContextModel).not.toBe('codex-sdk');
+  });
+});
+
+describe('deprecated gpt-5.3-codex-spark migration', () => {
+  it.each(['gpt-5.3-codex-spark', 'GPT-5.3-CODEX-SPARK', ' gpt-5.3-codex-spark '])(
+    'coerces persisted %j on codex-sdk primary and backup context compression to gpt-6-luna',
+    (legacyModel) => {
+      const result = normalizeSharedContextRuntimeConfig({
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: legacyModel,
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: legacyModel,
+      });
+      expect(result.primaryContextBackend).toBe('codex-sdk');
+      expect(result.primaryContextModel).toBe('gpt-6-luna');
+      expect(result.backupContextBackend).toBe('codex-sdk');
+      expect(result.backupContextModel).toBe('gpt-6-luna');
+
+      expect(normalizeOptionalSharedContextRuntimeSelection({
+        backend: 'codex-sdk',
+        model: legacyModel,
+      })).toEqual({
+        backend: 'codex-sdk',
+        model: 'gpt-6-luna',
+      });
+    },
+  );
+
+  it('infers codex-sdk and coerces legacy spark when backend is omitted', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextModel: 'gpt-5.3-codex-spark',
+      backupContextModel: 'gpt-5.3-codex-spark',
+    });
+    expect(result.primaryContextBackend).toBe('codex-sdk');
+    expect(result.primaryContextModel).toBe('gpt-6-luna');
+    expect(result.backupContextBackend).toBe('codex-sdk');
+    expect(result.backupContextModel).toBe('gpt-6-luna');
+  });
+
+  it('preserves other valid codex-sdk models and non-codex-sdk backends', () => {
+    for (const model of ['gpt-6-luna', 'gpt-6-sol', 'gpt-5.4-mini']) {
+      expect(normalizeSharedContextRuntimeConfig({
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: model,
+      }).primaryContextModel).toBe(model);
+    }
+
+    expect(normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen3-coder-plus',
+    })).toMatchObject({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen3-coder-plus',
+    });
+
+    expect(normalizeOptionalSharedContextRuntimeSelection({
+      backend: 'openclaw',
+      model: 'gpt-5.3-codex-spark',
+    })).toEqual({
+      backend: 'openclaw',
+      model: 'gpt-5.3-codex-spark',
+    });
   });
 });
