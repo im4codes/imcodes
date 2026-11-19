@@ -2156,7 +2156,7 @@ html.native-ios-mac .chat-dl-btn {
 .menu-wrap { position: relative; }
 .menu-dropdown { position: absolute; bottom: calc(100% + 4px); right: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; width: max-content; min-width: 200px; max-width: calc(var(--imcodes-ui-vw, 100vw) - 16px); max-height: calc(var(--imcodes-ui-vh, 100vh) * 0.6); overflow-y: auto; box-shadow: 0 4px 16px #00000060; z-index: 50; }
 .menu-dropdown-auto { left: 0; right: auto; min-width: 168px; max-width: min(220px, calc(var(--imcodes-ui-vw, 100vw) - 24px)); }
-.menu-dropdown-models { width: max-content; min-width: min(200px, calc(var(--imcodes-ui-vw, 100vw) - 16px)); max-width: calc(var(--imcodes-ui-vw, 100vw) - 16px); z-index: 2147483646; }
+.menu-dropdown-models { width: max-content; min-width: min(200px, calc(var(--imcodes-ui-vw, 100vw) - 16px)); max-width: calc(var(--imcodes-ui-vw, 100vw) - 16px); max-height: min(calc(var(--imcodes-ui-vh, 100vh) * 0.55), calc(var(--vvh, var(--imcodes-ui-dvh, var(--imcodes-ui-vh, 100vh))) - max(var(--sat, 0px), env(safe-area-inset-top, 0px)) - env(safe-area-inset-bottom, 0px) - 24px)); z-index: 2147483646; }
 .menu-dropdown-models .menu-item,
 .menu-dropdown .menu-item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .menu-dropdown-openspec { width: max-content; min-width: min(380px, calc(var(--imcodes-ui-vw, 100vw) - 24px)); max-width: calc(var(--imcodes-ui-vw, 100vw) - 24px); overscroll-behavior: contain; display: flex; flex-direction: column; z-index: 2147483646; }

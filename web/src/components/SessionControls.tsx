@@ -72,6 +72,13 @@ import {
   type CloudDocReferenceItem,
 } from '../util/cloud-doc-reference.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
+import {
+  computeModelDropdownStyle,
+  readSafeAreaBottomPx,
+  readSafeAreaTopPx,
+} from '../util/model-dropdown-style.js';
+
+export { computeModelDropdownStyle };
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
@@ -4869,58 +4876,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
   }, [modelOpen]);
 
-  const modelDropdownStyle = useMemo((): React.CSSProperties | undefined => {
+  const modelDropdownStyle = useMemo((): JSX.CSSProperties | undefined => {
     if (!modelOpen || typeof window === 'undefined') return undefined;
     const trigger = modelButtonRef.current ?? modelRef.current;
     if (!trigger) return undefined;
     const rect = trigger.getBoundingClientRect();
-
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const horizontalInset = 8;
-    const verticalInset = 8;
-    const triggerGap = 4;
-
-    const rawAbove = Math.floor(rect.top - verticalInset);
-    const rawBelow = Math.floor(viewportHeight - rect.bottom - verticalInset);
-    const shouldOpenBelow = rawAbove < 180 && rawBelow > rawAbove;
-    const availableHeight = Math.max(96, shouldOpenBelow ? rawBelow : rawAbove);
-
-    const isRightHalf = rect.left + rect.width / 2 > viewportWidth / 2;
-
-    const style: React.CSSProperties = {
-      position: 'fixed',
-      zIndex: 2147483646,
-      width: 'max-content',
-      minWidth: `${Math.min(200, viewportWidth - horizontalInset * 2)}px`,
-      maxHeight: `${availableHeight}px`,
-      overflowY: 'auto',
-      overscrollBehavior: 'contain',
-    };
-
-    if (shouldOpenBelow) {
-      style.top = `${Math.max(horizontalInset, Math.round(rect.bottom + triggerGap))}px`;
-      style.bottom = 'auto';
-    } else {
-      style.bottom = `${Math.max(horizontalInset, Math.round(viewportHeight - rect.top + triggerGap))}px`;
-      style.top = 'auto';
-    }
-
-    if (isRightHalf) {
-      const rightOffset = Math.max(horizontalInset, viewportWidth - rect.right);
-      const maxAvailableWidth = Math.max(160, rect.right - horizontalInset);
-      style.right = `${Math.round(rightOffset)}px`;
-      style.left = 'auto';
-      style.maxWidth = `${Math.round(Math.min(maxAvailableWidth, viewportWidth - horizontalInset * 2))}px`;
-    } else {
-      const leftOffset = Math.max(horizontalInset, rect.left);
-      const maxAvailableWidth = Math.max(160, viewportWidth - leftOffset - horizontalInset);
-      style.left = `${Math.round(leftOffset)}px`;
-      style.right = 'auto';
-      style.maxWidth = `${Math.round(Math.min(maxAvailableWidth, viewportWidth - horizontalInset * 2))}px`;
-    }
-
-    return style;
+    const viewport = window.visualViewport;
+    return computeModelDropdownStyle(rect, {
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      visualViewportWidth: viewport?.width,
+      visualViewportHeight: viewport?.height,
+      visualViewportOffsetTop: viewport?.offsetTop,
+      safeAreaTop: readSafeAreaTopPx(),
+      safeAreaBottom: readSafeAreaBottomPx(),
+    });
   }, [modelLayoutTick, modelOpen]);
 
   const renderModelDropdown = useCallback((content: ComponentChildren) => {
