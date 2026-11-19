@@ -939,4 +939,170 @@ describe('keyboard-shortcuts core helpers', () => {
       isComposing: true,
     }, ['ctrl', 'shift'])).toBeNull();
   });
+
+  it('allows non-text input controls and non-modal aria-modal="false" dialogs while blocking text inputs and modals', () => {
+    const panel = document.createElement('div');
+    panel.className = 'floating-panel';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    const btnInput = document.createElement('input');
+    btnInput.type = 'button';
+    const rangeInput = document.createElement('input');
+    rangeInput.type = 'range';
+
+    const textInput = document.createElement('input');
+    textInput.type = 'text';
+    const searchInput = document.createElement('input');
+    searchInput.type = 'search';
+    const defaultInput = document.createElement('input');
+    const selectEl = document.createElement('select');
+    const textareaEl = document.createElement('textarea');
+
+    panel.append(checkbox, radio, btnInput, rangeInput, textInput, searchInput, defaultInput, selectEl, textareaEl);
+    document.body.appendChild(panel);
+
+    for (const nonText of [checkbox, radio, btnInput, rangeInput]) {
+      nonText.focus();
+      expect(canHandleGlobalNavigationShortcut(nonText, nonText, {
+        hasBlockingOverlay: false,
+        isMobile: false,
+        viewMode: 'chat',
+      })).toBe(true);
+    }
+
+    for (const textCtrl of [textInput, searchInput, defaultInput, selectEl, textareaEl]) {
+      textCtrl.focus();
+      expect(canHandleGlobalNavigationShortcut(textCtrl, textCtrl, {
+        hasBlockingOverlay: false,
+        isMobile: false,
+        viewMode: 'chat',
+      })).toBe(false);
+    }
+
+    const miniChatFloat = document.createElement('div');
+    miniChatFloat.className = 'cloud-docs-mini-chat';
+    miniChatFloat.setAttribute('role', 'dialog');
+    miniChatFloat.setAttribute('aria-modal', 'false');
+    const floatBtn = document.createElement('button');
+    miniChatFloat.appendChild(floatBtn);
+    panel.appendChild(miniChatFloat);
+    floatBtn.focus();
+    expect(canHandleGlobalNavigationShortcut(floatBtn, floatBtn, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+      viewMode: 'chat',
+    })).toBe(true);
+
+    const realModal = document.createElement('div');
+    realModal.setAttribute('role', 'dialog');
+    realModal.setAttribute('aria-modal', 'true');
+    document.body.appendChild(realModal);
+    expect(canHandleGlobalNavigationShortcut(floatBtn, floatBtn, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+      viewMode: 'chat',
+    })).toBe(false);
+
+    realModal.remove();
+    panel.remove();
+  });
+
+  it('resolves non-terminal .floating-panel focus to chat even with an open shell sub-session or terminal main mode, while keeping terminal/RD surfaces terminal', () => {
+    const floatingPanel = document.createElement('div');
+    floatingPanel.className = 'floating-panel';
+    const fbButton = document.createElement('button');
+    const fbCheckbox = document.createElement('input');
+    fbCheckbox.type = 'checkbox';
+    floatingPanel.append(fbButton, fbCheckbox);
+
+    const rdPanel = document.createElement('div');
+    rdPanel.className = 'remote-desktop-panel';
+    const rdBtn = document.createElement('button');
+    rdPanel.appendChild(rdBtn);
+    floatingPanel.appendChild(rdPanel);
+
+    const xtermWrap = document.createElement('div');
+    xtermWrap.className = 'xterm';
+    const xtermTa = document.createElement('textarea');
+    xtermTa.className = 'xterm-helper-textarea';
+    xtermWrap.appendChild(xtermTa);
+    floatingPanel.appendChild(xtermWrap);
+
+    const subWin = document.createElement('div');
+    subWin.className = 'subsession-window subsession-window-active';
+    subWin.setAttribute('data-subsession-id', 'sub-shell');
+    subWin.setAttribute('data-view-mode', 'terminal');
+    const subBtn = document.createElement('button');
+    subWin.appendChild(subBtn);
+
+    document.body.append(floatingPanel, subWin);
+
+    for (const el of [fbButton, fbCheckbox]) {
+      el.focus();
+      expect(resolveFocusedKeyboardViewMode({
+        target: el,
+        activeElement: el,
+        focusedSubId: 'sub-shell',
+        isFocusedSubOpen: true,
+        focusedSubType: 'shell',
+        focusedSubSessionName: 'deck_sub_shell',
+        inputRefs: new Map(),
+        fallbackMainViewMode: 'terminal',
+        doc: document,
+      })).toBe('chat');
+    }
+
+    // Focus inside .subsession-window[data-view-mode="terminal"] stays 'terminal'
+    subBtn.focus();
+    expect(resolveFocusedKeyboardViewMode({
+      target: subBtn,
+      activeElement: subBtn,
+      focusedSubId: 'sub-shell',
+      isFocusedSubOpen: true,
+      focusedSubType: 'shell',
+      focusedSubSessionName: 'deck_sub_shell',
+      inputRefs: new Map(),
+      fallbackMainViewMode: 'chat',
+      doc: document,
+    })).toBe('terminal');
+
+    // Focus inside .remote-desktop-panel or .xterm inside .floating-panel must NOT be promoted to 'chat'
+    rdBtn.focus();
+    expect(resolveFocusedKeyboardViewMode({
+      target: rdBtn,
+      activeElement: rdBtn,
+      focusedSubId: null,
+      isFocusedSubOpen: false,
+      inputRefs: new Map(),
+      fallbackMainViewMode: 'terminal',
+      doc: document,
+    })).toBe('terminal');
+    expect(canHandleGlobalNavigationShortcut(rdBtn, rdBtn, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+      viewMode: 'chat',
+    })).toBe(false);
+
+    xtermTa.focus();
+    expect(resolveFocusedKeyboardViewMode({
+      target: xtermTa,
+      activeElement: xtermTa,
+      focusedSubId: null,
+      isFocusedSubOpen: false,
+      inputRefs: new Map(),
+      fallbackMainViewMode: 'terminal',
+      doc: document,
+    })).toBe('terminal');
+    expect(canHandleGlobalNavigationShortcut(xtermTa, xtermTa, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+      viewMode: 'chat',
+    })).toBe(false);
+
+    floatingPanel.remove();
+    subWin.remove();
+  });
 });

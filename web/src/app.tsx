@@ -4736,6 +4736,7 @@ function InternalMainApp() {
   // Per-session input refs (chat input element in SessionPane) — used by global keyboard handler
   const inputRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
   const hasBlockingComposerOverlayRef = useRef(false);
+  const hasBlockingNavigationOverlayRef = useRef(false);
   const termFocusFnsRef = useRef<Map<string, () => void>>(new Map());
   const termFitFnsRef = useRef<Map<string, () => void>>(new Map());
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());
@@ -7827,6 +7828,23 @@ function InternalMainApp() {
       ],
     },
   ], []);
+  const hasBlockingNavigationOverlay = showNewUserGuidePrompt
+    || showNewUserGuide
+    || showNewSession
+    || showSubDialog
+    || showDiscussionDialog
+    || showSettingsPage
+    || showUsageSummaryPage
+    || showAdminPage
+    || showMobileFileBrowser
+    || settingsTarget !== null
+    || cloneSessionTarget !== null
+    || shareDialogTarget !== null
+    || deleteTarget !== null
+    || renameRequest !== null
+    || pendingQuestion !== null
+    || pendingSharedPayload !== null
+    || appUpdateNotice?.required === true;
   const featureAnnouncementBlocked = showNewUserGuidePrompt
     || showNewUserGuide
     || showNewSession
@@ -7947,6 +7965,7 @@ function InternalMainApp() {
   const returnToMainWindowRef = useRef(returnToMainWindow);
   returnToMainWindowRef.current = returnToMainWindow;
   hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
+  hasBlockingNavigationOverlayRef.current = hasBlockingNavigationOverlay;
   const hasBlockingMobileGestureOverlayRef = useRef(false);
   hasBlockingMobileGestureOverlayRef.current = hasBlockingComposerOverlay
     || mobileSidebarOpen
@@ -8004,6 +8023,14 @@ function InternalMainApp() {
       } else {
         void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
         setTimeout(() => {
+          if (
+            isMobileRef.current
+            || hasBlockingComposerOverlayRef.current
+            || hasDomBlockingOverlay()
+            || viewModeNavRef.current !== 'chat'
+          ) {
+            return;
+          }
           const activeSession = activeSessionRef.current;
           if (activeSession) {
             const el = inputRefsMap.current.get(activeSession);
@@ -8100,7 +8127,7 @@ function InternalMainApp() {
       });
 
       if (!canHandleGlobalNavigationShortcut(e.target, document.activeElement, {
-        hasBlockingOverlay: hasBlockingComposerOverlayRef.current,
+        hasBlockingOverlay: hasBlockingNavigationOverlayRef.current,
         isMobile,
         isComposing: isImeComposingKeyEvent(e),
         viewMode: targetViewMode,

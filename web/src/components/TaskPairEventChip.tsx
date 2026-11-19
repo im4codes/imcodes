@@ -296,6 +296,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       id={hoverPreviewId}
       class="task-pair-card-hover-preview"
       role="dialog"
+      aria-modal="false"
       tabIndex={-1}
       aria-label={title}
       onFocusIn={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}

@@ -827,7 +827,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
         Aa
       </button>
       {open && (
-        <div ref={popRef} data-testid="font-prefs-popover" style={popStyle} role="dialog" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
+        <div ref={popRef} data-testid="font-prefs-popover" style={popStyle} role="dialog" aria-modal="false" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
           {/* Row 0 — whole-page UI scale (− 100% +), scales chrome, icons, cards, modals, and text uniformly. */}
           <div style={sizeRowStyle} role="group" aria-label={t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}>
             <span style={sizeRowLabelStyle}>{t('chat.font.uiScaleLabel', { defaultValue: 'UI scale' })}</span>

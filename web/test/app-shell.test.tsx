@@ -1010,8 +1010,8 @@ vi.mock('../src/components/ServerContextMenu.js', () => ({
   ),
 }));
 vi.mock('../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: ({ children, id, zIndex, onClose, onFocus, onPin, onToggleMaximized }: any) => (
-    <div data-testid={`floating-panel-${id}`} style={{ zIndex }}>
+  FloatingPanel: ({ children, id, className, zIndex, onClose, onFocus, onPin, onToggleMaximized }: any) => (
+    <div className={['floating-panel', className].filter(Boolean).join(' ')} data-testid={`floating-panel-${id}`} style={{ zIndex }}>
       floating-panel
       <button onClick={onFocus}>floating-focus</button>
       <button onClick={onPin}>floating-pin</button>
@@ -9411,6 +9411,181 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(chatNavEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
     } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('allows Alt+IKJL tab/server navigation, Ctrl+1 quick sub-session, and Ctrl+Shift+1 pair split while non-modal desktop FloatingPanel windows are open without stealing focus, while keeping modals/recording/xterm/text-inputs blocked', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-shell-bg',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_shell_bg',
+        parentSession: 'deck_alpha_brain',
+        label: 'Shell BG',
+        type: 'shell',
+        state: 'idle',
+        viewMode: 'terminal',
+      },
+      {
+        id: 'sub-chat-fg',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_chat_fg',
+        parentSession: 'deck_alpha_brain',
+        label: 'Chat FG',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    clearAllSupervisionTaskConsoleCaches();
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Open background shell sub-session first, then open non-modal desktop file browser FloatingPanel
+      fireEvent.click(screen.getByText('subbar-open-sub-shell-bg'));
+      expect((await screen.findByTestId('sub-session-window-sub-shell-bg')).getAttribute('data-visible')).toBe('true');
+
+      fireEvent.click(screen.getByTitle('picker.files'));
+      const fbPanel = await screen.findByTestId('floating-panel-filebrowser');
+      const fbButton = within(fbPanel).getByText('file-confirm');
+      const fbCheckbox = document.createElement('input');
+      fbCheckbox.type = 'checkbox';
+      fbPanel.appendChild(fbCheckbox);
+
+      // 1) Focus inside FloatingPanel button -> Alt+l switches tab without stealing focus back to underlying composer
+      fbButton.focus();
+      expect(document.activeElement).toBe(fbButton);
+      const tabNextEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      fbButton.dispatchEvent(tabNextEvt);
+      expect(tabNextEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(document.activeElement).toBe(fbButton);
+
+      // 2) Focus on non-text checkbox inside FloatingPanel -> Alt+j switches tab back without stealing focus
+      fbCheckbox.focus();
+      const tabPrevEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      fbCheckbox.dispatchEvent(tabPrevEvt);
+      expect(tabPrevEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(document.activeElement).toBe(fbCheckbox);
+
+      // 3) Quick sub-session Ctrl+2 and pair split Ctrl+Shift+1 work while FloatingPanel is open
+      const quickSub2 = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      fbButton.focus();
+      fbButton.dispatchEvent(quickSub2);
+      expect(quickSub2.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-chat-fg').getAttribute('data-visible')).toBe('true'));
+
+      await waitFor(() => {
+        expect((window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot?.authorityUnavailable).toBe(true);
+      });
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+        authoritative: true,
+        serverId: 'srv-1',
+        tasks: [
+          { taskId: 'task-fg-1', title: 'FG Split', status: 'working', updatedAt: 10, pair: { status: 'working', executor: 'deck_sub_shell_bg', auditor: 'deck_sub_chat_fg' } },
+        ],
+      };
+
+      fbButton.focus();
+      const pairSplitEvt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      fbButton.dispatchEvent(pairSplitEvt);
+      expect(pairSplitEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-shell-bg').getAttribute('data-task-pair-visit')).toBe('task-fg-1');
+        expect(screen.getByTestId('sub-session-window-sub-chat-fg').getAttribute('data-visible')).toBe('true');
+      });
+
+      // Focus inside .xterm still blocks Alt+l even while FloatingPanel is open
+      const xtermWrap = document.createElement('div');
+      xtermWrap.className = 'xterm';
+      const xtermTa = document.createElement('textarea');
+      xtermTa.className = 'xterm-helper-textarea';
+      xtermWrap.appendChild(xtermTa);
+      document.body.appendChild(xtermWrap);
+      xtermTa.focus();
+      const xtermBlockedEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      xtermTa.dispatchEvent(xtermBlockedEvt);
+      expect(xtermBlockedEvt.defaultPrevented).toBe(false);
+      xtermWrap.remove();
+
+      // Minimize open sub-sessions and close file browser, then test account-level FloatingPanel (ControlledNodes) across server switch:
+      // Alt+k switches server while keeping focus inside the open FloatingPanel without stealing focus to underlying composer
+      fbButton.focus();
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-shell-bg').getAttribute('data-visible')).toBe('false'));
+      fireEvent.click(within(fbPanel).getByText('file-close'));
+      await waitFor(() => expect(screen.queryByTestId('floating-panel-filebrowser')).toBeNull());
+
+      fireEvent.click(screen.getByText('controlled_nodes.title'));
+      const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      const nodesActionBtn = within(nodesPanel).getByText('controlled-nodes-panel');
+      nodesActionBtn.focus();
+      expect(document.activeElement).toBe(nodesActionBtn);
+
+      const srvNextEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      nodesActionBtn.dispatchEvent(srvNextEvt);
+      expect(srvNextEvt.defaultPrevented).toBe(true);
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      expect(screen.getByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+      expect(document.activeElement).not.toBe(deltaComposer);
+
+      // 5) Real text input inside FloatingPanel, active shortcut recording, and real modal dialogs still block shortcuts
+      const panelTextInput = document.createElement('input');
+      panelTextInput.type = 'text';
+      nodesPanel.appendChild(panelTextInput);
+      panelTextInput.focus();
+      const blockedTextEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      panelTextInput.dispatchEvent(blockedTextEvt);
+      expect(blockedTextEvt.defaultPrevented).toBe(false);
+      expect(localStorage.getItem('rcc_server')).toBe('srv-2');
+      panelTextInput.remove();
+
+      const recorderEl = document.createElement('button');
+      recorderEl.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorderEl);
+      nodesActionBtn.focus();
+      const blockedRecEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      nodesActionBtn.dispatchEvent(blockedRecEvt);
+      expect(blockedRecEvt.defaultPrevented).toBe(false);
+      recorderEl.remove();
+
+      // Real modal (New Session dialog) still blocks shortcuts
+      fireEvent.click(screen.getByText('tabs-new-session'));
+      const modalEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(modalEvt);
+      expect(modalEvt.defaultPrevented).toBe(false);
+      expect(localStorage.getItem('rcc_server')).toBe('srv-2');
+      fireEvent.click(screen.getByText('new-session-close'));
+
+      // 6) Close FloatingPanel -> Alt+i switches back to srv-1 and focuses composer stably
+      fireEvent.click(within(nodesPanel).getByText('floating-close'));
+      await waitFor(() => expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull());
+      const mainBtn = screen.getByText('server-toggle-sidebar');
+      mainBtn.focus();
+      const srvPrevEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      mainBtn.dispatchEvent(srvPrevEvt);
+      expect(srvPrevEvt.defaultPrevented).toBe(true);
+      const backToAlphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(backToAlphaComposer), { timeout: 1000 });
+    } finally {
+      clearAllSupervisionTaskConsoleCaches();
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
   }, 15000);

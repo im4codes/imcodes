@@ -224,6 +224,7 @@ export function CloudDocsMainChatFloat({
         <div
           class="cloud-docs-mini-chat"
           role="dialog"
+          aria-modal="false"
           aria-label={t('cloud_docs.ai_chat.title', { session: sessionDisplayName })}
           data-testid="cloud-docs-mini-chat"
         >

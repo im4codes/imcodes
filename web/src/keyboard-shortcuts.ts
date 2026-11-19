@@ -742,6 +742,19 @@ function isBlockingDomContextForElement(el: Element | null): boolean {
   return false;
 }
 
+const NON_TEXT_INPUT_TYPES = new Set([
+  'button',
+  'checkbox',
+  'color',
+  'file',
+  'hidden',
+  'image',
+  'radio',
+  'range',
+  'reset',
+  'submit',
+]);
+
 function isDisallowedEditableOrFormElement(el: Element | null): boolean {
   if (!el) return false;
   const htmlEl = el as HTMLElement;
@@ -749,7 +762,11 @@ function isDisallowedEditableOrFormElement(el: Element | null): boolean {
   // because auto-focus places focus there by default.
   if (isComposerInputElement(htmlEl)) return false;
   const tag = htmlEl.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') {
+    const inputType = ((htmlEl as HTMLInputElement).type || htmlEl.getAttribute?.('type') || 'text').trim().toLowerCase();
+    return !NON_TEXT_INPUT_TYPES.has(inputType);
+  }
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
   const contentEditableAttr = htmlEl.getAttribute?.('contenteditable');
   const contentEditableProp = htmlEl.contentEditable;
   if (
@@ -844,6 +861,21 @@ export function canHandleReturnToMainWindowShortcut(
   return true;
 }
 
+function isTerminalOrRemoteSurfaceElement(el: Element | null): boolean {
+  if (!el || typeof (el as HTMLElement).closest !== 'function') return false;
+  return Boolean((el as HTMLElement).closest('.xterm, .xterm-helper-textarea, .remote-desktop-panel, .remote-desktop-canvas, [data-remote-desktop-surface="true"]'));
+}
+
+function isFocusedNonTerminalFloatingPanelElement(el: Element | null): boolean {
+  if (!el || typeof (el as HTMLElement).closest !== 'function') return false;
+  const htmlEl = el as HTMLElement;
+  if (!htmlEl.closest('.floating-panel')) return false;
+  if (htmlEl.closest('.subsession-window') || isTerminalOrRemoteSurfaceElement(htmlEl)) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Authoritatively resolve whether keyboard handling (navigation shortcuts or key passthrough)
  * targets `'terminal'` or `'chat'`, preventing a focused terminal sub-session window from
@@ -877,6 +909,14 @@ export function resolveFocusedKeyboardViewMode(options: {
   const directMode = domSubWin?.getAttribute('data-view-mode');
   if (directMode === 'terminal' || directMode === 'chat') {
     return directMode;
+  }
+
+  if (
+    !isTerminalOrRemoteSurfaceElement(targetEl)
+    && !isTerminalOrRemoteSurfaceElement(activeElement)
+    && (isFocusedNonTerminalFloatingPanelElement(targetEl) || isFocusedNonTerminalFloatingPanelElement(activeElement))
+  ) {
+    return 'chat';
   }
 
   if (focusedSubId && isFocusedSubOpen) {
