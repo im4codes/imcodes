@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { buildAttachmentDownloadUrl } from '../api.js';
 import { forgetAttachmentPreview, getAttachmentPreview, isPreviewableImageName } from '../attachment-preview-cache.js';
 import { ATTACHMENT_PREVIEW_CHROME, ATTACHMENT_PREVIEW_MARGIN_PX, attachmentPreviewLeft, attachmentPreviewSize } from '../attachment-preview-size.js';
+import { isHoverPreviewSuppressed, onHoverPreviewSuppressed } from '../hover-preview-gate.js';
 import { ImageLightbox } from './ImageLightbox.js';
 import { sanitizeUploadFilename } from '@shared/upload-filename.js';
 
@@ -57,10 +58,6 @@ export function ComposerAttachmentBadge({
   const [natural, setNatural] = useState<{ src: string; width: number; height: number } | null>(null);
   const [lightbox, setLightbox] = useState(false);
 
-  useEffect(() => () => {
-    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
-  }, []);
-
   // Resolve a source lazily: the local object URL if we still have one, else
   // the authenticated download URL of the uploaded file.
   const ensureSource = () => {
@@ -96,12 +93,22 @@ export function ComposerAttachmentBadge({
     setHover(null);
   };
 
+  useEffect(() => {
+    const unsubscribe = onHoverPreviewSuppressed(cancelHover);
+    return () => {
+      unsubscribe();
+      if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+    };
+  }, []);
+
   const onPointerEnter = (event: PointerEvent) => {
+    if (isHoverPreviewSuppressed()) return;
     // Touch has no hover; a tap opens the full preview instead.
     if (!isImage || event.pointerType !== 'mouse') return;
     ensureSource();
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
     hoverTimerRef.current = setTimeout(() => {
+      hoverTimerRef.current = null;
       const rect = badgeRef.current?.getBoundingClientRect();
       if (!rect) return;
       setHover({ left: rect.left, bottom: window.innerHeight - rect.top + POPOVER_GAP_PX, viewport: { width: window.innerWidth, height: window.innerHeight } });
@@ -123,6 +130,7 @@ export function ComposerAttachmentBadge({
         title={`#${seq} ${path}`}
         data-attachment-seq={seq}
         onPointerEnter={onPointerEnter}
+        onPointerMove={(event: PointerEvent) => { if (!hover && !hoverTimerRef.current) onPointerEnter(event); }}
         onPointerLeave={cancelHover}
       >
         {/*

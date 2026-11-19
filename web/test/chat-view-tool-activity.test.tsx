@@ -728,6 +728,40 @@ describe('ChatView compact tool activity', () => {
     expect(container.querySelector('.chat-tool-activity-details')).not.toBeNull();
   });
 
+  it('closes open peek and suppresses pointer reopening on shortcut switch until mouse moves to a new coordinate, while keeping focus accessible', async () => {
+    const { suppressHoverPreviewsUntilPointerMove, resetHoverPreviewGateForTests } = await import('../src/hover-preview-gate.js');
+    resetHoverPreviewGateForTests();
+    stubHover(true);
+    const call = makeEvent('gate-call', 'tool.call', { tool: 'Bash', input: { command: 'ls' } }, 1);
+    const result = makeEvent('gate-result', 'tool.result', { output: 'ok' }, 2);
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+    const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+
+    // Initial pointer position and open peek.
+    act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200, clientY: 300 })); });
+    fireEvent.mouseEnter(chip);
+    expect(document.querySelector('.chat-tool-peek')).not.toBeNull();
+
+    // Shortcut switch immediately closes existing peek and blocks mouseenter / same-coordinate mousemove.
+    act(() => { suppressHoverPreviewsUntilPointerMove(); });
+    expect(document.querySelector('.chat-tool-peek')).toBeNull();
+
+    fireEvent.mouseEnter(chip, { clientX: 200, clientY: 300 });
+    fireEvent.mouseMove(chip, { clientX: 200, clientY: 300 });
+    expect(document.querySelector('.chat-tool-peek')).toBeNull();
+
+    // Keyboard focus remains accessible even while pointer hover is suppressed.
+    act(() => { chip.focus(); });
+    expect(document.querySelector('.chat-tool-peek')).not.toBeNull();
+    act(() => { chip.blur(); });
+    expect(document.querySelector('.chat-tool-peek')).toBeNull();
+
+    // Moving the mouse inside the chip (without leaving first) re-opens peek once coordinates change.
+    fireEvent.mouseMove(chip, { clientX: 204, clientY: 300 });
+    expect(document.querySelector('.chat-tool-peek')).not.toBeNull();
+    resetHoverPreviewGateForTests();
+  });
+
   it('renders compact tool descriptor with tool name, long command input, and duration on mobile viewports', () => {
     const call = makeEvent(
       'long-cmd-call',

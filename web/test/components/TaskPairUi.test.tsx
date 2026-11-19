@@ -134,6 +134,63 @@ describe('TaskPairEventChip', () => {
     vi.useRealTimers();
   });
 
+  it('closes open preview and suppresses pointer hover on shortcut navigation until real pointer move without resetting open debounce', async () => {
+    const { suppressHoverPreviewsUntilPointerMove, resetHoverPreviewGateForTests } = await import('../../src/hover-preview-gate.js');
+    resetHoverPreviewGateForTests();
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-gate" payload={{
+      taskId: 'gate-task', title: 'Gated hover task', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    const trigger = card.querySelector('.task-pair-title-preview-trigger')!;
+    const icon = card.querySelector('.task-pair-title-preview-icon')!;
+
+    act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 300, clientY: 120 })); });
+    fireEvent.pointerEnter(trigger, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(180));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
+
+    // Shortcut suppresses and immediately closes the open preview.
+    act(() => { suppressHoverPreviewsUntilPointerMove(); });
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+
+    const dispatchPointerMove = (el: Element, clientX: number, clientY: number, pointerType = 'mouse') => {
+      const build = (type: string) => {
+        const evt = new MouseEvent(type, { bubbles: true, clientX, clientY }) as MouseEvent & { pointerType?: string };
+        Object.defineProperty(evt, 'pointerType', { value: pointerType, configurable: true });
+        return evt;
+      };
+      act(() => {
+        if ('onpointermove' in el) {
+          el.dispatchEvent(build('pointermove'));
+        } else {
+          el.dispatchEvent(build('pointermove'));
+          el.dispatchEvent(build('PointerMove'));
+        }
+      });
+    };
+
+    // pointerEnter and same-coordinate pointerMove on both title and icon stay blocked.
+    fireEvent.pointerEnter(trigger, { pointerType: 'mouse' });
+    dispatchPointerMove(trigger, 300, 120);
+    fireEvent.pointerEnter(icon, { pointerType: 'mouse' });
+    dispatchPointerMove(icon, 300, 120);
+    act(() => vi.advanceTimersByTime(250));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+
+    // Real pointer movement on the icon schedules hover preview; a second move does not reset the 180ms timer.
+    dispatchPointerMove(icon, 305, 120);
+    act(() => vi.advanceTimersByTime(150));
+    dispatchPointerMove(icon, 306, 120);
+    act(() => vi.advanceTimersByTime(30));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
+
+    restoreMatchMedia();
+    resetHoverPreviewGateForTests();
+    vi.useRealTimers();
+  });
+
   it('keeps the click/keyboard expansion path explicitly accessible', () => {
     const { container } = render(<TaskPairEventChip eventId="e-focus" payload={{
       taskId: 'focus-task', title: 'Keyboard task', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',

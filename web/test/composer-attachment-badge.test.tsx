@@ -29,12 +29,26 @@ const base = { seq: 1, name: 'image.png', path: '/tmp/up/image.png', removing: f
 // `onpointerenter` property; older jsdom builds do not, and it then listens for
 // the literal `PointerEnter`. Real browsers always have it, so dispatch
 // whichever name this environment is listening on.
-function firePointer(el: Element, base: 'enter' | 'leave', pointerType: string) {
+function firePointer(el: Element, base: 'enter' | 'leave' | 'move', pointerType: string, clientX?: number, clientY?: number) {
   const name = `pointer${base}`;
-  const eventName = `on${name}` in el ? name : `Pointer${base === 'enter' ? 'Enter' : 'Leave'}`;
-  const event = new Event(eventName, { bubbles: false }) as Event & { pointerType?: string };
-  event.pointerType = pointerType;
-  act(() => { el.dispatchEvent(event); });
+  const fallback = `Pointer${base[0]!.toUpperCase()}${base.slice(1)}`;
+  const build = (type: string) => {
+    const event = new MouseEvent(type, {
+      bubbles: base === 'move',
+      clientX: clientX ?? 0,
+      clientY: clientY ?? 0,
+    }) as MouseEvent & { pointerType?: string };
+    Object.defineProperty(event, 'pointerType', { value: pointerType, configurable: true });
+    return event;
+  };
+  act(() => {
+    if (`on${name}` in el) {
+      el.dispatchEvent(build(name));
+    } else {
+      if (base === 'move') el.dispatchEvent(build(name));
+      el.dispatchEvent(build(fallback));
+    }
+  });
 }
 const enter = (el: Element, pointerType: string) => firePointer(el, 'enter', pointerType);
 
@@ -383,5 +397,41 @@ describe('ComposerAttachmentBadge', () => {
       expect(sizes[0]).not.toBe(sizes[1]);
       expect(Number.parseFloat(sizes[0]!)).toBeGreaterThan(1200);
     });
+  });
+
+  it('closes active preview and suppresses pointer hover after shortcut navigation until real pointer coordinate change without resetting debounce', async () => {
+    const { suppressHoverPreviewsUntilPointerMove, resetHoverPreviewGateForTests } = await import('../src/hover-preview-gate.js');
+    resetHoverPreviewGateForTests();
+    rememberAttachmentPreview(base.path, new File(['x'], 'image.png', { type: 'image/png' }));
+    const { container } = render(<ComposerAttachmentBadge {...base} />);
+    const badge = container.querySelector('.attachment-badge')!;
+
+    act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 80, clientY: 90 })); });
+    enter(badge, 'mouse');
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(document.querySelector('.attachment-hover-preview')).not.toBeNull();
+
+    // Shortcut suppresses & closes active preview.
+    act(() => { suppressHoverPreviewsUntilPointerMove(); });
+    expect(document.querySelector('.attachment-hover-preview')).toBeNull();
+
+    // Synthetic pointerenter and same-coord pointermove must not schedule or open preview.
+    enter(badge, 'mouse');
+    firePointer(badge, 'move', 'mouse', 80, 90);
+    act(() => { vi.advanceTimersByTime(250); });
+    expect(document.querySelector('.attachment-hover-preview')).toBeNull();
+
+    // Touch pointermove must not lift suppression.
+    firePointer(badge, 'move', 'touch', 85, 95);
+    act(() => { vi.advanceTimersByTime(250); });
+    expect(document.querySelector('.attachment-hover-preview')).toBeNull();
+
+    // Real pointer move inside badge schedules hover preview, and a consecutive move does not reset the 140ms timer.
+    firePointer(badge, 'move', 'mouse', 82, 90);
+    act(() => { vi.advanceTimersByTime(100); });
+    firePointer(badge, 'move', 'mouse', 83, 90);
+    act(() => { vi.advanceTimersByTime(45); });
+    expect(document.querySelector('.attachment-hover-preview')).not.toBeNull();
+    resetHoverPreviewGateForTests();
   });
 });

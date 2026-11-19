@@ -4,6 +4,7 @@ import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@share
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
+import { isHoverPreviewSuppressed, onHoverPreviewSuppressed } from '../hover-preview-gate.js';
 import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
@@ -193,6 +194,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const scheduleHoverPreview = (pointerType?: string) => {
     // Only the shrink-wrapped title/icon calls this. Keyboard preview is an
     // explicit shortcut, never a side effect of mouse/touch focus.
+    if (isHoverPreviewSuppressed()) return;
     if (pointerType && pointerType !== 'mouse' && pointerType !== 'pen') return;
     if (!supportsDesktopHover()) return;
     keyboardPreviewRef.current = false;
@@ -224,7 +226,13 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     focusPreviewRef.current = true;
     setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
   };
-  useEffect(() => () => clearHoverTimers(), []);
+  useEffect(() => {
+    const unsubscribe = onHoverPreviewSuppressed(closeHoverPreview);
+    return () => {
+      unsubscribe();
+      clearHoverTimers();
+    };
+  }, []);
   useEffect(() => { closeHoverPreview(); }, [eventId, taskId, expanded]);
   useEffect(() => {
     if (hoverPreviewAnchor && focusPreviewRef.current) {
@@ -383,11 +391,15 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           </span>
           <span class="task-pair-chip-task" title={title}>
             <svg class="task-pair-title-preview-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"
-              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)} onPointerLeave={scheduleHoverPreviewClose}>
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)}
+              onPointerMove={(pointer) => { if (!hoverPreviewAnchor && !hoverOpenTimerRef.current) scheduleHoverPreview(pointer.pointerType); }}
+              onPointerLeave={scheduleHoverPreviewClose}>
               <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" />
             </svg>
             <strong class="task-pair-title-preview-trigger"
-              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)} onPointerLeave={scheduleHoverPreviewClose}>{title}</strong>
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)}
+              onPointerMove={(pointer) => { if (!hoverPreviewAnchor && !hoverOpenTimerRef.current) scheduleHoverPreview(pointer.pointerType); }}
+              onPointerLeave={scheduleHoverPreviewClose}>{title}</strong>
           </span>
           {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
         </button>

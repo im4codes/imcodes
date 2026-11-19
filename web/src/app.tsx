@@ -1,5 +1,6 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
 import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
+import { suppressHoverPreviewsUntilPointerMove } from './hover-preview-gate.js';
 import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
 import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '@shared/desktop-setup-auth.js';
 import { focusComposerElement } from './util/composer-focus.js';
@@ -8189,12 +8190,14 @@ function InternalMainApp() {
       const shortcutKeycaps = formatShortcutKeycaps(matched.chord, isMacPlatform());
       if (matched.action === 'serverPrev' || matched.action === 'serverNext') {
         if (!navigateServerByStep(matched.action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;
+        suppressHoverPreviewsUntilPointerMove();
         e.preventDefault();
         e.stopPropagation();
         return;
       }
 
       if (!navigateTabByStep(matched.action === 'tabNext' ? 1 : -1, shortcutKeycaps)) return;
+      suppressHoverPreviewsUntilPointerMove();
       e.preventDefault();
       e.stopPropagation();
     };

@@ -8585,9 +8585,20 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       gammaComposer.focus();
 
       // Alt+l from inside .controls-input switches to next visual tab (deck_beta_brain) & calls preventDefault()
+      const { isHoverPreviewSuppressed } = await import('../src/hover-preview-gate.js');
+      expect(isHoverPreviewSuppressed()).toBe(false);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 400, clientY: 220 })); });
+
       const rightEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
       gammaComposer.dispatchEvent(rightEvt);
       expect(rightEvt.defaultPrevented).toBe(true);
+      expect(isHoverPreviewSuppressed()).toBe(true);
+
+      // Same-coordinate synthetic move after tab switch keeps suppression active until pointer moves.
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 400, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(true);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 402, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(false);
 
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
       const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
@@ -8597,13 +8608,19 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const leftEvt = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
       betaComposer.dispatchEvent(leftEvt);
       expect(leftEvt.defaultPrevented).toBe(true);
+      expect(isHoverPreviewSuppressed()).toBe(true);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 403, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(false);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
       await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
 
-      // Alt+k switches to next server (srv-2 -> deck_delta_brain) and auto-focuses its composer
+      // Alt+k switches to next server (srv-2 -> deck_delta_brain), auto-focuses its composer, and suppresses hover previews
       const downEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
       gammaComposer.dispatchEvent(downEvt);
       expect(downEvt.defaultPrevented).toBe(true);
+      expect(isHoverPreviewSuppressed()).toBe(true);
+      act(() => { window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 404, clientY: 220 })); });
+      expect(isHoverPreviewSuppressed()).toBe(false);
 
       const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
       await waitFor(() => expect(document.activeElement).toBe(deltaComposer));

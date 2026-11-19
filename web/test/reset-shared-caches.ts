@@ -21,4 +21,8 @@ export async function resetWebSharedCachesForTests(): Promise<void> {
     const { __resetMessagePinNavigationForTests } = await import('../src/message-pin-navigation.js');
     __resetMessagePinNavigationForTests();
   } catch { /* optional */ }
+  try {
+    const { resetHoverPreviewGateForTests } = await import('../src/hover-preview-gate.js');
+    resetHoverPreviewGateForTests();
+  } catch { /* optional */ }
 }

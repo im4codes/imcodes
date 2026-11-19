@@ -1,4 +1,5 @@
 import { createTimelineDisplayProjectionCache } from '../timeline/display-projection-cache.js';
+import { isHoverPreviewSuppressed, onHoverPreviewSuppressed } from '../hover-preview-gate.js';
 import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
 import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker, placeHistoryGapMarker } from './chat-history-gap.js';
 import {
@@ -5781,10 +5782,13 @@ function ToolActivitySummary({
   // through this gate: a no-hover device can still have a keyboard, and gating
   // focus on hover capability made the panel unreachable for those users.
   const openPeekFromPointer = (element: HTMLElement | null) => {
+    if (isHoverPreviewSuppressed()) return;
     if (typeof window !== 'undefined' && window.matchMedia
       && !window.matchMedia('(hover: hover)').matches) return;
     openPeek(element);
   };
+
+  useEffect(() => onHoverPreviewSuppressed(closePeek), []);
 
   // The anchor is a viewport rect and the panel is `position: fixed`, so any
   // scroll invalidates it. Re-measure instead of drifting; drop the peek if the
@@ -5824,6 +5828,7 @@ function ToolActivitySummary({
         aria-label={`${summary}. ${action}`}
         {...(peekAnchor && last ? { 'aria-describedby': peekId } : {})}
         onMouseEnter={(e) => openPeekFromPointer(e.currentTarget as HTMLElement)}
+        onMouseMove={(e) => { if (!peekAnchor) openPeekFromPointer(e.currentTarget as HTMLElement); }}
         onMouseLeave={closePeek}
         onFocus={(e) => openPeek(e.currentTarget as HTMLElement)}
         onBlur={closePeek}
