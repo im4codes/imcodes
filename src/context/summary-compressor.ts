@@ -815,12 +815,12 @@ ${serializedEvents}`);
 
 // ── Provider send with completion wait ───────────────────────────────────────
 
-// MiniMax/Qwen-compatible endpoints can legitimately take longer than the
-// 20s budget when producing a structured summary. Keep the lane bounded, but
-// make the timeout configurable so field recovery can extend it without a code
-// change. The default is deliberately higher than the old 20s value while still
-// finite so a wedged provider cannot pin daemon shutdown/upgrade indefinitely.
-const DEFAULT_COMPRESSION_TIMEOUT_MS = 60_000;
+// MiniMax/Qwen-compatible endpoints can legitimately take well over 60s when
+// producing a structured summary. Default to 240s (4 minutes) globally so
+// deployments need no extra env configuration, while still allowing
+// IMCODES_COMPRESSION_TIMEOUT_MS to extend up to 10 minutes (bounded so a
+// wedged provider cannot pin daemon shutdown/upgrade indefinitely).
+const DEFAULT_COMPRESSION_TIMEOUT_MS = 240_000;
 const MIN_COMPRESSION_TIMEOUT_MS = 5_000;
 const MAX_COMPRESSION_TIMEOUT_MS = 10 * 60_000;
 

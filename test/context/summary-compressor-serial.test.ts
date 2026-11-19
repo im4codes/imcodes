@@ -90,11 +90,17 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     resetActiveCompressionRunsForTests();
   });
 
-  it('uses an extended configurable compression timeout for slow MiniMax/Qwen-style providers', async () => {
+  it('defaults to 240s globally and allows extending via IMCODES_COMPRESSION_TIMEOUT_MS up to 10m', async () => {
     const { getCompressionTimeoutMs } = await import('../../src/context/summary-compressor.js');
 
     delete process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
-    expect(getCompressionTimeoutMs()).toBe(60_000);
+    expect(getCompressionTimeoutMs()).toBe(240_000);
+
+    process.env.IMCODES_COMPRESSION_TIMEOUT_MS = '   ';
+    expect(getCompressionTimeoutMs()).toBe(240_000);
+
+    process.env.IMCODES_COMPRESSION_TIMEOUT_MS = '360000';
+    expect(getCompressionTimeoutMs()).toBe(360_000);
 
     process.env.IMCODES_COMPRESSION_TIMEOUT_MS = '120000';
     expect(getCompressionTimeoutMs()).toBe(120_000);
@@ -106,7 +112,10 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     expect(getCompressionTimeoutMs()).toBe(10 * 60_000);
 
     process.env.IMCODES_COMPRESSION_TIMEOUT_MS = 'not-a-number';
-    expect(getCompressionTimeoutMs()).toBe(60_000);
+    expect(getCompressionTimeoutMs()).toBe(240_000);
+
+    process.env.IMCODES_COMPRESSION_TIMEOUT_MS = '123.45';
+    expect(getCompressionTimeoutMs()).toBe(240_000);
   });
 
   it('never runs two SDK query() calls concurrently, even with 3 callers firing at the same tick', async () => {
