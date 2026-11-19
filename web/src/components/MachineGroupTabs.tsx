@@ -3,12 +3,13 @@ import type { MachineListItem } from '../api/machines.js';
 import { MACHINE_GROUP_DIRECT, machineGroupTabs } from '../machine-grouping.js';
 
 /** Shared group chips for remote desktop and composer machine pickers. */
-export function MachineGroupTabs({ machines, group, onSelect, testIdPrefix, menu = false }: {
+export function MachineGroupTabs({ machines, group, onSelect, testIdPrefix, menu = false, preventBlur = false }: {
   machines: readonly MachineListItem[];
   group: string;
   onSelect(group: string): void;
   testIdPrefix: string;
   menu?: boolean;
+  preventBlur?: boolean;
 }) {
   const { t } = useTranslation();
   return <>{machineGroupTabs(machines).map(({ id, name, count }) => (
@@ -19,6 +20,7 @@ export function MachineGroupTabs({ machines, group, onSelect, testIdPrefix, menu
       aria-selected={menu ? undefined : group === id}
       class={`controlled-nodes-team-chip${group === id ? ' is-active' : ''}`}
       data-testid={`${testIdPrefix}-${id}`}
+      onMouseDown={preventBlur ? (e) => e.preventDefault() : undefined}
       onClick={() => onSelect(id)}
     >
       {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}

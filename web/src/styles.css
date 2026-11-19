@@ -5524,6 +5524,18 @@ html.native-ios-mac .chat-dl-btn {
   margin-bottom: 10px;
 }
 
+.controls-machine-group-filter {
+  gap: 9px 12px;
+  padding: 8px 12px 4px;
+  margin-bottom: 4px;
+}
+
+.controls-machine-group-filter .controlled-nodes-team-chip {
+  min-height: 26px;
+  padding: 3px 10px;
+  font-size: 10.5px;
+}
+
 .controlled-nodes-team-switch { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .controlled-nodes-team-chip {

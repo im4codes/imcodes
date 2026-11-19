@@ -14,7 +14,16 @@ import {
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { useAliases } from '../hooks/useAliases.js';
-import { useMachines } from '../hooks/useMachines.js';
+import { filterMachines, useMachines } from '../hooks/useMachines.js';
+import {
+  MACHINE_GROUP_ALL,
+  machineGroupsOf,
+  machinesInGroup,
+  resolveMachineGroup,
+  stepMachineGroupTab,
+  useRememberedMachineGroup,
+} from '../machine-grouping.js';
+import { MachineGroupTabs } from './MachineGroupTabs.js';
 import { useListboxNavigation } from '../hooks/useListboxNavigation.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { listAgentSkills } from '../api/agent-skills.js';
@@ -186,10 +195,24 @@ export function AtPicker({
   // Alias list is filtered by the same inline query (name + description) the
   // rest of the picker uses. Selecting one inserts its `;;(name)` marker only.
   const { filtered: aliasResults } = useAliases(category === 'aliases' ? query : undefined);
-  // Machine list, filtered by the same inline query. Online state is status
-  // context only: both online and offline nodes can be referenced for a task
-  // that may run after the node reconnects.
-  const { filtered: machineResults } = useMachines(category === 'machines' ? query : undefined);
+  // Machine list, filtered by the remembered group (when groups exist) plus the
+  // same inline query. Online state is status context only: both online and
+  // offline nodes can be referenced for a task that may run after reconnect.
+  const { machines: machineAll } = useMachines();
+  const [rememberedMachineGroup, setMachineGroup] = useRememberedMachineGroup(visible && category === 'machines');
+  const machineGroups = useMemo(() => machineGroupsOf(machineAll), [machineAll]);
+  const activeMachineGroup = useMemo(
+    () => (machineGroups.length > 0 ? resolveMachineGroup(rememberedMachineGroup, machineAll) : MACHINE_GROUP_ALL),
+    [machineAll, machineGroups.length, rememberedMachineGroup],
+  );
+  const machineGroupFiltered = useMemo(
+    () => (machineGroups.length > 0 ? machinesInGroup(machineAll, activeMachineGroup) : machineAll),
+    [activeMachineGroup, machineAll, machineGroups.length],
+  );
+  const machineResults = useMemo(
+    () => (category === 'machines' ? filterMachines(machineGroupFiltered, query) : []),
+    [category, machineGroupFiltered, query],
+  );
   const [fileResults, setFileResults] = useState<Array<{ path: string; basename: string; dir: string }>>([]);
   const [skillResults, setSkillResults] = useState<AgentSkillEntry[]>([]);
   const [highlightIdx, setHighlightIdx] = useState(0);
@@ -419,12 +442,20 @@ export function AtPicker({
         return;
       }
 
-      // Machines: ↑↓ move, Enter/Tab insert the highlighted marker. Connectivity
-      // is informational and never prevents composing a stable node reference.
+      // Machines: ↑↓ move, ←→ switch group (when grouped), Enter/Tab insert marker.
+      // Connectivity is informational and never prevents composing a stable node reference.
       if (category === 'machines') {
         const count = machineResults.length;
         if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(5); return; }
         if (handleNavigationKey(e)) return;
+        if (machineGroups.length > 0 && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+          e.preventDefault();
+          e.stopPropagation();
+          const delta = e.key === 'ArrowLeft' ? -1 : 1;
+          setMachineGroup(stepMachineGroupTab(machineAll, activeMachineGroup, delta));
+          setHighlightIdx(0);
+          return;
+        }
         if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
           e.preventDefault(); e.stopPropagation();
           const m = machineResults[activeNavigationIndex];
@@ -481,7 +512,7 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, activeNavigationIndex, fileResults, delegateAgents, aliasResults, machineResults, filteredSkills, teamRoundsIdx, teamComboOptions, handleNavigationKey, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onSelectSkill, onLaunchTeam],
+    [visible, category, activeNavigationIndex, fileResults, delegateAgents, aliasResults, machineResults, machineAll, machineGroups.length, activeMachineGroup, setMachineGroup, filteredSkills, teamRoundsIdx, teamComboOptions, handleNavigationKey, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onSelectSkill, onLaunchTeam],
   );
 
   // Keep one capture listener for the lifetime of the open picker. Rebinding a
@@ -608,9 +639,23 @@ export function AtPicker({
         <div style={groupLabelStyle}>
           {t('machine.category')} {query ? `— "${query}"` : ''}
         </div>
+        {machineGroups.length > 0 && (
+          <div class="controlled-nodes-group-filter controls-machine-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
+            <MachineGroupTabs
+              machines={machineAll}
+              group={activeMachineGroup}
+              onSelect={(nextGroup) => {
+                setMachineGroup(nextGroup);
+                setHighlightIdx(0);
+              }}
+              testIdPrefix="at-machine-group"
+              preventBlur
+            />
+          </div>
+        )}
         {machineResults.length === 0 && (
           <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>
-            {query ? t('machine.no_results') : t('machine.empty')}
+            {query ? t('machine.no_results') : (machineAll.length > 0 ? t('controlled_nodes.team_machines_empty') : t('machine.empty'))}
           </div>
         )}
         {machineResults.map((m, idx) => {
@@ -639,6 +684,11 @@ export function AtPicker({
             </div>
           );
         })}
+        {machineGroups.length > 0 && (
+          <div style={{ ...dimStyle, padding: '4px 12px 6px' }}>
+            ↑↓ · ◂▸ {t('controlled_nodes.group_filter_label')} · ⏎
+          </div>
+        )}
       </div>
     );
   }

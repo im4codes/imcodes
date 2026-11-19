@@ -6,6 +6,7 @@ import {
   machineGroupsOf,
   machineIsInGroup,
   machinesInGroup,
+  stepMachineGroupTab,
 } from '../src/machine-grouping.js';
 import type { MachineListItem } from '../src/api/machines.js';
 
@@ -172,5 +173,34 @@ describe('remembered machine group', () => {
     // Storage that throws (disabled / quota) never breaks the view.
     expect(() => saveMachineGroup('x', { setItem: () => { throw new Error('quota'); } })).not.toThrow();
     expect(loadMachineGroup({ getItem: () => { throw new Error('denied'); } })).toBeNull();
+  });
+});
+
+describe('stepMachineGroupTab', () => {
+  const mine = machine({ displayName: 'Mine', accessRole: 'owner' });
+  const ops = machine({ displayName: 'Ops', accessRole: 'viewer', teamIds: ['team-1'], teamNames: ['Ops'] });
+  const lab = machine({ displayName: 'Lab', accessRole: 'viewer', teamIds: ['team-2'], teamNames: ['Lab'] });
+  const grouped = [mine, ops, lab];
+
+  it('cycles forward and backward across direct, team groups, and all', () => {
+    expect(stepMachineGroupTab(grouped, MACHINE_GROUP_DIRECT, 1)).toBe('team-1');
+    expect(stepMachineGroupTab(grouped, 'team-1', 1)).toBe('team-2');
+    expect(stepMachineGroupTab(grouped, 'team-2', 1)).toBe(MACHINE_GROUP_ALL);
+    expect(stepMachineGroupTab(grouped, MACHINE_GROUP_ALL, 1)).toBe(MACHINE_GROUP_DIRECT);
+
+    expect(stepMachineGroupTab(grouped, MACHINE_GROUP_DIRECT, -1)).toBe(MACHINE_GROUP_ALL);
+    expect(stepMachineGroupTab(grouped, MACHINE_GROUP_ALL, -1)).toBe('team-2');
+    expect(stepMachineGroupTab(grouped, 'team-2', -1)).toBe('team-1');
+    expect(stepMachineGroupTab(grouped, 'team-1', -1)).toBe(MACHINE_GROUP_DIRECT);
+  });
+
+  it('resolves stale or unknown group IDs to direct before stepping', () => {
+    expect(stepMachineGroupTab(grouped, 'team-gone', 1)).toBe('team-1');
+    expect(stepMachineGroupTab(grouped, 'team-gone', -1)).toBe(MACHINE_GROUP_ALL);
+  });
+
+  it('handles ungrouped and empty lists cleanly', () => {
+    expect(stepMachineGroupTab([mine], MACHINE_GROUP_DIRECT, 1)).toBe(MACHINE_GROUP_ALL);
+    expect(stepMachineGroupTab([], MACHINE_GROUP_DIRECT, 1)).toBe(MACHINE_GROUP_ALL);
   });
 });

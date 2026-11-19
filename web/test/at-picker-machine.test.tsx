@@ -22,10 +22,12 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k, i18n: { language: 'en', changeLanguage: vi.fn() } }),
 }));
 
-const machineList: MachineListItem[] = [
+const ungroupedMachineList: MachineListItem[] = [
   { serverId: 'srv-on', nodeId: '1000000001', refName: 'winbox-a1', displayName: 'Win Box', os: 'windows', online: true, execEnabled: true },
   { serverId: 'srv-off', nodeId: '1000000002', refName: 'macmini-b2', displayName: 'Mac Mini', os: 'darwin', online: false, execEnabled: true },
 ];
+
+let activeMachineList: MachineListItem[] = ungroupedMachineList;
 
 vi.mock('../src/hooks/useMachines.js', async (importOriginal) => {
   // Use the REAL shared `filterMachines` so keystroke filtering is exercised for real.
@@ -33,8 +35,8 @@ vi.mock('../src/hooks/useMachines.js', async (importOriginal) => {
   return {
     ...orig,
     useMachines: (query?: string) => ({
-      machines: machineList,
-      filtered: orig.filterMachines(machineList, query),
+      machines: activeMachineList,
+      filtered: orig.filterMachines(activeMachineList, query),
       loaded: true,
       loading: false,
       error: null,
@@ -49,8 +51,14 @@ vi.mock('../src/components/p2p-combos.js', () => ({
 }));
 
 import { AtPicker } from '../src/components/AtPicker.js';
+import { MACHINE_GROUP_ALL, MACHINE_GROUP_DIRECT, loadMachineGroup, saveMachineGroup } from '../src/machine-grouping.js';
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); });
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  activeMachineList = ungroupedMachineList;
+  vi.clearAllMocks();
+});
 
 function baseProps(over: Record<string, unknown> = {}) {
   return {
@@ -135,5 +143,108 @@ describe('AtPicker — machine category (10.13)', () => {
     fireEvent.keyDown(document, { key: 'ArrowDown' });
     fireEvent.keyDown(document, { key: 'Enter' });
     expect(onSelectMachine).toHaveBeenCalledWith('1000000002', 'Mac Mini');
+  });
+
+  it('omits group tabs and leaves ArrowLeft/ArrowRight uncaptured when there are no team groups', async () => {
+    const { container } = render(<AtPicker {...baseProps()} />);
+    openMachineCategory(container);
+    await waitFor(() => expect(container.textContent).toContain('Win Box'));
+    expect(container.querySelector('.controlled-nodes-group-filter')).toBeNull();
+    const left = new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true, cancelable: true });
+    document.dispatchEvent(left);
+    expect(left.defaultPrevented).toBe(false);
+  });
+});
+
+const groupedMachines: MachineListItem[] = [
+  { serverId: 'srv-mine', nodeId: '1000000001', refName: 'mine-box', displayName: 'Mine Box', os: 'darwin', online: true, execEnabled: true, accessRole: 'owner' },
+  { serverId: 'srv-ops', nodeId: '1000000002', refName: 'ops-box', displayName: 'Ops Box', os: 'linux', online: true, execEnabled: true, accessRole: 'viewer', teamIds: ['ops'], teamNames: ['Ops Team'] },
+  { serverId: 'srv-lab', nodeId: '1000000003', refName: 'lab-box', displayName: 'Lab Box', os: 'linux', online: false, execEnabled: true, accessRole: 'viewer', teamIds: ['lab'], teamNames: ['Lab Team'] },
+];
+
+describe('AtPicker — machine group tabs, arrow switching & remembered group', () => {
+  it('renders group tabs, switches groups with ArrowLeft/ArrowRight, and inserts from the visible group', async () => {
+    activeMachineList = groupedMachines;
+    const onSelectMachine = vi.fn();
+    const { container } = render(<AtPicker {...baseProps({ onSelectMachine })} />);
+    openMachineCategory(container);
+    await waitFor(() => expect(container.querySelector('[data-testid="at-machine-group-direct"]')).not.toBeNull());
+
+    // Default direct group shows only Mine Box.
+    expect(container.textContent).toContain('Mine Box');
+    expect(container.textContent).not.toContain('Ops Box');
+
+    // ArrowRight moves to Ops Team and persists the choice.
+    fireEvent.keyDown(document, { key: 'ArrowRight' });
+    await waitFor(() => expect(container.textContent).toContain('Ops Box'));
+    expect(container.textContent).not.toContain('Mine Box');
+    expect(loadMachineGroup()).toBe('ops');
+
+    // ArrowRight again -> Lab Team; ArrowLeft -> back to Ops Team; ArrowLeft twice -> wraps to All.
+    fireEvent.keyDown(document, { key: 'ArrowRight' });
+    await waitFor(() => expect(container.textContent).toContain('Lab Box'));
+    fireEvent.keyDown(document, { key: 'ArrowLeft' });
+    await waitFor(() => expect(container.textContent).toContain('Ops Box'));
+    fireEvent.keyDown(document, { key: 'ArrowLeft' });
+    await waitFor(() => expect(container.textContent).toContain('Mine Box'));
+    fireEvent.keyDown(document, { key: 'ArrowLeft' });
+    await waitFor(() => {
+      expect(container.textContent).toContain('Mine Box');
+      expect(container.textContent).toContain('Ops Box');
+      expect(container.textContent).toContain('Lab Box');
+    });
+    expect(loadMachineGroup()).toBe(MACHINE_GROUP_ALL);
+
+    // Selecting by ArrowDown + Enter selects from the active visible group (Ops Box).
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(onSelectMachine).toHaveBeenCalledWith('1000000002', 'Ops Box');
+  });
+
+  it('prevents blur on chip mousedown, switches on click, filters within group, and handles empty results safely', async () => {
+    activeMachineList = groupedMachines;
+    const onSelectMachine = vi.fn();
+    const { container, rerender } = render(<AtPicker {...baseProps({ onSelectMachine })} />);
+    openMachineCategory(container);
+    const opsChip = await waitFor(() => container.querySelector('[data-testid="at-machine-group-ops"]') as HTMLElement);
+
+    const md = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    opsChip.dispatchEvent(md);
+    expect(md.defaultPrevented).toBe(true);
+
+    fireEvent.click(opsChip);
+    await waitFor(() => expect(container.textContent).toContain('Ops Box'));
+
+    // Query that matches Lab Box only yields empty state under Ops Team, and Enter does not insert.
+    rerender(<AtPicker {...baseProps({ onSelectMachine, query: 'lab' })} />);
+    await waitFor(() => expect(container.textContent).toContain('machine.no_results'));
+    fireEvent.keyDown(document, { key: 'Enter' });
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(onSelectMachine).not.toHaveBeenCalled();
+
+    // Switching to Lab Team restores the matching row and allows Enter selection.
+    fireEvent.keyDown(document, { key: 'ArrowRight' });
+    await waitFor(() => expect(container.textContent).toContain('Lab Box'));
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(onSelectMachine).toHaveBeenCalledWith('1000000003', 'Lab Box');
+  });
+
+  it('reuses remembered group across reopen and falls back to direct without overwriting unknown remembered group', async () => {
+    activeMachineList = groupedMachines;
+    saveMachineGroup('lab');
+    const { container, unmount } = render(<AtPicker {...baseProps()} />);
+    openMachineCategory(container);
+    await waitFor(() => expect(container.textContent).toContain('Lab Box'));
+    expect(container.textContent).not.toContain('Ops Box');
+    unmount();
+
+    // Stale/missing group falls back to direct while keeping localStorage intact.
+    saveMachineGroup('team-missing');
+    const second = render(<AtPicker {...baseProps()} />);
+    openMachineCategory(second.container);
+    await waitFor(() => expect(second.container.textContent).toContain('Mine Box'));
+    expect(second.container.textContent).not.toContain('Lab Box');
+    expect(loadMachineGroup()).toBe('team-missing');
+    expect(MACHINE_GROUP_DIRECT).toBe('direct');
   });
 });

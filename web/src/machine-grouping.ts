@@ -123,6 +123,25 @@ export function resolveMachineGroup(group: string, machines: readonly MachineLis
   return machineGroupsOf(machines).some(([id]) => id === group) ? group : MACHINE_GROUP_DIRECT;
 }
 
+/**
+ * Step to the previous (`-1`) or next (`1`) group tab, wrapping at the ends.
+ * Resolves the starting group against the current machines so stale remembered
+ * groups step cleanly from the default `direct` tab.
+ */
+export function stepMachineGroupTab(
+  machines: readonly MachineListItem[],
+  currentGroup: string,
+  delta: -1 | 1,
+): string {
+  const tabs = machineGroupTabs(machines);
+  if (tabs.length === 0) return MACHINE_GROUP_DIRECT;
+  const resolved = resolveMachineGroup(currentGroup, machines);
+  const currentIdx = tabs.findIndex((tab) => tab.id === resolved);
+  const startIdx = currentIdx >= 0 ? currentIdx : 0;
+  const nextIdx = (startIdx + delta + tabs.length) % tabs.length;
+  return tabs[nextIdx]?.id ?? resolved;
+}
+
 /** The chosen group, remembered in this browser across closing and reopening. */
 export function useRememberedMachineGroup(active = true): [string, (group: string) => void] {
   const [group, setGroupState] = useState<string>(() => loadMachineGroup() ?? MACHINE_GROUP_DIRECT);

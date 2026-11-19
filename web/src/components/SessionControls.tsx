@@ -47,7 +47,16 @@ import { getActiveCssZoom } from '../ui-scale.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
-import { useMachines } from '../hooks/useMachines.js';
+import { filterMachines, useMachines } from '../hooks/useMachines.js';
+import {
+  MACHINE_GROUP_ALL,
+  machineGroupsOf,
+  machinesInGroup,
+  resolveMachineGroup,
+  stepMachineGroupTab,
+  useRememberedMachineGroup,
+} from '../machine-grouping.js';
+import { MachineGroupTabs } from './MachineGroupTabs.js';
 import { insertMachineMarkerAtCaret } from '../util/machine-insert.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
@@ -2923,23 +2932,36 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setActiveIndex: setAliasHighlightIdx,
   });
   // Shared machine data — feeds compose-time resolution on send (the out-of-band
-  // `resolvedMachines` hint) and the inline `^` autocomplete. `machineFiltered`
-  // is the refName+displayName filtered view for the current inline query;
-  // `machineAll` is the full list used to resolve markers at send time. Unlike
-  // aliases there is NO fail-closed gate: an unresolved `^^(name)` marker is left
-  // literal (a visible hint the server re-validates), so no loaded/error state is
-  // needed here.
+  // `resolvedMachines` hint) and the inline `^` autocomplete. `machineAll` is
+  // the full list used to resolve markers at send time; `visibleMachines` applies
+  // the remembered group filter (when groups exist) plus the inline `machineQuery`.
+  // Unlike aliases there is NO fail-closed gate: an unresolved `^^(name)` marker
+  // is left literal (a visible hint the server re-validates), so no loaded/error
+  // state is needed here.
   const {
     machines: machineAll,
-    filtered: machineFiltered,
-  } = useMachines(machineQuery);
+  } = useMachines();
+  const [rememberedMachineGroup, setMachineGroup] = useRememberedMachineGroup(machinePickerOpen);
+  const machineGroups = useMemo(() => machineGroupsOf(machineAll), [machineAll]);
+  const activeMachineGroup = useMemo(
+    () => (machineGroups.length > 0 ? resolveMachineGroup(rememberedMachineGroup, machineAll) : MACHINE_GROUP_ALL),
+    [machineAll, machineGroups.length, rememberedMachineGroup],
+  );
+  const machineGroupFiltered = useMemo(
+    () => (machineGroups.length > 0 ? machinesInGroup(machineAll, activeMachineGroup) : machineAll),
+    [activeMachineGroup, machineAll, machineGroups.length],
+  );
+  const visibleMachines = useMemo(
+    () => filterMachines(machineGroupFiltered, machineQuery),
+    [machineGroupFiltered, machineQuery],
+  );
   const {
     activeIndex: activeMachineIndex,
     handleNavigationKey: handleMachineNavigationKey,
   } = useListboxNavigation({
     activeIndex: machineHighlightIdx,
     containerRef: machinePickerRef,
-    itemCount: machineFiltered.length,
+    itemCount: visibleMachines.length,
     open: machinePickerOpen,
     setActiveIndex: setMachineHighlightIdx,
   });
@@ -7799,8 +7821,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // When the inline `^` machine picker is open, it owns Enter/Tab/Arrow/Escape,
     // mirroring the alias picker. Online state never changes selectability.
     if (machinePickerOpen) {
-      const count = machineFiltered.length;
+      const count = visibleMachines.length;
       if (handleMachineNavigationKey(e)) return;
+      if (machineGroups.length > 0 && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        e.preventDefault();
+        e.stopPropagation();
+        const delta = e.key === 'ArrowLeft' ? -1 : 1;
+        setMachineGroup(stepMachineGroupTab(machineAll, activeMachineGroup, delta));
+        setMachineHighlightIdx(0);
+        return;
+      }
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -7811,7 +7841,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if ((e.key === 'Tab' || e.key === 'Enter') && count > 0) {
         e.preventDefault();
         e.stopPropagation();
-        const chosen = machineFiltered[activeMachineIndex];
+        const chosen = visibleMachines[activeMachineIndex];
         setMachinePickerOpen(false);
         setMachineQuery('');
         machineJustClosedRef.current = true;
@@ -10733,12 +10763,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <div style={aliasPickerGroupLabelStyle}>
                 {t('machine.category')} {machineQuery ? `— "${machineQuery}"` : ''}
               </div>
-              {machineFiltered.length === 0 && (
-                <div style={aliasPickerEmptyStyle}>
-                  {machineQuery ? t('machine.no_results') : t('machine.empty')}
+              {machineGroups.length > 0 && (
+                <div class="controlled-nodes-group-filter controls-machine-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
+                  <MachineGroupTabs
+                    machines={machineAll}
+                    group={activeMachineGroup}
+                    onSelect={(nextGroup) => {
+                      setMachineGroup(nextGroup);
+                      setMachineHighlightIdx(0);
+                    }}
+                    testIdPrefix="controls-machine-group"
+                    preventBlur
+                  />
                 </div>
               )}
-              {machineFiltered.map((m, idx) => {
+              {visibleMachines.length === 0 && (
+                <div style={aliasPickerEmptyStyle}>
+                  {machineQuery ? t('machine.no_results') : (machineAll.length > 0 ? t('controlled_nodes.team_machines_empty') : t('machine.empty'))}
+                </div>
+              )}
+              {visibleMachines.map((m, idx) => {
                 const hl = idx === activeMachineIndex;
                 return (
                   <div
@@ -10774,6 +10818,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   </div>
                 );
               })}
+              {machineGroups.length > 0 && (
+                <div style={{ ...aliasPickerDimStyle, padding: '4px 12px 6px' }}>
+                  ↑↓ · ◂▸ {t('controlled_nodes.group_filter_label')} · ⏎
+                </div>
+              )}
             </div>
           );
         })()}
