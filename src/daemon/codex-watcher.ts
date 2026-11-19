@@ -681,18 +681,30 @@ async function runSerializedCodexWork(
   sessionName: string,
   state: WatcherState,
   work: () => Promise<boolean>,
+  options: { coalesce?: boolean } = {},
 ): Promise<boolean> {
-  if (state.runningWork) {
-    state.rerunWork = true;
-    await state.runningWork.catch(() => false);
-    return !state.stopped;
+  const coalesce = options.coalesce ?? true;
+
+  if (coalesce) {
+    if (state.runningWork) {
+      state.rerunWork = true;
+      await state.runningWork.catch(() => false);
+      return !state.stopped;
+    }
+  } else {
+    while (state.runningWork) {
+      await state.runningWork.catch(() => false);
+      if (state.stopped) return false;
+    }
+    if (state.stopped) return false;
   }
 
   state.runningWork = (async () => {
     let result = await work();
     while (state.rerunWork && !state.stopped) {
       state.rerunWork = false;
-      result = (await refreshTrackedSessionInner(sessionName, state).catch(() => false)) || result;
+      const rerunResult = await refreshTrackedSessionInner(sessionName, state).catch(() => false);
+      if (coalesce) result = rerunResult || result;
     }
     return result;
   })().finally(() => {
@@ -752,7 +764,12 @@ async function refreshTrackedSessionInner(sessionName: string, state: WatcherSta
 export async function retrackLatestRollout(sessionName: string): Promise<boolean> {
   const state = watchers.get(sessionName);
   if (!state || state.stopped) return false;
-  return await runSerializedCodexWork(sessionName, state, () => retrackLatestRolloutInner(sessionName, state));
+  return await runSerializedCodexWork(
+    sessionName,
+    state,
+    () => retrackLatestRolloutInner(sessionName, state),
+    { coalesce: false },
+  );
 }
 
 async function retrackLatestRolloutInner(sessionName: string, state: WatcherState): Promise<boolean> {

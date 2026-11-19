@@ -15,7 +15,14 @@ vi.mock('../../src/store/session-store.js', () => ({
   updateSessionState: vi.fn(),
 }));
 
-import { startWatchingSpecificFile, retrackLatestRollout, stopWatching, parseLine, resetParseStateForTests } from '../../src/daemon/codex-watcher.js';
+import {
+  startWatchingSpecificFile,
+  refreshTrackedSession,
+  retrackLatestRollout,
+  stopWatching,
+  parseLine,
+  resetParseStateForTests,
+} from '../../src/daemon/codex-watcher.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
 function sessionMetaLine(cwd: string): string {
@@ -180,5 +187,56 @@ describe('codex retrackLatestRollout', () => {
 
     await rm(wrongFile, { force: true });
     vi.useRealTimers();
+  });
+
+  it('returns false when retrackLatestRollout runs concurrently with in-flight refresh and only a different UUID file exists', async () => {
+    vi.mocked(timelineEmitter.emit).mockClear();
+    await rm(newFile, { force: true });
+    await writeFile(otherUuidFile, `${sessionMetaLine(projectDir)}\n${userMessageLine('wrong uuid message')}\n`, 'utf8');
+
+    const inFlightRefresh = refreshTrackedSession(sessionName);
+    const retrackPromise = retrackLatestRollout(sessionName);
+    const [retracked, refreshed] = await Promise.all([retrackPromise, inFlightRefresh]);
+
+    expect(refreshed).toBe(true);
+    expect(retracked).toBe(false);
+    expect(
+      vi.mocked(timelineEmitter.emit).mock.calls.some(
+        (call) => call[0] === sessionName && call[1] === 'user.message' && (call[2] as any).text === 'wrong uuid message',
+      ),
+    ).toBe(false);
+  });
+
+  it('serializes concurrent retrackLatestRollout calls and returns false after stopWatching while work is in flight', async () => {
+    await rm(newFile, { force: true });
+    const inFlightRefresh = refreshTrackedSession(sessionName);
+    const concurrentRetracks = Promise.all([
+      retrackLatestRollout(sessionName),
+      retrackLatestRollout(sessionName),
+    ]);
+
+    const results = await concurrentRetracks;
+    await inFlightRefresh;
+    expect(results).toEqual([false, false]);
+
+    const inFlightBeforeStop = refreshTrackedSession(sessionName);
+    const pendingRetrack = retrackLatestRollout(sessionName);
+    stopWatching(sessionName);
+
+    expect(await pendingRetrack).toBe(false);
+    await inFlightBeforeStop;
+  });
+
+  it('still switches and replays a newer same-UUID rollout when retrackLatestRollout waits behind in-flight work', async () => {
+    vi.mocked(timelineEmitter.emit).mockClear();
+    const inFlightRefresh = refreshTrackedSession(sessionName);
+    const retrackPromise = retrackLatestRollout(sessionName);
+
+    await Promise.all([inFlightRefresh, retrackPromise]);
+    await waitUntil(() =>
+      vi.mocked(timelineEmitter.emit).mock.calls.some(
+        (call) => call[0] === sessionName && call[1] === 'user.message' && (call[2] as any).text === 'retracked codex message',
+      ),
+    );
   });
 });
