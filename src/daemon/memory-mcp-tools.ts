@@ -5609,7 +5609,7 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: z.object({
     dependsOn: z.array(z.string().min(1)).max(TASK_PAIR_MAX_DEPENDENCIES).optional(),
     taskId: z.string().trim().min(1).optional(),
-    title: z.string().trim().min(1).optional(),
+    title: z.string().trim().min(1),
     brief: z.string().min(1),
     executor: z.string().trim().min(1).optional(),
     auditor: z.string().trim().min(1).optional(),

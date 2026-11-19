@@ -53,14 +53,20 @@ describe('memory MCP bootstrap catalog', () => {
     expect(catalog.static_full.map((tool) => tool.name)).toEqual(expect.arrayContaining(pairDecisionTools));
   });
 
-  it('requires read-only root-cause analysis and concrete planning in the pair_create catalog entry', () => {
+  it('requires direct pair creation after a quick read-only check and a required non-empty title in pair_create', () => {
     const pairCreate = catalog.static_full.find((entry) => entry.name === MEMORY_MCP_TOOL_NAMES.PAIR_CREATE) as {
       description?: string;
+      inputSchema?: { required?: string[]; properties?: { title?: { minLength?: number } } };
     } | undefined;
-    expect(pairCreate?.description).toContain('inspect root cause/files read-only and plan first');
+    const expectedLead = 'do a quick read-only root-cause check and create a task pair directly without asking routine confirmation (short title required)';
+    expect(pairCreate?.description).toContain(expectedLead);
+    expect(pairCreate?.inputSchema?.required).toEqual(expect.arrayContaining(['title', 'brief']));
     const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE];
     const brief = (contract.inputSchema as { properties?: { brief?: { description?: string } } }).properties?.brief;
-    expect(contract.description).toContain('inspect root cause/files read-only and plan first');
+    const title = (contract.inputSchema as { properties?: { title?: { minLength?: number } } }).properties?.title;
+    expect(contract.description).toContain(expectedLead);
+    expect(contract.inputSchema.required).toEqual(['title', 'brief']);
+    expect(title?.minLength).toBe(1);
     expect(brief?.description).toContain('verified Proven files/logs, step-by-step Plan');
   });
 });

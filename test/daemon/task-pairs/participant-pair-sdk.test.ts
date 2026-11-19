@@ -166,3 +166,49 @@ describe('participant pause and dependency wait through real MCP', () => {
     } finally { await client.close(); await server.close(); await taskPairService.waitForIdle(); if (oldEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE; else process.env.IMCODES_SUPERVISION_ENGINE = oldEngine; }
   });
 });
+
+describe('pair_create MCP wire validation requires non-empty title', () => {
+  it.each([false, true])('rejects missing or whitespace-only title and accepts valid CJK/ASCII titles (fallback=%s)', async (fallback) => {
+    const oldEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store);
+    sessions.forEach(upsertSession);
+    setTaskPairDeliveryDepsForTests({ send: async () => {} });
+    const server = createMemoryMcpServer(caller, { sendDeps: { listSessions: () => sessions } });
+    const client = new Client({ name: 'pair-title-validation-sdk', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(b), client.connect(a)]);
+    const invoke = async (args: Record<string, unknown>) => {
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: N.PAIR_CREATE } });
+      await client.listTools();
+      try {
+        return await client.callTool(fallback
+          ? { name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: N.PAIR_CREATE, fallbackCall: { name: N.PAIR_CREATE, arguments: args } } }
+          : { name: N.PAIR_CREATE, arguments: args });
+      } catch (err) {
+        return { isError: true, thrown: err instanceof Error ? err.message : String(err) };
+      }
+    };
+    try {
+      const missingTitle = await invoke({ brief: '## Goal\nFix', executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'no-title' });
+      expect(missingTitle.isError).toBe(true);
+
+      const blankTitle = await invoke({ title: '   \t  ', brief: '## Goal\nFix', executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'blank-title' });
+      expect(blankTitle.isError).toBe(true);
+
+      expect(getTaskPairStore().listActivePairs()).toHaveLength(0);
+
+      const cjkRes = await invoke({ title: '修复移动端下拉菜单滚动问题', brief: '## Goal\nFix scroll', executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'cjk-title' });
+      expect(cjkRes.isError).not.toBe(true);
+      const cjkPayload = mcpToolPayload(cjkRes as Parameters<typeof mcpToolPayload>[0]);
+      expect(cjkPayload).toMatchObject({ status: 'ok' });
+
+      const asciiRes = await invoke({ title: 'Fix login retry', brief: '## Goal\nFix retry', executor: sibling, auditor: 'none', workspace: 'none', idempotencyKey: 'ascii-title' });
+      expect(asciiRes.isError).not.toBe(true);
+      expect(mcpToolPayload(asciiRes as Parameters<typeof mcpToolPayload>[0])).toMatchObject({ status: 'ok' });
+    } finally {
+      await client.close(); await server.close(); await taskPairService.waitForIdle();
+      if (oldEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE; else process.env.IMCODES_SUPERVISION_ENGINE = oldEngine;
+    }
+  });
+});
