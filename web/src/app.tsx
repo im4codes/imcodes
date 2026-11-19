@@ -8003,6 +8003,13 @@ function InternalMainApp() {
         void handleOpenSharedEntryNavRef.current(targetSharedEntry);
       } else {
         void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
+        setTimeout(() => {
+          const activeSession = activeSessionRef.current;
+          if (activeSession) {
+            const el = inputRefsMap.current.get(activeSession);
+            if (el) focusComposerElement(el);
+          }
+        }, 100);
       }
     }
     return true;
