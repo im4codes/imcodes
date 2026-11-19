@@ -4201,7 +4201,7 @@ describe('TransportSessionRuntime', () => {
     }
   });
 
-  it('keeps slash-control user bytes raw while retaining only permanent system authority', async () => {
+  it('keeps slash-control user bytes raw while preserving session system prompt and suppressing turn context', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
     r.setContextBootstrapResolver(async () => ({
@@ -4220,8 +4220,8 @@ describe('TransportSessionRuntime', () => {
     }));
     await r.initialize({
       ...defaultConfig,
-      description: 'Session description must not be attached to /compact',
-      systemPrompt: 'Runtime system prompt must not be attached to /compact',
+      description: 'Session description preserved across /compact',
+      systemPrompt: 'Runtime system prompt preserved across /compact',
       contextNamespace: { scope: 'personal', projectId: 'repo-1' },
       contextLocalProcessedFreshness: 'fresh',
     });
@@ -4234,9 +4234,9 @@ describe('TransportSessionRuntime', () => {
 
     expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
     const compactPayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, any>;
-    // `/compact` remains an ordinary, byte-exact provider message. The one
-    // surviving context value is permanent system authority, not turn/session
-    // authored context injected into the user message.
+    // `/compact` keeps user/assembled message bytes raw and suppresses turn-scoped
+    // context, while preserving session-level description, systemPrompt, and
+    // permanent system authority (d38566a66 contract).
     expect(compactPayload.userMessage).toBe('/compact');
     expect(compactPayload.assembledMessage).toBe('/compact');
     expect(localMock.provider.send).toHaveBeenCalledWith(
@@ -4246,14 +4246,26 @@ describe('TransportSessionRuntime', () => {
         assembledMessage: '/compact',
       }),
     );
-    expect(compactPayload.systemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
-    expect(compactPayload.sessionSystemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.systemText).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.systemText).toContain('Session description preserved across /compact');
+    expect(compactPayload.systemText).toContain('Runtime system prompt preserved across /compact');
+    expect(compactPayload.systemText).not.toContain('Historical context that must not be attached to /compact');
+    expect(compactPayload.systemText).not.toContain('Prefer pnpm');
+    expect(compactPayload.sessionSystemText).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.sessionSystemText).toContain('Session description preserved across /compact');
+    expect(compactPayload.sessionSystemText).toContain('Runtime system prompt preserved across /compact');
+    expect(compactPayload.sessionSystemText).not.toContain('Historical context that must not be attached to /compact');
+    expect(compactPayload.sessionSystemText).not.toContain('Prefer pnpm');
     expect(compactPayload.turnSystemText).toBeUndefined();
     expect(compactPayload.messagePreamble).toBeUndefined();
     expect(compactPayload.startupMemory).toBeUndefined();
     expect(compactPayload.memoryRecall).toBeUndefined();
-    expect(compactPayload.context?.systemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
-    expect(compactPayload.context?.sessionSystemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.context?.systemText).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.context?.systemText).toContain('Session description preserved across /compact');
+    expect(compactPayload.context?.systemText).toContain('Runtime system prompt preserved across /compact');
+    expect(compactPayload.context?.sessionSystemText).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.context?.sessionSystemText).toContain('Session description preserved across /compact');
+    expect(compactPayload.context?.sessionSystemText).toContain('Runtime system prompt preserved across /compact');
     expect(compactPayload.context?.turnSystemText).toBeUndefined();
     expect(compactPayload.context?.messagePreamble).toBeUndefined();
     expect(compactPayload.context?.requiredAuthoredContext).toEqual([]);
