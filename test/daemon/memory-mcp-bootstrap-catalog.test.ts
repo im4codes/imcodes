@@ -68,5 +68,7 @@ describe('memory MCP bootstrap catalog', () => {
     expect(contract.inputSchema.required).toEqual(['title', 'brief']);
     expect(title?.minLength).toBe(1);
     expect(brief?.description).toContain('verified Proven files/logs, step-by-step Plan');
+    expect(brief?.description).toContain('"- [ ][ ]"');
+    expect(brief?.description).toContain('required when audited');
   });
 });

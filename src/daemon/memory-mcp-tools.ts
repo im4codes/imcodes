@@ -20,7 +20,7 @@ import { pairSessionNotLiveReason } from './supervision-auto-provision.js';
 import { runExclusive } from '../util/keyed-mutex.js';
 import logger from '../util/logger.js';
 import { randomUUID } from 'node:crypto';
-import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
+import { hasAuditedPairChecklistItem, parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
 import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MANUAL_MODE_NOTE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, TASK_PAIR_PARTICIPANT_STATUSES, TASK_PAIR_WORKSPACE_REQUESTS, isTaskPairWorkspaceRequest, taskPairRoleOf, type TaskPairWorkspaceRequest } from '../../shared/task-pair.js';
 import { TASK_PAIR_WORKSPACE_PICK_GUIDANCE, taskPairWorkspaceCreateNote } from '../../shared/task-pair-workspace.js';
 import { z } from 'zod';
@@ -3788,6 +3788,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const brief = stringArg(args, 'brief');
       if (!brief) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'brief is required');
       const auditorArg = stringArg(args, 'auditor');
+      const auditorModelArg = stringArg(args, 'auditorModel');
       if ((auditorArg !== undefined && auditorArg === executorArg) || (executorArg && executorArg === caller.sessionName) || (auditorArg && auditorArg !== TASK_PAIR_NO_AUDITOR && auditorArg === caller.sessionName)) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executor, auditor, and Brain must be distinct');
       }
@@ -3814,10 +3815,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (store.getPair(context.project, taskId)) {
         return error(MCP_ERROR_REASONS.REVISION_CONFLICT, 'taskId already belongs to a different persisted pair; use its existing lifecycle');
       }
+      if (auditorArg !== TASK_PAIR_NO_AUDITOR && auditorModelArg !== TASK_PAIR_NO_AUDITOR && !hasAuditedPairChecklistItem(brief)) {
+        return error(
+          MCP_ERROR_REASONS.VALIDATION_FAILED,
+          'audited pair_create brief must include at least one unchecked "- [ ][ ] <acceptance item>" line outside code fences (plus how to verify it); use auditor="none" only for intentionally unaudited tasks',
+        );
+      }
       return runExclusive(`pair-create:${context.project}:${brainName}`, async () => {
         const title = stringArg(args, 'title');
         const executorModel = stringArg(args, 'executorModel');
-        const auditorModel = stringArg(args, 'auditorModel');
+        const auditorModel = auditorModelArg;
         const executionPool = stringArg(args, 'executionPool') as 'primary' | 'economy' | undefined;
         for (const [role, named] of [['executor', executorArg], ['auditor', auditorArg]] as const) {
           if (!named || (role === 'auditor' && named === TASK_PAIR_NO_AUDITOR)) continue;

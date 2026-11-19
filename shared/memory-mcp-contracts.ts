@@ -890,7 +890,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.', { minLength: 1 }),
-      brief: stringSchema('Complete Markdown brief: Goal, verified Proven files/logs, step-by-step Plan, checkable Acceptance, Boundaries.'),
+      brief: stringSchema('Complete Markdown brief: Goal, verified Proven files/logs, step-by-step Plan, checkable "- [ ][ ]" Acceptance + verification (required when audited), Boundaries.'),
       dependsOn: { type: 'array', maxItems: TASK_PAIR_MAX_DEPENDENCIES, items: { type: 'string', minLength: 1 }, description: 'Wait until these same-project tasks reach accepted done.' },
       executor: stringSchema('Exact executor.'),
       auditor: stringSchema('Exact auditor or none.'),

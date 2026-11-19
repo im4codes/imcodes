@@ -198,7 +198,7 @@ describe('pair_create MCP wire validation requires non-empty title', () => {
 
       expect(getTaskPairStore().listActivePairs()).toHaveLength(0);
 
-      const cjkRes = await invoke({ title: '修复移动端下拉菜单滚动问题', brief: '## Goal\nFix scroll', executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'cjk-title' });
+      const cjkRes = await invoke({ title: '修复移动端下拉菜单滚动问题', brief: '## Goal\nFix scroll\n- [ ][ ] 1. Verify scroll', executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'cjk-title' });
       expect(cjkRes.isError).not.toBe(true);
       const cjkPayload = mcpToolPayload(cjkRes as Parameters<typeof mcpToolPayload>[0]);
       expect(cjkPayload).toMatchObject({ status: 'ok' });

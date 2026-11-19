@@ -233,7 +233,10 @@ describe('pair_create end to end', () => {
   });
 
   const handlers = () => createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => listSessions() } });
-  const pairCreate = (input: Record<string, unknown>) => handlers()[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE](input);
+  const pairCreate = (input: Record<string, unknown>) => handlers()[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+    ...input,
+    brief: `${String(input.brief ?? '')}\n- [ ][ ] 1. Verify liveness`,
+  });
   const pairs = () => getTaskPairStore().listActivePairs();
 
   it('the server hears subsession.sync for both new sessions before any brief is delivered', async () => {
@@ -376,7 +379,7 @@ describe('the heartbeat reports an assigned session that is missing, by name', (
     const automation = new TaskPairAutomation({ now: () => now, importLegacy: () => undefined, mainCheckoutRoots: () => [] });
     taskPairService.setScheduler(automation);
     const created = await createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => listSessions() } })[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-      brief: 'b', executor: 'deck_sub_hb_exec', auditor: 'deck_sub_hb_aud', idempotencyKey: 'hb-1',
+      brief: '- [ ][ ] 1. check missing exec', executor: 'deck_sub_hb_exec', auditor: 'deck_sub_hb_aud', idempotencyKey: 'hb-1',
     });
     expect(created).toMatchObject({ status: 'ok', state: 'working' });
     sent.length = 0;
@@ -397,7 +400,7 @@ describe('the heartbeat reports an assigned session that is missing, by name', (
     const automation = new TaskPairAutomation({ now: () => now, importLegacy: () => undefined, mainCheckoutRoots: () => [] });
     taskPairService.setScheduler(automation);
     await createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => listSessions() } })[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-      brief: 'b', executor: 'deck_sub_hb_exec', auditor: 'deck_sub_hb_aud', idempotencyKey: 'hb-2',
+      brief: '- [ ][ ] 1. check healthy sessions', executor: 'deck_sub_hb_exec', auditor: 'deck_sub_hb_aud', idempotencyKey: 'hb-2',
     });
     sent.length = 0;
     for (let beat = 0; beat < 3; beat += 1) { now += 6 * 60_000; await automation.tick(); }

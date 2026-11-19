@@ -36,6 +36,12 @@ export function parseTaskPairChecklist(markdown: string): TaskPairChecklistItem[
   return items;
 }
 
+export function hasAuditedPairChecklistItem(markdown: string): boolean {
+  return parseTaskPairChecklist(markdown).some(
+    (item) => item.hasAuditBox && !item.implemented && !item.audited && item.text.trim().length > 0,
+  );
+}
+
 export function taskPairChecklistCounts(markdown: string): { total: number; implemented: number; audited: number } {
   const items = parseTaskPairChecklist(markdown);
   return { total: items.length, implemented: items.filter((item) => item.implemented).length, audited: items.filter((item) => item.audited).length };

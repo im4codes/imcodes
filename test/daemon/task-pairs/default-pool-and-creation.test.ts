@@ -545,7 +545,7 @@ describe('pair_create end to end with no pool', () => {
 
   it('pair_create with only a brief creates a sonnet executor and a different sonnet auditor and reports who and why', async () => {
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => listSessions() } });
-    const result = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: '# do it', title: 'Do it', idempotencyKey: 'e2e-1' });
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: '# do it\n- [ ][ ] 1. do it', title: 'Do it', idempotencyKey: 'e2e-1' });
     expect(result).toMatchObject({ status: 'ok', created: true });
     const taskId = String(result.taskId);
     const pair = getTaskPairStore().getPair(PROJECT, taskId)!.state;
@@ -563,7 +563,7 @@ describe('pair_create end to end with no pool', () => {
   it('an explicit executor with the default auditor creates just the auditor', async () => {
     upsertSession(sonnet('deck_sub_mine'));
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => listSessions() } });
-    const result = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: 'b', executor: 'deck_sub_mine', idempotencyKey: 'e2e-2' });
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: '- [ ][ ] 1. b', executor: 'deck_sub_mine', idempotencyKey: 'e2e-2' });
     try {
       expect(result).toMatchObject({ status: 'ok' });
       expect(createdNames).toHaveLength(1);
@@ -573,16 +573,16 @@ describe('pair_create end to end with no pool', () => {
 
   it('createExecutor / createAuditor create explicitly, and a bad combination persists nothing', async () => {
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => listSessions() } });
-    const ok = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: 'b', createExecutor: {}, createAuditor: { model: 'sonnet' }, idempotencyKey: 'e2e-3' });
+    const ok = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: '- [ ][ ] 1. b', createExecutor: {}, createAuditor: { model: 'sonnet' }, idempotencyKey: 'e2e-3' });
     expect(ok).toMatchObject({ status: 'ok' });
-    const bad = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: 'b', executor: 'deck_sub_x', createExecutor: {}, idempotencyKey: 'e2e-4' });
+    const bad = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: '- [ ][ ] 1. b', executor: 'deck_sub_x', createExecutor: {}, idempotencyKey: 'e2e-4' });
     expect(bad).toMatchObject({ status: 'error', message: expect.stringContaining('pair_create did nothing') });
     expect(getTaskPairStore().listActivePairs().filter((entry) => entry.state.title !== 'x')).toHaveLength(1);
   });
 
   it('simultaneous pair_creates do not exceed what the rule needs and share no session', async () => {
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => listSessions() } });
-    const results = await Promise.all([1, 2, 3].map((n) => handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: `b${n}`, idempotencyKey: `e2e-par-${n}` })));
+    const results = await Promise.all([1, 2, 3].map((n) => handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: `- [ ][ ] ${n}. b${n}`, idempotencyKey: `e2e-par-${n}` })));
     expect(results.every((result) => result.status === 'ok')).toBe(true);
     const pairs = getTaskPairStore().listActivePairs().map((entry) => entry.state);
     const used = pairs.flatMap((entry) => [entry.executor, entry.auditor]).filter(Boolean);

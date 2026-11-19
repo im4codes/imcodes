@@ -1,4 +1,8 @@
 import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../../shared/context-types.js';
 import type { TaskPairState } from '../../../shared/task-pair.js';
@@ -14,6 +18,8 @@ import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
 import { defaultHasActiveSupervisionLease, provisionSupervisionTarget } from '../../../src/daemon/supervision-auto-provision.js';
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
+import { setPairSessionCreationDepsForTests } from '../../../src/daemon/task-pairs/session-creation.js';
+import { setTaskPairWorkspaceDepsForTests } from '../../../src/daemon/task-pairs/workspace.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
 
 const PROJECT = 'pair-mcp-project';
@@ -382,22 +388,22 @@ describe('pair MCP projections', () => {
       });
 
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        brief: 'reuse idle executor from open pair', executor: EXEC, auditor: aud2, idempotencyKey: 'reuse-exec',
+        brief: '- [ ][ ] 1. reuse idle executor from open pair', executor: EXEC, auditor: aud2, idempotencyKey: 'reuse-exec',
       })).resolves.toMatchObject({
         status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: expect.stringContaining('open-in-audit'),
       });
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        brief: 'reuse idle auditor from open pair', executor: exec2, auditor: AUD, idempotencyKey: 'reuse-aud',
+        brief: '- [ ][ ] 1. reuse idle auditor from open pair', executor: exec2, auditor: AUD, idempotencyKey: 'reuse-aud',
       })).resolves.toMatchObject({
         status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: expect.stringContaining('open-in-audit'),
       });
       // Dependency wait referencing the holder pair remains valid.
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        brief: 'depends on holder', executor: EXEC, auditor: AUD, dependsOn: ['open-in-audit'], idempotencyKey: 'dep-ok',
+        brief: '- [ ][ ] 1. depends on holder', executor: EXEC, auditor: AUD, dependsOn: ['open-in-audit'], idempotencyKey: 'dep-ok',
       })).resolves.toMatchObject({ status: 'ok', state: 'queued' });
 
       const second = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        brief: 'dedicated sessions', executor: exec2, auditor: aud2, idempotencyKey: 'second-ok',
+        brief: '- [ ][ ] 1. dedicated sessions', executor: exec2, auditor: aud2, idempotencyKey: 'second-ok',
       });
       expect(second).toMatchObject({ status: 'ok', state: 'working' });
       const secondId = String(second.taskId);
@@ -469,7 +475,7 @@ describe('pair MCP projections', () => {
     try {
       const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => all } });
       const createdAuto = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Pool auto selection', brief: '# auto', idempotencyKey: 'pool-auto-1',
+        title: 'Pool auto selection', brief: '# auto\n- [ ][ ] 1. Verify auto selection', idempotencyKey: 'pool-auto-1',
       });
       expect(createdAuto).toMatchObject({ status: 'ok', state: 'working' });
       const autoPair = getTaskPairStore().getPair(PROJECT, String(createdAuto.taskId))?.state;
@@ -489,7 +495,7 @@ describe('pair MCP projections', () => {
       // Free the auditor by closing the first pair, then name only executor so pool still supplies the auditor.
       await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(createdAuto.taskId), action: 'done', force: true, idempotencyKey: 'close-auto-1' });
       const namedExecOmittedAud = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Pool auditor for named executor', brief: '# partial', executor: execB.name, idempotencyKey: 'pool-partial-1',
+        title: 'Pool auditor for named executor', brief: '# partial\n- [ ][ ] 1. Verify partial selection', executor: execB.name, idempotencyKey: 'pool-partial-1',
       });
       expect(namedExecOmittedAud).toMatchObject({ status: 'ok', state: 'working' });
       expect(getTaskPairStore().getPair(PROJECT, String(namedExecOmittedAud.taskId))?.state).toMatchObject({
@@ -599,7 +605,7 @@ describe('pair MCP projections', () => {
       const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => all } });
       // Auto pair_create omitting both roles MUST stay queued (never steal execHeld or audHeld; no free auditor exists yet).
       const autoBoth = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Independent auto pair', brief: '# auto', workspace: 'none', idempotencyKey: 'q-auto-both',
+        title: 'Independent auto pair', brief: '# auto\n- [ ][ ] 1. Verify isolation', workspace: 'none', idempotencyKey: 'q-auto-both',
       });
       expect(autoBoth).toMatchObject({ status: 'ok', state: 'queued' });
       const autoBothState = getTaskPairStore().getPair(PROJECT, String(autoBoth.taskId))?.state;
@@ -608,7 +614,7 @@ describe('pair MCP projections', () => {
 
       // Partial pair_create naming execFree and omitting auditor stays queued without stealing audHeld.
       const partialNoSteal = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Partial pair must not steal queued auditor', brief: '# partial-2', executor: execFree.name, workspace: 'none', idempotencyKey: 'q-partial-2',
+        title: 'Partial pair must not steal queued auditor', brief: '# partial-2\n- [ ][ ] 1. Verify no steal', executor: execFree.name, workspace: 'none', idempotencyKey: 'q-partial-2',
       });
       expect(partialNoSteal).toMatchObject({ status: 'ok', state: 'queued' });
       const partialState = getTaskPairStore().getPair(PROJECT, String(partialNoSteal.taskId))?.state;
@@ -617,7 +623,7 @@ describe('pair MCP projections', () => {
 
       // With execFree now owned by queued partialNoSteal, a second pair naming execFree is rejected as concurrent open-pair reuse.
       const reuseQueued = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Reuse queued execFree', brief: '# dup', executor: execFree.name, workspace: 'none', idempotencyKey: 'q-reuse-free',
+        title: 'Reuse queued execFree', brief: '# dup\n- [ ][ ] 1. Verify queued reuse rejection', executor: execFree.name, workspace: 'none', idempotencyKey: 'q-reuse-free',
       });
       expect(reuseQueued).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
 
@@ -630,7 +636,7 @@ describe('pair MCP projections', () => {
       upsertSession(audFree);
       all.push(audFree);
       const autoWithFreeAud = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Auto pair with free pool sessions', brief: '# auto-free', workspace: 'none', idempotencyKey: 'q-auto-free',
+        title: 'Auto pair with free pool sessions', brief: '# auto-free\n- [ ][ ] 1. Verify free pool pick', workspace: 'none', idempotencyKey: 'q-auto-free',
       });
       expect(autoWithFreeAud).toMatchObject({ status: 'ok', state: 'working' });
       expect(getTaskPairStore().getPair(PROJECT, String(autoWithFreeAud.taskId))?.state).toMatchObject({
@@ -643,7 +649,7 @@ describe('pair MCP projections', () => {
 
       // Downstream dependsOn pair MAY reference the holder's participants.
       const dependent = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Dependent downstream', brief: '# dep', executor: execHeld.name, auditor: audHeld.name,
+        title: 'Dependent downstream', brief: '# dep\n- [ ][ ] 1. Verify dependsOn', executor: execHeld.name, auditor: audHeld.name,
         dependsOn: ['tsk_paused_queued_holder'], workspace: 'none', idempotencyKey: 'q-dep',
       });
       expect(dependent).toMatchObject({ status: 'ok', state: 'queued' });
@@ -660,7 +666,7 @@ describe('pair MCP projections', () => {
       // Closing holder leaves dependent in queued holding execHeld/audHeld, so another auto pair still stays queued without stealing them.
       await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'tsk_paused_queued_holder', action: 'done', force: true, idempotencyKey: 'close-holder' });
       const whileDepQueued = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Fresh pair while dependent queued', brief: '# dep-holds', workspace: 'none', idempotencyKey: 'q-while-dep',
+        title: 'Fresh pair while dependent queued', brief: '# dep-holds\n- [ ][ ] 1. Verify held by dep', workspace: 'none', idempotencyKey: 'q-while-dep',
       });
       expect(whileDepQueued).toMatchObject({ status: 'ok', state: 'queued' });
       await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(whileDepQueued.taskId), action: 'cancel', idempotencyKey: 'cancel-while-dep' });
@@ -668,7 +674,7 @@ describe('pair MCP projections', () => {
       // Closing dependent frees both participants, so a fresh auto pair_create starts working with [execHeld, audHeld].
       await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(dependent.taskId), action: 'cancel', idempotencyKey: 'close-dep' });
       const afterClose = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Fresh pair after holder close', brief: '# free', workspace: 'none', idempotencyKey: 'q-after-close',
+        title: 'Fresh pair after holder close', brief: '# free\n- [ ][ ] 1. Verify reuse after close', workspace: 'none', idempotencyKey: 'q-after-close',
       });
       expect(afterClose).toMatchObject({ status: 'ok', state: 'working' });
       expect(getTaskPairStore().getPair(PROJECT, String(afterClose.taskId))?.state).toMatchObject({
@@ -879,6 +885,120 @@ describe('pair MCP projections', () => {
       taskPairService.setScheduler(undefined);
       setTaskPairDeliveryDepsForTests(undefined);
       all.forEach((record) => removeSession(record.name));
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
+  it('requires at least one unchecked non-empty dual-box "- [ ][ ]" line on audited pair_create without side effects, while preserving auditor="none" and legacy replays', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'imcodes-pair-gate-')));
+    const gitProject = join(base, 'repo');
+    const worktreesRoot = join(base, 'worktrees');
+    const worksRoot = join(base, 'works');
+    execFileSync('git', ['init', '-q', gitProject]);
+    execFileSync('git', ['-C', gitProject, 'config', 'user.email', 'test@example.invalid']);
+    execFileSync('git', ['-C', gitProject, 'config', 'user.name', 'Test']);
+    writeFileSync(join(gitProject, 'README.md'), 'hello\n');
+    execFileSync('git', ['-C', gitProject, 'add', '-A']);
+    execFileSync('git', ['-C', gitProject, 'commit', '-qm', 'base']);
+
+    const gateCaller: McpRuntimeCaller = {
+      ...caller,
+      projectRoot: gitProject,
+    };
+    const brain: SessionRecord = {
+      ...session(BRAIN, 'brain'),
+      agentType: 'claude-code-sdk',
+      activeModel: 'opus[1M]',
+      projectDir: gitProject,
+    };
+    const exec: SessionRecord = { ...session(EXEC, 'w1'), parentSession: BRAIN, agentType: 'claude-code-sdk', activeModel: 'sonnet', projectDir: gitProject };
+    const aud: SessionRecord = { ...session(AUD, 'w2'), parentSession: BRAIN, agentType: 'claude-code-sdk', activeModel: 'sonnet', projectDir: gitProject };
+    upsertSession(brain); upsertSession(exec); upsertSession(aud);
+
+    let spawnAttempts = 0;
+    setTaskPairDeliveryDepsForTests({ send: async () => undefined });
+    setTaskPairWorkspaceDepsForTests({ env: { ...process.env, IMCODES_WORKTREES_ROOT: worktreesRoot, IMCODES_WORKS_ROOT: worksRoot } });
+    setPairSessionCreationDepsForTests({
+      createSession: async () => {
+        spawnAttempts += 1;
+        return { ok: true, sessionName: `deck_sub_unexpected_${spawnAttempts}` };
+      },
+    });
+    try {
+      const handlers = createMemoryMcpToolHandlers(gateCaller, { sendDeps: { listSessions: () => [brain, exec, aud] } });
+      const badBriefs: Array<[string, string]> = [
+        ['no checklist', '## Goal\nShort 2-sentence brief without checklist.'],
+        ['single box only', '## Acceptance\n- [ ] 1. Single box item'],
+        ['fenced backtick only', '## Example\n```md\n- [ ][ ] 1. Example inside fence\n```'],
+        ['fenced tilde only', '## Example\n~~~\n- [ ][ ] 1. Example inside tilde fence\n~~~'],
+        ['blank dual box', '## Acceptance\n- [ ][ ]   '],
+        ['pre-checked both', '## Acceptance\n- [x][x] 1. Already checked'],
+        ['pre-checked implemented', '## Acceptance\n- [x][ ] 1. Half checked'],
+        ['pre-checked audited', '## Acceptance\n- [ ][x] 1. Half audited'],
+      ];
+
+      for (const [label, badBrief] of badBriefs) {
+        const resExplicit = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+          title: `Reject ${label}`, brief: badBrief, executor: EXEC, auditor: AUD, workspace: 'worktree', idempotencyKey: `gate-exp-${label}`,
+        });
+        expect(resExplicit, label).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+      }
+
+      // Omitted auditor (auto-pick / auto-create) and createAuditor are also audited and rejected without side effects.
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Reject omitted auditor', brief: 'No checklist', executor: EXEC, workspace: 'worktree', idempotencyKey: 'gate-omit-aud',
+      })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Reject createAuditor', brief: '- [ ] single box', executor: EXEC, createAuditor: { model: 'sonnet' }, workspace: 'worktree', idempotencyKey: 'gate-create-aud',
+      })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+
+      expect(spawnAttempts).toBe(0);
+      expect(getTaskPairStore().listActivePairs()).toHaveLength(0);
+      expect(existsSync(worktreesRoot)).toBe(false);
+
+      // Valid audited pair (including CRLF line endings) succeeds cleanly.
+      const okAudited = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Accept valid CRLF checklist',
+        brief: '## Goal\r\nFix gate\r\n\r\n## Acceptance\r\n- [ ][ ] 1. Verify gate passes\r\n',
+        executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'gate-ok-crlf',
+      });
+      expect(okAudited).toMatchObject({ status: 'ok', state: 'working' });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(okAudited.taskId), action: 'done', force: true, idempotencyKey: 'close-gate-ok' });
+
+      // Unaudited pair_create (auditor='none' and auditorModel='none') succeeds without checklist.
+      const okNoneAuditor = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Unaudited none auditor', brief: 'Quick edit without checklist.', executor: EXEC, auditor: 'none', workspace: 'none', idempotencyKey: 'gate-none-aud',
+      });
+      expect(okNoneAuditor).toMatchObject({ status: 'ok', state: 'working' });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(okNoneAuditor.taskId), action: 'done', force: true, idempotencyKey: 'close-gate-none-aud' });
+
+      const okNoneModel = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Unaudited none auditorModel', brief: 'Quick edit without checklist.', executor: EXEC, auditorModel: 'none', workspace: 'none', idempotencyKey: 'gate-none-model',
+      });
+      expect(okNoneModel).toMatchObject({ status: 'ok' });
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(okNoneModel.taskId), action: 'done', force: true, idempotencyKey: 'close-gate-none-model' });
+
+      // Legacy persisted pair replay without checklist stays idempotent instead of being blocked by the new gate.
+      const legacyId = 'tsk_legacy_no_checklist';
+      const legacyKey = 'legacy-replay-key';
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(legacyId, 'working'), brief: 'Legacy brief with no checklist' });
+      getTaskPairStore().recordEvent({
+        id: `mcp:pair-create:${PROJECT}:${legacyKey}`,
+        project: PROJECT, taskId: legacyId, writer: BRAIN, role: 'brain', verb: 'PAIR_CREATE', attrs: {}, effect: 'created', unusual: false, source: 'mcp', at: 15,
+      });
+      const replay = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        taskId: legacyId, title: 'Legacy', brief: 'Legacy brief with no checklist', executor: EXEC, auditor: AUD, idempotencyKey: legacyKey,
+      });
+      expect(replay).toMatchObject({ status: 'ok', taskId: legacyId, idempotentReplay: true, state: 'working' });
+    } finally {
+      setPairSessionCreationDepsForTests(undefined);
+      setTaskPairWorkspaceDepsForTests(undefined);
+      setTaskPairDeliveryDepsForTests(undefined);
+      removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
+      rmSync(base, { recursive: true, force: true });
       if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
       else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
     }

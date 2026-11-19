@@ -103,7 +103,12 @@ describe('manual pairs in supervision mode off', () => {
     importLegacy: () => undefined, mainCheckoutRoots: () => [],
   });
   const handlers = (sessionName = BRAIN) => createMemoryMcpToolHandlers({ ...caller, sessionName }, { sendDeps: { listSessions: () => listSessions() } });
-  const tool = (name: string, input: Record<string, unknown>, sessionName = BRAIN) => (handlers(sessionName) as Record<string, (input: unknown) => Promise<Record<string, unknown>>>)[name]!(input);
+  const tool = (name: string, input: Record<string, unknown>, sessionName = BRAIN) => {
+    const payload = name === MEMORY_MCP_TOOL_NAMES.PAIR_CREATE && typeof input.brief === 'string' && !input.brief.includes('- [ ][ ]') && input.auditor !== 'none'
+      ? { ...input, brief: `${input.brief}\n- [ ][ ] 1. Verify item` }
+      : input;
+    return (handlers(sessionName) as Record<string, (input: unknown) => Promise<Record<string, unknown>>>)[name]!(payload);
+  };
   const stateOf = (taskId: unknown) => getTaskPairStore().getPair(PROJECT, String(taskId))?.state;
 
   describe('the two predicates', () => {

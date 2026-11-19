@@ -207,7 +207,7 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     // 1. The Brain opens the work through the structured pair MCP surface.
     const created = await createPair({
       idempotencyKey: 'pairs-e2e-readme',
-      brief: 'Implement a cross-file README update, add tests, and validate the integration.',
+      brief: 'Implement a cross-file README update, add tests, and validate the integration.\n- [ ][ ] 1. Update README and tests',
     });
     if (created.status !== 'ok' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
@@ -254,7 +254,7 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     const verbs = pairEvents
       .filter((event) => event.session === BRAIN && event.payload.taskId === taskId)
       .map((event) => event.payload.verb);
-    expect(verbs).toEqual(['DISPATCH', 'READY_FOR_AUDIT', 'REWORK', 'READY_FOR_AUDIT', 'PASS', 'DONE']);
+    expect(verbs).toEqual(['DISPATCH', 'CHECKLIST_AUTO_TICK', 'READY_FOR_AUDIT', 'REWORK', 'READY_FOR_AUDIT', 'CHECKLIST_AUTO_TICK', 'PASS', 'DONE']);
 
     // A closed pair is out of the heartbeat: the next tick nudges nobody.
     const before = delivered.length;
@@ -268,7 +268,7 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
   it('delivers in rounds: PASS, Brain NEXT_ROUND x2, each round audited and PASSed by markers, then DONE (only the two deliberate negative markers are unusual)', async () => {
     const created = await createPair({
       idempotencyKey: 'pairs-e2e-rounds',
-      brief: 'Deliver the staged change: spinner, console sync, watchdog.',
+      brief: 'Deliver the staged change: spinner, console sync, watchdog.\n- [ ][ ] 1. Spinner, console sync, watchdog',
     });
     if (created.status !== 'ok' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
@@ -329,7 +329,7 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
   it('holds a REWORK that carries no blocking finding and asks the auditor to correct it', async () => {
     const created = await createPair({
       idempotencyKey: 'pairs-e2e-held',
-      brief: 'Tidy the README.',
+      brief: 'Tidy the README.\n- [ ][ ] 1. Tidy README',
     });
     if (created.status !== 'ok' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
