@@ -15,6 +15,7 @@ import { serializeContextTarget } from './context-keys.js';
 import { incrementCounter } from '../util/metrics.js';
 import { createConcurrencyGate } from '../util/concurrency.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 const INGEST_RETRY_BUFFER_MAX_EVENTS = 256;
@@ -195,7 +196,7 @@ export class LiveContextIngestion {
   }
 
   async flushDueTargets(now = Date.now()): Promise<void> {
-    if (!isLiveContextMaterializationAdmissionOpen()) return;
+    if (!isLiveContextMaterializationAdmissionOpen() || !isMemoryDaemonEnabled()) return;
     for (const job of await this.coordinator.scheduleDueTargets(now)) {
       await this.coordinator.materializeTarget(job.target, job.trigger, now);
     }
@@ -210,6 +211,7 @@ export class LiveContextIngestion {
   private readonly retryDrainGate = createConcurrencyGate(INGEST_RETRY_DRAIN_MAX_SESSIONS_CONCURRENT);
 
   async flushAllRetryBuffers(options: { forceDue?: boolean } = {}): Promise<void> {
+    if (!isMemoryDaemonEnabled()) return;
     const sessionIds = [...this.retryBuffer.keys()];
     await Promise.all(sessionIds.map((sessionId) => this.enqueueSessionWork(sessionId, async () => {
       await this.retryDrainGate.run(() => this.flushRetryBuffer(sessionId, { forceDue: options.forceDue }));

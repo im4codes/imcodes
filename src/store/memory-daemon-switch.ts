@@ -13,12 +13,24 @@ interface MemoryDaemonSwitchPayload {
   updatedAt: number;
 }
 
+export const MEMORY_DISABLED_MESSAGE =
+  'Memory recording, embedding, and indexing are disabled; run `imcodes memory enable` to re-enable.';
+
 export class MemoryDisabledError extends Error {
   readonly code = 'memory_disabled';
   constructor() {
-    super('Memory recording, embedding, and indexing are disabled; run `imcodes memory enable` to re-enable.');
+    super(MEMORY_DISABLED_MESSAGE);
     this.name = 'MemoryDisabledError';
   }
+}
+
+export function isMemoryDisabledError(err: unknown): boolean {
+  if (err instanceof MemoryDisabledError) return true;
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === 'memory_disabled') return true;
+  const message = (err as { message?: unknown }).message;
+  return typeof message === 'string' && message.includes('Memory recording, embedding, and indexing are disabled');
 }
 
 function switchPath(): string {

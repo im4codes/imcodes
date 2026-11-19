@@ -731,6 +731,7 @@ export class MaterializationCoordinator {
   }
 
   async materializeDueMasterSummaries(now = Date.now()): Promise<ProcessedContextProjection[]> {
+    if (!isMemoryDaemonEnabled()) return [];
     const client = getContextStoreClient();
     const due: ProcessedContextProjection[] = [];
     for (const item of await client.run<LatestRecentSummarySession[]>('listLatestRecentSummarySessions', [1000])) {

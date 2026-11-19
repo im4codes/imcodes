@@ -86,6 +86,7 @@ import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { backfillProjectionEmbeddings } from '../context/projection-embedding-maintenance.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-scheduling.js';
+import { isMemoryDaemonEnabled, isMemoryDisabledError } from '../store/memory-daemon-switch.js';
 import { getResendCount } from './transport-resend-queue.js';
 import {
   getTransportQueueStore,
@@ -797,6 +798,7 @@ export async function startup(): Promise<DaemonContext> {
 
   // Archive stale local memory projections (recent_summary with no hits after 30 days)
   const runStartupMemoryPruning = async (): Promise<void> => {
+    if (!isMemoryDaemonEnabled()) return;
     await yieldToDaemonEventLoop();
     // `pruneLocalMemory` already routes through the worker (in-process fallback
     // when cold), so call it directly — no second client hop needed.
@@ -1234,6 +1236,7 @@ export async function startup(): Promise<DaemonContext> {
   peerAuditService.init();
 
   const backfillLiveContextFromTimeline = async (): Promise<void> => {
+    if (!isMemoryDaemonEnabled()) return;
     const startedAt = Date.now();
     let sessionsSeen = 0;
     let sessionsBackfilled = 0;
@@ -1258,6 +1261,10 @@ export async function startup(): Promise<DaemonContext> {
       try {
         await liveContextIngestion.backfillSessionFromEvents(session.name, history);
       } catch (err) {
+        if (isMemoryDisabledError(err)) {
+          logger.debug({ err, session: session.name }, 'Shared-context timeline backfill skipped: daemon memory disabled');
+          return;
+        }
         logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
       }
       if (sessionsBackfilled % STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY === 0) {
@@ -2779,12 +2786,25 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
   }, CODEX_QUOTA_REFRESH_MS);
 }
 
+export async function runContextReplicationPollTick(
+  credentials: { workerUrl: string; serverId: string; token: string },
+): Promise<void> {
+  if (!isMemoryDaemonEnabled()) return;
+  try {
+    await replicatePendingProcessedContext(credentials);
+  } catch (err) {
+    if (isMemoryDisabledError(err)) {
+      logger.debug({ err }, 'Processed-context replication skipped: daemon memory disabled');
+      return;
+    }
+    logger.warn({ err }, 'Processed-context replication failed');
+  }
+}
+
 function startContextReplicationPoller(workerUrl: string | undefined, serverId: string, token: string): void {
   if (!workerUrl || !serverId || !token) return;
   contextReplicationTimer = setInterval(() => {
-    void replicatePendingProcessedContext({ workerUrl, serverId, token }).catch((err) => {
-      logger.warn({ err }, 'Processed-context replication failed');
-    });
+    void runContextReplicationPollTick({ workerUrl, serverId, token });
   }, CONTEXT_REPLICATION_POLL_MS);
 }
 
@@ -2808,15 +2828,35 @@ function startUsageSyncWorker(workerUrl: string | undefined, serverId: string, t
   usageSyncWorker.start();
 }
 
-function startContextMaterializationPoller(liveContextIngestion: LiveContextIngestion): void {
+export async function runContextMaterializationPollTick(
+  liveContextIngestion: Pick<LiveContextIngestion, 'flushAllRetryBuffers' | 'flushDueTargets'>,
+): Promise<void> {
+  if (!isMemoryDaemonEnabled()) return;
+  try {
+    await liveContextIngestion.flushAllRetryBuffers();
+    await liveContextIngestion.flushDueTargets();
+  } catch (err) {
+    if (isMemoryDisabledError(err)) {
+      logger.debug({ err }, 'Context materialization poll skipped: daemon memory disabled');
+      return;
+    }
+    logger.warn({ err }, 'Context materialization poll failed');
+  }
+}
+
+export function startContextMaterializationPoller(
+  liveContextIngestion: Pick<LiveContextIngestion, 'flushAllRetryBuffers' | 'flushDueTargets'>,
+): () => void {
+  if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
   contextMaterializationTimer = setInterval(() => {
-    void (async () => {
-      await liveContextIngestion.flushAllRetryBuffers();
-      await liveContextIngestion.flushDueTargets();
-    })().catch((err) => {
-      logger.warn({ err }, 'Context materialization poll failed');
-    });
+    void runContextMaterializationPollTick(liveContextIngestion);
   }, CONTEXT_MATERIALIZATION_POLL_MS);
+  return () => {
+    if (contextMaterializationTimer) {
+      clearInterval(contextMaterializationTimer);
+      contextMaterializationTimer = null;
+    }
+  };
 }
 
 /**
