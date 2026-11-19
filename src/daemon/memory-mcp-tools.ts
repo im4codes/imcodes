@@ -3815,7 +3815,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (store.getPair(context.project, taskId)) {
         return error(MCP_ERROR_REASONS.REVISION_CONFLICT, 'taskId already belongs to a different persisted pair; use its existing lifecycle');
       }
-      if (auditorArg !== TASK_PAIR_NO_AUDITOR && auditorModelArg !== TASK_PAIR_NO_AUDITOR && !hasAuditedPairChecklistItem(brief)) {
+      const isUnauditedPairCreate = auditorArg === TASK_PAIR_NO_AUDITOR
+        || (!auditorArg && auditorModelArg === TASK_PAIR_NO_AUDITOR);
+      if (!isUnauditedPairCreate && !hasAuditedPairChecklistItem(brief)) {
         return error(
           MCP_ERROR_REASONS.VALIDATION_FAILED,
           'audited pair_create brief must include at least one unchecked "- [ ][ ] <acceptance item>" line outside code fences (plus how to verify it); use auditor="none" only for intentionally unaudited tasks',

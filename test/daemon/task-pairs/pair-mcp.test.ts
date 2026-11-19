@@ -933,7 +933,11 @@ describe('pair MCP projections', () => {
         ['no checklist', '## Goal\nShort 2-sentence brief without checklist.'],
         ['single box only', '## Acceptance\n- [ ] 1. Single box item'],
         ['fenced backtick only', '## Example\n```md\n- [ ][ ] 1. Example inside fence\n```'],
+        ['nested 4-backtick fence with 3-backtick inner', '````markdown\n```\n- [ ][ ] only code example\n```\n````'],
+        ['3-backtick fence with ```js info line', '```md\n```js\n- [ ][ ] 1. Inside code fence\n```'],
         ['fenced tilde only', '## Example\n~~~\n- [ ][ ] 1. Example inside tilde fence\n~~~'],
+        ['nested 4-tilde fence with 3-tilde inner', '~~~~\r\n~~~\r\n- [ ][ ] 1. Tilde nested example\r\n~~~\r\n~~~~'],
+        ['unclosed fence', '```md\n- [ ][ ] 1. Never closed'],
         ['blank dual box', '## Acceptance\n- [ ][ ]   '],
         ['pre-checked both', '## Acceptance\n- [x][x] 1. Already checked'],
         ['pre-checked implemented', '## Acceptance\n- [x][ ] 1. Half checked'],
@@ -955,18 +959,33 @@ describe('pair MCP projections', () => {
         title: 'Reject createAuditor', brief: '- [ ] single box', executor: EXEC, createAuditor: { model: 'sonnet' }, workspace: 'worktree', idempotencyKey: 'gate-create-aud',
       })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
 
+      // Explicit non-'none' auditor combined with auditorModel='none' still resolves to an audited pair and MUST fail without checklist.
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Reject explicit auditor + none model without checklist', brief: 'No checklist', executor: EXEC, auditor: AUD, auditorModel: 'none', workspace: 'worktree', idempotencyKey: 'gate-explicit-aud-none-model',
+      })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+
       expect(spawnAttempts).toBe(0);
       expect(getTaskPairStore().listActivePairs()).toHaveLength(0);
       expect(existsSync(worktreesRoot)).toBe(false);
 
-      // Valid audited pair (including CRLF line endings) succeeds cleanly.
+      // Valid audited pair (including CRLF + nested fence followed by real acceptance item) succeeds cleanly.
       const okAudited = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
-        title: 'Accept valid CRLF checklist',
-        brief: '## Goal\r\nFix gate\r\n\r\n## Acceptance\r\n- [ ][ ] 1. Verify gate passes\r\n',
+        title: 'Accept valid CRLF checklist after nested fence',
+        brief: '## Goal\r\nFix gate\r\n\r\n````markdown\r\n```\r\n- [ ][ ] example\r\n```\r\n````\r\n\r\n## Acceptance\r\n- [ ][ ] 1. Verify gate passes\r\n',
         executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'gate-ok-crlf',
       });
       expect(okAudited).toMatchObject({ status: 'ok', state: 'working' });
       await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(okAudited.taskId), action: 'done', force: true, idempotencyKey: 'close-gate-ok' });
+
+      // Explicit non-'none' auditor + auditorModel='none' WITH valid checklist keeps explicit auditor priority and succeeds.
+      const okExplicitAudWithNoneModel = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        title: 'Keep explicit auditor priority when valid checklist is provided',
+        brief: '## Acceptance\n- [ ][ ] 1. Verify explicit auditor preserved',
+        executor: EXEC, auditor: AUD, auditorModel: 'none', workspace: 'none', idempotencyKey: 'gate-ok-explicit-aud-none-model',
+      });
+      expect(okExplicitAudWithNoneModel).toMatchObject({ status: 'ok', state: 'working' });
+      expect(getTaskPairStore().getPair(PROJECT, String(okExplicitAudWithNoneModel.taskId))?.state.auditor).toBe(AUD);
+      await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: String(okExplicitAudWithNoneModel.taskId), action: 'done', force: true, idempotencyKey: 'close-gate-ok-exp-aud' });
 
       // Unaudited pair_create (auditor='none' and auditorModel='none') succeeds without checklist.
       const okNoneAuditor = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({

@@ -11,17 +11,27 @@ const CHECKLIST_RE = /^(\s*-\s+)\[([ xX])\](?:\[([ xX])\])?\s+(.*)$/u;
 
 export function parseTaskPairChecklist(markdown: string): TaskPairChecklistItem[] {
   const items: TaskPairChecklistItem[] = [];
-  let fenced = false;
   let fenceChar = '';
+  let fenceLen = 0;
   markdown.split(/\r?\n/u).forEach((line, lineIndex) => {
-    const fence = line.match(/^\s*(`{3,}|~{3,})/u);
-    if (fence) {
-      const char = fence[1]![0]!;
-      if (!fenced) { fenced = true; fenceChar = char; }
-      else if (char === fenceChar) fenced = false;
+    if (fenceLen > 0) {
+      const closeFence = line.match(/^\s*(`{3,}|~{3,})\s*$/u);
+      if (closeFence && closeFence[1]![0] === fenceChar && closeFence[1]!.length >= fenceLen) {
+        fenceChar = '';
+        fenceLen = 0;
+      }
       return;
     }
-    if (fenced) return;
+    const openFence = line.match(/^\s*(`{3,}|~{3,})(.*)$/u);
+    if (openFence) {
+      const char = openFence[1]![0]!;
+      // CommonMark: backtick fence info strings cannot contain backticks (those are inline code).
+      if (!(char === '`' && openFence[2]!.includes('`'))) {
+        fenceChar = char;
+        fenceLen = openFence[1]!.length;
+        return;
+      }
+    }
     const match = line.match(CHECKLIST_RE);
     if (!match) return;
     items.push({
