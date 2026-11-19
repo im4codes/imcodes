@@ -1244,6 +1244,8 @@
     "tab_files": "ファイル",
     "tab_changes": "変更",
     "changes_title": "変更 ({{count}})",
+    "changes_truncated_notice": "最初の {{shown}} 件を表示（全 {{total}} 件）",
+    "changes_load_more": "さらに {{count}} 件読み込む（{{shown}}/{{total}}）",
     "no_changes": "変更なし",
     "refresh_changes": "変更を更新",
     "refreshing_changes": "変更を更新中…",

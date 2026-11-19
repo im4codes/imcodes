@@ -8,10 +8,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   requestSharedChanges,
+  requestSharedChangesCount,
   forceRefreshSharedChangesForCheckout,
   settleSharedChangesRequest,
   subscribeSharedChanges,
+  subscribeSharedChangesMeta,
   subscribeSharedChangesStatus,
+  useSharedGitChangesCount,
   getSharedChangesKey,
   __resetSharedChangesForTests,
   SHARED_CHANGES_INFLIGHT_TIMEOUT_MS,
@@ -25,7 +28,7 @@ function makeFakeWs() {
   const handlers = new Set<(msg: ServerMessage) => void>();
   let nextId = 1;
   const ws = {
-    fsGitStatus: vi.fn((_path: string, _opts?: { includeStats?: boolean }) => {
+    fsGitStatus: vi.fn((_path: string, _opts?: { includeStats?: boolean; summaryOnly?: boolean }) => {
       const id = `req-${nextId++}`;
       requestIds.push(id);
       return id;
@@ -229,5 +232,132 @@ describe('git-status-store — refresh resilience', () => {
     emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as unknown as ServerMessage);
     expect(ws.fsGitStatus).toHaveBeenCalledTimes(1);
     expect(ws.fsGitStatus).toHaveBeenCalledWith('/srv/alpha', { includeStats: true });
+  });
+
+  it('requestSharedChangesCount sends summaryOnly and isolates meta from full file lists', () => {
+    const { ws, emit } = makeFakeWs();
+    const fullFiles: ChangeFile[] = [{ path: '/srv/alpha/a.ts', code: 'M', additions: 1, deletions: 0 }];
+
+    // 1. Prime full-list cache
+    requestSharedChanges(ws, '/srv/alpha');
+    expect(ws.fsGitStatus).toHaveBeenLastCalledWith('/srv/alpha', { includeStats: true });
+    emit({
+      type: 'fs.git_status_response',
+      requestId: 'req-1',
+      path: '/srv/alpha',
+      resolvedPath: '/srv/alpha',
+      status: 'ok',
+      files: fullFiles,
+      totalCount: 1,
+      truncated: false,
+    } as ServerMessage);
+
+    const filesListener = vi.fn();
+    const metaListener = vi.fn();
+    const unsubFiles = subscribeSharedChanges(getSharedChangesKey(ws, '/srv/alpha'), filesListener);
+    const unsubMeta = subscribeSharedChangesMeta(getSharedChangesKey(ws, '/srv/alpha'), metaListener);
+    expect(filesListener).toHaveBeenCalledWith(fullFiles);
+    expect(metaListener).toHaveBeenCalledWith({ totalCount: 1, truncated: false });
+
+    // Unsubscribe list listener (now badge-only), force a summaryOnly count refresh
+    unsubFiles();
+    requestSharedChangesCount(ws, '/srv/alpha', true);
+    expect(ws.fsGitStatus).toHaveBeenLastCalledWith('/srv/alpha', { summaryOnly: true });
+
+    emit({
+      type: 'fs.git_status_response',
+      requestId: 'req-2',
+      path: '/srv/alpha',
+      resolvedPath: '/srv/alpha',
+      status: 'ok',
+      files: [],
+      totalCount: 40824,
+      truncated: true,
+    } as ServerMessage);
+
+    expect(metaListener).toHaveBeenLastCalledWith({ totalCount: 40824, truncated: true });
+
+    // Re-subscribing to full list preserves earlier cached files (was NOT wiped to [])
+    const filesListener2 = vi.fn();
+    const unsubFiles2 = subscribeSharedChanges(getSharedChangesKey(ws, '/srv/alpha'), filesListener2);
+    expect(filesListener2).toHaveBeenCalledWith(fullFiles);
+
+    // Calling requestSharedChangesCount while a list listener IS active upgrades to full list
+    requestSharedChangesCount(ws, '/srv/alpha', true);
+    expect(ws.fsGitStatus).toHaveBeenLastCalledWith('/srv/alpha', { includeStats: true });
+
+    unsubFiles2();
+    unsubMeta();
+  });
+
+  it('prevents an in-flight summaryOnly response from clobbering a newer full-list request', () => {
+    const { ws, emit } = makeFakeWs();
+    const key = getSharedChangesKey(ws, '/srv/alpha');
+    const filesListener = vi.fn();
+    const metaListener = vi.fn();
+    const unsubMeta = subscribeSharedChangesMeta(key, metaListener);
+
+    requestSharedChangesCount(ws, '/srv/alpha', true);
+    expect(ws.fsGitStatus).toHaveBeenNthCalledWith(1, '/srv/alpha', { summaryOnly: true });
+
+    const unsubFiles = subscribeSharedChanges(key, filesListener);
+    requestSharedChanges(ws, '/srv/alpha');
+    expect(ws.fsGitStatus).toHaveBeenNthCalledWith(2, '/srv/alpha', { includeStats: true });
+
+    // Full response arrives first (req-2), then stale summary response arrives (req-1)
+    const realFiles: ChangeFile[] = [{ path: '/srv/alpha/b.ts', code: 'M' }];
+    emit({
+      type: 'fs.git_status_response',
+      requestId: 'req-2',
+      path: '/srv/alpha',
+      resolvedPath: '/srv/alpha',
+      status: 'ok',
+      files: realFiles,
+      totalCount: 1200,
+      truncated: true,
+    } as ServerMessage);
+    emit({
+      type: 'fs.git_status_response',
+      requestId: 'req-1',
+      path: '/srv/alpha',
+      resolvedPath: '/srv/alpha',
+      status: 'ok',
+      files: [],
+      totalCount: 999,
+      truncated: true,
+    } as ServerMessage);
+
+    expect(filesListener).toHaveBeenLastCalledWith(realFiles);
+    expect(metaListener).toHaveBeenLastCalledWith({ totalCount: 1200, truncated: true });
+
+    unsubFiles();
+    unsubMeta();
+  });
+
+  it('falls back to files.length and truncated=false for older daemon responses', () => {
+    const { ws, emit } = makeFakeWs();
+    const key = getSharedChangesKey(ws, '/srv/alpha');
+    const metaListener = vi.fn();
+    const unsubMeta = subscribeSharedChangesMeta(key, metaListener);
+
+    requestSharedChanges(ws, '/srv/alpha');
+    emit({
+      type: 'fs.git_status_response',
+      requestId: 'req-1',
+      path: '/srv/alpha',
+      resolvedPath: '/srv/alpha',
+      status: 'ok',
+      files: [
+        { path: '/srv/alpha/a.ts', code: 'M' },
+        { path: '/srv/alpha/b.ts', code: 'A' },
+      ],
+    } as ServerMessage);
+
+    expect(metaListener).toHaveBeenLastCalledWith({ totalCount: 2, truncated: false });
+    unsubMeta();
+  });
+
+  it('exposes useSharedGitChangesCount helper', () => {
+    expect(typeof useSharedGitChangesCount).toBe('function');
   });
 });

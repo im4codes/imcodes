@@ -2036,15 +2036,18 @@ export class WsClient {
   }
 
   /** Request git status for a directory. Returns requestId. */
-  fsGitStatus(path: string, opts?: { includeStats?: boolean; sessionName?: string }): string {
-    const key = JSON.stringify(['fs.git_status', path, opts?.includeStats === true, opts?.sessionName ?? '']);
+  fsGitStatus(path: string, opts?: { includeStats?: boolean; summaryOnly?: boolean; sessionName?: string }): string {
+    const summaryOnly = opts?.summaryOnly === true;
+    const includeStats = !summaryOnly && opts?.includeStats === true;
+    const key = JSON.stringify(['fs.git_status', path, includeStats, summaryOnly, opts?.sessionName ?? '']);
     return this.beginOwnedDataRequest(
       key,
       (requestId) => ({
         type: 'fs.git_status',
         path,
         requestId,
-        ...(opts?.includeStats ? { includeStats: true } : {}),
+        ...(includeStats ? { includeStats: true } : {}),
+        ...(summaryOnly ? { summaryOnly: true } : {}),
         ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
       }),
       (requestId) => ({

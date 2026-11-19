@@ -178,7 +178,7 @@ import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDelive
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
-import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
+import { useSharedGitChangesCount, requestSharedChangesCount } from './git-status-store.js';
 import {
   applyFilePreviewRequestUpdate,
   normalizePreviewViewMode,
@@ -8711,11 +8711,10 @@ function InternalMainApp() {
   }, [activeSession, activeSessionInfo?.projectDir, pinnedPanels.length, pinPanel, selectedServerId]);
 
   // ── Git changes count for file browser badge ───────────────────────────
-  // Uses useSharedGitChanges — shares the cache with FileBrowser, SubSessionWindow,
-  // and any other consumer pointing at the same repo path. A single `fs.git_status`
-  // request feeds all of them; no duplicate requests when paths match.
-  const sharedGitFiles = useSharedGitChanges(wsRef.current, activeSessionInfo?.projectDir ?? null);
-  const gitChangesCount = sharedGitFiles.length;
+  // Uses useSharedGitChangesCount — sends lightweight summaryOnly requests when
+  // no FileBrowser list consumer is open, and shares/reuses the cache with
+  // FileBrowser and SubSessionWindow when paths match.
+  const gitChangesCount = useSharedGitChangesCount(wsRef.current, activeSessionInfo?.projectDir ?? null);
 
   // Nudge the shared cache when the agent finishes a tool call or goes idle,
   // so the badge reflects new/modified files without waiting for the 30s poll.
@@ -8728,7 +8727,7 @@ function InternalMainApp() {
       if (msg.type !== 'timeline.event') return;
       const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
       if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
-        requestSharedChanges(ws, dir);
+        requestSharedChangesCount(ws, dir);
       }
     });
     return () => { unsub(); };

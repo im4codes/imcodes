@@ -1244,6 +1244,8 @@
     "tab_files": "檔案",
     "tab_changes": "變更",
     "changes_title": "變更 ({{count}})",
+    "changes_truncated_notice": "僅顯示前 {{shown}} 項（共 {{total}} 項變更）",
+    "changes_load_more": "載入更多 {{count}} 項（{{shown}}/{{total}}）",
     "no_changes": "無變更",
     "refresh_changes": "重新整理變更",
     "refreshing_changes": "正在重新整理變更…",

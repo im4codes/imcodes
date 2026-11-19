@@ -1244,6 +1244,8 @@
     "tab_files": "文件",
     "tab_changes": "变更",
     "changes_title": "变更 ({{count}})",
+    "changes_truncated_notice": "仅显示前 {{shown}} 项（共 {{total}} 项变更）",
+    "changes_load_more": "加载更多 {{count}} 项（{{shown}}/{{total}}）",
     "no_changes": "无变更",
     "refresh_changes": "刷新变更",
     "refreshing_changes": "正在刷新变更…",

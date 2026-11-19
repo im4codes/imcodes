@@ -79,6 +79,7 @@ vi.mock('../../src/git-status-store.js', async (importOriginal) => {
   return {
     ...actual,
     useSharedGitChanges: () => [],
+    useSharedGitChangesCount: () => 0,
   };
 });
 

@@ -29,7 +29,7 @@ import { getLatestTransportActivityDetail } from '../transport-activity-status.j
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { getActiveCssZoom, UI_SCALE_EVENT } from '../ui-scale.js';
 import { useQuickData } from './QuickInputPanel.js';
-import { useSharedGitChanges } from '../git-status-store.js';
+import { useSharedGitChangesCount } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
 import { isShareScopedState, type SharedStateSummary } from '../tab-sharing-ui.js';
@@ -314,11 +314,9 @@ export function SubSessionWindow({
 
   // ── Shared git-changes cache for the 📁 badge ─────────────────────────────
   // Uses the same git-status-store as the main session and FileBrowser.
-  // When cwd matches another consumer (main session, other sub-sessions),
-  // a single `fs.git_status` request feeds all of them. No separate polling
-  // loop needed — `useSharedGitChanges` polls every 30s automatically.
-  const sharedGitFiles = useSharedGitChanges(ws, sub.cwd ?? null);
-  const gitChangesCount = sharedGitFiles.length;
+  // When no FileBrowser list consumer is mounted, sends lightweight summaryOnly
+  // count requests; when cwd matches FileBrowser, shares/reuses its updates.
+  const gitChangesCount = useSharedGitChangesCount(ws, sub.cwd ?? null);
 
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.

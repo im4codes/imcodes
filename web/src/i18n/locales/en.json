@@ -1244,6 +1244,8 @@
     "tab_files": "Files",
     "tab_changes": "Changes",
     "changes_title": "Changes ({{count}})",
+    "changes_truncated_notice": "Showing first {{shown}} of {{total}} changed files",
+    "changes_load_more": "Load {{count}} more ({{shown}}/{{total}})",
     "no_changes": "No changes",
     "refresh_changes": "Refresh changes",
     "refreshing_changes": "Refreshing changes…",

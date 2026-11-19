@@ -166,7 +166,10 @@ vi.mock('../src/hooks/usePref.js', () => ({
 }));
 vi.mock('../src/git-status-store.js', () => ({
   requestSharedChanges: vi.fn(),
+  requestSharedChangesCount: vi.fn(),
   useSharedGitChanges: () => [],
+  useSharedGitChangesCount: () => 0,
+  subscribeSharedChangesMeta: vi.fn(() => () => {}),
 }));
 vi.mock('../src/watch-bridge.js', () => ({ onWatchCommand: vi.fn(async () => vi.fn()) }));
 vi.mock('../src/watch-projection.js', () => ({

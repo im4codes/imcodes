@@ -1160,4 +1160,93 @@ describe('fs git cache handlers', () => {
     expect(mockExec).toHaveBeenCalledTimes(4);
     expect((sent.find((msg: any) => msg.requestId === 'write-1') as any)?.status).toBe('ok');
   });
+
+  it('handles summaryOnly without numstat, isolates cache from full list, and reuses fresh stats cache', async () => {
+    const repoRoot = '/home/k/project';
+    setupRepoMocks(repoRoot);
+    mockExec.mockImplementation((command: any, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      if (command === 'git status --porcelain=v1 -z -u') {
+        callback(null, 'M  src/a.ts\0?? untracked.txt\0', '');
+        return {} as any;
+      }
+      if (command === 'git diff --numstat -z HEAD') {
+        callback(null, '2\t1\tsrc/a.ts\0', '');
+        return {} as any;
+      }
+      callback(null, '', '');
+      return {} as any;
+    });
+
+    // 1. summaryOnly runs only git status, returns empty files + exact totalCount
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'sum-1', includeStats: true, summaryOnly: true }, mockServerLink as any);
+    await flushAsync();
+    const sum1 = sent.find((msg: any) => msg.requestId === 'sum-1') as any;
+    expect(sum1.status).toBe('ok');
+    expect(sum1.files).toEqual([]);
+    expect(sum1.totalCount).toBe(2);
+    expect(sum1.truncated).toBe(true);
+    expect(mockExec.mock.calls.map((call) => call[0])).toEqual(['git status --porcelain=v1 -z -u']);
+
+    // 2. Subsequent full-list request does NOT get polluted by summary cache
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'full-1', includeStats: true }, mockServerLink as any);
+    await flushAsync();
+    const full1 = sent.find((msg: any) => msg.requestId === 'full-1') as any;
+    expect(full1.status).toBe('ok');
+    expect(full1.totalCount).toBe(2);
+    expect(full1.truncated).toBe(false);
+    expect(full1.files).toEqual([
+      { path: '/home/k/project/src/a.ts', code: 'M', additions: 2, deletions: 1 },
+      { path: '/home/k/project/untracked.txt', code: '??' },
+    ]);
+    expect(mockExec.mock.calls.map((call) => call[0])).toEqual([
+      'git status --porcelain=v1 -z -u',
+      'git status --porcelain=v1 -z -u',
+      'git diff --numstat -z HEAD',
+    ]);
+
+    // 3. Subsequent summaryOnly request reuses the fresh stats cache without re-running git
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'sum-2', includeStats: true, summaryOnly: true }, mockServerLink as any);
+    await flushAsync();
+    const sum2 = sent.find((msg: any) => msg.requestId === 'sum-2') as any;
+    expect(sum2.files).toEqual([]);
+    expect(sum2.totalCount).toBe(2);
+    expect(sum2.truncated).toBe(true);
+    expect(mockExec).toHaveBeenCalledTimes(3);
+  });
+
+  it('caps large git status responses at 1000 entries and reports totalCount', async () => {
+    const repoRoot = '/home/k/project';
+    setupRepoMocks(repoRoot);
+    const untracked = Array.from({ length: 1050 }, (_, idx) => `?? file-${idx}.txt`).join('\0');
+    const tracked = 'M  src/important.ts';
+    mockExec.mockImplementation((command: any, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      if (command === 'git status --porcelain=v1 -z -u') {
+        callback(null, `${untracked}\0${tracked}\0`, '');
+        return {} as any;
+      }
+      if (command === 'git diff --numstat -z HEAD') {
+        callback(null, '4\t0\tsrc/important.ts\0', '');
+        return {} as any;
+      }
+      callback(null, '', '');
+      return {} as any;
+    });
+
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'cap-1', includeStats: true }, mockServerLink as any);
+    await flushAsync();
+
+    const res = sent.find((msg: any) => msg.requestId === 'cap-1') as any;
+    expect(res.status).toBe('ok');
+    expect(res.totalCount).toBe(1051);
+    expect(res.truncated).toBe(true);
+    expect(res.files).toHaveLength(1000);
+    expect(res.files[0]).toEqual({
+      path: '/home/k/project/src/important.ts',
+      code: 'M',
+      additions: 4,
+      deletions: 0,
+    });
+  });
 });

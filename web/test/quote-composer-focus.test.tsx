@@ -90,6 +90,9 @@ vi.mock('../src/hooks/useTimeline.js', () => ({
 
 vi.mock('../src/git-status-store.js', () => ({
   useSharedGitChanges: () => [],
+  useSharedGitChangesCount: () => 0,
+  requestSharedChangesCount: vi.fn(),
+  subscribeSharedChangesMeta: vi.fn(() => () => {}),
 }));
 
 vi.mock('../src/components/QuickInputPanel.js', () => ({

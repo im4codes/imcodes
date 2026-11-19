@@ -312,7 +312,10 @@ vi.mock('../src/hooks/useSyncedPreference.js', async () => {
 });
 vi.mock('../src/git-status-store.js', () => ({
   useSharedGitChanges: () => [],
+  useSharedGitChangesCount: () => 0,
   requestSharedChanges: vi.fn(),
+  requestSharedChangesCount: vi.fn(),
+  subscribeSharedChangesMeta: vi.fn(() => () => {}),
 }));
 vi.mock('../src/watch-bridge.js', () => ({
   onWatchCommand: () => Promise.resolve(() => {}),

@@ -43,6 +43,40 @@ export interface GitStatusEntry {
   deletions?: number;
 }
 
+/** Hard cap on per-response changed-file entries returned by `fs.git_status` to keep WS frames bounded on huge repos. */
+export const FS_GIT_STATUS_MAX_FILES = 1000;
+
+/**
+ * Cap changed-file entries to `maxFiles` while keeping `totalCount` exact.
+ * Tracked/staged changes (codes other than `??` and `!!`) are prioritized ahead of untracked (`??`) and ignored (`!!`) entries.
+ */
+export function capFsGitStatusFiles<T extends { code: string }>(
+  files: readonly T[],
+  maxFiles = FS_GIT_STATUS_MAX_FILES,
+): { files: T[]; totalCount: number; truncated: boolean } {
+  const totalCount = files.length;
+  if (totalCount <= maxFiles) {
+    return { files: [...files], totalCount, truncated: false };
+  }
+  const tracked: T[] = [];
+  const untracked: T[] = [];
+  const ignored: T[] = [];
+  for (const file of files) {
+    if (file.code === '??') untracked.push(file);
+    else if (file.code === '!!') ignored.push(file);
+    else tracked.push(file);
+  }
+  const prioritized: T[] = [];
+  for (const bucket of [tracked, untracked, ignored]) {
+    for (const file of bucket) {
+      if (prioritized.length >= maxFiles) break;
+      prioritized.push(file);
+    }
+    if (prioritized.length >= maxFiles) break;
+  }
+  return { files: prioritized, totalCount, truncated: true };
+}
+
 export const FS_WRITE_ERROR = {
   FILE_EXISTS: 'file_exists',
 } as const;
@@ -123,6 +157,10 @@ export interface FsWriteResponse extends Omit<FsBaseResponse, 'status'> {
 export interface FsGitStatusResponse extends FsBaseResponse {
   type: 'fs.git_status_response';
   files?: GitStatusEntry[];
+  /** Exact number of matching changed files before truncation (or in summaryOnly mode). */
+  totalCount?: number;
+  /** True when `files` was truncated or omitted (summaryOnly) relative to `totalCount`. */
+  truncated?: boolean;
 }
 
 export interface FsGitDiffResponse extends FsBaseResponse {

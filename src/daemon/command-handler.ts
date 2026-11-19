@@ -284,7 +284,7 @@ import {
 } from '../../shared/memory-ws.js';
 import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
-import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../shared/transport/fs.js';
+import { capFsGitStatusFiles, FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
@@ -11350,7 +11350,10 @@ interface GitStatusResponseSnapshot {
   repoSignature: string;
   requestedPath: string;
   includeStats: boolean;
+  summaryOnly?: boolean;
   files: GitStatusFile[];
+  totalCount?: number;
+  truncated?: boolean;
 }
 
 interface GitDiffSnapshot {
@@ -11514,7 +11517,7 @@ function toGitPath(relativePath: string): string {
 }
 
 async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string): Promise<GitStatusSnapshot> {
-  const { stdout } = await execFileAsync('git', ['status', '--porcelain=v1', '-z', '-u'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+  const { stdout } = await execFileAsync('git', ['status', '--porcelain=v1', '-z', '-u'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
   const files: GitStatusFile[] = [];
   const records = parseZRecords(stdout);
   for (let idx = 0; idx < records.length; idx++) {
@@ -11590,15 +11593,27 @@ async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSna
   return await promise;
 }
 
+function isNonRetryableGitStatusReadError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const err = error as { code?: unknown; killed?: unknown; message?: unknown };
+  if (err.killed === true || err.code === 'ETIMEDOUT' || err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+    return true;
+  }
+  const msg = typeof err.message === 'string' ? err.message.toLowerCase() : '';
+  return msg.includes('maxbuffer') || msg.includes('timed out');
+}
+
 async function loadRepoGitNumstatSnapshot(repoRoot: string, repoSignature: string): Promise<GitNumstatSnapshot> {
   let stdout = '';
   try {
     ({ stdout } = await execFileAsync('git', ['diff', '--numstat', '-z', 'HEAD'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
-  } catch {
-    try {
-      ({ stdout } = await execFileAsync('git', ['diff', '--numstat', '-z'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
-    } catch {
-      stdout = '';
+  } catch (err) {
+    if (!isNonRetryableGitStatusReadError(err)) {
+      try {
+        ({ stdout } = await execFileAsync('git', ['diff', '--numstat', '-z'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
+      } catch {
+        stdout = '';
+      }
     }
   }
   const stats = new Map<string, { additions?: number; deletions?: number }>();
@@ -11651,8 +11666,14 @@ async function getRepoGitNumstatSnapshot(startPath: string): Promise<GitNumstatS
   return await promise;
 }
 
-function getGitStatusResponseCacheKey(repoRoot: string, requestedPath: string, includeStats: boolean): string {
-  return `${repoRoot}::${requestedPath}::${includeStats ? 'stats' : 'plain'}`;
+function getGitStatusResponseCacheKey(
+  repoRoot: string,
+  requestedPath: string,
+  includeStats: boolean,
+  summaryOnly = false,
+): string {
+  const mode = summaryOnly ? 'summary' : (includeStats ? 'stats' : 'plain');
+  return `${repoRoot}::${requestedPath}::${mode}`;
 }
 
 function fsGitStatusErrorCode(error: unknown): string {
@@ -11699,49 +11720,101 @@ async function loadRepoGitStatusResponseSnapshot(
   context: RepoContext,
   requestedPath: string,
   includeStats: boolean,
+  summaryOnly = false,
 ): Promise<GitStatusResponseSnapshot> {
+  const effectiveIncludeStats = !summaryOnly && includeStats;
   if (shouldUseFsGitStatusWorkerPool()) {
     const snapshot = await getDefaultFsGitStatusWorkerPool().dispatch({
       repoRoot: context.repoRoot,
       repoSignature: context.repoSignature,
       requestedPath,
-      includeStats,
+      includeStats: effectiveIncludeStats,
+      ...(summaryOnly ? { summaryOnly: true } : {}),
     });
+    if (summaryOnly) {
+      const totalCount = snapshot.totalCount ?? snapshot.files.length;
+      return {
+        repoRoot: snapshot.repoRoot,
+        repoSignature: snapshot.repoSignature,
+        requestedPath: snapshot.requestedPath,
+        includeStats: false,
+        summaryOnly: true,
+        files: [],
+        totalCount,
+        truncated: snapshot.truncated ?? (totalCount > 0),
+      };
+    }
+    const capped = snapshot.totalCount !== undefined
+      ? {
+          files: snapshot.files,
+          totalCount: snapshot.totalCount,
+          truncated: snapshot.truncated ?? false,
+        }
+      : capFsGitStatusFiles(snapshot.files);
     return {
       repoRoot: snapshot.repoRoot,
       repoSignature: snapshot.repoSignature,
       requestedPath: snapshot.requestedPath,
       includeStats: snapshot.includeStats,
-      files: snapshot.files,
+      summaryOnly: false,
+      files: capped.files,
+      totalCount: capped.totalCount,
+      truncated: capped.truncated,
     };
   }
 
-  const [snapshot, numstat] = await Promise.all([
-    loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature),
-    includeStats ? loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature) : Promise.resolve(null),
-  ]);
+  const snapshot = await loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature);
+  const filteredStatusFiles = filterRepoFilesForPath(snapshot.files, requestedPath);
+  if (summaryOnly) {
+    const totalCount = filteredStatusFiles.length;
+    return {
+      repoRoot: context.repoRoot,
+      repoSignature: context.repoSignature,
+      requestedPath,
+      includeStats: false,
+      summaryOnly: true,
+      files: [],
+      totalCount,
+      truncated: totalCount > 0,
+    };
+  }
+
+  const directIgnored = effectiveIncludeStats ? [] : await loadRepoDirectIgnoredChildren(context.repoRoot, requestedPath);
   const filesByPath = new Map<string, GitStatusFile>();
-  for (const file of filterRepoFilesForPath(snapshot.files, requestedPath).map((file) => {
-    const stats = numstat?.stats.get(file.path);
-    return stats ? { ...file, ...stats } : file;
-  })) {
+  for (const file of filteredStatusFiles) {
     filesByPath.set(file.path, file);
   }
-  if (!includeStats) {
-    for (const file of await loadRepoDirectIgnoredChildren(context.repoRoot, requestedPath)) {
-      if (!filesByPath.has(file.path)) filesByPath.set(file.path, file);
-    }
+  for (const file of directIgnored) {
+    if (!filesByPath.has(file.path)) filesByPath.set(file.path, file);
   }
+  const capped = capFsGitStatusFiles([...filesByPath.values()]);
+  const numstat = effectiveIncludeStats && capped.files.length > 0
+    ? await loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature)
+    : null;
+  const files = numstat
+    ? capped.files.map((file) => {
+        const stats = numstat.stats.get(file.path);
+        return stats ? { ...file, ...stats } : file;
+      })
+    : capped.files;
   return {
     repoRoot: context.repoRoot,
     repoSignature: context.repoSignature,
     requestedPath,
-    includeStats,
-    files: [...filesByPath.values()],
+    includeStats: effectiveIncludeStats,
+    summaryOnly: false,
+    files,
+    totalCount: capped.totalCount,
+    truncated: capped.truncated,
   };
 }
 
-async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats: boolean): Promise<GitStatusResponseSnapshot | null> {
+async function getRepoGitStatusResponseSnapshot(
+  startPath: string,
+  includeStats: boolean,
+  summaryOnly = false,
+): Promise<GitStatusResponseSnapshot | null> {
+  const effectiveIncludeStats = !summaryOnly && includeStats;
   const context = await resolveRepoContext(startPath);
   if (!context) {
     recordFsWorkerMetric({
@@ -11751,11 +11824,11 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
       queueDepth: fsGitStatusWorkerQueueDepth(),
       queueWaitMs: 0,
       workerExecutionMs: 0,
-      includeStats,
+      includeStats: effectiveIncludeStats,
     });
     return null;
   }
-  const cacheKey = getGitStatusResponseCacheKey(context.repoRoot, startPath, includeStats);
+  const cacheKey = getGitStatusResponseCacheKey(context.repoRoot, startPath, effectiveIncludeStats, summaryOnly);
   const cached = getCachedGitStatusResponseSnapshot(cacheKey, context.repoSignature, false);
   if (cached) {
     recordFsWorkerMetric({
@@ -11765,10 +11838,37 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
       queueDepth: fsGitStatusWorkerQueueDepth(),
       queueWaitMs: 0,
       workerExecutionMs: 0,
-      includeStats,
-      fileCount: cached.files.length,
+      includeStats: effectiveIncludeStats,
+      fileCount: cached.totalCount ?? cached.files.length,
     });
     return cached;
+  }
+  if (summaryOnly) {
+    const statsCacheKey = getGitStatusResponseCacheKey(context.repoRoot, startPath, true, false);
+    const cachedFull = getCachedGitStatusResponseSnapshot(statsCacheKey, context.repoSignature, false);
+    if (cachedFull) {
+      const totalCount = cachedFull.totalCount ?? cachedFull.files.length;
+      recordFsWorkerMetric({
+        commandType: 'fs.git_status',
+        cacheStatus: 'hit',
+        terminalReason: 'ok',
+        queueDepth: fsGitStatusWorkerQueueDepth(),
+        queueWaitMs: 0,
+        workerExecutionMs: 0,
+        includeStats: false,
+        fileCount: totalCount,
+      });
+      return {
+        repoRoot: cachedFull.repoRoot,
+        repoSignature: cachedFull.repoSignature,
+        requestedPath: cachedFull.requestedPath,
+        includeStats: false,
+        summaryOnly: true,
+        files: [],
+        totalCount,
+        truncated: totalCount > 0,
+      };
+    }
   }
   const staleCached = getCachedGitStatusResponseSnapshot(cacheKey, context.repoSignature, true);
   const generation = getResourceGeneration(gitRepoGenerations, context.repoRoot);
@@ -11785,13 +11885,13 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
       queueWaitMs: 0,
       workerExecutionMs: 0,
       attached: inflight.attached,
-      includeStats,
+      includeStats: effectiveIncludeStats,
     });
     return await inflight.promise;
   }
   const workerStartedAt = Date.now();
   const queueDepthAtDispatch = fsGitStatusWorkerQueueDepth();
-  const promise = loadRepoGitStatusResponseSnapshot(context, startPath, includeStats)
+  const promise = loadRepoGitStatusResponseSnapshot(context, startPath, effectiveIncludeStats, summaryOnly)
     .then(async (value) => {
       const currentSignature = await getRepoSignature(context.repoRoot, context.gitDir);
       if (
@@ -11816,8 +11916,8 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
         queueDepth: queueDepthAtDispatch,
         queueWaitMs: 0,
         workerExecutionMs: Date.now() - workerStartedAt,
-        includeStats,
-        fileCount: value.files.length,
+        includeStats: effectiveIncludeStats,
+        fileCount: value.totalCount ?? value.files.length,
       });
       return value;
     })
@@ -11832,8 +11932,8 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
           queueWaitMs: 0,
           workerExecutionMs: Date.now() - workerStartedAt,
           lateResultSkip: true,
-          includeStats,
-          fileCount: staleCached.files.length,
+          includeStats: effectiveIncludeStats,
+          fileCount: staleCached.totalCount ?? staleCached.files.length,
         });
         return staleCached;
       }
@@ -11844,7 +11944,7 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
         queueDepth: queueDepthAtDispatch,
         queueWaitMs: 0,
         workerExecutionMs: Date.now() - workerStartedAt,
-        includeStats,
+        includeStats: effectiveIncludeStats,
       });
       throw error;
     })
@@ -12006,7 +12106,8 @@ function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): 
 async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
-  const includeStats = cmd.includeStats === true;
+  const summaryOnly = cmd.summaryOnly === true;
+  const includeStats = !summaryOnly && cmd.includeStats === true;
   if (!rawPath || !requestId) return;
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
@@ -12025,7 +12126,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     deadlineTimer.unref?.();
   });
   try {
-    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, requestContext, sessionRoot.realRoot), deadline]);
+    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, summaryOnly, requestContext, sessionRoot.realRoot), deadline]);
   } catch (err) {
     const msg = fsGitStatusErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -12045,6 +12146,7 @@ async function handleFsGitStatusInner(
   rawPath: string,
   requestId: string,
   includeStats: boolean,
+  summaryOnly: boolean,
   requestContext: FsListRequestContext,
   sessionRealRoot?: string,
 ): Promise<void> {
@@ -12054,7 +12156,7 @@ async function handleFsGitStatusInner(
     requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH });
     return;
   }
-  const snapshot = await getRepoGitStatusResponseSnapshot(real, includeStats);
+  const snapshot = await getRepoGitStatusResponseSnapshot(real, includeStats, summaryOnly);
   requestContext.send({
     type: 'fs.git_status_response',
     requestId,
@@ -12062,6 +12164,8 @@ async function handleFsGitStatusInner(
     resolvedPath: real,
     status: 'ok',
     files: snapshot?.files ?? [],
+    ...(snapshot?.totalCount !== undefined ? { totalCount: snapshot.totalCount } : {}),
+    ...(snapshot?.truncated !== undefined ? { truncated: snapshot.truncated } : {}),
   });
 }
 

@@ -29,6 +29,7 @@ vi.mock('node:fs/promises', async () => {
 });
 
 import { scanFsGitStatusSnapshot } from '../../src/daemon/fs-git-status-worker.js';
+import { FS_GIT_STATUS_MAX_FILES } from '../../src/shared/transport/fs.js';
 
 const mockExecFile = vi.mocked(childProcess.execFile);
 const mockReaddir = vi.mocked(fsp.readdir);
@@ -159,10 +160,117 @@ describe('fs git status worker', () => {
     });
 
     expect(result.files).toEqual([{ path: '/home/k/project/src/a.ts', code: 'M' }]);
+    expect(result.totalCount).toBe(1);
+    expect(result.truncated).toBe(false);
     expect(mockExecFile.mock.calls.map((call) => call[1])).toEqual([
       ['status', '--porcelain=v1', '-z', '-u'],
       ['diff', '--numstat', '-z', 'HEAD'],
       ['diff', '--numstat', '-z'],
+    ]);
+  });
+
+  it('caps large entry lists while preserving tracked changes first and exact totalCount', async () => {
+    const untracked = Array.from({ length: FS_GIT_STATUS_MAX_FILES + 50 }, (_, idx) => `?? untracked-${idx}.txt`).join('\0');
+    const tracked = Array.from({ length: 5 }, (_, idx) => `M  src/tracked-${idx}.ts`).join('\0');
+    const porcelain = `${untracked}\0${tracked}\0`;
+
+    mockExecFile.mockImplementation((_file, args, _options, callback) => {
+      const cb = typeof _options === 'function' ? _options : callback;
+      const argv = args as string[];
+      if (argv[0] === 'status') {
+        cb?.(null, porcelain, '');
+        return {} as any;
+      }
+      if (argv[0] === 'diff') {
+        cb?.(null, '3\t1\tsrc/tracked-0.ts\0', '');
+        return {} as any;
+      }
+      cb?.(null, '', '');
+      return {} as any;
+    });
+
+    const result = await scanFsGitStatusSnapshot({
+      repoRoot: '/home/k/project',
+      requestedPath: '/home/k/project',
+      includeStats: true,
+    });
+
+    expect(result.totalCount).toBe(FS_GIT_STATUS_MAX_FILES + 55);
+    expect(result.truncated).toBe(true);
+    expect(result.files).toHaveLength(FS_GIT_STATUS_MAX_FILES);
+    expect(result.files.slice(0, 5).map((entry) => entry.code)).toEqual(['M', 'M', 'M', 'M', 'M']);
+    expect(result.files[0]).toEqual({
+      path: '/home/k/project/src/tracked-0.ts',
+      code: 'M',
+      additions: 3,
+      deletions: 1,
+    });
+  });
+
+  it('supports summaryOnly fast-path without running numstat or check-ignore', async () => {
+    mockExecFile.mockImplementation((_file, args, _options, callback) => {
+      const cb = typeof _options === 'function' ? _options : callback;
+      const argv = args as string[];
+      if (argv[0] === 'status') {
+        cb?.(null, 'M  src/a.ts\0?? src/b.ts\0M  other/c.ts\0', '');
+        return {} as any;
+      }
+      cb?.(new Error(`unexpected command: ${argv.join(' ')}`), '', '');
+      return {} as any;
+    });
+
+    const fullRepoSummary = await scanFsGitStatusSnapshot({
+      repoRoot: '/home/k/project',
+      requestedPath: '/home/k/project',
+      includeStats: true,
+      summaryOnly: true,
+    });
+    expect(fullRepoSummary.files).toEqual([]);
+    expect(fullRepoSummary.totalCount).toBe(3);
+    expect(fullRepoSummary.truncated).toBe(true);
+    expect(fullRepoSummary.summaryOnly).toBe(true);
+
+    const subdirSummary = await scanFsGitStatusSnapshot({
+      repoRoot: '/home/k/project',
+      requestedPath: '/home/k/project/src',
+      includeStats: true,
+      summaryOnly: true,
+    });
+    expect(subdirSummary.files).toEqual([]);
+    expect(subdirSummary.totalCount).toBe(2);
+    expect(subdirSummary.truncated).toBe(true);
+    expect(mockExecFile.mock.calls.map((call) => call[1])).toEqual([
+      ['status', '--porcelain=v1', '-z', '-u'],
+      ['status', '--porcelain=v1', '-z', '-u'],
+    ]);
+  });
+
+  it('skips fallback numstat retry on maxBuffer error', async () => {
+    mockExecFile.mockImplementation((_file, args, _options, callback) => {
+      const cb = typeof _options === 'function' ? _options : callback;
+      const argv = args as string[];
+      if (argv[0] === 'status') {
+        cb?.(null, 'M  src/a.ts\0', '');
+        return {} as any;
+      }
+      if (argv[0] === 'diff' && argv[3] === 'HEAD') {
+        cb?.(Object.assign(new Error('stdout maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }), '', '');
+        return {} as any;
+      }
+      cb?.(new Error('should not retry'), '', '');
+      return {} as any;
+    });
+
+    const result = await scanFsGitStatusSnapshot({
+      repoRoot: '/home/k/project',
+      requestedPath: '/home/k/project',
+      includeStats: true,
+    });
+
+    expect(result.files).toEqual([{ path: '/home/k/project/src/a.ts', code: 'M' }]);
+    expect(mockExecFile.mock.calls.map((call) => call[1])).toEqual([
+      ['status', '--porcelain=v1', '-z', '-u'],
+      ['diff', '--numstat', '-z', 'HEAD'],
     ]);
   });
 });

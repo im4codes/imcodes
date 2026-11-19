@@ -1244,6 +1244,8 @@
     "tab_files": "파일",
     "tab_changes": "변경",
     "changes_title": "변경 ({{count}})",
+    "changes_truncated_notice": "처음 {{shown}}개만 표시 중 (전체 {{total}}개 변경)",
+    "changes_load_more": "{{count}}개 더 불러오기 ({{shown}}/{{total}})",
     "no_changes": "변경 없음",
     "refresh_changes": "변경 새로고침",
     "refreshing_changes": "변경을 새로 고치는 중…",

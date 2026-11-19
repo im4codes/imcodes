@@ -86,10 +86,12 @@ import {
 import {
   getSharedChangesKey,
   subscribeSharedChanges,
+  subscribeSharedChangesMeta,
   subscribeSharedChangesStatus,
   requestSharedChanges,
   __resetSharedChangesForTests,
   type ChangeFile,
+  type SharedChangesMeta,
   type SharedChangesRequestStatus,
 } from '../git-status-store.js';
 import { filePreviewStatesEqual } from '../file-preview-state.js';
@@ -99,6 +101,7 @@ import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 const PREF_KEY = 'fb_prefer_editor';
+export const CHANGES_RENDER_BATCH_SIZE = 200;
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 /** Sentinel path that asks the daemon to list Windows drive roots. */
 const WINDOWS_DRIVES_PATH = FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES;
@@ -809,6 +812,8 @@ export function FileBrowser({
     try { localStorage.setItem('rcc_fb_tab', v); } catch { /* ignore */ }
   };
   const [changesFiles, setChangesFiles] = useState<ChangeFile[]>([]);
+  const [changesMeta, setChangesMeta] = useState<SharedChangesMeta>({ totalCount: 0, truncated: false });
+  const [changesVisibleLimit, setChangesVisibleLimit] = useState(CHANGES_RENDER_BATCH_SIZE);
   const [changesRefreshStatus, setChangesRefreshStatus] = useState<SharedChangesRequestStatus>('idle');
   const changesRefreshFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -1899,7 +1904,12 @@ export function FileBrowser({
   }, [serverId, ws]);
 
   useEffect(() => {
-    if (!changesRootPath) return;
+    setChangesVisibleLimit(CHANGES_RENDER_BATCH_SIZE);
+    setChangesFiles([]);
+    setChangesMeta({ totalCount: 0, truncated: false });
+    if (!changesRootPath) {
+      return;
+    }
     const cacheKey = getSharedChangesKey(ws, changesRootPath);
     const unsubscribeFiles = subscribeSharedChanges(cacheKey, (files) => {
       if (!mountedRef.current) return;
@@ -1912,6 +1922,10 @@ export function FileBrowser({
         for (const file of files) next.set(file.path, file.code);
         return next;
       });
+    });
+    const unsubscribeMeta = subscribeSharedChangesMeta(cacheKey, (meta) => {
+      if (!mountedRef.current) return;
+      setChangesMeta(meta);
     });
     const unsubscribeStatus = subscribeSharedChangesStatus(cacheKey, (status) => {
       if (!mountedRef.current) return;
@@ -1934,6 +1948,7 @@ export function FileBrowser({
     });
     return () => {
       unsubscribeFiles();
+      unsubscribeMeta();
       unsubscribeStatus();
       if (changesRefreshFeedbackTimerRef.current) {
         clearTimeout(changesRefreshFeedbackTimerRef.current);
@@ -2093,6 +2108,7 @@ export function FileBrowser({
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
   const lastChangesRefreshRef = useRef(0);
+  const lastChangesRefreshPathRef = useRef<string>('');
   const pendingChangesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const changesVisible = !!changesRootPath && panelView === 'changes';
@@ -2100,8 +2116,14 @@ export function FileBrowser({
   const refreshChanges = useCallback(() => {
     if (!changesRootPath) return;
     const now = Date.now();
-    const elapsed = now - lastChangesRefreshRef.current;
+    const pathChanged = lastChangesRefreshPathRef.current !== changesRootPath;
+    const elapsed = pathChanged ? CHANGES_RATE_LIMIT_MS : now - lastChangesRefreshRef.current;
     if (elapsed >= CHANGES_RATE_LIMIT_MS) {
+      if (pendingChangesTimerRef.current) {
+        clearTimeout(pendingChangesTimerRef.current);
+        pendingChangesTimerRef.current = null;
+      }
+      lastChangesRefreshPathRef.current = changesRootPath;
       lastChangesRefreshRef.current = now;
       requestSharedChanges(ws, changesRootPath, false, scopedSessionName);
     } else {
@@ -2109,6 +2131,7 @@ export function FileBrowser({
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       pendingChangesTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return;
+        lastChangesRefreshPathRef.current = changesRootPath;
         lastChangesRefreshRef.current = Date.now();
         requestSharedChanges(ws, changesRootPath, true, scopedSessionName);
       }, CHANGES_RATE_LIMIT_MS - elapsed);
@@ -3150,15 +3173,21 @@ export function FileBrowser({
   const STATUS_LABEL: Record<string, string> = {
     M: 'Modified', A: 'Added', D: 'Deleted', R: 'Renamed', C: 'Copied', '??': 'Untracked', '!!': 'Ignored',
   };
+  const effectiveChangesTotal = Math.max(changesMeta.totalCount, changesFiles.length);
+  const isChangesTruncated = changesMeta.truncated || effectiveChangesTotal > changesFiles.length;
+  const visibleChangesFiles = useMemo(
+    () => changesFiles.slice(0, changesVisibleLimit),
+    [changesFiles, changesVisibleLimit],
+  );
   const groupedChanges = useMemo(() => {
     const groups: Record<string, Array<{ path: string; code: string; additions?: number; deletions?: number }>> = {};
-    for (const f of changesFiles) {
+    for (const f of visibleChangesFiles) {
       const label = STATUS_LABEL[f.code] ?? f.code;
       if (!groups[label]) groups[label] = [];
       groups[label].push(f);
     }
     return groups;
-  }, [changesFiles]);
+  }, [visibleChangesFiles]);
 
   const changesRefreshLabel = changesRefreshStatus === 'refreshing'
     ? t('file_browser.refreshing_changes')
@@ -3175,7 +3204,7 @@ export function FileBrowser({
   const changesSection = (
     <div class="fb-changes-section">
       <div class="fb-changes-header">
-        <span class="fb-changes-title">{t('file_browser.changes_title', { count: changesFiles.length })}</span>
+        <span class="fb-changes-title">{t('file_browser.changes_title', { count: effectiveChangesTotal })}</span>
         {changesRootPath && (
           <button
             class={`fb-changes-refresh is-${changesRefreshStatus}`}
@@ -3194,6 +3223,15 @@ export function FileBrowser({
           ><span class="fb-changes-refresh-icon" aria-hidden="true">{changesRefreshIcon}</span></button>
         )}
       </div>
+      {isChangesTruncated && (
+        <div class="fb-changes-truncated-notice" data-testid="fb-changes-truncated-notice">
+          {t('file_browser.changes_truncated_notice', {
+            shown: changesFiles.length,
+            total: effectiveChangesTotal,
+            defaultValue: 'Showing first {{shown}} of {{total}} changed files',
+          })}
+        </div>
+      )}
       {changesFiles.length > 0 ? (
         <div class="fb-changes-list">
           {Object.entries(groupedChanges).map(([label, files]) => (
@@ -3224,6 +3262,21 @@ export function FileBrowser({
             })}
           </div>
           ))}
+          {changesFiles.length > visibleChangesFiles.length && (
+            <button
+              type="button"
+              class="fb-changes-load-more"
+              data-testid="fb-changes-load-more"
+              onClick={() => setChangesVisibleLimit((prev) => prev + CHANGES_RENDER_BATCH_SIZE)}
+            >
+              {t('file_browser.changes_load_more', {
+                count: Math.min(CHANGES_RENDER_BATCH_SIZE, changesFiles.length - visibleChangesFiles.length),
+                shown: visibleChangesFiles.length,
+                total: changesFiles.length,
+                defaultValue: 'Load {{count}} more ({{shown}}/{{total}})',
+              })}
+            </button>
+          )}
         </div>
       ) : (
         <div class="fb-preview-msg fb-changes-empty">{t('file_browser.no_changes')}</div>
@@ -3790,7 +3843,7 @@ export function FileBrowser({
         <button class={`fb-panel-tab${panelView === 'files' ? ' active' : ''}`} onClick={() => setPanelView('files')}>{t('file_browser.tab_files')}</button>
         <button class={`fb-panel-tab${panelView === 'changes' ? ' active' : ''}`} onClick={() => setPanelView('changes')}>
           {t('file_browser.tab_changes')}
-          {changesFiles.length > 0 && <span class="fb-panel-tab-badge">{changesFiles.length}</span>}
+          {effectiveChangesTotal > 0 && <span class="fb-panel-tab-badge">{effectiveChangesTotal}</span>}
         </button>
       </div>
     ) : null;

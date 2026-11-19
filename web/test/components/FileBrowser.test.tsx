@@ -57,7 +57,7 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 
 vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 
-import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
+import { FileBrowser, CHANGES_RENDER_BATCH_SIZE, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
 import { NodeGroupsNavContext } from '../../src/components/node-groups-nav.js';
 import * as api from '../../src/api.js';
 import { resolvePreviewPath } from '../../src/components/ChatView.js';
@@ -4042,5 +4042,86 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       />,
     );
     expect((wsScoped.fsReadFile as any)).toHaveBeenCalledWith('/tmp/shared-chat.zip', 'deck_proj_brain', { chatFileReference: true });
+  });
+
+  it('renders changes in batches with load-more, shows exact totalCount and truncation notice, and resets on repo switch', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const files = Array.from({ length: CHANGES_RENDER_BATCH_SIZE + 25 }, (_, idx) => ({
+      path: `/home/repo-a/src/file-${String(idx).padStart(4, '0')}.ts`,
+      code: idx < 5 ? 'M' : '??',
+    }));
+
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/repo-a"
+        changesRootPath="/home/repo-a"
+        defaultTab="changes"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => { respond([], '/home/repo-a'); });
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/repo-a',
+        resolvedPath: '/home/repo-a',
+        status: 'ok',
+        files,
+        totalCount: 40824,
+        truncated: true,
+      } as ServerMessage);
+    });
+
+    // Exact totalCount shown in badge & truncation notice rendered
+    expect(document.querySelector('.fb-panel-tab-badge')?.textContent).toBe('40824');
+    expect(screen.getByTestId('fb-changes-truncated-notice')).toBeTruthy();
+
+    // Only the first batch is rendered initially
+    expect(document.querySelectorAll('.fb-changes-item')).toHaveLength(CHANGES_RENDER_BATCH_SIZE);
+    const loadMoreBtn = screen.getByTestId('fb-changes-load-more');
+    expect(loadMoreBtn).toBeTruthy();
+
+    // Clicking Load more renders remaining entries in the fetched slice
+    await act(async () => { fireEvent.click(loadMoreBtn); });
+    expect(document.querySelectorAll('.fb-changes-item')).toHaveLength(CHANGES_RENDER_BATCH_SIZE + 25);
+    expect(screen.queryByTestId('fb-changes-load-more')).toBeNull();
+
+    // Switching changesRootPath resets the batch limit back to CHANGES_RENDER_BATCH_SIZE
+    const repoBFiles = Array.from({ length: CHANGES_RENDER_BATCH_SIZE + 10 }, (_, idx) => ({
+      path: `/home/repo-b/src/b-${String(idx).padStart(4, '0')}.ts`,
+      code: 'M',
+    }));
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/repo-b"
+        changesRootPath="/home/repo-b"
+        defaultTab="changes"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/repo-b',
+        resolvedPath: '/home/repo-b',
+        status: 'ok',
+        files: repoBFiles,
+        totalCount: CHANGES_RENDER_BATCH_SIZE + 10,
+        truncated: false,
+      } as ServerMessage);
+    });
+
+    expect(document.querySelectorAll('.fb-changes-item')).toHaveLength(CHANGES_RENDER_BATCH_SIZE);
+    expect(screen.getByTestId('fb-changes-load-more')).toBeTruthy();
+    expect(screen.queryByTestId('fb-changes-truncated-notice')).toBeNull();
   });
 });
