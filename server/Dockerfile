@@ -24,15 +24,16 @@ RUN cd server && npm ci --ignore-scripts
 COPY web/package.json web/package-lock.json* web/.npmrc* ./web/
 RUN cd web && npm ci --ignore-scripts
 
-# Copy source
+# Copy server + shared sources and build server TypeScript before BUILD_TIME
 COPY server/ ./server/
-COPY web/ ./web/
 COPY src/repo/ ./src/repo/
 COPY src/agent/repository-identity-service.ts ./src/agent/repository-identity-service.ts
 COPY src/shared/ ./src/shared/
 COPY shared/ ./shared/
+RUN cd server && npm run build
 
-# Build web (BUILD_TIME arg ensures cache is busted on each CI run)
+# Copy web source and build web (BUILD_TIME arg ensures cache is busted on each CI run)
+COPY web/ ./web/
 ARG BUILD_TIME
 ENV BUILD_TIME=${BUILD_TIME}
 ARG IMC_PERF_SOURCEMAP=0
@@ -48,9 +49,6 @@ RUN mkdir -p /app/updates \
  && printf '{"version":%s,"sha256":"%s","url":"/api/updates/bundle.zip","buildTime":"%s"}\n' \
       "${OTA_VERSION}" "${SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       > /app/updates/manifest.json
-
-# Build server TypeScript
-RUN cd server && npm run build
 
 # ── Stage 1.5: Stable embedding-model cache ──────────────────────────────────
 # The 73MB @huggingface/transformers model layer used to invalidate on every

@@ -18,13 +18,13 @@ const ci = () => parse(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
 };
 
 describe('bounded parallel daemon CI, with unchanged release safety', () => {
-  it.each([['unit-tests', 4], ['macos-unit-tests', 6]] as const)(
+  it.each([['unit-tests', 4], ['macos-unit-tests', 4]] as const)(
     '%s executes every contiguous shard once, without masking failures', (id, count) => {
       const job = ci().jobs[id]!;
       expect(job.name).toContain(`shard \${{ matrix.shard }}/${count}`);
       expect(job.strategy?.matrix.shard).toEqual(Array.from({ length: count }, (_, i) => i + 1));
       expect(job.strategy?.['fail-fast']).toBe(false);
-      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 4 : 6);
+      expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 8 : 4);
       const script = id === 'macos-unit-tests' ? 'test:unit:macos' : 'test:unit';
       expect(job.steps.filter((step) => step.run?.includes('npm run test:unit')).map((step) => step.run))
         .toEqual([`npm run ${script} -- --shard=\${{ matrix.shard }}/${count}`]);
@@ -99,10 +99,16 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
 
     const macUnit = jobs['macos-unit-tests']!;
     expect(macUnit['runs-on']).toBe('macos-15-intel');
-    expect(macUnit.strategy?.matrix.shard).toEqual([1, 2, 3, 4, 5, 6]);
-    expect(macUnit.strategy?.['max-parallel']).toBe(6);
+    expect(macUnit.strategy?.matrix.shard).toEqual([1, 2, 3, 4]);
+    expect(macUnit.strategy?.['max-parallel']).toBe(4);
     expect(macUnit['timeout-minutes']).toBe(45);
     expect(jobs.docker!.needs).toContain('macos-unit-tests');
+
+    // Total simultaneous macOS jobs (Intel + arm64) must stay <= GitHub's 5-runner cap
+    // so shards do not starve in a second wave on dev pushes or PRs.
+    const macUnitMaxParallel = macUnit.strategy?.['max-parallel'] ?? macUnit.strategy!.matrix.shard.length;
+    expect(macUnitMaxParallel + 1).toBeLessThanOrEqual(5); // dev: + controlled-node-executables (macos-15)
+    expect(macUnitMaxParallel + (isRdEnabledForRef('refs/pull/42/merge') ? 1 : 0)).toBeLessThanOrEqual(5);
 
     const installSmoke = parse(readFileSync('.github/workflows/install-smoke.yml', 'utf8')) as {
       jobs: Record<string, { strategy?: { matrix?: { os?: string[] } }; steps?: Array<{ if?: string; run?: string }> }>;
