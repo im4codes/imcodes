@@ -30,6 +30,8 @@ COPY src/repo/ ./src/repo/
 COPY src/agent/repository-identity-service.ts ./src/agent/repository-identity-service.ts
 COPY src/shared/ ./src/shared/
 COPY shared/ ./shared/
+# shared/openspec-prompt-templates.ts imports ../web/src/i18n/locales/en.json at compile time
+COPY web/src/i18n/locales/en.json ./web/src/i18n/locales/en.json
 RUN cd server && npm run build
 
 # Copy web source and build web (BUILD_TIME arg ensures cache is busted on each CI run)
