@@ -4506,6 +4506,31 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       expect(e2TermJson).not.toContain('SYNTHETIC_OUT_PW');
       expect(e2Term.status).toBe('error');
 
+      // 3b. Whole-quoted env assignments, quoted CLI flags, and bash -lc subshell secrets
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-3`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: "env 'TOKEN=SYNTHETIC_QUOTED_ENV' bash worker.sh" },
+        toolStatus: 'running',
+      });
+      const e3 = events.at(-1)!;
+      expect(JSON.stringify(e3)).not.toContain('SYNTHETIC_QUOTED_ENV');
+      expect(e3.detail?.summary).toBe("env 'TOKEN=[REDACTED]' bash worker.sh");
+
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-4`,
+        toolName: 'run_command',
+        toolInput: {
+          CommandLine:
+            'env "GH_TOKEN=SYNTHETIC_QUOTED_GH" \'--password=SYNTHETIC_QFLAG\' bash -lc \'SECRET="a\\"SYNTHETIC_SUBSHELL" ./run.sh\'',
+        },
+        toolStatus: 'running',
+      });
+      const e4Json = JSON.stringify(events.at(-1)!);
+      expect(e4Json).not.toContain('SYNTHETIC_QUOTED_GH');
+      expect(e4Json).not.toContain('SYNTHETIC_QFLAG');
+      expect(e4Json).not.toContain('SYNTHETIC_SUBSHELL');
+
       // 4. Positive control: normal command with spaces and escaped quotes is preserved intact
       const normalCmd = 'git commit -m "fix \\"quote\\" edge" && ./sync.sh --all';
       (provider as any).updateAgyBackgroundTasks(id, state, {
@@ -4645,6 +4670,56 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       expect(sysEmitted).toHaveLength(2);
       expect(sysEmitted.find((e) => e.id === keyE)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
       expect(sysEmitted.find((e) => e.id === keyA)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+      expect(state.agyBackgroundTasks.size).toBe(0);
+
+      // Case 4: Native [Message] envelope multi-record isolation (exit 0 + exit 1 AND reversed 1 + 0, plus sender-only)
+      for (const suffix of ['F', 'G', 'H', 'I']) {
+        (provider as any).updateAgyBackgroundTasks(id, state, {
+          text: `Tool is running as a background task with task id: ${nativeId}/${suffix}`,
+          toolName: 'run_command',
+          toolInput: { CommandLine: `echo ${suffix}` },
+          toolStatus: 'running',
+        });
+      }
+      const keyF = state.agyBackgroundTasks.get(`${nativeId}/F`).canonicalKey;
+      const keyG = state.agyBackgroundTasks.get(`${nativeId}/G`).canonicalKey;
+      const keyH = state.agyBackgroundTasks.get(`${nativeId}/H`).canonicalKey;
+      const keyI = state.agyBackgroundTasks.get(`${nativeId}/I`).canonicalKey;
+
+      const beforeEnv = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `[Message] timestamp=2026-11-19T00:00:00Z sender=${nativeId}/F priority=MESSAGE_PRIORITY_HIGH content=Task id "${nativeId}/F" finished with result:\nCommand exited with code 0.`,
+          `[Message] timestamp=2026-11-19T00:00:01Z sender=${nativeId}/G priority=MESSAGE_PRIORITY_HIGH content=Task id "${nativeId}/G" finished with result:\nCommand exited with code 1.`,
+        ].join('\n'),
+        isSystemMessage: true,
+      });
+      const envEmitted1 = events.slice(beforeEnv);
+      expect(envEmitted1).toHaveLength(2);
+      const evtF = envEmitted1.find((e) => e.id === keyF)!;
+      const evtG = envEmitted1.find((e) => e.id === keyG)!;
+      expect(evtF.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+      expect(evtF.output).toContain(`${nativeId}/F`);
+      expect(evtF.output).not.toContain(`${nativeId}/G`);
+      expect(evtG.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+      expect(evtG.output).toContain(`${nativeId}/G`);
+      expect(evtG.output).not.toContain(`${nativeId}/F`);
+
+      // Reversed order: exit 1 first, sender-only completion second
+      const beforeEnv2 = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `[Message] timestamp=2026-11-19T00:00:02Z sender=${nativeId}/H priority=MESSAGE_PRIORITY_HIGH content=Task id "${nativeId}/H" finished with result:\nCommand exited with code 1.`,
+          `[Message] timestamp=2026-11-19T00:00:03Z sender=${nativeId}/I priority=MESSAGE_PRIORITY_HIGH content=done`,
+        ].join('\n'),
+        isSystemMessage: true,
+      });
+      const envEmitted2 = events.slice(beforeEnv2);
+      expect(envEmitted2).toHaveLength(2);
+      expect(envEmitted2.find((e) => e.id === keyH)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+      expect(envEmitted2.find((e) => e.id === keyI)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+      expect(envEmitted2.find((e) => e.id === keyI)?.output).not.toContain(`${nativeId}/H`);
+
       expect(state.agyBackgroundTasks.size).toBe(0);
       expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
       expect(runtime.getStatus()).toBe('idle');

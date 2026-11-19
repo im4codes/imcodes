@@ -4639,6 +4639,54 @@ function scanShellTokenEnd(value: string, start: number): { end: number; unclose
   return { end: i, unclosedQuote: quote !== null };
 }
 
+function normalizeShellTokenView(token: string): string {
+  let out = '';
+  let i = 0;
+  let quote: '"' | "'" | null = null;
+  while (i < token.length) {
+    const ch = token[i]!;
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else {
+        out += ch;
+      }
+      i += 1;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '\\' && i + 1 < token.length) {
+        const next = token[i + 1]!;
+        if (next === '"' || next === '\\' || next === '$' || next === '`') {
+          out += next;
+          i += 2;
+          continue;
+        }
+      }
+      if (ch === '"') {
+        quote = null;
+      } else {
+        out += ch;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < token.length) {
+      out += token[i + 1]!;
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      i += 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
 function unquoteSingleOrDoubleShellArg(token: string): { quote: "'" | '"'; inner: string } | null {
   if (token.length < 2) return null;
   const first = token[0];
@@ -4652,6 +4700,13 @@ function unquoteSingleOrDoubleShellArg(token: string): { quote: "'" | '"'; inner
     return { quote: '"', inner: unescaped };
   }
   return null;
+}
+
+function formatRedactedAssignment(rawToken: string, lhs: string): string {
+  const masked = `${lhs}=${SDK_SUBAGENT_REDACTED_VALUE}`;
+  if (rawToken.startsWith("'") && rawToken.endsWith("'") && rawToken.length >= 2) return `'${masked}'`;
+  if (rawToken.startsWith('"') && rawToken.endsWith('"') && rawToken.length >= 2) return `"${masked}"`;
+  return masked;
 }
 
 function redactAgyBackgroundCommandSecrets(
@@ -4682,6 +4737,7 @@ function redactAgyBackgroundCommandSecrets(
     const scanned = scanShellTokenEnd(preRedacted, i);
     if (scanned.unclosedQuote) unclosedQuote = true;
     const token = preRedacted.slice(i, scanned.end);
+    const normalizedToken = normalizeShellTokenView(token);
     i = scanned.end;
 
     if (redactNextMode === 'secret') {
@@ -4691,7 +4747,7 @@ function redactAgyBackgroundCommandSecrets(
     }
     if (redactNextMode === 'header') {
       redactNextMode = null;
-      out += AGY_SENSITIVE_HEADER_RE.test(token) ? SDK_SUBAGENT_REDACTED_VALUE : token;
+      out += AGY_SENSITIVE_HEADER_RE.test(normalizedToken) ? SDK_SUBAGENT_REDACTED_VALUE : token;
       continue;
     }
 
@@ -4711,28 +4767,28 @@ function redactAgyBackgroundCommandSecrets(
       }
     }
 
-    const eqIdx = token.indexOf('=');
+    const eqIdx = normalizedToken.indexOf('=');
     if (eqIdx > 0) {
-      const lhs = token.slice(0, eqIdx);
+      const lhs = normalizedToken.slice(0, eqIdx);
       if (AGY_ENV_IDENTIFIER_RE.test(lhs) && AGY_SECRET_KEY_NAME_RE.test(lhs)) {
-        out += `${lhs}=${SDK_SUBAGENT_REDACTED_VALUE}`;
+        out += formatRedactedAssignment(token, lhs);
         continue;
       }
       if (AGY_SECRET_FLAG_RE.test(lhs)) {
-        out += `${lhs}=${SDK_SUBAGENT_REDACTED_VALUE}`;
+        out += formatRedactedAssignment(token, lhs);
         continue;
       }
-      if (AGY_HEADER_FLAG_RE.test(lhs) && AGY_SENSITIVE_HEADER_RE.test(token.slice(eqIdx + 1))) {
-        out += `${lhs}=${SDK_SUBAGENT_REDACTED_VALUE}`;
+      if (AGY_HEADER_FLAG_RE.test(lhs) && AGY_SENSITIVE_HEADER_RE.test(normalizedToken.slice(eqIdx + 1))) {
+        out += formatRedactedAssignment(token, lhs);
         continue;
       }
     }
 
-    if (AGY_SECRET_FLAG_RE.test(token)) {
+    if (AGY_SECRET_FLAG_RE.test(normalizedToken)) {
       redactNextMode = 'secret';
-    } else if (AGY_HEADER_FLAG_RE.test(token)) {
+    } else if (AGY_HEADER_FLAG_RE.test(normalizedToken)) {
       redactNextMode = 'header';
-    } else if (token === '-c' || token === '--command' || token === 'eval') {
+    } else if (normalizedToken === '--command' || normalizedToken === 'eval' || /^-[a-zA-Z]*c$/.test(normalizedToken)) {
       expectSubshellScript = true;
     }
     out += token;
@@ -4813,10 +4869,15 @@ function resolveAgyManageTaskTerminalStatus(rawStatus: string | undefined): SdkS
   return null;
 }
 
-function splitByOffsets(text: string, regex: RegExp): string[] {
+function splitByOffsets(text: string, regex: RegExp, includePreamble = false): string[] {
   const matches = [...text.matchAll(regex)];
-  if (matches.length <= 1) return [text];
+  if (matches.length === 0) return [text];
   const segments: string[] = [];
+  if (includePreamble && (matches[0]!.index ?? 0) > 0) {
+    const preamble = text.slice(0, matches[0]!.index!);
+    if (preamble.trim()) segments.push(preamble);
+  }
+  if (matches.length === 1 && segments.length === 0) return [text];
   for (let i = 0; i < matches.length; i += 1) {
     const start = matches[i]!.index ?? 0;
     const end = i + 1 < matches.length ? (matches[i + 1]!.index ?? text.length) : text.length;
@@ -4825,9 +4886,12 @@ function splitByOffsets(text: string, regex: RegExp): string[] {
   return segments;
 }
 
+const AGY_SYSTEM_MESSAGE_ENVELOPE_RE = /\[Message\](?=\s|$)/gi;
+
 function extractSystemMessageTerminalSegments(text: string): string[] {
-  const primary = /\[Message\]\b/i.test(text)
-    ? splitByOffsets(text, /\[Message\]\b/gi)
+  const hasEnvelope = /\[Message\](?=\s|$)/i.test(text);
+  const primary = hasEnvelope
+    ? splitByOffsets(text, AGY_SYSTEM_MESSAGE_ENVELOPE_RE, true)
     : /Task id "[^"]+" finished/i.test(text)
       ? splitByOffsets(text, /Task id "[^"]+" finished/gi)
       : splitByOffsets(text, /\bsender=[^\s]+/gi);
