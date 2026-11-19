@@ -2410,6 +2410,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const cloudDocPickerRef = useRef<HTMLDivElement>(null);
   const cloudDocJustClosedRef = useRef(false);
   const cloudDocPasteSuppressRef = useRef(false);
+  const cloudDocImeCommitAtRef = useRef(0);
   const cloudDocInitialAbortRef = useRef<AbortController | null>(null);
   const cloudDocSearchAbortRef = useRef<AbortController | null>(null);
   const cloudDocCachedUnfilteredRef = useRef<CloudDocReferenceItem[] | null>(null);
@@ -2419,6 +2420,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     cloudDocSearchAbortRef.current?.abort();
     cloudDocSearchAbortRef.current = null;
     cloudDocCachedUnfilteredRef.current = null;
+    cloudDocImeCommitAtRef.current = 0;
     setCloudDocPickerOpen(false);
     setCloudDocQuery('');
     setCloudDocItems([]);
@@ -3047,6 +3049,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const markImeActivity = () => { lastImeCompositionAtRef.current = Date.now(); };
     const handleCompositionStart = () => {
       imeComposingRef.current = true;
+      cloudDocImeCommitAtRef.current = 0;
       markImeActivity();
       if (inlineVoiceActiveRef.current && !programmaticVoiceWriteRef.current) {
         interruptInlineVoiceRef.current?.();
@@ -3054,6 +3057,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
     const handleCompositionEnd = () => {
       imeComposingRef.current = false;
+      cloudDocImeCommitAtRef.current = Date.now();
       markImeActivity();
       // Re-run onInput now that composition committed. On many mobile IMEs the
       // input event carrying the composed text fires WHILE isComposing is still
@@ -7840,6 +7844,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     if (cloudDocPickerOpen) {
+      const isPostCompositionCommitWindow = cloudDocImeCommitAtRef.current > 0
+        && Date.now() - cloudDocImeCommitAtRef.current < 80;
+      const isImeCommitKey = !e.ctrlKey && !e.metaKey && !e.altKey
+        && ((e.key === 'Enter' && !e.shiftKey) || e.key === ' ' || e.key === 'Tab');
+      if (isPostCompositionCommitWindow && isImeCommitKey) {
+        // WebKit fires compositionend before the trailing IME commit keydown with
+        // isComposing=false; absorb one commit keystroke without selecting or closing.
+        cloudDocImeCommitAtRef.current = 0;
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      cloudDocImeCommitAtRef.current = 0;
       if (handleCloudDocNavigationKey(e)) return;
       if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey) {
         closeCloudDocPicker();
@@ -10981,39 +10998,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 || (event as InputEvent).isComposing === true;
               const suppressQuickPhrase = quickPhraseInputSuppressRef.current;
               quickPhraseInputSuppressRef.current = false;
+              const pasteSuppressed = aliasPasteSuppressRef.current;
+              aliasPasteSuppressRef.current = false;
+              const machinePasteSuppressed = machinePasteSuppressRef.current;
+              machinePasteSuppressRef.current = false;
+              const cloudDocPasteSuppressed = cloudDocPasteSuppressRef.current;
+              cloudDocPasteSuppressRef.current = false;
 
-              const skillTrigger = inputIsComposing ? null : matchInlineSkillTrigger(text);
-              const modelTrigger = inputIsComposing ? null : matchModelCommandTrigger(text);
-              const slashTrigger = inputIsComposing ? null : matchSlashCommandTrigger(text);
-              const hasSkillSuggestions = skillTrigger !== null
-                && agentSkills.some((skill) => !skillTrigger || [skill.name, skill.description, skill.source, skill.sourceUrl]
-                  .some((value) => value?.toLocaleLowerCase().includes(skillTrigger.toLocaleLowerCase())));
-              if (skillTrigger !== null && hasSkillSuggestions) {
-                setQuickSuggestionKind('skill');
-                setQuickSuggestionQuery(skillTrigger);
-                setQuickSuggestionHighlightIdx(0);
-              } else if (modelTrigger !== null) {
-                setQuickSuggestionKind('model');
-                setQuickSuggestionQuery(modelTrigger);
-                setQuickSuggestionHighlightIdx(0);
-              } else if (slashTrigger !== null) {
-                setQuickSuggestionKind('command');
-                setQuickSuggestionQuery(slashTrigger);
-                setQuickSuggestionHighlightIdx(0);
-              } else {
-                const phraseTrigger = inputIsComposing || suppressQuickPhrase
-                  ? null
-                  : matchQuickPhraseTrigger(text);
-                const hasPhraseSuggestions = phraseTrigger !== null
-                  && getQuickPhraseSuggestions(quickData.data.phrases, phraseTrigger).length > 0;
-                if (phraseTrigger !== null && hasPhraseSuggestions) {
-                  setQuickSuggestionKind('phrase');
-                  setQuickSuggestionQuery(phraseTrigger);
-                  setQuickSuggestionHighlightIdx(0);
-                } else if (quickSuggestionKind !== null) {
-                  closeQuickSuggestions();
-                }
-              }
+              const closeCompetingPickersForCloudDoc = () => {
+                setAtPickerOpen(false);
+                setAtPickerStage('choose');
+                setAtQuery('');
+                setAliasPickerOpen(false);
+                setAliasQuery('');
+                setMachinePickerOpen(false);
+                setMachineQuery('');
+                setTaskPairPickerOpen(false);
+                setTaskPairQuery('');
+                closeQuickSuggestions();
+              };
 
               // @@ → open the TEAM dropdown (combos / workflows). Selecting one
               // launches a team discussion immediately with the current composer
@@ -11021,12 +11024,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               // had little value vs. the combo/flow team discussion.) Strip the
               // @@ trigger but keep the preceding text as the topic.
               const doubleAt = text.match(/@@[\w-]*$/);
+              const cloudDocTrigger = !doubleAt && !inputIsComposing && !cloudDocPasteSuppressed
+                ? matchInlineCloudDocTrigger(text)
+                : null;
+              const keepCloudDocDuringComposition = !doubleAt
+                && inputIsComposing
+                && cloudDocPickerOpen
+                && !cloudDocPasteSuppressed;
+
               if (doubleAt) {
                 const before = text.replace(/@@[\w-]*$/, '');
                 if (divRef.current) setComposerElementText(divRef.current, before);
                 setHasText(!!before.trim());
-                setAtPickerOpen(false);
-                setAtPickerStage('choose');
+                closeCompetingPickersForCloudDoc();
                 if (cloudDocPickerOpen) closeCloudDocPicker();
                 setP2pOpen(true);
                 try {
@@ -11037,7 +11047,56 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   sel?.removeAllRanges();
                   sel?.addRange(range);
                 } catch { /* jsdom lacks Selection API */ }
+              } else if (cloudDocTrigger !== null) {
+                // Single-owner precedence: when `&` Cloud Docs owns the current tail
+                // (including queries containing `@`, e.g. `&@`), clear all competing
+                // pickers unconditionally in this render without reading stale booleans.
+                closeCompetingPickersForCloudDoc();
+                setCloudDocQuery(cloudDocTrigger);
+                setCloudDocHighlightIdx(0);
+                setCloudDocPickerOpen(true);
+              } else if (keepCloudDocDuringComposition) {
+                // Keep open `&` dropdown intact during IME composition while
+                // preventing `@` or other triggers from opening alongside it.
+                closeCompetingPickersForCloudDoc();
               } else {
+                if (cloudDocPickerOpen) {
+                  closeCloudDocPicker();
+                }
+
+                const skillTrigger = inputIsComposing ? null : matchInlineSkillTrigger(text);
+                const modelTrigger = inputIsComposing ? null : matchModelCommandTrigger(text);
+                const slashTrigger = inputIsComposing ? null : matchSlashCommandTrigger(text);
+                const hasSkillSuggestions = skillTrigger !== null
+                  && agentSkills.some((skill) => !skillTrigger || [skill.name, skill.description, skill.source, skill.sourceUrl]
+                    .some((value) => value?.toLocaleLowerCase().includes(skillTrigger.toLocaleLowerCase())));
+                if (skillTrigger !== null && hasSkillSuggestions) {
+                  setQuickSuggestionKind('skill');
+                  setQuickSuggestionQuery(skillTrigger);
+                  setQuickSuggestionHighlightIdx(0);
+                } else if (modelTrigger !== null) {
+                  setQuickSuggestionKind('model');
+                  setQuickSuggestionQuery(modelTrigger);
+                  setQuickSuggestionHighlightIdx(0);
+                } else if (slashTrigger !== null) {
+                  setQuickSuggestionKind('command');
+                  setQuickSuggestionQuery(slashTrigger);
+                  setQuickSuggestionHighlightIdx(0);
+                } else {
+                  const phraseTrigger = inputIsComposing || suppressQuickPhrase
+                    ? null
+                    : matchQuickPhraseTrigger(text);
+                  const hasPhraseSuggestions = phraseTrigger !== null
+                    && getQuickPhraseSuggestions(quickData.data.phrases, phraseTrigger).length > 0;
+                  if (phraseTrigger !== null && hasPhraseSuggestions) {
+                    setQuickSuggestionKind('phrase');
+                    setQuickSuggestionQuery(phraseTrigger);
+                    setQuickSuggestionHighlightIdx(0);
+                  } else if (quickSuggestionKind !== null) {
+                    closeQuickSuggestions();
+                  }
+                }
+
                 // Single @ → choose stage (files + agents menu)
                 const singleAt = text.match(/@([^\s@]*)$/);
                 if (singleAt) {
@@ -11070,90 +11129,48 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   setAtPickerStage('choose');
                   setAtQuery('');
                 }
-              }
 
-              // Inline `;` alias autocomplete. Independent of the @ trigger.
-              // Suppressed during IME composition and on the input event that
-              // immediately follows a paste (both must not open the picker).
-              const pasteSuppressed = aliasPasteSuppressRef.current;
-              aliasPasteSuppressRef.current = false;
-              const aliasTrigger = (imeComposingRef.current || pasteSuppressed)
-                ? null
-                : matchInlineAliasTrigger(text);
-              if (aliasTrigger !== null && !doubleAt) {
-                setAliasQuery(aliasTrigger);
-                setAliasHighlightIdx(0);
-                setAliasPickerOpen(true);
-              } else if (aliasPickerOpen) {
-                setAliasPickerOpen(false);
-                setAliasQuery('');
-              }
+                // Inline `;` alias autocomplete. Independent of the @ trigger.
+                // Suppressed during IME composition and on the input event that
+                // immediately follows a paste (both must not open the picker).
+                const aliasTrigger = (imeComposingRef.current || pasteSuppressed)
+                  ? null
+                  : matchInlineAliasTrigger(text);
+                if (aliasTrigger !== null) {
+                  setAliasQuery(aliasTrigger);
+                  setAliasHighlightIdx(0);
+                  setAliasPickerOpen(true);
+                } else if (aliasPickerOpen) {
+                  setAliasPickerOpen(false);
+                  setAliasQuery('');
+                }
 
-              // Inline `^` machine autocomplete. Independent of the `@`/`;`
-              // triggers. Suppressed during IME composition and on the input
-              // event immediately following a paste (both must not open it).
-              const machinePasteSuppressed = machinePasteSuppressRef.current;
-              machinePasteSuppressRef.current = false;
-              const machineTrigger = (imeComposingRef.current || machinePasteSuppressed)
-                ? null
-                : matchInlineMachineTrigger(text);
-              if (machineTrigger !== null && !doubleAt) {
-                setMachineQuery(machineTrigger);
-                setMachineHighlightIdx(0);
-                setMachinePickerOpen(true);
-              } else if (machinePickerOpen) {
-                setMachinePickerOpen(false);
-                setMachineQuery('');
-              }
+                // Inline `^` machine autocomplete. Independent of the `@`/`;`
+                // triggers. Suppressed during IME composition and on the input
+                // event immediately following a paste (both must not open it).
+                const machineTrigger = (imeComposingRef.current || machinePasteSuppressed)
+                  ? null
+                  : matchInlineMachineTrigger(text);
+                if (machineTrigger !== null) {
+                  setMachineQuery(machineTrigger);
+                  setMachineHighlightIdx(0);
+                  setMachinePickerOpen(true);
+                } else if (machinePickerOpen) {
+                  setMachinePickerOpen(false);
+                  setMachineQuery('');
+                }
 
-              const taskPairTrigger = inputIsComposing ? null : matchTaskPairReferenceTrigger(text);
-              const taskPairMatches = taskPairTrigger === null
-                ? []
-                : filterTaskPairReferences(taskPairReferences, taskPairTrigger);
-              if (taskPairTrigger !== null && taskPairMatches.length > 0) {
-                setTaskPairQuery(taskPairTrigger);
-                setTaskPairHighlightIdx(0);
-                setTaskPairPickerOpen(true);
-              } else if (taskPairPickerOpen) {
-                setTaskPairPickerOpen(false);
-                setTaskPairQuery('');
-              }
-
-              // Inline `&` Cloud Docs search & citation autocomplete.
-              // Keep open during IME preedit so typing Chinese pinyin never
-              // closes or flickers the dropdown; re-evaluates on compositionend.
-              const cloudDocPasteSuppressed = cloudDocPasteSuppressRef.current;
-              cloudDocPasteSuppressRef.current = false;
-              if (cloudDocPasteSuppressed) {
-                if (cloudDocPickerOpen) closeCloudDocPicker();
-              } else if (!inputIsComposing) {
-                const cloudDocTrigger = !doubleAt ? matchInlineCloudDocTrigger(text) : null;
-                if (cloudDocTrigger !== null) {
-                  if (atPickerOpen) {
-                    setAtPickerOpen(false);
-                    setAtPickerStage('choose');
-                    setAtQuery('');
-                  }
-                  if (aliasPickerOpen) {
-                    setAliasPickerOpen(false);
-                    setAliasQuery('');
-                  }
-                  if (machinePickerOpen) {
-                    setMachinePickerOpen(false);
-                    setMachineQuery('');
-                  }
-                  if (taskPairPickerOpen) {
-                    setTaskPairPickerOpen(false);
-                    setTaskPairQuery('');
-                  }
-                  if (quickSuggestionKind !== null) {
-                    closeQuickSuggestions();
-                  }
-                  setCloudDocQuery(cloudDocTrigger);
-                  setCloudDocHighlightIdx(0);
-                  setCloudDocPickerOpen(true);
-                } else if (cloudDocPickerOpen) {
-                  closeCloudDocPicker();
+                const taskPairTrigger = inputIsComposing ? null : matchTaskPairReferenceTrigger(text);
+                const taskPairMatches = taskPairTrigger === null
+                  ? []
+                  : filterTaskPairReferences(taskPairReferences, taskPairTrigger);
+                if (taskPairTrigger !== null && taskPairMatches.length > 0) {
+                  setTaskPairQuery(taskPairTrigger);
+                  setTaskPairHighlightIdx(0);
+                  setTaskPairPickerOpen(true);
+                } else if (taskPairPickerOpen) {
+                  setTaskPairPickerOpen(false);
+                  setTaskPairQuery('');
                 }
               }
             }}

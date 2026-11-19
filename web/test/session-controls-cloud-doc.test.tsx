@@ -383,4 +383,140 @@ describe('SessionControls — inline & Cloud Docs search & citation picker', () 
     expect(container.querySelector('[data-cloud-doc-id="doc-stale"]')).toBeNull();
     expect(container.querySelector('[data-cloud-doc-id="doc-new"]')).toBeTruthy();
   });
+
+  it('absorbs WebKit post-compositionend IME commit Enter/Space before allowing explicit follow-up selection or dismissal', async () => {
+    const { ws, container, editor } = renderControls();
+    typeInto(editor, '&');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+
+    // Preedit during composition
+    editor.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+    typeInto(editor, '&fang', { isComposing: true });
+    expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy();
+
+    // Commit Chinese text: compositionend runs first, followed immediately by WebKit commit Enter (isComposing=false, keyCode=13)
+    editor.textContent = '&方案';
+    editor.dispatchEvent(new Event('compositionend', { bubbles: true }));
+    const commitEnterAllowed = fireEvent.keyDown(editor, { key: 'Enter', isComposing: false, keyCode: 13 });
+    expect(commitEnterAllowed).toBe(false);
+    expect(editor.textContent).toBe('&方案');
+    expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // Filtered result remains visible and a subsequent explicit Enter selects the doc
+    await waitFor(() => {
+      const options = container.querySelectorAll('.controls-cloud-doc-picker [role="option"]');
+      expect(options).toHaveLength(1);
+      expect(options[0]!.getAttribute('data-cloud-doc-id')).toBe('doc-plan');
+    });
+    await new Promise((r) => setTimeout(r, 95));
+    fireEvent.keyDown(editor, { key: 'Enter', isComposing: false, keyCode: 13 });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(editor.textContent).toBe('[CloudDoc: 技术方案.md | id=doc-plan] ');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull());
+
+    // Same WebKit post-compositionend commit guard for Space (isComposing=false, keyCode=32)
+    typeInto(editor, '&');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    editor.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+    typeInto(editor, '&fang', { isComposing: true });
+    editor.textContent = '&方案';
+    editor.dispatchEvent(new Event('compositionend', { bubbles: true }));
+    const commitSpaceAllowed = fireEvent.keyDown(editor, { key: ' ', isComposing: false, keyCode: 32 });
+    expect(commitSpaceAllowed).toBe(false);
+    expect(editor.textContent).toBe('&方案');
+    expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy();
+
+    // Explicit Space after grace window closes the picker without preventDefault
+    await new Promise((r) => setTimeout(r, 95));
+    const explicitSpaceAllowed = fireEvent.keyDown(editor, { key: ' ', isComposing: false, keyCode: 32 });
+    expect(explicitSpaceAllowed).toBe(true);
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull());
+
+    // Non-composition normal Enter sends as expected once selection just-closed guard expires
+    await new Promise((r) => setTimeout(r, 170));
+    typeInto(editor, '普通发送');
+    fireEvent.keyDown(editor, { key: 'Enter' });
+    await waitFor(() => expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1));
+  });
+
+  it('enforces single-owner trigger precedence across &@, composition @, @, ;, /, and @@ transitions', async () => {
+    const { ws, container, editor } = renderControls();
+
+    // 1. `&@` in a single onInput must open ONLY Cloud Docs picker (never AtPicker),
+    // and Enter with 0 matches dismisses cleanly without sending or opening AtPicker
+    typeInto(editor, '&@');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    expect(container.textContent).not.toContain('p2p.picker.search_project_files');
+    fireEvent.keyDown(editor, { key: 'Enter' });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull());
+    expect(editor.textContent).toBe('&@');
+    expect(container.textContent).not.toContain('p2p.picker.search_project_files');
+
+    // Escape on `&@` also closes Cloud Docs cleanly with no lingering AtPicker
+    typeInto(editor, '&');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    typeInto(editor, '&@');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    expect(container.textContent).not.toContain('p2p.picker.search_project_files');
+    fireEvent.keyDown(editor, { key: 'Escape' });
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull());
+    expect(container.textContent).not.toContain('p2p.picker.search_project_files');
+
+    // 2. When a Cloud Doc name contains `@`, `&@` filters and Enter inserts the doc citation
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [{ ...sampleResponse.docs[0]!, name: 'spec@v2.md' }],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+    typeInto(editor, '&@');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker [role="option"]')).toBeTruthy());
+    expect(container.textContent).not.toContain('p2p.picker.search_project_files');
+    fireEvent.keyDown(editor, { key: 'Enter' });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(editor.textContent).toBe('[CloudDoc: spec@v2.md | id=doc-plan] ');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull());
+    listCloudDocsApiMock.mockResolvedValue(sampleResponse);
+    await new Promise((r) => setTimeout(r, 170));
+
+    // 3. IME composition `&@` while `&` is open must NOT spawn AtPicker
+    typeInto(editor, '&');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    editor.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+    typeInto(editor, '&@', { isComposing: true });
+    expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy();
+    expect(container.textContent).not.toContain('p2p.picker.search_project_files');
+    editor.textContent = '&';
+    editor.dispatchEvent(new Event('compositionend', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 95));
+
+    // 4. Bidirectional switch `&` <-> `@`
+    typeInto(editor, '@');
+    await waitFor(() => expect(container.textContent).toContain('p2p.picker.search_project_files'));
+    expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull();
+    typeInto(editor, '@ &');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    expect(container.textContent).not.toContain('p2p.picker.search_project_files');
+
+    // 5. Bidirectional switch `;` <-> `&` and `/model` -> `&`
+    typeInto(editor, ';');
+    await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeTruthy());
+    expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull();
+    typeInto(editor, ';dep &');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    expect(container.querySelector('.controls-alias-picker')).toBeNull();
+
+    typeInto(editor, '/m');
+    await waitFor(() => expect(container.querySelector('.controls-slash-picker')).toBeTruthy());
+    expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull();
+    typeInto(editor, '/m &');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeTruthy());
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    // 6. `&` -> `@@` closes Cloud Docs cleanly
+    typeInto(editor, '@@');
+    await waitFor(() => expect(container.querySelector('.controls-cloud-doc-picker')).toBeNull());
+  });
 });
