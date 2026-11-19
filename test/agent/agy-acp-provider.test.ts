@@ -3964,7 +3964,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     await sendTurn('turn-1-upgraded-no-id', outerV2, 1);
     // 2. Later add identity B while base stays outerV2 -> must send full outerV2 + idB (not idB alone!)
     await sendTurn('turn-2-upgraded-with-id-b', `${outerV2}\n${idB}`, 2);
-    // 3. Revert back to original outerV1 + idA (matching Slot A) -> sends compact idA revert to clear outerV2 in Slot B
+    // 3. Revert back to original outerV1 + idA (matching Slot A) -> sends '' to clear outerV2 + idB in Slot B
     await sendTurn('turn-3-revert-to-v1', `${outerV1}\n${idA}`, 3);
     // 4. Refresh while matching outerV1 + idA -> no extra session/resume
     provider.refreshSessionSystemText(id);
@@ -3974,7 +3974,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     expect(resumes).toHaveLength(3);
     expect(resumes[0]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(`${outerV2}\n\n<imcodes-agent-identity>\n</imcodes-agent-identity>`);
     expect(resumes[1]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(`${outerV2}\n${idB}`);
-    expect(resumes[2]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(idA);
+    expect(resumes[2]?.params?._meta?.antigravity?.systemPrompt?.append).toBe('');
   });
 
   it('handles stripAgentIdentityBlock and resolveAgyResumeSystemPromptMeta boundary cases', () => {
@@ -4004,7 +4004,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       hasDeliveredMeta: step1.nextMetaDelivered,
       activeSlotBOverride: step1.nextSlotBOverride,
     });
-    expect(step2).toMatchObject({ shouldSendMeta: true, metaToSend: '', nextSlotBOverride: null });
+    expect(step2).toMatchObject({ shouldSendMeta: true, metaToSend: '', nextSlotBOverride: undefined });
     const step3 = resolveAgyResumeSystemPromptMeta({
       persistedPrompt: 'BASE_V1',
       trimmedSystemText: 'BASE_V1',
@@ -4116,6 +4116,134 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     expect(prompts[1]).toContain('FULL_NON_META_CONTRACT');
     expect(prompts[1]).toContain('NON_META_ID');
     expect(prompts[1]).toContain('ordinary turn');
+  });
+
+  it('clears full Slot B override when reverting A+I -> B+I -> A+I without repeating on subsequent A+I (F1 provider fixture flow)', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const baseA = 'BASE_CONTRACT_A '.repeat(1200).trim();
+    const baseB = 'BASE_CONTRACT_B '.repeat(1200).trim();
+    const sameIdentity = '<imcodes-agent-identity>\nSAME_IDENTITY_RULE\n</imcodes-agent-identity>';
+
+    await writeAgyMetadataBlobDb(root, 'slot-b-full-revert', buildPersistedSystemPromptBlob(`${baseA}\n${sameIdentity}`));
+    const id = await route(provider, 'deck_test_full_slot_b_revert_same_id', { resumeId: 'slot-b-full-revert' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(id, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Cold resume A+I -> B+I (base differs, same identity) -> sends full B+I into Slot B
+    await sendTurn('turn-1-b-plus-i', `${baseB}\n${sameIdentity}`, 1);
+    // 2. Revert back to A+I (same base & identity as Slot A) -> MUST send '' to clear full B+I in Slot B
+    await sendTurn('turn-2-revert-a-plus-i', `${baseA}\n${sameIdentity}`, 2);
+    // 3. Repeated A+I (even after refreshSessionSystemText) -> MUST NOT repeat session/resume
+    provider.refreshSessionSystemText(id);
+    await sendTurn('turn-3-repeat-a-plus-i', `${baseA}\n${sameIdentity}`, 3);
+
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(2);
+    expect(resumes[0]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: `${baseB}\n${sameIdentity}` } },
+    });
+    expect(resumes[1]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: '' } },
+    });
+  });
+
+  it.each([
+    {
+      label: 'A+I -> B+I -> A+I (same identity)',
+      persisted: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected2: '',
+    },
+    {
+      label: 'A+I -> B -> A+I (B dropped identity, reverted to A+I)',
+      persisted: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step1: 'B',
+      expected1: 'B\n\n<imcodes-agent-identity>\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected2: '',
+    },
+    {
+      label: 'A+I -> B -> A (B dropped identity, stayed identity-less on A)',
+      persisted: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step1: 'B',
+      expected1: 'B\n\n<imcodes-agent-identity>\n</imcodes-agent-identity>',
+      step2: 'A',
+      expected2: '<imcodes-agent-identity>\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A+ID_A -> B+ID_B -> A+ID_B (new identity retained on A)',
+      persisted: 'A\n<imcodes-agent-identity>\nID_A\n</imcodes-agent-identity>',
+      step1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      expected2: '<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A+ID_A -> B+ID_B -> A (identity cleared on revert to A)',
+      persisted: 'A\n<imcodes-agent-identity>\nID_A\n</imcodes-agent-identity>',
+      step1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nID_B\n</imcodes-agent-identity>',
+      step2: 'A',
+      expected2: '<imcodes-agent-identity>\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A -> B+I -> A+I (persisted no-id, reverted base with new identity)',
+      persisted: 'A',
+      step1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step2: 'A\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected2: '<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+    },
+    {
+      label: 'A -> B+I -> A (persisted no-id, B had identity, reverted to A)',
+      persisted: 'A',
+      step1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      expected1: 'B\n<imcodes-agent-identity>\nI\n</imcodes-agent-identity>',
+      step2: 'A',
+      expected2: '',
+    },
+    {
+      label: 'A -> B -> A (no identity anywhere)',
+      persisted: 'A',
+      step1: 'B',
+      expected1: 'B',
+      step2: 'A',
+      expected2: '',
+    },
+  ])('clears/replaces full Slot B override cleanly across full-to-base revert matrix ($label)', ({ persisted, step1, expected1, step2, expected2 }) => {
+    const p1 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: persisted,
+      trimmedSystemText: step1,
+      hasDeliveredMeta: false,
+    });
+    expect(p1).toMatchObject({ shouldSendMeta: true, metaToSend: expected1 });
+
+    const p2 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: persisted,
+      trimmedSystemText: step2,
+      hasDeliveredMeta: p1.nextMetaDelivered,
+      activeSlotBOverride: p1.nextSlotBOverride,
+    });
+    expect(p2).toMatchObject({ shouldSendMeta: true, metaToSend: expected2 });
+
+    // Repeating step2 MUST NOT re-send _meta
+    const p3 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: persisted,
+      trimmedSystemText: step2,
+      hasDeliveredMeta: p2.nextMetaDelivered,
+      activeSlotBOverride: p2.nextSlotBOverride,
+    });
+    expect(p3.shouldSendMeta).toBe(false);
   });
 
   function encodeLenDelimitedField(fieldNum: number, payload: Uint8Array): Buffer {

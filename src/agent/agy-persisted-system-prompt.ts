@@ -376,7 +376,11 @@ export function readPersistedAgySystemPrompt(homeDir: string, acpSessionId: stri
   }
 }
 
-export type AgySlotBIdentityOverride = string | null | undefined;
+export type AgySlotBOverride =
+  | { kind: 'identity'; identity: string | undefined }
+  | { kind: 'full'; identity: string | undefined };
+
+export type AgySlotBIdentityOverride = AgySlotBOverride | undefined;
 
 export interface AgyResumeSystemPromptPlan {
   shouldSendMeta: boolean;
@@ -418,7 +422,7 @@ export function resolveAgyResumeSystemPromptMeta(params: {
       metaToSend: trimmedSystemText,
       nextInjectedKey,
       nextMetaDelivered: true,
-      nextSlotBOverride: undefined,
+      nextSlotBOverride: { kind: 'full', identity: extractAgentIdentityBlock(trimmedSystemText) },
     };
   }
 
@@ -438,25 +442,34 @@ export function resolveAgyResumeSystemPromptMeta(params: {
       metaToSend,
       nextInjectedKey,
       nextMetaDelivered: true,
-      // Use '' (not null) when nextIdentity is absent so a subsequent revert back
-      // to Slot A's base still clears this full-contract Slot B override once.
-      nextSlotBOverride: nextIdentity ?? '',
+      nextSlotBOverride: { kind: 'full', identity: nextIdentity },
     };
   }
 
-  const effectiveIdentity = activeSlotBOverride === undefined
-    ? persistedIdentity
-    : (activeSlotBOverride ?? undefined);
+  let metaToSend: string | undefined;
+  if (activeSlotBOverride?.kind === 'full') {
+    // Slot B holds a full-contract override; reverting to Slot A's base MUST
+    // clear/replace Slot B even when nextIdentity equals persistedIdentity.
+    metaToSend = nextIdentity !== undefined
+      ? (nextIdentity === persistedIdentity ? '' : nextIdentity)
+      : (persistedIdentity !== undefined ? EMPTY_AGENT_IDENTITY_BLOCK : '');
+  } else {
+    const effectiveIdentity = activeSlotBOverride === undefined
+      ? persistedIdentity
+      : activeSlotBOverride.identity;
+    if (effectiveIdentity !== nextIdentity) {
+      metaToSend = nextIdentity
+        ?? (persistedIdentity !== undefined ? EMPTY_AGENT_IDENTITY_BLOCK : '');
+    }
+  }
 
-  if (effectiveIdentity !== nextIdentity) {
-    const metaToSend = nextIdentity
-      ?? (persistedIdentity !== undefined ? EMPTY_AGENT_IDENTITY_BLOCK : '');
+  if (metaToSend !== undefined) {
     return {
       shouldSendMeta: true,
       metaToSend,
       nextInjectedKey,
       nextMetaDelivered: true,
-      nextSlotBOverride: nextIdentity ?? null,
+      nextSlotBOverride: metaToSend === '' ? undefined : { kind: 'identity', identity: nextIdentity },
     };
   }
 
