@@ -2679,8 +2679,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // A share viewer cannot dispatch anything, so appending is denied at the
   // bridge too. Offering the control would only produce a rollback plus a raw
   // denial code; participants and owners keep it.
+  const activeQueuedTransportEntries = queuedTransportEntries.filter((entry) => entry.status !== 'failed');
   const appendableQueuedTransportEntries = canSharedSessionSend
-    ? queuedTransportEntries.filter((entry) => entry.status !== 'failed')
+    ? activeQueuedTransportEntries
     : [];
   const appendAllConfirmationScope = JSON.stringify({
     serverId: serverId ?? '',
@@ -11192,7 +11193,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   testId="transport-queue-append-all"
                 />
               )}
-              <div>{t(queuedMessageDeliveryLabelKey(queuedTransportEntries.find((entry) => entry.deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND && !entry.appendFallbackReason) ?? queuedTransportEntries[0] ?? {}))}</div>
+              <div>
+                {activeQueuedTransportEntries.length > 0
+                  ? t(queuedMessageDeliveryLabelKey(activeQueuedTransportEntries.find((entry) => entry.deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND && !entry.appendFallbackReason) ?? activeQueuedTransportEntries[0] ?? {}))
+                  : t('chat.sendFailedLabel', 'Send failed')}
+              </div>
               <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
                 {t('common.hide')}
               </button>
@@ -11268,7 +11273,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       )}
       {editingQueuedEntry && (
         <div class="controls-queued-editing">
-          <span>{t(queuedMessageDeliveryLabelKey(queuedTransportEntries[0] ?? {}))} · {t('settings.edit')}</span>
+          <span>{t(queuedMessageDeliveryLabelKey(editingQueuedEntry))} · {t('settings.edit')}</span>
           <button type="button" class="controls-queued-action" onClick={() => setEditingQueuedMessageId(null)}>
             {t('common.cancel')}
           </button>

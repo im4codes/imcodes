@@ -1226,4 +1226,73 @@ describe('task-pair marker ingestion', () => {
   it('hides marker lines from displayed assistant text', async () => {
     expect(normalizeAssistantTextForDisplay('Done.\n<!-- IMCODES_TASK READY_FOR_AUDIT T1 -->')).toBe('Done.');
   });
+
+  it('cleans stale queued and failed task-pair nudges on terminal CANCEL and DONE while preserving user messages, sibling pairs, and Brain completion notices', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../../src/daemon/transport-queue-store.js');
+    const {
+      TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+      TASK_PAIR_NUDGE_ID_PREFIX,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+    } = await import('../../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    try {
+      const queueStore = getTransportQueueStore();
+      const addQueueRow = (sessionName: string, id: string, failed: boolean) => {
+        queueStore.enqueue({ sessionName, clientMessageId: id, text: `msg ${id}`, now: 100 });
+        if (failed) queueStore.markFailed(sessionName, id, 'expired', 200);
+      };
+
+      // Pair 1: cancelled via CANCEL marker -> worker + brain nudges cleaned, unrelated & sibling active kept
+      await say(BRAIN, `Dispatching.\n<!-- IMCODES_TASK DISPATCH T_CANCEL_Q executor=${EXEC} auditor=${AUD} title="Cancel queue cleanup" -->`);
+      addQueueRow(EXEC, `${TASK_PAIR_NUDGE_ID_PREFIX}T_CANCEL_Q:work-nudge:1`, false);
+      addQueueRow(EXEC, `${TASK_PAIR_NUDGE_ID_PREFIX}T_CANCEL_Q:work-nudge:2`, true);
+      addQueueRow(AUD, `${TASK_PAIR_NUDGE_ID_PREFIX}T_CANCEL_Q:audit-nudge:1`, true);
+      addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}T_CANCEL_Q:brain-nudge:1`, true);
+      addQueueRow(EXEC, `${TASK_PAIR_NUDGE_ID_PREFIX}T_ACTIVE_Q:work-nudge:1`, true);
+      addQueueRow(EXEC, 'human-msg-keep', true);
+
+      await say(BRAIN, `Cancelling.\n<!-- IMCODES_TASK CANCEL T_CANCEL_Q -->`);
+
+      expect(queueStore.readSnapshot(EXEC).pendingMessageEntries).toEqual([]);
+      expect(queueStore.readSnapshot(EXEC).failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}T_ACTIVE_Q:work-nudge:1`,
+        'human-msg-keep',
+      ]);
+      expect(queueStore.readSnapshot(AUD).failedMessageEntries).toEqual([]);
+      expect(queueStore.readSnapshot(BRAIN).failedMessageEntries).toEqual([]);
+
+      // Pair 2: closed as done via DONE force=true -> worker nudges dropped, Brain done notices preserved
+      await say(BRAIN, `Dispatching.\n<!-- IMCODES_TASK DISPATCH T_DONE_Q executor=${EXEC} auditor=${AUD} title="Done queue cleanup" -->`);
+      addQueueRow(EXEC, `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:rework-nudge:1`, true);
+      addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:wait-reminder:1`, true);
+      addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`, true);
+      addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`, true);
+      for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+        addQueueRow(BRAIN, `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:${reason}:1`, true);
+      }
+
+      service.applyMarker({
+        project: PROJECT,
+        writer: BRAIN,
+        marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'T_DONE_Q', attrs: { force: 'true' } },
+        source: 'marker',
+        now: Date.now(),
+        eventId: 'done-q-close',
+      });
+
+      expect(queueStore.readSnapshot(EXEC).failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}T_ACTIVE_Q:work-nudge:1`,
+        'human-msg-keep',
+      ]);
+      expect(queueStore.readSnapshot(BRAIN).failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+        ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}T_DONE_Q:${reason}:1`),
+      ]);
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
+  });
 });

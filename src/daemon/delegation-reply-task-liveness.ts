@@ -6,6 +6,7 @@ import {
   parseTaskPairBindingId,
   TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
   TASK_PAIR_NUDGE_ID_PREFIX,
+  taskPairIdFromNudgeId,
   taskPairNudgeReasonFromId,
 } from '../../shared/task-pair.js';
 import type { QueueSupervisionAdmission } from '../../shared/transport-queue-types.js';
@@ -103,15 +104,6 @@ export function resolveQueuedDelegationReplyAdmission(delegationId: string): Que
  * finished task.  Aggregate heartbeat ids (`__...`) have no pair row and stay
  * conservative/authorized.
  */
-function taskPairIdFromNudgeId(id: string | undefined): string | undefined {
-  if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;
-  const remainder = id.slice(TASK_PAIR_NUDGE_ID_PREFIX.length);
-  const separator = remainder.indexOf(':');
-  if (separator <= 0) return undefined;
-  const taskId = remainder.slice(0, separator).trim();
-  return taskId && !taskId.startsWith('__') ? taskId : undefined;
-}
-
 function resolveQueuedTaskPairNudgeAdmission(
   sessionName: string,
   entry: { clientMessageId?: string; commandId?: string },

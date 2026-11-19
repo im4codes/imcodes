@@ -236,6 +236,16 @@ export const TASK_PAIR_ENDED_PAIR_NOTICE_REASONS: readonly string[] = ['brain-wo
 export const TASK_PAIR_PASS_DONE_NOTICE_REASON = 'brain-line-pass-done' as const;
 export const TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON = 'brain-non-git-finish' as const;
 
+/** The `taskId` segment of a daemon-authored pair message id, or undefined when `id` is missing or an aggregate (`__...`). */
+export function taskPairIdFromNudgeId(id: string | undefined): string | undefined {
+  if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;
+  const remainder = id.slice(TASK_PAIR_NUDGE_ID_PREFIX.length);
+  const separator = remainder.indexOf(':');
+  if (separator <= 0) return undefined;
+  const taskId = remainder.slice(0, separator).trim();
+  return taskId && !taskId.startsWith('__') ? taskId : undefined;
+}
+
 /** The `reason` segment of a daemon-authored pair message id, or undefined when `id` is not one. */
 export function taskPairNudgeReasonFromId(id: string | undefined): string | undefined {
   if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;

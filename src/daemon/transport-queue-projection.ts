@@ -12,6 +12,15 @@ import { getTransportQueueStore } from './transport-queue-store.js';
 import type { QueueRecipientIdentity, TransportQueueStore } from './transport-queue-store.js';
 import { getSession } from '../store/session-store.js';
 import { getSupervisionTaskRegistry } from './supervision-state-store.js';
+import {
+  isTerminalTaskPairStatus,
+  TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+  TASK_PAIR_NUDGE_ID_PREFIX,
+  taskPairIdFromNudgeId,
+  taskPairNudgeReasonFromId,
+} from '../../shared/task-pair.js';
+import { getTaskPairStore, type StoredTaskPair } from './task-pairs/store.js';
+import { isDoneBrainCompletionNoticeAllowed } from './task-pairs/wake-authority.js';
 
 type SupervisionQueueAuthority = {
   taskId: string;
@@ -157,6 +166,28 @@ export function reconcileObsoleteSupervisionQueueFailures(
   return changed;
 }
 
+export function reconcileObsoleteTaskPairQueueFailures(
+  store: TransportQueueStore,
+  snapshot: QueueSnapshot,
+  lookupPair: (taskId: string, rawMessageId: string) => StoredTaskPair | undefined,
+): boolean {
+  let changed = false;
+  for (const entry of snapshot.failedMessageEntries) {
+    const rawId = entry.commandId ?? entry.clientMessageId;
+    const taskId = taskPairIdFromNudgeId(entry.commandId) ?? taskPairIdFromNudgeId(entry.clientMessageId);
+    if (!taskId) continue;
+    const reason = taskPairNudgeReasonFromId(entry.commandId) ?? taskPairNudgeReasonFromId(entry.clientMessageId);
+    if (reason && TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) continue;
+    const stored = lookupPair(taskId, rawId);
+    if (!stored || !isTerminalTaskPairStatus(stored.state.status)) continue;
+    if (reason && isDoneBrainCompletionNoticeAllowed(stored.state, reason, snapshot.sessionName)) continue;
+    if (reason === 'brain-line-done-no-auditor' && stored.state.status === 'done' && snapshot.sessionName === stored.state.brain) continue;
+    store.dismissFailed(snapshot.sessionName, entry.clientMessageId);
+    changed = true;
+  }
+  return changed;
+}
+
 export type TransportQueueSnapshotSource =
   | 'command_handler'
   | 'session_manager'
@@ -287,6 +318,32 @@ export function buildTransportQueueSnapshot(
       // store-wide snapshot, which must never become a public cross-generation
       // projection merely because a stale supervision card was retired.
       snapshot = readGated();
+    }
+    if (snapshot.failedMessageEntries.some((entry) => (entry.commandId ?? entry.clientMessageId).startsWith(TASK_PAIR_NUDGE_ID_PREFIX))) {
+      const pairStore = getTaskPairStore();
+      const sessionPairs = pairStore.pairsForSession(sessionName);
+      const project = record?.projectName;
+      const pairChanged = reconcileObsoleteTaskPairQueueFailures(
+        store,
+        snapshot,
+        (taskId, rawId) => {
+          const activeMatch = sessionPairs
+            .filter((p) => rawId.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}${p.state.taskId}:`))
+            .sort((a, b) => b.state.taskId.length - a.state.taskId.length)[0];
+          if (activeMatch) return activeMatch;
+          if (project) {
+            const exact = pairStore.getPair(project, taskId);
+            if (exact) return exact;
+          }
+          const matches = pairStore.findPairsByTaskId(taskId);
+          return matches.find((p) =>
+            p.state.brain === sessionName
+            || p.state.executor === sessionName
+            || p.state.auditor === sessionName,
+          ) ?? (matches.length === 1 ? matches[0] : undefined);
+        },
+      );
+      if (pairChanged) snapshot = readGated();
     }
   } catch {
     // Queue projection remains fail-closed: an unavailable registry never

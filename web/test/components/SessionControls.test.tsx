@@ -6122,6 +6122,80 @@ afterEach(() => {
     await waitFor(() => expect(screen.queryByText('failed delete stays hidden')).toBeNull());
   });
 
+  it('shows Send failed in the queue header instead of waiting to append when all queued entries are failed', () => {
+    const ws = makeWs();
+    const { container } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [],
+          pendingMessageEntries: [],
+          transportPendingMessageVersion: 8,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          failedMessageEntries: [
+            {
+              clientMessageId: 'task-pair-nudge:tsk_8697b50d26:nudge:1',
+              text: 'expired append nudge',
+              status: 'failed',
+              failureReason: 'expired',
+              deliveryMode: 'append',
+            },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const header = container.querySelector('.controls-queued-header');
+    expect(header).toBeTruthy();
+    expect(header?.textContent).toContain('sendFailedLabel');
+    expect(header?.textContent).not.toContain('transport_append_pending');
+  });
+
+  it('reflects active queued append delivery in the queue header when failed and queued entries coexist', () => {
+    const ws = makeWs();
+    const { container } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            {
+              clientMessageId: 'queued-append-1',
+              text: 'active append message',
+              status: 'queued',
+              deliveryMode: 'append',
+            },
+          ],
+          transportPendingMessageVersion: 9,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          failedMessageEntries: [
+            {
+              clientMessageId: 'failed-append-1',
+              text: 'expired append nudge',
+              status: 'failed',
+              failureReason: 'expired',
+              deliveryMode: 'append',
+            },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const header = container.querySelector('.controls-queued-header');
+    expect(header).toBeTruthy();
+    expect(header?.textContent).toContain('transport_append_pending');
+    expect(header?.textContent).not.toContain('sendFailedLabel');
+  });
+
   it('does not resurrect an absent card when not-found follows its authoritative queue snapshot', async () => {
     const ws = makeWs();
     render(

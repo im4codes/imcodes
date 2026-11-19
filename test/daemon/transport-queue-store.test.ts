@@ -28,6 +28,12 @@ import {
   resetSupervisionTaskRegistryForTests,
 } from '../../src/daemon/supervision-state-store.js';
 import { retireExactSupersededAuditDelivery } from '../../src/daemon/supervision-registry-port.js';
+import {
+  TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+  TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+  TASK_PAIR_NUDGE_ID_PREFIX,
+  TASK_PAIR_PASS_DONE_NOTICE_REASON,
+} from '../../shared/task-pair.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -1709,5 +1715,65 @@ describe('delivered-but-still-queued ghost rows', () => {
       VALUES (?, (SELECT queue_epoch FROM queue_meta WHERE session_name = ?), 'again', 'f', 100)`).run(NAME, NAME);
     expect(ghostStore.reconcileDeliveredQueueRows(NAME, 600)).toEqual([]);
     expect(pendingIds()).toEqual(['again']);
+  });
+});
+
+describe('dropTaskPairEntries', () => {
+  it('removes only exact task-pair queued and failed rows, escaping SQL wildcards and preserving user messages and done notices', () => {
+    const sess = 'deck_sub_worker1';
+    const recipient = { sessionInstanceId: 'inst-drop', runtimeEpoch: 'epoch-drop' };
+    const enqueueRow = (id: string, failed = false) => {
+      store.enqueue({
+        sessionName: sess,
+        clientMessageId: id,
+        text: `text ${id}`,
+        recipient,
+        now: 100,
+        privateMaterialJson: JSON.stringify({ clientMessageId: id, text: `text ${id}`, deliveryMode: 'append' }),
+      });
+      if (failed) {
+        store.markFailed(sess, id, 'expired', 200);
+      }
+    };
+
+    enqueueRow(`${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:worker-nudge:1`, false);
+    enqueueRow(`${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:worker-nudge:2`, true);
+    // SQL `_` wildcard collision probe: must NOT be matched by `tsk_8697b50d26`.
+    enqueueRow(`${TASK_PAIR_NUDGE_ID_PREFIX}tskX8697b50d26:worker-nudge:1`, true);
+    enqueueRow('human-queued-1', false);
+    enqueueRow('human-failed-1', true);
+    enqueueRow(`${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`, true);
+    enqueueRow(`${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`, true);
+    for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+      enqueueRow(`${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:${reason}:1`, true);
+    }
+
+    const preserveReasons = [
+      ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+    ];
+    const result = store.dropTaskPairEntries(sess, 'tsk_8697b50d26', {
+      includeFailed: true,
+      preserveReasons,
+      now: 300,
+    });
+    expect(result.removed).toBe(2);
+    expect(result.snapshot.pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['human-queued-1']);
+    expect(result.snapshot.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+      `${TASK_PAIR_NUDGE_ID_PREFIX}tskX8697b50d26:worker-nudge:1`,
+      'human-failed-1',
+      `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+      `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+      ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_8697b50d26:${reason}:1`),
+    ]);
+
+    const repeat = store.dropTaskPairEntries(sess, 'tsk_8697b50d26', {
+      includeFailed: true,
+      preserveReasons,
+      now: 301,
+    });
+    expect(repeat.removed).toBe(0);
+    expect(repeat.snapshot.pendingMessageVersion).toBe(result.snapshot.pendingMessageVersion);
   });
 });

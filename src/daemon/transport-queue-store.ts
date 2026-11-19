@@ -1,5 +1,6 @@
 import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 import { readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
+import { TASK_PAIR_NUDGE_ID_PREFIX, taskPairNudgeReasonFromId } from '../../shared/task-pair.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -11,6 +12,7 @@ import {
   LIVE_QUEUE_ENTRY_STATUSES,
   type QueueDropReason,
   type QueueDeliveryFact,
+  type QueueEntryStatus,
   type QueueFailureReason,
   type QueuePlacement,
   type QueueProjectionEntry,
@@ -203,6 +205,10 @@ function nowMs(input?: number): number {
 
 function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function escapeSqlLikePattern(value: string): string {
+  return value.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
 }
 
 function parseSupervisionReference(value: unknown): QueueSupervisionReference | undefined {
@@ -1692,6 +1698,83 @@ export class TransportQueueStore {
       const version = this.bumpVersion(sessionName, now);
       this.db.exec('COMMIT');
       return this.readSnapshot(sessionName, 'drop', { ...version, dropReason });
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Drop queued and/or failed `task-pair-nudge:<taskId>:` rows for one session,
+   * preserving any explicitly retained notice reasons (such as Brain done/ended notices).
+   */
+  dropTaskPairEntries(
+    sessionNameInput: string,
+    taskIdInput: string,
+    options: {
+      includeFailed?: boolean;
+      preserveReasons?: readonly string[];
+      now?: number;
+    } = {},
+  ): { removed: number; snapshot: QueueSnapshot } {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const taskId = taskIdInput.trim();
+    const now = nowMs(options.now);
+    if (!taskId) {
+      return { removed: 0, snapshot: this.readSnapshot(sessionName, 'drop_task_pair_noop') };
+    }
+    const prefix = `${TASK_PAIR_NUDGE_ID_PREFIX}${taskId}:`;
+    const likePattern = `${escapeSqlLikePattern(prefix)}%`;
+    const includeFailed = options.includeFailed !== false;
+    const preserveReasons = new Set(options.preserveReasons ?? []);
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.ensureMeta(sessionName, now);
+      const candidates = this.db.prepare(`
+        SELECT client_message_id AS clientMessageId, command_id AS commandId, status
+        FROM queue_entries
+        WHERE session_name = ?
+          AND (client_message_id LIKE ? ESCAPE '\\' OR command_id LIKE ? ESCAPE '\\')
+      `).all(sessionName, likePattern, likePattern) as Array<{
+        clientMessageId?: unknown;
+        commandId?: unknown;
+        status?: unknown;
+      }>;
+
+      const deleteEntry = this.db.prepare(
+        'DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?',
+      );
+      const deletePrivateMaterial = this.db.prepare(
+        'DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?',
+      );
+
+      let removed = 0;
+      for (const row of candidates) {
+        const clientMessageId = readString(row.clientMessageId);
+        const commandId = readString(row.commandId);
+        const status = readString(row.status) as QueueEntryStatus | undefined;
+        if (!clientMessageId || !status) continue;
+        if (!clientMessageId.startsWith(prefix) && !(commandId?.startsWith(prefix) ?? false)) continue;
+        const removable = status === 'queued' || (includeFailed && FAILED_QUEUE_ENTRY_STATUSES.has(status));
+        if (!removable) continue;
+        const reason = taskPairNudgeReasonFromId(commandId) ?? taskPairNudgeReasonFromId(clientMessageId);
+        if (reason && preserveReasons.has(reason)) continue;
+        const changes = Number(deleteEntry.run(sessionName, clientMessageId).changes ?? 0);
+        if (changes > 0) {
+          deletePrivateMaterial.run(sessionName, clientMessageId);
+          removed += changes;
+        }
+      }
+
+      const version = removed > 0 ? this.bumpVersion(sessionName, now) : undefined;
+      this.db.exec('COMMIT');
+      return {
+        removed,
+        snapshot: version
+          ? this.readSnapshot(sessionName, 'drop_task_pair', version)
+          : this.readSnapshot(sessionName, 'drop_task_pair_noop'),
+      };
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;

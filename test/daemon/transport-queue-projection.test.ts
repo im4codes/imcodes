@@ -223,4 +223,73 @@ describe('transport queue projection builder', () => {
     });
     expect(JSON.stringify(snapshot)).not.toContain('queued text');
   });
+
+  it('dismisses stale failed task-pair nudges for already-terminated pairs on snapshot projection while preserving Brain done notices and active pairs', async () => {
+    const { getTransportQueueStore, resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const {
+      TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+      TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+      TASK_PAIR_NUDGE_ID_PREFIX,
+      TASK_PAIR_PASS_DONE_NOTICE_REASON,
+    } = await import('../../shared/task-pair.js');
+
+    resetTransportQueueStoreForTests();
+    const pairStore = new TaskPairStore(':memory:');
+    setTaskPairStoreForTests(pairStore);
+    try {
+      const basePair = {
+        flags: [],
+        flagSides: {},
+        round: 1,
+        blocking: ['P0' as const],
+        createdAt: 100,
+        updatedAt: 200,
+        brain: 'deck_proj_brain',
+        executor: 'deck_sub_exec',
+        auditor: 'deck_sub_aud',
+      };
+      pairStore.savePair('proj', { ...basePair, taskId: 'tsk_cancelled_1', status: 'cancelled' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'tsk_done_1', status: 'done' });
+      pairStore.savePair('proj', { ...basePair, taskId: 'tsk_active_1', status: 'working' });
+
+      const qStore = getTransportQueueStore();
+      const recipient = { sessionInstanceId: 'inst-proj', runtimeEpoch: 'epoch-proj' };
+      const addFailed = (sessionName: string, id: string) => {
+        qStore.enqueue({ sessionName, clientMessageId: id, text: `msg ${id}`, recipient, now: 100 });
+        qStore.markFailed(sessionName, id, 'expired', 200);
+      };
+
+      // Worker session has expired failed nudges from terminated + active pairs + user failure
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_cancelled_1:dispatch-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:ready-nudge:1`);
+      addFailed('deck_sub_exec', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_active_1:work-nudge:1`);
+      addFailed('deck_sub_exec', 'user-failed-1');
+
+      const workerSnapshot = buildTransportQueueSnapshot('deck_sub_exec', 'test');
+      expect(workerSnapshot.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_active_1:work-nudge:1`,
+        'user-failed-1',
+      ]);
+
+      // Brain session keeps done completion notices + workspace notices, drops cancelled non-notice nudges
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_cancelled_1:done-reminder:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:done-reminder:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`);
+      addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`);
+      for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+        addFailed('deck_proj_brain', `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${reason}:1`);
+      }
+
+      const brainSnapshot = buildTransportQueueSnapshot('deck_proj_brain', 'test');
+      expect(brainSnapshot.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual([
+        `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_PASS_DONE_NOTICE_REASON}:1`,
+        `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON}:1`,
+        ...TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.map((reason) => `${TASK_PAIR_NUDGE_ID_PREFIX}tsk_done_1:${reason}:1`),
+      ]);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests();
+    }
+  });
 });
