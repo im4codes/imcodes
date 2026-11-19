@@ -5526,7 +5526,13 @@
     "quote": {
       "inserted": "「{{name}}」をアクティブなセッションに引用しました",
       "sent_to_main": "「{{name}}」の引用をメインウィンドウに送信しました",
-      "no_target_window": "アクティブな IM.codes セッションウィンドウが見つかりません"
+      "no_target_window": "アクティブな IM.codes セッションウィンドウが見つかりません",
+      "reference_picker": "クラウドドキュメント",
+      "reference_loading": "クラウドドキュメントを検索中...",
+      "reference_empty": "参照可能なドキュメントはありません",
+      "reference_no_results": "一致するドキュメントがありません",
+      "reference_error": "ドキュメントの読み込みに失敗しました",
+      "reference_shared": "共有"
     },
     "ai_chat": {
       "title": "AI チャット — {{session}}",

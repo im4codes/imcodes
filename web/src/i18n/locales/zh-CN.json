@@ -5537,7 +5537,13 @@
     "quote": {
       "inserted": "已引用「{{name}}」到当前会话",
       "sent_to_main": "已发送「{{name}}」引用到主窗口",
-      "no_target_window": "未找到可接收引用的 IM.codes 会话窗口"
+      "no_target_window": "未找到可接收引用的 IM.codes 会话窗口",
+      "reference_picker": "云文档引用",
+      "reference_loading": "正在搜索云文档...",
+      "reference_empty": "暂无可引用的云文档",
+      "reference_no_results": "未找到匹配的云文档",
+      "reference_error": "加载云文档失败",
+      "reference_shared": "共享"
     },
     "ai_chat": {
       "title": "AI 对话 — {{session}}",

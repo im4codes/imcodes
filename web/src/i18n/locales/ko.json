@@ -5526,7 +5526,13 @@
     "quote": {
       "inserted": "\"{{name}}\" 문서를 활성 세션에 인용했습니다",
       "sent_to_main": "\"{{name}}\" 인용을 기본 창으로 보냈습니다",
-      "no_target_window": "활성 IM.codes 세션 창을 찾을 수 없습니다"
+      "no_target_window": "활성 IM.codes 세션 창을 찾을 수 없습니다",
+      "reference_picker": "클라우드 문서",
+      "reference_loading": "클라우드 문서 검색 중...",
+      "reference_empty": "참조할 클라우드 문서가 없습니다",
+      "reference_no_results": "일치하는 클라우드 문서가 없습니다",
+      "reference_error": "클라우드 문서를 불러오지 못했습니다",
+      "reference_shared": "공유"
     },
     "ai_chat": {
       "title": "AI 채팅 — {{session}}",

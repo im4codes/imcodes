@@ -54,6 +54,14 @@ import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/ma
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
 import { filterTaskPairReferences, matchTaskPairReferenceTrigger, openTaskPairReferences, replaceTaskPairReferenceTrigger, taskPairReferenceStatusKey, type TaskPairReference } from '../util/task-pair-reference.js';
+import {
+  filterCloudDocReferences,
+  matchInlineCloudDocTrigger,
+  mergeCloudDocReferences,
+  normalizeCloudDocReferences,
+  replaceInlineCloudDocTrigger,
+  type CloudDocReferenceItem,
+} from '../util/cloud-doc-reference.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
@@ -85,7 +93,7 @@ import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
-import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
+import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment, listCloudDocsApi } from '../api.js';
 import { SHARE_CANCEL_FAILED_EVENT, notifyShareCancelFailure, shareCancelFailureFromHttpError, trackShareCancelCommand } from '../share-cancel-feedback.js';
 import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
@@ -2392,6 +2400,130 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     open: taskPairPickerOpen,
     setActiveIndex: setTaskPairHighlightIdx,
   });
+  // Inline `&` Cloud Docs search & citation picker.
+  const [cloudDocPickerOpen, setCloudDocPickerOpen] = useState(false);
+  const [cloudDocQuery, setCloudDocQuery] = useState('');
+  const [cloudDocItems, setCloudDocItems] = useState<CloudDocReferenceItem[]>([]);
+  const [cloudDocLoading, setCloudDocLoading] = useState(false);
+  const [cloudDocError, setCloudDocError] = useState<string | null>(null);
+  const [cloudDocHighlightIdx, setCloudDocHighlightIdx] = useState(0);
+  const cloudDocPickerRef = useRef<HTMLDivElement>(null);
+  const cloudDocJustClosedRef = useRef(false);
+  const cloudDocPasteSuppressRef = useRef(false);
+  const cloudDocInitialAbortRef = useRef<AbortController | null>(null);
+  const cloudDocSearchAbortRef = useRef<AbortController | null>(null);
+  const cloudDocCachedUnfilteredRef = useRef<CloudDocReferenceItem[] | null>(null);
+  const closeCloudDocPicker = useCallback((withJustClosedGuard = false) => {
+    cloudDocInitialAbortRef.current?.abort();
+    cloudDocInitialAbortRef.current = null;
+    cloudDocSearchAbortRef.current?.abort();
+    cloudDocSearchAbortRef.current = null;
+    cloudDocCachedUnfilteredRef.current = null;
+    setCloudDocPickerOpen(false);
+    setCloudDocQuery('');
+    setCloudDocItems([]);
+    setCloudDocLoading(false);
+    setCloudDocError(null);
+    if (withJustClosedGuard) {
+      cloudDocJustClosedRef.current = true;
+      setTimeout(() => { cloudDocJustClosedRef.current = false; }, 150);
+    }
+  }, []);
+  useEffect(() => {
+    closeCloudDocPicker();
+  }, [serverId, activeSession?.name, closeCloudDocPicker]);
+  useEffect(() => {
+    if (!cloudDocPickerOpen || !activeSession) {
+      cloudDocInitialAbortRef.current?.abort();
+      cloudDocInitialAbortRef.current = null;
+      return;
+    }
+    const controller = new AbortController();
+    cloudDocInitialAbortRef.current?.abort();
+    cloudDocInitialAbortRef.current = controller;
+    setCloudDocLoading(true);
+    setCloudDocError(null);
+    void listCloudDocsApi({ allFolders: true, signal: controller.signal })
+      .then((res) => {
+        if (controller.signal.aborted || !mountedRef.current) return;
+        const normalized = normalizeCloudDocReferences(res);
+        cloudDocCachedUnfilteredRef.current = normalized;
+        setCloudDocItems((prev) => (prev.length > 0 ? mergeCloudDocReferences(normalized, prev) : normalized));
+        setCloudDocError(null);
+        setCloudDocLoading(false);
+      })
+      .catch((err) => {
+        if (controller.signal.aborted || !mountedRef.current) return;
+        if (err instanceof Error && err.name === 'AbortError') return;
+        setCloudDocError(err instanceof Error ? err.message : 'error');
+        setCloudDocLoading(false);
+      });
+    return () => {
+      controller.abort();
+      if (cloudDocInitialAbortRef.current === controller) {
+        cloudDocInitialAbortRef.current = null;
+      }
+    };
+  }, [cloudDocPickerOpen, serverId, activeSession?.name]);
+  useEffect(() => {
+    if (!cloudDocPickerOpen || !activeSession) {
+      cloudDocSearchAbortRef.current?.abort();
+      cloudDocSearchAbortRef.current = null;
+      return;
+    }
+    const trimmed = cloudDocQuery.trim();
+    if (!trimmed) {
+      cloudDocSearchAbortRef.current?.abort();
+      cloudDocSearchAbortRef.current = null;
+      if (cloudDocCachedUnfilteredRef.current) {
+        setCloudDocItems(cloudDocCachedUnfilteredRef.current);
+      }
+      return;
+    }
+    const controller = new AbortController();
+    cloudDocSearchAbortRef.current?.abort();
+    cloudDocSearchAbortRef.current = controller;
+    const timer = setTimeout(() => {
+      if (controller.signal.aborted || !mountedRef.current) return;
+      setCloudDocLoading(true);
+      void listCloudDocsApi({ allFolders: true, search: trimmed, signal: controller.signal })
+        .then((res) => {
+          if (controller.signal.aborted || !mountedRef.current) return;
+          const normalized = normalizeCloudDocReferences(res);
+          const base = cloudDocCachedUnfilteredRef.current ?? [];
+          setCloudDocItems(mergeCloudDocReferences(base, normalized));
+          setCloudDocError(null);
+          setCloudDocLoading(false);
+        })
+        .catch((err) => {
+          if (controller.signal.aborted || !mountedRef.current) return;
+          if (err instanceof Error && err.name === 'AbortError') return;
+          setCloudDocError(err instanceof Error ? err.message : 'error');
+          setCloudDocLoading(false);
+        });
+    }, 150);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+      if (cloudDocSearchAbortRef.current === controller) {
+        cloudDocSearchAbortRef.current = null;
+      }
+    };
+  }, [cloudDocPickerOpen, cloudDocQuery, serverId, activeSession?.name]);
+  const filteredCloudDocs = useMemo(
+    () => filterCloudDocReferences(cloudDocItems, cloudDocQuery),
+    [cloudDocItems, cloudDocQuery],
+  );
+  const {
+    activeIndex: activeCloudDocIndex,
+    handleNavigationKey: handleCloudDocNavigationKey,
+  } = useListboxNavigation({
+    activeIndex: cloudDocHighlightIdx,
+    containerRef: cloudDocPickerRef,
+    itemCount: filteredCloudDocs.length,
+    open: cloudDocPickerOpen,
+    setActiveIndex: setCloudDocHighlightIdx,
+  });
   useEffect(() => {
     if (!serverId) { setAgentSkills([]); return; }
     let cancelled = false;
@@ -2936,6 +3068,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       composerFocusedRef.current = false;
       setComposerFocused(false);
       closeQuickSuggestions();
+      closeCloudDocPicker();
     };
     el.addEventListener('compositionstart', handleCompositionStart);
     el.addEventListener('compositionupdate', markImeActivity);
@@ -2947,7 +3080,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       el.removeEventListener('compositionend', handleCompositionEnd);
       el.removeEventListener('blur', handleNativeBlur);
     };
-  }, [closeQuickSuggestions]);
+  }, [closeQuickSuggestions, closeCloudDocPicker]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -4410,6 +4543,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     fillInput(replaceTaskPairReferenceTrigger(current, title));
   }, [fillInput]);
 
+  const insertCloudDocReference = useCallback((doc: { id: string; name: string }) => {
+    const el = divRef.current;
+    const current = el ? readComposerElementText(el) : '';
+    fillInput(replaceInlineCloudDocTrigger(current, doc));
+  }, [fillInput]);
+
   /**
    * Insert a `^^(nodeId)-(displayName)` machine reference at the caret via the
    * shared helper (stable marker plus render-only note; never resolves or sends),
@@ -5541,6 +5680,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const escapeKeyboardOwnerOpen = atPickerOpen
     || aliasPickerOpen
     || machinePickerOpen
+    || taskPairPickerOpen
+    || cloudDocPickerOpen
     || quickSuggestionKind !== null
     || quickOpen
     || modelOpen
@@ -7698,6 +7839,36 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     }
 
+    if (cloudDocPickerOpen) {
+      if (handleCloudDocNavigationKey(e)) return;
+      if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        closeCloudDocPicker();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeCloudDocPicker();
+        return;
+      }
+      if (e.key === 'Tab' && filteredCloudDocs.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chosen = filteredCloudDocs[activeCloudDocIndex];
+        closeCloudDocPicker(true);
+        if (chosen) insertCloudDocReference(chosen);
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chosen = filteredCloudDocs[activeCloudDocIndex];
+        closeCloudDocPicker(true);
+        if (chosen) insertCloudDocReference(chosen);
+        return;
+      }
+    }
+
     if (e.key === 'Escape' && handleTransportEscapeCancel(e)) {
       return;
     }
@@ -7720,6 +7891,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (e.key === 'Enter' && taskPairJustClosedRef.current) {
       e.preventDefault();
       taskPairJustClosedRef.current = false;
+      return;
+    }
+    if (e.key === 'Enter' && cloudDocJustClosedRef.current) {
+      e.preventDefault();
+      cloudDocJustClosedRef.current = false;
       return;
     }
 
@@ -8527,6 +8703,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // input (paste must never open either picker).
     aliasPasteSuppressRef.current = true;
     machinePasteSuppressRef.current = true;
+    cloudDocPasteSuppressRef.current = true;
     quickPhraseInputSuppressRef.current = true;
     let inserted = false;
     try {
@@ -10622,6 +10799,62 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           </div>
         )}
 
+        {cloudDocPickerOpen && activeSession && (
+          <div
+            ref={cloudDocPickerRef}
+            class="controls-cloud-doc-picker"
+            role="listbox"
+            aria-label={t('cloud_docs.quote.reference_picker')}
+            style={aliasPickerContainerStyle}
+          >
+            <div style={aliasPickerGroupLabelStyle}>
+              {t('cloud_docs.quote.reference_picker')} {cloudDocQuery ? `— "${cloudDocQuery}"` : ''}
+            </div>
+            {filteredCloudDocs.length === 0 && (
+              <div style={aliasPickerEmptyStyle}>
+                {cloudDocLoading
+                  ? t('cloud_docs.quote.reference_loading')
+                  : cloudDocError
+                    ? t('cloud_docs.quote.reference_error')
+                    : cloudDocQuery
+                      ? t('cloud_docs.quote.reference_no_results')
+                      : t('cloud_docs.quote.reference_empty')}
+              </div>
+            )}
+            {filteredCloudDocs.map((doc, idx) => {
+              const highlighted = idx === activeCloudDocIndex;
+              return (
+                <div
+                  key={doc.id}
+                  role="option"
+                  aria-selected={highlighted ? 'true' : 'false'}
+                  data-cloud-doc-id={doc.id}
+                  data-cloud-doc-name={doc.name}
+                  data-hl={highlighted ? 'true' : undefined}
+                  style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    closeCloudDocPicker(true);
+                    insertCloudDocReference(doc);
+                  }}
+                  onMouseEnter={() => setCloudDocHighlightIdx(idx)}
+                >
+                  <span style={{ fontWeight: 500, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {doc.name}
+                  </span>
+                  {doc.folderName ? <span style={aliasPickerDimStyle}>{doc.folderName}</span> : null}
+                  {doc.shared ? (
+                    <span style={{ ...aliasPickerDimStyle, color: '#38bdf8' }}>
+                      {t('cloud_docs.quote.reference_shared')}
+                      {doc.ownerLabel ? ` · ${doc.ownerLabel}` : ''}
+                    </span>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {/*
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
@@ -10794,6 +11027,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 setHasText(!!before.trim());
                 setAtPickerOpen(false);
                 setAtPickerStage('choose');
+                if (cloudDocPickerOpen) closeCloudDocPicker();
                 setP2pOpen(true);
                 try {
                   const sel = window.getSelection();
@@ -10883,6 +11117,44 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               } else if (taskPairPickerOpen) {
                 setTaskPairPickerOpen(false);
                 setTaskPairQuery('');
+              }
+
+              // Inline `&` Cloud Docs search & citation autocomplete.
+              // Keep open during IME preedit so typing Chinese pinyin never
+              // closes or flickers the dropdown; re-evaluates on compositionend.
+              const cloudDocPasteSuppressed = cloudDocPasteSuppressRef.current;
+              cloudDocPasteSuppressRef.current = false;
+              if (cloudDocPasteSuppressed) {
+                if (cloudDocPickerOpen) closeCloudDocPicker();
+              } else if (!inputIsComposing) {
+                const cloudDocTrigger = !doubleAt ? matchInlineCloudDocTrigger(text) : null;
+                if (cloudDocTrigger !== null) {
+                  if (atPickerOpen) {
+                    setAtPickerOpen(false);
+                    setAtPickerStage('choose');
+                    setAtQuery('');
+                  }
+                  if (aliasPickerOpen) {
+                    setAliasPickerOpen(false);
+                    setAliasQuery('');
+                  }
+                  if (machinePickerOpen) {
+                    setMachinePickerOpen(false);
+                    setMachineQuery('');
+                  }
+                  if (taskPairPickerOpen) {
+                    setTaskPairPickerOpen(false);
+                    setTaskPairQuery('');
+                  }
+                  if (quickSuggestionKind !== null) {
+                    closeQuickSuggestions();
+                  }
+                  setCloudDocQuery(cloudDocTrigger);
+                  setCloudDocHighlightIdx(0);
+                  setCloudDocPickerOpen(true);
+                } else if (cloudDocPickerOpen) {
+                  closeCloudDocPicker();
+                }
               }
             }}
             onKeyDown={handleKeyDown}

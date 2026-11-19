@@ -5537,7 +5537,13 @@
     "quote": {
       "inserted": "Quoted \"{{name}}\" into active session",
       "sent_to_main": "Quoted \"{{name}}\" to main window",
-      "no_target_window": "No active IM.codes session window found"
+      "no_target_window": "No active IM.codes session window found",
+      "reference_picker": "Cloud Docs",
+      "reference_loading": "Searching Cloud Docs...",
+      "reference_empty": "No Cloud Docs available",
+      "reference_no_results": "No matching Cloud Docs",
+      "reference_error": "Failed to load Cloud Docs",
+      "reference_shared": "Shared"
     },
     "ai_chat": {
       "title": "AI Chat — {{session}}",

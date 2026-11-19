@@ -5526,7 +5526,13 @@
     "quote": {
       "inserted": "Документ «{{name}}» процитирован в активной сессии",
       "sent_to_main": "Цитата «{{name}}» отправлена в основное окно",
-      "no_target_window": "Активное окно сессии IM.codes не найдено"
+      "no_target_window": "Активное окно сессии IM.codes не найдено",
+      "reference_picker": "Облачные документы",
+      "reference_loading": "Поиск облачных документов...",
+      "reference_empty": "Нет доступных облачных документов",
+      "reference_no_results": "Подходящие документы не найдены",
+      "reference_error": "Не удалось загрузить документы",
+      "reference_shared": "Общий"
     },
     "ai_chat": {
       "title": "AI-чат — {{session}}",

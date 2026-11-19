@@ -5527,7 +5527,13 @@
     "quote": {
       "inserted": "已引用「{{name}}」至目前工作階段",
       "sent_to_main": "已傳送「{{name}}」引用至主視窗",
-      "no_target_window": "找不到可接收引用的 IM.codes 工作階段視窗"
+      "no_target_window": "找不到可接收引用的 IM.codes 工作階段視窗",
+      "reference_picker": "雲端文件引用",
+      "reference_loading": "正在搜尋雲端文件...",
+      "reference_empty": "暫無可引用的雲端文件",
+      "reference_no_results": "找不到符合的雲端文件",
+      "reference_error": "載入雲端文件失敗",
+      "reference_shared": "共用"
     },
     "ai_chat": {
       "title": "AI 對話 — {{session}}",

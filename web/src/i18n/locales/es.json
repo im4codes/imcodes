@@ -5527,7 +5527,13 @@
     "quote": {
       "inserted": "Se citó \"{{name}}\" en la sesión activa",
       "sent_to_main": "Se envió la cita de \"{{name}}\" a la ventana principal",
-      "no_target_window": "No se encontró ninguna ventana de sesión de IM.codes activa"
+      "no_target_window": "No se encontró ninguna ventana de sesión de IM.codes activa",
+      "reference_picker": "Documentos en la nube",
+      "reference_loading": "Buscando documentos...",
+      "reference_empty": "No hay documentos disponibles",
+      "reference_no_results": "Sin documentos coincidentes",
+      "reference_error": "Error al cargar los documentos",
+      "reference_shared": "Compartido"
     },
     "ai_chat": {
       "title": "Chat de IA — {{session}}",
