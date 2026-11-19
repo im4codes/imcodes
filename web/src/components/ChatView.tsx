@@ -1978,7 +1978,6 @@ function sdkAgentsTaskKindLabel(t: ChatTranslate, row: SdkSubagentStatusRow): st
   }
   switch (row.providerKind) {
     case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL:
-    case SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL:
       return t('chat.sdk_agents_task_bash');
     case SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT:
     case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT:

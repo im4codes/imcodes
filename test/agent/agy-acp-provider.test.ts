@@ -1459,7 +1459,8 @@ rl.on('line', (line) => {
     const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
     const isAgyAgentCard = (e: ToolCallEvent) =>
       e.detail?.kind === SDK_SUBAGENT_DETAIL_KIND
-      && e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT;
+      && e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+      && e.detail?.meta?.taskType !== SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH;
     const beforeAgentCount = events.filter(isAgyAgentCard).length;
     const update = (u: any) => (provider as any).handleSessionUpdate({ sessionId: nativeId, update: u });
 
@@ -1522,12 +1523,12 @@ rl.on('line', (line) => {
       expect(provider.getActiveWorkSnapshot(id)?.busyReasons).toContain('background_monitor');
     }, { timeout: 5000 });
     expect(events.filter(isAgyAgentCard)).toHaveLength(beforeAgentCount);
-    expect(events.filter((e) => e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL)).toMatchObject([{
+    expect(events.filter((e) => e.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT && e.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH)).toMatchObject([{
       detail: {
         summary: 'sleep 10',
         meta: {
           provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
           taskId: `${nativeId}/task-999`,
           taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
           backgrounded: true,
@@ -4278,7 +4279,11 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     const events: ToolCallEvent[] = [];
     provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
     provider.onToolCall((sid, evt) => {
-      if (sid === id && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL) {
+      if (
+        sid === id
+        && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+        && evt.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH
+      ) {
         events.push(evt);
       }
     });
@@ -4305,7 +4310,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       expect(startEvt.detail?.meta).toMatchObject({
         isSdkSubagent: true,
         provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
         taskId: `${nativeId}/task-1`,
         taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
         backgrounded: true,
@@ -4330,7 +4335,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       expect(events).toHaveLength(1);
       expect(state.agyBackgroundTasks.get(`${nativeId}/task-1`)?.startedAtMs).toBe(firstStartedAt);
 
-      // 3. Excluded tools (IsDaemon, recurring schedule, invoke_subagent) do NOT create agyRuntimeShell rows
+      // 3. Excluded tools (IsDaemon, recurring schedule, invoke_subagent) do NOT create local_bash background shell rows
       (provider as any).updateAgyBackgroundTasks(id, state, {
         text: `Tool is running as a background task with task id: ${nativeId}/daemon-1`,
         toolName: 'run_command',
@@ -4453,7 +4458,11 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     const events: ToolCallEvent[] = [];
     provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
     provider.onToolCall((sid, evt) => {
-      if (sid === id && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL) {
+      if (
+        sid === id
+        && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+        && evt.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH
+      ) {
         events.push(evt);
       }
     });
@@ -4554,7 +4563,11 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     const events: ToolCallEvent[] = [];
     provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
     provider.onToolCall((sid, evt) => {
-      if (sid === id && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL) {
+      if (
+        sid === id
+        && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT
+        && evt.detail?.meta?.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH
+      ) {
         events.push(evt);
       }
     });

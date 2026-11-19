@@ -661,12 +661,12 @@ describe('ChatView SDK agents panel', () => {
     expect(screen.getByText('45s')).toBeTruthy();
   });
 
-  it('displays AGY_RUNTIME_SHELL local_bash background commands in the Agents panel and clears when terminal', () => {
+  it('displays AGY_RUNTIME_AGENT local_bash background commands as Bash / Shell alongside native AGY subagents and clears when terminal', () => {
     localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
     const agyBashRunning = makeSdkEvent('agy-bash-running', makeMeta({
       canonicalKey: 'agy:deck_agents:bg_task-7',
       provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
       taskId: 'conv-1/task-7',
       taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
       backgrounded: true,
@@ -675,19 +675,35 @@ describe('ChatView SDK agents panel', () => {
       terminal: false,
     }), { summary: 'docker compose logs -f' });
 
+    const agyNativeSubagent = makeSdkEvent('agy-subagent-running', makeMeta({
+      canonicalKey: 'agy:deck_agents:sub:child-1',
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      agentPath: 'child-1',
+      agentName: 'Researcher',
+      taskType: SDK_SUBAGENT_TASK_TYPES.AGENT,
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { summary: 'Antigravity sub-agent Researcher' });
+
     const { container, rerender } = render(
-      <ChatView events={[agyBashRunning]} loading={false} sessionId="deck_agents" />,
+      <ChatView events={[agyBashRunning, agyNativeSubagent]} loading={false} sessionId="deck_agents" />,
     );
 
-    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 2 running' })).toBeTruthy();
     expect(screen.getByText('docker compose logs -f')).toBeTruthy();
-    expect(container.querySelector('.chat-sdk-agent-provider')?.textContent).toBe('Antigravity');
-    expect(container.querySelector('.chat-sdk-agent-task-kind')?.textContent).toBe('Bash / Shell');
+    expect(screen.getByText('Antigravity sub-agent Researcher')).toBeTruthy();
+    const providers = [...container.querySelectorAll('.chat-sdk-agent-provider')].map((el) => el.textContent);
+    const taskKinds = [...container.querySelectorAll('.chat-sdk-agent-task-kind')].map((el) => el.textContent);
+    expect(providers).toEqual(['Antigravity', 'Antigravity']);
+    expect(taskKinds).toEqual(['Bash / Shell', 'Agent']);
 
     const agyBashStopped = makeSdkEvent('agy-bash-stopped', makeMeta({
       canonicalKey: 'agy:deck_agents:bg_task-7',
       provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
       taskId: 'conv-1/task-7',
       taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
       backgrounded: true,
@@ -696,7 +712,20 @@ describe('ChatView SDK agents panel', () => {
       terminal: true,
     }), { summary: 'docker compose logs -f', output: 'Session stopped' });
 
-    rerender(<ChatView events={[agyBashRunning, agyBashStopped]} loading={false} sessionId="deck_agents" />);
+    const agyNativeDone = makeSdkEvent('agy-subagent-done', makeMeta({
+      canonicalKey: 'agy:deck_agents:sub:child-1',
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      agentPath: 'child-1',
+      agentName: 'Researcher',
+      taskType: SDK_SUBAGENT_TASK_TYPES.AGENT,
+      backgrounded: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }), { summary: 'Antigravity sub-agent Researcher', output: 'done' });
+
+    rerender(<ChatView events={[agyBashRunning, agyNativeSubagent, agyBashStopped, agyNativeDone]} loading={false} sessionId="deck_agents" />);
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' })).toBeTruthy();
     expect(screen.queryByRole('region', { name: 'Agents' })).toBeNull();
   });

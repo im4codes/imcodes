@@ -58,7 +58,6 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
   GROK_RUNTIME_AGENT: 'grokRuntimeAgent',
   AGY_RUNTIME_AGENT: 'agyRuntimeAgent',
-  AGY_RUNTIME_SHELL: 'agyRuntimeShell',
   MUSE_RUNTIME_AGENT: 'museRuntimeAgent',
 } as const;
 
@@ -70,7 +69,6 @@ export const SDK_SUBAGENT_TASK_TYPES = {
 
 export const SDK_SUBAGENT_ACTIONS = {
   CODEX_BACKGROUND_SHELL: 'codex-background-shell',
-  AGY_BACKGROUND_TASK: 'agy-background-task',
 } as const;
 
 export const SDK_SUBAGENT_STATUS = {
@@ -405,6 +403,68 @@ export function buildGenericRuntimeSubagentTool(options: GenericRuntimeSubagentT
     id: canonicalKey,
     name: 'Agent',
     status: terminal ? (normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error') : 'running',
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
+}
+
+export interface SdkBackgroundShellToolEventOptions {
+  canonicalKey: string;
+  provider: SdkSubagentProvider;
+  providerKind: SdkSubagentProviderKind;
+  parentSessionId: string;
+  parentToolUseId?: string;
+  taskId: string;
+  description: string;
+  status: SdkSubagentNormalizedStatus;
+  startedAtMs?: number;
+  output?: string;
+  action?: string;
+}
+
+/** Provider-neutral builder for backgrounded shell/command subagent panel events. */
+export function buildSdkBackgroundShellToolEvent(options: SdkBackgroundShellToolEventOptions): ToolCallEvent {
+  const active = options.status === SDK_SUBAGENT_STATUS.RUNNING || options.status === SDK_SUBAGENT_STATUS.PENDING;
+  const rawStatus = options.status === SDK_SUBAGENT_STATUS.COMPLETE
+    ? 'completed'
+    : options.status === SDK_SUBAGENT_STATUS.INTERRUPTED
+      ? 'interrupted'
+      : options.status === SDK_SUBAGENT_STATUS.ERROR
+        ? 'error'
+        : options.status === SDK_SUBAGENT_STATUS.PENDING
+          ? 'pending'
+          : 'running';
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: options.description,
+    input: {
+      action: options.action ?? 'background-shell',
+      description: options.description,
+    },
+    ...(options.output !== undefined ? { output: options.output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: options.provider,
+      providerKind: options.providerKind,
+      canonicalKey: options.canonicalKey,
+      normalizedStatus: options.status,
+      rawStatus,
+      active,
+      terminal: !active,
+      parentSessionId: options.parentSessionId,
+      ...(options.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
+      taskId: options.taskId,
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      backgrounded: true,
+      ...(options.startedAtMs !== undefined ? { startedAtMs: options.startedAtMs } : {}),
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+  return {
+    id: detail.meta.canonicalKey,
+    name: 'Bash',
+    status: active ? 'running' : options.status === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error',
     ...(detail.input ? { input: detail.input } : {}),
     ...(detail.output ? { output: detail.output } : {}),
     detail,

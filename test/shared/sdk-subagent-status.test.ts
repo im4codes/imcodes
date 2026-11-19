@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  SDK_SUBAGENT_ACTIONS,
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDER_KINDS,
@@ -10,6 +9,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
   SDK_SUBAGENT_REDACTED_VALUE,
   SDK_SUBAGENT_SAFE_RAW_MAX_TOTAL_BYTES,
+  buildSdkBackgroundShellToolEvent,
   buildSdkSubagentSafeDetail,
   buildSdkSubagentWakePrompt,
   buildSdkSubagentMinimalReplayDetail,
@@ -71,30 +71,98 @@ describe('sdk-subagent-status shared contract', () => {
     expect(parseSdkSubagentDetail(detail)).toEqual(expect.objectContaining({ kind: 'ok' }));
   });
 
-  it('accepts explicitly structured Antigravity background shell details', () => {
-    const detail = makeDetail({
-      summary: 'bash ./sync.sh --all',
+  it('builds generic background shell tool events across existing provider kinds with sanitization', () => {
+    const running = buildSdkBackgroundShellToolEvent({
+      canonicalKey: 'agy:deck:bg:task-1',
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      parentSessionId: 'conv-1',
+      parentToolUseId: 'tool-1',
+      taskId: 'conv-1/task-1',
+      description: 'bash ./sync.sh --all',
+      status: SDK_SUBAGENT_STATUS.RUNNING,
+      startedAtMs: 1234,
+    });
+    expect(running).toMatchObject({
+      id: 'agy:deck:bg:task-1',
+      name: 'Bash',
+      status: 'running',
       input: {
-        action: SDK_SUBAGENT_ACTIONS.AGY_BACKGROUND_TASK,
+        action: 'background-shell',
         description: 'bash ./sync.sh --all',
       },
-      meta: {
-        ...makeDetail().meta,
+    });
+    const parsedRunning = parseSdkSubagentDetail(running.detail);
+    expect(parsedRunning).toEqual(expect.objectContaining({ kind: 'ok' }));
+    if (parsedRunning.kind === 'ok') {
+      expect(parsedRunning.detail.meta).toMatchObject({
         provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
-        canonicalKey: 'agy:deck:bg_task-1',
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
         taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
         backgrounded: true,
-      },
+        active: true,
+        terminal: false,
+        rawStatus: 'running',
+        startedAtMs: 1234,
+        parentToolUseId: 'tool-1',
+      });
+    }
+
+    const complete = buildSdkBackgroundShellToolEvent({
+      canonicalKey: 'claude:deck:bg:task-2',
+      provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+      parentSessionId: 'deck',
+      taskId: 'task-2',
+      description: 'npm test',
+      status: SDK_SUBAGENT_STATUS.COMPLETE,
+      output: 'Authorization: Bearer secret-xyz done',
+      action: 'custom-bg',
+    });
+    expect(complete).toMatchObject({
+      name: 'Bash',
+      status: 'complete',
+      input: { action: 'custom-bg', description: 'npm test' },
+    });
+    expect(complete.output).not.toContain('secret-xyz');
+    expect(complete.output).toContain(SDK_SUBAGENT_REDACTED_VALUE);
+    expect(parseSdkSubagentDetail(complete.detail)).toEqual(expect.objectContaining({ kind: 'ok' }));
+
+    const errored = buildSdkBackgroundShellToolEvent({
+      canonicalKey: 'codex:deck:bg:task-3',
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+      parentSessionId: 'deck',
+      taskId: 'task-3',
+      description: 'sleep 10',
+      status: SDK_SUBAGENT_STATUS.ERROR,
+      output: 'exit 1',
+    });
+    expect(errored.status).toBe('error');
+    expect(errored.detail?.meta).toMatchObject({
+      rawStatus: 'error',
+      active: false,
+      terminal: true,
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
     });
 
-    const parsed = parseSdkSubagentDetail(detail);
-    expect(parsed).toEqual(expect.objectContaining({ kind: 'ok' }));
-    if (parsed.kind === 'ok') {
-      expect(parsed.detail.meta.providerKind).toBe(SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL);
-      expect(parsed.detail.meta.taskType).toBe(SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH);
-      expect(parsed.detail.meta.backgrounded).toBe(true);
-    }
+    const interrupted = buildSdkBackgroundShellToolEvent({
+      canonicalKey: 'agy:deck:bg:task-4',
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      parentSessionId: 'deck',
+      taskId: 'task-4',
+      description: 'sleep 60',
+      status: SDK_SUBAGENT_STATUS.INTERRUPTED,
+      output: 'stopped',
+    });
+    expect(interrupted.status).toBe('error');
+    expect(interrupted.detail?.meta).toMatchObject({
+      rawStatus: 'interrupted',
+      active: false,
+      terminal: true,
+      normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+    });
   });
 
   it('accepts explicitly structured Muse runtime subagent details', () => {

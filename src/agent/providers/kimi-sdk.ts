@@ -145,22 +145,17 @@ import {
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 import {
   buildGenericRuntimeSubagentTool,
-  buildSdkSubagentSafeDetail,
+  buildSdkBackgroundShellToolEvent,
   isSdkRuntimeSubagentEventName,
   makeAgySubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
   sanitizeSdkSubagentText,
-  SDK_SUBAGENT_ACTIONS,
-  SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_REDACTED_VALUE,
   SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH,
-  SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
-  SDK_SUBAGENT_TASK_TYPES,
   startsWithSdkRuntimeSubagentTag,
-  type SdkSubagentDetail,
   type SdkSubagentNormalizedStatus,
   type SdkSubagentProvider,
   type SdkSubagentProviderKind,
@@ -1144,51 +1139,21 @@ export class KimiSdkProvider implements TransportProvider {
     status: SdkSubagentNormalizedStatus,
     output?: string,
   ): ToolCallEvent {
-    const active = status === SDK_SUBAGENT_STATUS.RUNNING;
-    const rawStatus = status === SDK_SUBAGENT_STATUS.COMPLETE
-      ? 'completed'
-      : status === SDK_SUBAGENT_STATUS.INTERRUPTED
-        ? 'interrupted'
-        : status === SDK_SUBAGENT_STATUS.ERROR
-          ? 'error'
-          : 'running';
     const safeOutput = output !== undefined
       ? sanitizeAgyBackgroundText(output)
       : undefined;
-    const detail = buildSdkSubagentSafeDetail({
-      kind: SDK_SUBAGENT_DETAIL_KIND,
-      summary: entry.description,
-      input: {
-        action: SDK_SUBAGENT_ACTIONS.AGY_BACKGROUND_TASK,
-        description: entry.description,
-      },
+    return buildSdkBackgroundShellToolEvent({
+      canonicalKey: entry.canonicalKey,
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      parentSessionId: state.acpSessionId ?? sessionId,
+      ...(entry.toolId ? { parentToolUseId: entry.toolId } : {}),
+      taskId: entry.id,
+      description: entry.description,
+      status,
+      startedAtMs: entry.startedAtMs,
       ...(safeOutput ? { output: safeOutput } : {}),
-      meta: {
-        isSdkSubagent: true,
-        schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
-        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
-        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL,
-        canonicalKey: entry.canonicalKey,
-        normalizedStatus: status,
-        rawStatus,
-        active,
-        terminal: !active,
-        parentSessionId: state.acpSessionId ?? sessionId,
-        ...(entry.toolId ? { parentToolUseId: entry.toolId } : {}),
-        taskId: entry.id,
-        taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
-        backgrounded: true,
-        startedAtMs: entry.startedAtMs,
-      },
-    } satisfies SdkSubagentDetail, { allowRaw: false });
-    return {
-      id: entry.canonicalKey,
-      name: 'Bash',
-      status: active ? 'running' : status === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error',
-      ...(detail.input ? { input: detail.input } : {}),
-      ...(detail.output ? { output: detail.output } : {}),
-      detail,
-    };
+    });
   }
 
   private terminalizeAgyBackgroundTasks(
