@@ -4015,6 +4015,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const verb = action === MEMORY_MCP_PAIR_CLOSE_ACTIONS[0] ? 'DONE' as const : 'CANCEL' as const;
       const eventKey = idempotencyKey?.trim() || JSON.stringify(Object.entries(attrs).sort());
       const dismissesDoneIntegration = stored.state.status === 'done' && integration === 'dismiss';
+      if (stored.state.status === 'done' && action === MEMORY_MCP_PAIR_CLOSE_ACTIONS[0] && !integration && !output && !dest) {
+        if (stored.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_close requires the pair Brain');
+        return { status: 'ok', taskId, state: stored.state.status, effect: 'noop', idempotentReplay: true };
+      }
       if (isTerminalTaskPairStatus(stored.state.status) && !dismissesDoneIntegration && !getTaskPairStore().hasEvent(`mcp:pair-${verb.toLowerCase()}:${context.project}:${taskId}:${eventKey}`)) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot ${action} terminal pair (${stored.state.status})`);
       }

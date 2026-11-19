@@ -48,6 +48,8 @@ import {
   TASK_PAIR_WORKSPACE_KEPT_MAX_PER_SWEEP,
   TASK_PAIR_WORKSPACE_KEPT_NOTICE_VERSION,
   TASK_PAIR_WORKSPACE_KEPT_REASON,
+  TASK_PAIR_PASS_DONE_NOTICE_REASON,
+  TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
   taskPairWorkspaceKeptDigestMetaKey,
   TASK_PAIR_TERMINAL_FLUSH_FIELD,
   isComplexSupervisionTaskBrief,
@@ -1125,8 +1127,10 @@ export class TaskPairService {
       if (!stored.liveness.notified.includes(key)) {
         store.saveLiveness(input.project, stored.state.taskId, { ...stored.liveness, notified: [...stored.liveness.notified, key] });
         this.#track(sendTaskPairMessage(
-          stored.state.brain, stored.state.taskId, 'brain-line-pass-done',
+          stored.state.brain, stored.state.taskId, TASK_PAIR_PASS_DONE_NOTICE_REASON,
           buildPassDoneNoticeMessage(stored.state),
+          undefined,
+          [{ project: input.project, taskId: stored.state.taskId, epoch: stored.state.scheduling?.epoch ?? 0 }],
         ));
       }
     }
@@ -2209,7 +2213,12 @@ export class TaskPairService {
         : outcome.status === 'noop' ? TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_NOOP
           : outcome.status === 'conflict' ? TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_CONFLICT : TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_FAILED;
       this.#recordWorkspaceEvent(project, latest, effect, { mode: nonGit.mode, files: String(outcome.files.length) }, {}, outcome.status === 'conflict' || outcome.status === 'failed');
-      await sendTaskPairMessage(latest.brain, taskId, 'brain-non-git-finish', buildNonGitFinishLine(latest, nonGit.mode === 'git_init' ? 'git_init' : 'cow', outcome));
+      await sendTaskPairMessage(
+        latest.brain, taskId, TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+        buildNonGitFinishLine(latest, nonGit.mode === 'git_init' ? 'git_init' : 'cow', outcome),
+        undefined,
+        [{ project, taskId, epoch: latest.scheduling?.epoch ?? 0 }],
+      );
     });
   }
 

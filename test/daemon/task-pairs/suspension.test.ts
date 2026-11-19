@@ -313,3 +313,67 @@ it('projects dependencyTitles into buildPairConsoleRow and timeline events under
     off();
   }
 });
+
+describe('brain-line-pass-done wake authority across passed -> done', () => {
+  it('admits queued PASS notice after executor DONE and delivers DONE backstop while keeping cancelled/dismissed/non-brain stale', async () => {
+    save('pass-race', 'in_audit');
+    await taskPairService.applyMarker({
+      project: P,
+      writer: A,
+      marker: { verb: 'PASS', knownVerb: 'PASS', taskId: 'pass-race', attrs: { blocking: 'P0' } },
+      source: 'timeline',
+      eventId: 'ev-pass-race-pass',
+    });
+    await taskPairService.waitForIdle();
+    const passNotice = messages.find((m) => m.target === B && m.id.includes(':brain-line-pass-done:'));
+    expect(passNotice).toBeDefined();
+
+    // Executor emits DONE before Brain's transport queue finishes draining PASS notice.
+    await taskPairService.applyMarker({
+      project: P,
+      writer: E,
+      marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'pass-race', attrs: {} },
+      source: 'timeline',
+      eventId: 'ev-pass-race-done',
+    });
+    await taskPairService.waitForIdle();
+    expect(get('pass-race').status).toBe('done');
+
+    expect(queuedPairWakeAllowed(B, passNotice!.id)).toBe(true);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: passNotice!.id, text: passNotice!.text })).toBe('authorized');
+    // Non-Brain sessions remain blocked.
+    expect(queuedPairWakeAllowed(E, passNotice!.id)).toBe(false);
+    expect(queuedPairWakeAllowed(A, passNotice!.id)).toBe(false);
+    // Worker nudges on the same done pair remain stale.
+    const workerNudge = `task-pair-nudge:pass-race:nudge-executor:${passNotice!.id.slice(passNotice!.id.indexOf(':wake-v1:'))}`.replace('brain-line-pass-done', 'nudge-executor');
+    expect(queuedPairWakeAllowed(E, workerNudge)).toBe(false);
+
+    // Dismissing integration drops queued brain-line-pass-done.
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('pass-race'), integrationDismissedAt: now + 1 });
+    expect(queuedPairWakeAllowed(B, passNotice!.id)).toBe(false);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: passNotice!.id, text: passNotice!.text })).toBe('stale');
+
+    // Direct DONE backstop when no PASS notice was previously sent succeeds and binds wake-v1.
+    messages.length = 0;
+    putTaskPairFixture(getTaskPairStore(), P, { ...state('done-backstop', 'passed'), passRound: 2, scheduling: { epoch: 1, manual: false, dependsOn: [], since: now, writer: B } });
+    // Simulate a passed round whose earlier PASS notice was missed in liveness.notified.
+    await taskPairService.applyMarker({
+      project: P,
+      writer: E,
+      marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'done-backstop', attrs: {} },
+      source: 'timeline',
+      eventId: 'ev-done-backstop',
+    });
+    await taskPairService.waitForIdle();
+    expect(get('done-backstop').status).toBe('done');
+    const backstopNotice = messages.find((m) => m.target === B && m.id.includes(':brain-line-pass-done:'));
+    expect(backstopNotice).toBeDefined();
+    expect(queuedPairWakeAllowed(B, backstopNotice!.id)).toBe(true);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: backstopNotice!.id, text: backstopNotice!.text })).toBe('authorized');
+
+    // Cancelled pair keeps brain-line-pass-done blocked.
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('done-backstop'), status: 'cancelled' });
+    expect(queuedPairWakeAllowed(B, backstopNotice!.id)).toBe(false);
+    expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: backstopNotice!.id, text: backstopNotice!.text })).toBe('stale');
+  });
+});

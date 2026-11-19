@@ -1,4 +1,4 @@
-import { queuedPairWakeAllowed } from './task-pairs/wake-authority.js';
+import { isDoneBrainCompletionNoticeAllowed, queuedPairWakeAllowed } from './task-pairs/wake-authority.js';
 import { isTaskPairSuspended, TASK_PAIR_WAKE_BINDING_TAG } from '../../shared/task-pair-suspension.js';
 import { isEndedSupervisionTaskStatus } from '../../shared/supervision-config.js';
 import {
@@ -134,6 +134,14 @@ function resolveQueuedTaskPairNudgeAdmission(
     // Legacy ids did not escape ':': match the longest known task prefix.
     const known = getTaskPairStore().pairsForSession(sessionName).filter((p) => rawId.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}${p.state.taskId}:`)).sort((a, b) => b.state.taskId.length - a.state.taskId.length)[0];
     const pair = known ?? getTaskPairStore().getPair(project, taskId);
+    if (pair && reason) {
+      const completionAllowed = isDoneBrainCompletionNoticeAllowed(pair.state, reason, sessionName);
+      if (completionAllowed !== undefined) {
+        if (completionAllowed) return 'authorized';
+        logger.info({ sessionName, taskId, reason, status: pair.state.status }, 'dropping a queued task-pair completion notice');
+        return 'stale';
+      }
+    }
     // Legacy nudges have no epoch; once this pair has ever paused, they are obsolete even after resume.
     if (pair?.state.scheduling || (pair && isTaskPairSuspended(pair.state))) return 'stale';
     if (!pair || !isTerminalTaskPairStatus(pair.state.status)) return 'authorized';

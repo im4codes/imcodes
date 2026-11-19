@@ -353,6 +353,30 @@ describe('task-bound delegation replies across a daemon restart', () => {
     expect(taskPairNudgeReasonFromId('client-1')).toBeUndefined();
   });
 
+  it('admits binding-less brain-line-pass-done and brain-non-git-finish for done Brain only, dropping cancelled, dismissed, and non-Brain targets', () => {
+    mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
+    mocks.sessions.set('deck_sub_exec', { name: 'deck_sub_exec', projectName: PROJECT });
+    putTaskPairFixture(pairs, PROJECT, {
+      ...pairState('tsk_pass_done', 'done'),
+      scheduling: { epoch: 1, manual: false, dependsOn: [], since: 1, writer: brain.sessionName },
+    });
+    putTaskPairFixture(pairs, PROJECT, { ...pairState('tsk_pass_dismissed', 'done'), integrationDismissedAt: 999 });
+    putTaskPairFixture(pairs, PROJECT, pairState('tsk_pass_cancelled', 'cancelled'));
+
+    const passId = (taskId: string) => `${taskPairMessageIdPrefix(taskId, 'brain-line-pass-done')}uuid-1`;
+    const nonGitId = (taskId: string) => `${taskPairMessageIdPrefix(taskId, 'brain-non-git-finish')}uuid-2`;
+
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: passId('tsk_pass_done'), text: 'done notice' })).toBe('authorized');
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: nonGitId('tsk_pass_done'), text: 'merge notice' })).toBe('authorized');
+
+    expect(resolveTransportQueueEntryAdmission('deck_sub_exec', { commandId: passId('tsk_pass_done'), text: 'done notice' })).toBe('stale');
+    expect(resolveTransportQueueEntryAdmission('deck_sub_exec', { commandId: nonGitId('tsk_pass_done'), text: 'merge notice' })).toBe('stale');
+
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: passId('tsk_pass_dismissed'), text: 'done notice' })).toBe('stale');
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: passId('tsk_pass_cancelled'), text: 'done notice' })).toBe('stale');
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: nonGitId('tsk_pass_cancelled'), text: 'merge notice' })).toBe('stale');
+  });
+
   it('drops a queued aggregate integration reminder after every listed pair is integrated or dismissed', () => {
     mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
     putTaskPairFixture(pairs, PROJECT, pairState('tsk_integrated', 'done'), {

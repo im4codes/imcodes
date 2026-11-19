@@ -242,6 +242,53 @@ describe('pair MCP projections', () => {
     removeSession(BRAIN); removeSession(EXEC);
   });
 
+  it('makes plain pair_close(action=done) idempotent on already-done pairs while preserving cancel, output/dest, and scope guards', async () => {
+    const doneByExecId = 'already-done-by-exec';
+    const cancelledId = 'already-cancelled';
+    upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(doneByExecId, 'done'), executor: EXEC });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(cancelledId, 'cancelled'), executor: EXEC });
+    const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1')];
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: sessions } });
+
+    // Plain done without idempotencyKey succeeds idempotently (even after executor DONE).
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'done' })).resolves.toMatchObject({
+      status: 'ok', taskId: doneByExecId, state: 'done', effect: 'noop', idempotentReplay: true,
+    });
+    // Plain done with a new idempotencyKey also succeeds idempotently.
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'done', idempotencyKey: 'late-brain-done' })).resolves.toMatchObject({
+      status: 'ok', taskId: doneByExecId, state: 'done', effect: 'noop', idempotentReplay: true,
+    });
+    // output / dest / invalid integration remain rejected on already-done pairs unless replaying exact eventKey.
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'done', output: 'dist/out.txt' })).resolves.toMatchObject({
+      status: 'error', reason: 'validation_failed',
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'done', dest: 'out.txt' })).resolves.toMatchObject({
+      status: 'error', reason: 'validation_failed',
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'done', integration: 'keep' })).resolves.toMatchObject({
+      status: 'error', reason: 'validation_failed',
+    });
+    // action=cancel on done and action=done on cancelled remain rejected.
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'cancel' })).resolves.toMatchObject({
+      status: 'error', reason: 'validation_failed',
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: cancelledId, action: 'done' })).resolves.toMatchObject({
+      status: 'error', reason: 'validation_failed',
+    });
+    // integration=dismiss on done still works and records dismissal.
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'done', integration: 'dismiss' })).resolves.toMatchObject({
+      status: 'ok', taskId: doneByExecId, state: 'done',
+    });
+    expect(getTaskPairStore().getPair(PROJECT, doneByExecId)?.state.integrationDismissedAt).toBeDefined();
+    // Non-Brain session remains rejected even on already-done pairs.
+    const execHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
+    await expect(execHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: doneByExecId, action: 'done' })).resolves.toMatchObject({
+      status: 'error', reason: 'scope_forbidden',
+    });
+    removeSession(BRAIN); removeSession(EXEC);
+  });
+
   it('enforces Brain-only reassignment and persists the REASSIGN effect', async () => {
     const taskId = 'structured-reassign';
     const replacement = 'deck_sub_pair_mcp_exec2';

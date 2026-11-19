@@ -1,8 +1,33 @@
 import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON } from '../../../shared/task-pair-decision.js';
-import { isTerminalTaskPairStatus, TASK_PAIR_ENDED_PAIR_NOTICE_REASONS, TASK_PAIR_NUDGE_ID_PREFIX } from '../../../shared/task-pair.js';
+import {
+  isTerminalTaskPairStatus,
+  TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+  TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON,
+  TASK_PAIR_NUDGE_ID_PREFIX,
+  TASK_PAIR_PASS_DONE_NOTICE_REASON,
+  type TaskPairState,
+} from '../../../shared/task-pair.js';
 import { isTaskPairSuspended, TASK_PAIR_DEPENDENCY_FAILURE_REASON, TASK_PAIR_RESUME_REASON, TASK_PAIR_WAKE_BINDING_TAG, type TaskPairWakeBinding } from '../../../shared/task-pair-suspension.js';
 import { getTaskPairStore } from './store.js';
 import { isTaskPairMissingExplanation, taskPairMissingExplanationKey } from './decision-context.js';
+
+export function isDoneBrainCompletionNoticeAllowed(
+  state: Pick<TaskPairState, 'brain' | 'status' | 'integrationDismissedAt' | 'scheduling'>,
+  reason: string,
+  target?: string,
+): boolean | undefined {
+  if (reason === TASK_PAIR_PASS_DONE_NOTICE_REASON) {
+    if (target !== state.brain) return false;
+    if (state.integrationDismissedAt !== undefined) return false;
+    if (state.status === 'done') return true;
+    if (isTerminalTaskPairStatus(state.status)) return false;
+    return !isTaskPairSuspended(state);
+  }
+  if (reason === TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON) {
+    return target === state.brain && state.status === 'done';
+  }
+  return undefined;
+}
 
 export function pairWakeBindings(target: string, taskId: string): TaskPairWakeBinding[] {
   return getTaskPairStore().pairsForSession(target)
@@ -14,6 +39,8 @@ export function pairWakeAllowed(bindings: TaskPairWakeBinding[], reason: string,
     const state = getTaskPairStore().getPair(b.project, b.taskId)?.state;
     if (!state || (state.scheduling?.epoch ?? 0) !== b.epoch) return false;
     if (TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) return true;
+    const completionAllowed = isDoneBrainCompletionNoticeAllowed(state, reason, target);
+    if (completionAllowed !== undefined) return completionAllowed;
     if (isTerminalTaskPairStatus(state.status)) return false;
     // Explicit human/decision input may reach Brain while workers stay suspended.
     if (reason === TASK_PAIR_DECISION_BRAIN_NOTICE_REASON) return target === state.brain;

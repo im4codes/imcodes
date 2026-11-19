@@ -755,4 +755,70 @@ describe('Pair pause during asynchronous pre-provider assembly', () => {
       resetTransportQueueStoreForTests(); resetContextStoreClientForTests();
     }
   });
+
+  it('delivers queued brain-line-pass-done across passed -> done race during async context assembly, while still dropping cancelled/dismissed', async () => {
+    const { getTaskPairStore, TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const { sendTaskPairMessage, setTaskPairDeliveryDepsForTests } = await import('../../src/daemon/task-pairs/delivery.js');
+    const { resolveTransportQueueEntryAdmission } = await import('../../src/daemon/delegation-reply-task-liveness.js');
+    resetTransportQueueStoreForTests(); resetContextStoreClientForTests();
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    const brain = 'deck_e2e_pass_done_brain';
+    const exec = 'deck_e2e_pass_done_exec';
+    const store = getTaskPairStore();
+    putTaskPairFixture(store, 'pass-done-runtime', {
+      taskId: 'pass-done-race',
+      brain,
+      executor: exec,
+      auditor: 'deck_e2e_pass_done_aud',
+      status: 'passed',
+      flags: [],
+      flagSides: {},
+      round: 2,
+      blocking: ['P0'],
+      previousAuditors: [],
+      capCounts: {},
+      capRound: 2,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const sentIds: string[] = [];
+    setTaskPairDeliveryDepsForTests({ send: async (_target, _text, id) => { sentIds.push(id); } });
+    await sendTaskPairMessage(brain, 'pass-done-race', 'brain-line-pass-done', 'PASS notice for pass-done-race');
+    await sendTaskPairMessage(brain, 'pass-done-race', 'brain-line-pass-done', 'Dismissed notice should drop');
+
+    const provider = makeProvider();
+    const runtime = new TransportSessionRuntime(provider, brain);
+    runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(brain, entry);
+    let release!: () => void;
+    let called!: () => void;
+    const entered = new Promise<void>((resolve) => { called = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      await runtime.initialize({ sessionKey: brain });
+      runtime.setContextBootstrapResolver(async () => { called(); await blocked; return { diagnostics: [], localProcessedFreshness: 'fresh' }; });
+      runtime.send('PASS notice for pass-done-race', sentIds[0]!);
+      await entered;
+      // Executor emits DONE before context assembly completes.
+      putTaskPairFixture(store, 'pass-done-runtime', {
+        ...store.getPair('pass-done-runtime', 'pass-done-race')!.state,
+        status: 'done',
+        updatedAt: 2,
+      });
+      release();
+      await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(1));
+      const payload = (provider.send as ReturnType<typeof vi.fn>).mock.calls[0]![1];
+      expect(typeof payload === 'string' ? payload : payload.userMessage).toBe('PASS notice for pass-done-race');
+
+      // Once integration is dismissed, a queued brain-line-pass-done MUST be dropped.
+      putTaskPairFixture(store, 'pass-done-runtime', {
+        ...store.getPair('pass-done-runtime', 'pass-done-race')!.state,
+        integrationDismissedAt: 3,
+        updatedAt: 3,
+      });
+      expect(resolveTransportQueueEntryAdmission(brain, { clientMessageId: sentIds[1]!, text: 'Dismissed notice' })).toBe('stale');
+    } finally {
+      release(); await runtime.kill(); setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests(); resetContextStoreClientForTests();
+    }
+  });
 });

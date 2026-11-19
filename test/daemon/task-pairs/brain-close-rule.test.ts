@@ -186,9 +186,11 @@ describe('a notice about a pair that has ALREADY ended advises only calls that s
       const shape = (taskId: string, dismiss: boolean) => ({ taskId, action: 'done', ...(dismiss ? { integration: 'dismiss' } : {}) });
       // Advised: accepted for a done pair.
       await expect(close(shape('ended_done', true))).resolves.toMatchObject({ status: 'ok' });
-      // The advice the notices used to carry: rejected as terminal, for done and for cancelled pairs.
+      // Plain done on an already-done pair is idempotent (e.g. Brain acting on PASS notice after executor DONE).
+      await expect(close(shape('ended_done', false))).resolves.toMatchObject({ status: 'ok', taskId: 'ended_done', state: 'done', effect: 'noop', idempotentReplay: true });
+      // Cancelled pairs and action=cancel on done pairs remain rejected as terminal.
       await expect(close({ taskId: 'ended_done', action: 'cancel', idempotencyKey: 'old-advice-1' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
-      await expect(close(shape('ended_done', false))).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+      await expect(close(shape('ended_cancelled', false))).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
       await expect(close({ taskId: 'ended_cancelled', action: 'cancel', idempotencyKey: 'old-advice-2' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]!({ taskId: 'ended_done' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
     } finally {

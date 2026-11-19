@@ -232,6 +232,9 @@ export const TASK_PAIR_DONE_WORKSPACE_RETENTION_MS = 0;
  * The value is the `reason` segment of the message id (`task-pair-nudge:<taskId>:<reason>:...`).
  */
 export const TASK_PAIR_ENDED_PAIR_NOTICE_REASONS: readonly string[] = ['brain-workspace-kept', 'brain-output-failed'];
+/** Completion notices to Brain whose subject pair may already be `done` (not `cancelled` or integration-dismissed). */
+export const TASK_PAIR_PASS_DONE_NOTICE_REASON = 'brain-line-pass-done' as const;
+export const TASK_PAIR_NON_GIT_FINISH_NOTICE_REASON = 'brain-non-git-finish' as const;
 
 /** The `reason` segment of a daemon-authored pair message id, or undefined when `id` is not one. */
 export function taskPairNudgeReasonFromId(id: string | undefined): string | undefined {
