@@ -1153,7 +1153,7 @@ export class KimiSdkProvider implements TransportProvider {
           ? 'error'
           : 'running';
     const safeOutput = output !== undefined
-      ? sanitizeSdkSubagentText(redactAgyBackgroundCommandSecrets(output))
+      ? sanitizeAgyBackgroundText(output)
       : undefined;
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
@@ -1293,13 +1293,13 @@ export class KimiSdkProvider implements TransportProvider {
       if (isEmptyManageTaskListResult(text, opts)) {
         this.terminalizeAgyBackgroundTasks(sessionId, state, SDK_SUBAGENT_STATUS.COMPLETE, 'No running tasks');
       } else {
-        for (const { id, status: terminalStatus } of extractAgyBackgroundTaskTerminals(text, opts)) {
+        for (const { id, status: terminalStatus, output: terminalOutput } of extractAgyBackgroundTaskTerminals(text, opts)) {
           const entry = tasks.get(id);
           if (!entry) continue;
           tasks.delete(id);
           this.emitAgyBackgroundTaskEvent(
             sessionId,
-            this.buildAgyBackgroundShellToolEvent(sessionId, state, entry, terminalStatus, text),
+            this.buildAgyBackgroundShellToolEvent(sessionId, state, entry, terminalStatus, terminalOutput),
           );
         }
       }
@@ -4518,8 +4518,16 @@ const AGY_BACKGROUND_TASK_START_RE = /Tool is running as a background task with 
 const AGY_BACKGROUND_TASK_DESCRIPTION_RE = /(?:^|\n)\s*Task Description:\s*(.+)/i;
 const AGY_BACKGROUND_TASK_FINISHED_RE = /Task id "([^"]+)" finished/gi;
 const AGY_BACKGROUND_TASK_SENDER_RE = /\bsender=([^\s]+)/gi;
-const AGY_MANAGE_TASK_TERMINAL_RE = /\bTask:\s*([A-Za-z0-9._:/-]+)\b[\s\S]*?\bStatus:\s*(DONE|KILLED|FAILED|CANCELLED|ERROR|STOPPED)\b/gi;
-const AGY_BACKGROUND_ENV_SECRET_RE = /\b([A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL|AUTH)[A-Za-z0-9_]*)=('[^']*'|"[^"]*"|\S+)/gi;
+const AGY_MANAGE_TASK_HEADER_RE = /(?:^|\n)[ \t]*Task:\s*([A-Za-z0-9._:/-]+)\b/gi;
+const AGY_MANAGE_TASK_STATUS_RE = /\bStatus:\s*([A-Za-z0-9_-]+)\b/i;
+const AGY_ENV_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const AGY_SECRET_KEY_NAME_RE = /(?:SECRET|TOKEN|PASSWORD|PASSWD|API[-_]?KEY|APIKEY|PRIVATE[-_]?KEY|CREDENTIAL|(?:^|_)(?:PASS|AUTH)(?:$|_))/i;
+const AGY_SECRET_FLAG_RE = /^--?(?:password|passwd|pass|token|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|secret|client[-_]?secret|auth[-_]?token|bearer|credential|credentials|private[-_]?key|secret[-_]?key)$/i;
+const AGY_HEADER_FLAG_RE = /^(?:-H|--header)$/i;
+const AGY_SENSITIVE_HEADER_RE = /\b(?:authorization|proxy-authorization|x-api-key|api[-_]?key|x-auth-token|cookie|set-cookie)\s*:/i;
+const AGY_INLINE_AUTH_RE = /\b((?:Authorization|Proxy-Authorization)\s*:\s*(?:Basic|Bearer|Token)\s+)\S+/gi;
+const AGY_URL_CREDENTIALS_RE = /([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+):([^/\s@]+)@/gi;
+const AGY_SHELL_SEPARATORS = new Set([';', '|', '&', '(', ')', '\n', '\r']);
 
 const AGY_EMPTY_MANAGE_TASK_LIST_RE = /\bno\s+(?:running|active|background)\s+tasks?\b/i;
 
@@ -4597,14 +4605,157 @@ function isEmptyManageTaskListResult(
   return AGY_EMPTY_MANAGE_TASK_LIST_RE.test(trimmed);
 }
 
-function redactAgyBackgroundCommandSecrets(value: string): string {
-  return value.replace(AGY_BACKGROUND_ENV_SECRET_RE, `$1=${SDK_SUBAGENT_REDACTED_VALUE}`);
+function scanShellTokenEnd(value: string, start: number): { end: number; unclosedQuote: boolean } {
+  let i = start;
+  let quote: '"' | "'" | null = null;
+  while (i < value.length) {
+    const ch = value[i]!;
+    if (quote === "'") {
+      i += 1;
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '\\' && i + 1 < value.length) {
+        i += 2;
+        continue;
+      }
+      i += 1;
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || AGY_SHELL_SEPARATORS.has(ch)) break;
+    if (ch === '\\' && i + 1 < value.length) {
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return { end: i, unclosedQuote: quote !== null };
+}
+
+function unquoteSingleOrDoubleShellArg(token: string): { quote: "'" | '"'; inner: string } | null {
+  if (token.length < 2) return null;
+  const first = token[0];
+  const last = token[token.length - 1];
+  if (first === "'" && last === "'") {
+    return { quote: "'", inner: token.slice(1, -1) };
+  }
+  if (first === '"' && last === '"') {
+    const rawInner = token.slice(1, -1);
+    const unescaped = rawInner.replace(/\\(["\\$`])/g, '$1');
+    return { quote: '"', inner: unescaped };
+  }
+  return null;
+}
+
+function redactAgyBackgroundCommandSecrets(
+  value: string,
+  depth = 0,
+): { text: string; unclosedQuote: boolean } {
+  const preRedacted = value
+    .replace(AGY_URL_CREDENTIALS_RE, `$1${SDK_SUBAGENT_REDACTED_VALUE}@`)
+    .replace(AGY_INLINE_AUTH_RE, `$1${SDK_SUBAGENT_REDACTED_VALUE}`);
+  let out = '';
+  let i = 0;
+  let redactNextMode: 'secret' | 'header' | null = null;
+  let expectSubshellScript = false;
+  let unclosedQuote = false;
+
+  while (i < preRedacted.length) {
+    const ch = preRedacted[i]!;
+    if (ch === ' ' || ch === '\t' || AGY_SHELL_SEPARATORS.has(ch)) {
+      if (AGY_SHELL_SEPARATORS.has(ch)) {
+        redactNextMode = null;
+        expectSubshellScript = false;
+      }
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    const scanned = scanShellTokenEnd(preRedacted, i);
+    if (scanned.unclosedQuote) unclosedQuote = true;
+    const token = preRedacted.slice(i, scanned.end);
+    i = scanned.end;
+
+    if (redactNextMode === 'secret') {
+      redactNextMode = null;
+      out += SDK_SUBAGENT_REDACTED_VALUE;
+      continue;
+    }
+    if (redactNextMode === 'header') {
+      redactNextMode = null;
+      out += AGY_SENSITIVE_HEADER_RE.test(token) ? SDK_SUBAGENT_REDACTED_VALUE : token;
+      continue;
+    }
+
+    if (expectSubshellScript) {
+      expectSubshellScript = false;
+      if (depth < 2) {
+        const unquoted = unquoteSingleOrDoubleShellArg(token);
+        if (unquoted) {
+          const nested = redactAgyBackgroundCommandSecrets(unquoted.inner, depth + 1);
+          if (nested.unclosedQuote) unclosedQuote = true;
+          const rewrapped = unquoted.quote === "'"
+            ? `'${nested.text}'`
+            : `"${nested.text.replace(/([\\"])/g, '\\$1')}"`;
+          out += rewrapped;
+          continue;
+        }
+      }
+    }
+
+    const eqIdx = token.indexOf('=');
+    if (eqIdx > 0) {
+      const lhs = token.slice(0, eqIdx);
+      if (AGY_ENV_IDENTIFIER_RE.test(lhs) && AGY_SECRET_KEY_NAME_RE.test(lhs)) {
+        out += `${lhs}=${SDK_SUBAGENT_REDACTED_VALUE}`;
+        continue;
+      }
+      if (AGY_SECRET_FLAG_RE.test(lhs)) {
+        out += `${lhs}=${SDK_SUBAGENT_REDACTED_VALUE}`;
+        continue;
+      }
+      if (AGY_HEADER_FLAG_RE.test(lhs) && AGY_SENSITIVE_HEADER_RE.test(token.slice(eqIdx + 1))) {
+        out += `${lhs}=${SDK_SUBAGENT_REDACTED_VALUE}`;
+        continue;
+      }
+    }
+
+    if (AGY_SECRET_FLAG_RE.test(token)) {
+      redactNextMode = 'secret';
+    } else if (AGY_HEADER_FLAG_RE.test(token)) {
+      redactNextMode = 'header';
+    } else if (token === '-c' || token === '--command' || token === 'eval') {
+      expectSubshellScript = true;
+    }
+    out += token;
+  }
+
+  return { text: out, unclosedQuote };
+}
+
+const AGY_SECRET_KEYWORD_RE = /(?:password|passwd|pass(?:$|[^a-z])|token|api[-_]?key|apikey|secret|credential|private[-_]?key|authorization)/i;
+
+function sanitizeAgyBackgroundText(value: string, fallback?: string): string | undefined {
+  const { text: redacted, unclosedQuote } = redactAgyBackgroundCommandSecrets(value);
+  if (unclosedQuote && AGY_SECRET_KEYWORD_RE.test(value)) {
+    return fallback ?? SDK_SUBAGENT_REDACTED_VALUE;
+  }
+  return sanitizeSdkSubagentText(redacted, SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH);
 }
 
 function extractAgyBackgroundTaskDescription(
   text: string,
   opts: { toolName?: string; toolInput?: unknown },
 ): string {
+  const fallback = normalizeAgyToolName(opts.toolName ?? '') === 'schedule' ? 'Scheduled task' : 'Bash';
   const input = asToolInputRecord(opts.toolInput);
   const textDescription = AGY_BACKGROUND_TASK_DESCRIPTION_RE.exec(text)?.[1];
   const candidates = [
@@ -4619,13 +4770,10 @@ function extractAgyBackgroundTaskDescription(
   ];
   for (const candidate of candidates) {
     if (typeof candidate !== 'string' || !candidate.trim()) continue;
-    const sanitized = sanitizeSdkSubagentText(
-      redactAgyBackgroundCommandSecrets(candidate),
-      SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH,
-    );
+    const sanitized = sanitizeAgyBackgroundText(candidate, fallback);
     if (sanitized) return sanitized;
   }
-  return normalizeAgyToolName(opts.toolName ?? '') === 'schedule' ? 'Scheduled task' : 'Bash';
+  return fallback;
 }
 
 function extractAgyBackgroundTaskStartIds(text: string): string[] {
@@ -4651,38 +4799,123 @@ function resolveAgyBackgroundSystemTerminalStatus(text: string): SdkSubagentNorm
   return SDK_SUBAGENT_STATUS.COMPLETE;
 }
 
-function resolveAgyManageTaskTerminalStatus(rawStatus: string | undefined): SdkSubagentNormalizedStatus {
-  const normalized = (rawStatus ?? '').toUpperCase();
-  if (normalized === 'KILLED' || normalized === 'CANCELLED' || normalized === 'STOPPED') {
+function resolveAgyManageTaskTerminalStatus(rawStatus: string | undefined): SdkSubagentNormalizedStatus | null {
+  const normalized = (rawStatus ?? '').trim().toUpperCase();
+  if (normalized === 'KILLED' || normalized === 'CANCELLED' || normalized === 'CANCELED' || normalized === 'STOPPED' || normalized === 'INTERRUPTED') {
     return SDK_SUBAGENT_STATUS.INTERRUPTED;
   }
-  if (normalized === 'FAILED' || normalized === 'ERROR') {
+  if (normalized === 'FAILED' || normalized === 'ERROR' || normalized === 'ERRORED') {
     return SDK_SUBAGENT_STATUS.ERROR;
   }
-  return SDK_SUBAGENT_STATUS.COMPLETE;
+  if (normalized === 'DONE' || normalized === 'COMPLETE' || normalized === 'COMPLETED' || normalized === 'SUCCESS') {
+    return SDK_SUBAGENT_STATUS.COMPLETE;
+  }
+  return null;
+}
+
+function splitByOffsets(text: string, regex: RegExp): string[] {
+  const matches = [...text.matchAll(regex)];
+  if (matches.length <= 1) return [text];
+  const segments: string[] = [];
+  for (let i = 0; i < matches.length; i += 1) {
+    const start = matches[i]!.index ?? 0;
+    const end = i + 1 < matches.length ? (matches[i + 1]!.index ?? text.length) : text.length;
+    segments.push(text.slice(start, end));
+  }
+  return segments;
+}
+
+function extractSystemMessageTerminalSegments(text: string): string[] {
+  const primary = /\[Message\]\b/i.test(text)
+    ? splitByOffsets(text, /\[Message\]\b/gi)
+    : /Task id "[^"]+" finished/i.test(text)
+      ? splitByOffsets(text, /Task id "[^"]+" finished/gi)
+      : splitByOffsets(text, /\bsender=[^\s]+/gi);
+  const out: string[] = [];
+  for (const seg of primary) {
+    const finishedMatches = [...seg.matchAll(/Task id "[^"]+" finished/gi)];
+    if (finishedMatches.length > 1) {
+      out.push(...splitByOffsets(seg, /Task id "[^"]+" finished/gi));
+    } else {
+      out.push(seg);
+    }
+  }
+  return out;
 }
 
 function extractAgyBackgroundTaskTerminals(
   text: string,
   opts: { isSystemMessage?: boolean; toolName?: string; toolInput?: unknown; toolStatus?: string },
-): Array<{ id: string; status: SdkSubagentNormalizedStatus }> {
-  const results: Array<{ id: string; status: SdkSubagentNormalizedStatus }> = [];
+): Array<{ id: string; status: SdkSubagentNormalizedStatus; output?: string }> {
+  const results: Array<{ id: string; status: SdkSubagentNormalizedStatus; output?: string }> = [];
   if (opts.isSystemMessage) {
-    const status = resolveAgyBackgroundSystemTerminalStatus(text);
-    for (const match of text.matchAll(AGY_BACKGROUND_TASK_FINISHED_RE)) {
-      if (match[1]) results.push({ id: match[1], status });
-    }
-    for (const match of text.matchAll(AGY_BACKGROUND_TASK_SENDER_RE)) {
-      if (match[1]) results.push({ id: match[1], status });
+    for (const segment of extractSystemMessageTerminalSegments(text)) {
+      const status = resolveAgyBackgroundSystemTerminalStatus(segment);
+      for (const match of segment.matchAll(AGY_BACKGROUND_TASK_FINISHED_RE)) {
+        if (match[1]) results.push({ id: match[1], status, output: segment });
+      }
+      for (const match of segment.matchAll(AGY_BACKGROUND_TASK_SENDER_RE)) {
+        if (match[1]) results.push({ id: match[1], status, output: segment });
+      }
     }
   }
   if (normalizeAgyToolName(opts.toolName ?? '') === 'managetask') {
     const input = asToolInputRecord(opts.toolInput);
-    if (input?.Action === 'kill' && typeof input.TaskId === 'string' && opts.toolStatus !== 'error') {
-      results.push({ id: input.TaskId, status: SDK_SUBAGENT_STATUS.INTERRUPTED });
+    const killId = typeof input?.TaskId === 'string' ? input.TaskId : typeof input?.taskId === 'string' ? input.taskId : undefined;
+    const action = String(input?.Action ?? input?.action ?? '').trim().toLowerCase();
+    if (action === 'kill' && killId && opts.toolStatus !== 'error') {
+      results.push({ id: killId, status: SDK_SUBAGENT_STATUS.INTERRUPTED, output: text || 'Task killed' });
     }
-    for (const match of text.matchAll(AGY_MANAGE_TASK_TERMINAL_RE)) {
-      if (match[1]) results.push({ id: match[1], status: resolveAgyManageTaskTerminalStatus(match[2]) });
+    let parsedJsonList = false;
+    const trimmed = text.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const list = Array.isArray(parsed)
+          ? parsed
+          : parsed && typeof parsed === 'object'
+            ? [
+                (parsed as Record<string, unknown>).tasks,
+                (parsed as Record<string, unknown>).runningTasks,
+                (parsed as Record<string, unknown>).running,
+                (parsed as Record<string, unknown>).items,
+              ].find(Array.isArray)
+            : undefined;
+        if (Array.isArray(list)) {
+          parsedJsonList = true;
+          for (const item of list) {
+            if (!item || typeof item !== 'object') continue;
+            const row = item as Record<string, unknown>;
+            const id = typeof row.taskId === 'string'
+              ? row.taskId
+              : typeof row.task_id === 'string'
+                ? row.task_id
+                : typeof row.id === 'string'
+                  ? row.id
+                  : undefined;
+            const status = resolveAgyManageTaskTerminalStatus(
+              typeof row.status === 'string' ? row.status : typeof row.state === 'string' ? row.state : undefined,
+            );
+            if (id && status) results.push({ id, status, output: JSON.stringify(row) });
+          }
+        }
+      } catch { /* fall through to block parser */ }
+    }
+    if (!parsedJsonList) {
+      const headers = [...text.matchAll(AGY_MANAGE_TASK_HEADER_RE)];
+      for (let i = 0; i < headers.length; i += 1) {
+        const match = headers[i]!;
+        const id = match[1];
+        if (!id) continue;
+        const start = match.index ?? 0;
+        const end = i + 1 < headers.length ? (headers[i + 1]!.index ?? text.length) : text.length;
+        const block = text.slice(start, end);
+        const statusMatch = AGY_MANAGE_TASK_STATUS_RE.exec(block);
+        const terminalStatus = resolveAgyManageTaskTerminalStatus(statusMatch?.[1]);
+        if (terminalStatus) {
+          results.push({ id, status: terminalStatus, output: block.trim() });
+        }
+      }
     }
   }
   return results;

@@ -4443,4 +4443,213 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       await runtime.kill();
     }
   });
+
+  it('redacts quoted/escaped env secrets, CLI password flags, and terminal secret outputs without over-redacting normal quoted commands', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_shell_redaction';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => {
+      if (sid === id && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL) {
+        events.push(evt);
+      }
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-redact')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      // 1. Escaped double quotes inside secret env value + trailing command
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'TOKEN="prefix\\"SYNTHETIC_SECRET_TAIL" bash worker.sh' },
+        toolStatus: 'running',
+      });
+      const e1 = events.at(-1)!;
+      expect(JSON.stringify(e1)).not.toContain('SYNTHETIC_SECRET_TAIL');
+      expect(JSON.stringify(e1)).not.toContain('prefix');
+      expect(e1.detail?.summary).toBe('TOKEN=[REDACTED] bash worker.sh');
+
+      // 2. Concatenated quotes + escaped whitespace inside env value + CLI password/token flags
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/sec-2`,
+        toolName: 'run_command',
+        toolInput: {
+          CommandLine:
+            'API_KEY="part1"\'part2\'\\ SYNTHETIC_JOINED docker login --username alice --password SYNTHETIC_PASSWORD --token="tok\\"SYNTHETIC_FLAG" registry.example',
+        },
+        toolStatus: 'running',
+      });
+      const e2 = events.at(-1)!;
+      const e2Json = JSON.stringify(e2);
+      expect(e2Json).not.toContain('SYNTHETIC_JOINED');
+      expect(e2Json).not.toContain('SYNTHETIC_PASSWORD');
+      expect(e2Json).not.toContain('SYNTHETIC_FLAG');
+      expect(e2.detail?.summary).toContain('docker login --username alice --password [REDACTED] --token=[REDACTED] registry.example');
+
+      // 3. Terminal output containing quoted/escaped secret and password flag is also sanitized before truncation
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Task id "${nativeId}/sec-2" finished with error: TOKEN="a\\"SYNTHETIC_OUT_ENV" --password SYNTHETIC_OUT_PW`,
+        isSystemMessage: true,
+      });
+      const e2Term = events.at(-1)!;
+      const e2TermJson = JSON.stringify(e2Term);
+      expect(e2TermJson).not.toContain('SYNTHETIC_OUT_ENV');
+      expect(e2TermJson).not.toContain('SYNTHETIC_OUT_PW');
+      expect(e2Term.status).toBe('error');
+
+      // 4. Positive control: normal command with spaces and escaped quotes is preserved intact
+      const normalCmd = 'git commit -m "fix \\"quote\\" edge" && ./sync.sh --all';
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/norm-1`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: normalCmd },
+        toolStatus: 'running',
+      });
+      expect(events.at(-1)?.detail?.summary).toBe(normalCmd);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('parses manage_task multi-task lists and multi-record system notices per record without cross-task status bleeding', async () => {
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_multitask_isolation';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const events: ToolCallEvent[] = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    provider.onToolCall((sid, evt) => {
+      if (sid === id && evt.detail?.meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_SHELL) {
+        events.push(evt);
+      }
+    });
+
+    try {
+      expect(runtime.send('warm', 'warm-multi')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+
+      for (const suffix of ['A', 'B', 'C']) {
+        (provider as any).updateAgyBackgroundTasks(id, state, {
+          text: `Tool is running as a background task with task id: ${nativeId}/${suffix}`,
+          toolName: 'run_command',
+          toolInput: { CommandLine: `echo ${suffix}` },
+          toolStatus: 'running',
+        });
+      }
+      expect(state.agyBackgroundTasks.size).toBe(3);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(3);
+
+      const startEventsBefore = events.length;
+      const keyA = state.agyBackgroundTasks.get(`${nativeId}/A`).canonicalKey;
+      const keyB = state.agyBackgroundTasks.get(`${nativeId}/B`).canonicalKey;
+      const keyC = state.agyBackgroundTasks.get(`${nativeId}/C`).canonicalKey;
+
+      // Case 1: RUNNING block before DONE block + KILLED block -> only B & C close with exact statuses, A stays running!
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `Task: ${nativeId}/A`,
+          'Status: RUNNING',
+          '',
+          `Task: ${nativeId}/B`,
+          'Status: DONE',
+          '',
+          `Task: ${nativeId}/C`,
+          'Status: KILLED',
+        ].join('\n'),
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+
+      const listEmitted1 = events.slice(startEventsBefore);
+      expect(listEmitted1).toHaveLength(2);
+      expect(listEmitted1.find((e) => e.id === keyB)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/B`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      });
+      expect(listEmitted1.find((e) => e.id === keyC)?.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/C`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+        active: false,
+        terminal: true,
+      });
+      expect(listEmitted1.some((e) => e.id === keyA)).toBe(false);
+      expect([...state.agyBackgroundTasks.keys()]).toEqual([`${nativeId}/A`]);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(1);
+
+      // Case 2: Swapped order (FAILED first, RUNNING second) + multi-record SYSTEM_MESSAGE isolation
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/D`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'echo D' },
+        toolStatus: 'running',
+      });
+      const keyD = state.agyBackgroundTasks.get(`${nativeId}/D`).canonicalKey;
+      const beforeSwap = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `Task: ${nativeId}/D`,
+          'Status: FAILED',
+          '',
+          `Task: ${nativeId}/A`,
+          'Status: RUNNING',
+        ].join('\n'),
+        toolName: 'manage_task',
+        toolInput: { Action: 'list' },
+        toolStatus: 'complete',
+      });
+      const swapEmitted = events.slice(beforeSwap);
+      expect(swapEmitted).toHaveLength(1);
+      expect(swapEmitted[0]!.id).toBe(keyD);
+      expect(swapEmitted[0]!.detail?.meta).toMatchObject({
+        taskId: `${nativeId}/D`,
+        normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+        active: false,
+        terminal: true,
+      });
+      expect([...state.agyBackgroundTasks.keys()]).toEqual([`${nativeId}/A`]);
+
+      // Case 3: Multi-record SYSTEM_MESSAGE with distinct exit statuses (E code 0 vs A code 1)
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/E`,
+        toolName: 'run_command',
+        toolInput: { CommandLine: 'echo E' },
+        toolStatus: 'running',
+      });
+      const keyE = state.agyBackgroundTasks.get(`${nativeId}/E`).canonicalKey;
+      const beforeSys = events.length;
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: [
+          `Task id "${nativeId}/E" finished with result:\nCommand exited with code 0.`,
+          `Task id "${nativeId}/A" finished with result:\nCommand exited with code 1.`,
+        ].join('\n\n'),
+        isSystemMessage: true,
+      });
+      const sysEmitted = events.slice(beforeSys);
+      expect(sysEmitted).toHaveLength(2);
+      expect(sysEmitted.find((e) => e.id === keyE)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+      expect(sysEmitted.find((e) => e.id === keyA)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+      expect(state.agyBackgroundTasks.size).toBe(0);
+      expect(provider.getActiveWorkSnapshot(id)?.backgroundWorkCount).toBe(0);
+      expect(runtime.getStatus()).toBe('idle');
+    } finally {
+      await runtime.kill();
+    }
+  });
 });
