@@ -740,21 +740,33 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    private func configureAudioSessionCategoryIfNeeded(session: AVAudioSession) throws {
+    private func preferBuiltInMicIfAvailable(session: AVAudioSession) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
-        let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
-        if audioSessionCategoryConfigured,
-           session.category == .playAndRecord,
-           (session.mode == .spokenAudio || session.mode == .default),
-           session.categoryOptions.contains(desiredOptions) {
+        guard let builtInMic = session.availableInputs?.first(where: { $0.portType == .builtInMic }) else {
             return
         }
-        do {
-            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
-        } catch {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+        if session.preferredInput?.uid != builtInMic.uid {
+            try? session.setPreferredInput(builtInMic)
         }
-        audioSessionCategoryConfigured = true
+    }
+
+    private func configureAudioSessionCategoryIfNeeded(session: AVAudioSession) throws {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
+        let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker, .allowBluetoothA2DP]
+        let categoryMatches = audioSessionCategoryConfigured
+            && session.category == .playAndRecord
+            && (session.mode == .spokenAudio || session.mode == .default)
+            && session.categoryOptions.contains(desiredOptions)
+            && !session.categoryOptions.contains(.allowBluetooth)
+        if !categoryMatches {
+            do {
+                try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothA2DP])
+            } catch {
+                try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothA2DP])
+            }
+            audioSessionCategoryConfigured = true
+        }
+        preferBuiltInMicIfAvailable(session: session)
     }
 
     private func cancelWarmHoldDeactivationOnAudioQueue() {
