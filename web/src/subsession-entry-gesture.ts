@@ -141,7 +141,10 @@ export function createSubSessionEntryGestureController(
   let pendingSingleClick: ReturnType<typeof setTimeout> | null = null;
   let lastPointerType: string | null = null;
   let suppressSyntheticClick = false;
+  let suppressSource: 'touchend' | 'cancel' | null = null;
   let suppressSyntheticClickTimer: ReturnType<typeof setTimeout> | null = null;
+  let touchSequenceCanceled = false;
+  let touchEndHandled = false;
 
   const cancelPendingSingleClick = () => {
     if (!pendingSingleClick) return;
@@ -151,16 +154,19 @@ export function createSubSessionEntryGestureController(
 
   const clearSyntheticClickSuppression = () => {
     suppressSyntheticClick = false;
+    suppressSource = null;
     if (!suppressSyntheticClickTimer) return;
     clearTimeout(suppressSyntheticClickTimer);
     suppressSyntheticClickTimer = null;
   };
 
-  const suppressNextSyntheticClick = () => {
+  const suppressNextSyntheticClick = (source: 'touchend' | 'cancel') => {
     suppressSyntheticClick = true;
+    suppressSource = source;
     if (suppressSyntheticClickTimer) clearTimeout(suppressSyntheticClickTimer);
     suppressSyntheticClickTimer = setTimeout(() => {
       suppressSyntheticClick = false;
+      suppressSource = null;
       suppressSyntheticClickTimer = null;
     }, 800);
   };
@@ -214,7 +220,7 @@ export function createSubSessionEntryGestureController(
   };
 
   const handleTouchEndFallback = (event: Event, root?: Element | null) => {
-    if (suppressSyntheticClick) return;
+    if (touchSequenceCanceled || touchEndHandled) return;
 
     if (shouldIgnoreEvent(event, root)) {
       cancelPendingSingleClick();
@@ -223,13 +229,21 @@ export function createSubSessionEntryGestureController(
 
     cancelPendingSingleClick();
     lastPointerType = 'touch';
-    suppressNextSyntheticClick();
+    touchEndHandled = true;
+    suppressNextSyntheticClick('touchend');
     run('single');
   };
 
   return {
     handlePointerDown(event) {
       lastPointerType = event.pointerType || null;
+      if (event.pointerType === 'touch') {
+        touchSequenceCanceled = false;
+        touchEndHandled = false;
+        if (suppressSource === 'cancel') clearSyntheticClickSuppression();
+      } else if (event.pointerType) {
+        clearSyntheticClickSuppression();
+      }
       if (isSuppressed()) cancelPendingSingleClick();
     },
     handleTouchEndFallback,
@@ -237,12 +251,15 @@ export function createSubSessionEntryGestureController(
     handleDoubleClick,
     cancelTouchSequence() {
       cancelPendingSingleClick();
-      suppressNextSyntheticClick();
+      touchSequenceCanceled = true;
+      suppressNextSyntheticClick('cancel');
     },
     cancelPendingSingleClick,
     dispose() {
       cancelPendingSingleClick();
       clearSyntheticClickSuppression();
+      touchSequenceCanceled = false;
+      touchEndHandled = false;
     },
   };
 }

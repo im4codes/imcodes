@@ -239,7 +239,8 @@ const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
 const EXPANDED_PREVIEW_BATCH_SIZE = 4;
 const EXPANDED_PREVIEW_BATCH_DELAY_MS = 32;
 const COMPACT_REORDER_HOLD_MS = 400;
-const COMPACT_REORDER_MOVE_CANCEL_PX = 8;
+const SUBSESSION_TOUCH_TAP_SLOP_PX = 15;
+const COMPACT_REORDER_ACTIVE_DRAG_MOVE_PX = 8;
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -903,11 +904,22 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     startY: number;
     moved: boolean;
   }>({ id: null, active: false, startX: 0, startY: 0, moved: false });
-  const expandedTouchRef = useRef<{ id: string | null; startX: number; startY: number; moved: boolean }>({
+  const expandedTouchRef = useRef<{
+    id: string | null;
+    startX: number;
+    startY: number;
+    moved: boolean;
+    startScrollLeft: number;
+    previewEl: HTMLElement | null;
+    startPreviewScrollTop: number;
+  }>({
     id: null,
     startX: 0,
     startY: 0,
     moved: false,
+    startScrollLeft: 0,
+    previewEl: null,
+    startPreviewScrollTop: 0,
   });
   const entryGestureControllersRef = useRef<Map<string, SubSessionEntryGestureController>>(new Map());
   const suppressEntryClickRef = useRef(false);
@@ -1010,39 +1022,85 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     getEntryGestureController(id).handleDoubleClick(event, event.currentTarget as Element);
   }, [getEntryGestureController]);
 
+  const resetExpandedTouch = () => {
+    expandedTouchRef.current = {
+      id: null,
+      startX: 0,
+      startY: 0,
+      moved: false,
+      startScrollLeft: 0,
+      previewEl: null,
+      startPreviewScrollTop: 0,
+    };
+  };
+
   const handleExpandedEntryTouchStart = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
+    if (event.touches.length !== 1) {
+      const prevId = expandedTouchRef.current.id;
+      resetExpandedTouch();
+      if (prevId) getEntryGestureController(prevId).cancelTouchSequence();
+      return;
+    }
     handleEntryTouchStart(id);
     const touch = event.touches[0];
+    const previewEl = (event.target instanceof Element
+      ? event.target.closest('.subcard-preview')
+      : null) as HTMLElement | null;
     expandedTouchRef.current = {
       id,
       startX: touch?.clientX ?? 0,
       startY: touch?.clientY ?? 0,
       moved: false,
+      startScrollLeft: expandedScrollRef.current?.scrollLeft ?? 0,
+      previewEl,
+      startPreviewScrollTop: previewEl?.scrollTop ?? 0,
     };
-  }, [handleEntryTouchStart]);
+  }, [getEntryGestureController, handleEntryTouchStart]);
 
   const handleExpandedEntryTouchMove = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
     const state = expandedTouchRef.current;
     if (state.id !== id) return;
+    if (event.touches.length !== 1) {
+      state.moved = true;
+      return;
+    }
     const touch = event.touches[0];
     if (!touch) return;
     const dx = touch.clientX - state.startX;
     const dy = touch.clientY - state.startY;
-    if (Math.hypot(dx, dy) > 8) state.moved = true;
+    const barScrolled = Math.abs((expandedScrollRef.current?.scrollLeft ?? 0) - state.startScrollLeft) > 2;
+    const previewScrolled = state.previewEl
+      ? Math.abs(state.previewEl.scrollTop - state.startPreviewScrollTop) > 2
+      : false;
+    if (Math.hypot(dx, dy) > SUBSESSION_TOUCH_TAP_SLOP_PX || barScrolled || previewScrolled) {
+      state.moved = true;
+    }
   }, []);
 
   const handleExpandedEntryTouchEnd = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
     const state = expandedTouchRef.current;
-    const shouldActivate = state.id === id && !state.moved;
-    expandedTouchRef.current = { id: null, startX: 0, startY: 0, moved: false };
-    if (!shouldActivate) return;
+    const releaseTouch = event.changedTouches?.[0];
+    const releaseDist = releaseTouch
+      ? Math.hypot(releaseTouch.clientX - state.startX, releaseTouch.clientY - state.startY)
+      : 0;
+    const barScrolled = Math.abs((expandedScrollRef.current?.scrollLeft ?? 0) - state.startScrollLeft) > 2;
+    const previewScrolled = state.previewEl
+      ? Math.abs(state.previewEl.scrollTop - state.startPreviewScrollTop) > 2
+      : false;
+    const moved = state.moved || releaseDist > SUBSESSION_TOUCH_TAP_SLOP_PX || barScrolled || previewScrolled;
+    const shouldActivate = state.id === id && !moved;
+    resetExpandedTouch();
+    if (!shouldActivate) {
+      if (state.id === id) getEntryGestureController(id).cancelTouchSequence();
+      return;
+    }
     getEntryGestureController(id).handleTouchEndFallback(event, event.currentTarget as Element);
   }, [getEntryGestureController]);
 
   const handleExpandedEntryTouchCancel = useCallback((id: string) => {
     const state = expandedTouchRef.current;
     if (state.id !== id) return;
-    expandedTouchRef.current = { id: null, startX: 0, startY: 0, moved: false };
+    resetExpandedTouch();
     getEntryGestureController(id).cancelTouchSequence();
   }, [getEntryGestureController]);
 
@@ -1332,6 +1390,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       const id = findBtnId(e.target);
       const touch = e.touches[0];
       if (!id || !touch || e.touches.length !== 1) return;
+      getEntryGestureController(id).handlePointerDown({ pointerType: 'touch' });
       td.id = id;
       td.startX = touch.clientX;
       td.startY = touch.clientY;
@@ -1363,7 +1422,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       const touch = e.touches[0];
       const dx = touch.clientX - td.startX;
       const dy = touch.clientY - td.startY;
-      if (Math.hypot(dx, dy) > COMPACT_REORDER_MOVE_CANCEL_PX) {
+      const moveThreshold = td.active ? COMPACT_REORDER_ACTIVE_DRAG_MOVE_PX : SUBSESSION_TOUCH_TAP_SLOP_PX;
+      if (Math.hypot(dx, dy) > moveThreshold) {
         td.moved = true;
         if (!td.active) {
           clearHold();
@@ -1476,7 +1536,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         if (!touch) return;
         const dx = touch.clientX - startX;
         const dy = touch.clientY - startY;
-        if (Math.abs(dx) < 6 || Math.abs(dx) <= Math.abs(dy)) return;
+        if (Math.abs(dx) <= SUBSESSION_TOUCH_TAP_SLOP_PX || Math.abs(dx) <= Math.abs(dy)) return;
         const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth);
         if (maxScrollLeft <= 0) {
           e.preventDefault();
@@ -1498,12 +1558,21 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const cleanupCollapsed = installHorizontalEdgeGuard(collapsedBarElement);
-    const cleanupExpanded = installHorizontalEdgeGuard(expandedScrollRef.current);
+    const expandedEl = expandedScrollRef.current;
+    const cleanupExpanded = installHorizontalEdgeGuard(expandedEl);
+    const onExpandedScroll = () => {
+      const state = expandedTouchRef.current;
+      if (!state.id) return;
+      state.moved = true;
+      getEntryGestureController(state.id).cancelTouchSequence();
+    };
+    expandedEl?.addEventListener('scroll', onExpandedScroll, { passive: true });
     return () => {
       cleanupCollapsed();
       cleanupExpanded();
+      expandedEl?.removeEventListener('scroll', onExpandedScroll);
     };
-  }, [collapsedBarElement, collapsed, isVerticalRail, layout, orderedSessions.length]);
+  }, [collapsedBarElement, collapsed, getEntryGestureController, isVerticalRail, layout, orderedSessions.length]);
 
   useEffect(() => {
     // Another server (or socket) never inherits this one's disks, embedding,

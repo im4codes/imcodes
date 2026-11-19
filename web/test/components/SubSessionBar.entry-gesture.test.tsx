@@ -31,7 +31,14 @@ vi.mock('../../src/api.js', () => ({
 
 vi.mock('../../src/components/SubSessionCard.js', () => ({
   SubSessionCard: ({ sub }: { sub: SubSession }) => (
-    <div data-testid={`subsession-card-preview-${sub.id}`}>{sub.label}</div>
+    <div data-testid={`subsession-card-preview-${sub.id}`}>
+      <div class="subcard-preview">
+        <div class="chat-view chat-view-preview" data-testid={`subsession-preview-blank-${sub.id}`}>
+          <button type="button" data-testid={`subsession-preview-btn-${sub.id}`}>Interactive</button>
+          {sub.label}
+        </div>
+      </div>
+    </div>
   ),
 }));
 
@@ -269,9 +276,31 @@ describe('sub-session entry gesture helper', () => {
 
     controller.handlePointerDown({ pointerType: 'touch' });
     controller.cancelTouchSequence();
+    controller.handleTouchEndFallback(makeMouseEvent(root), root);
     controller.handleClick(makeMouseEvent(root), root);
 
     expect(log).toEqual([]);
+  });
+
+  it('does not allow a prior canceled touch sequence to swallow the next tap within 800ms', () => {
+    const log: string[] = [];
+    const root = document.createElement('div');
+    const controller = createSubSessionEntryGestureController({
+      getState: () => ({ isOpen: false, isMaximized: false }),
+      actions: makeActions(log),
+    });
+
+    // Previous touch sequence canceled (e.g. scroll/touchcancel), so no synthetic click follows.
+    controller.handlePointerDown({ pointerType: 'touch' });
+    controller.cancelTouchSequence();
+    vi.advanceTimersByTime(150);
+
+    // Brand-new tap starts within 800ms -> must open once on touchend and ignore its synthetic click.
+    controller.handlePointerDown({ pointerType: 'touch' });
+    controller.handleTouchEndFallback(makeMouseEvent(root), root);
+    controller.handleClick(makeMouseEvent(root), root);
+
+    expect(log).toEqual(['openNormal']);
   });
 });
 
@@ -504,6 +533,126 @@ describe('SubSessionBar component entry gestures', () => {
     fireEvent.touchCancel(entry);
     fireEvent.click(entry);
 
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('opens collapsed mobile entries on Android taps with minor finger jitter (11px) without double-toggling', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, onOpen });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    firePointerDown(entry, 'touch');
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchMove(entry, { touches: [{ clientX: 20, clientY: 14 }] });
+    fireEvent.touchEnd(entry);
+    fireEvent.click(entry);
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+  });
+
+  it('opens collapsed mobile entries on the next clean tap right after a scroll or canceled touch', () => {
+    const onOpen = vi.fn();
+    const { container } = renderBar({ desktopLayoutCapable: false, onOpen });
+
+    const bar = container.querySelector('.subsession-bar') as HTMLElement;
+    const entry = screen.getByRole('button', { name: /worker/ });
+    firePointerDown(entry, 'touch');
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.scroll(bar);
+    fireEvent.touchEnd(entry);
+    expect(onOpen).not.toHaveBeenCalled();
+
+    // Immediate next tap 150ms later (no synthetic click ever fired from the scrolled touch)
+    vi.advanceTimersByTime(150);
+    firePointerDown(entry, 'touch');
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchEnd(entry);
+    fireEvent.click(entry);
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+  });
+
+  it('opens expanded mobile preview cards when tapping internal blank chat areas with minor finger jitter', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, collapsed: false, onOpen });
+
+    const blankArea = screen.getByTestId('subsession-preview-blank-sub-1');
+    firePointerDown(blankArea, 'touch');
+    fireEvent.touchStart(blankArea, { touches: [{ clientX: 20, clientY: 20 }] });
+    const move = new Event('touchmove', { bubbles: true, cancelable: true });
+    Object.defineProperty(move, 'touches', { value: [{ clientX: 30, clientY: 25 }] });
+    fireEvent(blankArea, move);
+    expect(move.defaultPrevented).toBe(false);
+    fireEvent.touchEnd(blankArea);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+    fireEvent.click(blankArea);
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens expanded mobile preview cards on the next tap right after touchcancel or preview scroll', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, collapsed: false, onOpen });
+
+    const blankArea = screen.getByTestId('subsession-preview-blank-sub-1');
+    firePointerDown(blankArea, 'touch');
+    fireEvent.touchStart(blankArea, { touches: [{ clientX: 20, clientY: 20 }] });
+    fireEvent.touchCancel(blankArea);
+    expect(onOpen).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(150);
+    firePointerDown(blankArea, 'touch');
+    fireEvent.touchStart(blankArea, { touches: [{ clientX: 20, clientY: 20 }] });
+    fireEvent.touchEnd(blankArea);
+    fireEvent.click(blankArea);
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+  });
+
+  it('does not open expanded mobile preview cards when scrolling the preview or tapping interactive controls', () => {
+    const onOpen = vi.fn();
+    const { container } = renderBar({ desktopLayoutCapable: false, collapsed: false, onOpen });
+
+    const blankArea = screen.getByTestId('subsession-preview-blank-sub-1');
+    const previewScroll = blankArea.parentElement as HTMLElement;
+    const cardScroll = container.querySelector('.subcard-scroll') as HTMLElement;
+    const btn = screen.getByTestId('subsession-preview-btn-sub-1');
+
+    // Vertical scroll inside preview (> 15px move)
+    firePointerDown(blankArea, 'touch');
+    fireEvent.touchStart(blankArea, { touches: [{ clientX: 20, clientY: 20 }] });
+    fireEvent.touchMove(blankArea, { touches: [{ clientX: 20, clientY: 46 }] });
+    fireEvent.touchEnd(blankArea);
+    expect(onOpen).not.toHaveBeenCalled();
+
+    // Actual scrollTop change on .subcard-preview even with small finger movement
+    vi.advanceTimersByTime(150);
+    previewScroll.scrollTop = 0;
+    firePointerDown(blankArea, 'touch');
+    fireEvent.touchStart(blankArea, { touches: [{ clientX: 20, clientY: 20 }] });
+    previewScroll.scrollTop = 12;
+    fireEvent.touchMove(blankArea, { touches: [{ clientX: 20, clientY: 25 }] });
+    fireEvent.touchEnd(blankArea);
+    expect(onOpen).not.toHaveBeenCalled();
+
+    // Horizontal scroll on .subcard-scroll
+    vi.advanceTimersByTime(150);
+    firePointerDown(blankArea, 'touch');
+    fireEvent.touchStart(blankArea, { touches: [{ clientX: 20, clientY: 20 }] });
+    fireEvent.scroll(cardScroll);
+    fireEvent.touchEnd(blankArea);
+    expect(onOpen).not.toHaveBeenCalled();
+
+    // Interactive inner button does not open
+    vi.advanceTimersByTime(150);
+    firePointerDown(btn, 'touch');
+    fireEvent.touchStart(btn, { touches: [{ clientX: 20, clientY: 20 }] });
+    fireEvent.touchEnd(btn);
+    fireEvent.click(btn);
     expect(onOpen).not.toHaveBeenCalled();
   });
 });
