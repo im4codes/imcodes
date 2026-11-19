@@ -15,9 +15,10 @@ import { randomUUID } from 'node:crypto';
 import { getSession } from '../../store/session-store.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import { getTransportRuntime } from '../../agent/session-manager.js';
-import { dispatchSessionMessage } from '../session-dispatch.js';
+import { dispatchSessionMessage, type SessionDispatchActorOption } from '../session-dispatch.js';
 import { createSendDispatchId, type SendMessageId } from '../../../shared/send-message-id.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
+import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 import {
   TASK_PAIR_AUTOMATION_KIND,
   TASK_PAIR_HEARTBEAT_AUTOMATION_KIND,
@@ -77,6 +78,64 @@ export function resetTaskPairDeliveryInFlightForTests(): void {
   inFlightTaskPairMessages.clear();
 }
 
+function buildTaskPairParticipantActor(
+  target: string,
+  actorUserId: string,
+  actionId: string,
+  now: number,
+): SharedActorEnvelope {
+  const targetSnapshot = target.startsWith('deck_sub_')
+    ? {
+        kind: 'subsession' as const,
+        serverId: 'local',
+        subSessionId: target,
+      }
+    : {
+        kind: 'main' as const,
+        serverId: 'local',
+        sessionName: target,
+      };
+  return {
+    actorUserId,
+    actorDisplayName: actorUserId === 'participant' ? 'Participant' : actorUserId,
+    snapshot: {
+      target: targetSnapshot,
+      effectiveRole: 'participant',
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: [],
+      primaryShareId: null,
+      authorizedAt: now,
+    },
+    primaryShareId: null,
+    effectiveActorRole: 'participant',
+    actionId,
+    origin: 'server-member',
+    authorizedAt: now,
+    queuedAt: now,
+  };
+}
+
+function resolveTaskPairDeliveryAuthority(
+  target: string,
+  taskId: string,
+  bindings: readonly TaskPairWakeBinding[],
+  authorityBindings: readonly { project: string; taskId: string }[] | undefined,
+  actionId: string,
+  now: number,
+): SessionDispatchActorOption | undefined {
+  const resolved = getTaskPairStore().getPrivateAuthorityForDelivery(target, taskId, bindings, authorityBindings);
+  if (!resolved) return undefined;
+  if (resolved.kind === 'owner') {
+    return { ownerMachineAuthority: resolved.authority };
+  }
+  return {
+    sharedActor: buildTaskPairParticipantActor(target, resolved.actorUserId, actionId, now),
+    ...(resolved.authority ? { sharedMachineAuthority: resolved.authority } : {}),
+    deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
+  };
+}
+
 export async function sendTaskPairMessage(
   target: string,
   taskId: string,
@@ -84,8 +143,9 @@ export async function sendTaskPairMessage(
   text: string,
   dedupeScope?: string,
   wakeBindings?: TaskPairWakeBinding[],
+  authorityBindings?: readonly { project: string; taskId: string }[],
 ): Promise<TaskPairDeliveryResult> {
-  const result = await deliverTaskPairMessage(target, taskId, reason, text, dedupeScope, wakeBindings);
+  const result = await deliverTaskPairMessage(target, taskId, reason, text, dedupeScope, wakeBindings, authorityBindings);
   // Brain's side of a pair: remember what became of the notice. Aggregate
   // notices (`__...` ids) name no single pair; their senders record per pair.
   if (!taskId.startsWith('__')) {
@@ -103,6 +163,7 @@ async function deliverTaskPairMessage(
   text: string,
   dedupeScope?: string,
   wakeBindings?: TaskPairWakeBinding[],
+  authorityBindings?: readonly { project: string; taskId: string }[],
 ): Promise<TaskPairDeliveryResult> {
   const bindings = wakeBindings ?? pairWakeBindings(target, taskId);
   if (!pairWakeAllowed(bindings, reason, target)) return 'suspended';
@@ -169,14 +230,18 @@ async function deliverTaskPairMessage(
       automationKind: isTaskPairHeartbeatReason(reason) ? TASK_PAIR_HEARTBEAT_AUTOMATION_KIND : TASK_PAIR_AUTOMATION_KIND,
       memoryExcluded: true,
     }, { source: 'daemon', confidence: 'high', eventId: messageId });
+    const authorityOptions = resolveTaskPairDeliveryAuthority(target, taskId, bindings, authorityBindings, messageId, Date.now());
     const result = await dispatchSessionMessage(record, text, {
       dispatchId: createSendDispatchId(),
       // Our own id prefix is what makes the pending-queue dedupe possible.
       messageId: messageId as SendMessageId,
       durableQueue: true,
-      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      deliveryMode: authorityOptions?.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       suppressTimeline: true,
       messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      ...(authorityOptions?.ownerMachineAuthority ? { ownerMachineAuthority: authorityOptions.ownerMachineAuthority } : {}),
+      ...(authorityOptions?.sharedActor ? { sharedActor: authorityOptions.sharedActor } : {}),
+      ...(authorityOptions?.sharedMachineAuthority ? { sharedMachineAuthority: authorityOptions.sharedMachineAuthority } : {}),
     });
     return result === 'queued' ? 'queued' : 'sent';
   } catch (error) {

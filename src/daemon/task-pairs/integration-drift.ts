@@ -109,7 +109,15 @@ interface GitOptions { env?: Record<string, string>; maxBuffer?: number }
 export interface IntegrationDriftDeps {
   now?: () => number;
   git?: (cwd: string, args: readonly string[], timeoutMs: number, options?: GitOptions) => Promise<GitOutcome>;
-  send?: (target: string, taskId: string, reason: string, text: string) => Promise<TaskPairDeliveryResult>;
+  send?: (
+    target: string,
+    taskId: string,
+    reason: string,
+    text: string,
+    dedupeScope?: string,
+    wakeBindings?: undefined,
+    authorityBindings?: readonly { project: string; taskId: string }[],
+  ) => Promise<TaskPairDeliveryResult>;
 }
 
 let testDeps: IntegrationDriftDeps = {};
@@ -833,7 +841,15 @@ async function runPass(at: number): Promise<IntegrationDriftPassResult> {
       checked: integration.checked ?? [],
       branchCount: integration.branchCount ?? 0,
     })));
-    const delivered = await send(brain, TASK_PAIR_INTEGRATION_DIGEST_ID, TASK_PAIR_INTEGRATION_DIGEST_REASON, text);
+    const delivered = await send(
+      brain,
+      TASK_PAIR_INTEGRATION_DIGEST_ID,
+      TASK_PAIR_INTEGRATION_DIGEST_REASON,
+      text,
+      undefined,
+      undefined,
+      entries.map(({ candidate }) => ({ project: candidate.stored.project, taskId: candidate.stored.state.taskId })),
+    );
     if (delivered !== 'sent' && delivered !== 'queued') continue;
     for (const { candidate } of entries) {
       const state = reminderStateOf(candidate);

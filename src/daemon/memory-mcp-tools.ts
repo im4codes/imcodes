@@ -221,6 +221,7 @@ import { mapLegacySupervisionUpdate, mapLegacySupervisionFinish } from './superv
 import { resolveSupervisionIntent } from './supervision-intent-ops.js';
 import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import { captureTaskPairCallerAuthority } from './task-pairs/service.js';
 import type { StoredTaskPair } from './task-pairs/store.js';
 import { compareQueuedTaskPairs, type TaskPairState } from '../../shared/task-pair.js';
 import { getCallbackTaskStore, type CallbackTaskStore } from './callback-task-store.js';
@@ -1885,6 +1886,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     if (authorization) return authorization;
     const eventId = structuredPairLifecycleEventId(input.project, input.taskId, input.verb, input.attrs, input.idempotencyKey);
     const replay = store.hasEvent(eventId);
+    captureTaskPairCallerAuthority(input.project, input.taskId, caller.sessionName, { caller });
     const transition = taskPairService.applyMarker({
       project: input.project,
       writer: caller.sessionName!,
@@ -2417,6 +2419,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const current = refreshPairChecklistAccess(caller, access.pair);
       if (current.status !== 'ok') return pairAccessError(current, caller);
       const pair = current.pair;
+      captureTaskPairCallerAuthority(pair.project, pair.state.taskId, caller.sessionName, { caller });
       if (viewers !== undefined) {
         if (!caller.serverId || pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may update legacy title viewer metadata');
         if (!taskPairService.grantTaskPairTitle(pair.project, pair.state.taskId, caller.serverId, viewers as string[], caller.sessionName, title)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid title or title viewer grant');
@@ -2439,6 +2442,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const current = refreshPairChecklistAccess(caller, access.pair);
       if (current.status !== 'ok') return pairAccessError(current, caller);
       const pair = current.pair;
+      captureTaskPairCallerAuthority(pair.project, pair.state.taskId, caller.sessionName, { caller });
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       const saved = savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
       if (!saved) return pairAccessError({ status: 'forbidden', pair }, caller);
@@ -3730,6 +3734,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, String(cause));
       }
       try {
+        captureTaskPairCallerAuthority(context.project, taskId, caller.sessionName, { caller });
         const result = taskPairService.recordDecision({
           ...details,
           project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
@@ -3802,6 +3807,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         }
         const replayProblems = isTerminalTaskPairStatus(replay.state.status) ? [] : pairParticipantsNotLive(replay.state);
         if (replayProblems.length > 0) return sessionNotLiveError(taskId, replayProblems, { idempotentReplay: true });
+        captureTaskPairCallerAuthority(context.project, taskId, caller.sessionName, { caller });
         const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
         return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, ...supervisionFields(context.project), deliveries };
       }
@@ -3897,6 +3903,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               suppressAutomaticBrief: true,
             });
         // Any unsettled role (executor or auditor) starts through the queue right away so the pool or no-pool default picks it.
+        const persistedBeforeDelivery = store.getPair(context.project, taskId);
+        if (transition && persistedBeforeDelivery) {
+          captureTaskPairCallerAuthority(context.project, taskId, caller.sessionName, { caller });
+        }
         if (dependencies.length) await taskPairAutomation.reconcileSuspensions();
         if ((!executor || !auditor) && dependencies.length === 0 && !busyTarget && transition) await taskPairAutomation.runQueue(context.project, brainName);
         const stored = store.getPair(context.project, taskId);
@@ -3942,10 +3952,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         if (!replay) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair dispatch replay has no persisted pair');
         const replayProblems = isTerminalTaskPairStatus(replay.state.status) || replay.state.status === 'queued' ? [] : pairParticipantsNotLive(replay.state);
         if (replayProblems.length > 0) return sessionNotLiveError(taskId, replayProblems, { idempotentReplay: true });
+        captureTaskPairCallerAuthority(context.project, taskId, caller.sessionName, { caller });
         const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
         return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, ...supervisionFields(context.project), deliveries };
       }
       if (stored.state.status !== 'queued') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair is not queued (${stored.state.status})`);
+      captureTaskPairCallerAuthority(context.project, taskId, caller.sessionName, { caller });
       await taskPairAutomation.runQueue(context.project, caller.sessionName);
       const after = store.getPair(context.project, taskId);
       if (!after) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair disappeared during dispatch');
@@ -3971,6 +3983,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const mode = stringArg(args, 'mode') ?? TASK_PAIR_PAUSE_MODES[0];
       if (!(TASK_PAIR_PAUSE_MODES as readonly string[]).includes(mode)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'unknown pause mode');
       try {
+        captureTaskPairCallerAuthority(access.pair.project, access.pair.state.taskId, caller.sessionName, { caller });
         pausePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '', mode as 'manual' | 'dependencies', args.dependsOn, stringArg(args, 'note'));
         await taskPairAutomation.reconcileSuspensions();
         taskPairAutomation.publishBadges();
@@ -3983,6 +3996,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const access = pairChecklistAccess(caller, await sendSessions(), stringArg(args, 'taskId'));
       if (access.status !== 'ok') return pairAccessError(access, caller);
       try {
+        captureTaskPairCallerAuthority(access.pair.project, access.pair.state.taskId, caller.sessionName, { caller });
         resumePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '');
         await taskPairAutomation.reconcileSuspensions();
         taskPairAutomation.publishBadges();

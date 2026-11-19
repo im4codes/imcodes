@@ -183,6 +183,10 @@ export interface TaskPairDecisionNotification {
   deliveredAt?: number;
 }
 
+export type TaskPairPrivateAuthority =
+  | { kind: 'owner'; authority: string; updatedAt: number }
+  | { kind: 'participant'; actorUserId: string; authority: string | null; updatedAt: number };
+
 function emptyLiveness(now: number): TaskPairLiveness {
   return {
     silenceExecutor: 0,
@@ -377,6 +381,15 @@ export class TaskPairStore {
         UNIQUE (decision_id, target)
       );
       CREATE INDEX IF NOT EXISTS task_pair_decision_notifications_pending_idx ON task_pair_decision_notifications (delivered_at, last_attempt_at);
+      CREATE TABLE IF NOT EXISTS task_pair_private_authority (
+        project TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        actor_user_id TEXT,
+        authority TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (project, task_id)
+      );
     `);
     // Additive and restart-safe for databases created by older daemons.
     const decisionColumns = this.#db.prepare('PRAGMA table_info(task_pair_decisions)').all() as Array<{ name: string }>;
@@ -1042,7 +1055,144 @@ export class TaskPairStore {
     this.#db.prepare(`DELETE FROM task_pairs WHERE status IN (${terminal}) AND updated_at < ?`)
       .run(...TASK_PAIR_TERMINAL_STATUSES, now - TERMINAL_PAIR_RETENTION_MS);
     this.#db.prepare('DELETE FROM task_pair_events WHERE at < ?').run(now - EVENT_RETENTION_MS);
+    this.#db.prepare(
+      'DELETE FROM task_pair_private_authority WHERE NOT EXISTS (SELECT 1 FROM task_pairs WHERE task_pairs.project = task_pair_private_authority.project AND task_pairs.task_id = task_pair_private_authority.task_id)',
+    ).run();
     this.#activeIndex = undefined;
+  }
+
+  /**
+   * Persist per-pair machine authority in a private table never projected into TaskPairState,
+   * timeline events, WS console snapshots, or MCP projections.
+   * Participant-bound pairs fail closed and can never be upgraded to owner authority.
+   */
+  recordPrivateAuthority(
+    project: string,
+    taskId: string,
+    entry:
+      | { kind: 'owner'; authority: string; updatedAt?: number }
+      | { kind: 'participant'; actorUserId: string; authority: string | null; updatedAt?: number },
+  ): void {
+    const now = entry.updatedAt ?? Date.now();
+    if (entry.kind === 'participant') {
+      const actorUserId = entry.actorUserId.trim() || 'participant';
+      const authority = typeof entry.authority === 'string' && entry.authority.trim() ? entry.authority.trim() : null;
+      this.#db.prepare(`
+        INSERT INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at)
+        VALUES (?, ?, 'participant', ?, ?, ?)
+        ON CONFLICT (project, task_id) DO UPDATE SET
+          kind = 'participant',
+          actor_user_id = excluded.actor_user_id,
+          authority = excluded.authority,
+          updated_at = excluded.updated_at
+      `).run(project, taskId, actorUserId, authority, now);
+      return;
+    }
+    const authority = entry.authority.trim();
+    if (!authority) return;
+    this.#db.prepare(`
+      INSERT INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at)
+      VALUES (?, ?, 'owner', NULL, ?, ?)
+      ON CONFLICT (project, task_id) DO UPDATE SET
+        kind = 'owner',
+        actor_user_id = NULL,
+        authority = excluded.authority,
+        updated_at = excluded.updated_at
+      WHERE task_pair_private_authority.kind != 'participant'
+    `).run(project, taskId, authority, now);
+  }
+
+  getPrivateAuthority(project: string, taskId: string): TaskPairPrivateAuthority | undefined {
+    const row = this.#db.prepare('SELECT kind, actor_user_id, authority, updated_at FROM task_pair_private_authority WHERE project = ? AND task_id = ?')
+      .get(project, taskId) as { kind: string; actor_user_id: string | null; authority: string | null; updated_at: number } | undefined;
+    if (!row) return undefined;
+    const updatedAt = Number(row.updated_at ?? 0);
+    if (row.kind === 'participant') {
+      return {
+        kind: 'participant',
+        actorUserId: typeof row.actor_user_id === 'string' && row.actor_user_id.trim() ? row.actor_user_id.trim() : 'participant',
+        authority: typeof row.authority === 'string' && row.authority.trim() ? row.authority.trim() : null,
+        updatedAt,
+      };
+    }
+    if (row.kind === 'owner' && typeof row.authority === 'string' && row.authority.trim()) {
+      return {
+        kind: 'owner',
+        authority: row.authority.trim(),
+        updatedAt,
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolve the effective private authority for delivering a task-pair message.
+   * Single pairs read their stored authority; aggregate notices (`__*`) inspect every
+   * covered pair and fail closed if any covered pair is participant-bound or unauthenticated.
+   */
+  getPrivateAuthorityForDelivery(
+    target: string,
+    taskId: string,
+    bindings?: readonly { project: string; taskId: string }[],
+    authorityBindings?: readonly { project: string; taskId: string }[],
+  ): TaskPairPrivateAuthority | undefined {
+    if (!taskId.startsWith('__')) {
+      const explicit = bindings?.[0];
+      if (explicit) return this.getPrivateAuthority(explicit.project, explicit.taskId);
+      const active = this.pairsForSession(target).find((pair) => pair.state.taskId === taskId);
+      if (active) return this.getPrivateAuthority(active.project, active.state.taskId);
+      const roleRow = this.#db.prepare(
+        'SELECT project FROM task_pairs WHERE task_id = ? AND (brain = ? OR executor = ? OR auditor = ?) ORDER BY updated_at DESC LIMIT 1',
+      ).get(taskId, target, target, target) as { project: string } | undefined;
+      if (roleRow) return this.getPrivateAuthority(roleRow.project, taskId);
+      const fallbackRows = this.#db.prepare(
+        'SELECT project FROM task_pairs WHERE task_id = ? LIMIT 2',
+      ).all(taskId) as Array<{ project: string }>;
+      if (fallbackRows.length === 1) return this.getPrivateAuthority(fallbackRows[0]!.project, taskId);
+      return undefined;
+    }
+
+    const rawCovered = (authorityBindings && authorityBindings.length > 0)
+      ? authorityBindings
+      : (bindings && bindings.length > 0)
+        ? bindings
+        : this.pairsForSession(target)
+          .filter((pair) => pair.state.brain === target)
+          .map((pair) => ({ project: pair.project, taskId: pair.state.taskId }));
+
+    if (rawCovered.length === 0) return undefined;
+    const deduped = new Map<string, { project: string; taskId: string }>();
+    for (const ref of rawCovered) {
+      deduped.set(pairKey(ref.project, ref.taskId), ref);
+    }
+    const entries = [...deduped.values()].map((ref) => this.getPrivateAuthority(ref.project, ref.taskId));
+    const hasParticipant = entries.some((entry) => entry?.kind === 'participant');
+    if (hasParticipant) {
+      const allParticipant = entries.every((entry): entry is Extract<TaskPairPrivateAuthority, { kind: 'participant' }> => entry?.kind === 'participant');
+      if (!allParticipant) {
+        return { kind: 'participant', actorUserId: 'participant', authority: null, updatedAt: Date.now() };
+      }
+      const actors = new Set(entries.map((entry) => entry.actorUserId));
+      const singleActor = actors.size === 1 ? [...actors][0]! : 'participant';
+      if (singleActor === 'participant') {
+        return { kind: 'participant', actorUserId: 'participant', authority: null, updatedAt: Math.max(...entries.map((entry) => entry.updatedAt)) };
+      }
+      const tokens = new Set(entries.map((entry) => entry.authority).filter((token): token is string => !!token));
+      const allHaveToken = entries.every((entry) => !!entry.authority);
+      return {
+        kind: 'participant',
+        actorUserId: singleActor,
+        authority: allHaveToken && tokens.size === 1 ? [...tokens][0]! : null,
+        updatedAt: Math.max(...entries.map((entry) => entry.updatedAt)),
+      };
+    }
+
+    let freshestOwner: Extract<TaskPairPrivateAuthority, { kind: 'owner' }> | undefined;
+    for (const entry of entries) {
+      if (!entry || entry.kind !== 'owner') return undefined;
+      if (!freshestOwner || entry.updatedAt > freshestOwner.updatedAt) freshestOwner = entry;
+    }
+    return freshestOwner;
   }
 }
 

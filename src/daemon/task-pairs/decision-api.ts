@@ -3,7 +3,7 @@ import { TASK_PAIR_DECISION_KIND, TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_LIM
 import { readPairScheduling } from '../../../shared/task-pair-suspension.js';
 import type { SupervisionTaskConsoleScope } from '../../../shared/supervision-task-console.js';
 import { getTaskPairStore } from './store.js';
-import { taskPairService } from './service.js';
+import { captureTaskPairCallerAuthority, taskPairService } from './service.js';
 import { buildPairConsoleRow } from '../supervision-console-pair-projection.js';
 import { buildDependencyTitleRecord } from '../../../shared/task-pair-display.js';
 import { taskPairDecisionRevision } from './decision-context.js';
@@ -41,6 +41,7 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
       if (input.optionId && !choice) throw new Error('Unknown choice');
       if ((!feedback && !choice) || feedback.length > TASK_PAIR_DECISION_LIMITS.SUMMARY) throw new Error('Feedback is empty or too long');
       const reason = activeQuestion?.question || activeQuestion?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note || 'Please clarify the blocking condition and available options.';
+      captureTaskPairCallerAuthority(scope.projectName, taskId, undefined, { stamped: input });
       taskPairService.recordDecision({
         project: scope.projectName, taskId, round: Math.max(1, pair.round), kind: TASK_PAIR_DECISION_KIND.FEEDBACK,
         conclusion: choice?.label || 'Human feedback', summary: feedback || choice!.label,

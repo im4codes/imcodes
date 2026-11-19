@@ -981,7 +981,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
         const detail = (notice.credentialPaths.length ? 'Credential-like paths have priority: ' + notice.credentialPaths.join(', ') + '. ' : '') + 'Main checkout changed outside the pair workspace: ' + notice.paths.join(', ') + '. Do not auto-delete; move work to the pair workspace.';
         // Writers are not attributed (the owner edits this checkout too), so
         // only Brain is told; participants must not act on others' paths.
-        for (const recipient of new Set(pairs.map((pair) => pair.state.brain).filter((name): name is string => !!name))) void sendTaskPairMessage(recipient, '__main-checkout__', 'main-checkout-guard', detail);
+        for (const recipient of new Set(pairs.map((pair) => pair.state.brain).filter((name): name is string => !!name))) {
+          const covered = pairs.filter((pair) => pair.state.brain === recipient).map((pair) => ({ project: pair.project, taskId: pair.state.taskId }));
+          void sendTaskPairMessage(recipient, '__main-checkout__', 'main-checkout-guard', detail, undefined, undefined, covered);
+        }
       }
     }
     // A project switched back to `pairs` while the daemon runs gets its

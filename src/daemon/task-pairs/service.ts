@@ -90,6 +90,9 @@ import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewri
 import { applyBackCow, hasUnfinishedApplyBack, rollbackApplyBack, undoApplyBack } from './non-git.js';
 import { mergePairIntoProject } from './git-init.js';
 import { copyTaskPairOutput, describeKeptTaskPairWorkspace, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRelease, type TaskPairWorkspaceRevisionSource } from './workspace.js';
+import { AMBIGUOUS_PARTICIPANT_ACTOR, readSenderOwnerMachineAuthority, readSenderParticipantTurn } from '../sender-participant-turn.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import type { McpRuntimeCaller } from '../memory-mcp-caller.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import {
   classifyDiskLevel, diskLevelRank, isDiskLevel, readWorktreeVolumeSpace, stripHeavyIgnoredDirs, stripHeavyNamedDirs, taskPairHygieneDeps,
@@ -503,6 +506,72 @@ export function resetTaskPairTerminalStreamRecoveryForTests(): void {
   terminalStreamRecoveryStarted = false;
 }
 
+/**
+ * Capture the caller's live turn machine authority (owner or restricted participant)
+ * and persist it privately in task-pairs.sqlite. Participant turns always fail closed
+ * and can never be upgraded to owner authority.
+ */
+export function captureTaskPairCallerAuthority(
+  project: string,
+  taskId: string,
+  callerSessionName: string | null | undefined,
+  options?: {
+    caller?: Pick<McpRuntimeCaller, 'isParticipantTurn' | 'userId' | 'participantAuthority'>;
+    stamped?: Record<string, unknown>;
+  },
+): void {
+  if (!project || !taskId || taskId.startsWith('__')) return;
+  const store = getTaskPairStore();
+  if (options?.caller?.isParticipantTurn) {
+    store.recordPrivateAuthority(project, taskId, {
+      kind: 'participant',
+      actorUserId: options.caller.userId?.trim() || AMBIGUOUS_PARTICIPANT_ACTOR,
+      authority: typeof options.caller.participantAuthority === 'string' && options.caller.participantAuthority.trim()
+        ? options.caller.participantAuthority.trim()
+        : null,
+    });
+    return;
+  }
+  const participantTurn = readSenderParticipantTurn(callerSessionName);
+  if (participantTurn) {
+    store.recordPrivateAuthority(project, taskId, {
+      kind: 'participant',
+      actorUserId: participantTurn.actorUserId,
+      authority: participantTurn.authority,
+    });
+    return;
+  }
+  const stamped = options?.stamped;
+  if (stamped) {
+    const sharedActor = stamped.sharedActor && typeof stamped.sharedActor === 'object'
+      ? stamped.sharedActor as { effectiveActorRole?: unknown; actorUserId?: unknown }
+      : undefined;
+    const sharedAuth = typeof stamped[SHARED_MACHINE_AUTHORITY_FIELD] === 'string' && String(stamped[SHARED_MACHINE_AUTHORITY_FIELD]).trim()
+      ? String(stamped[SHARED_MACHINE_AUTHORITY_FIELD]).trim()
+      : null;
+    if (sharedActor?.effectiveActorRole === 'participant' || sharedAuth) {
+      const actorUserId = typeof sharedActor?.actorUserId === 'string' && sharedActor.actorUserId.trim()
+        ? sharedActor.actorUserId.trim()
+        : AMBIGUOUS_PARTICIPANT_ACTOR;
+      store.recordPrivateAuthority(project, taskId, {
+        kind: 'participant',
+        actorUserId,
+        authority: sharedActor?.effectiveActorRole === 'participant' ? sharedAuth : null,
+      });
+      return;
+    }
+    const rawOwner = stamped[OWNER_MACHINE_AUTHORITY_FIELD];
+    if (typeof rawOwner === 'string' && rawOwner.trim()) {
+      store.recordPrivateAuthority(project, taskId, { kind: 'owner', authority: rawOwner.trim() });
+      return;
+    }
+  }
+  const ownerAuthority = readSenderOwnerMachineAuthority(callerSessionName);
+  if (ownerAuthority) {
+    store.recordPrivateAuthority(project, taskId, { kind: 'owner', authority: ownerAuthority });
+  }
+}
+
 export class TaskPairService {
   static readonly TITLE_REQUEST_RETRY_MS = 5 * 60_000;
   #titleRequestFlushes = new Map<string, Promise<void>>();
@@ -555,6 +624,9 @@ export class TaskPairService {
     }
     const result = store.recordDecision({ ...input, deliveryRound, at: input.at ?? Date.now() });
     if (!result.created) return { ...result, notified: [] };
+    if (input.author && input.author !== 'human' && input.author !== 'daemon') {
+      captureTaskPairCallerAuthority(input.project, input.taskId, input.author);
+    }
     const fresh = store.getPair(input.project, input.taskId);
     if (fresh) {
       store.saveLiveness(input.project, input.taskId, {
@@ -981,6 +1053,9 @@ export class TaskPairService {
         event,
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
       });
+      if (input.writer !== 'daemon' && input.source !== 'queue') {
+        captureTaskPairCallerAuthority(input.project, stored.state.taskId, input.writer);
+      }
       if (busySessions.size > 0) stored = this.#noteParticipantConflicts(input.project, stored, busySessions);
       this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
     }
@@ -1419,6 +1494,9 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const existing = store.getPair(project, input.taskId);
     if (existing) {
+      if (input.sender !== 'daemon') {
+        captureTaskPairCallerAuthority(project, input.taskId, input.sender);
+      }
       this.ensureTaskPairTitle(project, input.taskId, input.brief ?? existing.state.brief ?? existing.state.title, input.sender, { mechanicalTitle: input.titleExplicit !== true });
       if (input.sender === existing.state.brain
         && (input.target === existing.state.executor
@@ -2425,7 +2503,7 @@ export class TaskPairService {
         })),
         announcedOpen: open.map((stored) => ({ taskId: stored.state.taskId, title: stored.state.title })),
         maxListed: TASK_PAIR_WORKSPACE_KEPT_DIGEST_MAX_LISTED,
-      }));
+      }), undefined, undefined, due.map((item) => ({ project: group.project, taskId: item.pair.taskId })));
       if (result === 'sent' || result === 'queued' || result === 'skipped_pending') store.setMeta(metaKey, String(now));
     }
   }
@@ -2728,8 +2806,15 @@ export class TaskPairService {
     const text = buildDiskPressureMessage({
       level, freeBeforeBytes: before.freeBytes, freeAfterBytes: after.freeBytes, totalBytes: before.totalBytes, strippedPairs,
     });
+    const pairsByBrain = new Map<string, Array<{ project: string; taskId: string }>>();
+    for (const stored of store.listActivePairs()) {
+      if (!isPairsEngineProject(stored.project)) continue;
+      const list = pairsByBrain.get(stored.state.brain) ?? [];
+      list.push({ project: stored.project, taskId: stored.state.taskId });
+      pairsByBrain.set(stored.state.brain, list);
+    }
     for (const brain of brains) {
-      await sendTaskPairMessage(brain, TASK_PAIR_DISK_NOTICE_TASK_ID, 'brain-disk-pressure', text);
+      await sendTaskPairMessage(brain, TASK_PAIR_DISK_NOTICE_TASK_ID, 'brain-disk-pressure', text, undefined, undefined, pairsByBrain.get(brain));
     }
   }
 
