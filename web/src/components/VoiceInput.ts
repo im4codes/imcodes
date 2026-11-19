@@ -59,7 +59,7 @@ export function pickRecognitionLocale(preferredLang?: string): string | undefine
   return pickLocale(preferredLang);
 }
 
-/** Resolve the user's active UI language preference first, then fall back to system navigator.language. */
+/** Resolve the user's active UI language preference first, then system navigator language, then <html lang>. */
 function resolvePreferredLanguageTag(preferredLang?: string): string {
   if (typeof preferredLang === 'string' && preferredLang.trim()) {
     return preferredLang.trim();
@@ -70,9 +70,13 @@ function resolvePreferredLanguageTag(preferredLang?: string): string {
       return saved.trim();
     }
   } catch { /* localStorage may be unavailable in restricted contexts */ }
+  // Prefer system/browser language before static <html lang="en"> from index.html when imcodes_lang is unset,
+  // matching i18n detectUiLanguage() so a Chinese OS with English fallback HTML doesn't force English ASR.
+  const sysLang = typeof navigator !== 'undefined' ? resolveSystemLanguageTag() : '';
+  if (sysLang) return sysLang;
   const docLang = typeof document !== 'undefined' ? document.documentElement?.lang?.trim() : '';
   if (docLang) return docLang;
-  return (typeof navigator !== 'undefined' && navigator.language) ? navigator.language : 'en-US';
+  return 'en-US';
 }
 
 /** Native (Capacitor) speech-recognition locale tags. */
@@ -112,12 +116,12 @@ function resolveSystemLanguageTag(): string {
       return navigator.language.trim();
     }
   }
-  return 'en-US';
+  return '';
 }
 
 /** Web Speech API auto-mode fallback locale from browser system language (ignores `<html lang>` and `imcodes_lang`). */
 export function pickWebAutoLocale(): string {
-  return mapWebLocaleTag(resolveSystemLanguageTag(), true);
+  return mapWebLocaleTag(resolveSystemLanguageTag() || 'en-US', true);
 }
 
 /** Web Speech API locale tags (BCP-47, region-specific). */
@@ -924,8 +928,9 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
     }
 
     const locale = pickRecognitionLocale();
+    const effectiveLocale = locale ?? (recognition !== primaryRecognition ? pickWebAutoLocale() : undefined);
     const startOpts = {
-      ...(locale ? { language: locale } : {}),
+      ...(effectiveLocale ? { language: effectiveLocale } : {}),
       partialResults: true,
       popup: false,
       addPunctuation: true,
@@ -966,8 +971,13 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
             if (_nativeSession === session) _nativeSession = null;
             return false;
           }
+          const fallbackLocale = locale ?? pickWebAutoLocale();
+          const fallbackOpts = {
+            ...startOpts,
+            ...(fallbackLocale ? { language: fallbackLocale } : {}),
+          };
           await withTimeout(
-            recognition.start({ ...startOpts }),
+            recognition.start(fallbackOpts),
             NATIVE_START_TIMEOUT_MS,
             'Speech recognition timed out',
           );

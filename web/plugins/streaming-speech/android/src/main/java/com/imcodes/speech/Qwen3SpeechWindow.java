@@ -27,6 +27,8 @@ public final class Qwen3SpeechWindow {
     public static final int ONSET_CLEAR_SILENCE_SAMPLES = SAMPLE_RATE / 10; // 100ms unvoiced gap clears unconfirmed onset
     public static final float ONSET_BYPASS_RMS = 0.05f; // Normal handheld speech opens window immediately
     public static final float MIN_DECODE_WINDOW_RMS = 0.0024f; // Skip decoder call if no 200ms window reaches soft-speech energy
+    public static final float MIN_DECODE_NOISE_MULTIPLIER = 1.75f; // Require ~4.9 dB above adapted ambient noise floor
+    public static final int SILENCE_RESET_MIN_VOICED_SAMPLES = SAMPLE_RATE / 20; // 50ms voiced continuity required to reset active pause clock
     public static final int DECODE_ENERGY_WINDOW_SAMPLES = SAMPLE_RATE * 2 / 10; // 200ms @ 16 kHz
     public static final int DECODE_ENERGY_HOP_SAMPLES = SAMPLE_RATE / 10; // 100ms hop @ 16 kHz
 
@@ -76,6 +78,8 @@ public final class Qwen3SpeechWindow {
     private int pendingOnsetCount = 0;
     private int pendingOnsetActiveSamples = 0;
     private int pendingOnsetSilenceSamples = 0;
+    private float latestNoiseFloorRMS = SpeechGain.INITIAL_NOISE_FLOOR_RMS;
+    private int voicedSinceSilenceSamples = 0;
 
     private void appendPendingOnset(float[] chunk) {
         if (pendingOnsetCount + chunk.length > pendingOnset.length) {
@@ -107,9 +111,14 @@ public final class Qwen3SpeechWindow {
     }
 
     public static boolean hasDecodableEnergy(float[] audio, int count) {
+        return hasDecodableEnergy(audio, count, SpeechGain.INITIAL_NOISE_FLOOR_RMS);
+    }
+
+    public static boolean hasDecodableEnergy(float[] audio, int count, float noiseFloorRMS) {
         int n = Math.min(audio.length, Math.max(0, count));
         if (n <= 0) return false;
-        double threshSq = (double) MIN_DECODE_WINDOW_RMS * MIN_DECODE_WINDOW_RMS;
+        float effectiveMinRMS = Math.max(MIN_DECODE_WINDOW_RMS, noiseFloorRMS * MIN_DECODE_NOISE_MULTIPLIER);
+        double threshSq = (double) effectiveMinRMS * effectiveMinRMS;
         int win = DECODE_ENERGY_WINDOW_SAMPLES;
         if (n <= win) {
             double sumSq = 0.0;
@@ -229,13 +238,30 @@ public final class Qwen3SpeechWindow {
         return sampleCount;
     }
 
-    private void advanceSilence(int sliceCount, boolean speech, int trailingSilence, int tailRemaining) {
+    private void advanceSilence(
+        int sliceCount,
+        boolean speech,
+        int trailingSilence,
+        int activeInSlice,
+        float sliceRMS,
+        int tailRemaining
+    ) {
         if (!speech) {
+            voicedSinceSilenceSamples = 0;
+            silentSamples += sliceCount;
+            return;
+        }
+        voicedSinceSilenceSamples += activeInSlice;
+        if (sliceRMS < ONSET_BYPASS_RMS && voicedSinceSilenceSamples < SILENCE_RESET_MIN_VOICED_SAMPLES) {
+            // Isolated single-subframe (25ms) ambient blip must not reset an active pause clock.
             silentSamples += sliceCount;
             return;
         }
         int silentEnd = Math.max(0, trailingSilence - tailRemaining);
         silentSamples = silentEnd < sliceCount ? silentEnd : silentSamples + sliceCount;
+        if (silentEnd >= sliceCount) {
+            voicedSinceSilenceSamples = 0;
+        }
     }
 
     public void append(
@@ -249,6 +275,35 @@ public final class Qwen3SpeechWindow {
         DecodeFn decode,
         Consumer<String> emit
     ) {
+        append(
+            input,
+            speech,
+            trailingSilence,
+            speech ? (input != null ? input.length : 0) : 0,
+            SpeechGain.INITIAL_NOISE_FLOOR_RMS,
+            isFinal,
+            shouldEmitNonFinal,
+            shouldContinue,
+            rollbackPrefix,
+            decode,
+            emit
+        );
+    }
+
+    public void append(
+        float[] input,
+        boolean speech,
+        int trailingSilence,
+        int activeSamples,
+        float noiseFloorRMS,
+        boolean isFinal,
+        BooleanSupplier shouldEmitNonFinal,
+        BooleanSupplier shouldContinue,
+        RollbackFn rollbackPrefix,
+        DecodeFn decode,
+        Consumer<String> emit
+    ) {
+        latestNoiseFloorRMS = noiseFloorRMS;
         if (input == null || input.length == 0) {
             return;
         }
@@ -267,7 +322,9 @@ public final class Qwen3SpeechWindow {
                 return;
             }
             int silentEnd = Math.min(input.length, Math.max(0, trailingSilence));
-            int activeInChunk = Math.max(0, input.length - silentEnd);
+            int activeInChunk = activeSamples >= 0
+                ? Math.min(input.length, activeSamples)
+                : Math.max(0, input.length - silentEnd);
             boolean bypassOnset = rms(input, input.length) >= ONSET_BYPASS_RMS;
             if (pendingOnsetCount == 0 && (bypassOnset || activeInChunk >= ONSET_CONFIRM_SAMPLES)) {
                 src = input;
@@ -293,6 +350,8 @@ public final class Qwen3SpeechWindow {
             src = input;
         }
         RollbackFn rollbackFn = rollbackPrefix != null ? rollbackPrefix : Qwen3SpeechWindow::defaultRollbackPrefix;
+        int activeForSilence = activeSamples >= 0 ? activeSamples : src.length;
+        float inputRMS = rms(src, src.length);
         int offset = 0;
         int remaining = src.length;
 
@@ -306,7 +365,7 @@ public final class Qwen3SpeechWindow {
                 sampleCount += takeCount;
                 newSamples += takeCount;
             }
-            advanceSilence(takeCount, speech, trailingSilence, remaining);
+            advanceSilence(takeCount, speech, trailingSilence, Math.min(takeCount, activeForSilence), inputRMS, remaining);
             int pause = endsSentence(partial) ? PUNCTUATION_PAUSE : VAD_PAUSE;
             if (silentSamples >= pause) {
                 evaluate(samples, sampleCount, sampleCount, true, rollbackFn, shouldContinue, decode);
@@ -327,7 +386,7 @@ public final class Qwen3SpeechWindow {
         System.arraycopy(src, offset, samples, sampleCount, remaining);
         sampleCount += remaining;
         newSamples += remaining;
-        advanceSilence(remaining, speech, trailingSilence, 0);
+        advanceSilence(remaining, speech, trailingSilence, Math.min(remaining, activeForSilence), inputRMS, 0);
 
         if (isFinal || !shouldEmitNonFinal.getAsBoolean()) {
             return;
@@ -412,7 +471,7 @@ public final class Qwen3SpeechWindow {
         DecodeFn decode
     ) {
         if (!shouldContinue.getAsBoolean()) throw new CancelledException();
-        if (!hasDecodableEnergy(audio, audioLen)) {
+        if (!hasDecodableEnergy(audio, audioLen, latestNoiseFloorRMS)) {
             partial = "";
             newSamples = 0;
             return;
@@ -441,6 +500,7 @@ public final class Qwen3SpeechWindow {
         sampleCount = 0;
         newSamples = 0;
         silentSamples = 0;
+        voicedSinceSilenceSamples = 0;
         clearPendingOnset();
     }
 
@@ -475,11 +535,19 @@ public final class Qwen3SpeechWindow {
             public final float[] samples;
             public final boolean speech;
             public final int trailingSilence;
+            public final int activeSamples;
+            public final float noiseFloorRMS;
 
             public Batch(float[] samples, boolean speech, int trailingSilence) {
+                this(samples, speech, trailingSilence, speech && samples != null ? samples.length : 0, SpeechGain.INITIAL_NOISE_FLOOR_RMS);
+            }
+
+            public Batch(float[] samples, boolean speech, int trailingSilence, int activeSamples, float noiseFloorRMS) {
                 this.samples = samples;
                 this.speech = speech;
                 this.trailingSilence = trailingSilence;
+                this.activeSamples = activeSamples;
+                this.noiseFloorRMS = noiseFloorRMS;
             }
         }
 
@@ -488,6 +556,8 @@ public final class Qwen3SpeechWindow {
         private int pendingSampleCount = 0;
         private boolean speech = false;
         private int trailingSilence = 0;
+        private int activeSamples = 0;
+        private boolean lastVoiced = false;
         private int warmupRemaining = WARMUP_SAMPLES;
         private Double pendingAudioLevel = null;
         private long lastAudioLevelNs = Long.MIN_VALUE;
@@ -512,6 +582,14 @@ public final class Qwen3SpeechWindow {
             return pending.isEmpty();
         }
 
+        public boolean isLastVoiced() {
+            return lastVoiced;
+        }
+
+        public float getCurrentNoiseFloorRMS() {
+            return speechGain != null ? speechGain.getNoiseFloor() : SpeechGain.INITIAL_NOISE_FLOOR_RMS;
+        }
+
         public boolean offer(float[] input, int length) throws IOException {
             if (input == null || length <= 0) return false;
             int safeLen = Math.min(length, input.length);
@@ -528,19 +606,33 @@ public final class Qwen3SpeechWindow {
             System.arraycopy(input, skip, chunk, 0, usable);
 
             double level;
+            boolean anyVoiced;
+            boolean chunkLastVoiced;
+            int voicedInChunk;
+            int trailingUnvoiced;
             if (speechGain != null) {
-                level = speechGain.processChunk(chunk, usable);
+                SpeechGain.Result res = speechGain.processDetailed(chunk, usable);
+                level = res.level;
+                anyVoiced = res.anyVoiced;
+                chunkLastVoiced = res.lastVoiced;
+                voicedInChunk = res.voicedSamples;
+                trailingUnvoiced = res.trailingUnvoicedSamples;
             } else {
                 double power = 0.0;
                 for (float s : chunk) {
                     power += s * s;
                 }
                 level = Math.min(1.0, Math.sqrt(power / usable));
+                anyVoiced = level >= VOICED_THRESHOLD;
+                chunkLastVoiced = anyVoiced;
+                voicedInChunk = anyVoiced ? usable : 0;
+                trailingUnvoiced = anyVoiced ? 0 : usable;
             }
             pendingAudioLevel = level;
-            boolean voiced = level >= VOICED_THRESHOLD;
-            speech |= voiced;
-            trailingSilence = voiced ? 0 : trailingSilence + usable;
+            lastVoiced = chunkLastVoiced;
+            speech |= anyVoiced;
+            activeSamples += voicedInChunk;
+            trailingSilence = anyVoiced ? trailingUnvoiced : trailingSilence + usable;
 
             pending.addLast(chunk);
             pendingSampleCount += usable;
@@ -569,10 +661,11 @@ public final class Qwen3SpeechWindow {
                 System.arraycopy(chunk, 0, combined, offset, chunk.length);
                 offset += chunk.length;
             }
-            Batch batch = new Batch(combined, speech, trailingSilence);
+            Batch batch = new Batch(combined, speech, trailingSilence, activeSamples, getCurrentNoiseFloorRMS());
             pendingSampleCount = 0;
             speech = false;
             trailingSilence = 0;
+            activeSamples = 0;
             return batch;
         }
 
@@ -581,6 +674,8 @@ public final class Qwen3SpeechWindow {
             pendingSampleCount = 0;
             speech = false;
             trailingSilence = 0;
+            activeSamples = 0;
+            lastVoiced = false;
             pendingAudioLevel = null;
         }
     }

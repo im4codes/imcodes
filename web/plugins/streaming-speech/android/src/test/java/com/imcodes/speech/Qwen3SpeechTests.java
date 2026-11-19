@@ -35,6 +35,7 @@ public final class Qwen3SpeechTests {
         testSpeechWindowPrefixRollbackAndVad();
         testSpeechWindowLowestEnergySplit();
         testSilencePreOnsetAndDecodeEnergyGuard();
+        testAmbientHumFanAdaptationZeroDecodesAndPauseClock();
         testOnnxDecoderPureHelpers();
         testLanguagePromptMappingAndEncoding();
         testPretokenizePatternAndMultiScript();
@@ -461,6 +462,114 @@ public final class Qwen3SpeechTests {
         String res = quietWindow.finish(() -> true, Qwen3SpeechWindow::defaultRollbackPrefix, captureDecode);
         checkEquals("嗯", res, "genuine 200ms quiet word preserved and decoded");
         checkEquals(3200 + Qwen3SpeechWindow.FINAL_SILENCE_PADDING, decodedLengths[0], "all 3200 quiet speech samples retained");
+    }
+
+    private static void testAmbientHumFanAdaptationZeroDecodesAndPauseClock() throws Exception {
+        Qwen3SpeechWindow.SpeechInbox inbox = new Qwen3SpeechWindow.SpeechInbox(new SpeechGain());
+        Qwen3SpeechWindow window = new Qwen3SpeechWindow();
+        int[] decodeCalls = new int[] { 0 };
+        Qwen3SpeechWindow.DecodeFn decodeFn = (pcm, count, prefix) -> {
+            decodeCalls[0]++;
+            return new Qwen3SpeechWindow.DecodeResult("嗯", new int[] { 99 });
+        };
+
+        // Drain 20ms startup warmup
+        inbox.offer(new float[Qwen3SpeechWindow.SpeechInbox.WARMUP_SAMPLES], Qwen3SpeechWindow.SpeechInbox.WARMUP_SAMPLES);
+
+        // 34s realistic ambient room hum (117/148/531 Hz) + broadband fan noise (~0.0022-0.0030 RMS)
+        long seed = 0x160000L;
+        for (int step = 0; step < 340; step++) {
+            int off = step * 1600;
+            float[] chunk = new float[1600];
+            float[] noise = new float[1600];
+            double sumSqNoise = 0.0;
+            for (int i = 0; i < 1600; i++) {
+                seed = seed * 6364136223846793005L + 1442695040888963407L;
+                float u = ((seed >>> 40) & 0xFFFFFF) / (float) (1 << 24) * 2.0f - 1.0f;
+                noise[i] = u;
+                sumSqNoise += (double) u * u;
+            }
+            float nScale = (float) (0.0016 / Math.sqrt(sumSqNoise / 1600));
+            for (int i = 0; i < 1600; i++) {
+                double t = (off + i) / 16000.0;
+                float h1 = (float) (0.0016 * Math.sqrt(2.0) * Math.sin(2.0 * Math.PI * 117.0 * t));
+                float h2 = (float) (0.0014 * Math.sqrt(2.0) * Math.sin(2.0 * Math.PI * 148.0 * t));
+                float h3 = (float) (0.0012 * Math.sqrt(2.0) * Math.sin(2.0 * Math.PI * 531.0 * t));
+                chunk[i] = h1 + h2 + h3 + noise[i] * nScale;
+            }
+            inbox.offer(chunk, chunk.length);
+            Qwen3SpeechWindow.SpeechInbox.Batch batch = inbox.take();
+            if (batch != null) {
+                window.append(
+                    batch.samples,
+                    batch.speech,
+                    batch.trailingSilence,
+                    batch.activeSamples,
+                    batch.noiseFloorRMS,
+                    false,
+                    () -> true,
+                    () -> true,
+                    Qwen3SpeechWindow::defaultRollbackPrefix,
+                    decodeFn,
+                    s -> {}
+                );
+            }
+        }
+        String silOut = window.finish(() -> true, Qwen3SpeechWindow::defaultRollbackPrefix, decodeFn);
+        check(inbox.getCurrentNoiseFloorRMS() >= 0.0020f,
+            "ambient noise floor adapted (>= 0.0020): " + inbox.getCurrentNoiseFloorRMS());
+        checkEquals(0, decodeCalls[0], "34s ambient silence emits 0 decodes");
+        checkEquals("", silOut, "34s ambient silence returns empty transcript");
+
+        // Soft 220Hz speech (0.0055 RMS) over that adapted floor still opens window and decodes cleanly.
+        for (int s = 0; s < 4; s++) {
+            int off = s * 1600;
+            float[] tone = new float[1600];
+            for (int i = 0; i < 1600; i++) {
+                tone[i] = (float) (0.0055 * Math.sqrt(2.0) * Math.sin(2.0 * Math.PI * 220.0 * (off + i) / 16000.0));
+            }
+            inbox.offer(tone, tone.length);
+            Qwen3SpeechWindow.SpeechInbox.Batch batch = inbox.take();
+            if (batch != null) {
+                window.append(
+                    batch.samples,
+                    batch.speech,
+                    batch.trailingSilence,
+                    batch.activeSamples,
+                    batch.noiseFloorRMS,
+                    false,
+                    () -> true,
+                    () -> true,
+                    Qwen3SpeechWindow::defaultRollbackPrefix,
+                    decodeFn,
+                    sOut -> {}
+                );
+            }
+        }
+        String softOut = window.finish(() -> true, Qwen3SpeechWindow::defaultRollbackPrefix, decodeFn);
+        checkEquals("嗯", softOut, "soft speech over adapted floor decodes cleanly");
+        checkEquals(1, decodeCalls[0], "soft speech invoked decoder once");
+
+        // Single 25ms (400-sample) isolated blip inside pause must NOT reset VAD pause clock.
+        Qwen3SpeechWindow pauseWin = new Qwen3SpeechWindow();
+        int[] pauseCalls = new int[] { 0 };
+        Qwen3SpeechWindow.DecodeFn pauseDecode = (pcm, count, prefix) -> {
+            pauseCalls[0]++;
+            return new Qwen3SpeechWindow.DecodeResult("短句。", new int[] { 50 });
+        };
+        float[] speech = new float[Qwen3SpeechWindow.STRIDE];
+        Arrays.fill(speech, 0.1f);
+        pauseWin.append(speech, true, 0, speech.length, 0.00075f, false, () -> true, () -> true, Qwen3SpeechWindow::defaultRollbackPrefix, pauseDecode, s -> {});
+        // 300ms silence + single 25ms (400-sample < 800) blip + 100ms silence = 425ms >= 400ms PUNCTUATION_PAUSE -> commits!
+        float[] sil300 = new float[4800];
+        float[] blip25 = new float[400];
+        Arrays.fill(blip25, 0.004f);
+        float[] sil100 = new float[1600];
+        pauseWin.append(sil300, false, sil300.length, 0, 0.00075f, false, () -> true, () -> true, Qwen3SpeechWindow::defaultRollbackPrefix, pauseDecode, s -> {});
+        pauseWin.append(blip25, true, 0, blip25.length, 0.00075f, false, () -> true, () -> true, Qwen3SpeechWindow::defaultRollbackPrefix, pauseDecode, s -> {});
+        pauseWin.append(sil100, false, sil100.length, 0, 0.00075f, false, () -> true, () -> true, Qwen3SpeechWindow::defaultRollbackPrefix, pauseDecode, s -> {});
+        checkEquals("短句。", pauseWin.getCommitted(), "single 25ms blip did not reset punctuation pause clock");
+        checkEquals(0, pauseWin.getSampleCount(), "segment committed cleanly after pause despite 25ms blip");
     }
 
     private static void testOnnxDecoderPureHelpers() {

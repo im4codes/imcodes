@@ -220,9 +220,9 @@ import { recordPerfRender } from '../perf-render-debug.js';
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
 export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
-const VOICE_HOLD_TAP_GUARD_MS = 100;
-const VOICE_HOLD_UNFOCUSED_DELAY_MS = 115;
-const VOICE_HOLD_SLIDE_INTENT_MS = 65;
+const VOICE_HOLD_TAP_GUARD_MS = 145;
+const VOICE_HOLD_UNFOCUSED_DELAY_MS = 175;
+const VOICE_HOLD_SLIDE_INTENT_MS = 90;
 const VOICE_HOLD_SLIDE_PROMOTE_PX = 14;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
 const VOICE_HOLD_SCROLL_ABORT_PX = 40;
@@ -7514,8 +7514,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         && Math.abs(dx) >= VOICE_HOLD_SLIDE_PROMOTE_PX
         && Math.abs(dx) > Math.abs(dy) * 1.2;
 
-      // Never start mic capture inside the <=100ms tap protection window;
-      // past 65ms recognize horizontal intent and promote once the tap guard clears.
+      // Never start mic capture inside the <=140ms tap protection window;
+      // past 90ms recognize horizontal intent and promote once the tap guard clears.
       if (hasHorizontalSlideIntent && elapsed >= VOICE_HOLD_TAP_GUARD_MS) {
         if (event.cancelable) event.preventDefault();
         activateComposerVoiceHold(ptr, dx, divRef.current);

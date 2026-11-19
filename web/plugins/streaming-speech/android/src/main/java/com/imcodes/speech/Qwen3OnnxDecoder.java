@@ -719,9 +719,6 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
                 kvCachedAudioTokens = Math.min(cachedEncTokens, audioFrames);
                 OnnxTensor logitsTensor = getTensorOutput(prefillRes, "logits");
                 nextId = sampleGreedyFromLogits(logitsTensor, tailCtxLen - 1, -1);
-                if (nextId == tokenizer.eosTokenId && activePrefix.length == 0) {
-                    nextId = sampleGreedyFromLogits(logitsTensor, tailCtxLen - 1, tokenizer.eosTokenId);
-                }
             } catch (OrtException | RuntimeException e) {
                 kvCachedAudioTokens = 0;
                 throw e;

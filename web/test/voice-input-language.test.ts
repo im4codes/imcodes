@@ -165,6 +165,28 @@ describe('multilingual plugin session ownership', () => {
     expect(await input.startListening(vi.fn())).toBe(true);
     expect(bridges.platform.start).toHaveBeenCalledTimes(2);
     await input.stopListening();
+
+    // 4. Unset imcodes_lang with hardcoded <html lang="en"> must still prefer Chinese navigator.language over <html lang>
+    const prevDocLang = document.documentElement.lang;
+    try {
+      localStorage.removeItem('imcodes_lang');
+      document.documentElement.lang = 'en';
+      vi.stubGlobal('navigator', { languages: ['zh-CN', 'en-US'], language: 'zh-CN' });
+      expect(input.pickLocale()).toBe('zh-Hans');
+      expect(input.pickRecognitionLocale()).toBe('zh-Hans');
+
+      // 5. In auto mode, fallback to platform recognizer still passes system locale instead of defaulting Android ASR to en-US
+      input.setVoiceLanguageMode('auto');
+      expect(input.pickRecognitionLocale()).toBeUndefined();
+      bridges.streaming.available.mockResolvedValueOnce({ available: false });
+      bridges.platform.available.mockResolvedValueOnce({ available: true });
+      expect(await input.startListening(vi.fn())).toBe(true);
+      expect(bridges.platform.start).toHaveBeenLastCalledWith(expect.objectContaining({ language: 'zh-CN' }));
+      await input.stopListening();
+    } finally {
+      document.documentElement.lang = prevDocLang;
+      input.setVoiceLanguageMode('follow');
+    }
   });
 
   it('keeps all 7 locale files synchronized for all voice keys including recognizing, buffering, and hold-to-talk HUD prompts', () => {

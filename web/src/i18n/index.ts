@@ -33,4 +33,13 @@ i18n
 
 installTranslationCache(i18n);
 
+if (typeof document !== 'undefined' && document.documentElement) {
+  document.documentElement.lang = i18n.resolvedLanguage || i18n.language || savedLang || 'en';
+}
+i18n.on('languageChanged', (lng) => {
+  if (typeof document !== 'undefined' && document.documentElement) {
+    document.documentElement.lang = lng || 'en';
+  }
+});
+
 export default i18n;

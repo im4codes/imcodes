@@ -15,7 +15,8 @@ public final class SpeechGainTest {
         testUltraLowRoomFloorDoesNotTriggerFalseVoicedOrInfiniteGain();
         testSilenceAfterSpeechDropsVoicedImmediately();
         testNonFiniteAndEdgeInputsRemainBounded();
-        System.out.println("SpeechGainTest: ALL 6 TESTS PASSED");
+        testSubBassHumRejectedAndFanNoiseAdaptsFloorWhileSpeechStillTriggers();
+        System.out.println("SpeechGainTest: ALL 7 TESTS PASSED");
     }
 
     private static void testQuietHandheldSpeechBoostedImmediately() {
@@ -120,6 +121,46 @@ public final class SpeechGainTest {
         double level = gain.processChunk(dirty, dirty.length);
         assertTrue(Double.isFinite(level) && level >= 0.0 && level <= 1.0, "level must remain finite in [0,1]");
         assertAllSamplesBounded(dirty);
+    }
+
+    private static void testSubBassHumRejectedAndFanNoiseAdaptsFloorWhileSpeechStillTriggers() {
+        SpeechGain gain = new SpeechGain();
+        // 60 Hz sub-bass hum below 125 Hz HPF cutoff at 0.01 RMS must NOT be marked voiced.
+        float[] hum60 = new float[CHUNK_SAMPLES];
+        for (int i = 0; i < hum60.length; i++) {
+            hum60[i] = (float) (0.01 * Math.sqrt(2.0) * Math.sin(2.0 * Math.PI * 60.0 * i / 16000.0));
+        }
+        SpeechGain.Result humRes = gain.processDetailed(hum60, hum60.length);
+        assertTrue(!humRes.anyVoiced, "60Hz sub-bass hum must be rejected by 125Hz HPF");
+        assertTrue(gain.getCurrentGain() == 1.0f, "unity gain preserved during hum");
+
+        // Sustained broadband fan noise (~0.0025 RMS) adapts noiseFloor up above initial 0.00075
+        // without locking voiced.
+        long seed = 0x160000L;
+        for (int step = 0; step < 30; step++) {
+            float[] fan = new float[CHUNK_SAMPLES];
+            double sumSq = 0.0;
+            for (int i = 0; i < fan.length; i++) {
+                seed = seed * 6364136223846793005L + 1442695040888963407L;
+                float u = ((seed >>> 40) & 0xFFFFFF) / (float) (1 << 24) * 2.0f - 1.0f;
+                fan[i] = u;
+                sumSq += (double) u * u;
+            }
+            float scale = (float) (0.0025 / Math.sqrt(sumSq / fan.length));
+            for (int i = 0; i < fan.length; i++) fan[i] *= scale;
+            SpeechGain.Result fanRes = gain.processDetailed(fan, fan.length);
+            if (step >= 10) {
+                assertTrue(!fanRes.anyVoiced, "stationary broadband fan noise must not falsely trigger voiced at step " + step);
+            }
+        }
+        assertTrue(gain.getNoiseFloor() >= 0.0018f, "noiseFloor must adapt to stationary fan noise, got " + gain.getNoiseFloor());
+
+        // Soft 220Hz speech (0.0055 RMS) over adapted floor must still trigger voiced cleanly at unity gain.
+        float[] speech = sineWithRms(CHUNK_SAMPLES, 0.0055f);
+        SpeechGain.Result speechRes = gain.processDetailed(speech, speech.length);
+        assertTrue(speechRes.anyVoiced && speechRes.voicedSamples == CHUNK_SAMPLES,
+            "soft speech over adapted floor must still trigger voiced");
+        assertTrue(gain.getCurrentGain() == 1.0f, "unity gain preserved during speech");
     }
 
     private static float[] sineWithRms(int length, float targetRms) {

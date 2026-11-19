@@ -82,17 +82,21 @@ vi.mock('../../src/hooks/useSwipeBack.js', () => ({
   useSwipeBack: () => ({ current: null }),
 }));
 
-vi.mock('../../src/hooks/useMachines.js', () => ({
-  useMachines: () => ({
-    machines: [],
-    filtered: [],
-    loaded: true,
-    loading: false,
-    error: null,
-    stale: false,
-    refetch: vi.fn(),
-  }),
-}));
+vi.mock('../../src/hooks/useMachines.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/hooks/useMachines.js')>();
+  return {
+    ...actual,
+    useMachines: () => ({
+      machines: [],
+      filtered: [],
+      loaded: true,
+      loading: false,
+      error: null,
+      stale: false,
+      refetch: vi.fn(),
+    }),
+  };
+});
 
 vi.mock('../../src/api.js', () => ({
   uploadFile: vi.fn(),
@@ -243,9 +247,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     fireEvent.blur(input);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // Realistic 95ms mobile single tap on unfocused composer opens typing mode cleanly without false-triggering voice.
+    // Realistic 140ms mobile single tap on unfocused composer opens typing mode cleanly without false-triggering voice.
     expect(dispatchPointer(input, 'pointerdown', 180, 500, 3)).toBe(true);
-    await vi.advanceTimersByTimeAsync(95);
+    await vi.advanceTimersByTimeAsync(140);
     dispatchPointer(input, 'pointerup', 180, 500, 3);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
@@ -327,13 +331,13 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
     dispatchPointer(input, 'pointerdown', 180);
 
-    // Not triggered at 114ms; still pending with selection/callout lock (keeps <=95ms taps safe)
-    await vi.advanceTimersByTimeAsync(114);
+    // Not triggered at 174ms; still pending with selection/callout lock (keeps <=140ms taps safe)
+    await vi.advanceTimersByTimeAsync(174);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
 
-    // Triggers exactly at 115ms (+1ms) on unfocused composer
+    // Triggers exactly at 175ms (+1ms) on unfocused composer
     await vi.advanceTimersByTimeAsync(1);
 
     expect(vibrate).toHaveBeenCalledWith(20);
@@ -2445,7 +2449,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     }));
   });
 
-  it('defers setPointerCapture until hold activates, promotes horizontal slide-hold right after 95ms tap-guard (100ms), keeps focused native-editable vs unfocused 115ms distinct, and invokes passive prewarm', async () => {
+  it('defers setPointerCapture until hold activates, promotes horizontal slide-hold right after 140ms tap-guard (145ms), keeps focused native-editable vs unfocused 175ms distinct, and invokes passive prewarm', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -2471,15 +2475,15 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
     expect(setPointerCaptureSpy).not.toHaveBeenCalled();
 
-    // 2. Horizontal slide past 65ms debounce does NOT prematurely fire inside <=95ms single-tap guard; promotes cleanly at 100ms (<115ms) even if setPointerCapture throws
+    // 2. Horizontal slide past 90ms debounce does NOT prematurely fire inside <=140ms single-tap guard; promotes cleanly at 145ms (<175ms) even if setPointerCapture throws
     setPointerCaptureSpy.mockImplementationOnce(() => { throw new Error('unsupported'); });
-    await vi.advanceTimersByTimeAsync(70);
+    await vi.advanceTimersByTimeAsync(95);
     dispatchPointer(input, 'pointermove', 200, 502, 1); // dx = +20, dy = +2
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(setPointerCaptureSpy).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(25); // total 95ms — still guarded
+    await vi.advanceTimersByTimeAsync(45); // total 140ms — still guarded
     expect(voiceMock.startListening).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(5); // total 100ms — slide-intent promotes early (<115ms stationary / focused untouched)
+    await vi.advanceTimersByTimeAsync(5); // total 145ms — slide-intent promotes early (<175ms stationary / focused untouched)
     expect(setPointerCaptureSpy).toHaveBeenCalledWith(1);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
     expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
@@ -2776,15 +2780,15 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(input.getAttribute('contenteditable')).toBe('false');
     expect(document.activeElement).not.toBe(input);
 
-    // F2: <100ms taps with thumb drift (dx=14, 15, 18 across 70..95ms) MUST NEVER start voice & MUST focus cleanly without orphaned slide timers
+    // F2: <145ms taps with thumb drift (dx=14, 15, 18 across 95..140ms) MUST NEVER start voice & MUST focus cleanly without orphaned slide timers
     voiceMock.startListening.mockClear();
     for (const [idx, dx] of ([14, 15, 18] as const).entries()) {
       const pid = 40 + idx;
       dispatchPrimaryPointer(input, 'pointerdown', 180, 500, pid, 1);
-      await vi.advanceTimersByTimeAsync(70);
+      await vi.advanceTimersByTimeAsync(95);
       dispatchPrimaryPointer(input, 'pointermove', 180 + dx, 501, pid, 1);
       expect(voiceMock.startListening).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(25); // total 95ms — still inside single-tap guard
+      await vi.advanceTimersByTimeAsync(45); // total 140ms — still inside single-tap guard
       expect(voiceMock.startListening).not.toHaveBeenCalled();
       dispatchPrimaryPointer(input, 'pointerup', 180 + dx, 501, pid, 0);
       await vi.advanceTimersByTimeAsync(200); // verify slide timer was cleared and never fires orphaned
@@ -3976,7 +3980,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       // jsdom default all-zero rect -> relies on CSS fallback, no NaN/negative inline clearance
       dispatchPointer(input, 'pointerdown', 180, 760, 1);
-      await vi.advanceTimersByTimeAsync(115);
+      await vi.advanceTimersByTimeAsync(175);
       const hudZero = document.querySelector('.voice-hold-hud') as HTMLElement;
       expect(hudZero).not.toBeNull();
       expect(hudZero.style.getPropertyValue('--voice-hud-bottom-clearance')).toBe('');
@@ -4002,7 +4006,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       });
 
       dispatchPointer(input, 'pointerdown', 180, 770, 2);
-      await vi.advanceTimersByTimeAsync(115);
+      await vi.advanceTimersByTimeAsync(175);
       const hudSingle = document.querySelector('.voice-hold-hud') as HTMLElement;
       expect(hudSingle.style.getPropertyValue('--voice-hud-bottom-clearance')).toBe(
         `${844 - 754 + VOICE_HOLD_COMPOSER_CLEARANCE_GAP_PX}px`,

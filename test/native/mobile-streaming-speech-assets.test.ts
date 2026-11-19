@@ -179,6 +179,11 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(android).toContain('new Qwen3SpeechWindow()');
     expect(android).toContain('new Qwen3SpeechWindow.SpeechInbox(new SpeechGain())');
     expect(android).toContain('decoder.close()');
+    expect(android).toContain('MediaRecorder.AudioSource.VOICE_RECOGNITION');
+    expect(android).not.toContain('AutomaticGainControl');
+    expect(androidWindow).toContain('MIN_DECODE_NOISE_MULTIPLIER');
+    expect(androidWindow).toContain('SILENCE_RESET_MIN_VOICED_SAMPLES');
+    expect(androidDecoder).not.toContain('nextId == tokenizer.eosTokenId && activePrefix.length == 0');
     expect(android).not.toContain('OfflineRecognizer');
     expect(android).not.toContain('OfflinePunctuation');
     expect(android).not.toContain('OnlineStream');
@@ -402,7 +407,7 @@ public class AudioRecord {
   public static volatile int chunksPerStart=1;
   public static volatile int silentChunksPerStart=0;
   public static volatile boolean labelledWords=false;
-  public static volatile boolean failMicSource=false;
+  public static volatile boolean failVoiceRecognitionSource=false;
   public static volatile int lastSource=-1;
   private static int nextSessionId=42;
   public static int reads=0;
@@ -415,7 +420,7 @@ public class AudioRecord {
   private int deliveredVoiced=0;
   public AudioRecord(int source,int b,int c,int d,int e){
     lastSource=source;
-    state=(failMicSource && source==MediaRecorder.AudioSource.MIC) ? STATE_UNINITIALIZED : STATE_INITIALIZED;
+    state=(failVoiceRecognitionSource && source==MediaRecorder.AudioSource.VOICE_RECOGNITION) ? STATE_UNINITIALIZED : STATE_INITIALIZED;
     if(state==STATE_INITIALIZED){
       latest=this;
       remaining=chunksPerStart;
@@ -973,35 +978,19 @@ public class Harness {
    check(OnnxTensor.created.get()-OnnxTensor.released.get()==4,"per-inference tensor leak while decoder alive (expected 4 persistent KV tensors): "+OnnxTensor.created.get()+" vs "+OnnxTensor.released.get());
    check(OrtSession.Result.created.get()==OrtSession.Result.released.get(),"result leak: "+OrtSession.Result.created.get()+" vs "+OrtSession.Result.released.get());
    System.out.println("WINDOW_AND_RELEASE_OK");
-   check(AutomaticGainControl.created>=1 && AutomaticGainControl.enabled==AutomaticGainControl.created, "AGC should attach and enable");
-   check(AutomaticGainControl.disabled==AutomaticGainControl.created && AutomaticGainControl.released==AutomaticGainControl.created,
-    "AGC must disable and release once per session: disabled="+AutomaticGainControl.disabled+" released="+AutomaticGainControl.released+" created="+AutomaticGainControl.created);
-   System.out.println("AGC_LIFECYCLE_OK");
-   String[] agcModes = {"unavailable", "null", "throwCreate", "failEnable", "throwEnable", "throwRelease"};
-   for (String mode : agcModes) {
-    AutomaticGainControl.reset();
-    if (mode.equals("unavailable")) AutomaticGainControl.available = false;
-    if (mode.equals("null")) AutomaticGainControl.returnNullOnCreate = true;
-    if (mode.equals("throwCreate")) AutomaticGainControl.throwOnCreate = true;
-    if (mode.equals("failEnable")) AutomaticGainControl.failEnable = true;
-    if (mode.equals("throwEnable")) AutomaticGainControl.throwOnEnable = true;
-    if (mode.equals("throwRelease")) AutomaticGainControl.throwOnRelease = true;
-    p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OrtSession.decoded=new CountDownLatch(1);
-    PluginCall modeStart=new PluginCall();p.start(modeStart);await(modeStart.done);await(AudioRecord.delivered);
-    check(modeStart.error==null, "AGC mode "+mode+" must be non-fatal: "+modeStart.error);
-    PluginCall modeStop=new PluginCall();p.stop(modeStop);await(modeStop.done);
-    check(finals(p)==1, "AGC mode "+mode+" failed to deliver final result");
-    check(AutomaticGainControl.released==AutomaticGainControl.created, "AGC mode "+mode+" leaked AutomaticGainControl");
-   }
-   AutomaticGainControl.reset();
-   AudioRecord.failMicSource = true;
+   check(AutomaticGainControl.created==0 && AutomaticGainControl.enabled==0,
+    "AGC must never be created or enabled: created="+AutomaticGainControl.created+" enabled="+AutomaticGainControl.enabled);
+   check(AudioRecord.lastSource==MediaRecorder.AudioSource.VOICE_RECOGNITION,
+    "Primary AudioRecord source must prefer VOICE_RECOGNITION, got "+AudioRecord.lastSource);
+   System.out.println("NO_AGC_OK");
+   AudioRecord.failVoiceRecognitionSource = true;
    p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OrtSession.decoded=new CountDownLatch(1);
    PluginCall fbStart=new PluginCall();p.start(fbStart);await(fbStart.done);await(AudioRecord.delivered);
-   check(AudioRecord.lastSource==MediaRecorder.AudioSource.VOICE_RECOGNITION, "MIC init failure must fall back to VOICE_RECOGNITION");
+   check(AudioRecord.lastSource==MediaRecorder.AudioSource.MIC, "VOICE_RECOGNITION init failure must fall back to MIC");
    PluginCall fbStop=new PluginCall();p.stop(fbStop);await(fbStop.done);
    check(finals(p)==1, "fallback source failed to deliver final result");
-   AudioRecord.failMicSource = false;
-   System.out.println("AGC_FALLBACK_OK");
+   AudioRecord.failVoiceRecognitionSource = false;
+   System.out.println("SOURCE_FALLBACK_OK");
   } finally {p.destroy();}
   for(int i=0;i<100&&OrtSession.closes.get()<3;i++)Thread.sleep(5);check(OrtSession.closes.get()==3,"expected 3 closed sessions, got "+OrtSession.closes.get());
   check(OnnxTensor.created.get()==OnnxTensor.released.get(),"tensor leak after destroy: "+OnnxTensor.created.get()+" vs "+OnnxTensor.released.get());
@@ -1045,7 +1034,7 @@ public class Harness {
     expect(unitOut).toBe('QWEN3_JAVA_UNIT_TESTS:PASS');
     for (const dtype of ['FLOAT', 'FLOAT16']) {
       const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DortDtype='+dtype, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
-      expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','AGC_LIFECYCLE_OK','AGC_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','HAPTIC_OK','SpeechGainTest: ALL 6 TESTS PASSED']);
+      expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','NO_AGC_OK','SOURCE_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','HAPTIC_OK','SpeechGainTest: ALL 7 TESTS PASSED']);
     }
   }, 95000);
 });

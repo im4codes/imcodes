@@ -5,8 +5,6 @@ import androidx.lifecycle.Lifecycle;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
-import android.media.audiofx.AudioEffect;
-import android.media.audiofx.AutomaticGainControl;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import ai.onnxruntime.OrtException;
@@ -163,17 +161,14 @@ public class StreamingSpeechPlugin extends Plugin {
                 call.reject("Offline speech could not start", new IOException("Microphone initialization failed"));
                 return;
             }
-            AutomaticGainControl agc = attachAutomaticGainControl(audio);
             try {
                 audio.startRecording();
             } catch (IllegalStateException e) {
-                releaseAutomaticGainControl(agc);
                 audio.release();
                 call.reject("Offline speech could not start", e);
                 return;
             }
             if (audio.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-                releaseAutomaticGainControl(agc);
                 try { audio.stop(); } catch (IllegalStateException ignored) { }
                 audio.release();
                 call.reject("Offline speech could not start", new IOException("Microphone start failed"));
@@ -181,7 +176,7 @@ public class StreamingSpeechPlugin extends Plugin {
             }
             long owner = generation.incrementAndGet();
             String language = Qwen3OnnxDecoder.resolveLanguage(call.getString("language"));
-            CaptureSession session = new CaptureSession(owner, audio, agc, language);
+            CaptureSession session = new CaptureSession(owner, audio, language);
             activeSession = session;
             recorder = audio;
             listening = true;
@@ -198,9 +193,10 @@ public class StreamingSpeechPlugin extends Plugin {
     // Isolated audio capture factory/reader helpers keep AudioRecord configuration
     // cleanly separated from segmentation, SpeechGain conditioning, and ORT decoding.
     private static AudioRecord createAudioRecord(int bufferSizeInBytes) {
+        // Prefer VOICE_RECOGNITION to avoid OS/OEM hardware AGC & noise-suppression pumping.
         int[] sources = {
-            MediaRecorder.AudioSource.MIC,
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC,
         };
         for (int source : sources) {
             AudioRecord candidate = null;
@@ -223,38 +219,6 @@ public class StreamingSpeechPlugin extends Plugin {
             }
         }
         return null;
-    }
-
-    private static AutomaticGainControl attachAutomaticGainControl(AudioRecord audio) {
-        try {
-            if (!AutomaticGainControl.isAvailable()) {
-                return null;
-            }
-            AutomaticGainControl effect = AutomaticGainControl.create(audio.getAudioSessionId());
-            if (effect == null) {
-                return null;
-            }
-            try {
-                if (effect.setEnabled(true) != AudioEffect.SUCCESS) {
-                    effect.release();
-                    return null;
-                }
-                return effect;
-            } catch (RuntimeException ignored) {
-                try { effect.release(); } catch (RuntimeException ignoredRelease) { }
-                return null;
-            }
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    private static void releaseAutomaticGainControl(AutomaticGainControl agc) {
-        if (agc == null) {
-            return;
-        }
-        try { agc.setEnabled(false); } catch (Throwable ignored) { }
-        try { agc.release(); } catch (Throwable ignored) { }
     }
 
     private static float[] pcm16ToNormalizedFloats(short[] pcm, int count) {
@@ -331,6 +295,8 @@ public class StreamingSpeechPlugin extends Plugin {
                     batch.samples,
                     batch.speech,
                     batch.trailingSilence,
+                    batch.activeSamples,
+                    batch.noiseFloorRMS,
                     batch.finalTail,
                     () -> !session.isStopRequested() && !session.isDiscarded() && generation.get() == owner,
                     () -> !session.isDiscarded() && generation.get() == owner,
@@ -403,12 +369,23 @@ public class StreamingSpeechPlugin extends Plugin {
         final float[] samples;
         final boolean speech;
         final int trailingSilence;
+        final int activeSamples;
+        final float noiseFloorRMS;
         final boolean finalTail;
 
-        AudioBatch(float[] samples, boolean speech, int trailingSilence, boolean finalTail) {
+        AudioBatch(
+            float[] samples,
+            boolean speech,
+            int trailingSilence,
+            int activeSamples,
+            float noiseFloorRMS,
+            boolean finalTail
+        ) {
             this.samples = samples;
             this.speech = speech;
             this.trailingSilence = trailingSilence;
+            this.activeSamples = activeSamples;
+            this.noiseFloorRMS = noiseFloorRMS;
             this.finalTail = finalTail;
         }
     }
@@ -420,7 +397,6 @@ public class StreamingSpeechPlugin extends Plugin {
         private final Qwen3SpeechWindow.SpeechInbox inbox = new Qwen3SpeechWindow.SpeechInbox(new SpeechGain());
         private final CountDownLatch readerStarted = new CountDownLatch(1);
         private final CountDownLatch firstPassDone = new CountDownLatch(1);
-        private AutomaticGainControl agc;
         private boolean audioReleased;
         private boolean stopRequested;
         private boolean discarded;
@@ -428,18 +404,15 @@ public class StreamingSpeechPlugin extends Plugin {
         private boolean overflowed;
         private Exception readError;
 
-        CaptureSession(long owner, AudioRecord audio, AutomaticGainControl agc, String language) {
+        CaptureSession(long owner, AudioRecord audio, String language) {
             this.owner = owner;
             this.audio = audio;
-            this.agc = agc;
             this.language = language;
         }
 
         synchronized void releaseAudioResources() {
             if (audioReleased) return;
             audioReleased = true;
-            releaseAutomaticGainControl(agc);
-            agc = null;
             try { audio.stop(); } catch (IllegalStateException ignored) { }
             audio.release();
         }
@@ -512,7 +485,14 @@ public class StreamingSpeechPlugin extends Plugin {
             if (batch != null) {
                 // Bind stop ownership at the drain boundary so stop cannot turn two
                 // full inboxes into an unbounded utterance tail.
-                return new AudioBatch(batch.samples, batch.speech, batch.trailingSilence, stopRequested && readerDone);
+                return new AudioBatch(
+                    batch.samples,
+                    batch.speech,
+                    batch.trailingSilence,
+                    batch.activeSamples,
+                    batch.noiseFloorRMS,
+                    stopRequested && readerDone
+                );
             }
             if (readError != null) {
                 throw readError;
