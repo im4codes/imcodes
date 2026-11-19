@@ -235,14 +235,18 @@ describe('the file window does not leak pointer input into the desktop', () => {
       .toBeLessThan(forwarder.indexOf('clientRef.current?.pointerMove'));
   });
 
-  it('re-reads the window-open flags instead of capturing them once', () => {
-    // A stale closure here would leave the guard permanently disabled, and
-    // every test above would still pass.
+  it('guards every pointer move over any overlay regardless of file drawer open/minimized state', () => {
+    // Hit-testing via document.elementFromPoint naturally returns false when the
+    // file drawer is closed or minimized (`filePanelOpen && !fileDrawerMinimized`
+    // is already what mounts the drawer), while protecting other floating overlays
+    // such as the workspace mini-chat even when the file drawer is closed.
     const forwarder = remoteDesktop.slice(
       remoteDesktop.indexOf('const sendDesktopPointerMove'),
       remoteDesktop.indexOf('const onStagePointerMove'),
     );
-    expect(forwarder).toMatch(/\}, \[normalizedClientPoint, filePanelOpen, fileDrawerMinimized\]\)/);
+    expect(forwarder).not.toContain('filePanelOpen && !fileDrawerMinimized');
+    expect(forwarder).toMatch(/\}, \[normalizedClientPoint\]\)/);
+    expect(remoteDesktop).toContain('{filePanelOpen && !fileDrawerMinimized && (');
   });
 
   it('derives the overlay selector from one constant', () => {

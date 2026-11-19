@@ -33,21 +33,237 @@ export interface CloudDocsMainChatContext {
   detectedModel?: string;
 }
 
+export const DEFAULT_MINI_CHAT_HEIGHT = 420;
+export const DEFAULT_MINI_CHAT_MIN_HEIGHT = 220;
+
 interface CloudDocsMainChatFloatProps {
   mainChat: CloudDocsMainChatContext;
   activePreviewQuote?: CloudDocQuoteTarget | null;
   onOpenDoc?: (docId: string) => void;
+  heightStorageKey?: string;
+  defaultHeight?: number;
+  minHeight?: number;
+  maxHeight?: number;
+  overlayClassName?: string;
+}
+
+function sanitizePositiveHeight(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+function readContainerHeight(anchorEl: HTMLDivElement | null): number {
+  const parent = anchorEl?.parentElement;
+  if (!parent) return 0;
+  if (parent.clientHeight > 0) return parent.clientHeight;
+  const rectHeight = parent.getBoundingClientRect?.().height ?? 0;
+  return rectHeight > 0 ? rectHeight : 0;
+}
+
+function resolveAvailableMaxHeight(
+  anchorEl: HTMLDivElement | null,
+  minHeight: number,
+  maxHeightProp?: number,
+): number | undefined {
+  const containerHeight = readContainerHeight(anchorEl);
+  let limit: number | undefined;
+  if (containerHeight > 0) {
+    // Anchor sits 14px above bottom + 14px top gap + 40px FAB + 8px flex gap = 76px.
+    limit = Math.max(140, Math.floor(containerHeight - 76));
+  } else if (typeof window !== 'undefined' && window.innerHeight > 0) {
+    limit = Math.max(minHeight, Math.floor(window.innerHeight - 120));
+  }
+  if (maxHeightProp != null && Number.isFinite(maxHeightProp) && maxHeightProp > 0) {
+    const cappedProp = Math.max(Math.min(minHeight, maxHeightProp), Math.floor(maxHeightProp));
+    limit = limit != null ? Math.min(limit, cappedProp) : cappedProp;
+  }
+  return limit;
+}
+
+function clampMiniChatHeight(
+  height: number,
+  minHeight: number,
+  availableMax?: number,
+): number {
+  const floor = availableMax != null ? Math.min(minHeight, availableMax) : minHeight;
+  const upper = availableMax != null ? Math.max(floor, availableMax) : Number.POSITIVE_INFINITY;
+  return Math.round(Math.min(upper, Math.max(floor, height)));
+}
+
+function readStoredMiniChatHeight(
+  storageKey: string | undefined,
+  minHeight: number,
+  maxHeightProp?: number,
+): number | null {
+  if (!storageKey || typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    const parsed = sanitizePositiveHeight(raw);
+    if (parsed === null) return null;
+    const maxBound = maxHeightProp != null && Number.isFinite(maxHeightProp) && maxHeightProp > 0
+      ? Math.max(minHeight, Math.floor(maxHeightProp))
+      : undefined;
+    return clampMiniChatHeight(parsed, minHeight, maxBound);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredMiniChatHeight(storageKey: string | undefined, height: number): void {
+  if (!storageKey || typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(storageKey, String(Math.round(height)));
+  } catch {
+    /* ignore storage quota / restricted storage failures */
+  }
 }
 
 export function CloudDocsMainChatFloat({
   mainChat,
   activePreviewQuote = null,
   onOpenDoc,
+  heightStorageKey,
+  defaultHeight = DEFAULT_MINI_CHAT_HEIGHT,
+  minHeight = DEFAULT_MINI_CHAT_MIN_HEIGHT,
+  maxHeight,
+  overlayClassName,
 }: CloudDocsMainChatFloatProps) {
   const { t } = useTranslation();
+  const safeMinHeight = useMemo(
+    () => (Number.isFinite(minHeight) && minHeight > 0 ? minHeight : DEFAULT_MINI_CHAT_MIN_HEIGHT),
+    [minHeight],
+  );
+  const safeDefaultHeight = useMemo(
+    () => (Number.isFinite(defaultHeight) && defaultHeight > 0 ? Math.max(safeMinHeight, defaultHeight) : DEFAULT_MINI_CHAT_HEIGHT),
+    [defaultHeight, safeMinHeight],
+  );
+  const resizable = Boolean(heightStorageKey);
   const [expanded, setExpanded] = useState(false);
   const [dismissedDocKey, setDismissedDocKey] = useState<string | null>(null);
   const [extraQuotes, setExtraQuotes] = useState<string[]>([]);
+  const [customHeight, setCustomHeight] = useState<number | null>(() => (
+    readStoredMiniChatHeight(heightStorageKey, safeMinHeight, maxHeight)
+  ));
+  const [containerMaxHeight, setContainerMaxHeight] = useState<number | undefined>(undefined);
+  const [isResizing, setIsResizing] = useState(false);
+  const anchorRef = useRef<HTMLDivElement | null>(null);
+  const miniChatRef = useRef<HTMLDivElement | null>(null);
+  const resizeHandleRef = useRef<HTMLDivElement | null>(null);
+  const cleanupDragRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    setCustomHeight(readStoredMiniChatHeight(heightStorageKey, safeMinHeight, maxHeight));
+  }, [heightStorageKey, maxHeight, safeMinHeight]);
+
+  useEffect(() => {
+    if (!resizable || !expanded) return undefined;
+    const syncMaxHeight = () => {
+      setContainerMaxHeight(resolveAvailableMaxHeight(anchorRef.current, safeMinHeight, maxHeight));
+    };
+    syncMaxHeight();
+    const parent = anchorRef.current?.parentElement;
+    let observer: ResizeObserver | null = null;
+    if (parent && typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => syncMaxHeight());
+      observer.observe(parent);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', syncMaxHeight);
+    }
+    return () => {
+      observer?.disconnect();
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', syncMaxHeight);
+      }
+    };
+  }, [expanded, maxHeight, resizable, safeMinHeight]);
+
+  useEffect(() => () => {
+    cleanupDragRef.current?.();
+  }, []);
+
+  const handleResizePointerDown = useCallback((event: PointerEvent) => {
+    if (!resizable) return;
+    if (typeof event.button === 'number' && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    cleanupDragRef.current?.();
+
+    const startY = event.clientY;
+    const rectHeight = miniChatRef.current?.getBoundingClientRect?.().height ?? 0;
+    const currentEffective = customHeight != null
+      ? clampMiniChatHeight(customHeight, safeMinHeight, containerMaxHeight ?? resolveAvailableMaxHeight(anchorRef.current, safeMinHeight, maxHeight))
+      : safeDefaultHeight;
+    const startHeight = rectHeight > 0 ? rectHeight : currentEffective;
+    const pointerId = event.pointerId;
+    let latestHeight: number | null = null;
+    setIsResizing(true);
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (pointerId != null && moveEvent.pointerId != null && moveEvent.pointerId !== pointerId) return;
+      const availableMax = resolveAvailableMaxHeight(anchorRef.current, safeMinHeight, maxHeight);
+      setContainerMaxHeight(availableMax);
+      const nextHeight = clampMiniChatHeight(
+        startHeight + (startY - moveEvent.clientY),
+        safeMinHeight,
+        availableMax,
+      );
+      latestHeight = nextHeight;
+      setCustomHeight(nextHeight);
+      writeStoredMiniChatHeight(heightStorageKey, nextHeight);
+    };
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      cleanupDragRef.current = null;
+      setIsResizing(false);
+    };
+
+    const onUp = (upEvent: PointerEvent) => {
+      if (pointerId != null && upEvent.pointerId != null && upEvent.pointerId !== pointerId) return;
+      cleanup();
+      if (latestHeight !== null) {
+        writeStoredMiniChatHeight(heightStorageKey, latestHeight);
+      }
+    };
+
+    const onCancel = (cancelEvent: PointerEvent) => {
+      if (pointerId != null && cancelEvent.pointerId != null && cancelEvent.pointerId !== pointerId) return;
+      cleanup();
+    };
+
+    cleanupDragRef.current = cleanup;
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+  }, [containerMaxHeight, customHeight, heightStorageKey, maxHeight, resizable, safeDefaultHeight, safeMinHeight]);
+
+  // Attach lowercase 'pointerdown' directly so both real browsers and jsdom
+  // (where HTMLElement lacks `onpointerdown` in Preact's prop-name check) fire it.
+  useEffect(() => {
+    const el = resizeHandleRef.current;
+    if (!el || !resizable || !expanded) return undefined;
+    el.addEventListener('pointerdown', handleResizePointerDown);
+    return () => {
+      el.removeEventListener('pointerdown', handleResizePointerDown);
+    };
+  }, [expanded, handleResizePointerDown, resizable]);
+
+  const effectiveMiniChatHeight = useMemo(() => {
+    if (!resizable || customHeight === null) return undefined;
+    const maxBound = containerMaxHeight ?? resolveAvailableMaxHeight(anchorRef.current, safeMinHeight, maxHeight);
+    return clampMiniChatHeight(customHeight, safeMinHeight, maxBound);
+  }, [containerMaxHeight, customHeight, maxHeight, resizable, safeMinHeight]);
 
   const session = mainChat.session;
   const sessionName = session.name;
@@ -214,20 +430,45 @@ export function CloudDocsMainChatFloat({
     });
   }, [mainChat.connected, mainChat.ws, retryOptimisticMessage, sessionName]);
 
+  const overlayClassSuffix = overlayClassName ? ` ${overlayClassName}` : '';
+  const miniChatStyle = effectiveMiniChatHeight != null
+    ? {
+        height: `${effectiveMiniChatHeight}px`,
+        ...(containerMaxHeight != null ? { maxHeight: `${containerMaxHeight}px` } : {}),
+      }
+    : undefined;
+
   return (
     <div
+      ref={anchorRef}
       class="cloud-docs-main-chat-anchor"
       onMouseDown={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
     >
       {expanded && (
         <div
-          class="cloud-docs-mini-chat"
+          ref={miniChatRef}
+          class={`cloud-docs-mini-chat${isResizing ? ' is-resizing' : ''}${overlayClassSuffix}`}
+          style={miniChatStyle}
           role="dialog"
           aria-modal="false"
           aria-label={t('cloud_docs.ai_chat.title', { session: sessionDisplayName })}
           data-testid="cloud-docs-mini-chat"
+          onContextMenu={(e) => e.stopPropagation()}
         >
+          {resizable && (
+            <div
+              ref={resizeHandleRef}
+              class="mini-chat-resize-handle"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label={t('cloud_docs.ai_chat.resize_height', 'Resize AI chat height')}
+              aria-valuemin={safeMinHeight}
+              aria-valuemax={containerMaxHeight}
+              aria-valuenow={effectiveMiniChatHeight ?? safeDefaultHeight}
+              data-testid="mini-chat-resize-handle"
+            />
+          )}
           <div class="cloud-docs-mini-chat-header">
             <div class="cloud-docs-mini-chat-title-group">
               <img
@@ -356,7 +597,7 @@ export function CloudDocsMainChatFloat({
 
       <button
         type="button"
-        class={`cloud-docs-fab${expanded ? ' active' : ''}${isBusy ? ' busy' : ''}`}
+        class={`cloud-docs-fab${expanded ? ' active' : ''}${isBusy ? ' busy' : ''}${overlayClassSuffix}`}
         onClick={() => setExpanded((prev) => !prev)}
         aria-expanded={expanded}
         aria-label={expanded

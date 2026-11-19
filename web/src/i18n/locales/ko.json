@@ -5543,7 +5543,8 @@
       "synced": "동기화됨",
       "thinking": "생각 중...",
       "reattach_doc": "{{name}} 연결",
-      "reattach_doc_hint": "\"{{name}}\" 문서를 인용 컨텍스트로 다시 연결"
+      "reattach_doc_hint": "\"{{name}}\" 문서를 인용 컨텍스트로 다시 연결",
+      "resize_height": "AI 채팅 높이 조절"
     }
   },
   "mobile_gesture": {

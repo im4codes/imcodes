@@ -19,12 +19,17 @@
 
 .remote-desktop-workspace input,
 .remote-desktop-workspace textarea,
-.remote-desktop-workspace select {
+.remote-desktop-workspace select,
+.remote-desktop-workspace .cloud-docs-mini-chat-controls [contenteditable],
+.remote-desktop-workspace .cloud-docs-mini-chat-messages,
+.remote-desktop-workspace .cloud-docs-mini-chat-messages * {
+  -webkit-touch-callout: default !important;
   -webkit-user-select: text !important;
   user-select: text !important;
 }
 
 .remote-desktop-workspace {
+  position: relative;
   display: flex;
   min-height: 0;
   height: 100%;

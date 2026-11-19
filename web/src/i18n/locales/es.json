@@ -5544,7 +5544,8 @@
       "synced": "Sincronizado",
       "thinking": "Pensando...",
       "reattach_doc": "Adjuntar {{name}}",
-      "reattach_doc_hint": "Volver a adjuntar \"{{name}}\" como contexto citado"
+      "reattach_doc_hint": "Volver a adjuntar \"{{name}}\" como contexto citado",
+      "resize_height": "Ajustar altura del chat de IA"
     }
   },
   "mobile_gesture": {

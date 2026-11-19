@@ -5544,7 +5544,8 @@
       "synced": "已同步",
       "thinking": "思考中...",
       "reattach_doc": "關聯 {{name}}",
-      "reattach_doc_hint": "重新關聯「{{name}}」作為引用上下文"
+      "reattach_doc_hint": "重新關聯「{{name}}」作為引用上下文",
+      "resize_height": "拖曳調整 AI 對話高度"
     }
   },
   "mobile_gesture": {

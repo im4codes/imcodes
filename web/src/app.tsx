@@ -10376,6 +10376,7 @@ function InternalMainApp() {
           state={remoteDesktopWorkspace}
           manager={remoteDesktopConnectionManager}
           quickData={quickData}
+          mainChat={cloudDocsMainChatContext}
           ws={wsRef.current}
           minimized={remoteDesktopWorkspaceMinimized}
           zIndex={getDesktopWindowZIndex(

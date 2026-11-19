@@ -26,8 +26,12 @@ import {
 } from './RemoteDesktopMinimizedDock.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
+import { CloudDocsMainChatFloat, type CloudDocsMainChatContext } from './CloudDocsMainChatFloat.js';
+import { REMOTE_DESKTOP_OVERLAY_CLASS } from '../remote-desktop-pointer-overlay.js';
 import './remote-desktop-workspace.css';
 import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
+
+export const REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY = 'imcodes_rd_mini_chat_height_v1';
 
 export interface RemoteDesktopWorkspaceProps {
   state: RemoteDesktopWorkspaceState;
@@ -57,6 +61,7 @@ export interface RemoteDesktopWorkspaceProps {
    */
   standalone?: boolean;
   quickData?: UseQuickDataResult;
+  mainChat?: CloudDocsMainChatContext | null;
 }
 
 export function RemoteDesktopWorkspace({
@@ -77,6 +82,7 @@ export function RemoteDesktopWorkspace({
   allowStandaloneWindow = false,
   standalone = false,
   quickData,
+  mainChat = null,
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
   const [maximized, setMaximized] = useState(false);
@@ -332,6 +338,13 @@ export function RemoteDesktopWorkspace({
           onAuthorityLost={() => closeHost(hostKey)}
         />
       ))}
+      {mainChat && (
+        <CloudDocsMainChatFloat
+          mainChat={mainChat}
+          heightStorageKey={REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY}
+          overlayClassName={REMOTE_DESKTOP_OVERLAY_CLASS}
+        />
+      )}
     </div>
   );
 

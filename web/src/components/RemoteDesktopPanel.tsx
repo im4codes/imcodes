@@ -2120,8 +2120,7 @@ export function RemoteDesktopPanel({
     // desktop, which is why target ownership was rejected here originally.
     // `elementFromPoint` is pure geometry, so it answers the occlusion
     // question without inheriting that problem.
-    if (filePanelOpen && !fileDrawerMinimized
-      && isPointOverRemoteDesktopOverlay(clientX, clientY)) {
+    if (isPointOverRemoteDesktopOverlay(clientX, clientY)) {
       pointerMovesOutsideRef.current += 1;
       return;
     }
@@ -2136,10 +2135,7 @@ export function RemoteDesktopPanel({
       return;
     }
     clientRef.current?.pointerMove(point.x, point.y);
-    // The window-open flags are read above, so they must be dependencies:
-    // without them the effect below keeps the FIRST closure and the guard
-    // would still see the window as closed after it is opened.
-  }, [normalizedClientPoint, filePanelOpen, fileDrawerMinimized]);
+  }, [normalizedClientPoint]);
 
   useEffect(() => {
     const onWindowMouseMove = (event: globalThis.MouseEvent) => {

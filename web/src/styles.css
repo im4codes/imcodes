@@ -20622,6 +20622,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .cloud-docs-mini-chat {
+  position: relative;
   pointer-events: auto;
   width: min(380px, 100%);
   height: min(420px, calc(var(--imcodes-ui-vh, 100vh) - 180px));
@@ -20634,6 +20635,35 @@ button.quick-agent-delegation-preset.active {
   background: #0b1120;
   box-shadow: 0 18px 42px rgba(2, 6, 23, 0.72);
   overflow: hidden;
+}
+
+.mini-chat-resize-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: ns-resize;
+  z-index: 3;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mini-chat-resize-handle::after {
+  content: '';
+  width: 32px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.28);
+  transition: background 140ms ease, width 140ms ease;
+}
+
+.mini-chat-resize-handle:hover::after,
+.cloud-docs-mini-chat.is-resizing .mini-chat-resize-handle::after {
+  width: 48px;
+  background: rgba(96, 165, 250, 0.85);
 }
 
 .cloud-docs-mini-chat-header {

@@ -5554,7 +5554,8 @@
       "synced": "Synced",
       "thinking": "Thinking...",
       "reattach_doc": "Attach {{name}}",
-      "reattach_doc_hint": "Re-attach \"{{name}}\" as quote context"
+      "reattach_doc_hint": "Re-attach \"{{name}}\" as quote context",
+      "resize_height": "Resize AI chat height"
     }
   },
   "mobile_gesture": {

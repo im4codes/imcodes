@@ -116,6 +116,7 @@ import {
   type UseTimelineResult,
 } from '../../src/hooks/useTimeline.js';
 import { CloudDocsMainChatFloat, type CloudDocsMainChatContext } from '../../src/components/CloudDocsMainChatFloat.js';
+import { REMOTE_DESKTOP_OVERLAY_CLASS } from '../../src/remote-desktop-pointer-overlay.js';
 
 function createSharedMockWs() {
   const listeners = new Set<(msg: ServerMessage) => void>();
@@ -178,6 +179,7 @@ describe('CloudDocsMainChatFloat', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
     __clearPersistedTimelineSnapshotsForTests();
+    localStorage.clear();
     chatViewPropsSpy.mockClear();
     chatScrollBottomSpy.mockClear();
     controlsPropsSpy.mockClear();
@@ -340,5 +342,175 @@ describe('CloudDocsMainChatFloat', () => {
     fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
     await waitFor(() => expect(screen.getByTestId('cloud-docs-mini-chat')).toBeTruthy());
     await waitFor(() => expect(chatScrollBottomSpy).toHaveBeenCalled());
+  });
+
+  it('keeps CloudDocs default mode without resize handle, storage writes, or overlay class', async () => {
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem');
+
+    render(<CloudDocsMainChatFloat mainChat={mainChat} />);
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(fab.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(false);
+
+    fireEvent.click(fab);
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(miniChat.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(false);
+    expect(miniChat.style.height).toBe('');
+    expect(screen.queryByTestId('mini-chat-resize-handle')).toBeNull();
+    expect(setItemSpy).not.toHaveBeenCalled();
+  });
+
+  it('supports drag height resizing, boundary clamping, storage persistence, and overlayClassName', async () => {
+    const storageKey = 'test_rd_mini_chat_height';
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    const view = render(
+      <div style={{ height: '600px' }}>
+        <CloudDocsMainChatFloat
+          mainChat={mainChat}
+          heightStorageKey={storageKey}
+          defaultHeight={420}
+          minHeight={220}
+          maxHeight={500}
+          overlayClassName={REMOTE_DESKTOP_OVERLAY_CLASS}
+        />
+      </div>,
+    );
+
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    const anchor = fab.closest('.cloud-docs-main-chat-anchor') as HTMLElement;
+    expect(fab.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    expect(anchor.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(false);
+
+    fireEvent.click(fab);
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(miniChat.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    // Unset before first drag / stored value
+    expect(miniChat.style.height).toBe('');
+
+    const handle = screen.getByTestId('mini-chat-resize-handle');
+    expect(handle.getAttribute('role')).toBe('separator');
+    expect(handle.getAttribute('aria-orientation')).toBe('horizontal');
+
+    // Non-primary button does not start resize
+    fireEvent(handle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 2, clientY: 300, pointerId: 1,
+    }));
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientY: 240, pointerId: 1,
+    }));
+    expect(localStorage.getItem(storageKey)).toBeNull();
+
+    // Drag upward by 60px: 420 -> 480
+    fireEvent(handle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientY: 300, pointerId: 2,
+    }));
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientY: 240, pointerId: 2,
+    }));
+    expect(miniChat.style.height).toBe('480px');
+
+    // Drag further past maxHeight (500): clamped at 500
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientY: 100, pointerId: 2,
+    }));
+    expect(miniChat.style.height).toBe('500px');
+
+    // Drag downward past minHeight (220): clamped at 220
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientY: 800, pointerId: 2,
+    }));
+    expect(miniChat.style.height).toBe('220px');
+
+    // Drag to 350 and release
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientY: 370, pointerId: 2,
+    }));
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientY: 370, pointerId: 2,
+    }));
+    expect(miniChat.style.height).toBe('350px');
+    expect(localStorage.getItem(storageKey)).toBe('350');
+
+    // Collapse & re-expand preserves 350px
+    fireEvent.click(screen.getByTestId('cloud-docs-mini-chat-close'));
+    await waitFor(() => expect(screen.queryByTestId('cloud-docs-mini-chat')).toBeNull());
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    const reopened = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(reopened.style.height).toBe('350px');
+
+    // Unmount & remount restores 350px from localStorage
+    view.unmount();
+    render(
+      <CloudDocsMainChatFloat
+        mainChat={mainChat}
+        heightStorageKey={storageKey}
+        defaultHeight={420}
+        minHeight={220}
+        maxHeight={500}
+        overlayClassName={REMOTE_DESKTOP_OVERLAY_CLASS}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    const remounted = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(remounted.style.height).toBe('350px');
+  });
+
+  it('handles corrupt/extreme localStorage heights safely and cleans up drag listeners on pointercancel and unmount', async () => {
+    const storageKey = 'test_rd_mini_chat_height_bounds';
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    for (const badValue of ['not-a-number', '-120', '0', 'NaN']) {
+      localStorage.setItem(storageKey, badValue);
+      const { unmount } = render(
+        <CloudDocsMainChatFloat
+          mainChat={mainChat}
+          heightStorageKey={storageKey}
+          minHeight={220}
+          maxHeight={520}
+        />,
+      );
+      fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+      const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+      expect(miniChat.style.height).toBe('');
+      unmount();
+    }
+
+    // Oversized stored value clamps to maxHeight
+    localStorage.setItem(storageKey, '99999');
+    const removeSpy = vi.spyOn(window, 'removeEventListener');
+    const { unmount } = render(
+      <CloudDocsMainChatFloat
+        mainChat={mainChat}
+        heightStorageKey={storageKey}
+        minHeight={220}
+        maxHeight={520}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(miniChat.style.height).toBe('520px');
+
+    const handle = screen.getByTestId('mini-chat-resize-handle');
+    fireEvent(handle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientY: 300, pointerId: 5,
+    }));
+    fireEvent(window, Object.assign(new Event('pointercancel', { bubbles: true }), { pointerId: 5 }));
+    expect(removeSpy).toHaveBeenCalledWith('pointermove', expect.any(Function));
+    expect(removeSpy).toHaveBeenCalledWith('pointerup', expect.any(Function));
+    expect(removeSpy).toHaveBeenCalledWith('pointercancel', expect.any(Function));
+
+    // Start another drag and unmount without pointerup -> cleans up cleanly
+    removeSpy.mockClear();
+    fireEvent(handle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientY: 300, pointerId: 6,
+    }));
+    unmount();
+    expect(removeSpy).toHaveBeenCalledWith('pointermove', expect.any(Function));
+    expect(removeSpy).toHaveBeenCalledWith('pointerup', expect.any(Function));
+    expect(removeSpy).toHaveBeenCalledWith('pointercancel', expect.any(Function));
   });
 });

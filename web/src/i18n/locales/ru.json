@@ -5543,7 +5543,8 @@
       "synced": "Синхронизировано",
       "thinking": "Думаю...",
       "reattach_doc": "Прикрепить {{name}}",
-      "reattach_doc_hint": "Повторно прикрепить «{{name}}» как контекст цитаты"
+      "reattach_doc_hint": "Повторно прикрепить «{{name}}» как контекст цитаты",
+      "resize_height": "Изменить высоту AI-чата"
     }
   },
   "mobile_gesture": {

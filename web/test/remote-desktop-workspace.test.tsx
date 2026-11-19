@@ -62,9 +62,49 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   ),
 }));
 
+vi.mock('../src/components/ChatView.js', () => ({
+  ChatView: () => <div data-testid="rd-mock-chat-view">Selectable chat text</div>,
+}));
+
+vi.mock('../src/components/StableSessionControls.js', () => ({
+  StableSessionControls: ({ activeSession }: { activeSession: { name: string } }) => (
+    <div data-testid="rd-mock-controls">{activeSession.name}</div>
+  ),
+}));
+
+vi.mock('../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
+  useTimeline: () => ({
+    events: [],
+    loading: false,
+    refreshing: false,
+    historyStatus: 'ready',
+    loadingOlder: false,
+    hasOlderHistory: false,
+    loadOlderEvents: vi.fn(),
+    historyGap: false,
+    loadMessageContext: vi.fn(),
+    addOptimisticUserMessage: vi.fn(),
+    removeOptimisticMessage: vi.fn(),
+    markOptimisticFailed: vi.fn(),
+    retryOptimisticMessage: vi.fn(),
+    forceRefresh: vi.fn(),
+  }),
+}));
+
 import { installFullscreenStub, removeFullscreenStub } from './support/fullscreen-stub.js';
 import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
-import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
+import {
+  REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY,
+  RemoteDesktopWorkspace,
+} from '../src/components/RemoteDesktopWorkspace.js';
+import {
+  isPointOverRemoteDesktopOverlay,
+  REMOTE_DESKTOP_OVERLAY_CLASS,
+} from '../src/remote-desktop-pointer-overlay.js';
+import type { CloudDocsMainChatContext } from '../src/components/CloudDocsMainChatFloat.js';
+import type { SessionInfo } from '../src/types.js';
+import type { WsClient } from '../src/ws-client.js';
 import { __resetMachinesForTests } from '../src/hooks/useMachines.js';
 import {
   REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS,
@@ -771,5 +811,122 @@ describe('RemoteDesktopWorkspace', () => {
       onCloseWorkspace={vi.fn()}
     />);
     expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_fullscreen' })).toBeNull();
+  });
+
+  it('auto-mounts resizable active-session mini chat in workspace corner, persists height, preserves text selection/contextmenu, and blocks desktop pointer bleed', async () => {
+    localStorage.clear();
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    const makeMainChat = (sessionName: string, label: string): CloudDocsMainChatContext => {
+      const session: SessionInfo = {
+        name: sessionName,
+        label,
+        project: 'codedeck',
+        role: 'brain',
+        agentType: 'claude-code',
+        runtimeType: 'transport',
+        state: 'idle',
+        projectDir: '/repo',
+      };
+      return {
+        session,
+        sessions: [session],
+        subSessions: [],
+        ws: { connected: true, onMessage: () => () => {}, sendSessionCommand: vi.fn() } as unknown as WsClient,
+        connected: true,
+        serverId: 'srv-1',
+        quickData: {
+          loaded: true,
+          history: [],
+          commands: [],
+          phrases: [],
+          reload: vi.fn(),
+          recordHistory: vi.fn(),
+          addCommand: vi.fn(),
+          updateCommand: vi.fn(),
+          removeCommand: vi.fn(),
+          addPhrase: vi.fn(),
+          removePhrase: vi.fn(),
+        } as unknown as CloudDocsMainChatContext['quickData'],
+      };
+    };
+
+    const view = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={makeMainChat('deck_proj_brain', 'MainBrain')}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const fab = screen.getByTestId('cloud-docs-main-chat-fab');
+    expect(fab.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => fab)).toBe(true);
+
+    fireEvent.click(fab);
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(miniChat.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    expect(screen.getByTestId('rd-mock-controls').textContent).toBe('deck_proj_brain');
+    expect(screen.getByText('MainBrain')).toBeTruthy();
+
+    // Pointer inside resize handle / mini-chat is protected by overlay hit-test
+    const handle = screen.getByTestId('mini-chat-resize-handle');
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => handle)).toBe(true);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => screen.getByTestId('rd-mock-chat-view'))).toBe(true);
+
+    // Drag resize handle upward by 80px -> 500px and saved to imcodes_rd_mini_chat_height_v1
+    fireEvent(handle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientY: 300, pointerId: 11,
+    }));
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientY: 220, pointerId: 11,
+    }));
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientY: 220, pointerId: 11,
+    }));
+    expect(miniChat.style.height).toBe('500px');
+    expect(localStorage.getItem(REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY)).toBe('500');
+
+    // Right-clicking inside mini-chat messages is NOT preventDefault'd by workspace chrome
+    const chatMsgEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    expect(screen.getByTestId('rd-mock-chat-view').dispatchEvent(chatMsgEvent)).toBe(true);
+    expect(chatMsgEvent.defaultPrevented).toBe(false);
+
+    // Switching active session updates mini-chat target immediately
+    view.rerender(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={makeMainChat('deck_other_brain', 'OtherBrain')}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(screen.getByTestId('rd-mock-controls').textContent).toBe('deck_other_brain');
+    expect(screen.getByText('OtherBrain')).toBeTruthy();
+
+    // CSS contract restores text selection inside mini-chat messages and enables relative anchor positioning
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace\s*\{[^}]*position:\s*relative;/);
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace \.cloud-docs-mini-chat-messages[\s\S]*user-select:\s*text\s*!important/);
+
+    // Reopening workspace restores saved 500px height
+    view.unmount();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      mainChat={makeMainChat('deck_other_brain', 'OtherBrain')}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    expect((await screen.findByTestId('cloud-docs-mini-chat')).style.height).toBe('500px');
   });
 });
