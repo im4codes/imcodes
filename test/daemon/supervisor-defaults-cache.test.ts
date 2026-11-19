@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildSupervisionExecutionCapabilityId, DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS } from '../../shared/supervision-execution-pool.js';
-import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
+import { normalizeSessionSupervisionSnapshot, normalizeSupervisorDefaultConfig, SUPERVISION_MODE } from '../../shared/supervision-config.js';
 
 const loadCredentialsMock = vi.fn();
 
@@ -283,6 +283,28 @@ describe('supervisor defaults cache', () => {
       __setCachedSupervisorDefaultsForTests(null);
       __reloadSupervisorDefaultsCacheFromDiskForTests();
       expect(getCachedSupervisorDefaults()?.executionPools.primaryDevelopmentPool.configs[0]?.role).toBe('executor');
+    });
+
+    it('keeps unconfigured default gpt-6-luna pools legacy_unconfigured across server sync, SQLite reload, and overlay', async () => {
+      const serverDefaults = JSON.parse(JSON.stringify(normalizeSupervisorDefaultConfig(null)));
+      expect(serverDefaults.model).toBe('gpt-6-luna');
+      expect(serverDefaults.executionPools.state).toBe('legacy_unconfigured');
+
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ defaults: serverDefaults }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await refreshSupervisorDefaultsCache();
+      expect(getCachedSupervisorDefaults()?.executionPools.state).toBe('legacy_unconfigured');
+      expect(getCachedSupervisorDefaults()?.executionPools.primaryDevelopmentPool.configs).toEqual([]);
+
+      __setCachedSupervisorDefaultsForTests(null);
+      __reloadSupervisorDefaultsCacheFromDiskForTests();
+      expect(getCachedSupervisorDefaults()?.executionPools.state).toBe('legacy_unconfigured');
+      expect(getCachedSupervisorDefaults()?.executionPools.primaryDevelopmentPool.configs).toEqual([]);
+      expect(overlayCachedExecutionPools(sessionSnapshot).executionPools.state).toBe('legacy_unconfigured');
     });
   });
 });

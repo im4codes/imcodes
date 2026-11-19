@@ -605,13 +605,25 @@ export function normalizeSupervisionExecutionPools(value: unknown): SupervisionE
   };
 }
 
+function hasExplicitPoolConfigState(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const state = (value as Record<string, unknown>).state;
+  return (SUPERVISION_EXECUTION_POOL_CONFIG_STATES as readonly unknown[]).includes(state);
+}
+
 export function migrateLegacySupervisionExecutionPools(input: {
   backend?: string | null;
   model?: string | null;
   executionPools?: unknown;
 }): SupervisionExecutionPoolsConfig {
   const normalized = normalizeSupervisionExecutionPools(input.executionPools);
-  if (normalized.state === 'configured') return normalized;
+  // Respect any authoritative canonical pool state (both 'configured' and
+  // explicit 'legacy_unconfigured') so re-normalizing or JSON round-tripping
+  // a normalized snapshot never upgrades an unconfigured pool from its
+  // serialized default model.
+  if (hasExplicitPoolConfigState(input.executionPools) || normalized.state === 'configured') {
+    return normalized;
+  }
   const backend = input.backend?.trim();
   const rawModel = input.model?.trim();
   // No hardcoded model allowlist. Any observed backend+model may migrate, and

@@ -127,6 +127,28 @@ describe('supervision config helpers', () => {
     expect(config.model).toBe('gpt-6-luna');
     expect(config.model).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
     expect(config.executionPools.state).toBe('legacy_unconfigured');
+    expect(config.executionPools.primaryDevelopmentPool.configs).toEqual([]);
+
+    // Round-tripping normalized defaults (including JSON serialization and fallback merge)
+    // must never silently upgrade an explicit legacy_unconfigured pool via serialized model.
+    const roundTrip = normalizeSupervisorDefaultConfig(JSON.parse(JSON.stringify(config)));
+    const thirdPass = normalizeSupervisorDefaultConfig(JSON.parse(JSON.stringify(roundTrip)));
+    const fallbackMerged = normalizeSupervisorDefaultConfig({}, roundTrip);
+    const sessionRoundTrip = normalizeSessionSupervisionSnapshot(
+      JSON.parse(JSON.stringify(config)),
+      roundTrip,
+    );
+    for (const candidate of [roundTrip, thirdPass, fallbackMerged, sessionRoundTrip]) {
+      expect(candidate.model).toBe('gpt-6-luna');
+      expect(candidate.executionPools.state).toBe('legacy_unconfigured');
+      expect(candidate.executionPools.primaryDevelopmentPool.configs).toEqual([]);
+    }
+
+    // Genuine legacy model-only input without executionPools still migrates, and explicit configured stays intact.
+    const legacyModelOnly = normalizeSupervisorDefaultConfig({ backend: 'codex-sdk', model: 'gpt-5.6' });
+    expect(legacyModelOnly.executionPools.state).toBe('configured');
+    expect(legacyModelOnly.executionPools.primaryDevelopmentPool.configs).toHaveLength(1);
+    expect(normalizeSupervisorDefaultConfig(JSON.parse(JSON.stringify(legacyModelOnly)))).toEqual(legacyModelOnly);
   });
 
   it('uses 30 seconds as both the default and minimum supervision timeout', () => {

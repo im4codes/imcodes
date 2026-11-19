@@ -371,6 +371,11 @@ describe('supervision execution pools', () => {
       .toMatchObject({ state: 'configured', primaryDevelopmentPool: { configs: [{ model: 'opus[1M]', providerFamily: 'anthropic' }] } });
     expect(migrateLegacySupervisionExecutionPools({ backend: 'codex-sdk', model: 'gpt-5.6-sol' }))
       .toMatchObject({ state: 'configured', primaryDevelopmentPool: { configs: [{ model: 'gpt-5.6-sol', providerFamily: 'openai' }] } });
+    expect(migrateLegacySupervisionExecutionPools({
+      backend: 'codex-sdk',
+      model: 'gpt-6-luna',
+      executionPools: { state: 'legacy_unconfigured' },
+    })).toMatchObject({ state: 'legacy_unconfigured', primaryDevelopmentPool: { configs: [] } });
   });
 
   it('binds a legacy-migrated pool to the canonical live provider identity', () => {
