@@ -2159,17 +2159,55 @@ jobs:
 
       - name: Build web (with FCM) + sync + assemble withFcmRelease
         working-directory: web
+        shell: bash
         run: |
+          set -euo pipefail
           npm run build:with-fcm
           npx cap sync android
-          (cd android && ./gradlew assembleWithFcmRelease bundleWithFcmRelease --stacktrace)
+          (
+            cd android
+            for attempt in 1 2 3; do
+              extra_flag=""
+              if [ "$attempt" -gt 1 ]; then
+                extra_flag="--refresh-dependencies"
+              fi
+              if timeout --kill-after=15 600 ./gradlew assembleWithFcmRelease bundleWithFcmRelease --stacktrace ${extra_flag}; then
+                exit 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "Gradle withFcmRelease build failed on attempt ${attempt}; retrying..." >&2
+                sleep $((attempt * 10))
+              fi
+            done
+            echo "Gradle withFcmRelease build failed after 3 attempts." >&2
+            exit 1
+          )
 
       - name: Build web (without FCM) + sync + assemble withoutFcmRelease
         working-directory: web
+        shell: bash
         run: |
+          set -euo pipefail
           npm run build:without-fcm
           npx cap sync android
-          (cd android && ./gradlew assembleWithoutFcmRelease bundleWithoutFcmRelease --stacktrace)
+          (
+            cd android
+            for attempt in 1 2 3; do
+              extra_flag=""
+              if [ "$attempt" -gt 1 ]; then
+                extra_flag="--refresh-dependencies"
+              fi
+              if timeout --kill-after=15 600 ./gradlew assembleWithoutFcmRelease bundleWithoutFcmRelease --stacktrace ${extra_flag}; then
+                exit 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "Gradle withoutFcmRelease build failed on attempt ${attempt}; retrying..." >&2
+                sleep $((attempt * 10))
+              fi
+            done
+            echo "Gradle withoutFcmRelease build failed after 3 attempts." >&2
+            exit 1
+          )
 
       - name: Get version info
         id: version

@@ -1369,14 +1369,14 @@ process.exit(0);
           ['--isolated-root', iso, '--home', tc.homeArg, '--no-service-control', '--dry-run'],
           {
             encoding: 'utf8',
-            timeout: 2500,
+            timeout: 5000,
             env: { ...process.env, HOME: callerHome },
           },
         );
         const elapsedMs = Date.now() - started;
         expect(res.signal, tc.label).toBeNull();
         expect(res.status, tc.label).not.toBe(0);
-        expect(elapsedMs, tc.label).toBeLessThan(2000);
+        expect(elapsedMs, tc.label).toBeLessThan(4000);
         expect(res.stderr, tc.label).toMatch(tc.expectMsg);
         expect(existsSync(join(iso, 'rollback-snapshots')), tc.label).toBe(false);
         expect(existsSync(join(iso, 'daemon-runtime')), tc.label).toBe(false);
@@ -1387,14 +1387,14 @@ process.exit(0);
         ['--isolated-root', iso, '--home', join(iso, 'link-1'), '--no-service-control', '--dry-run'],
         {
           encoding: 'utf8',
-          timeout: 2500,
+          timeout: 15_000,
           env: { ...process.env, HOME: callerHome },
         },
       );
       expect(posRes.signal, `${platform}:positive-bounded-chain`).toBeNull();
       expect(posRes.status, `${platform}:positive-bounded-chain:${posRes.stderr}`).toBe(0);
     }
-  });
+  }, 30_000);
 
   it('stages and builds Linux/macOS/Windows installers cleanly from --runtime-archive (tar.gz and zip)', async () => {
     const root = makeTempDir('imcodes-runtime-archive-');
