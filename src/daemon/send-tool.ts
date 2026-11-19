@@ -1534,12 +1534,25 @@ export async function dispatchSendMessage(
   // minting an untitled task when a Brain sends a post-completion status note.
   if (!input.automaticSupervision && !noImplicitWorkPair.has(input)
     && isPairsEngineProject(callerProjectName) && !input.broadcast && !input.clone
-    && caller.sessionName === projectBrainSession(callerProjectName)
-    && resolveProjectAuthoritativeSupervisionSnapshot(callerProjectName, allSessions).mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+    && caller.sessionName === projectBrainSession(callerProjectName)) {
+    const supervisedAuditMode = resolveProjectAuthoritativeSupervisionSnapshot(callerProjectName, allSessions).mode === SUPERVISION_MODE.SUPERVISED_AUDIT;
     const result = await dispatchSendMessage(caller, withoutImplicitWorkPair({ ...input }), deps);
     if (result.status !== 'accepted') return result;
     const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
     const target = result.deliveries.length === 1 && reached.length === 1 ? reached[0]!.target : undefined;
+    if (!supervisedAuditMode) {
+      if (target) {
+        const mentioned = taskPairService.resolveMentionedOpenPair(callerProjectName, caller.sessionName, input.message ?? '');
+        const mentionedState = mentioned ? getTaskPairStore().getPair(callerProjectName, mentioned)?.state : undefined;
+        const targetInMentioned = !!mentionedState && (mentionedState.executor === target || mentionedState.auditor === target);
+        const existingTaskId = (targetInMentioned ? mentioned : undefined)
+          ?? taskPairService.resolveSingleParticipantOpenPair(caller.sessionName, target);
+        if (existingTaskId) {
+          taskPairService.settleResumedPairIfActive(callerProjectName, existingTaskId, { actor: target, now: Date.now() });
+        }
+      }
+      return result;
+    }
     const focused = target ? taskPairService.recentBrainDispatch(callerProjectName, caller.sessionName, target) : undefined;
     // A DISPATCH marker already opened this pair in the same turn: bind the
     // receipt to it and, crucially, do not mint/bind a second implicit pair

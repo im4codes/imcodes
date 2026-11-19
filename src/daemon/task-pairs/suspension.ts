@@ -1,6 +1,6 @@
-import { isTerminalTaskPairStatus } from '../../../shared/task-pair.js';
+import { isTerminalTaskPairStatus, taskPairSideToAct, TASK_PAIR_NO_AUDITOR, type TaskPairState } from '../../../shared/task-pair.js';
 import { TASK_PAIR_DEPENDENCY_GRAPH_LIMIT, TASK_PAIR_MAX_DEPENDENCIES, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
-import { getTaskPairStore } from './store.js';
+import { getTaskPairStore, type StoredTaskPair } from './store.js';
 import { emitTaskPairTimelineEvent } from './service.js';
 
 /** IDs resolve only inside the caller's existing project; no session-name or cross-owner inference. */
@@ -59,8 +59,48 @@ export function resumePair(project: string, taskId: string, writer: string) {
   if (!pair || pair.state.brain !== writer || isTerminalTaskPairStatus(pair.state.status)) throw new Error('only the current Brain may resume an open pair');
   const prev = pair.state.scheduling;
   if (!prev || !prev.manual) return pair;
-  const next = { ...prev, epoch: prev.epoch + 1, manual: false, resumePending: prev.dependsOn.length === 0, admitted: false, since: Date.now() };
+  const next: TaskPairScheduling = {
+    ...prev,
+    epoch: prev.epoch + 1,
+    manual: false,
+    resumePending: prev.dependsOn.length === 0,
+    admitted: false,
+    since: Date.now(),
+    ...(prev.dependsOn.length === 0 ? { note: undefined } : {}),
+  };
   const saved = store.patchScheduling(project, taskId, prev, next, Date.now());
   if (!saved) throw new Error('pair changed; retry resume');
   return saved;
+}
+
+/**
+ * Settle a `resumePending` pair immediately when its active side is already
+ * executing under post-resume Brain direction or has already emitted post-resume
+ * pair activity (marker / checklist update), clearing stale pause notes without
+ * waiting for idle or sending a redundant Resume nudge.
+ */
+export function settleResumedSchedulingIfActive(
+  project: string,
+  taskId: string,
+  opts: { actor?: string; preTransitionState?: TaskPairState; now?: number },
+): StoredTaskPair | undefined {
+  const store = getTaskPairStore();
+  const stored = store.getPair(project, taskId);
+  if (!stored || isTerminalTaskPairStatus(stored.state.status)) return undefined;
+  const s = stored.state.scheduling;
+  if (!s || s.manual || s.dependsOn.length > 0 || !s.resumePending) return undefined;
+  const now = opts.now ?? Date.now();
+  if (now < s.since) return undefined;
+  const sideState = opts.preTransitionState ?? stored.state;
+  const side = taskPairSideToAct({ ...sideState, scheduling: undefined });
+  const active = side === 'auditor' ? sideState.auditor : side === 'executor' ? sideState.executor : undefined;
+  if (!active || active === TASK_PAIR_NO_AUDITOR || opts.actor !== active) return undefined;
+  return store.patchScheduling(project, taskId, s, {
+    ...s,
+    resumePending: false,
+    admitted: false,
+    note: undefined,
+    resumeRetryAt: undefined,
+    resumedAt: now,
+  }, now);
 }

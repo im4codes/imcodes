@@ -184,6 +184,41 @@ describe('send-tool', () => {
     }
   });
 
+  it('settles resumePending immediately when Brain sends a direct message to the active executor even in mode=off pairs projects', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain',
+      transportConfig: { supervision: { mode: 'off' } },
+    });
+    const executor = session({ name: 'deck_alpha_executor', projectName: 'alpha', role: 'w1', state: 'running' });
+    const since = Date.now() - 1000;
+    putTaskPairFixture(getTaskPairStore(), 'alpha', {
+      taskId: 'resuming-direct-send', brain: brain.name, executor: executor.name, auditor: 'none',
+      status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
+      previousAuditors: [], capCounts: {}, capRound: 0, createdAt: since - 1000, updatedAt: since,
+      scheduling: { epoch: 2, manual: false, dependsOn: [], resumePending: true, since, writer: brain.name },
+    });
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    try {
+      const result = await dispatchSendMessage({ ...caller, sessionName: brain.name }, {
+        target: executor.name, message: 'Continue with the updated brief.',
+      }, {
+        listSessions: () => [brain, executor], dispatchMessage,
+      });
+      expect(result).toMatchObject({ status: 'accepted' });
+      expect(result).not.toHaveProperty('taskId');
+      const updated = getTaskPairStore().getPair('alpha', 'resuming-direct-send')?.state;
+      expect(updated?.scheduling?.resumePending).toBe(false);
+      expect(updated?.scheduling?.resumedAt).toBeTypeOf('number');
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
   it('surfaces the caller project\'s current supervision mode and auto-audit flag', () => {
     const enabledSnapshot = normalizeSessionSupervisionSnapshot({
       mode: 'supervised_audit',

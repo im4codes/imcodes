@@ -78,6 +78,7 @@ import {
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
 import { TaskPairWriteConflictError, flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairDecisionRecord, type TaskPairLiveness } from './store.js';
+import { settleResumedSchedulingIfActive } from './suspension.js';
 import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
@@ -988,6 +989,7 @@ export class TaskPairService {
     // stamped like any other activity (throttled, in memory first).
     if (existing && this.#isIdempotentStarted(input, existing, transition, role)) {
       store.saveLivenessActivityStamp(input.project, existing.state.taskId, this.#livenessAfterMarker(existing.liveness, transition, role, now));
+      this.settleResumedPairIfActive(input.project, existing.state.taskId, { actor: input.writer, now });
       return { effect: TASK_PAIR_IDEMPOTENT_STARTED_EFFECT, fromStatus: 'working', toStatus: 'working', unusual: false, intents: [] };
     }
     // The same READY_FOR_AUDIT again while its round is open changes nothing:
@@ -1103,6 +1105,17 @@ export class TaskPairService {
         input.writer,
         { emitEvent: false },
       );
+    }
+    if (stored && !transition.unusual && transition.effect !== 'ignored' && input.marker.knownVerb
+      && (input.marker.knownVerb === 'STARTED' || input.marker.knownVerb === 'WORKING' || input.marker.knownVerb === 'CHECK'
+        || input.marker.knownVerb === 'READY_FOR_AUDIT' || input.marker.knownVerb === 'PASS' || input.marker.knownVerb === 'REWORK'
+        || input.marker.knownVerb === 'BLOCKED' || input.marker.knownVerb === 'NEEDS_INPUT' || input.marker.knownVerb === 'DONE')) {
+      stored = this.settleResumedPairIfActive(input.project, stored.state.taskId, {
+        actor: input.writer,
+        preTransitionState: existing?.state,
+        now,
+      }) ?? stored;
+      if (transition.pair) transition.pair = stored.state;
     }
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
     const holdsAutoPickAuditor = input.suppressAutoPickAuditor
@@ -1503,6 +1516,7 @@ export class TaskPairService {
           || (existing.state.auditor && existing.state.auditor !== TASK_PAIR_NO_AUDITOR && input.target === existing.state.auditor))) {
         const resolved = this.resolveBrainReply(project, input.taskId, input.sender, input.target, input.eventId);
         if (resolved) {
+          this.settleResumedPairIfActive(project, input.taskId, { actor: input.target });
           noteTaskPairFocus(input.target, input.taskId);
           return resolved;
         }
@@ -1526,6 +1540,7 @@ export class TaskPairService {
           marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: input.taskId, attrs: {} },
           source: 'implicit_dispatch', eventId: input.eventId,
         });
+        this.settleResumedPairIfActive(project, input.taskId, { actor: input.target });
         noteTaskPairFocus(input.target, input.taskId);
         return resumed;
       }
@@ -1595,6 +1610,9 @@ export class TaskPairService {
       }
       // A task-tagged send is progress on that pair, and its target now works on it.
       this.recordPairProgress(project, input.taskId, input.sender, at);
+      if (input.sender === state.brain) {
+        this.settleResumedPairIfActive(project, input.taskId, { actor: input.target, now: at });
+      }
       noteTaskPairFocus(input.target, input.taskId);
       return { effect: 'recorded', unusual, intents: [] };
     }
@@ -1700,6 +1718,32 @@ export class TaskPairService {
   recordPairProgress(project: string, taskId: string, writer: string, now: number): void {
     const pair = getTaskPairStore().getPair(project, taskId);
     if (pair) this.#stampProgress(pair, writer, now);
+  }
+
+  /** Settle a `resumePending` pair once Brain dispatches its active participant or the active participant emits pair progress. */
+  settleResumedPairIfActive(
+    project: string,
+    taskId: string,
+    opts: { actor?: string; preTransitionState?: TaskPairState; now?: number },
+  ): StoredTaskPair | undefined {
+    const now = opts.now ?? Date.now();
+    const saved = settleResumedSchedulingIfActive(project, taskId, { ...opts, now });
+    if (!saved) return undefined;
+    getTaskPairStore().saveLiveness(saved.project, saved.state.taskId, {
+      ...saved.liveness,
+      activityExecutorAt: now,
+      activityAuditorAt: now,
+      lastTickAt: now,
+      phaseStartedAt: now,
+      stageStallPromptAt: undefined,
+      stageStallEscalatedAt: undefined,
+      silenceExecutor: 0,
+      silenceAuditor: 0,
+      bothIdleNudgedAt: undefined,
+      bothIdleNudgeCount: undefined,
+    });
+    this.#scheduler?.publishBadges?.();
+    return saved;
   }
 
   /** Record non-marker activity for every open pair the participant owns. */

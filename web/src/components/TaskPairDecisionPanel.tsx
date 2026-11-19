@@ -164,9 +164,11 @@ function DecisionPanel({ taskId, pair, context, readOnly, taskTitles, initialRec
   const resolved = !!relevantRuling;
   const rulingToShow = relevantRuling ?? (latest?.kind === TASK_PAIR_DECISION_KIND.DECISION ? latest : undefined);
   const hasActiveQuestion = !!(question && !resolved);
+  const waitKind = taskPairWaitKind(pair);
+  const hasBlockingWait = waitKind === 'paused' || waitKind === 'waiting_dependencies';
   const hasNewBlocker = !!(
     pair.blockedNote?.trim()
-    || taskPairWaitKind(pair)
+    || hasBlockingWait
     || pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')
     || pair.status === 'awaiting_brain_decision'
     || pair.status === 'passed'
@@ -210,7 +212,8 @@ function DecisionPanel({ taskId, pair, context, readOnly, taskTitles, initialRec
     }
     case 'blocked': {
       const scheduling = readPairScheduling(pair.scheduling);
-      reason = [pair.blockedNote, scheduling?.note].filter(Boolean).join('\n');
+      const waitNote = hasBlockingWait ? scheduling?.note : undefined;
+      reason = [pair.blockedNote, waitNote].filter(Boolean).join('\n');
       const side = pair.flagSides?.blocked || pair.flagSides?.needs_input;
       const author = (side && (side === 'executor' ? pair.executor : pair.auditor)) || pair.executor || pair.auditor;
       if (author) {

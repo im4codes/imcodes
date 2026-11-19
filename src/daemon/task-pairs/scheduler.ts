@@ -350,7 +350,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         }
         // PASS is not completion: only the Brain's accepted DONE unlocks work.
         if (deps.every((dep) => dep?.state.status === 'done')) {
-          const next = { ...s, dependsOn: [], resumePending: !s.manual, admitted: false };
+          const next = { ...s, dependsOn: [], resumePending: !s.manual, admitted: false, ...(!s.manual ? { note: undefined } : {}) };
           const saved = store.patchScheduling(stored.project, stored.state.taskId, s, next, this.#now());
           if (!saved) continue;
           stored = saved; s = next;
@@ -382,7 +382,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
           { ...s, admitted: false, resumeRetryAt: this.#now() + TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS }, this.#now());
         continue;
       }
-      const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, resumePending: false, admitted: false, resumeRetryAt: undefined, resumedAt: this.#now() }, this.#now());
+      const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, resumePending: false, admitted: false, note: undefined, resumeRetryAt: undefined, resumedAt: this.#now() }, this.#now());
       if (!saved) continue;
       const now = this.#now();
       store.saveLiveness(saved.project, saved.state.taskId, { ...saved.liveness,
@@ -546,6 +546,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
         for (const key of keys) {
           const [project, brain] = key.split('\u0000');
           if (project && brain) void this.runQueue(project, brain).catch((error) => logger.warn({ err: error, project, brain }, 'task-pair: idle queue admission failed'));
+        }
+        if (participantPairs.some((stored) => {
+          const s = stored.state.scheduling;
+          return !!s && !s.manual && s.dependsOn.length === 0 && s.resumePending === true;
+        })) {
+          void this.reconcileSuspensions().catch((error) => logger.warn({ err: error, sessionId: event.sessionId }, 'task-pair: idle suspension reconciliation failed'));
         }
       }
     } else if (event.type === 'user.message' && event.payload.automation !== true

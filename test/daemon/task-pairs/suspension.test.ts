@@ -377,3 +377,117 @@ describe('brain-line-pass-done wake authority across passed -> done', () => {
     expect(resolveTransportQueueEntryAdmission(B, { clientMessageId: backstopNotice!.id, text: backstopNotice!.text })).toBe('stale');
   });
 });
+
+describe('resume note clearing, active-execution settle, and idle reconciliation', () => {
+  it('clears stale pause note on resumePair when no dependencies remain, while preserving dependency note when dependsOn is non-empty', async () => {
+    save('plain-pause');
+    pausePair(P, 'plain-pause', B, 'manual', [], '暂停以重写准确brief');
+    expect(get('plain-pause').scheduling?.note).toBe('暂停以重写准确brief');
+    resumePair(P, 'plain-pause', B);
+    expect(get('plain-pause').scheduling?.note).toBeUndefined();
+    expect(get('plain-pause').scheduling?.resumePending).toBe(true);
+
+    save('dep');
+    save('dep-and-manual');
+    pausePair(P, 'dep-and-manual', B, 'manual');
+    pausePair(P, 'dep-and-manual', B, 'dependencies', ['dep'], 'Wait for dep');
+    resumePair(P, 'dep-and-manual', B);
+    expect(get('dep-and-manual').scheduling).toMatchObject({ manual: false, dependsOn: ['dep'], resumePending: false, note: 'Wait for dep' });
+
+    putTaskPairFixture(getTaskPairStore(), P, { ...get('dep'), status: 'done' });
+    await automation.reconcileSuspensions();
+    expect(get('dep-and-manual').scheduling?.note).toBeUndefined();
+    expect(get('dep-and-manual').scheduling?.resumePending).toBe(false);
+    expect(get('dep-and-manual').scheduling?.resumedAt).toBeTypeOf('number');
+  });
+
+  it('settles resumePending immediately when Brain dispatches the active busy worker or the active worker emits pair activity, without redundant Resume nudges or breaking maxConcurrency', async () => {
+    save('active-send');
+    pausePair(P, 'active-send', B, 'manual', [], 'stale pause note');
+    busy.add(E);
+    resumePair(P, 'active-send', B);
+    await automation.reconcileSuspensions();
+    expect(isTaskPairSuspended(get('active-send'))).toBe(true);
+
+    // Brain sends a direct task message to the busy executor after resume:
+    // settles immediately without waiting for idle or sending a Resume nudge.
+    taskPairService.implicitDispatch({
+      project: P,
+      sender: B,
+      target: E,
+      taskId: 'active-send',
+      message: 'Continue with the updated brief',
+      eventId: 'ev-brain-resume-send',
+    });
+    expect(isTaskPairSuspended(get('active-send'))).toBe(false);
+    expect(get('active-send').scheduling).toMatchObject({
+      resumePending: false,
+      admitted: false,
+    });
+    expect(get('active-send').scheduling?.note).toBeUndefined();
+    expect(get('active-send').scheduling?.resumedAt).toBeTypeOf('number');
+    await automation.reconcileSuspensions();
+    expect(messages.filter((m) => m.id.includes(TASK_PAIR_RESUME_REASON))).toEqual([]);
+
+    // Active worker submitting a marker (even while busy, e.g. CHECK / READY_FOR_AUDIT)
+    // settles resumePending immediately too; manual pause stays paused even on stray messages.
+    save('active-marker');
+    pausePair(P, 'active-marker', B, 'manual', [], 'keep while manual');
+    taskPairService.implicitDispatch({
+      project: P,
+      sender: B,
+      target: E,
+      taskId: 'active-marker',
+      message: 'stray message while manual',
+      eventId: 'ev-manual-stray',
+    });
+    expect(get('active-marker').scheduling?.manual).toBe(true);
+    expect(isTaskPairSuspended(get('active-marker'))).toBe(true);
+
+    resumePair(P, 'active-marker', B);
+    expect(get('active-marker').scheduling?.resumePending).toBe(true);
+    taskPairService.applyMarker({
+      project: P,
+      writer: E,
+      marker: { verb: 'CHECK', knownVerb: 'CHECK', taskId: 'active-marker', attrs: { box: 'implemented', items: '1' } },
+      source: 'marker',
+      eventId: 'ev-worker-check',
+    });
+    expect(isTaskPairSuspended(get('active-marker'))).toBe(false);
+    expect(get('active-marker').scheduling?.resumePending).toBe(false);
+    expect(get('active-marker').scheduling?.note).toBeUndefined();
+
+    // Concurrency cap remains enforced for queued pairs after active-send settles.
+    getTaskPairStore().setMaxConcurrency(B, 1);
+    const e2 = 'deck_e2e_cap_exec', a2 = 'deck_e2e_cap_aud';
+    for (const [name, role] of [[e2, 'w3'], [a2, 'w4']]) upsertSession({ name, role, projectName: P, projectDir: process.env.HOME!, agentType: 'codex-sdk', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: now, updatedAt: now } as SessionRecord);
+    try {
+      putTaskPairFixture(getTaskPairStore(), P, { ...state('queued-cap', 'queued'), executor: e2, auditor: a2 });
+      await automation.runQueue(P, B);
+      expect(get('queued-cap').status).toBe('queued');
+    } finally {
+      removeSession(e2); removeSession(a2);
+    }
+  });
+
+  it('triggers reconcileSuspensions promptly when a resumePending participant transitions to idle', async () => {
+    save('idle-hook', 'in_audit');
+    pausePair(P, 'idle-hook', B, 'manual', [], 'wait for idle');
+    busy.add(A);
+    resumePair(P, 'idle-hook', B);
+    await automation.reconcileSuspensions();
+    expect(messages).toEqual([]);
+    expect(isTaskPairSuspended(get('idle-hook'))).toBe(true);
+
+    // Participant transitions to idle: observeTimelineEvent runs reconcileSuspensions immediately.
+    busy.delete(A);
+    automation.observeTimelineEvent({ sessionId: A, type: 'session.state', payload: { state: 'idle' } });
+    await automation.waitForSuspensionIdle();
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.target).toBe(A);
+    expect(messages[0]!.id).toContain(TASK_PAIR_RESUME_REASON);
+    expect(isTaskPairSuspended(get('idle-hook'))).toBe(false);
+    expect(get('idle-hook').scheduling?.note).toBeUndefined();
+  });
+});

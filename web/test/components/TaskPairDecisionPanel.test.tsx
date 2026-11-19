@@ -985,3 +985,66 @@ describe('recovery reconciles with the live console', () => {
     expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Keep draft through live catch-up');
   });
 });
+
+describe('resuming and resumed scheduling must not render blocker panel or stale pause note', () => {
+  it('returns null when pair is resuming with a stale pause note and no active blocker', () => {
+    const { container } = render(
+      <TaskPairDecisionPanel
+        taskId="task"
+        pair={{
+          status: 'working',
+          round: 1,
+          flags: [],
+          blocking: ['P0'],
+          executor: 'Ag3',
+          brain: 'BrainChief',
+          scheduling: {
+            epoch: 4,
+            manual: false,
+            dependsOn: [],
+            resumePending: true,
+            since: 1793700100000,
+            writer: 'BrainChief',
+            note: '暂停以重写准确brief',
+          },
+          decisionRevision: 'rev-1',
+        }}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByText('taskPair.decision.title')).toBeNull();
+    expect(screen.queryByText(/暂停以重写准确brief/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+  });
+
+  it('still shows a real blockedNote during resuming without leaking stale scheduling pause note', () => {
+    render(
+      <TaskPairDecisionPanel
+        taskId="task"
+        pair={{
+          status: 'working',
+          round: 1,
+          flags: ['blocked'],
+          flagSides: { blocked: 'executor' },
+          blockedNote: 'Missing staging credential',
+          blocking: ['P0'],
+          executor: 'Ag3',
+          brain: 'BrainChief',
+          scheduling: {
+            epoch: 4,
+            manual: false,
+            dependsOn: [],
+            resumePending: true,
+            since: 1793700100000,
+            writer: 'BrainChief',
+            note: '旧暂停说明',
+          },
+          decisionRevision: 'rev-1',
+        }}
+      />,
+    );
+    expect(screen.getByText('taskPair.decision.title_blocked')).toBeTruthy();
+    expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Missing staging credential');
+    expect(screen.getByTestId('expandable-task-objective-text').textContent).not.toContain('旧暂停说明');
+  });
+});

@@ -398,9 +398,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           {(() => {
             const rowWaitKind = getTaskPairWaitKind(payload);
-            if (!rowWaitKind) return null;
+            if (!rowWaitKind || rowWaitKind === 'resuming') return null;
             const rowScheduling = readPairScheduling(payload.scheduling as TaskPairScheduling | undefined);
             const deps = rowScheduling?.dependsOn ?? [];
+            if (!rowScheduling?.note && deps.length === 0) return null;
             return <small class="task-pair-status-row-meta">{rowScheduling?.note}{deps.length > 0 && t('taskPair.waiting_for_tasks', { tasks: formatTaskPairDependencyTasks(deps, taskTitles, rowScheduling?.dependencyTitles) })}</small>;
           })()}
           <TaskPairDecisionPanel taskId={String(payload.taskId)} pair={{ ...payload,

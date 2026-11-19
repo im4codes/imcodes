@@ -1023,4 +1023,46 @@ describe('pair MCP projections', () => {
     }
   });
 
+  it('clears pause note on pair_resume and settles resumePending immediately on active-executor pair_task_check', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    const execBusy = session(EXEC, 'w1', 'running');
+    const brainSess = session(BRAIN, 'brain', 'idle');
+    const audSess = session(AUD, 'w2', 'idle');
+    for (const s of [brainSess, execBusy, audSess]) upsertSession(s);
+    const all = [brainSess, execBusy, audSess];
+    try {
+      putTaskPairFixture(getTaskPairStore(), PROJECT, {
+        ...pair('tsk_mcp_check_settle', 'working'),
+        brief: '## Acceptance\n- [ ][ ] 1. Item one',
+      });
+      const brainHandlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => all } });
+      await brainHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]({
+        taskId: 'tsk_mcp_check_settle', mode: 'manual', note: '暂停以重写brief',
+      });
+      expect(getTaskPairStore().getPair(PROJECT, 'tsk_mcp_check_settle')?.state.scheduling?.note).toBe('暂停以重写brief');
+
+      const resumed = await brainHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]({ taskId: 'tsk_mcp_check_settle' });
+      expect(resumed).toMatchObject({ status: 'ok', state: 'working' });
+      expect(getTaskPairStore().getPair(PROJECT, 'tsk_mcp_check_settle')?.state.scheduling).toMatchObject({
+        manual: false, resumePending: true,
+      });
+      expect(getTaskPairStore().getPair(PROJECT, 'tsk_mcp_check_settle')?.state.scheduling?.note).toBeUndefined();
+
+      const execHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: () => all } });
+      await execHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]({
+        taskId: 'tsk_mcp_check_settle', items: [1], box: 'implemented', checked: true,
+      });
+      const afterCheck = getTaskPairStore().getPair(PROJECT, 'tsk_mcp_check_settle')?.state;
+      expect(afterCheck?.scheduling?.resumePending).toBe(false);
+      expect(afterCheck?.scheduling?.resumedAt).toBeTypeOf('number');
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
 });

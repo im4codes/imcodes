@@ -2446,7 +2446,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       const saved = savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
       if (!saved) return pairAccessError({ status: 'forbidden', pair }, caller);
-      return pairChecklistView(saved)!;
+      const settled = taskPairService.settleResumedPairIfActive(pair.project, pair.state.taskId, { actor: caller.sessionName ?? undefined, now: Date.now() }) ?? saved;
+      return pairChecklistView(settled)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;

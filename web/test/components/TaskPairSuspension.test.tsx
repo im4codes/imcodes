@@ -26,6 +26,15 @@ describe('durable Pair wait presentation', () => {
     const view = render(<TaskPairStatusPanel events={[]} serverId="source" />);
     expect(view.getByText('taskPair.status.done')).toBeTruthy(); expect(view.queryByText('taskPair.status.paused')).toBeNull();
   });
+  it('resuming does not display stale pause note or blocker panel', () => {
+    const resuming = { ...scheduling, manual: false, resumePending: true };
+    (window as W).__imcodesTaskPairSnapshot = { tasks: [row(resuming)] };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="source" />);
+    expect(view.getAllByText('taskPair.status.resuming').length).toBeGreaterThan(0);
+    expect(view.queryByText('待确认')).toBeNull();
+    expect(view.queryByText('taskPair.decision.title')).toBeNull();
+    expect(view.queryByText('taskPair.decision.ask')).toBeNull();
+  });
   it('new browser still shows the dependency wait when an older server removes private brief envelopes', () => {
     const projected = projectPairScheduling({ ...scheduling, manual: false, dependsOn: ['private-upstream'] });
     const old = JSON.parse(JSON.stringify(projected, (key, value) => key === 'brief' ? undefined : value));
