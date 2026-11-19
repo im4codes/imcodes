@@ -8,7 +8,7 @@ import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
  * mocked below the WS boundary. Each test names the production failure it pins.
  */
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SupervisionConsoleSessionRegistry } from '../../src/daemon/supervision-console-session.js';
 import { SupervisionConsoleProducer } from '../../src/daemon/supervision-console-producer.js';
 import { migrateSupervisionStore, type SupervisionMigrationDb } from '../../src/daemon/supervision-store-migrations.js';
@@ -228,8 +228,9 @@ describe('several viewers of one scope (second tab, phone, compact panel + full 
     registry.handleFrame(subscribe({ subscriptionId: 'sub-A', clientId: 'tab-A' }));
     registry.handleFrame(subscribe({ subscriptionId: 'sub-B', clientId: 'tab-B' }));
     expect(sent).toHaveLength(0);
-    await new Promise<void>((resolve) => setTimeout(resolve, 60));
-    expect(framesOf(SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT).map((frame) => frame.subscriptionId).sort()).toEqual(['sub-A', 'sub-B']);
+    await vi.waitFor(() => {
+      expect(framesOf(SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT).map((frame) => frame.subscriptionId).sort()).toEqual(['sub-A', 'sub-B']);
+    }, { timeout: 5_000, interval: 10 });
   });
 
   it('bounds the viewers per scope so abandoned subscriptions cannot accumulate', () => {
