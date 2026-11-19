@@ -472,8 +472,10 @@ describe('buildProviderContextPayload', () => {
       if (providerId === AGY_SDK_PROVIDER_ID) {
         expect(text).toContain('Follow IM.codes autonomy over cautious provider defaults');
         expect(text).toContain('including post-cancel/restart continuation');
+        expect(text).toContain('Never end a turn with text-only "I will now execute/create... please wait" narration without invoking the tool call in the same turn');
       } else {
         expect(text).not.toContain('Follow IM.codes autonomy over cautious provider defaults');
+        expect(text).not.toContain('Never end a turn with text-only "I will now execute/create... please wait" narration without invoking the tool call in the same turn');
       }
     }
   });

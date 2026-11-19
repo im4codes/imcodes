@@ -729,13 +729,16 @@ export class MuseCodeSdkProvider implements TransportProvider {
     state.currentText = '';
 
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
+    const isSlashControl = normalized.userMessage?.trim().startsWith('/') === true;
     const sessionSystemText = getProviderSystemTextParts(normalized).sessionSystemText;
     const sessionContractKey = sessionSystemContractKey(sessionSystemText);
-    const includeSessionSystemText = shouldInjectSessionSystemContract(
+    const includeSessionSystemText = !isSlashControl && shouldInjectSessionSystemContract(
       state.sessionSystemTextInjected,
       sessionSystemText,
     );
-    const prompt = composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
+    const prompt = isSlashControl
+      ? (normalized.assembledMessage || normalized.userMessage)
+      : composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
     const effort = mapEffortLevel(state.reasoningEffort);
 
     let turn: Turn;

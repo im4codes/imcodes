@@ -878,9 +878,12 @@ export class GeminiSdkProvider implements TransportProvider {
       // before settleTurn ran.)
       state.currentText = '';
       state.currentMessageId = null;
+      const isSlashControl = payload.userMessage?.trim().startsWith('/') === true;
       const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
-      const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
-      const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
+      const includeSessionSystemText = !isSlashControl && !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+      const promptBlocks = isSlashControl
+        ? [{ type: 'text' as const, text: payload.assembledMessage || payload.userMessage }]
+        : this.buildPromptContent(payload, includeSessionSystemText);
 
       // Long-lived call — agent streams sessionUpdate notifications until this
       // resolves with { stopReason }.

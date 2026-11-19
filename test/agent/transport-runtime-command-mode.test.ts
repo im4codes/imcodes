@@ -145,7 +145,9 @@ describe('TransportSessionRuntime command mode', () => {
     expect(cmd!.memoryRecall).toBeUndefined();
     expect(cmd!.startupMemory).toBeUndefined();
     expect(cmd!.messagePreamble).toBeUndefined();
-    expect(cmd!.sessionSystemText ?? '').not.toContain('Session identity that ordinary turns carry');
+    // Session-level system prompt & identity travel in system channels and must NEVER be stripped on command mode.
+    expect(cmd!.sessionSystemText).toContain('Session identity that ordinary turns carry');
+    expect(cmd!.sessionSystemText).toContain('Session description that ordinary turns carry');
     expect(searchLocalMemorySemanticMock).toHaveBeenCalledTimes(1); // the ordinary turn only
 
     // The one-shot handoff was not consumed by the command: the next ordinary turn still carries it.

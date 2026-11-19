@@ -2620,14 +2620,21 @@ export class KimiSdkProvider implements TransportProvider {
             : state.sessionSystemTextMetaDelivered && state.sessionSystemTextInjected === sessionContractKey
         ),
       );
-      const includeSessionSystemText = deliveredViaMeta
+      const isSlashControl = payload.userMessage?.trim().startsWith('/') === true;
+      const includeSessionSystemText = isSlashControl || deliveredViaMeta
         ? false
         : shouldInjectSessionSystemContract(state.sessionSystemTextInjected, sessionSystemText);
       const compactControl = isSessionControlCommandText(payload.userMessage, 'compact');
-      const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
+      const promptBlocks = isSlashControl
+        ? [{ type: 'text' as const, text: payload.assembledMessage || payload.userMessage }]
+        : this.buildPromptContent(payload, includeSessionSystemText);
       if (this.id === AGY_SDK_PROVIDER_ID) {
         const meter = state.agyContextUsage ??= new AgyContextUsage();
-        meter.beginPrompt(composeMessageSideProviderPrompt(payload, { includeSessionSystemText }));
+        meter.beginPrompt(
+          isSlashControl
+            ? (payload.assembledMessage || payload.userMessage)
+            : composeMessageSideProviderPrompt(payload, { includeSessionSystemText }),
+        );
         if (deliveredViaMeta && sessionSystemText && !state.agyContextUsageMetaSeeded) {
           meter.addText(sessionSystemText);
           state.agyContextUsageMetaSeeded = true;

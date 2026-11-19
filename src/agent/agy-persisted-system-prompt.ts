@@ -315,6 +315,19 @@ export function extractAgentIdentityBlock(text?: string): string | undefined {
 }
 
 /**
+ * Removes `<imcodes-agent-identity>...</imcodes-agent-identity>` blocks and
+ * normalizes surrounding blank lines so the non-identity base contract can be
+ * compared reliably across persisted Slot A prompts and live contracts.
+ */
+export function stripAgentIdentityBlock(text: string): string {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(new RegExp(AGENT_IDENTITY_BLOCK_RE.source, 'g'), '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
  * Reads AGY's persisted `acp_system_prompt` from `trajectory_metadata_blob`
  * (read-only, zero busy wait) so resume can avoid stacking a second Slot B prompt.
  */
@@ -410,10 +423,30 @@ export function resolveAgyResumeSystemPromptMeta(params: {
   }
 
   const persistedIdentity = extractAgentIdentityBlock(persistedPrompt);
+  const nextIdentity = extractAgentIdentityBlock(trimmedSystemText);
+
+  if (stripAgentIdentityBlock(persistedPrompt) !== stripAgentIdentityBlock(trimmedSystemText)) {
+    // Persisted Slot A is either a partial stub (e.g. slash-control stub) or an
+    // outdated base contract. Send the full contract via Slot B, and if Slot A
+    // still carries an older <imcodes-agent-identity> while the new contract
+    // omits one, append an empty identity block so stale Slot A rules cannot leak.
+    const metaToSend = persistedIdentity !== undefined && nextIdentity === undefined
+      ? `${trimmedSystemText}\n\n${EMPTY_AGENT_IDENTITY_BLOCK}`
+      : trimmedSystemText;
+    return {
+      shouldSendMeta: true,
+      metaToSend,
+      nextInjectedKey,
+      nextMetaDelivered: true,
+      // Use '' (not null) when nextIdentity is absent so a subsequent revert back
+      // to Slot A's base still clears this full-contract Slot B override once.
+      nextSlotBOverride: nextIdentity ?? '',
+    };
+  }
+
   const effectiveIdentity = activeSlotBOverride === undefined
     ? persistedIdentity
     : (activeSlotBOverride ?? undefined);
-  const nextIdentity = extractAgentIdentityBlock(trimmedSystemText);
 
   if (effectiveIdentity !== nextIdentity) {
     const metaToSend = nextIdentity

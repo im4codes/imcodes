@@ -318,9 +318,12 @@ export class PiProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown session ${sessionId}`, false);
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    const isSlashControl = payload.userMessage?.trim().startsWith('/') === true;
     const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
-    const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
-    const message = composeMessageSideProviderPrompt(payload, { includeSessionSystemText });
+    const includeSessionSystemText = !isSlashControl && !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+    const message = isSlashControl
+      ? (payload.assembledMessage || payload.userMessage)
+      : composeMessageSideProviderPrompt(payload, { includeSessionSystemText });
     if (!message.trim()) return;
     if (state.incognito && state.hasStartedChild && !state.child) {
       throw new Error('Incognito conversation ended; start a new session instead of resuming history.');

@@ -4931,7 +4931,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
-      const isSlashControl = isTransportSlashControl(message) || isCommandDispatch;
+      const isTrueSlashControl = isTransportSlashControl(message);
+      const suppressTurnContext = isTrueSlashControl || isCommandDispatch;
       const authority = resolveTransportDispatchAuthority(this.provider, {
         namespace: this._contextNamespace,
         remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
@@ -4943,7 +4944,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // particular, do not consume first-turn startup memory or run semantic
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
-      const suppressMemoryContext = this.incognito || isSlashControl || isPrivateControlDispatch;
+      const suppressMemoryContext = this.incognito || suppressTurnContext || isPrivateControlDispatch;
       // The toggle is re-read here, not only at bootstrap: a session whose
       // first-turn memory was assembled before injection was turned off must
       // still honor the switch without a restart. Managed Skills stay.
@@ -4963,7 +4964,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         ));
       const memoryRecallResult = this.incognito || isPrivateControlDispatch
         ? { artifact: null }
-        : isSlashControl
+        : suppressTurnContext
         ? {
             artifact: null,
             statusPayload: buildMemoryContextStatusPayload(message.trim().slice(0, 200), 'skipped_control_message', 'message', {
@@ -4981,10 +4982,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
       summarySyncReservation = memoryRecallResult.summaryReservation;
       const memoryRecall = memoryRecallResult.artifact;
-      const handoffPreamble = !isSlashControl && this._pendingHandoff
+      const handoffPreamble = !suppressTurnContext && this._pendingHandoff
         ? `[${this._pendingHandoff.sourceAgentType} handoff — ${this._pendingHandoff.cutoff.ts}]\n${this._pendingHandoff.text}`
         : undefined;
-      const messagePreamble = isSlashControl
+      const messagePreamble = suppressTurnContext
         ? undefined
         : this.mergeMessagePreambles(dispatchedEntries, message, handoffPreamble);
       const activeContracts = this._activeDispatchEntries
@@ -5033,7 +5034,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       const taskPairEngine = this.resolveTaskPairEngine();
       const brainContractVariant = brainContractVariantKey(automaticSupervisionEnabled, taskPairEngine);
       // Provider-native slash controls stay byte-clean, like the identity above.
-      const pairTurnCwd = isSlashControl ? undefined : this.resolvePairTurnCwd();
+      const pairTurnCwd = suppressTurnContext ? undefined : this.resolvePairTurnCwd();
       const providerTakesTurnCwd = this.provider.capabilities?.turnCwd === true;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
@@ -5045,15 +5046,16 @@ export class TransportSessionRuntime implements SessionRuntime {
           ? [`cwd: ${pairTurnCwd} (authoritative pair workspace — your shell tool still starts in the main checkout on each call; prefix every command with cd "${pairTurnCwd}" && ... or git -C "${pairTurnCwd}", and pass absolute paths under "${pairTurnCwd}" to file tools; never write in the main checkout)`, messagePreamble].filter(Boolean).join('\n')
           : messagePreamble,
         ...(pairTurnCwd && providerTakesTurnCwd ? { turnCwd: pairTurnCwd } : {}),
-        description: isSlashControl ? undefined : this._description,
-        systemPrompt: isSlashControl ? undefined : this._systemPrompt,
-        // Provider-native slash controls must remain byte-clean. The stable
-        // identity is deliberately reasserted on the next ordinary turn after
-        // /compact rather than being prepended to the control itself.
-        identityPrompt: isSlashControl ? undefined : this._identityPrompt,
-        suppressMcpMemorySearchGuidance: isSlashControl,
-        suppressAgentProgressGuidance: isSlashControl,
-        suppressFilePathReportingGuidance: isSlashControl,
+        // Session-level system prompt, identity, and IM.codes contracts are invariant
+        // across slash controls (/compact, /clear, /usage) and command-mode dispatches.
+        // Message-side providers keep slash-control prompts byte-clean by skipping
+        // prepending `sessionSystemText` when `userMessage` is a slash control.
+        description: this._description,
+        systemPrompt: this._systemPrompt,
+        identityPrompt: this._identityPrompt,
+        suppressMcpMemorySearchGuidance: false,
+        suppressAgentProgressGuidance: false,
+        suppressFilePathReportingGuidance: false,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,
@@ -5061,9 +5063,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         localProcessedFreshness: this._contextLocalProcessedFreshness,
         retryExhausted: this._contextRetryExhausted,
         sharedPolicyOverride: this._contextSharedPolicyOverride,
-        authoredContextRepository: isSlashControl ? undefined : this.resolveAuthoredContextRepository(),
-        authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
-        authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
+        authoredContextRepository: suppressTurnContext ? undefined : this.resolveAuthoredContextRepository(),
+        authoredContextLanguage: suppressTurnContext ? undefined : this._contextAuthoredContextLanguage,
+        authoredContextFilePath: suppressTurnContext ? undefined : this._contextAuthoredContextFilePath,
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
         automaticSupervisionEnabled,
         taskPairEngine,
@@ -5073,7 +5075,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {
         resolveAuthoredContext: (input) => {
-          if (isSlashControl) return Promise.resolve([]);
+          if (suppressTurnContext) return Promise.resolve([]);
           if (!input.namespace) return Promise.resolve([]);
           return resolveRuntimeAuthoredContext(input.namespace, {
             language: input.authoredContextLanguage,
@@ -5150,7 +5152,11 @@ export class TransportSessionRuntime implements SessionRuntime {
       // This variant's contract body (or its reference, when it was already
       // registered) reached the provider on this turn, so later turns on the
       // same thread re-assert it by reference -- until the mode changes.
-      this._brainContractRegisteredVariant = brainContractVariant;
+      // True slash controls skip message-side prompt prepending, so don't mark
+      // the Brain contract registered on their behalf.
+      if (!isTrueSlashControl) {
+        this._brainContractRegisteredVariant = brainContractVariant;
+      }
       for (const entry of this._activeDispatchEntries) {
         const contract = entry.registeredSystemContract;
         if (contract) this._registeredSystemContractSignatures.set(contract.contractId, contract.signature);

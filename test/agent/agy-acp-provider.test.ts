@@ -15,7 +15,9 @@ import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlit
 import {
   readPersistedAgySystemPrompt,
   reconcilePersistedAgyWorkspace,
+  resolveAgyResumeSystemPromptMeta,
   sanitizeAgyTrajectoryWorkspaceBlob,
+  stripAgentIdentityBlock,
 } from '../../src/agent/agy-persisted-system-prompt.js';
 import { pathToFileURL } from 'node:url';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
@@ -3620,19 +3622,19 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       const complete = vi.fn();
       provider.onComplete(complete);
 
-      // Cold session/resume after hibernation or daemon upgrade (outer contract tweaked, identity unchanged)
-      const upgradedOuterPrompt = `${'OUTER_SYSTEM_CONTRACT_V2 '.repeat(2400)}\n${identity}`;
+      // Cold session/resume after hibernation when base contract and identity match (CRLF / blank lines normalized)
+      const matchingSystemPrompt = `${'OUTER_SYSTEM_CONTRACT_V1 '.repeat(2400).trimEnd()}\r\n\r\n${identity}`;
       const p1 = normalizeProviderPayload('wake from hibernation');
-      p1.sessionSystemText = upgradedOuterPrompt;
-      p1.context = { ...p1.context, sessionSystemText: upgradedOuterPrompt };
+      p1.sessionSystemText = matchingSystemPrompt;
+      p1.context = { ...p1.context, sessionSystemText: matchingSystemPrompt };
       await provider.send(id, p1);
       await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
 
-      // Live syncMetaOnLoaded after refreshSessionSystemText while identity is still unchanged
+      // Live syncMetaOnLoaded after refreshSessionSystemText while base & identity remain unchanged
       provider.refreshSessionSystemText(id);
       const p2 = normalizeProviderPayload('turn after refresh');
-      p2.sessionSystemText = upgradedOuterPrompt;
-      p2.context = { ...p2.context, sessionSystemText: upgradedOuterPrompt };
+      p2.sessionSystemText = matchingSystemPrompt;
+      p2.context = { ...p2.context, sessionSystemText: matchingSystemPrompt };
       await provider.send(id, p2);
       await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
 
@@ -3800,8 +3802,6 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     },
   ])('reverts Slot B override back to Slot A baseline cleanly ($label)', async ({ initialIdentity, revertAppend, sessionId }) => {
     const outerV1 = 'OUTER_SYSTEM_CONTRACT_V1 '.repeat(2200);
-    const outerV2 = 'OUTER_SYSTEM_CONTRACT_V2 '.repeat(2200);
-    const outerV3 = 'OUTER_SYSTEM_CONTRACT_V3 '.repeat(2200);
     const identityB = '<imcodes-agent-identity>\nIDENTITY_B_DYNAMIC\n</imcodes-agent-identity>';
 
     const buildSystemText = (outer: string, idBlock?: string) => (idBlock ? `${outer}\n${idBlock}` : outer);
@@ -3834,22 +3834,22 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       identityB,
     ]);
 
-    // 3. Outer contract refresh + refreshSessionSystemText while B unchanged -> no extra resume RPC
+    // 3. refreshSessionSystemText while base & B unchanged -> no extra resume RPC
     provider.refreshSessionSystemText(routeName);
-    await sendTurn('turn-3-keep-b-outer-refresh', buildSystemText(outerV2, identityB), 3);
+    await sendTurn('turn-3-keep-b-outer-refresh', buildSystemText(outerV1, identityB), 3);
     expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(2);
 
     // 4. Revert back to Slot A baseline -> MUST send resume override to clear/replace B in Slot B
-    await sendTurn('turn-4-revert-to-a', buildSystemText(outerV2, initialIdentity), 4);
+    await sendTurn('turn-4-revert-to-a', buildSystemText(outerV1, initialIdentity), 4);
     expect((await requests()).filter((x) => x.method === 'session/resume').map((x) => x.params?._meta?.antigravity?.systemPrompt?.append ?? null)).toEqual([
       null,
       identityB,
       revertAppend,
     ]);
 
-    // 5. Outer contract refresh + refreshSessionSystemText while reverted baseline unchanged -> no extra resume RPC
+    // 5. refreshSessionSystemText while reverted baseline unchanged -> no extra resume RPC
     provider.refreshSessionSystemText(routeName);
-    await sendTurn('turn-5-keep-reverted-outer-refresh', buildSystemText(outerV3, initialIdentity), 5);
+    await sendTurn('turn-5-keep-reverted-outer-refresh', buildSystemText(outerV1, initialIdentity), 5);
     expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(3);
 
     // 6. Transport rebuild on a fresh provider instance (simulating daemon restart / hibernation wake) ->
@@ -3876,7 +3876,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       resumeId: sessionId,
     });
     const pRebuild = normalizeProviderPayload('turn-6-after-rebuild');
-    pRebuild.sessionSystemText = buildSystemText(outerV3, initialIdentity);
+    pRebuild.sessionSystemText = buildSystemText(outerV1, initialIdentity);
     pRebuild.context = { ...pRebuild.context, sessionSystemText: pRebuild.sessionSystemText };
     await providerAfterRebuild.send(routeName, pRebuild);
     await vi.waitFor(() => expect(rebuildComplete).toHaveBeenCalledTimes(1), { timeout: 5000 });
@@ -3897,6 +3897,225 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
       'turn-5-keep-reverted-outer-refresh',
     ]);
     expect(rebuildPrompts).toEqual(['turn-6-after-rebuild']);
+  });
+
+  it('resends full contract when SQLite holds a 643-byte slash-control stub without repeating on subsequent identical turns', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const slashStub = [
+      '<imcodes-cron-control> message is a trusted scheduled task.',
+      '</imcodes-cron-control>',
+      '',
+      'IM.codes session identity:',
+      '- Exact session name: deck_jdzj_brain',
+      '- Display label: Brain',
+      'X'.repeat(420),
+    ].join('\n');
+    expect(Buffer.byteLength(slashStub, 'utf8')).toBeGreaterThan(500);
+    expect(Buffer.byteLength(slashStub, 'utf8')).toBeLessThan(800);
+    await writeAgyMetadataBlobDb(root, 'stub-session', buildPersistedSystemPromptBlob(slashStub));
+
+    const id = await route(provider, 'deck_test_stub_recovery', { resumeId: 'stub-session' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const fullContract = `${'IM.codes autonomous-work policy + task_pair_markers_v1 '.repeat(900)}\n<imcodes-agent-identity>\nPROJECT_RULES\n</imcodes-agent-identity>`;
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(id, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Cold resume with 643-byte stub -> MUST deliver full contract in Slot B
+    await sendTurn('turn-1-recover-stub', fullContract, 1);
+    // 2. Repeated turn with unchanged contract hash -> MUST NOT re-send _meta / session/resume
+    await sendTurn('turn-2-same-contract', fullContract, 2);
+
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]?.params?._meta).toEqual({
+      antigravity: { systemPrompt: { append: fullContract } },
+    });
+  });
+
+  it('resends full contract on outdated base upgrade, preserves full contract across identity edits, and neutralizes stale Slot A identity', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const outerV1 = 'OUTER_CONTRACT_V1 '.repeat(1200).trim();
+    const outerV2 = 'OUTER_CONTRACT_V2_UPGRADED '.repeat(1200).trim();
+    const idA = '<imcodes-agent-identity>\nSTALE_SLOT_A_IDENTITY\n</imcodes-agent-identity>';
+    const idB = '<imcodes-agent-identity>\nLIVE_IDENTITY_B\n</imcodes-agent-identity>';
+
+    await writeAgyMetadataBlobDb(root, 'outdated-base', buildPersistedSystemPromptBlob(`${outerV1}\n${idA}`));
+    const id = await route(provider, 'deck_test_outdated_base', { resumeId: 'outdated-base' });
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const sendTurn = async (msg: string, sys: string, expectedCount: number) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = sys;
+      p.context = { ...p.context, sessionSystemText: sys };
+      await provider.send(id, p);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(expectedCount), { timeout: 5000 });
+    };
+
+    // 1. Upgraded base WITHOUT identity while Slot A carried STALE_SLOT_A_IDENTITY ->
+    //    must deliver full outerV2 AND append empty identity block to neutralize Slot A's identity.
+    await sendTurn('turn-1-upgraded-no-id', outerV2, 1);
+    // 2. Later add identity B while base stays outerV2 -> must send full outerV2 + idB (not idB alone!)
+    await sendTurn('turn-2-upgraded-with-id-b', `${outerV2}\n${idB}`, 2);
+    // 3. Revert back to original outerV1 + idA (matching Slot A) -> sends compact idA revert to clear outerV2 in Slot B
+    await sendTurn('turn-3-revert-to-v1', `${outerV1}\n${idA}`, 3);
+    // 4. Refresh while matching outerV1 + idA -> no extra session/resume
+    provider.refreshSessionSystemText(id);
+    await sendTurn('turn-4-stay-v1', `${outerV1}\n${idA}`, 4);
+
+    const resumes = (await requests()).filter((x) => x.method === 'session/resume');
+    expect(resumes).toHaveLength(3);
+    expect(resumes[0]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(`${outerV2}\n\n<imcodes-agent-identity>\n</imcodes-agent-identity>`);
+    expect(resumes[1]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(`${outerV2}\n${idB}`);
+    expect(resumes[2]?.params?._meta?.antigravity?.systemPrompt?.append).toBe(idA);
+  });
+
+  it('handles stripAgentIdentityBlock and resolveAgyResumeSystemPromptMeta boundary cases', () => {
+    const idBlock = '<imcodes-agent-identity>\nUSER_RULE\n</imcodes-agent-identity>';
+    expect(stripAgentIdentityBlock(`A\r\n\r\n${idBlock}\r\n\r\n\r\nB`)).toBe('A\n\nB');
+    expect(stripAgentIdentityBlock('   \n  ')).toBe('');
+
+    // Whitespace-only persisted prompt triggers full send
+    const onEmpty = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: '   \n  ',
+      trimmedSystemText: `FULL_CONTRACT\n${idBlock}`,
+      hasDeliveredMeta: false,
+    });
+    expect(onEmpty.shouldSendMeta).toBe(true);
+    expect(onEmpty.metaToSend).toBe(`FULL_CONTRACT\n${idBlock}`);
+
+    // Revert from mismatched full override without identity back to matching base without identity clears Slot B once
+    const step1 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: 'BASE_V1',
+      trimmedSystemText: 'BASE_V2',
+      hasDeliveredMeta: false,
+    });
+    expect(step1).toMatchObject({ shouldSendMeta: true, metaToSend: 'BASE_V2' });
+    const step2 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: 'BASE_V1',
+      trimmedSystemText: 'BASE_V1',
+      hasDeliveredMeta: step1.nextMetaDelivered,
+      activeSlotBOverride: step1.nextSlotBOverride,
+    });
+    expect(step2).toMatchObject({ shouldSendMeta: true, metaToSend: '', nextSlotBOverride: null });
+    const step3 = resolveAgyResumeSystemPromptMeta({
+      persistedPrompt: 'BASE_V1',
+      trimmedSystemText: 'BASE_V1',
+      hasDeliveredMeta: step2.nextMetaDelivered,
+      activeSlotBOverride: step2.nextSlotBOverride,
+    });
+    expect(step3.shouldSendMeta).toBe(false);
+  });
+
+  it('preserves full IM.codes contract & identity across /compact on an active AGY session and keeps /compact byte-clean', async () => {
+    const { provider, root, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_compact_preserve';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({
+      sessionKey: id,
+      sessionName: id,
+      role: 'brain',
+      description: 'AGY Brain description',
+      identityPrompt: '<imcodes-agent-identity>\nKEEP_ME_ACROSS_COMPACT\n</imcodes-agent-identity>',
+      agentId: 'model-a',
+    });
+
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+
+    try {
+      runtime.send('initial task', 't-1');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const newAppend = (await requests()).find((x) => x.method === 'session/new')?.params?._meta?.antigravity?.systemPrompt?.append as string;
+      const acpSessionId = (provider as any).sessions.get(id).acpSessionId as string;
+      await writeAgyMetadataBlobDb(root, acpSessionId, buildPersistedSystemPromptBlob(newAppend));
+
+      runtime.send('/compact', 't-compact');
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect((await requests()).filter((x) => x.method === 'session/resume')).toHaveLength(0);
+
+      runtime.send('after compact task', 't-3');
+      await vi.waitFor(() => expect(completed).toHaveLength(3), { timeout: 5000 });
+
+      const reqs = await requests();
+      const resumes = reqs.filter((x) => x.method === 'session/resume');
+      const prompts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+
+      expect(newAppend).toContain('KEEP_ME_ACROSS_COMPACT');
+      expect(newAppend).toContain('AGY Brain description');
+      // Never sends EMPTY_AGENT_IDENTITY_BLOCK or overwrites Slot B during /compact or post-compact turn
+      expect(resumes).toHaveLength(0);
+      expect(prompts).toEqual(['initial task', '/compact', 'after compact task']);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('delivers full IM.codes system contract on session/new when first turn on fresh AGY session is commandMode: true', async () => {
+    const { provider, requests } = await setup('', { AGY_ACP_FIXTURE_SYSTEM_PROMPT_META: '1' });
+    const id = 'deck_test_agy_cmd_first_turn';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({
+      sessionKey: id,
+      sessionName: id,
+      role: 'brain',
+      description: 'Fresh Brain description',
+      identityPrompt: '<imcodes-agent-identity>\nFRESH_CMD_IDENTITY\n</imcodes-agent-identity>',
+      agentId: 'model-a',
+    });
+
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+
+    try {
+      runtime.send('status probe', 'cmd-first', undefined, undefined, { commandMode: true });
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const reqs = await requests();
+      const newReq = reqs.find((x) => x.method === 'session/new');
+      const promptTexts = reqs.filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+      const append = newReq?.params?._meta?.antigravity?.systemPrompt?.append as string | undefined;
+
+      expect(append).toContain('FRESH_CMD_IDENTITY');
+      expect(append).toContain('Fresh Brain description');
+      expect(append).toContain('IM.codes autonomous-work policy');
+      expect(promptTexts).toEqual(['status probe']);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('keeps /compact byte-clean on non-meta ACP turns while delivering full sessionSystemText on the next ordinary turn', async () => {
+    const { provider, requests } = await setup('');
+    const id = await route(provider, 'deck_test_non_meta_compact_clean');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const makePayload = (msg: string) => {
+      const p = normalizeProviderPayload(msg);
+      p.sessionSystemText = 'FULL_NON_META_CONTRACT\n<imcodes-agent-identity>NON_META_ID</imcodes-agent-identity>';
+      p.context = { ...p.context, sessionSystemText: p.sessionSystemText };
+      return p;
+    };
+
+    await provider.send(id, makePayload('/compact'));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await provider.send(id, makePayload('ordinary turn'));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const prompts = (await requests()).filter((x) => x.method === 'session/prompt').map((x) => x.params.prompt[0].text);
+    expect(prompts[0]).toBe('/compact');
+    expect(prompts[1]).toContain('FULL_NON_META_CONTRACT');
+    expect(prompts[1]).toContain('NON_META_ID');
+    expect(prompts[1]).toContain('ordinary turn');
   });
 
   function encodeLenDelimitedField(fieldNum: number, payload: Uint8Array): Buffer {

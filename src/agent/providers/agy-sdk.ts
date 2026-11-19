@@ -389,8 +389,11 @@ export class AgySdkProvider implements TransportProvider {
     const sessionSystemText = getProviderSystemTextParts(normalized).sessionSystemText;
     const sessionContractKey = sessionSystemContractKey(sessionSystemText);
     const willRestart = !state.child || state.child.killed || state.child.exitCode !== null || state.childModel !== state.model;
-    const includeSessionSystemText = shouldInjectSessionSystemContract(willRestart ? undefined : state.sessionSystemTextInjected, sessionSystemText);
-    const prompt = composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
+    const isSlashControl = normalized.userMessage?.trim().startsWith('/') === true;
+    const includeSessionSystemText = !isSlashControl && shouldInjectSessionSystemContract(willRestart ? undefined : state.sessionSystemTextInjected, sessionSystemText);
+    const prompt = isSlashControl
+      ? (normalized.assembledMessage || normalized.userMessage)
+      : composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
     if (!prompt.trim()) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Cannot send an empty message to agy', false);
     }

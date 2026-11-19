@@ -335,8 +335,13 @@ describe('TransportSessionRuntime memory provenance', () => {
 
     runtime.send('/compact', 'compact-1');
     await waitForProviderSend(provider);
-    expect((provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.sessionSystemText)
-      .toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    const compactPayload = (provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+    expect(compactPayload?.userMessage).toBe('/compact');
+    expect(compactPayload?.assembledMessage).toBe('/compact');
+    expect(compactPayload?.messagePreamble).toBeUndefined();
+    expect(compactPayload?.memoryRecall).toBeUndefined();
+    expect(compactPayload?.sessionSystemText).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload?.sessionSystemText).toContain('session identity must return after compact');
     complete?.('provider-session-1', {
       id: 'compact-done',
       sessionId: 'provider-session-1',
@@ -820,5 +825,73 @@ describe('Pair pause during asynchronous pre-provider assembly', () => {
       release(); await runtime.kill(); setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined);
       resetTransportQueueStoreForTests(); resetContextStoreClientForTests();
     }
+  });
+
+  it('preserves full sessionSystemText across /compact, commandMode, and handoff without prematurely registering Brain contract on /compact', async () => {
+    let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
+    const provider = makeProvider();
+    provider.onComplete = (callback) => {
+      complete = callback;
+      return () => undefined;
+    };
+    const runtime = new TransportSessionRuntime(provider, 'deck_proj_brain');
+    await runtime.initialize({
+      sessionKey: 'deck_proj_brain',
+      sessionName: 'deck_proj_brain',
+      role: 'brain',
+      description: 'Project Brain description',
+      systemPrompt: 'Custom Brain system prompt',
+      identityPrompt: '<imcodes-agent-identity>\nPRESERVED_IDENTITY\n</imcodes-agent-identity>',
+      pendingHandoff: {
+        text: 'Handoff summary context',
+        sourceAgentType: 'claude-code-sdk',
+        sourceRuntimeType: 'transport',
+        sourceConversationKey: 'cc-prev',
+        cutoff: { epoch: 1, seq: 1, ts: 10 },
+        createdAt: Date.now(),
+        tokenCount: 5,
+      },
+    });
+
+    // 1. /compact on turn 1 keeps full sessionSystemText while keeping user text byte-clean and holding handoff
+    runtime.send('/compact', 'c-1');
+    await waitForProviderSend(provider);
+    const sendMock = provider.send as ReturnType<typeof vi.fn>;
+    const p1 = sendMock.mock.calls[0]![1];
+    expect(p1.userMessage).toBe('/compact');
+    expect(p1.assembledMessage).toBe('/compact');
+    expect(p1.messagePreamble).toBeUndefined();
+    expect(p1.sessionSystemText).toContain('PRESERVED_IDENTITY');
+    expect(p1.sessionSystemText).toContain('Project Brain description');
+    expect(p1.sessionSystemText).toContain('Custom Brain system prompt');
+    expect(p1.context?.brainContractRegistered).not.toBe(true);
+    complete?.('provider-session-1', {
+      id: 'done-c-1', sessionId: 'provider-session-1', kind: 'text', role: 'assistant',
+      content: 'ok', timestamp: Date.now(), status: 'complete',
+    });
+
+    // 2. commandMode on turn 2 keeps full sessionSystemText, keeps command raw, and holds handoff
+    runtime.send('raw shell cmd', 'cmd-2', undefined, undefined, { commandMode: true });
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+    const p2 = sendMock.mock.calls[1]![1];
+    expect(p2.userMessage).toBe('raw shell cmd');
+    expect(p2.assembledMessage).toBe('raw shell cmd');
+    expect(p2.messagePreamble).toBeUndefined();
+    expect(p2.sessionSystemText).toContain('PRESERVED_IDENTITY');
+    expect(p2.sessionSystemText).toContain('Project Brain description');
+    expect(p2.sessionSystemText).toContain('Custom Brain system prompt');
+    complete?.('provider-session-1', {
+      id: 'done-cmd-2', sessionId: 'provider-session-1', kind: 'text', role: 'assistant',
+      content: 'ok', timestamp: Date.now(), status: 'complete',
+    });
+
+    // 3. Ordinary turn 3 receives both the held handoff preamble and full sessionSystemText
+    runtime.send('continue project work', 'ord-3');
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledTimes(3), { timeout: 5_000 });
+    const p3 = sendMock.mock.calls[2]![1];
+    expect(p3.messagePreamble).toContain('Handoff summary context');
+    expect(p3.sessionSystemText).toContain('PRESERVED_IDENTITY');
+    expect(p3.sessionSystemText).toContain('Project Brain description');
+    await runtime.kill();
   });
 });
