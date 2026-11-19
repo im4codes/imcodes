@@ -84,8 +84,21 @@ describe('delegation dispatch facts', () => {
     // tool name alone is exactly how a non-durable native call could have been
     // counted as an authoritative dispatch.
     expect(isDelegationDispatchTool('codex-native', 'send_message')).toBe(false);
+    expect(isDelegationDispatchTool('codex-native', 'send_im_message')).toBe(false);
     expect(readDelegationDispatchFact('codex-native', 'send_message', TASK_ARGS, ACCEPTED_OUTPUT))
       .toBeNull();
+  });
+
+  it('recognizes send_im_message with the exact same delegation dispatch authority as send_message', () => {
+    expect(isDelegationDispatchTool(DELEGATION_AUTHORITY_MCP_SERVER, 'send_im_message')).toBe(true);
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_im_message', TASK_ARGS, ACCEPTED_OUTPUT,
+    )).toEqual({
+      dispatchId: 'send_dispatch_806104d8',
+      taskId: 'tsk_5gi',
+      assignmentId: 'asg_5gl',
+      deliveries: [{ target: 'deck_cd_brain', messageId: 'send_message_4772bca6', status: 'delivered' }],
+    });
   });
 
   it('refuses an accepted dispatch that reached nobody', () => {

@@ -57,25 +57,26 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // pause/resume Cron controls add 503 measured authored bytes to the full
 // catalog, so retain bounded headroom above the resulting 53,503-byte surface.
 // Consolidating the 6 partial Cloud Docs MCP tools into the single unified
-// `cloud_docs` CLI-passthrough tool shrinks the measured full stdio surface
-// (with alias + pool tools) from 67,616 raw bytes down to 64,592 raw bytes
-// (51,915 authored without pool/alias; ~56.3 KiB authored on full stdio).
-// Keep tight reviewable headroom above that reduced surface.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 58_500;
-// Raw = authored + the MCP SDK framing (measured 64,592 bytes on full stdio).
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 67_000;
+// Adding `send_im_message` (host-collision-safe alias of `send_message`) adds
+// one full `send_message` schema (~4.1 KiB authored / ~6 KiB raw with SDK
+// framing on full stdio: 62,614 authored / 70,654 raw bytes measured).
+// Keep tight reviewable headroom above that measured surface.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 64_500;
+// Raw = authored + the MCP SDK framing (measured 70,654 bytes on full stdio).
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 72_500;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,
  * runtime-identity, exact-alias, and verification-machine bootstrap in
  * MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE. All other schemas are explicit-on-demand.
  * The bound is intentionally tight so a new eager schema cannot quietly erase
- * the lazy-loading reduction. The 25k ceiling includes send_message's required
- * automatic-pool execution identity: that metadata is part of the core dispatch
- * contract and cannot be hidden without making supervised dispatch fail before
- * discovery. Full-surface authored/raw dual accounting below remains unchanged.
+ * the lazy-loading reduction. Adding `send_im_message` (the host-collision-safe
+ * core alias sharing `send_message`'s schema, including required automatic-pool
+ * execution identity) raises the measured dynamic bootstrap surface from ~24.7 KiB
+ * to 28,564 bytes; keep tight reviewable headroom above that measured size.
+ * Full-surface authored/raw dual accounting above remains unchanged.
  */
-export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 25_000;
+export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 29_500;
 
 export interface McpSurfaceRemoval {
   /** Dotted path of the containing object, for diagnosis when an assert fails. */

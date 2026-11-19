@@ -1746,7 +1746,14 @@ describe('memory MCP tool schema firewall', () => {
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({ target: 'deck_proj_w1', message: 'hello' })).resolves.toMatchObject({
       status: 'accepted',
     });
-    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]({ target: 'Friendly', message: 'hello' })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'validation_failed',
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]({ target: 'deck_proj_w1', message: 'hello' })).resolves.toMatchObject({
+      status: 'accepted',
+    });
+    expect(dispatchMessage).toHaveBeenCalledTimes(2);
   });
 
   it('strips forged serverId from get_memory_sources input — orchestrator never sees it', async () => {

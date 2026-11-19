@@ -32,7 +32,7 @@ export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
  * IM.codes authority; they are distinguished here by MCP server, never by name
  * alone.
  */
-export const DELEGATION_DISPATCH_TOOLS = ['send_message'] as const;
+export const DELEGATION_DISPATCH_TOOLS = ['send_message', 'send_im_message'] as const;
 
 /** Metadata field carrying the projection on a completed assistant message. */
 export const DELEGATION_CLAIM_METADATA_FIELD = 'delegationClaim';

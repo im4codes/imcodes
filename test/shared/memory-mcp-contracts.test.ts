@@ -120,6 +120,7 @@ describe('memory MCP shared contracts', () => {
       'session_close',
       'session_model',
       'send_message',
+      'send_im_message',
       'pair_task_get',
       'pair_task_update',
       'pair_task_check',
@@ -192,6 +193,9 @@ describe('memory MCP shared contracts', () => {
     expect(feedback).not.toHaveProperty('userId');
 
     const send = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+    const sendAlias = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE];
+    expect(sendAlias.inputSchema).toEqual(send.inputSchema);
+    expect(sendAlias.statusSchema).toEqual(send.statusSchema);
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;
     const deliveryMode = send.inputSchema.properties?.deliveryMode as { enum?: string[]; description?: string } | undefined;
     expect(files?.description).toMatch(/path references/i);

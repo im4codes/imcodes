@@ -159,7 +159,7 @@ describe('pair prompt consistency regressions', () => {
       buildAuditRequestMessage(reportPair, { report: 'validation', source: 'executor' }),
     ];
     for (const text of texts) {
-      expect(text).toContain('IM.codes imcodes-memory MCP send_message');
+      expect(text).toContain('IM.codes imcodes-memory MCP send_im_message');
       expect(text).toContain('{target: "<deck_* sessionName>", message: "..."}');
       expect(text).toContain('provider built-in subagent send_message ({Recipient, Message})');
       expect(text).toContain('stale delegation_reply from an earlier daemon epoch');

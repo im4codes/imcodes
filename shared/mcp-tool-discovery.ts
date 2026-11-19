@@ -51,7 +51,7 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
     id: 'supervision',
     summary: 'Delegate work, report audits, and operate the supervised task lifecycle.',
     tools: Object.freeze([
-      MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE, MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+      MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE, MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE, MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
       MEMORY_MCP_TOOL_NAMES.PAIR_LIST, MEMORY_MCP_TOOL_NAMES.PAIR_GET,
       MEMORY_MCP_TOOL_NAMES.PAIR_CREATE, MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
       MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE, MEMORY_MCP_TOOL_NAMES.PAIR_RESUME,
@@ -166,6 +166,7 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
 export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freeze([
   // delegation + audit receipts
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   // Pair inspection/config (pair_list, pair_get, pair max-concurrency) stays
   // out of the always-active bootstrap: it would push the dynamic catalog

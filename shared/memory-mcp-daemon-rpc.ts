@@ -20,6 +20,7 @@ export const MEMORY_MCP_DAEMON_TOOL_NAMES = [
   // private session map/provider registry; launching there creates a target
   // that the daemon and server cannot observe or retain.
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
   // The pair tools that create, queue, re-assign, advance or finish a pair launch and stop sub-sessions (pair_create's own ones),
   // deliver the briefs through live runtimes and announce the new session to the server. All of that is daemon state: run in a
   // stdio MCP child, pair_create made a session the daemon never saw ("session_not_found") while the pair said it was dispatched.

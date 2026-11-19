@@ -675,8 +675,9 @@ describe('memory MCP stdio server', () => {
       const cronNames = (await client.listTools()).tools.map((tool) => tool.name);
       expect(cronNames).toContain(MCP_TOOL_DISCOVERY_NAME);
       expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
-      // send_message is core, so it survives an unrelated search.
+      // send_message and send_im_message are core, so they survive an unrelated search.
       expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE);
       // ...while the previously discovered lazy tool is retired as designed.
       expect(cronNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
       // Cached self-wakeup loops survive every replacement without searching.
@@ -1157,6 +1158,25 @@ describe('memory MCP stdio server', () => {
         depth: 0,
         deliveryMode: 'append',
         emergency: true,
+      });
+
+      const aliasSend = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
+        arguments: {
+          target: 'deck_sub_peer',
+          message: 'hello from send_im_message alias',
+        },
+      });
+      expect(aliasSend.structuredContent).toMatchObject({
+        status: 'accepted',
+        deliveries: [expect.objectContaining({ target: 'deck_sub_peer', status: 'delivered' })],
+      });
+      expect(hookBodies.at(-1)).toEqual({
+        from: 'deck_sub_worker',
+        to: 'deck_sub_peer',
+        message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nhello from send_im_message alias`,
+        depth: 0,
+        deliveryMode: 'append',
       });
     } finally {
       await client.close();

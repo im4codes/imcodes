@@ -481,7 +481,7 @@ describe('buildProviderContextPayload', () => {
   });
 
   it('distinguishes cross-session IM.codes messaging from provider-native subagent messaging', () => {
-    expect(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE).toContain('IM.codes MCP send_message ({target, message})');
+    expect(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE).toContain('IM.codes MCP send_im_message (or send_message) ({target, message})');
     expect(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE).toContain('deck_* sessions');
     expect(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE).toContain('provider built-in subagent send_message ({Recipient, Message})');
   });

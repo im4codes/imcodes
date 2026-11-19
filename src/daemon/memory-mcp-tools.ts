@@ -2393,6 +2393,58 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     })}`;
   };
 
+  const handleSendMessage: MemoryMcpToolHandler = async (input) => {
+    const sessions = await sendSessions();
+    const effectiveProjectRoot = sendIdentityProjectRoot(caller, sessions);
+    const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'command', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone', 'emergency', 'enmergency', 'enmergacy']);
+    const clone = parseCloneArg(args.clone);
+    if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
+    const audit = parseAuditArg(args.audit);
+    if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
+    const task = parseTaskArg(args.task);
+    if (task && 'error' in task) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, task.error);
+    // A session's working project directory is authoritative even when the
+    // directory is not a Git checkout. Older/restored MCP registrations can
+    // omit PROJECT_ROOT, so recover it from the live session record before
+    // resolving a relative identity document.
+    const identity = await parseSendIdentityArg(args.identity, effectiveProjectRoot);
+    if (identity === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'identity is invalid');
+    const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
+    if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
+    const emergency = boolArg(args, 'emergency') ?? boolArg(args, 'enmergency') ?? boolArg(args, 'enmergacy');
+    return dispatchSendMessage({ ...caller, projectRoot: effectiveProjectRoot }, {
+      target: stringArg(args, 'target'),
+      message: stringArg(args, 'message'),
+      files: stringArrayArg(args, 'files'),
+      reply: boolArg(args, 'reply'),
+      ...(boolArg(args, SEND_COMMAND_FIELD) === true ? { command: true } : {}),
+      ...(emergency ? { emergency: true } : {}),
+      ...(audit ? { audit } : {}),
+      ...(task ? { task } : {}),
+      ...(identity ? { identity } : {}),
+      broadcast: boolArg(args, 'broadcast'),
+      idempotencyKey: stringArg(args, 'idempotencyKey'),
+      ...(deliveryMode ? { deliveryMode } : {}),
+      ...(clone ? { clone } : {}),
+    }, sendDepsWithSessions(sessions, {
+      isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
+      exactTargetOnly: true,
+      applyProvisionedIdentity: async (target, provisionedIdentity) => {
+        const saved = await identitySet({
+          scope: SESSION_IDENTITY_SCOPES.SESSION,
+          scopeKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+          content: provisionedIdentity.content,
+          ...(provisionedIdentity.sourceFile ? { sourceFile: provisionedIdentity.sourceFile } : {}),
+        }, identityOptions);
+        if (saved.status !== 'ok') return { ok: false, error: saved.message };
+        const refreshed = await refreshIdentityTarget(target);
+        return refreshed.status === 'applied' || refreshed.status === 'pending'
+          ? { ok: true }
+          : { ok: false, error: refreshed.error ?? refreshed.reason ?? 'identity refresh unavailable' };
+      },
+    })) as unknown as Promise<ToolResult>;
+  };
+
   const handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler> = {
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: async (input) => {
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
@@ -4272,57 +4324,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         },
       };
     },
-    [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
-      const sessions = await sendSessions();
-      const effectiveProjectRoot = sendIdentityProjectRoot(caller, sessions);
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'command', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone', 'emergency', 'enmergency', 'enmergacy']);
-      const clone = parseCloneArg(args.clone);
-      if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
-      const audit = parseAuditArg(args.audit);
-      if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
-      const task = parseTaskArg(args.task);
-      if (task && 'error' in task) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, task.error);
-      // A session's working project directory is authoritative even when the
-      // directory is not a Git checkout. Older/restored MCP registrations can
-      // omit PROJECT_ROOT, so recover it from the live session record before
-      // resolving a relative identity document.
-      const identity = await parseSendIdentityArg(args.identity, effectiveProjectRoot);
-      if (identity === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'identity is invalid');
-      const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
-      if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
-      const emergency = boolArg(args, 'emergency') ?? boolArg(args, 'enmergency') ?? boolArg(args, 'enmergacy');
-      return dispatchSendMessage({ ...caller, projectRoot: effectiveProjectRoot }, {
-        target: stringArg(args, 'target'),
-        message: stringArg(args, 'message'),
-        files: stringArrayArg(args, 'files'),
-        reply: boolArg(args, 'reply'),
-        ...(boolArg(args, SEND_COMMAND_FIELD) === true ? { command: true } : {}),
-        ...(emergency ? { emergency: true } : {}),
-        ...(audit ? { audit } : {}),
-        ...(task ? { task } : {}),
-        ...(identity ? { identity } : {}),
-        broadcast: boolArg(args, 'broadcast'),
-        idempotencyKey: stringArg(args, 'idempotencyKey'),
-        ...(deliveryMode ? { deliveryMode } : {}),
-        ...(clone ? { clone } : {}),
-      }, sendDepsWithSessions(sessions, {
-        isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
-        exactTargetOnly: true,
-        applyProvisionedIdentity: async (target, provisionedIdentity) => {
-          const saved = await identitySet({
-            scope: SESSION_IDENTITY_SCOPES.SESSION,
-            scopeKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
-            content: provisionedIdentity.content,
-            ...(provisionedIdentity.sourceFile ? { sourceFile: provisionedIdentity.sourceFile } : {}),
-          }, identityOptions);
-          if (saved.status !== 'ok') return { ok: false, error: saved.message };
-          const refreshed = await refreshIdentityTarget(target);
-          return refreshed.status === 'applied' || refreshed.status === 'pending'
-            ? { ok: true }
-            : { ok: false, error: refreshed.error ?? refreshed.reason ?? 'identity refresh unavailable' };
-        },
-      })) as unknown as Promise<ToolResult>;
-    },
+    [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: handleSendMessage,
+    [MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]: handleSendMessage,
     [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: async (input) => {
       const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['target', 'idempotencyKey']);
@@ -5418,6 +5421,56 @@ function toolResult(result: ToolResult, name?: MemoryMcpToolName): CallToolResul
   };
 }
 
+const sendMessageInputSchema = z.object({
+  target: z.string().optional().describe('Exact target; omit only for autoProvision.'),
+  message: z.string().describe('Request and expected output.'),
+  emergency: z.boolean().optional().describe('When true, auto-stops busy targets that do not support in-flight turn append before delivery.'),
+  enmergency: z.boolean().optional(),
+  enmergacy: z.boolean().optional(),
+  deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
+    .optional(),
+  files: z.array(z.string()).optional(),
+  reply: z.boolean().optional(),
+  command: z.boolean().optional().describe(SEND_COMMAND_DESCRIPTION),
+  task: z.object({
+    taskId: z.string().optional(), assignmentId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
+    objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
+    integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
+    auditPolicy: z.enum(SUPERVISION_TASK_AUDIT_POLICIES).optional(),
+    executionPool: z.enum(['primary', 'economy']).optional(),
+    autoProvision: z.literal(true).optional().describe('Create a NEW sub-session (never reuses one); the same top-level idempotencyKey (required) returns the same session while it is open (after session_close a repeat creates a new one). Stays open until session_close.'),
+    requestedExecutionType: z.object({
+      capabilityId: z.string(),
+      agentType: z.string(),
+      providerFamily: z.string(),
+      runtimeType: z.enum(['process', 'transport']),
+      model: z.string(),
+      ccPresetId: z.string().min(1).optional(),
+    }).strict().optional(),
+  }).strict().optional(),
+  identity: z.object({
+    content: z.string().optional().describe('Inline session-scoped Agent identity contract.'),
+    filePath: z.string().max(SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS).optional()
+      .describe('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for session-scoped startup identity.'),
+  }).strict().refine((value) => Boolean(value.content?.trim()) !== Boolean(value.filePath?.trim()), {
+    message: 'provide exactly one of content or filePath',
+  }).describe('Startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath.').optional(),
+  audit: z.object({
+    kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
+    attemptId: z.string().min(1),
+    auditedSessionName: z.string().min(1).describe('Audited session.'),
+    strictCrossVendor: z.literal(true).optional().describe('Forbid same-family degradation.'),
+  }).strict().optional().describe('Audit metadata; requires reply and exact target.'),
+  broadcast: z.boolean().optional().describe('All sessions only.'),
+  idempotencyKey: z.string().optional().describe('Replay key.'),
+  clone: z.object({
+    kind: z.literal(EXECUTION_CLONE_KIND),
+    ephemeral: z.literal(true),
+    parentRunId: z.string().min(1),
+    parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES),
+  }).strict().optional().describe('Fresh ephemeral clone; no broadcast.'),
+});
+
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: z.object({ taskId: z.string().optional().describe('Pair task id.') }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().optional().describe('Complete Markdown brief.'), title: z.string().min(1).optional().describe('Short specific title in the owner UI language; Brain only.'), titleViewerUserIds: z.array(z.string().min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS)).min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USERS).optional().describe('Brain only: update legacy title viewer metadata. Not required for Pair access or display.') }).refine((value) => value.markdown !== undefined || value.title !== undefined || value.titleViewerUserIds !== undefined, { message: 'markdown, title or titleViewerUserIds is required' }),
@@ -5700,55 +5753,8 @@ const schemas = {
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY]: z.object({ sessionId: z.string().trim().min(1).optional(), kind: z.enum(SESSION_HISTORY_KINDS).optional(), limit: z.number().int().min(1).max(SESSION_TEXT_HISTORY_MAX_LIMIT).default(SESSION_TEXT_HISTORY_DEFAULT_LIMIT).optional() }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
-  [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
-    target: z.string().optional().describe('Exact target; omit only for autoProvision.'),
-    message: z.string().describe('Request and expected output.'),
-    emergency: z.boolean().optional().describe('When true, auto-stops busy targets that do not support in-flight turn append before delivery.'),
-    enmergency: z.boolean().optional(),
-    enmergacy: z.boolean().optional(),
-    deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
-      .optional(),
-    files: z.array(z.string()).optional(),
-    reply: z.boolean().optional(),
-    command: z.boolean().optional().describe(SEND_COMMAND_DESCRIPTION),
-    task: z.object({
-      taskId: z.string().optional(), assignmentId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
-      objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
-      integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
-      auditPolicy: z.enum(SUPERVISION_TASK_AUDIT_POLICIES).optional(),
-      executionPool: z.enum(['primary', 'economy']).optional(),
-      autoProvision: z.literal(true).optional().describe('Create a NEW sub-session (never reuses one); the same top-level idempotencyKey (required) returns the same session while it is open (after session_close a repeat creates a new one). Stays open until session_close.'),
-      requestedExecutionType: z.object({
-        capabilityId: z.string(),
-        agentType: z.string(),
-        providerFamily: z.string(),
-        runtimeType: z.enum(['process', 'transport']),
-        model: z.string(),
-        ccPresetId: z.string().min(1).optional(),
-      }).strict().optional(),
-    }).strict().optional(),
-    identity: z.object({
-      content: z.string().optional().describe('Inline session-scoped Agent identity contract.'),
-      filePath: z.string().max(SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS).optional()
-        .describe('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for session-scoped startup identity.'),
-    }).strict().refine((value) => Boolean(value.content?.trim()) !== Boolean(value.filePath?.trim()), {
-      message: 'provide exactly one of content or filePath',
-    }).describe('Startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath.').optional(),
-    audit: z.object({
-      kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
-      attemptId: z.string().min(1),
-      auditedSessionName: z.string().min(1).describe('Audited session.'),
-      strictCrossVendor: z.literal(true).optional().describe('Forbid same-family degradation.'),
-    }).strict().optional().describe('Audit metadata; requires reply and exact target.'),
-    broadcast: z.boolean().optional().describe('All sessions only.'),
-    idempotencyKey: z.string().optional().describe('Replay key.'),
-    clone: z.object({
-      kind: z.literal(EXECUTION_CLONE_KIND),
-      ephemeral: z.literal(true),
-      parentRunId: z.string().min(1),
-      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES),
-    }).strict().optional().describe('Fresh ephemeral clone; no broadcast.'),
-  }),
+  [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: sendMessageInputSchema,
+  [MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]: sendMessageInputSchema,
   [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: z.object({
     target: z.string().describe('Exact result.clone.target.'),
     idempotencyKey: z.string().optional().describe('Accepted-destroy replay key.'),

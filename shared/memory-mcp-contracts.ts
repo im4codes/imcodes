@@ -152,6 +152,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SESSION_CLOSE: 'session_close',
   SESSION_MODEL: 'session_model',
   SEND_MESSAGE: 'send_message',
+  SEND_IM_MESSAGE: 'send_im_message',
   SUPERVISION_TASK_START: 'supervision_task_start',
   SUPERVISION_TASK_UPDATE: 'supervision_task_update',
   SUPERVISION_TASK_FINISH: 'supervision_task_finish',
@@ -240,6 +241,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
   MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
@@ -472,6 +474,92 @@ const objectSchema = (
 const statusSchema = objectSchema({
   status: stringSchema('Machine status for the tool result.'),
 });
+
+const SEND_MESSAGE_INPUT_SCHEMA = objectSchema({
+  target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true; auto-provision requests also require a top-level idempotencyKey.'),
+  message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
+  emergency: booleanSchema('Optional emergency flag. When true, if the target session is busy and does not support in-flight turn append, the daemon automatically force-stops the target before delivering the message, ensuring immediate steering/interruption instead of waiting in the FIFO queue.'),
+  deliveryMode: {
+    type: 'string',
+    enum: [...Object.values(MEMORY_MCP_SEND_DELIVERY_MODES)],
+    description: 'append is the default direct inter-session mode with durable fallback; queue is explicit FIFO and never inserts into the active turn.',
+  },
+  files: {
+    type: 'array',
+    description: `Optional file path references under the caller project root; at most ${MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT}; contents are not read or transferred by MCP.`,
+    items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
+    maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
+  },
+  reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id, while the daemon authenticates its current session identity and accepts bounded append-only replies. Each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+  command: booleanSchema(SEND_COMMAND_DESCRIPTION),
+  task: {
+    ...objectSchema({
+      taskId: stringSchema('Existing visible task to append; missing or inaccessible ids never create work.'),
+      assignmentId: stringSchema('Exact existing implementer assignment for an unambiguous append.'),
+      topLevelTaskId: stringSchema('Optional top-level task id.'),
+      sliceId: stringSchema('Optional slice id.'),
+      classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
+      objective: stringSchema('Task objective/title.'),
+      acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
+      ownedFiles: { description: 'Optional attribution metadata; unusable values are ignored and never become an edit ACL or validation authority.' },
+      sharedFiles: { type: 'array', items: stringSchema('Repo-relative shared path.'), description: 'Shared files.' },
+      dependencies: { type: 'array', items: stringSchema('Task dependencies.'), description: 'Dependencies.' },
+      integrationOwner: stringSchema('Integration owner assignment/session reference.'),
+      baseRevision: stringSchema('Base revision.'),
+      currentRevision: stringSchema('Current revision.'),
+      auditAttemptId: stringSchema('Matching audit attempt id.'),
+      auditRevision: stringSchema('Matching audit revision.'),
+      auditPolicy: {
+        type: 'string',
+        enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+        description: 'Explicit Brain-owned automatic-audit policy. Omit to inherit the creating Brain session snapshot.',
+      },
+      executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
+      autoProvision: { type: 'boolean', description: 'When true (target omitted), ALWAYS creates a new sub-session, never reuses one; the same top-level idempotencyKey (required) returns the same session while it is open (after session_close a repeat creates a new one). Type: requestedExecutionType (all required fields), else the configured pool\'s first executor entry, else your provider family\'s secondary model. Stays open until session_close.' },
+      requestedExecutionType: objectSchema({
+        capabilityId: stringSchema('Exact canonical capability id for the explicitly selected execution identity.'),
+        agentType: stringSchema('Explicitly selected SDK agent type.'),
+        providerFamily: stringSchema('Canonical provider family.'),
+        runtimeType: { type: 'string', enum: ['process', 'transport'] },
+        model: stringSchema('Canonical selected model.'),
+        ccPresetId: stringSchema('Optional canonical Claude Code preset identity.', { minLength: 1 }),
+      }, [...SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS]),
+    }),
+    description: 'Optional daemon-authoritative supervision task metadata. When present, accepted result returns taskId and assignmentId; idempotency replay must reuse both.',
+  },
+  identity: {
+    ...objectSchema({
+      content: stringSchema('Inline session-scoped Agent identity contract, up to 80,000 characters.'),
+      filePath: stringSchema('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for this session-scoped startup identity.', { maxLength: SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS }),
+    }),
+    anyOf: [{ required: ['content'] }, { required: ['filePath'] }],
+    description: 'Optional startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath. Different identity content is never silently reused as the same Agent session.',
+  },
+  audit: {
+    ...objectSchema({
+      kind: {
+        type: 'string',
+        enum: [AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT],
+        description: 'Exact supervision-audit purpose. Ordinary reply-enabled delegations must omit this object.',
+      },
+      attemptId: stringSchema('Exact automatic supervision audit attempt id supplied by the orchestration request.'),
+      auditedSessionName: stringSchema('Exact session being audited, chosen by the Supervisor Brain. The daemon never infers it.'),
+      strictCrossVendor: booleanSchema('Set true only when the user explicitly requires cross-vendor and forbids same-family degradation.'),
+    }, ['kind', 'attemptId', 'auditedSessionName']),
+    description: 'Strict automatic-supervision metadata. Requires reply=true, one exact target, no broadcast, and no clone.',
+  },
+  broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers. Use targeted sends for singular requests like "ask a reviewer"; use broadcast only when the user asks every/all available sessions.'),
+  idempotencyKey: stringSchema(`Optional retry key; duplicate sends within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
+  clone: {
+    ...objectSchema({
+      kind: { type: 'string', enum: [EXECUTION_CLONE_KIND], description: 'Must be the literal execution-clone kind discriminant.' },
+      ephemeral: booleanSchema('Must be true — managed execution clones are always ephemeral.'),
+      parentRunId: stringSchema('Non-empty id of the parent run that owns the created clone.'),
+      parentStage: { type: 'string', enum: [...EXECUTION_CLONE_PARENT_STAGES], description: 'Execution entry-point stage creating the clone; one of the fixed parent stages.' },
+    }, ['kind', 'ephemeral', 'parentRunId', 'parentStage']),
+    description: 'Optional execution-clone request. Routes to a fresh ephemeral clone of the resolved target, never the target itself, and returns clone.target. Cannot be combined with broadcast.',
+  },
+}, ['message']);
 
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
@@ -1069,91 +1157,13 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
     description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default; busy turns use provider append with durable FIFO fallback, idle turns start immediately. queue is opt-in FIFO only. emergency=true auto-stops busy targets that cannot append. Returns status. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
-    inputSchema: objectSchema({
-      target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true; auto-provision requests also require a top-level idempotencyKey.'),
-      message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
-      emergency: booleanSchema('Optional emergency flag. When true, if the target session is busy and does not support in-flight turn append, the daemon automatically force-stops the target before delivering the message, ensuring immediate steering/interruption instead of waiting in the FIFO queue.'),
-      deliveryMode: {
-        type: 'string',
-        enum: [...Object.values(MEMORY_MCP_SEND_DELIVERY_MODES)],
-        description: 'append is the default direct inter-session mode with durable fallback; queue is explicit FIFO and never inserts into the active turn.',
-      },
-      files: {
-        type: 'array',
-        description: `Optional file path references under the caller project root; at most ${MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT}; contents are not read or transferred by MCP.`,
-        items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
-        maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
-      },
-      reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id, while the daemon authenticates its current session identity and accepts bounded append-only replies. Each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
-      command: booleanSchema(SEND_COMMAND_DESCRIPTION),
-      task: {
-        ...objectSchema({
-          taskId: stringSchema('Existing visible task to append; missing or inaccessible ids never create work.'),
-          assignmentId: stringSchema('Exact existing implementer assignment for an unambiguous append.'),
-          topLevelTaskId: stringSchema('Optional top-level task id.'),
-          sliceId: stringSchema('Optional slice id.'),
-          classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
-          objective: stringSchema('Task objective/title.'),
-          acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
-          ownedFiles: { description: 'Optional attribution metadata; unusable values are ignored and never become an edit ACL or validation authority.' },
-          sharedFiles: { type: 'array', items: stringSchema('Repo-relative shared path.'), description: 'Shared files.' },
-          dependencies: { type: 'array', items: stringSchema('Task dependencies.'), description: 'Dependencies.' },
-          integrationOwner: stringSchema('Integration owner assignment/session reference.'),
-          baseRevision: stringSchema('Base revision.'),
-          currentRevision: stringSchema('Current revision.'),
-          auditAttemptId: stringSchema('Matching audit attempt id.'),
-          auditRevision: stringSchema('Matching audit revision.'),
-          auditPolicy: {
-            type: 'string',
-            enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
-            description: 'Explicit Brain-owned automatic-audit policy. Omit to inherit the creating Brain session snapshot.',
-          },
-          executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
-          autoProvision: { type: 'boolean', description: 'When true (target omitted), ALWAYS creates a new sub-session, never reuses one; the same top-level idempotencyKey (required) returns the same session while it is open (after session_close a repeat creates a new one). Type: requestedExecutionType (all required fields), else the configured pool\'s first executor entry, else your provider family\'s secondary model. Stays open until session_close.' },
-          requestedExecutionType: objectSchema({
-            capabilityId: stringSchema('Exact canonical capability id for the explicitly selected execution identity.'),
-            agentType: stringSchema('Explicitly selected SDK agent type.'),
-            providerFamily: stringSchema('Canonical provider family.'),
-            runtimeType: { type: 'string', enum: ['process', 'transport'] },
-            model: stringSchema('Canonical selected model.'),
-            ccPresetId: stringSchema('Optional canonical Claude Code preset identity.', { minLength: 1 }),
-          }, [...SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS]),
-        }),
-        description: 'Optional daemon-authoritative supervision task metadata. When present, accepted result returns taskId and assignmentId; idempotency replay must reuse both.',
-      },
-      identity: {
-        ...objectSchema({
-          content: stringSchema('Inline session-scoped Agent identity contract, up to 80,000 characters.'),
-          filePath: stringSchema('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for this session-scoped startup identity.', { maxLength: SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS }),
-        }),
-        anyOf: [{ required: ['content'] }, { required: ['filePath'] }],
-        description: 'Optional startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath. Different identity content is never silently reused as the same Agent session.',
-      },
-      audit: {
-        ...objectSchema({
-          kind: {
-            type: 'string',
-            enum: [AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT],
-            description: 'Exact supervision-audit purpose. Ordinary reply-enabled delegations must omit this object.',
-          },
-          attemptId: stringSchema('Exact automatic supervision audit attempt id supplied by the orchestration request.'),
-          auditedSessionName: stringSchema('Exact session being audited, chosen by the Supervisor Brain. The daemon never infers it.'),
-          strictCrossVendor: booleanSchema('Set true only when the user explicitly requires cross-vendor and forbids same-family degradation.'),
-        }, ['kind', 'attemptId', 'auditedSessionName']),
-        description: 'Strict automatic-supervision metadata. Requires reply=true, one exact target, no broadcast, and no clone.',
-      },
-      broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers. Use targeted sends for singular requests like "ask a reviewer"; use broadcast only when the user asks every/all available sessions.'),
-      idempotencyKey: stringSchema(`Optional retry key; duplicate sends within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
-      clone: {
-        ...objectSchema({
-          kind: { type: 'string', enum: [EXECUTION_CLONE_KIND], description: 'Must be the literal execution-clone kind discriminant.' },
-          ephemeral: booleanSchema('Must be true — managed execution clones are always ephemeral.'),
-          parentRunId: stringSchema('Non-empty id of the parent run that owns the created clone.'),
-          parentStage: { type: 'string', enum: [...EXECUTION_CLONE_PARENT_STAGES], description: 'Execution entry-point stage creating the clone; one of the fixed parent stages.' },
-        }, ['kind', 'ephemeral', 'parentRunId', 'parentStage']),
-        description: 'Optional execution-clone request. Routes to a fresh ephemeral clone of the resolved target, never the target itself, and returns clone.target. Cannot be combined with broadcast.',
-      },
-    }, ['message']),
+    inputSchema: SEND_MESSAGE_INPUT_SCHEMA,
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SEND_IM_MESSAGE,
+    description: 'Collision-safe alias of send_message (avoids host built-in send_message shadowing); identical schema and semantics. Send to an exact send_list_targets target; Callers and labels are invalid targets. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
+    inputSchema: SEND_MESSAGE_INPUT_SCHEMA,
     outputSchema: statusSchema,
   },
 

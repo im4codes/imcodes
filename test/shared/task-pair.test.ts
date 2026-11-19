@@ -904,10 +904,10 @@ describe('history-based child supervision contract', () => {
 describe('pair contract consistency regressions', () => {
   it('requires the MCP namespace for inter-session sends rather than provider-native or stale delegation tools', () => {
     const contract = buildTaskPairMarkerContract();
-    expect(contract).toContain('IM.codes imcodes-memory MCP send_message');
+    expect(contract).toContain('IM.codes imcodes-memory MCP send_im_message tool');
     expect(contract).toContain('{target: "<deck_* sessionName>", message: "..."}');
-    expect(contract).toContain('mcp_imcodes-memory_send_message');
-    expect(contract).toContain('load send_message via mcp_tool_search');
+    expect(contract).toContain('mcp_imcodes-memory_send_im_message');
+    expect(contract).toContain('alias send_message');
     expect(contract).toContain('provider built-in subagent send_message ({Recipient, Message})');
     expect(contract).toContain('stale delegation_reply from an earlier daemon epoch');
   });
