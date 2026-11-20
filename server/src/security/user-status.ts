@@ -41,7 +41,26 @@ export async function loadUserAccess(db: Database, userId: string): Promise<User
     'SELECT status, sessions_valid_after FROM users WHERE id = $1',
     [userId],
   );
-  return row ? { status: row.status, sessionsValidAfter: Number(row.sessions_valid_after) } : null;
+  return row ? { status: row.status, sessionsValidAfter: Number(row.sessions_valid_after ?? 0) || 0 } : null;
+}
+
+/**
+ * Minimum JWT `iat` (seconds) that satisfies `iat * 1000 >= sessionsValidAfter`.
+ */
+export function alignedSessionIssuedAt(sessionsValidAfter: number, nowMs = Date.now()): number {
+  const nowSec = Math.floor(nowMs / 1000);
+  return sessionsValidAfter > 0 ? Math.max(nowSec, Math.ceil(sessionsValidAfter / 1000)) : nowSec;
+}
+
+/**
+ * Next `sessions_valid_after` timestamp (ms) for a password change.
+ * Advances strictly past both the current second and any prior second-rounded token boundary
+ * so consecutive same-second password changes invalidate prior replacement JWTs.
+ */
+export function nextPasswordChangeValidAfter(previousValidAfter: number, nowMs = Date.now()): number {
+  const nowSec = Math.floor(nowMs / 1000);
+  const minAfterPrevBoundary = previousValidAfter > 0 ? Math.ceil(previousValidAfter / 1000) * 1000 + 1 : 0;
+  return Math.max(nowMs, nowSec * 1000 + 1, minAfterPrevBoundary);
 }
 
 /**

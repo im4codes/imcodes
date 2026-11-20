@@ -11,6 +11,7 @@ import {
 import type { Env } from '../env.js';
 import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, hashPassword } from '../security/crypto.js';
+import { alignedSessionIssuedAt, loadUserAccess } from '../security/user-status.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
@@ -69,17 +70,19 @@ async function storeRefreshToken(db: Env['DB'], userId: string, refreshHash: str
 }
 
 /**
- * Validate and canonicalize native callback URLs to the custom `imcodes://` scheme.
+ * Validate and canonicalize native callback URLs to a hierarchical `imcodes://<host>...` URL.
  */
 function validateNativeCallbackUrl(raw: string | undefined): string | null {
-  if (!raw) return null;
+  if (!raw || !raw.startsWith('imcodes://')) return null;
   let parsed: URL;
   try {
     parsed = new URL(raw);
   } catch {
     return null;
   }
-  if (parsed.protocol !== 'imcodes:') return null;
+  if (parsed.protocol !== 'imcodes:' || !parsed.hostname || parsed.username || parsed.password) {
+    return null;
+  }
   return parsed.toString();
 }
 
@@ -160,6 +163,8 @@ interface StoredPasskeyCredential {
   transports: string | null;
 }
 
+const DOC_RELAY_TICKET_PURPOSE = 'doc-relay-ticket';
+
 async function saveChallenge(
   db: Env['DB'],
   id: string,
@@ -172,14 +177,17 @@ async function saveChallenge(
     'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
     [id, challenge, userId, displayName, now + 5 * 60 * 1000, now],
   );
-  // Clean up expired challenges opportunistically
-  await db.execute('DELETE FROM passkey_challenges WHERE expires_at < $1', [now]);
+  // Clean up expired passkey challenges opportunistically without touching other purposes
+  await db.execute(
+    'DELETE FROM passkey_challenges WHERE expires_at < $1 AND display_name != $2',
+    [now, DOC_RELAY_TICKET_PURPOSE],
+  );
 }
 
 async function getChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
   const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
-    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2',
-    [id, Date.now()],
+    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND display_name != $3',
+    [id, Date.now(), DOC_RELAY_TICKET_PURPOSE],
   );
   if (!row) return null;
   return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
@@ -187,8 +195,8 @@ async function getChallenge(db: Env['DB'], id: string): Promise<PendingChallenge
 
 async function consumeChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
   const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
-    'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 RETURNING challenge, user_id, display_name',
-    [id, Date.now()],
+    'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND display_name != $3 RETURNING challenge, user_id, display_name',
+    [id, Date.now(), DOC_RELAY_TICKET_PURPOSE],
   );
   if (!row) return null;
   return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
@@ -344,6 +352,12 @@ const registerCompleteSchema = z.object({
 });
 
 passkeyRoutes.post('/register/complete', async (c) => {
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
+
   const body = await parseBody(c);
   const parsed = registerCompleteSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -423,16 +437,16 @@ passkeyRoutes.post('/register/complete', async (c) => {
   }
 
   // Native callback: issue API key + redirect (skip the second login round-trip)
-  const rawNativeCallback = c.req.query('native_callback');
-  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
-  if (rawNativeCallback !== undefined && !nativeCallback) {
-    return c.json({ error: 'invalid_callback' }, 400);
-  }
   if (nativeCallback) {
     return issueNativeAuthRedirect(c, userId, nativeCallback, { keyLabel: 'mobile-app' });
   }
 
-  const accessToken = signJwt({ sub: userId }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessInfo = await loadUserAccess(c.env.DB, userId);
+  const accessToken = signJwt(
+    { sub: userId, iat: alignedSessionIssuedAt(accessInfo?.sessionsValidAfter ?? 0) },
+    c.env.JWT_SIGNING_KEY,
+    4 * 3600,
+  );
   const refreshToken = randomHex(32);
   await storeRefreshToken(c.env.DB, userId, sha256Hex(refreshToken));
   setSessionCookies(c, accessToken, refreshToken);
@@ -462,6 +476,12 @@ const loginCompleteSchema = z.object({
 });
 
 passkeyRoutes.post('/login/complete', async (c) => {
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
+
   const body = await parseBody(c);
   const parsed = loginCompleteSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -528,11 +548,6 @@ passkeyRoutes.post('/login/complete', async (c) => {
 
   const isNativeReq = c.req.query('native') === '1';
 
-  const rawNativeCallback = c.req.query('native_callback');
-  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
-  if (rawNativeCallback !== undefined && !nativeCallback) {
-    return c.json({ error: 'invalid_callback' }, 400);
-  }
   if (isNativeReq || nativeCallback) {
     // Native app: return a persistent API key instead of setting session cookies.
     // The client stores this key in biometric-protected storage.
@@ -557,7 +572,12 @@ passkeyRoutes.post('/login/complete', async (c) => {
     return c.json({ ok: true, userId: user.id, nonce, apiKey: rawKey, keyId });
   }
 
-  const accessToken = signJwt({ sub: user.id }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessInfo = await loadUserAccess(c.env.DB, user.id);
+  const accessToken = signJwt(
+    { sub: user.id, iat: alignedSessionIssuedAt(accessInfo?.sessionsValidAfter ?? 0) },
+    c.env.JWT_SIGNING_KEY,
+    4 * 3600,
+  );
   const refreshToken = randomHex(32);
   await storeRefreshToken(c.env.DB, user.id, sha256Hex(refreshToken));
   setSessionCookies(c, accessToken, refreshToken);
@@ -576,6 +596,12 @@ const passwordSetupSchema = z.object({
 passkeyRoutes.post('/password/setup', async (c) => {
   const userId = await resolveAuthedUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
 
   const body = await parseBody(c);
   const parsed = passwordSetupSchema.safeParse(body);
@@ -646,8 +672,8 @@ passkeyRoutes.post('/password/setup', async (c) => {
   try {
     await c.env.DB.transaction(async (tx) => {
       const deleted = await tx.execute(
-        'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND user_id = $3',
-        [challengeId, Date.now(), userId],
+        'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND user_id = $3 AND display_name != $4',
+        [challengeId, Date.now(), userId, DOC_RELAY_TICKET_PURPOSE],
       );
       if (deleted.changes === 0) throw new Error('challenge_expired');
       const counterUpdate = await tx.execute(
@@ -681,11 +707,6 @@ passkeyRoutes.post('/password/setup', async (c) => {
     details: { credentialId: storedCred.id },
   }, c.env.DB);
 
-  const rawNativeCallback = c.req.query('native_callback');
-  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
-  if (rawNativeCallback !== undefined && !nativeCallback) {
-    return c.json({ error: 'invalid_callback' }, 400);
-  }
   if (nativeCallback) {
     return issueNativeAuthRedirect(c, userId, nativeCallback, {
       keyLabel: 'mobile-password-setup',

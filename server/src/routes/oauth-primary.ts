@@ -4,10 +4,10 @@ import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from
 import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import type { Env } from '../env.js';
-import { createUser, getSetting, getUserByPlatformId, updateUserStatus, upsertPlatformIdentity } from '../db/queries.js';
+import { createUser, getSetting, getUserByPlatformId, updateUserStatus, upsertPlatformIdentity, withTransaction } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
 import { rateLimiter } from '../security/lockout.js';
-import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
+import { alignedSessionIssuedAt, evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 import logger from '../util/logger.js';
 
 export type PrimaryOAuthProvider = 'github' | 'google';
@@ -113,9 +113,15 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
     const state = c.req.query('state');
     const relayToken = c.req.query('relay_token');
 
+    const OAUTH_RELAY_KEY_ID = 'oauth-relay';
     let userId: string;
     let targetOrigin: string | null = null;
     let desktopCallback: string | null = null;
+    let accessToken = '';
+    const refreshRaw = randomHex(32);
+    const refreshHash = sha256Hex(refreshRaw);
+    const familyId = randomHex(16);
+    const refreshId = randomHex(16);
 
     if (relayToken) {
       const payload = verifyJwt(relayToken, c.env.JWT_SIGNING_KEY);
@@ -133,24 +139,45 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
       if (typeof payload.origin !== 'string' || payload.origin !== actualOrigin) {
         return c.json({ error: 'invalid_relay_origin' }, 401);
       }
-      const relayNonce = `oauth-relay:${payload.jti}`;
-      if (!rateLimiter.consumeJti(relayNonce, 120_000)) {
-        return c.json({ error: 'relay_token_replayed' }, 401);
-      }
-      const consumedNonce = await c.env.DB.queryOne<{ user_id: string }>(
-        'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 RETURNING user_id',
-        [relayNonce, Date.now()],
-      );
-      if (!consumedNonce || consumedNonce.user_id !== payload.sub) {
-        return c.json({ error: 'relay_token_replayed' }, 401);
-      }
-      userId = payload.sub;
+      const relayNonce = `${OAUTH_RELAY_KEY_ID}:${payload.jti}`;
       targetOrigin = payload.origin;
       desktopCallback = typeof payload.desktopCallback === 'string'
         ? parseDesktopSetupCallbackUrl(payload.desktopCallback)?.href ?? null
         : null;
-      const relayDecision = evaluateUserAccess(await loadUserAccess(c.env.DB, userId));
-      if (!relayDecision.ok) return c.json({ error: relayDecision.code }, 403);
+
+      const relayResult = await withTransaction(c.env.DB, async (tx) => {
+        const txNow = Date.now();
+        const consumedNonce = await tx.queryOne<{ user_id: string }>(
+          'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 AND key_id = $3 RETURNING user_id',
+          [relayNonce, txNow, OAUTH_RELAY_KEY_ID],
+        );
+        if (!consumedNonce || consumedNonce.user_id !== payload.sub) {
+          return { ok: false as const, status: 401 as const, error: 'relay_token_replayed' };
+        }
+        const access = await loadUserAccess(tx, payload.sub);
+        const relayDecision = evaluateUserAccess(access);
+        if (!relayDecision.ok) {
+          return { ok: false as const, status: 403 as const, error: relayDecision.code };
+        }
+        await tx.execute(
+          'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+          [refreshId, payload.sub, refreshHash, familyId, txNow + 30 * 24 * 3600 * 1000, txNow],
+        );
+        const token = signJwt(
+          { sub: payload.sub, type: ACCOUNT_SESSION_JWT_TYPE, iat: alignedSessionIssuedAt(access?.sessionsValidAfter ?? 0, txNow) },
+          c.env.JWT_SIGNING_KEY,
+          4 * 3600,
+        );
+        return { ok: true as const, token };
+      });
+      if (!relayResult.ok) {
+        return c.json({ error: relayResult.error }, relayResult.status);
+      }
+      if (!rateLimiter.consumeJti(relayNonce, 120_000)) {
+        return c.json({ error: 'relay_token_replayed' }, 401);
+      }
+      userId = payload.sub;
+      accessToken = relayResult.token;
     } else {
       if (!code || !state) {
         return c.json({ error: 'missing_params' }, 400);
@@ -204,30 +231,38 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
         if (regEnabled === 'false') {
           return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
         }
-        user = await createUser(c.env.DB, randomHex(16));
         const requireApproval = await getSetting(c.env.DB, 'require_approval');
-        if (requireApproval === 'true') {
-          await updateUserStatus(c.env.DB, user.id, 'pending');
-        }
-        await upsertPlatformIdentity(c.env.DB, randomHex(16), user.id, config.provider, exchanged.platformUserId);
+        user = await withTransaction(c.env.DB, async (tx) => {
+          const created = await createUser(tx, randomHex(16));
+          if (requireApproval === 'true') {
+            await updateUserStatus(tx, created.id, 'pending');
+          }
+          await upsertPlatformIdentity(tx, randomHex(16), created.id, config.provider, exchanged.platformUserId);
+          return created;
+        });
       }
       userId = user.id;
 
-      const loginDecision = evaluateUserAccess(await loadUserAccess(c.env.DB, userId));
+      const loginAccess = await loadUserAccess(c.env.DB, userId);
+      const loginDecision = evaluateUserAccess(loginAccess);
       if (!loginDecision.ok) return c.json({ error: loginDecision.code }, 403);
 
       if (isCrossDomain && targetOrigin) {
         const jti = randomHex(16);
         const now = Date.now();
-        const relayNonce = `oauth-relay:${jti}`;
-        await c.env.DB.execute(
-          'DELETE FROM auth_nonces WHERE key_id = $1 AND expires_at < $2',
-          ['oauth-relay', now],
-        );
-        await c.env.DB.execute(
-          'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-          [relayNonce, '', userId, 'oauth-relay', now + 120_000, now],
-        );
+        const relayNonce = `${OAUTH_RELAY_KEY_ID}:${jti}`;
+        // Cover the full integer-second verifyJwt acceptance window for a 120s token.
+        const nonceExpiresAt = (Math.floor(now / 1000) + 121) * 1000;
+        await withTransaction(c.env.DB, async (tx) => {
+          await tx.execute(
+            'DELETE FROM auth_nonces WHERE key_id = $1 AND expires_at < $2',
+            [OAUTH_RELAY_KEY_ID, now],
+          );
+          await tx.execute(
+            'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+            [relayNonce, '', userId, OAUTH_RELAY_KEY_ID, nonceExpiresAt, now],
+          );
+        });
         const relay = signJwt(
           { sub: userId, type: 'auth-relay', origin: targetOrigin, jti, ...(desktopCallback ? { desktopCallback } : {}) },
           c.env.JWT_SIGNING_KEY,
@@ -238,19 +273,20 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
         logger.info({ provider: config.provider, targetOrigin }, 'oauth callback: relaying to proxy domain with token');
         return c.redirect(relayUrl.toString());
       }
+
+      const now = Date.now();
+      await c.env.DB.execute(
+        'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+        [refreshId, userId, refreshHash, familyId, now + 30 * 24 * 3600 * 1000, now],
+      );
+      accessToken = signJwt(
+        { sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, iat: alignedSessionIssuedAt(loginAccess?.sessionsValidAfter ?? 0, now) },
+        c.env.JWT_SIGNING_KEY,
+        4 * 3600,
+      );
     }
 
     const isSecure = c.env.NODE_ENV === 'production';
-    const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
-
-    const refreshRaw = randomHex(32);
-    const refreshHash = sha256Hex(refreshRaw);
-    const familyId = randomHex(16);
-    const refreshId = randomHex(16);
-    await c.env.DB.execute(
-      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-      [refreshId, userId, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
-    );
 
     setCookie(c, 'rcc_session', accessToken, {
       httpOnly: true,

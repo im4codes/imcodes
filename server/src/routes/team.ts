@@ -3,6 +3,7 @@ import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import type { Database } from '../db/client.js';
+import { withTransaction } from '../db/queries.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { mutateAndRevalidateMachineGroupAccess } from '../ws/machine-group-revalidation.js';
@@ -114,17 +115,20 @@ teamRoutes.post('/join/:token', requireAuth(), async (c) => {
   const token = c.req.param('token');
   const now = Date.now();
 
-  const invite = await c.env.DB.queryOne<{ id: string; team_id: string; role: string }>(
-    'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, team_id, role',
-    [now, token],
-  );
-  if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
+  const invite = await withTransaction(c.env.DB, async (tx) => {
+    const row = await tx.queryOne<{ id: string; team_id: string; role: string }>(
+      'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, team_id, role',
+      [now, token],
+    );
+    if (!row) return null;
 
-  // Add to team
-  await c.env.DB.execute(
-    'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-    [invite.team_id, userId, invite.role, now],
-  );
+    await tx.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+      [row.team_id, userId, row.role, now],
+    );
+    return row;
+  });
+  if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
 
   await logAudit({ userId, action: 'team.joined', details: { teamId: invite.team_id, via: 'invite' } }, c.env.DB);
 
@@ -139,16 +143,20 @@ teamRoutes.post('/:id/join', requireAuth(), async (c) => {
   const now = Date.now();
 
   if (body.token) {
-    const invite = await c.env.DB.queryOne<{ id: string; role: string }>(
-      'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND team_id = $3 AND used_at IS NULL AND expires_at > $1 RETURNING id, role',
-      [now, body.token, teamId],
-    );
-    if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
+    const invite = await withTransaction(c.env.DB, async (tx) => {
+      const row = await tx.queryOne<{ id: string; role: string }>(
+        'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND team_id = $3 AND used_at IS NULL AND expires_at > $1 RETURNING id, role',
+        [now, body.token, teamId],
+      );
+      if (!row) return null;
 
-    await c.env.DB.execute(
-      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-      [teamId, userId, invite.role, now],
-    );
+      await tx.execute(
+        'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+        [teamId, userId, row.role, now],
+      );
+      return row;
+    });
+    if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
 
     await logAudit({ userId, action: 'team.joined', details: { teamId, via: 'invite' } }, c.env.DB);
     return c.json({ ok: true, role: invite.role });

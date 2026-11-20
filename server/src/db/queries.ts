@@ -1765,3 +1765,10 @@ export async function writeAuditLog(
     [id, userId, serverId, action, JSON.stringify(details), ipAddress, Date.now()],
   );
 }
+
+/** Run `fn` inside a database transaction when supported, falling back to direct execution on minimal unit-test mocks. */
+export async function withTransaction<T>(db: Database, fn: (tx: Database) => Promise<T>): Promise<T> {
+  return typeof (db as { transaction?: Database['transaction'] }).transaction === 'function'
+    ? db.transaction(fn)
+    : fn(db);
+}

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
-import { createServer, getServerById, updateServerToken } from '../db/queries.js';
+import { createServer, getServerById, updateServerToken, withTransaction } from '../db/queries.js';
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
 import { rateLimiter } from '../security/lockout.js';
@@ -45,19 +45,21 @@ bindRoutes.post('/confirm', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const { code } = parsed.data;
-  const pending = await c.env.DB.queryOne<{ code: string; user_id: string; server_name: string }>(
-    `DELETE FROM pending_binds WHERE code = $1 AND expires_at > $2 AND ${activeUserExistsSql('user_id')} RETURNING code, user_id, server_name`,
-    [code, Date.now()],
-  );
-
-  if (!pending) return c.json({ error: 'invalid_code' }, 404);
-
-  // Generate daemon auth token
   const rawToken = randomHex(32);
   const tokenHash = sha256Hex(rawToken);
-
   const serverId = randomHex(16);
-  await createServer(c.env.DB, serverId, pending.user_id, pending.server_name, tokenHash);
+
+  const pending = await withTransaction(c.env.DB, async (tx) => {
+    const row = await tx.queryOne<{ code: string; user_id: string; server_name: string }>(
+      `DELETE FROM pending_binds WHERE code = $1 AND expires_at > $2 AND ${activeUserExistsSql('user_id')} RETURNING code, user_id, server_name`,
+      [code, Date.now()],
+    );
+    if (!row) return null;
+    await createServer(tx, serverId, row.user_id, row.server_name, tokenHash);
+    return row;
+  });
+
+  if (!pending) return c.json({ error: 'invalid_code' }, 404);
 
   await logAudit({ userId: pending.user_id, action: 'bind.confirm', ip, details: { serverId } }, c.env.DB);
 

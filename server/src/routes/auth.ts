@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
-import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
+import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus, withTransaction } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkAuthLockout, rateLimiter, recordAuthFailure } from '../security/lockout.js';
 import { DOC_COLLABORATOR_SCOPE_REFUSAL, requireAuth, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
@@ -11,7 +11,8 @@ import {
   DESKTOP_SETUP_CALLBACK_QUERY_PARAM,
   parseDesktopSetupCallbackUrl,
 } from '../../../shared/desktop-setup-auth.js';
-import { isUserActive } from '../security/user-status.js';
+import { alignedSessionIssuedAt, isUserActive, nextPasswordChangeValidAfter } from '../security/user-status.js';
+import { isUserStatusActive } from '../../../shared/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
@@ -27,6 +28,8 @@ export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string;
 
 const AUTH_NONCE_TTL_MS = 60_000;
 const AUTH_NONCE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const OAUTH_RELAY_KEY_ID = 'oauth-relay';
+const DOC_RELAY_TICKET_PURPOSE = 'doc-relay-ticket';
 
 let authNonceCleanupDb: Database | null = null;
 let authNonceCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -138,7 +141,10 @@ export async function issueAuthNonce(
 }
 
 export async function cleanupExpiredAuthNonces(db: Database): Promise<number> {
-  const result = await db.execute('DELETE FROM auth_nonces WHERE expires_at < $1', [Date.now()]);
+  const result = await db.execute(
+    'DELETE FROM auth_nonces WHERE expires_at < $1 AND key_id != $2',
+    [Date.now(), OAUTH_RELAY_KEY_ID],
+  );
   return result.changes ?? 0;
 }
 
@@ -423,14 +429,14 @@ authRoutes.post('/token-exchange', async (c) => {
 
   const now = Date.now();
   const nonceRow = await c.env.DB.queryOne<{ api_key: string; user_id: string; key_id: string }>(
-    'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 RETURNING api_key, user_id, key_id',
-    [parsed.data.nonce, now],
+    'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 AND key_id != $3 RETURNING api_key, user_id, key_id',
+    [parsed.data.nonce, now, OAUTH_RELAY_KEY_ID],
   );
 
   if (!nonceRow) {
     const existing = await c.env.DB.queryOne<{ user_id: string; expires_at: number }>(
-      'SELECT user_id, expires_at FROM auth_nonces WHERE nonce = $1',
-      [parsed.data.nonce],
+      'SELECT user_id, expires_at FROM auth_nonces WHERE nonce = $1 AND key_id != $2',
+      [parsed.data.nonce, OAUTH_RELAY_KEY_ID],
     );
     await logAuthAudit(c, {
       userId: existing?.user_id,
@@ -526,51 +532,83 @@ authRoutes.post('/refresh', async (c) => {
   const tokenHash = sha256Hex(refreshToken);
   const now = Date.now();
 
-  // Atomically consume unused, non-expired refresh token so concurrent requests cannot
-  // rotate the same token twice. Already-consumed tokens are rejected without family revocation.
-  const row = await c.env.DB.queryOne<{ id: string; user_id: string; family_id: string }>(
-    'UPDATE refresh_tokens SET used_at = $1 WHERE token_hash = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, user_id, family_id',
-    [now, tokenHash],
+  // Read-only lookup first so temporary account lockout never consumes the refresh token.
+  const peek = await c.env.DB.queryOne<{ user_id: string }>(
+    'SELECT user_id FROM refresh_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2',
+    [tokenHash, now],
   );
-
-  if (!row) {
+  if (!peek) {
     logger.warn({ hashPrefix: tokenHash.slice(0, 8) }, '[refresh] token not found, already used, or expired');
     return c.json({ error: 'invalid_token' }, 401);
-  }
-
-  // Reject disabled/pending users — prevents token refresh after admin disables account
-  const refreshUser = await getUserById(c.env.DB, row.user_id);
-  if (!refreshUser || refreshUser.status !== 'active') {
-    return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   // A valid refresh token is not a brute-force attempt. In particular, never
   // consult a shared IP bucket here: one user's password failures must not
   // invalidate refresh for every other logged-in user.
-  const userLockout = await checkAuthLockout(c.env.DB, `user:${row.user_id}`);
-  if (userLockout.locked) {
-    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
+  const preLockout = await checkAuthLockout(c.env.DB, `user:${peek.user_id}`);
+  if (preLockout.locked) {
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: preLockout.lockedUntil ? preLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
-  logger.info({ tokenId: row.id }, '[refresh] token consumed, issuing new pair');
-
-  // Issue new access (4h) + refresh (30d) tokens
-  // Preserve restricted doc_collaborator scope across token rotation
-  const isDocCollabRefresh = typeof row.family_id === 'string' && row.family_id.startsWith('doc_collab:');
-  const accessToken = signJwt(
-    isDocCollabRefresh
-      ? { sub: row.user_id, type: ACCOUNT_SESSION_JWT_TYPE, scope: 'doc_collaborator' }
-      : { sub: row.user_id },
-    c.env.JWT_SIGNING_KEY,
-    4 * 3600,
-  );
   const newRefresh = randomHex(32);
   const newRefreshHash = sha256Hex(newRefresh);
   const newRefreshId = randomHex(16);
-  await c.env.DB.execute(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-    [newRefreshId, row.user_id, newRefreshHash, row.family_id, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
-  );
+
+  // Lock users row before updating refresh_tokens (same lock order as /password/change) so an
+  // in-flight refresh cannot race past a concurrent password change or disable and still mint a new pair.
+  const txResult = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ id: string; status: string; sessions_valid_after: string | number }>(
+      'SELECT id, status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [peek.user_id],
+    );
+    if (!lockedUser || lockedUser.status !== 'active') {
+      return { ok: false as const, status: 403 as const, error: AUTH_ERROR_CODES.ACCOUNT_DISABLED };
+    }
+
+    const userLockout = await checkAuthLockout(tx, `user:${lockedUser.id}`);
+    if (userLockout.locked) {
+      return {
+        ok: false as const,
+        status: 429 as const,
+        error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+        retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0,
+      };
+    }
+
+    const txNow = Date.now();
+    const row = await tx.queryOne<{ id: string; user_id: string; family_id: string }>(
+      'UPDATE refresh_tokens SET used_at = $1 WHERE token_hash = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, user_id, family_id',
+      [txNow, tokenHash],
+    );
+    if (!row) {
+      return { ok: false as const, status: 401 as const, error: 'invalid_token' };
+    }
+
+    const isDocCollabRefresh = typeof row.family_id === 'string' && row.family_id.startsWith('doc_collab:');
+    const iat = alignedSessionIssuedAt(Number(lockedUser.sessions_valid_after ?? 0) || 0, txNow);
+    const accessToken = signJwt(
+      isDocCollabRefresh
+        ? { sub: row.user_id, type: ACCOUNT_SESSION_JWT_TYPE, scope: 'doc_collaborator', iat }
+        : { sub: row.user_id, iat },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [newRefreshId, row.user_id, newRefreshHash, row.family_id, txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    return { ok: true as const, tokenId: row.id, accessToken };
+  });
+
+  if (!txResult.ok) {
+    if (txResult.status === 429) {
+      return c.json({ error: txResult.error, retryAfterMs: txResult.retryAfterMs }, 429);
+    }
+    return c.json({ error: txResult.error }, txResult.status);
+  }
+
+  logger.info({ tokenId: txResult.tokenId }, '[refresh] token consumed, issuing new pair');
+  const accessToken = txResult.accessToken;
 
   const isSecure = c.env.NODE_ENV === 'production';
 
@@ -838,17 +876,73 @@ authRoutes.post('/password/login', async (c) => {
     return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
-  // Issue access (4h) + refresh (30d) tokens
-  const accessToken = signJwt({ sub: user.id, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  // Lock users row before issuing tokens and confirm the password hash is still the one verified above.
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
   const familyId = randomHex(16);
   const refreshId = randomHex(16);
-  await c.env.DB.execute(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-    [refreshId, user.id, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
-  );
+  const rawKey = native ? `deck_${randomHex(32)}` : undefined;
+  const keyId = native ? randomHex(16) : undefined;
 
+  const loginTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{
+      id: string;
+      password_hash: string | null;
+      status: string;
+      password_must_change: boolean | null;
+      sessions_valid_after: string | number;
+    }>(
+      'SELECT id, password_hash, status, password_must_change, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [user.id],
+    );
+    if (!lockedUser || lockedUser.password_hash !== user.password_hash) {
+      return { ok: false as const, status: 401 as const, error: AUTH_ERROR_CODES.INVALID_CREDENTIALS };
+    }
+    if (lockedUser.status !== 'active') {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
+      };
+    }
+    const txLockout = await checkAuthLockout(tx, `user:${user.id}`);
+    if (txLockout.locked) {
+      return {
+        ok: false as const,
+        status: 429 as const,
+        error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+        retryAfterMs: txLockout.lockedUntil ? txLockout.lockedUntil - Date.now() : 0,
+      };
+    }
+
+    const txNow = Date.now();
+    const iat = alignedSessionIssuedAt(Number(lockedUser.sessions_valid_after ?? 0) || 0, txNow);
+    const accessToken = signJwt(
+      { sub: user.id, type: ACCOUNT_SESSION_JWT_TYPE, iat },
+      c.env.JWT_SIGNING_KEY,
+      4 * 3600,
+    );
+    await tx.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [refreshId, user.id, refreshHash, familyId, txNow + 30 * 24 * 3600 * 1000, txNow],
+    );
+    if (native && rawKey && keyId) {
+      await tx.execute(
+        'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+        [keyId, user.id, sha256Hex(rawKey), 'native-password-login', txNow],
+      );
+    }
+    return { ok: true as const, accessToken, passwordMustChange: !!lockedUser.password_must_change };
+  });
+
+  if (!loginTx.ok) {
+    if (loginTx.status === 429) {
+      return c.json({ error: loginTx.error, retryAfterMs: loginTx.retryAfterMs }, 429);
+    }
+    return c.json({ error: loginTx.error }, loginTx.status);
+  }
+
+  const { accessToken, passwordMustChange } = loginTx;
   const isSecure = c.env.NODE_ENV === 'production';
   setCookie(c, COOKIE_SESSION, accessToken, {
     httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
@@ -862,26 +956,12 @@ authRoutes.post('/password/login', async (c) => {
 
   await logAuthAudit(c, { userId: user.id, action: 'auth.password_login', ip }, c.env.DB);
 
-  // Native apps need a long-lived API key (cookies don't work in Capacitor).
-  let apiKey: string | undefined;
-  let keyId: string | undefined;
-  if (native) {
-    const rawKey = `deck_${randomHex(32)}`;
-    keyId = randomHex(16);
-    const keyHash = sha256Hex(rawKey);
-    await c.env.DB.execute(
-      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
-      [keyId, user.id, keyHash, 'native-password-login', Date.now()],
-    );
-    apiKey = rawKey;
-  }
-
   return c.json({
     ok: true,
-    passwordMustChange: !!user.password_must_change,
+    passwordMustChange,
     accessToken,
     refreshToken: refreshRaw,
-    ...(native ? { apiKey, keyId, userId: user.id } : {}),
+    ...(native ? { apiKey: rawKey, keyId, userId: user.id } : {}),
   });
 });
 
@@ -946,32 +1026,63 @@ authRoutes.post('/password/change', async (c) => {
   }
 
   const newHash = await hashPassword(newPassword);
-  const now = Date.now();
-  const nowSec = Math.floor(now / 1000);
-  const newValidAfter = Math.max(now, nowSec * 1000 + 1);
-  await c.env.DB.execute(
-    'UPDATE users SET password_hash = $1, password_must_change = false, sessions_valid_after = GREATEST(sessions_valid_after, $3) WHERE id = $2',
-    [newHash, userId, newValidAfter],
-  );
-  await c.env.DB.execute(
-    'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
-    [now, userId],
-  );
-
   const hadSessionCookie = !c.req.header('Authorization') && !!getCookie(c, COOKIE_SESSION);
-  if (hadSessionCookie && c.env.JWT_SIGNING_KEY) {
-    const isSecure = c.env.NODE_ENV === 'production';
-    const nextIat = Math.ceil(newValidAfter / 1000);
-    const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, iat: nextIat }, c.env.JWT_SIGNING_KEY, 4 * 3600);
-    const refreshRaw = randomHex(32);
-    await c.env.DB.execute(
-      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
-      [randomHex(16), userId, sha256Hex(refreshRaw), randomHex(16), now + 30 * 24 * 3600 * 1000, now],
+
+  const changeTx = await withTransaction(c.env.DB, async (tx) => {
+    const lockedUser = await tx.queryOne<{ id: string; password_hash: string | null; status: string; sessions_valid_after: string | number }>(
+      'SELECT id, password_hash, status, sessions_valid_after FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
     );
-    setCookie(c, COOKIE_SESSION, accessToken, {
+    if (!lockedUser || !lockedUser.password_hash) {
+      return { ok: false as const, status: 400 as const, error: 'no_password_set' };
+    }
+    if (lockedUser.password_hash !== user.password_hash) {
+      return { ok: false as const, status: 401 as const, error: 'invalid_old_password' };
+    }
+    if (!isUserStatusActive(lockedUser.status)) {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        error: lockedUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED,
+      };
+    }
+
+    const txNow = Date.now();
+    const prevValidAfter = Number(lockedUser.sessions_valid_after ?? 0) || 0;
+    const newValidAfter = nextPasswordChangeValidAfter(prevValidAfter, txNow);
+
+    await tx.execute(
+      'UPDATE users SET password_hash = $1, password_must_change = false, sessions_valid_after = GREATEST(sessions_valid_after, $3) WHERE id = $2',
+      [newHash, userId, newValidAfter],
+    );
+    await tx.execute(
+      'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
+      [txNow, userId],
+    );
+
+    if (hadSessionCookie && c.env.JWT_SIGNING_KEY) {
+      const nextIat = alignedSessionIssuedAt(newValidAfter, txNow);
+      const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, iat: nextIat }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+      const refreshRaw = randomHex(32);
+      await tx.execute(
+        'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+        [randomHex(16), userId, sha256Hex(refreshRaw), randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
+      );
+      return { ok: true as const, accessToken, refreshRaw };
+    }
+    return { ok: true as const, accessToken: null, refreshRaw: null };
+  });
+
+  if (!changeTx.ok) {
+    return c.json({ error: changeTx.error }, changeTx.status);
+  }
+
+  if (changeTx.accessToken && changeTx.refreshRaw) {
+    const isSecure = c.env.NODE_ENV === 'production';
+    setCookie(c, COOKIE_SESSION, changeTx.accessToken, {
       httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
     });
-    setCookie(c, 'rcc_refresh', refreshRaw, {
+    setCookie(c, 'rcc_refresh', changeTx.refreshRaw, {
       httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
     });
     const existingCsrf = getCookie(c, COOKIE_CSRF);
@@ -1018,13 +1129,6 @@ authRoutes.post('/logout', async (c) => {
 // ── Keyless Central OAuth Relay for Document Collaborators (GitHub & Google) ──
 
 const DOC_SHARE_RELAY_CALLBACK_PATH = '/api/doc-shares/auth-relay/callback';
-const consumedDocRelayTickets = new Map<string, number>();
-
-function cleanupConsumedDocRelayTickets(now = Date.now()): void {
-  for (const [jti, expiresAt] of consumedDocRelayTickets) {
-    if (expiresAt <= now) consumedDocRelayTickets.delete(jti);
-  }
-}
 
 function isAllowedDocRelayOrigin(
   env: { SERVER_URL: string; ALLOWED_ORIGINS?: string },
@@ -1267,7 +1371,6 @@ const verifyRelayTicketSchema = z.object({
 });
 
 authRoutes.post('/relay/verify', async (c) => {
-  cleanupConsumedDocRelayTickets();
   const body = await c.req.json().catch(() => null);
   const parsed = verifyRelayTicketSchema.safeParse(body);
   if (!parsed.success) {
@@ -1298,33 +1401,27 @@ authRoutes.post('/relay/verify', async (c) => {
   }
 
   const jti = typeof payload.jti === 'string' ? payload.jti : '';
-  if (!jti || consumedDocRelayTickets.has(jti)) {
+  if (!jti) {
     return c.json({ error: 'relay_token_replayed' }, 401);
   }
 
-  // Persist single-use JTI consumption across replicas in passkey_challenges (nullable user_id, no FK),
-  // falling back cleanly to consumedDocRelayTickets when minimal unit-test mock DBs don't store inserts.
-  const ticketChallengeId = `doc-relay-ticket:${jti}`;
+  // Persist single-use JTI consumption across all replicas using a purpose-isolated, server-keyed
+  // passkey_challenges row (no passkey endpoint may read or delete display_name='doc-relay-ticket').
+  // Retain the marker until (exp + 1) * 1000 because verifyJwt accepts tokens throughout their exp second.
+  const ticketChallengeId = `${DOC_RELAY_TICKET_PURPOSE}:${sha256Hex(`${c.env.JWT_SIGNING_KEY}:${DOC_RELAY_TICKET_PURPOSE}:${jti}`)}`;
   const now = Date.now();
-  const expiresAt = typeof payload.exp === 'number' ? payload.exp * 1000 : now + 5 * 60 * 1000;
+  const expiresAt = typeof payload.exp === 'number' ? (payload.exp + 1) * 1000 : now + 5 * 60 * 1000;
   await c.env.DB.execute(
-    'DELETE FROM passkey_challenges WHERE id LIKE $1 AND expires_at < $2',
-    ['doc-relay-ticket:%', now],
+    'DELETE FROM passkey_challenges WHERE display_name = $1 AND expires_at < $2',
+    [DOC_RELAY_TICKET_PURPOSE, now],
   );
   const insertedTicket = await c.env.DB.queryOne<{ id: string }>(
     'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, NULL, $3, $4, $5) ON CONFLICT (id) DO NOTHING RETURNING id',
-    [ticketChallengeId, jti, 'doc-relay-ticket', expiresAt, now],
+    [ticketChallengeId, ticketChallengeId, DOC_RELAY_TICKET_PURPOSE, expiresAt, now],
   );
   if (!insertedTicket) {
-    const existingTicket = await c.env.DB.queryOne<{ id: string }>(
-      'SELECT id FROM passkey_challenges WHERE id = $1',
-      [ticketChallengeId],
-    );
-    if (existingTicket) {
-      return c.json({ error: 'relay_token_replayed' }, 401);
-    }
+    return c.json({ error: 'relay_token_replayed' }, 401);
   }
-  consumedDocRelayTickets.set(jti, expiresAt);
 
   return c.json({
     ok: true,

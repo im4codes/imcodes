@@ -65,11 +65,70 @@ function createHardeningDb() {
   const idempotencyRecords = new Map<string, unknown>();
   const lockouts = new Map<string, { fail_count: number; first_fail_at: Date; locked_until: Date | null }>();
 
+  let failNextSqlSubstring: string | null = null;
+  let beforeTxSqlHook: ((sql: string) => Promise<void> | void) | null = null;
+  const txLocks = new Map<string, Promise<void>>();
+
+  async function withUserLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = txLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = prev.then(() => next);
+    txLocks.set(key, chained);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (txLocks.get(key) === chained) txLocks.delete(key);
+    }
+  }
+
+  function snapshotMaps() {
+    return {
+      users: new Map([...users.entries()].map(([k, v]) => [k, { ...v }])),
+      refreshTokens: new Map([...refreshTokens.entries()].map(([k, v]) => [k, { ...v }])),
+      authNonces: new Map([...authNonces.entries()].map(([k, v]) => [k, { ...v }])),
+      pendingBinds: new Map([...pendingBinds.entries()].map(([k, v]) => [k, { ...v }])),
+      servers: new Map([...servers.entries()].map(([k, v]) => [k, { ...v }])),
+      teamInvites: new Map([...teamInvites.entries()].map(([k, v]) => [k, { ...v }])),
+      teamMembers: new Map([...teamMembers.entries()].map(([k, m]) => [k, new Map([...m.entries()].map(([mk, mv]) => [mk, { ...mv }]))])),
+    };
+  }
+
+  function restoreMaps(snap: ReturnType<typeof snapshotMaps>) {
+    users.clear();
+    for (const [k, v] of snap.users) users.set(k, v);
+    refreshTokens.clear();
+    for (const [k, v] of snap.refreshTokens) refreshTokens.set(k, v);
+    authNonces.clear();
+    for (const [k, v] of snap.authNonces) authNonces.set(k, v);
+    pendingBinds.clear();
+    for (const [k, v] of snap.pendingBinds) pendingBinds.set(k, v);
+    servers.clear();
+    for (const [k, v] of snap.servers) servers.set(k, v);
+    teamInvites.clear();
+    for (const [k, v] of snap.teamInvites) teamInvites.set(k, v);
+    teamMembers.clear();
+    for (const [k, v] of snap.teamMembers) teamMembers.set(k, v);
+  }
+
+  function checkInjectedFailure(s: string) {
+    if (failNextSqlSubstring && s.includes(failNextSqlSubstring)) {
+      failNextSqlSubstring = null;
+      throw new Error(`injected db failure on: ${s}`);
+    }
+  }
+
   const norm = (sql: string) => sql.toLowerCase().replace(/\s+/g, ' ').trim();
 
   const db = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
       const s = norm(sql);
+      if (beforeTxSqlHook) await beforeTxSqlHook(s);
+      checkInjectedFailure(s);
       if (s.includes('select status, sessions_valid_after from users where id = $1')) {
         const u = users.get(String(params[0]));
         return u ? ({ status: u.status, sessions_valid_after: u.sessions_valid_after } as T) : null;
@@ -119,11 +178,18 @@ function createHardeningDb() {
           owner_status: owner?.status ?? null,
         } as T;
       }
-      if (s.includes('delete from passkey_challenges where id = $1 and expires_at > $2 returning')) {
+      if (s.includes('delete from passkey_challenges where id = $1 and expires_at > $2') && s.includes('returning')) {
         const id = String(params[0]);
         const row = passkeyChallenges.get(id);
         if (!row || row.expires_at <= Number(params[1])) return null;
+        if (s.includes('display_name != $3') && row.display_name === String(params[2])) return null;
         passkeyChallenges.delete(id);
+        return { challenge: row.challenge, user_id: row.user_id, display_name: row.display_name } as T;
+      }
+      if (s.includes('from passkey_challenges where id = $1 and expires_at > $2')) {
+        const row = passkeyChallenges.get(String(params[0]));
+        if (!row || row.expires_at <= Number(params[1])) return null;
+        if (s.includes('display_name != $3') && row.display_name === String(params[2])) return null;
         return { challenge: row.challenge, user_id: row.user_id, display_name: row.display_name } as T;
       }
       if (s.includes('insert into passkey_challenges') && s.includes('on conflict (id) do nothing returning id')) {
@@ -147,12 +213,30 @@ function createHardeningDb() {
         const row = passkeyCreds.get(String(params[0]));
         return (row ? { ...row } : null) as T | null;
       }
-      if (s.includes('delete from auth_nonces where nonce = $1 and expires_at > $2 returning')) {
+      if (s.includes('delete from auth_nonces where nonce = $1 and expires_at > $2') && s.includes('returning')) {
         const key = String(params[0]);
         const row = authNonces.get(key);
         if (!row || row.expires_at <= Number(params[1])) return null;
+        if (s.includes('key_id = $3') && row.key_id !== String(params[2])) return null;
+        if (s.includes('key_id != $3') && row.key_id === String(params[2])) return null;
         authNonces.delete(key);
         return { api_key: row.api_key, user_id: row.user_id, key_id: row.key_id } as T;
+      }
+      if (s.includes('select user_id, expires_at from auth_nonces where nonce = $1')) {
+        const row = authNonces.get(String(params[0]));
+        if (!row) return null;
+        if (s.includes('key_id != $2') && row.key_id === String(params[1])) return null;
+        return { user_id: row.user_id, expires_at: row.expires_at } as T;
+      }
+      if (s.includes('select user_id from refresh_tokens where token_hash = $1 and used_at is null and expires_at > $2')) {
+        const hash = String(params[0]);
+        const now = Number(params[1]);
+        for (const rt of refreshTokens.values()) {
+          if (rt.token_hash === hash && rt.used_at === null && rt.expires_at > now) {
+            return { user_id: rt.user_id } as T;
+          }
+        }
+        return null;
       }
       if (s.includes('update refresh_tokens set used_at = $1 where token_hash = $2') && s.includes('returning')) {
         const now = Number(params[0]);
@@ -216,6 +300,8 @@ function createHardeningDb() {
     query: async <T = unknown>() => [] as T[],
     execute: async (sql: string, params: unknown[] = []): Promise<{ changes: number }> => {
       const s = norm(sql);
+      if (beforeTxSqlHook) await beforeTxSqlHook(s);
+      checkInjectedFailure(s);
       if (s.startsWith('insert into users')) {
         users.set(String(params[0]), {
           id: String(params[0]),
@@ -237,6 +323,13 @@ function createHardeningDb() {
       } else if (s.startsWith('update users set status = $1 where id = $2')) {
         const u = users.get(String(params[1]));
         if (u) u.status = String(params[0]) as MemUser['status'];
+      } else if (s.startsWith('update users set username = $1, password_hash = $2')) {
+        const u = users.get(String(params[2]));
+        if (u) {
+          u.username = String(params[0]);
+          u.password_hash = String(params[1]);
+          u.password_must_change = false;
+        }
       } else if (s.startsWith('update users set password_hash = $1')) {
         const u = users.get(String(params[1]));
         if (u) {
@@ -282,7 +375,10 @@ function createHardeningDb() {
         });
       } else if (s.startsWith('delete from auth_nonces where expires_at <')) {
         const cutoff = Number(params[0]);
-        for (const [k, v] of authNonces) if (v.expires_at < cutoff) authNonces.delete(k);
+        const excludeKeyId = s.includes('key_id != $2') ? String(params[1]) : null;
+        for (const [k, v] of authNonces) {
+          if (v.expires_at < cutoff && (excludeKeyId === null || v.key_id !== excludeKeyId)) authNonces.delete(k);
+        }
       } else if (s.startsWith('delete from auth_nonces where key_id =')) {
         for (const [k, v] of authNonces) if (v.key_id === params[0] && v.expires_at < Number(params[1])) authNonces.delete(k);
       } else if (s.startsWith('insert into passkey_challenges')) {
@@ -294,6 +390,24 @@ function createHardeningDb() {
           expires_at: Number(params[4]),
           created_at: Number(params[5]),
         });
+      } else if (s.startsWith('delete from passkey_challenges where display_name = $1 and expires_at < $2')) {
+        const purpose = String(params[0]);
+        const cutoff = Number(params[1]);
+        for (const [k, v] of passkeyChallenges) if (v.display_name === purpose && v.expires_at < cutoff) passkeyChallenges.delete(k);
+      } else if (s.startsWith('delete from passkey_challenges where expires_at < $1')) {
+        const cutoff = Number(params[0]);
+        const excludePurpose = s.includes('display_name != $2') ? String(params[1]) : null;
+        for (const [k, v] of passkeyChallenges) {
+          if (v.expires_at < cutoff && (excludePurpose === null || v.display_name !== excludePurpose)) passkeyChallenges.delete(k);
+        }
+      } else if (s.startsWith('delete from passkey_challenges where id = $1')) {
+        const row = passkeyChallenges.get(String(params[0]));
+        if (!row) return { changes: 0 };
+        if (s.includes('expires_at > $2') && row.expires_at <= Number(params[1])) return { changes: 0 };
+        if (s.includes('user_id = $3') && row.user_id !== String(params[2])) return { changes: 0 };
+        if (s.includes('display_name != $4') && row.display_name === String(params[3])) return { changes: 0 };
+        passkeyChallenges.delete(String(params[0]));
+        return { changes: 1 };
       } else if (s.startsWith('delete from passkey_challenges where id like')) {
         const cutoff = Number(params[1]);
         for (const [k, v] of passkeyChallenges) if (k.startsWith('doc-relay-ticket:') && v.expires_at < cutoff) passkeyChallenges.delete(k);
@@ -354,7 +468,15 @@ function createHardeningDb() {
     },
     exec: async () => undefined,
     close: async () => undefined,
-    transaction: async <T>(fn: (tx: Database) => Promise<T>): Promise<T> => fn(db),
+    transaction: async <T>(fn: (tx: Database) => Promise<T>): Promise<T> => withUserLock('global-tx', async () => {
+      const snap = snapshotMaps();
+      try {
+        return await fn(db);
+      } catch (err) {
+        restoreMaps(snap);
+        throw err;
+      }
+    }),
   } as unknown as Database;
 
   return {
@@ -372,6 +494,13 @@ function createHardeningDb() {
     teamMembers,
     teamInvites,
     idempotencyRecords,
+    lockouts,
+    setFailNextSql(substring: string | null) {
+      failNextSqlSubstring = substring;
+    },
+    setBeforeSqlHook(hook: ((sql: string) => Promise<void> | void) | null) {
+      beforeTxSqlHook = hook;
+    },
   };
 }
 
@@ -402,6 +531,7 @@ describe('security hardening (tsk_3b375f8d07)', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -591,6 +721,19 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       headers: { Authorization: `Bearer ${sessionJwt}` },
     }, env);
     expect(memberAllowed.status).toBe(200);
+
+    // Unsafe POST with genuine daemon token + session cookie MUST still fail closed on non-daemon routes
+    const daemonCookiePost = await app.request('/api/team', {
+      method: 'POST',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(sessionJwt)}`,
+        Authorization: 'Bearer full-tok',
+        [SERVER_ID_HEADER]: 'srv-full',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: 'Daemon CSRF Attempt' }),
+    });
+    expect(daemonCookiePost.status).toBe(403);
   });
 
   it('AC3: enforces registration_enabled, require_approval, origin-bound single-use relay_token, and redacts relay_token logs', async () => {
@@ -843,31 +986,15 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       body: JSON.stringify({ relayToken: relayTicket, expectedAudience: 'https://self.example.com' }),
     });
     expect(v1.status).toBe(200);
-    expect(store.passkeyChallenges.has('doc-relay-ticket:doc-jti-db-1')).toBe(true);
-    // Simulate a second pod (different in-memory Map) by using a fresh jti already recorded in DB
-    store.passkeyChallenges.set('doc-relay-ticket:doc-jti-other-pod', {
-      id: 'doc-relay-ticket:doc-jti-other-pod',
-      challenge: 'doc-jti-other-pod',
-      user_id: null,
-      display_name: 'doc-relay-ticket',
-      expires_at: Date.now() + 120_000,
-      created_at: Date.now(),
-    });
-    const otherPodTicket = signJwt({
-      type: 'doc-auth-relay-ticket',
-      iss: 'https://app.im.codes',
-      aud: 'https://self.example.com',
-      jti: 'doc-jti-other-pod',
-      provider: 'github',
-      externalId: 'ext-1',
-      username: 'extuser',
-      displayName: 'Ext',
-    }, env.JWT_SIGNING_KEY, 120);
-    const v2 = await app.request('/api/auth/relay/verify', {
+    const storedTicket = [...store.passkeyChallenges.values()].find((r) => r.display_name === 'doc-relay-ticket');
+    expect(storedTicket).toBeTruthy();
+    // Simulate a second pod (different Hono app instance sharing DB, no shared memory)
+    const appPod2 = buildApp(env);
+    const replayPod2 = await appPod2.request('/api/auth/relay/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ relayToken: otherPodTicket, expectedAudience: 'https://self.example.com' }),
+      body: JSON.stringify({ relayToken: relayTicket, expectedAudience: 'https://self.example.com' }),
     });
-    expect(v2.status).toBe(401);
+    expect(replayPod2.status).toBe(401);
   });
 
   it('AC5: blocks team admin from adding admin via POST /api/team/:id/member and consumes invites atomically', async () => {
@@ -927,5 +1054,507 @@ describe('security hardening (tsk_3b375f8d07)', () => {
       app.request('/api/team/join/tok-race-1', { method: 'POST', headers: { Authorization: `Bearer ${j2Jwt}` } }),
     ]);
     expect([join1.status, join2.status].sort()).toEqual([200, 400]);
+  });
+
+  it('P0-1a: rejects hostless/non-hierarchical imcodes: callbacks while preserving hierarchical mobile callbacks', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+
+    for (const bad of ['imcodes:foo', 'imcodes:///foo', 'imcodes://', 'imcodes://user@auth', '']) {
+      const nativeRes = await app.request(`/api/auth/passkey/native?callback=${encodeURIComponent(bad)}`);
+      expect(nativeRes.status, `GET /native should reject ${bad}`).toBe(400);
+
+      const regRes = await app.request(`/api/auth/passkey/register/complete?native_callback=${encodeURIComponent(bad)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challengeId: 'any', response: {} }),
+      });
+      expect(regRes.status, `POST /register/complete should reject ${bad}`).toBe(400);
+
+      const loginRes = await app.request(`/api/auth/passkey/login/complete?native_callback=${encodeURIComponent(bad)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challengeId: 'any', response: {} }),
+      });
+      expect(loginRes.status, `POST /login/complete should reject ${bad}`).toBe(400);
+    }
+
+    const okNative = await app.request(`/api/auth/passkey/native?callback=${encodeURIComponent('imcodes://auth/callback?a=1')}`);
+    expect(okNative.status).toBe(200);
+  });
+
+  it('P0-1b: validates native_callback before consuming challenges or writing users, credentials, counters, or passwords', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    const now = Date.now();
+
+    store.users.set('u-setup', {
+      id: 'u-setup', username: null, display_name: 'SetupUser', password_hash: null, password_must_change: null,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: now,
+    });
+    store.passkeyCreds.set('cred-setup', {
+      id: 'cred-setup', user_id: 'u-setup', public_key: Buffer.from('pk').toString('base64'), counter: 7,
+      device_name: null, transports: null, created_at: now, last_used_at: null,
+    });
+    store.passkeyChallenges.set('ch-reg-bad', {
+      id: 'ch-reg-bad', challenge: 'reg-ch', user_id: null, display_name: 'NewUser', expires_at: now + 60_000, created_at: now,
+    });
+    store.passkeyChallenges.set('ch-login-bad', {
+      id: 'ch-login-bad', challenge: 'login-ch', user_id: null, display_name: '', expires_at: now + 60_000, created_at: now,
+    });
+    store.passkeyChallenges.set('ch-setup-bad', {
+      id: 'ch-setup-bad', challenge: 'setup-ch', user_id: 'u-setup', display_name: '', expires_at: now + 60_000, created_at: now,
+    });
+    verifyRegistrationResponseMock.mockResolvedValue({
+      verified: true,
+      registrationInfo: { credentialID: 'should-not-write', credentialPublicKey: Buffer.from('pk2'), counter: 0 },
+    });
+    verifyAuthenticationResponseMock.mockResolvedValue({
+      verified: true,
+      authenticationInfo: { newCounter: 8 },
+    });
+
+    const badCb = encodeURIComponent('imcodes:///evil');
+    const regFail = await app.request(`/api/auth/passkey/register/complete?native_callback=${badCb}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeId: 'ch-reg-bad', response: { id: 'should-not-write' } }),
+    });
+    expect(regFail.status).toBe(400);
+    expect(store.passkeyChallenges.has('ch-reg-bad')).toBe(true);
+    expect(store.passkeyCreds.has('should-not-write')).toBe(false);
+    expect(store.users.size).toBe(1);
+
+    const loginFail = await app.request(`/api/auth/passkey/login/complete?native_callback=${badCb}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeId: 'ch-login-bad', response: { id: 'cred-setup' } }),
+    });
+    expect(loginFail.status).toBe(400);
+    expect(store.passkeyChallenges.has('ch-login-bad')).toBe(true);
+    expect(store.passkeyCreds.get('cred-setup')?.counter).toBe(7);
+
+    const setupJwt = signJwt({ sub: 'u-setup', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+    const setupFail = await app.request(`/api/auth/passkey/password/setup?native_callback=${badCb}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${setupJwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'validuser',
+        newPassword: 'ValidPassword1!',
+        challengeId: 'ch-setup-bad',
+        response: { id: 'cred-setup' },
+      }),
+    });
+    expect(setupFail.status).toBe(400);
+    expect(store.passkeyChallenges.has('ch-setup-bad')).toBe(true);
+    expect(store.passkeyCreds.get('cred-setup')?.counter).toBe(7);
+    expect(store.users.get('u-setup')?.username).toBeNull();
+    expect(store.users.get('u-setup')?.password_hash).toBeNull();
+  });
+
+  it('P0-2a: consecutive same-second password changes invalidate prior replacement session cookies', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_100);
+
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    const hash1 = await hashPassword('PassOne123!');
+    store.users.set('u-same-sec', {
+      id: 'u-same-sec', username: 'samesec', display_name: 'SameSec', password_hash: hash1, password_must_change: false,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: Date.now(),
+    });
+
+    const initialJwt = signJwt({ sub: 'u-same-sec', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+    const chg1 = await app.request('/api/auth/password/change', {
+      method: 'POST',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(initialJwt)}; ${COOKIE_CSRF}=csrf1`,
+        [HEADER_CSRF]: 'csrf1',
+        Origin: 'https://app.im.codes',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ oldPassword: 'PassOne123!', newPassword: 'PassTwo123!' }),
+    });
+    expect(chg1.status).toBe(200);
+    const cookie1 = (chg1.headers.getSetCookie?.() ?? [chg1.headers.get('set-cookie') ?? '']).join('; ').match(/rcc_session=([^;]+)/)?.[1];
+    expect(cookie1).toBeTruthy();
+
+    // Advance only 50ms within the exact same wall-clock second (still 1_700_000_000s)
+    vi.setSystemTime(1_700_000_000_150);
+    const chg2 = await app.request('/api/auth/password/change', {
+      method: 'POST',
+      headers: {
+        Cookie: `${COOKIE_SESSION}=${cookie1}; ${COOKIE_CSRF}=csrf2`,
+        [HEADER_CSRF]: 'csrf2',
+        Origin: 'https://app.im.codes',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ oldPassword: 'PassTwo123!', newPassword: 'PassThree123!' }),
+    });
+    expect(chg2.status).toBe(200);
+    const cookie2 = (chg2.headers.getSetCookie?.() ?? [chg2.headers.get('set-cookie') ?? '']).join('; ').match(/rcc_session=([^;]+)/)?.[1];
+    expect(cookie2).toBeTruthy();
+
+    // Cookie from password change #1 MUST be rejected after same-second password change #2
+    const me1 = await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${cookie1}` } });
+    expect(me1.status).toBe(401);
+
+    // Cookie from password change #2 MUST work immediately
+    const me2 = await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${cookie2}` } });
+    expect(me2.status).toBe(200);
+  });
+
+  it('P0-2b: concurrent /refresh interleaved with /password/change cannot mint next-gen tokens after password change', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    const hash1 = await hashPassword('InitialPass1!');
+    store.users.set('u-interleave', {
+      id: 'u-interleave', username: 'interleave', display_name: 'IL', password_hash: hash1, password_must_change: false,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: Date.now(),
+    });
+    const rtRaw = randomHex(32);
+    await store.db.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      ['rt-il-1', 'u-interleave', sha256Hex(rtRaw), 'fam-il', Date.now() + 60_000, Date.now()],
+    );
+    const jwt = signJwt({ sub: 'u-interleave', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+
+    let interleaved = false;
+    store.setBeforeSqlHook(async (s) => {
+      // Runs before /refresh acquires the transaction lock, simulating /password/change winning the race
+      // right after /refresh's initial refresh_tokens lookup.
+      if (!interleaved && s.includes('select user_id from refresh_tokens where token_hash')) {
+        interleaved = true;
+        store.setBeforeSqlHook(null);
+        const pwRes = await app.request('/api/auth/password/change', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ oldPassword: 'InitialPass1!', newPassword: 'RotatedPass2!' }),
+        });
+        expect(pwRes.status).toBe(200);
+      }
+    });
+
+    const refreshRes = await app.request('/api/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: rtRaw }),
+    });
+    expect(refreshRes.status).toBe(401);
+    expect(store.refreshTokens.size).toBe(1);
+    expect(store.refreshTokens.get('rt-il-1')?.used_at).not.toBeNull();
+  });
+
+  it('P0-2c: in-flight /password/login verifying an old password aborts with 401 when password changes before lock', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    const oldHash = await hashPassword('OldLoginPass1!');
+    store.users.set('u-login-race', {
+      id: 'u-login-race', username: 'loginrace', display_name: 'LR', password_hash: oldHash, password_must_change: false,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: Date.now(),
+    });
+    const bearerJwt = signJwt({ sub: 'u-login-race', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+
+    let changedDuringVerify = false;
+    store.setBeforeSqlHook(async (s) => {
+      // Runs after getUserByUsername reads the old password_hash and before /password/login enters tx/lock.
+      if (!changedDuringVerify && s.includes('from auth_lockout') && store.users.get('u-login-race')?.password_hash === oldHash) {
+        changedDuringVerify = true;
+        store.setBeforeSqlHook(null);
+        const pwRes = await app.request('/api/auth/password/change', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${bearerJwt}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ oldPassword: 'OldLoginPass1!', newPassword: 'BrandNewPass2!' }),
+        });
+        expect(pwRes.status).toBe(200);
+      }
+    });
+
+    const loginRes = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'loginrace', password: 'OldLoginPass1!', native: true }),
+    });
+    expect(loginRes.status).toBe(401);
+    expect(store.refreshTokens.size).toBe(0);
+    expect(store.apiKeys.size).toBe(0);
+  });
+
+  it('P0-3a: /refresh returns 429 under user lockout without consuming the refresh token, then succeeds after lockout clears', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    store.users.set('u-lock-rf', {
+      id: 'u-lock-rf', username: 'lockrf', display_name: 'LRF', password_hash: null, password_must_change: null,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: Date.now(),
+    });
+    const rtRaw = randomHex(32);
+    await store.db.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      ['rt-lock-1', 'u-lock-rf', sha256Hex(rtRaw), 'fam-lock', Date.now() + 60_000, Date.now()],
+    );
+    store.lockouts.set('user:u-lock-rf', {
+      fail_count: 5,
+      first_fail_at: new Date(),
+      locked_until: new Date(Date.now() + 60_000),
+    });
+
+    const lockedRes = await app.request('/api/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: rtRaw }),
+    });
+    expect(lockedRes.status).toBe(429);
+    expect(store.refreshTokens.get('rt-lock-1')?.used_at).toBeNull();
+
+    // Clear lockout and retry with the same refresh token
+    store.lockouts.delete('user:u-lock-rf');
+    const okRes = await app.request('/api/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: rtRaw }),
+    });
+    expect(okRes.status).toBe(200);
+    expect(store.refreshTokens.get('rt-lock-1')?.used_at).not.toBeNull();
+  });
+
+  it('P0-3b: downstream DB write failures roll back single-use consumption across /refresh, /bind/confirm, both team join routes, and OAuth relay', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    const now = Date.now();
+
+    store.users.set('u-rb', {
+      id: 'u-rb', username: 'rbuser', display_name: 'RB', password_hash: null, password_must_change: null,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: now,
+    });
+    store.teams.set('team-rb', { id: 'team-rb', name: 'RB Team', owner_id: 'u-rb' });
+    const jwt = signJwt({ sub: 'u-rb', type: 'web' }, env.JWT_SIGNING_KEY, 3600);
+
+    // 1. /refresh rollback on INSERT INTO refresh_tokens failure
+    const rtRaw = randomHex(32);
+    await store.db.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      ['rt-rb-1', 'u-rb', sha256Hex(rtRaw), 'fam-rb', now + 60_000, now],
+    );
+    store.setFailNextSql('insert into refresh_tokens');
+    const rfFail = await app.request('/api/auth/refresh', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ refreshToken: rtRaw }),
+    });
+    expect(rfFail.status).toBe(500);
+    expect(store.refreshTokens.get('rt-rb-1')?.used_at).toBeNull();
+    const rfRetry = await app.request('/api/auth/refresh', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ refreshToken: rtRaw }),
+    });
+    expect(rfRetry.status).toBe(200);
+
+    // 2. /bind/confirm rollback on createServer (INSERT INTO servers) failure
+    await store.db.execute(
+      'INSERT INTO pending_binds (code, user_id, server_name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)',
+      ['RB-CODE1', 'u-rb', 'srv-rb', now + 60_000, now],
+    );
+    store.setFailNextSql('insert into servers');
+    const bindFail = await app.request('/api/bind/confirm', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: 'RB-CODE1' }),
+    });
+    expect(bindFail.status).toBe(500);
+    expect(store.pendingBinds.has('RB-CODE1')).toBe(true);
+    const bindRetry = await app.request('/api/bind/confirm', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: 'RB-CODE1' }),
+    });
+    expect(bindRetry.status).toBe(200);
+
+    // 3. POST /api/team/join/:token rollback on INSERT INTO team_members failure
+    store.teamInvites.set('inv-rb-1', {
+      id: 'inv-rb-1', team_id: 'team-rb', token: 'tok-rb-1', role: 'member', expires_at: now + 60_000, used_at: null,
+    });
+    store.setFailNextSql('insert into team_members');
+    const joinFail1 = await app.request('/api/team/join/tok-rb-1', {
+      method: 'POST', headers: { Authorization: `Bearer ${jwt}` },
+    });
+    expect(joinFail1.status).toBe(500);
+    expect(store.teamInvites.get('inv-rb-1')?.used_at).toBeNull();
+    const joinRetry1 = await app.request('/api/team/join/tok-rb-1', {
+      method: 'POST', headers: { Authorization: `Bearer ${jwt}` },
+    });
+    expect(joinRetry1.status).toBe(200);
+
+    // 4. POST /api/team/:id/join rollback on INSERT INTO team_members failure
+    store.teamInvites.set('inv-rb-2', {
+      id: 'inv-rb-2', team_id: 'team-rb', token: 'tok-rb-2', role: 'member', expires_at: now + 60_000, used_at: null,
+    });
+    store.setFailNextSql('insert into team_members');
+    const joinFail2 = await app.request('/api/team/team-rb/join', {
+      method: 'POST', headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: 'tok-rb-2' }),
+    });
+    expect(joinFail2.status).toBe(500);
+    expect(store.teamInvites.get('inv-rb-2')?.used_at).toBeNull();
+    const joinRetry2 = await app.request('/api/team/team-rb/join', {
+      method: 'POST', headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: 'tok-rb-2' }),
+    });
+    expect(joinRetry2.status).toBe(200);
+
+    // 5. OAuth relay callback rollback on INSERT INTO refresh_tokens failure + no JTI burn
+    const relayJti = 'oauth-rb-jti-1';
+    await store.db.execute(
+      'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [`oauth-relay:${relayJti}`, '', 'u-rb', 'oauth-relay', now + 120_000, now],
+    );
+    const relayToken = signJwt(
+      { sub: 'u-rb', type: 'auth-relay', origin: 'https://hk.im.codes', jti: relayJti },
+      env.JWT_SIGNING_KEY,
+      120,
+    );
+    store.setFailNextSql('insert into refresh_tokens');
+    const oauthFail = await app.request(`https://hk.im.codes/api/auth/github/callback?relay_token=${encodeURIComponent(relayToken)}`, {
+      headers: { host: 'hk.im.codes' },
+    });
+    expect(oauthFail.status).toBe(500);
+    expect(store.authNonces.has(`oauth-relay:${relayJti}`)).toBe(true);
+    const oauthRetry = await app.request(`https://hk.im.codes/api/auth/github/callback?relay_token=${encodeURIComponent(relayToken)}`, {
+      headers: { host: 'hk.im.codes' },
+    });
+    expect(oauthRetry.status).toBe(302);
+  });
+
+  it('P0-4a: strictly isolates passkey_challenges and auth_nonces by purpose so cross-flow reads/cleanups never interfere', async () => {
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+    const now = Date.now();
+
+    // Verify a doc relay ticket first
+    const docTicket = signJwt({
+      type: 'doc-auth-relay-ticket',
+      iss: 'https://app.im.codes',
+      aud: 'https://self.example.com',
+      jti: 'doc-purpose-jti',
+      provider: 'github',
+      externalId: 'ext-p',
+      username: 'puser',
+      displayName: 'P',
+    }, env.JWT_SIGNING_KEY, 120);
+    const vRes = await app.request('/api/auth/relay/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relayToken: docTicket, expectedAudience: 'https://self.example.com' }),
+    });
+    expect(vRes.status).toBe(200);
+    const docRow = [...store.passkeyChallenges.values()].find((r) => r.display_name === 'doc-relay-ticket')!;
+    expect(docRow).toBeTruthy();
+
+    // Passkey login/complete attempting to consume docRow.id must NOT consume it
+    const crossConsume = await app.request('/api/auth/passkey/login/complete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeId: docRow.id, response: { id: 'cred-missing' } }),
+    });
+    expect(crossConsume.status).toBe(400);
+    expect(store.passkeyChallenges.has(docRow.id)).toBe(true);
+
+    // Even if docRow were expired, passkey register/begin cleanup must NOT delete doc-relay-ticket rows,
+    // and /relay/verify cleanup must NOT delete expired passkey challenges created by passkey flows.
+    docRow.expires_at = now - 10;
+    store.passkeyChallenges.set('pk-expired', {
+      id: 'pk-expired', challenge: 'pk', user_id: null, display_name: '', expires_at: now - 10, created_at: now - 100,
+    });
+    const docTicket2 = signJwt({
+      type: 'doc-auth-relay-ticket',
+      iss: 'https://app.im.codes',
+      aud: 'https://self.example.com',
+      jti: 'doc-purpose-jti-2',
+      provider: 'github',
+      externalId: 'ext-p',
+      username: 'puser',
+      displayName: 'P',
+    }, env.JWT_SIGNING_KEY, 120);
+    await app.request('/api/auth/relay/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relayToken: docTicket2, expectedAudience: 'https://self.example.com' }),
+    });
+    expect(store.passkeyChallenges.has('pk-expired')).toBe(true);
+
+    // Re-insert expired doc-relay-ticket row and confirm passkey begin cleanup leaves it alone
+    store.passkeyChallenges.set('doc-exp-probe', {
+      id: 'doc-exp-probe', challenge: 'x', user_id: null, display_name: 'doc-relay-ticket', expires_at: now - 10, created_at: now - 100,
+    });
+    await app.request('/api/auth/passkey/login/begin', { method: 'POST', headers: { host: 'localhost' } });
+    expect(store.passkeyChallenges.has('doc-exp-probe')).toBe(true);
+    expect(store.passkeyChallenges.has('pk-expired')).toBe(false);
+
+    // auth_nonces purpose isolation: /token-exchange cannot consume or delete an oauth-relay nonce
+    store.users.set('u-iso', {
+      id: 'u-iso', username: 'iso', display_name: 'ISO', password_hash: null, password_must_change: null,
+      is_admin: false, status: 'active', sessions_valid_after: 0, created_at: now,
+    });
+    await store.db.execute(
+      'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      ['oauth-relay:cross-1', '', 'u-iso', 'oauth-relay', now + 60_000, now],
+    );
+    const exCross = await app.request('/api/auth/token-exchange', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce: 'oauth-relay:cross-1' }),
+    });
+    expect(exCross.status).toBe(400);
+    expect(store.authNonces.has('oauth-relay:cross-1')).toBe(true);
+  });
+
+  it('P0-4b: /relay/verify keeps consumed ticket across the entire exp second until verifyJwt itself expires', async () => {
+    vi.useFakeTimers();
+    const baseMs = 1_700_000_000_400;
+    vi.setSystemTime(baseMs);
+
+    const store = createHardeningDb();
+    const env = makeEnv(store.db);
+    const app = buildApp(env);
+
+    // Token signed with exp = nowSec + 10 = 1_700_000_010
+    const expSec = Math.floor(baseMs / 1000) + 10;
+    const ticket = signJwt({
+      type: 'doc-auth-relay-ticket',
+      iss: 'https://app.im.codes',
+      aud: 'https://self.example.com',
+      jti: 'doc-exp-boundary-jti',
+      provider: 'github',
+      externalId: 'ext-b',
+      username: 'buser',
+      displayName: 'B',
+    }, env.JWT_SIGNING_KEY, 10);
+
+    const first = await app.request('/api/auth/relay/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relayToken: ticket, expectedAudience: 'https://self.example.com' }),
+    });
+    expect(first.status).toBe(200);
+
+    // Move inside the exact exp second (exp * 1000 + 500ms) while verifyJwt still accepts the token!
+    vi.setSystemTime(expSec * 1000 + 500);
+    // Trigger cleanup with an unrelated valid ticket
+    const otherTicket = signJwt({
+      type: 'doc-auth-relay-ticket',
+      iss: 'https://app.im.codes',
+      aud: 'https://self.example.com',
+      jti: 'doc-exp-boundary-other',
+      provider: 'github',
+      externalId: 'ext-b',
+      username: 'buser',
+      displayName: 'B',
+    }, env.JWT_SIGNING_KEY, 60);
+    const second = await app.request('/api/auth/relay/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relayToken: otherTicket, expectedAudience: 'https://self.example.com' }),
+    });
+    expect(second.status).toBe(200);
+
+    // Replaying the first ticket at exp * 1000 + 800ms (still inside exp second!) MUST still be rejected as replayed
+    vi.setSystemTime(expSec * 1000 + 800);
+    const replayAtBoundary = await app.request('/api/auth/relay/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relayToken: ticket, expectedAudience: 'https://self.example.com' }),
+    });
+    expect(replayAtBoundary.status).toBe(401);
   });
 });

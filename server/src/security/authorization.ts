@@ -107,9 +107,26 @@ const authOutcomeRequestCache = new WeakMap<object, MemoizedAuthEntry>();
 async function computeAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
   // When Authorization is present, resolve ONLY Bearer auth and never fall back
   // to COOKIE_SESSION — prevents bogus-Bearer CSRF middleware bypasses.
+  // The sole exception is a safe-method (GET/HEAD/OPTIONS) request carrying a verified
+  // daemon credential on a non-daemon route alongside a valid account session cookie
+  // (e.g. account cookie flow with incidental daemon headers).
   const authHeader = c.req.header('Authorization');
   if (authHeader && authHeader.trim().length > 0) {
-    return resolveBearerOutcome(c);
+    try {
+      return await resolveBearerOutcome(c);
+    } catch (err) {
+      const method = (c.req.method ?? 'GET').toUpperCase();
+      if (err instanceof HTTPException && err.status === 403 && (method === 'GET' || method === 'HEAD' || method === 'OPTIONS')) {
+        const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
+        if (cookieToken && c.env.JWT_SIGNING_KEY) {
+          const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
+          if (isAccountSessionJwt(payload)) {
+            return resolveLoginTokenUser(c.env.DB, payload, c.req.path, c.req.method);
+          }
+        }
+      }
+      throw err;
+    }
   }
 
   // Try HttpOnly session cookie (browser sessions)

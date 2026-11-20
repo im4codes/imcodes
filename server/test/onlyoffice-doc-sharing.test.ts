@@ -352,7 +352,19 @@ function createInMemoryDb() {
         return (srv ?? null) as unknown as T | null;
       }
 
-      // Passkey challenge & credential lookups
+      // Passkey challenge & credential lookups + doc relay ticket DB markers
+      if (normSql.startsWith('INSERT INTO passkey_challenges') && normSql.includes('ON CONFLICT (id) DO NOTHING RETURNING id')) {
+        const [id, challenge, displayName, expiresAt] = params as [string, string, string, number];
+        if (passkeyChallenges.has(id)) return null;
+        passkeyChallenges.set(id, {
+          id,
+          user_id: null,
+          challenge,
+          display_name: displayName,
+          expires_at: Number(expiresAt),
+        });
+        return { id } as unknown as T;
+      }
       if (normSql.startsWith('SELECT challenge FROM passkey_challenges WHERE id = $1 AND expires_at > $2')) {
         const [id, now] = params as [string, number];
         const row = passkeyChallenges.get(id);
@@ -685,6 +697,17 @@ function createInMemoryDb() {
         const r = refreshTokens.get(id);
         if (r) r.revoked_at = now;
         return { changes: r ? 1 : 0 };
+      }
+      if (normSql.startsWith('DELETE FROM passkey_challenges WHERE display_name = $1 AND expires_at < $2')) {
+        const [displayName, cutoff] = params as [string, number];
+        let deleted = 0;
+        for (const [id, row] of passkeyChallenges.entries()) {
+          if ((row as { display_name?: string }).display_name === displayName && row.expires_at < Number(cutoff)) {
+            passkeyChallenges.delete(id);
+            deleted++;
+          }
+        }
+        return { changes: deleted };
       }
       if (normSql.startsWith('DELETE FROM passkey_challenges WHERE id = $1')) {
         passkeyChallenges.delete(params[0] as string);
