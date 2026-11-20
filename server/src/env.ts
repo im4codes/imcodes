@@ -51,6 +51,7 @@ export interface EnvConfig {
   TTS_API_KEY?: string;
   TTS_MODEL?: string;
   TTS_VOICE?: string;
+  TTS_VOICES_BY_LANG?: string;
   TTS_RESPONSE_FORMAT?: string;
 
   // Server URL (used to build webhook URLs)
@@ -196,6 +197,7 @@ export function loadEnv(): EnvConfig {
     TTS_API_KEY: process.env.TTS_API_KEY,
     TTS_MODEL: process.env.TTS_MODEL,
     TTS_VOICE: process.env.TTS_VOICE,
+    TTS_VOICES_BY_LANG: process.env.TTS_VOICES_BY_LANG,
     TTS_RESPONSE_FORMAT: process.env.TTS_RESPONSE_FORMAT,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,

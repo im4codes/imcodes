@@ -30,6 +30,9 @@ export const TTS_OPENAI_PRESET_VOICES = [
   'verse',
 ] as const;
 
+export const TTS_VOICE_LANG_KEYS = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'es', 'ru'] as const;
+export type TtsVoiceLangKey = (typeof TTS_VOICE_LANG_KEYS)[number];
+
 export const TTS_DEFAULT_MODEL = 'gpt-4o-mini-tts';
 export const TTS_DEFAULT_VOICE = 'alloy';
 export const TTS_DEFAULT_RESPONSE_FORMAT: TtsResponseFormat = 'mp3';
@@ -62,6 +65,7 @@ export interface TtsPublicConfig {
   apiKeyMasked: string | null;
   model: string;
   voice: string;
+  voicesByLang?: Record<string, string>;
   responseFormat: TtsResponseFormat;
   serverDefaultConfigured: boolean;
 }
@@ -72,6 +76,7 @@ export interface TtsConfigUpdateBody {
   apiKey?: string;
   model?: string;
   voice?: string;
+  voicesByLang?: Record<string, string>;
   responseFormat?: TtsResponseFormat;
 }
 
@@ -79,9 +84,114 @@ export interface TtsSpeechRequestBody {
   input: string;
   model?: string;
   voice?: string;
+  lang?: string;
   speed?: number;
   response_format?: TtsResponseFormat;
   instructions?: string;
+}
+
+const PREFERRED_VOICE_LOCALE_BY_KEY: Record<TtsVoiceLangKey, string> = {
+  'zh-CN': 'zh-cn',
+  'zh-TW': 'zh-tw',
+  en: 'en-us',
+  ja: 'ja-jp',
+  ko: 'ko-kr',
+  es: 'es-es',
+  ru: 'ru-ru',
+};
+
+/** Map arbitrary BCP-47 / short language tags into the 7 canonical per-language voice keys. */
+export function normalizeTtsVoiceLangKey(lang?: string | null): TtsVoiceLangKey | null {
+  if (typeof lang !== 'string') return null;
+  const raw = lang.trim().replace(/_/g, '-').toLowerCase();
+  if (!raw) return null;
+  const parts = raw.split('-').filter(Boolean);
+  const primary = parts[0];
+  if (!primary) return null;
+  if (primary === 'zh') {
+    if (parts.includes('tw') || parts.includes('hk') || parts.includes('mo') || parts.includes('hant')) {
+      return 'zh-TW';
+    }
+    return 'zh-CN';
+  }
+  if (primary === 'en') return 'en';
+  if (primary === 'ja') return 'ja';
+  if (primary === 'ko') return 'ko';
+  if (primary === 'es') return 'es';
+  if (primary === 'ru') return 'ru';
+  return null;
+}
+
+/** Normalize and bound a user/env per-language voice map, dropping empty or unknown entries. */
+export function sanitizeTtsVoicesByLang(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const result: Record<string, string> = {};
+  let inspected = 0;
+  for (const [rawKey, rawVal] of Object.entries(raw as Record<string, unknown>)) {
+    if (++inspected > 32) break;
+    const normKey = normalizeTtsVoiceLangKey(rawKey);
+    if (!normKey || typeof rawVal !== 'string') continue;
+    const voice = rawVal.trim().slice(0, 256);
+    if (!voice) continue;
+    result[normKey] = voice;
+  }
+  return result;
+}
+
+/**
+ * Resolve the upstream voice for a speech segment:
+ * explicit `voicesByLang` override -> matching `fallbackVoice` locale -> best localized upstream voice -> `fallbackVoice`.
+ */
+export function resolveServerTtsVoiceForLang(params: {
+  lang?: string | null;
+  voicesByLang?: Record<string, string> | null;
+  availableVoices?: readonly TtsVoiceOption[] | null;
+  fallbackVoice?: string | null;
+}): string {
+  const fallback = (typeof params.fallbackVoice === 'string' ? params.fallbackVoice.trim() : '') || TTS_DEFAULT_VOICE;
+  const rawLang = typeof params.lang === 'string' ? params.lang.trim() : '';
+  if (!rawLang) return fallback;
+
+  const normKey = normalizeTtsVoiceLangKey(rawLang);
+  const overrides = params.voicesByLang;
+  if (overrides && typeof overrides === 'object') {
+    const exactOverride = overrides[rawLang]?.trim();
+    if (exactOverride) return exactOverride;
+    if (normKey) {
+      const normalizedOverride = overrides[normKey]?.trim();
+      if (normalizedOverride) return normalizedOverride;
+      for (const [k, v] of Object.entries(overrides)) {
+        if (normalizeTtsVoiceLangKey(k) === normKey && typeof v === 'string' && v.trim()) {
+          return v.trim();
+        }
+      }
+    }
+  }
+
+  const voices = Array.isArray(params.availableVoices) ? params.availableVoices : [];
+  if (!normKey || voices.length === 0) return fallback;
+
+  const fallbackEntry = voices.find((v) => v.id?.trim() === fallback && v.locale && normalizeTtsVoiceLangKey(v.locale) === normKey);
+  if (fallbackEntry) return fallback;
+
+  const normalizedRawTag = rawLang.replace(/_/g, '-').toLowerCase();
+  const exactTagMatch = voices.find(
+    (v) => v.locale && v.locale.trim().replace(/_/g, '-').toLowerCase() === normalizedRawTag && v.id?.trim(),
+  );
+  if (exactTagMatch) return exactTagMatch.id.trim();
+
+  const preferredTag = PREFERRED_VOICE_LOCALE_BY_KEY[normKey];
+  const preferredMatch = voices.find(
+    (v) => v.locale && v.locale.trim().replace(/_/g, '-').toLowerCase() === preferredTag && v.id?.trim(),
+  );
+  if (preferredMatch) return preferredMatch.id.trim();
+
+  const familyMatch = voices.find(
+    (v) => v.locale && normalizeTtsVoiceLangKey(v.locale) === normKey && v.id?.trim(),
+  );
+  if (familyMatch) return familyMatch.id.trim();
+
+  return fallback;
 }
 
 export type TtsBaseUrlValidationResult =

@@ -94,22 +94,31 @@ beforeEach(() => {
     apiKeyMasked: null,
     model: 'gpt-4o-mini-tts',
     voice: 'alloy',
+    voicesByLang: {},
     responseFormat: 'mp3',
     serverDefaultConfigured: false,
   });
-  mockApi.updateServerTtsConfig.mockImplementation(async (body: Record<string, unknown>) => ({
-    ok: true,
-    config: {
-      mode: body.mode ?? 'server',
-      baseUrl: body.baseUrl ?? 'http://127.0.0.1:8880/v1',
-      hasApiKey: body.apiKey === '' ? false : (body.apiKey !== undefined ? Boolean(body.apiKey) : true),
-      apiKeyMasked: body.apiKey === '' ? null : 'sk-1...7890',
-      model: body.model ?? 'gpt-4o-mini-tts',
-      voice: body.voice ?? 'alloy',
-      responseFormat: body.responseFormat ?? 'mp3',
-      serverDefaultConfigured: false,
-    },
-  }));
+  mockApi.updateServerTtsConfig.mockImplementation(async (body: Record<string, unknown>) => {
+    const rawVoices = (body.voicesByLang ?? {}) as Record<string, string>;
+    const voicesByLang: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawVoices)) {
+      if (typeof v === 'string' && v.trim()) voicesByLang[k] = v.trim();
+    }
+    return {
+      ok: true,
+      config: {
+        mode: body.mode ?? 'server',
+        baseUrl: body.baseUrl ?? 'http://127.0.0.1:8880/v1',
+        hasApiKey: body.apiKey === '' ? false : (body.apiKey !== undefined ? Boolean(body.apiKey) : true),
+        apiKeyMasked: body.apiKey === '' ? null : 'sk-1...7890',
+        model: body.model ?? 'gpt-4o-mini-tts',
+        voice: body.voice ?? 'alloy',
+        voicesByLang,
+        responseFormat: body.responseFormat ?? 'mp3',
+        serverDefaultConfigured: false,
+      },
+    };
+  });
 });
 
 vi.mock('react-i18next', () => ({
@@ -466,6 +475,7 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
         baseUrl: 'http://127.0.0.1:8880/v1',
         model: 'kokoro',
         voice: 'af_bella',
+        voicesByLang: { 'zh-CN': '', 'zh-TW': '', en: '', ja: '', ko: '', es: '', ru: '' },
         responseFormat: 'wav',
       });
     });
@@ -578,6 +588,75 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
     fireEvent.change(popSelect, { target: { value: 'nova' } });
     await waitFor(() => {
       expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith({ voice: 'nova' });
+    });
+  });
+
+  it('renders per-language voice selectors with auto-match labels and persists voicesByLang overrides', async () => {
+    mockApi.getServerTtsConfig.mockResolvedValueOnce({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: { ja: 'ja-JP-NanamiNeural' },
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+    mockApi.getServerTtsVoices.mockResolvedValue({
+      voices: [
+        { id: 'zh-CN-XiaoxiaoNeural', name: 'Xiaoxiao', locale: 'zh-CN' },
+        { id: 'en-US-AriaNeural', name: 'Aria', locale: 'en-US' },
+        { id: 'en-GB-SoniaNeural', name: 'Sonia', locale: 'en-GB' },
+        { id: 'ja-JP-NanamiNeural', name: 'Nanami', locale: 'ja-JP' },
+      ],
+      source: 'upstream',
+      endpointConfigured: true,
+    });
+
+    render(
+      <SettingsPage
+        displayName="Tester"
+        username="tester"
+        hasPassword={true}
+        onBack={() => {}}
+        onDisplayNameChanged={() => {}}
+        onUserAuthUpdated={() => {}}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('settings-tts-server-lang-voices')).toBeTruthy();
+    });
+
+    const enSelect = screen.getByTestId('settings-tts-lang-voice-en') as HTMLSelectElement;
+    const jaSelect = screen.getByTestId('settings-tts-lang-voice-ja') as HTMLSelectElement;
+    const ruSelect = screen.getByTestId('settings-tts-lang-voice-ru') as HTMLSelectElement;
+    await waitFor(() => {
+      expect(jaSelect.value).toBe('ja-JP-NanamiNeural');
+      expect(Array.from(enSelect.options).some((opt) => opt.value === 'en-GB-SoniaNeural')).toBe(true);
+      expect(enSelect.options[0]?.textContent).toBe('settings.tts_lang_voice_auto_matched');
+      expect(ruSelect.options[0]?.textContent).toBe('settings.tts_lang_voice_auto_fallback');
+    });
+
+    // Choose explicit en override and revert ja back to auto
+    fireEvent.change(enSelect, { target: { value: 'en-GB-SoniaNeural' } });
+    fireEvent.change(jaSelect, { target: { value: '' } });
+    fireEvent.click(screen.getByTestId('settings-tts-server-save'));
+
+    await waitFor(() => {
+      expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith(expect.objectContaining({
+        voice: 'zh-CN-XiaoxiaoNeural',
+        voicesByLang: {
+          'zh-CN': '',
+          'zh-TW': '',
+          en: 'en-GB-SoniaNeural',
+          ja: '',
+          ko: '',
+          es: '',
+          ru: '',
+        },
+      }));
     });
   });
 });

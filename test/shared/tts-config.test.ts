@@ -13,13 +13,18 @@ import {
   TTS_OPENAI_PRESET_VOICES,
   TTS_RESPONSE_FORMATS,
   TTS_SPEECH_PATH,
+  TTS_USER_CONFIG_PREF_KEY,
   TTS_VOICES_PATH,
+  TTS_VOICE_LANG_KEYS,
   clampTtsServerSpeed,
   isTtsEngineMode,
   isTtsResponseFormat,
   maskTtsApiKey,
+  normalizeTtsVoiceLangKey,
   resolveOpenAiSpeechEndpoint,
   resolveOpenAiVoicesEndpoints,
+  resolveServerTtsVoiceForLang,
+  sanitizeTtsVoicesByLang,
   ttsAudioContentType,
   validateTtsBaseUrl,
 } from '../../shared/tts-config.js';
@@ -111,5 +116,99 @@ describe('shared tts-config contract', () => {
     expect(ttsAudioContentType('mp3')).toBe('audio/mpeg');
     expect(ttsAudioContentType('opus')).toBe('audio/opus');
     expect(ttsAudioContentType('wav')).toBe('audio/wav');
+  });
+
+  it('normalizes language keys, sanitizes voicesByLang, and resolves per-language voices with fallback', () => {
+    expect(TTS_VOICE_LANG_KEYS).toEqual(['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'es', 'ru']);
+    expect(TTS_USER_CONFIG_PREF_KEY).toBe('imcodes.server.tts.config');
+
+    expect(normalizeTtsVoiceLangKey('zh-TW')).toBe('zh-TW');
+    expect(normalizeTtsVoiceLangKey('zh_HK')).toBe('zh-TW');
+    expect(normalizeTtsVoiceLangKey('zh-Hant')).toBe('zh-TW');
+    expect(normalizeTtsVoiceLangKey('zh')).toBe('zh-CN');
+    expect(normalizeTtsVoiceLangKey('zh-CN')).toBe('zh-CN');
+    expect(normalizeTtsVoiceLangKey('en-GB')).toBe('en');
+    expect(normalizeTtsVoiceLangKey('ja-JP')).toBe('ja');
+    expect(normalizeTtsVoiceLangKey('ko-KR')).toBe('ko');
+    expect(normalizeTtsVoiceLangKey('es-ES')).toBe('es');
+    expect(normalizeTtsVoiceLangKey('ru-RU')).toBe('ru');
+    expect(normalizeTtsVoiceLangKey('fr-FR')).toBeNull();
+    expect(normalizeTtsVoiceLangKey('')).toBeNull();
+
+    expect(sanitizeTtsVoicesByLang({
+      'en-US': ' en-US-AriaNeural ',
+      zh_HK: 'zh-HK-HiuGaaiNeural',
+      ja: '   ',
+      fr: 'fr-FR-DeniseNeural',
+      ru: 123,
+    })).toEqual({
+      en: 'en-US-AriaNeural',
+      'zh-TW': 'zh-HK-HiuGaaiNeural',
+    });
+
+    const available = [
+      { id: 'zh-CN-XiaoxiaoNeural', locale: 'zh-CN' },
+      { id: 'zh-CN-YunxiNeural', locale: 'zh-CN' },
+      { id: 'zh-HK-HiuGaaiNeural', locale: 'zh-HK' },
+      { id: 'zh-TW-HsiaoChenNeural', locale: 'zh-TW' },
+      { id: 'en-GB-SoniaNeural', locale: 'en-GB' },
+      { id: 'en-US-AriaNeural', locale: 'en-US' },
+      { id: 'ja-JP-NanamiNeural', locale: 'ja-JP' },
+    ];
+
+    // 1. Explicit voicesByLang override wins
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'en-US',
+      voicesByLang: { en: 'en-GB-SoniaNeural' },
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-XiaoxiaoNeural',
+    })).toBe('en-GB-SoniaNeural');
+
+    // 2. Fallback whose locale matches target lang is preserved
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'zh-CN',
+      voicesByLang: {},
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-YunxiNeural',
+    })).toBe('zh-CN-YunxiNeural');
+
+    // 3. Auto-match prefers exact tag or primary regional tag (en-US over en-GB, zh-TW over zh-HK)
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'en-US',
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-XiaoxiaoNeural',
+    })).toBe('en-US-AriaNeural');
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'zh-TW',
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-XiaoxiaoNeural',
+    })).toBe('zh-TW-HsiaoChenNeural');
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'zh-HK',
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-XiaoxiaoNeural',
+    })).toBe('zh-HK-HiuGaaiNeural');
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'ja-JP',
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-XiaoxiaoNeural',
+    })).toBe('ja-JP-NanamiNeural');
+
+    // 4. Unmatched language (e.g. es-ES without es upstream voices, or OpenAI presets without locale) falls back cleanly
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'es-ES',
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-XiaoxiaoNeural',
+    })).toBe('zh-CN-XiaoxiaoNeural');
+    expect(resolveServerTtsVoiceForLang({
+      lang: 'ja-JP',
+      availableVoices: [{ id: 'alloy' }, { id: 'nova' }],
+      fallbackVoice: 'nova',
+    })).toBe('nova');
+    expect(resolveServerTtsVoiceForLang({
+      lang: '',
+      availableVoices: available,
+      fallbackVoice: 'zh-CN-XiaoxiaoNeural',
+    })).toBe('zh-CN-XiaoxiaoNeural');
   });
 });

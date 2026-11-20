@@ -5,12 +5,17 @@ import {
 import {
   TTS_DEFAULT_VOICE,
   TTS_OPENAI_PRESET_VOICES,
+  TTS_VOICE_LANG_KEYS,
   clampTtsServerSpeed,
   isTtsEngineMode,
+  normalizeTtsVoiceLangKey,
+  resolveServerTtsVoiceForLang,
+  sanitizeTtsVoicesByLang,
   type TtsConfigUpdateBody,
   type TtsEngineMode,
   type TtsPublicConfig,
   type TtsSpeechRequestBody,
+  type TtsVoiceLangKey,
   type TtsVoiceOption,
   type TtsVoicesResponse,
 } from '@shared/tts-config.js';
@@ -22,8 +27,8 @@ import {
   type NativeTtsVoiceQualityInfo,
 } from './voice-recognition-backend.js';
 
-export { TTS_OPENAI_PRESET_VOICES };
-export type { TtsEngineMode, TtsPublicConfig, TtsVoiceOption, TtsVoicesResponse };
+export { TTS_OPENAI_PRESET_VOICES, TTS_VOICE_LANG_KEYS, normalizeTtsVoiceLangKey, resolveServerTtsVoiceForLang, sanitizeTtsVoicesByLang };
+export type { TtsEngineMode, TtsPublicConfig, TtsVoiceLangKey, TtsVoiceOption, TtsVoicesResponse };
 
 export const TTS_AUTO_READ_STORAGE_KEY = 'imcodes_tts_auto_read';
 export const TTS_SPEECH_RATE_STORAGE_KEY = 'imcodes_tts_rate';
@@ -226,10 +231,11 @@ export function getCachedServerTtsConfig(): TtsPublicConfig | null {
       apiKeyMasked: typeof parsed.apiKeyMasked === 'string' ? parsed.apiKeyMasked : null,
       model: typeof parsed.model === 'string' ? parsed.model : 'gpt-4o-mini-tts',
       voice: typeof parsed.voice === 'string' ? parsed.voice : TTS_DEFAULT_VOICE,
+      voicesByLang: sanitizeTtsVoicesByLang(parsed.voicesByLang),
       responseFormat: typeof parsed.responseFormat === 'string' ? parsed.responseFormat : 'mp3',
       serverDefaultConfigured: parsed.serverDefaultConfigured === true,
     };
-    return { ...cachedServerTtsConfig };
+    return { ...cachedServerTtsConfig, voicesByLang: { ...(cachedServerTtsConfig.voicesByLang ?? {}) } };
   } catch {
     return null;
   }
@@ -248,7 +254,11 @@ export function applyServerTtsConfig(config: TtsPublicConfig): void {
       : isTtsEngineMode(config.mode)
         ? config.mode
         : 'server';
-  cachedServerTtsConfig = { ...config, mode: effectiveMode };
+  cachedServerTtsConfig = {
+    ...config,
+    voicesByLang: sanitizeTtsVoicesByLang(config.voicesByLang),
+    mode: effectiveMode,
+  };
   try {
     globalThis.localStorage?.setItem(TTS_MODE_STORAGE_KEY, effectiveMode);
     globalThis.localStorage?.setItem(TTS_SERVER_CONFIG_CACHE_KEY, JSON.stringify(cachedServerTtsConfig));
@@ -1005,9 +1015,44 @@ async function speakWithServerTts(
   activeServerAbortController = abortController;
   const speed = clampTtsServerSpeed(rate);
 
-  const fetchSegmentBlob = (seg: TtsSegment): Promise<Blob> => (
-    synthesizeFn({ input: seg.text, speed }, { signal: abortController.signal })
-  );
+  let config = getCachedServerTtsConfig();
+  let voicesRes = getCachedServerTtsVoices();
+  if (!voicesRes && isServerTtsConfigured(config)) {
+    try {
+      voicesRes = await Promise.race([
+        fetchServerTtsVoices(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2_000)),
+      ]);
+    } catch {
+      voicesRes = null;
+    }
+    if (playbackGeneration !== gen || abortController.signal.aborted) {
+      if (activeServerAbortController === abortController) activeServerAbortController = null;
+      return { started: false, reason: 'superseded' };
+    }
+    config = getCachedServerTtsConfig();
+  }
+
+  const fetchSegmentBlob = (seg: TtsSegment): Promise<Blob> => {
+    const resolvedVoice = resolveServerTtsVoiceForLang({
+      lang: seg.lang,
+      voicesByLang: config?.voicesByLang,
+      availableVoices: voicesRes?.voices,
+      fallbackVoice: config?.voice,
+    });
+    const hasConfiguredOrMatchedVoice = Boolean(
+      config?.voice?.trim()
+      || (voicesRes?.voices && voicesRes.voices.length > 0)
+      || (config?.voicesByLang && Object.keys(config.voicesByLang).length > 0),
+    );
+    const body: TtsSpeechRequestBody = {
+      input: seg.text,
+      speed,
+      ...(hasConfiguredOrMatchedVoice && resolvedVoice ? { voice: resolvedVoice } : {}),
+      ...(seg.lang ? { lang: seg.lang } : {}),
+    };
+    return synthesizeFn(body, { signal: abortController.signal });
+  };
 
   setState({ status: 'speaking', activeMessageId: messageId, error: null });
 

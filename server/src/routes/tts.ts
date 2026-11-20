@@ -22,8 +22,11 @@ import {
   isTtsEngineMode,
   isTtsResponseFormat,
   maskTtsApiKey,
+  normalizeTtsVoiceLangKey,
   resolveOpenAiSpeechEndpoint,
   resolveOpenAiVoicesEndpoints,
+  resolveServerTtsVoiceForLang,
+  sanitizeTtsVoicesByLang,
   ttsAudioContentType,
   validateTtsBaseUrl,
   type TtsEngineMode,
@@ -43,6 +46,7 @@ interface StoredUserTtsConfig {
   apiKeyEncrypted?: string | null;
   model?: string;
   voice?: string;
+  voicesByLang?: Record<string, string>;
   responseFormat?: TtsResponseFormat;
 }
 
@@ -51,6 +55,7 @@ interface EnvTtsDefaults {
   apiKey: string;
   model: string;
   voice: string;
+  voicesByLang: Record<string, string>;
   responseFormat: TtsResponseFormat;
   serverDefaultConfigured: boolean;
 }
@@ -61,6 +66,7 @@ const configUpdateSchema = z.object({
   apiKey: z.string().max(4096).optional(),
   model: z.string().max(256).optional(),
   voice: z.string().max(256).optional(),
+  voicesByLang: z.record(z.string().max(32), z.string().max(256)).optional(),
   responseFormat: z.enum(TTS_RESPONSE_FORMATS).optional(),
 });
 
@@ -68,10 +74,21 @@ const speechRequestSchema = z.object({
   input: z.string().max(TTS_MAX_INPUT_CHARS),
   model: z.string().max(256).optional(),
   voice: z.string().max(256).optional(),
+  lang: z.string().max(32).optional(),
   speed: z.number().finite().optional(),
   response_format: z.enum(TTS_RESPONSE_FORMATS).optional(),
   instructions: z.string().max(1024).optional(),
 });
+
+function parseEnvVoicesByLang(raw?: string): Record<string, string> {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return {};
+  try {
+    return sanitizeTtsVoicesByLang(JSON.parse(trimmed));
+  } catch {
+    return {};
+  }
+}
 
 function readEnvTtsDefaults(env: Env): EnvTtsDefaults {
   const rawBaseUrl = (env.TTS_BASE_URL ?? '').trim();
@@ -80,6 +97,7 @@ function readEnvTtsDefaults(env: Env): EnvTtsDefaults {
   const apiKey = (env.TTS_API_KEY ?? '').trim();
   const model = (env.TTS_MODEL ?? '').trim() || TTS_DEFAULT_MODEL;
   const voice = (env.TTS_VOICE ?? '').trim() || TTS_DEFAULT_VOICE;
+  const voicesByLang = parseEnvVoicesByLang(env.TTS_VOICES_BY_LANG);
   const rawFmt = (env.TTS_RESPONSE_FORMAT ?? '').trim();
   const responseFormat = isTtsResponseFormat(rawFmt) ? rawFmt : TTS_DEFAULT_RESPONSE_FORMAT;
   return {
@@ -87,6 +105,7 @@ function readEnvTtsDefaults(env: Env): EnvTtsDefaults {
     apiKey,
     model,
     voice,
+    voicesByLang,
     responseFormat,
     serverDefaultConfigured: Boolean(baseUrl),
   };
@@ -98,12 +117,14 @@ async function loadStoredUserTtsConfig(env: Env, userId: string): Promise<Stored
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (!parsed || typeof parsed !== 'object') return {};
+    const sanitizedVoices = sanitizeTtsVoicesByLang(parsed.voicesByLang);
     return {
       mode: isTtsEngineMode(parsed.mode) ? parsed.mode : undefined,
       baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : undefined,
       apiKeyEncrypted: typeof parsed.apiKeyEncrypted === 'string' ? parsed.apiKeyEncrypted : null,
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
       voice: typeof parsed.voice === 'string' ? parsed.voice : undefined,
+      ...(Object.keys(sanitizedVoices).length > 0 ? { voicesByLang: sanitizedVoices } : {}),
       responseFormat: isTtsResponseFormat(parsed.responseFormat) ? parsed.responseFormat : undefined,
     };
   } catch {
@@ -138,6 +159,7 @@ function buildPublicTtsConfig(stored: StoredUserTtsConfig, env: Env): TtsPublicC
     apiKeyMasked: maskTtsApiKey(userApiKey),
     model: stored.model?.trim() || envDefaults.model,
     voice: stored.voice?.trim() || envDefaults.voice,
+    voicesByLang: { ...envDefaults.voicesByLang, ...(stored.voicesByLang ?? {}) },
     responseFormat: stored.responseFormat ?? envDefaults.responseFormat,
     serverDefaultConfigured: envDefaults.serverDefaultConfigured,
   };
@@ -329,6 +351,25 @@ ttsRoutes.put('/config', async (c) => {
     }
   }
 
+  if (parsed.data.voicesByLang !== undefined) {
+    const mergedVoices: Record<string, string> = { ...(next.voicesByLang ?? {}) };
+    for (const [rawKey, rawVoice] of Object.entries(parsed.data.voicesByLang)) {
+      const key = normalizeTtsVoiceLangKey(rawKey);
+      if (!key) continue;
+      const trimmedVoice = rawVoice.trim();
+      if (!trimmedVoice) {
+        delete mergedVoices[key];
+      } else {
+        mergedVoices[key] = trimmedVoice;
+      }
+    }
+    if (Object.keys(mergedVoices).length === 0) {
+      delete next.voicesByLang;
+    } else {
+      next.voicesByLang = mergedVoices;
+    }
+  }
+
   if (parsed.data.responseFormat !== undefined) {
     next.responseFormat = parsed.data.responseFormat;
   }
@@ -468,10 +509,19 @@ ttsRoutes.post('/speech', async (c) => {
 
   const responseFormat: TtsResponseFormat =
     parsed.data.response_format ?? stored.responseFormat ?? envDefaults.responseFormat;
+  const fallbackVoice = stored.voice?.trim() || envDefaults.voice;
+  const mergedVoicesByLang = { ...envDefaults.voicesByLang, ...(stored.voicesByLang ?? {}) };
+  const resolvedVoice =
+    parsed.data.voice?.trim()
+    || resolveServerTtsVoiceForLang({
+      lang: parsed.data.lang,
+      voicesByLang: mergedVoicesByLang,
+      fallbackVoice,
+    });
   const upstreamPayload: Record<string, unknown> = {
     model: parsed.data.model?.trim() || stored.model?.trim() || envDefaults.model,
     input: inputText,
-    voice: parsed.data.voice?.trim() || stored.voice?.trim() || envDefaults.voice,
+    voice: resolvedVoice,
     response_format: responseFormat,
   };
   if (parsed.data.speed !== undefined) {

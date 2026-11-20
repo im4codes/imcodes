@@ -657,4 +657,95 @@ describe('server TTS playback', () => {
     await tts.syncTtsConfigFromServer();
     expect(tts.getTtsMode()).toBe('system');
   });
+
+  it('auto-resolves per-segment voices from /api/tts/voices + voicesByLang and degrades cleanly when /voices fails', async () => {
+    URL.createObjectURL = vi.fn(() => 'blob:mock/lang');
+    URL.revokeObjectURL = vi.fn();
+    class MockAudio {
+      src = '';
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play = vi.fn(async () => {
+        queueMicrotask(() => this.onended?.());
+      });
+      pause = vi.fn();
+    }
+    vi.stubGlobal('Audio', MockAudio);
+
+    const speechBodies: Array<{ input: string; voice?: string; lang?: string }> = [];
+    globalThis.fetch = vi.fn(async (url, init) => {
+      const u = String(url);
+      if (u.includes('/voices')) {
+        return new Response(JSON.stringify({
+          voices: [
+            { id: 'zh-CN-XiaoxiaoNeural', locale: 'zh-CN' },
+            { id: 'en-US-AriaNeural', locale: 'en-US' },
+            { id: 'ja-JP-NanamiNeural', locale: 'ja-JP' },
+            { id: 'es-ES-ElviraNeural', locale: 'es-ES' },
+          ],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      speechBodies.push(JSON.parse(String(init?.body ?? '{}')) as { input: string; voice?: string; lang?: string });
+      return new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: { ja: 'ja-JP-KeitaNeural' },
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+
+    const res = await tts.speakText('中文一句。 English line! 日本語テスト。 Привет.', {
+      messageId: 'multi-lang',
+      lang: 'zh-CN',
+    });
+    expect(res).toEqual({ started: true });
+    await vi.waitFor(() => expect(tts.getTtsState().status).toBe('idle'));
+
+    expect(speechBodies).toEqual([
+      { input: '中文一句。', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'zh-CN' },
+      { input: 'English line!', speed: 1.1, voice: 'en-US-AriaNeural', lang: 'en-US' },
+      { input: '日本語テスト。', speed: 1.1, voice: 'ja-JP-KeitaNeural', lang: 'ja-JP' },
+      { input: 'Привет.', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'ru-RU' },
+    ]);
+
+    // When /voices fails on a fresh session, fallbackVoice still plays without blocking
+    vi.resetModules();
+    const ttsFallback = await import('../src/tts.js');
+    const fallbackBodies: Array<{ input: string; voice?: string; lang?: string }> = [];
+    globalThis.fetch = vi.fn(async (url, init) => {
+      if (String(url).includes('/voices')) {
+        return new Response('unavailable', { status: 503 });
+      }
+      fallbackBodies.push(JSON.parse(String(init?.body ?? '{}')) as { input: string; voice?: string; lang?: string });
+      return new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 });
+    }) as typeof fetch;
+
+    ttsFallback.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+    const res2 = await ttsFallback.speakText('Hello world!', { messageId: 'fb-1', lang: 'en-US' });
+    expect(res2).toEqual({ started: true });
+    await vi.waitFor(() => expect(ttsFallback.getTtsState().status).toBe('idle'));
+    expect(fallbackBodies).toEqual([
+      { input: 'Hello world!', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'en-US' },
+    ]);
+  });
 });

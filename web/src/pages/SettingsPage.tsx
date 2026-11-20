@@ -8,6 +8,10 @@ import {
   TTS_DEFAULT_VOICE,
   TTS_ENGINES,
   TTS_RESPONSE_FORMATS,
+  TTS_VOICE_LANG_KEYS,
+  normalizeTtsVoiceLangKey,
+  resolveServerTtsVoiceForLang,
+  sanitizeTtsVoicesByLang,
   type TtsResponseFormat,
 } from '@shared/tts-config.js';
 import { isNative } from '../native.js';
@@ -148,6 +152,7 @@ export function SettingsPage({
   const [ttsApiKeyMasked, setTtsApiKeyMasked] = useState<string | null>(() => getCachedServerTtsConfig()?.apiKeyMasked ?? null);
   const [ttsModel, setTtsModel] = useState<string>(() => getCachedServerTtsConfig()?.model ?? TTS_DEFAULT_MODEL);
   const [ttsVoice, setTtsVoice] = useState<string>(() => getCachedServerTtsConfig()?.voice ?? TTS_DEFAULT_VOICE);
+  const [ttsLangVoices, setTtsLangVoices] = useState<Record<string, string>>(() => sanitizeTtsVoicesByLang(getCachedServerTtsConfig()?.voicesByLang));
   const [ttsFormat, setTtsFormat] = useState<TtsResponseFormat>(() => getCachedServerTtsConfig()?.responseFormat ?? TTS_DEFAULT_RESPONSE_FORMAT);
   const [ttsServerDefaultConfigured, setTtsServerDefaultConfigured] = useState<boolean>(() => getCachedServerTtsConfig()?.serverDefaultConfigured ?? false);
   const [ttsVoices, setTtsVoices] = useState<TtsVoiceOption[]>(() => (
@@ -208,6 +213,7 @@ export function SettingsPage({
       setTtsApiKeyMasked(cfg.apiKeyMasked);
       setTtsModel(cfg.model);
       setTtsVoice(cfg.voice);
+      setTtsLangVoices(sanitizeTtsVoicesByLang(cfg.voicesByLang));
       setTtsFormat(cfg.responseFormat);
       setTtsServerDefaultConfigured(cfg.serverDefaultConfigured);
     }).catch(() => {});
@@ -1075,6 +1081,74 @@ export function SettingsPage({
                           </select>
                         </div>
                       </div>
+                      <div data-testid="settings-tts-server-lang-voices">
+                        <div style={{ marginBottom: 6 }}>
+                          <div style={{ fontSize: '12px', fontWeight: 600, color: '#cbd5e1' }}>
+                            {t('settings.tts_server_lang_voices')}
+                          </div>
+                          <div style={{ fontSize: '11px', color: '#94a3b8' }}>
+                            {t('settings.tts_server_lang_voices_hint')}
+                          </div>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 8 }}>
+                          {TTS_VOICE_LANG_KEYS.map((langKey) => {
+                            const fallbackVoice = ttsVoice.trim() || TTS_DEFAULT_VOICE;
+                            const matching = ttsVoiceOptions.filter((v) => v.locale && normalizeTtsVoiceLangKey(v.locale) === langKey);
+                            const others = ttsVoiceOptions.filter((v) => !v.locale || normalizeTtsVoiceLangKey(v.locale) !== langKey);
+                            const ordered = [...matching, ...others];
+                            const selectedVal = ttsLangVoices[langKey] ?? '';
+                            const hasSelectedInOrdered = !selectedVal || ordered.some((v) => v.id === selectedVal);
+                            const autoResolved = resolveServerTtsVoiceForLang({
+                              lang: langKey,
+                              availableVoices: ttsVoiceOptions,
+                              fallbackVoice,
+                            });
+                            const autoLabel = matching.length > 0
+                              ? t('settings.tts_lang_voice_auto_matched', { voice: autoResolved })
+                              : t('settings.tts_lang_voice_auto_fallback', { voice: autoResolved });
+                            const handleLangSelect = (e: Event) => {
+                              const nextVal = (e.currentTarget as HTMLSelectElement).value;
+                              setTtsLangVoices((prev) => {
+                                const next = { ...prev };
+                                if (nextVal) next[langKey] = nextVal;
+                                else delete next[langKey];
+                                return next;
+                              });
+                            };
+                            return (
+                              <div key={langKey}>
+                                <label style={inlineLabelStyle} for={`settings-tts-lang-voice-${langKey}`}>
+                                  {t(`settings.tts_lang_${langKey}`)}
+                                </label>
+                                <select
+                                  id={`settings-tts-lang-voice-${langKey}`}
+                                  data-testid={`settings-tts-lang-voice-${langKey}`}
+                                  aria-label={t(`settings.tts_lang_${langKey}`)}
+                                  class="settings-input"
+                                  value={selectedVal}
+                                  onInput={handleLangSelect}
+                                  onChange={handleLangSelect}
+                                >
+                                  <option value="">{autoLabel}</option>
+                                  {!hasSelectedInOrdered && (
+                                    <option value={selectedVal}>{selectedVal}</option>
+                                  )}
+                                  {ordered.map((voice) => {
+                                    const label = voice.name && voice.name !== voice.id
+                                      ? `${voice.name} (${voice.id})`
+                                      : voice.id;
+                                    return (
+                                      <option key={voice.id} value={voice.id}>
+                                        {voice.locale ? `${label} · ${voice.locale}` : label}
+                                      </option>
+                                    );
+                                  })}
+                                </select>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
                       <div class="settings-action-row" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                         <button
                           type="button"
@@ -1086,18 +1160,24 @@ export function SettingsPage({
                             setTtsSaving(true);
                             setTtsServerMsg(null);
                             try {
+                              const voicesByLangPayload: Record<string, string> = {};
+                              for (const langKey of TTS_VOICE_LANG_KEYS) {
+                                voicesByLangPayload[langKey] = (ttsLangVoices[langKey] ?? '').trim();
+                              }
                               const payload: {
                                 mode: TtsEngineMode;
                                 baseUrl: string;
                                 apiKey?: string;
                                 model: string;
                                 voice: string;
+                                voicesByLang: Record<string, string>;
                                 responseFormat: TtsResponseFormat;
                               } = {
                                 mode: ttsMode,
                                 baseUrl: ttsBaseUrl.trim(),
                                 model: ttsModel.trim(),
                                 voice: ttsVoice.trim(),
+                                voicesByLang: voicesByLangPayload,
                                 responseFormat: ttsFormat,
                               };
                               if (ttsApiKeyInput.trim()) {
@@ -1110,6 +1190,7 @@ export function SettingsPage({
                                 setTtsApiKeyMasked(res.config.apiKeyMasked);
                                 setTtsModel(res.config.model);
                                 setTtsVoice(res.config.voice);
+                                setTtsLangVoices(sanitizeTtsVoicesByLang(res.config.voicesByLang));
                                 setTtsFormat(res.config.responseFormat);
                                 setTtsServerDefaultConfigured(res.config.serverDefaultConfigured);
                                 setTtsApiKeyInput('');

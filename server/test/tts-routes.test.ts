@@ -530,4 +530,106 @@ describe('TTS routes & preferences isolation', () => {
     expect(bigRes.status).toBe(200);
     expect((await bigRes.json() as { source: string }).source).toBe('preset');
   });
+
+  it('persists voicesByLang, preserves overrides across partial updates, clears with empty string, and resolves lang on /speech', async () => {
+    const { db, prefs } = makeMemDb();
+    const env = makeEnv(db, {
+      TTS_BASE_URL: 'https://tts.example.com/v1',
+      TTS_VOICE: 'zh-CN-XiaoxiaoNeural',
+      TTS_VOICES_BY_LANG: JSON.stringify({ en: 'en-US-GuyNeural', 'zh-TW': 'zh-TW-HsiaoChenNeural', invalid: 'skip' }),
+    });
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    // GET /config merges env TTS_VOICES_BY_LANG defaults
+    const get1 = await app.request(TTS_CONFIG_PATH, { method: 'GET', headers: { Cookie: cookie } }, env);
+    expect(get1.status).toBe(200);
+    expect((await get1.json() as { voicesByLang: Record<string, string> }).voicesByLang).toEqual({
+      en: 'en-US-GuyNeural',
+      'zh-TW': 'zh-TW-HsiaoChenNeural',
+    });
+
+    // Legacy preference record without voicesByLang treats voicesByLang as {} cleanly
+    prefs.set(`user-legacy:${TTS_USER_CONFIG_PREF_KEY}`, JSON.stringify({ voice: 'nova', mode: 'server' }));
+    const legacyRes = await app.request(TTS_CONFIG_PATH, {
+      method: 'GET',
+      headers: { Cookie: authCookies('user-legacy') },
+    }, env);
+    expect((await legacyRes.json() as { voicesByLang: Record<string, string> }).voicesByLang).toEqual({
+      en: 'en-US-GuyNeural',
+      'zh-TW': 'zh-TW-HsiaoChenNeural',
+    });
+
+    // PUT /config saves per-language overrides + sanitizes keys
+    const put1 = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({
+        voicesByLang: {
+          'en-GB': 'en-GB-SoniaNeural',
+          ja: 'ja-JP-NanamiNeural',
+          fr: 'ignored-lang',
+          ko: '   ',
+        },
+      }),
+    }, env);
+    expect(put1.status).toBe(200);
+    expect((await put1.json() as { config: { voicesByLang: Record<string, string> } }).config.voicesByLang).toEqual({
+      en: 'en-GB-SoniaNeural',
+      'zh-TW': 'zh-TW-HsiaoChenNeural',
+      ja: 'ja-JP-NanamiNeural',
+    });
+
+    // Partial update (e.g. quick popover { voice }) preserves saved voicesByLang
+    const putPartial = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ voice: 'zh-CN-YunxiNeural' }),
+    }, env);
+    expect(putPartial.status).toBe(200);
+    const partialBody = await putPartial.json() as { config: { voice: string; voicesByLang: Record<string, string> } };
+    expect(partialBody.config.voice).toBe('zh-CN-YunxiNeural');
+    expect(partialBody.config.voicesByLang).toEqual({
+      en: 'en-GB-SoniaNeural',
+      'zh-TW': 'zh-TW-HsiaoChenNeural',
+      ja: 'ja-JP-NanamiNeural',
+    });
+
+    // Empty string clears a language override back to default/auto
+    const putClear = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ voicesByLang: { ja: '' } }),
+    }, env);
+    expect((await putClear.json() as { config: { voicesByLang: Record<string, string> } }).config.voicesByLang).toEqual({
+      en: 'en-GB-SoniaNeural',
+      'zh-TW': 'zh-TW-HsiaoChenNeural',
+    });
+
+    // POST /speech resolves lang -> override when body.voice omitted, explicit voice wins, unmatched falls back
+    const upstreamVoices: string[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as { voice?: string };
+      upstreamVoices.push(String(parsed.voice));
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'Content-Type': 'audio/mpeg' } });
+    }) as typeof fetch;
+
+    await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Hello world', lang: 'en-US' }),
+    }, env);
+    await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Привет мир', lang: 'ru-RU' }),
+    }, env);
+    await app.request(TTS_SPEECH_PATH, {
+      method: 'POST',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ input: 'Explicit override', lang: 'en-US', voice: 'en-US-AriaNeural' }),
+    }, env);
+
+    expect(upstreamVoices).toEqual(['en-GB-SoniaNeural', 'zh-CN-YunxiNeural', 'en-US-AriaNeural']);
+  });
 });
