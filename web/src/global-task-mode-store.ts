@@ -106,10 +106,37 @@ function writeStorageJson(key: string, value: unknown): void {
   }
 }
 
+function hasStoredMutedServerFilter(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    return localStorage.getItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
 function loadMutedServerIds(): string[] {
   const raw = readStorageJson<unknown>(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY, []);
   if (!Array.isArray(raw)) return [];
   return [...new Set(raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((s) => s.trim()))];
+}
+
+/**
+ * Compute default muted server IDs when the user has not explicitly customized the Task Mode server filter.
+ * Defaults to showing only workspace-pinned servers, falling back to all servers when none match.
+ */
+export function computeDefaultMutedServerIds(
+  servers: readonly GlobalTaskServerSummary[],
+  pinnedServerIds?: ReadonlySet<string>,
+): string[] {
+  if (!pinnedServerIds || pinnedServerIds.size === 0 || servers.length === 0) {
+    return [];
+  }
+  const hasMatchingPinned = servers.some((s) => pinnedServerIds.has(s.id));
+  if (!hasMatchingPinned) {
+    return [];
+  }
+  return servers.filter((s) => !pinnedServerIds.has(s.id)).map((s) => s.id);
 }
 
 function loadPinnedBrains(): GlobalTaskPinnedBrain[] {
@@ -385,6 +412,7 @@ export class GlobalTaskModeStore {
   private brainTextListeners = new Set<BrainTextListener>();
   private seenBrainEventIds = new Set<string>();
   private brainTextOrder: string[] = [];
+  private hasExplicitMutedFilter = hasStoredMutedServerFilter();
   private state: GlobalTaskModeState = this.createInitialState();
 
   private createInitialState(): GlobalTaskModeState {
@@ -483,9 +511,11 @@ export class GlobalTaskModeStore {
     return snapshot;
   }
 
-  setMutedServerIds(mutedServerIds: readonly string[]): void {
-    const nextMuted = [...new Set(mutedServerIds.map((id) => id.trim()).filter(Boolean))];
-    writeStorageJson(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY, nextMuted);
+  hasExplicitMutedServerFilter(): boolean {
+    return this.hasExplicitMutedFilter || hasStoredMutedServerFilter();
+  }
+
+  private applyMutedFilterState(nextMuted: string[]): void {
     const mutedSet = new Set(nextMuted);
 
     const nextLatestBrainTexts: Record<string, GlobalTaskBrainTextEvent> = {};
@@ -510,6 +540,28 @@ export class GlobalTaskModeStore {
         // Reconnect sends SET_FILTER cleanly on open.
       }
     }
+  }
+
+  setMutedServerIds(mutedServerIds: readonly string[]): void {
+    const nextMuted = [...new Set(mutedServerIds.map((id) => id.trim()).filter(Boolean))];
+    this.hasExplicitMutedFilter = true;
+    writeStorageJson(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY, nextMuted);
+    this.applyMutedFilterState(nextMuted);
+  }
+
+  /**
+   * Apply a computed default server filter without persisting an explicit user preference.
+   * Returns true if the active filter changed.
+   */
+  applyDefaultMutedServerIds(mutedServerIds: readonly string[]): boolean {
+    if (this.hasExplicitMutedServerFilter()) return false;
+    const nextMuted = [...new Set(mutedServerIds.map((id) => id.trim()).filter(Boolean))];
+    const currentSet = new Set(this.state.mutedServerIds);
+    if (nextMuted.length === currentSet.size && nextMuted.every((id) => currentSet.has(id))) {
+      return false;
+    }
+    this.applyMutedFilterState(nextMuted);
+    return true;
   }
 
   toggleMutedServer(serverId: string): void {
@@ -591,6 +643,7 @@ export class GlobalTaskModeStore {
     this.stop();
     this.seenBrainEventIds.clear();
     this.brainTextOrder = [];
+    this.hasExplicitMutedFilter = false;
     try {
       if (typeof localStorage !== 'undefined') {
         localStorage.removeItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY);

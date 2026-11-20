@@ -12,7 +12,9 @@ import {
 import { configure as configureApi, configureApiKey, clearApiKey } from '../src/api.js';
 import {
   clearGlobalTaskModeSessionState,
+  computeDefaultMutedServerIds,
   formatTaskReplyMessage,
+  GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY,
   GlobalTaskModeStore,
   MAX_RECENT_BRAINS,
   resolveQuickDispatchBrains,
@@ -530,5 +532,90 @@ describe('global-task-mode-store', () => {
       'u-on-a',
       'u-off',
     ]);
+  });
+
+  it('computes default muted servers from pinnedServerIds and falls back cleanly when none match', () => {
+    const servers: GlobalTaskServerSummary[] = [
+      { id: 'srv-pin', name: 'Pinned', online: true },
+      { id: 'srv-a', name: 'A', online: true },
+      { id: 'srv-b', name: 'B', online: false },
+    ];
+
+    expect(computeDefaultMutedServerIds(servers, new Set(['srv-pin']))).toEqual(['srv-a', 'srv-b']);
+    expect(computeDefaultMutedServerIds(servers, new Set(['srv-pin', 'srv-a', 'srv-b']))).toEqual([]);
+    expect(computeDefaultMutedServerIds(servers, new Set())).toEqual([]);
+    expect(computeDefaultMutedServerIds(servers, undefined)).toEqual([]);
+    expect(computeDefaultMutedServerIds(servers, new Set(['srv-missing']))).toEqual([]);
+    expect(computeDefaultMutedServerIds([], new Set(['srv-pin']))).toEqual([]);
+  });
+
+  it('applies default muted filter idempotently without writing localStorage and never overwrites explicit user choices', async () => {
+    const store = new GlobalTaskModeStore();
+    expect(store.hasExplicitMutedServerFilter()).toBe(false);
+
+    await store.start();
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateOpen();
+    // Consume initial SET_FILTER on open
+    expect(ws.sent.map((s) => JSON.parse(s))).toEqual([
+      { type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: [] },
+    ]);
+
+    ws.simulateMessage({
+      type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+      ts: 1_000,
+      servers: [
+        { id: 'srv-pin', name: 'Pinned', online: true },
+        { id: 'srv-unpin', name: 'Unpinned', online: true },
+      ],
+      tasks: [
+        makeTask({ serverId: 'srv-pin', taskId: 'tsk_pin' }),
+        makeTask({ serverId: 'srv-unpin', taskId: 'tsk_unpin' }),
+      ],
+      brains: [
+        makeBrain({ serverId: 'srv-pin', sessionName: 's_pin' }),
+        makeBrain({ serverId: 'srv-unpin', sessionName: 's_unpin' }),
+      ],
+    });
+
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    // First default application mutes unpinned server and syncs SET_FILTER, without touching localStorage
+    expect(store.applyDefaultMutedServerIds(['srv-unpin'])).toBe(true);
+    expect(store.getState().mutedServerIds).toEqual(['srv-unpin']);
+    expect(store.getState().tasks.map((t) => t.taskId)).toEqual(['tsk_pin']);
+    expect(store.getState().brains.map((b) => b.sessionName)).toEqual(['s_pin']);
+    expect(localStorage.getItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY)).toBeNull();
+    expect(store.hasExplicitMutedServerFilter()).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(ws.sent.map((s) => JSON.parse(s))).toEqual([
+      { type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: [] },
+      { type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: ['srv-unpin'] },
+    ]);
+
+    // Idempotent re-application does not emit or send SET_FILTER
+    expect(store.applyDefaultMutedServerIds(['srv-unpin'])).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(ws.sent).toHaveLength(2);
+
+    // Explicit user toggle to unmute all persists '[]' and blocks default override
+    store.toggleMutedServer('srv-unpin');
+    expect(store.hasExplicitMutedServerFilter()).toBe(true);
+    expect(store.getState().mutedServerIds).toEqual([]);
+    expect(localStorage.getItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY)).toBe('[]');
+    expect(store.applyDefaultMutedServerIds(['srv-unpin'])).toBe(false);
+    expect(store.getState().mutedServerIds).toEqual([]);
+
+    // clearSessionState resets explicit flag
+    store.clearSessionState();
+    expect(store.hasExplicitMutedServerFilter()).toBe(false);
+
+    // Pre-existing explicit '[]' in localStorage is respected by fresh store instance
+    localStorage.setItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY, '[]');
+    const restored = new GlobalTaskModeStore();
+    expect(restored.hasExplicitMutedServerFilter()).toBe(true);
+    expect(restored.applyDefaultMutedServerIds(['srv-unpin'])).toBe(false);
+    expect(restored.getState().mutedServerIds).toEqual([]);
   });
 });

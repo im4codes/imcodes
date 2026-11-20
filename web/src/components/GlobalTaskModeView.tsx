@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
 import {
   brainKey,
+  computeDefaultMutedServerIds,
   globalTaskModeStore,
   resolveQuickDispatchBrains,
   sortGlobalTaskServers,
@@ -451,6 +452,14 @@ export function GlobalTaskModeView({
       taskModeSpokenIdsRef.current.clear();
     };
   }, []);
+
+  // Default server filter to workspace-pinned servers until the user explicitly customizes it.
+  useEffect(() => {
+    if (state.servers.length === 0) return;
+    if (globalTaskModeStore.hasExplicitMutedServerFilter()) return;
+    const defaultMuted = computeDefaultMutedServerIds(state.servers, pinnedServerIds);
+    globalTaskModeStore.applyDefaultMutedServerIds(defaultMuted);
+  }, [pinnedServerIds, state.servers]);
 
   // Close server filter menu on outside click / Escape
   useEffect(() => {

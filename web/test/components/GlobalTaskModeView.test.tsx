@@ -8,7 +8,7 @@ import {
   type GlobalTaskServerFrame,
 } from '@shared/global-task-mode.js';
 import { configure as configureApi, configureApiKey, clearApiKey } from '../../src/api.js';
-import { clearGlobalTaskModeSessionState } from '../../src/global-task-mode-store.js';
+import { clearGlobalTaskModeSessionState, GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY } from '../../src/global-task-mode-store.js';
 import en from '../../src/i18n/locales/en.json';
 import es from '../../src/i18n/locales/es.json';
 import ja from '../../src/i18n/locales/ja.json';
@@ -733,6 +733,8 @@ describe('GlobalTaskModeView', () => {
   });
 
   it('orders quick-dispatch pills, server filter list, and add-modal server select by workspace pinned server + pinned session priorities', async () => {
+    // Explicit all-servers filter so both pinned and unpinned servers participate in priority sorting.
+    localStorage.setItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY, '[]');
     const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
     render(
       <GlobalTaskModeView
@@ -1192,5 +1194,176 @@ describe('GlobalTaskModeView', () => {
       fireEvent.click(screen.getByTestId(`task-mode-server-toggle-srv-${i}`));
     }
     expect(serverBtn.textContent?.trim()).toBe('12/24');
+  });
+
+  it('defaults server filter to workspace-pinned servers, syncs SET_FILTER without spurious TTS, falls back when none match, and preserves explicit user toggles', async () => {
+    const { setTtsAutoReadEnabled } = await import('../../src/tts.js');
+    setTtsAutoReadEnabled(true);
+
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    const pinnedSet = new Set(['srv-pin']);
+    const { rerender } = render(
+      <GlobalTaskModeView
+        onExit={vi.fn()}
+        onJumpToSession={vi.fn()}
+        pinnedServerIds={pinnedSet}
+      />,
+    );
+
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+    const nowLive = Date.now();
+
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: nowLive,
+        servers: [
+          { id: 'srv-pin', name: 'Pinned-Srv', online: true },
+          { id: 'srv-unpin', name: 'Unpinned-Srv', online: true },
+        ],
+        brains: [
+          {
+            serverId: 'srv-pin',
+            serverName: 'Pinned-Srv',
+            serverOnline: true,
+            sessionName: 'brain_pin',
+            projectName: 'p1',
+            label: 'PinnedBrain',
+            state: 'idle',
+            agentType: 'claude-code',
+          },
+          {
+            serverId: 'srv-unpin',
+            serverName: 'Unpinned-Srv',
+            serverOnline: true,
+            sessionName: 'brain_unpin',
+            projectName: 'p2',
+            label: 'UnpinnedBrain',
+            state: 'idle',
+            agentType: 'claude-code',
+          },
+        ],
+        tasks: [
+          {
+            serverId: 'srv-pin',
+            serverName: 'Pinned-Srv',
+            serverOnline: true,
+            projectName: 'p1',
+            brainSession: 'brain_pin',
+            brainLabel: 'PinnedBrain',
+            taskId: 'tsk_pin_1',
+            title: 'Pinned task',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: nowLive - 1000,
+            updatedAt: nowLive,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-unpin',
+            serverName: 'Unpinned-Srv',
+            serverOnline: true,
+            projectName: 'p2',
+            brainSession: 'brain_unpin',
+            brainLabel: 'UnpinnedBrain',
+            taskId: 'tsk_unpin_1',
+            title: 'Unpinned task',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: nowLive - 1000,
+            updatedAt: nowLive,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    // Only pinned server is checked and visible; SET_FILTER synced over WS; no localStorage write; no spurious TTS
+    expect(screen.queryByTestId('task-mode-card-tsk_pin_1')).not.toBeNull();
+    expect(screen.queryByTestId('task-mode-card-tsk_unpin_1')).toBeNull();
+    expect(localStorage.getItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY)).toBeNull();
+    expect(spokenUtterances).toHaveLength(0);
+    expect(ws.sent.map((s) => JSON.parse(s))).toEqual([
+      { type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: [] },
+      { type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: ['srv-unpin'] },
+    ]);
+
+    fireEvent.click(screen.getByTestId('task-mode-server-filter-btn'));
+    expect((screen.getByTestId('task-mode-server-toggle-srv-pin') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('task-mode-server-toggle-srv-unpin') as HTMLInputElement).checked).toBe(false);
+
+    // Idempotent re-render does not send duplicate SET_FILTER or trigger TTS
+    rerender(
+      <GlobalTaskModeView
+        onExit={vi.fn()}
+        onJumpToSession={vi.fn()}
+        pinnedServerIds={pinnedSet}
+      />,
+    );
+    expect(ws.sent).toHaveLength(2);
+    expect(spokenUtterances).toHaveLength(0);
+
+    // Explicit toggle persists '[]' and prevents pinned default from overwriting on later snapshots
+    fireEvent.click(screen.getByTestId('task-mode-server-toggle-srv-unpin'));
+    expect(localStorage.getItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY)).toBe('[]');
+    expect((screen.getByTestId('task-mode-server-toggle-srv-unpin') as HTMLInputElement).checked).toBe(true);
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: nowLive + 1000,
+        servers: [
+          { id: 'srv-pin', name: 'Pinned-Srv', online: true },
+          { id: 'srv-unpin', name: 'Unpinned-Srv', online: true },
+        ],
+        brains: [],
+        tasks: [],
+      });
+    });
+    expect((screen.getByTestId('task-mode-server-toggle-srv-unpin') as HTMLInputElement).checked).toBe(true);
+    expect(localStorage.getItem(GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY)).toBe('[]');
+  });
+
+  it('falls back to checking all servers when pinnedServerIds matches no available server', async () => {
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    render(
+      <GlobalTaskModeView
+        onExit={vi.fn()}
+        onJumpToSession={vi.fn()}
+        pinnedServerIds={new Set(['srv-not-in-list'])}
+      />,
+    );
+
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: Date.now(),
+        servers: [
+          { id: 'srv-1', name: 'Srv-1', online: true },
+          { id: 'srv-2', name: 'Srv-2', online: true },
+        ],
+        brains: [],
+        tasks: [],
+      });
+    });
+
+    fireEvent.click(screen.getByTestId('task-mode-server-filter-btn'));
+    expect((screen.getByTestId('task-mode-server-toggle-srv-1') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('task-mode-server-toggle-srv-2') as HTMLInputElement).checked).toBe(true);
+    expect(ws.sent.map((s) => JSON.parse(s))).toEqual([
+      { type: GLOBAL_TASK_MODE_MSG.SET_FILTER, mutedServerIds: [] },
+    ]);
   });
 });
