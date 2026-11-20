@@ -673,4 +673,61 @@ describe('GlobalTaskModeView', () => {
     expect(css).toMatch(/@media\s*\(max-width:\s*640px\)\s*\{[^}]*\.global-task-server-filter-menu\s*\{[^}]*position:\s*fixed;[^}]*left:\s*10px;[^}]*right:\s*10px;[^}]*\}\s*\.global-task-server-filter-list\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
     expect(css).toMatch(/\.global-task-server-filter-name\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
   });
+
+  it('prevents body horizontal scroll, packs mobile topbar into 2 rows with dot-only sync indicator, and renders compact 2-row quick-dispatch grid with + button', async () => {
+    const brains = Array.from({ length: 6 }, (_, idx) => ({
+      serverId: `srv-${idx + 1}`,
+      serverName: idx === 0 ? 'very-long-production-cluster-host-01' : `Server-${idx + 1}`,
+      serverOnline: idx % 2 === 0,
+      sessionName: `deck_brain_${idx + 1}`,
+      label: `Brain-${idx + 1}`,
+      projectName: `proj-${idx + 1}`,
+    }));
+
+    const { ws } = await mountWithSnapshot();
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: 15_000,
+        servers: brains.map((b) => ({ id: b.serverId, name: b.serverName, online: b.serverOnline })),
+        brains,
+        tasks: [],
+        mutedServerIds: [],
+      });
+    });
+
+    // Topbar sync badge exposes title & aria-label for dot-only mobile mode and separate label span
+    const syncBadge = screen.getByTestId('task-mode-sync-badge');
+    expect(syncBadge.getAttribute('aria-label')).toBeTruthy();
+    expect(syncBadge.getAttribute('title')).toBeTruthy();
+    expect(syncBadge.querySelector('.global-task-mode-sync-label')).not.toBeNull();
+
+    // Quick-dispatch compact + button + 2-row pill grid with title/ellipsis
+    const addBtn = screen.getByTestId('task-mode-add-brain-btn');
+    expect(addBtn.textContent).toBe('+');
+    expect(addBtn.getAttribute('aria-label')).toBeTruthy();
+    const quickList = screen.getByTestId('task-mode-quickbar-list');
+    expect(quickList.querySelectorAll('.global-task-brain-pill')).toHaveLength(6);
+    const firstPillText = quickList.querySelector('.global-task-brain-pill-text');
+    expect(firstPillText?.getAttribute('title')).toContain('very-long-production-cluster-host-01');
+
+    // Pin button inside grid pill still stops propagation without opening composer
+    fireEvent.click(screen.getByTestId('task-mode-brain-pin-srv-1-deck_brain_1'));
+    expect(screen.queryByTestId('task-mode-composer')).toBeNull();
+    expect(screen.getByTestId('task-mode-brain-pin-srv-1-deck_brain_1').getAttribute('aria-pressed')).toBe('true');
+
+    // Verify CSS contracts for horizontal overflow prevention, 2-row mobile topbar, and 2-row quickbar grid
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const css = readFileSync(resolve(process.cwd().endsWith('/web') ? process.cwd() : resolve(process.cwd(), 'web'), 'src/styles.css'), 'utf8');
+    expect(css).toMatch(/\.global-task-mode-body\s*\{[^}]*overflow-x:\s*hidden;[^}]*overscroll-behavior-x:\s*none;/s);
+    expect(css).toMatch(/\.global-task-card-title\s*\{[^}]*overflow-wrap:\s*anywhere;/s);
+    expect(css).toMatch(/\.global-task-quickbar-list\s*\{[^}]*max-height:\s*76px;[^}]*overflow-y:\s*auto;[^}]*overflow-x:\s*hidden;/s);
+    expect(css).toMatch(/\.global-task-brain-pill-text\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
+    const mobileBlock = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
+    expect(mobileBlock).toMatch(/\.global-task-mode-topbar-left\s*\{\s*display:\s*contents;/);
+    expect(mobileBlock).toMatch(/\.global-task-mode-sync-label\s*\{\s*display:\s*none;/);
+    expect(mobileBlock).toMatch(/\.global-task-mode-topbar-right\s*\{[^}]*flex-wrap:\s*nowrap;/s);
+    expect(mobileBlock).toMatch(/\.global-task-quickbar-list\s*\{\s*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
+  });
 });

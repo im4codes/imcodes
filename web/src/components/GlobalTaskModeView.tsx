@@ -836,6 +836,11 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
 
   const totalServersCount = state.servers.length;
   const activeServersCount = state.servers.filter((s) => !mutedSet.has(s.id)).length;
+  const syncLabel = state.connected
+    ? t('taskMode.live_sync', 'Live sync')
+    : state.connecting
+      ? t('common.reconnecting', 'Reconnecting…')
+      : t('common.disconnected', 'Disconnected');
   const brainsForSelectedAddServer = state.brains.filter((b) => b.serverId === addServerId);
   const isAddTargetPinned = Boolean(addServerId && addSessionName && pinnedBrainKeys.has(brainKey(addServerId, addSessionName)));
 
@@ -889,15 +894,11 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
           <div
             class={`global-task-mode-sync-badge${state.connected ? ' is-connected' : state.error ? ' is-error' : ' is-connecting'}`}
             data-testid="task-mode-sync-badge"
+            title={syncLabel}
+            aria-label={syncLabel}
           >
             <span class="global-task-mode-sync-dot" aria-hidden="true" />
-            <span>
-              {state.connected
-                ? t('taskMode.live_sync', 'Live sync')
-                : state.connecting
-                  ? t('common.reconnecting', 'Reconnecting…')
-                  : t('common.disconnected', 'Disconnected')}
-            </span>
+            <span class="global-task-mode-sync-label">{syncLabel}</span>
           </div>
 
           {/* Reused unified TTS auto-read + quick settings popover */}
@@ -997,8 +998,23 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
       <div class="global-task-mode-body">
         {/* Quick Dispatch Brain Bar */}
         <section class="global-task-quickbar" data-testid="task-mode-quickbar">
-          <span class="global-task-quickbar-label">{t('taskMode.quick_dispatch', 'Quick dispatch')}</span>
-          <div class="global-task-quickbar-list">
+          <div class="global-task-quickbar-header">
+            <span class="global-task-quickbar-label">{t('taskMode.quick_dispatch', 'Quick dispatch')}</span>
+            <button
+              type="button"
+              class="global-task-add-btn"
+              data-testid="task-mode-add-brain-btn"
+              title={t('taskMode.add_or_dispatch', '+ Add / Dispatch')}
+              aria-label={t('taskMode.add_or_dispatch', '+ Add / Dispatch')}
+              onClick={() => {
+                setAddError(null);
+                setAddModalOpen(true);
+              }}
+            >
+              +
+            </button>
+          </div>
+          <div class="global-task-quickbar-list" data-testid="task-mode-quickbar-list">
             {quickDispatchBrains.map((brain: GlobalTaskQuickDispatchBrain) => {
               const dispatchSnapshot: TaskModeTargetSnapshot = {
                 serverId: brain.serverId,
@@ -1008,6 +1024,7 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
                 projectName: brain.projectName,
                 mode: 'dispatch',
               };
+              const pillLabel = `${brain.serverName} · ${brain.label}`;
               const pressProps = bindDualActionButton(
                 `brain:${brain.serverId}:${brain.sessionName}`,
                 () => openQuickComposer(dispatchSnapshot),
@@ -1020,6 +1037,7 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
                   data-testid={`task-mode-brain-pill-${brain.serverId}-${brain.sessionName}`}
                   role="button"
                   tabIndex={0}
+                  title={pillLabel}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
@@ -1050,24 +1068,13 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
                     {brain.pinned ? '★' : '☆'}
                   </button>
                   <span class={`global-task-dot${brain.serverOnline ? ' is-online' : ' is-offline'}`} aria-hidden="true" />
-                  <span class="global-task-brain-pill-text">
-                    {brain.serverName} · {brain.label}
+                  <span class="global-task-brain-pill-text" title={pillLabel}>
+                    {pillLabel}
                   </span>
                 </div>
               );
             })}
           </div>
-          <button
-            type="button"
-            class="global-task-add-btn"
-            data-testid="task-mode-add-brain-btn"
-            onClick={() => {
-              setAddError(null);
-              setAddModalOpen(true);
-            }}
-          >
-            {t('taskMode.add_or_dispatch', '+ Add / Dispatch')}
-          </button>
         </section>
 
         {/* Active Tasks Section */}
