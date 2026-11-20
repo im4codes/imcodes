@@ -874,14 +874,15 @@ async function authorizeSessionFileAccess(
   const member = forceParticipantShareOnly
     ? { ok: false as const, reason: 'share-participant-pinned' }
     : await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId: effectiveUserId });
-  if (member.ok) return { ok: true };
-
-  const sessionName = (
+  const requestedSessionName = (
     pinnedSessionName
     ?? (c.get('tokenSessionName' as never) as string | undefined)
     ?? c.req.query('sessionName')
     ?? ''
   ).trim();
+  if (member.ok) return { ok: true, ...(requestedSessionName ? { sessionName: requestedSessionName } : {}) };
+
+  const sessionName = requestedSessionName;
 
   const serverAccess = await resolveHttpShareAccess(c.env.DB, {
     serverId,
@@ -1334,9 +1335,11 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
   // Controlled-node shares have their own DB-authoritative Owner/Participant
   // grants. Standard daemons retain the existing member/session-share check.
+  let uploadSessionName: string | undefined;
   if (!controlledGate.controlled) {
     const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
     if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+    uploadSessionName = access.sessionName;
   }
 
   const contentLengthHeader = c.req.header('content-length');
@@ -1531,6 +1534,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
       ...(destinationDirectory ? { destinationDirectory } : {}),
+      ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
     };
   } else {
     uploadMsg = {
@@ -1544,6 +1548,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       content: (await readFile(stagedPath)).toString('base64'),
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
       ...(destinationDirectory ? { destinationDirectory } : {}),
+      ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
     };
   }
 

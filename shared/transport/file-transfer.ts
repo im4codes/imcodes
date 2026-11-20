@@ -429,6 +429,8 @@ export interface FileUploadRequest {
   clientUploadId?: string;
   /** Optional user-selected existing directory on a capable controlled node. */
   destinationDirectory?: string;
+  /** Server-authorized session binding for upload isolation in shared views. */
+  sessionName?: string;
 }
 
 export interface FileUploadFetchRequest {
@@ -446,6 +448,8 @@ export interface FileUploadFetchRequest {
   clientUploadId?: string;
   /** Optional user-selected existing directory on a capable controlled node. */
   destinationDirectory?: string;
+  /** Server-authorized session binding for upload isolation in shared views. */
+  sessionName?: string;
 }
 
 export interface FileDownloadRequest {

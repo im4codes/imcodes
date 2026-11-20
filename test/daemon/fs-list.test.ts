@@ -52,6 +52,7 @@ import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { __resetSessionFileReadGrantsForTests } from '../../src/daemon/session-file-read-grants.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
 // Helper: make a Dirent-like object
 function makeDirent(name: string, isDir: boolean) {
@@ -221,7 +222,7 @@ describe('fs.ls handler', () => {
     });
   });
 
-  it('allows an exact live registered upload with same-session attachment authorization on both regular and chat read branches', async () => {
+  it('allows an exact live registered upload with trusted same-session upload binding on both regular and chat read branches', async () => {
     const projectDir = path.join(homedir(), 'project');
     const uploadRoot = path.join(homedir(), '.imcodes', 'uploads');
     const uploadPath = path.join(uploadRoot, '392836a75fc67a4ff38c2dcedc9afe32.png');
@@ -230,31 +231,25 @@ describe('fs.ls handler', () => {
       id: path.basename(uploadPath),
       daemonPath: uploadPath,
       source: 'upload',
+      sessionName: 'deck_project_brain',
       createdAt: Date.now(),
       expiresAt: Date.now() + 60_000,
     });
-    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
-      eventId: 'same-session-attachment',
-      sessionId: 'deck_project_brain',
-      ts: Date.now(),
-      seq: 1,
-      epoch: 1,
-      source: 'daemon',
-      confidence: 'high',
-      type: 'user.message',
-      payload: {
-        text: 'preview attachment',
-        attachments: [{ id: path.basename(uploadPath), daemonPath: uploadPath }],
-      },
-    }] as never);
     vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
     mockRealpath.mockImplementation(async (target) => String(target));
+
+    const sharedActor = {
+      origin: 'shared-tab',
+      effectiveActorRole: 'participant',
+      snapshot: { target: { kind: 'session', sessionName: 'deck_project_brain' } },
+    };
 
     handleWebCommand({
       type: 'fs.read',
       path: uploadPath,
       requestId: 'read-shared-upload-regular',
       sessionName: 'deck_project_brain',
+      sharedActor,
     }, mockServerLink as any);
     handleWebCommand({
       type: 'fs.read',
@@ -262,6 +257,7 @@ describe('fs.ls handler', () => {
       requestId: 'read-shared-upload-chat',
       sessionName: 'deck_project_brain',
       chatFileReference: true,
+      sharedActor,
     }, mockServerLink as any);
     await flushAsync();
 
@@ -270,157 +266,150 @@ describe('fs.ls handler', () => {
     expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(uploadPath, 'read-shared-upload-chat', expect.any(Function));
   });
 
-  it('rejects a live registered upload owned by another session or lacking same-session attachment authorization on both regular and chat read branches', async () => {
+  it('rejects cross-session uploads, unbound legacy entries, and process/transport timeline text or legacy attachments for non-server shares while preserving owner and whole-server previews', async () => {
     const projectDirA = path.join(homedir(), 'project-a');
     const projectDirB = path.join(homedir(), 'project-b');
     const uploadRoot = path.join(homedir(), '.imcodes', 'uploads');
-    const uploadPath = path.join(uploadRoot, '992836a75fc67a4ff38c2dcedc9afe99.png');
+    const crossSessionUploadPath = path.join(uploadRoot, '992836a75fc67a4ff38c2dcedc9afe99.png');
+    const unboundLegacyUploadPath = path.join(uploadRoot, '772836a75fc67a4ff38c2dcedc9afe77.png');
     vi.spyOn(sessionStore, 'getSession').mockImplementation((name) => {
       if (name === 'deck_session_a') return { name: 'deck_session_a', projectDir: projectDirA } as never;
       if (name === 'deck_session_b') return { name: 'deck_session_b', projectDir: projectDirB } as never;
       return undefined;
     });
-    mockLookupAttachment.mockReturnValue({
-      id: path.basename(uploadPath),
-      daemonPath: uploadPath,
-      source: 'upload',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 60_000,
-    });
+    // Simulate both a real process user.message (no sharedActor) and a transport
+    // user.message mentioning foreign/legacy uploads — neither may mint read access.
     vi.spyOn(timelineStore, 'readByTypesPreferred').mockImplementation(async (targetSession) => {
-      if (targetSession === 'deck_session_a') {
-        return [{
-          eventId: 'session-a-attachment',
-          sessionId: 'deck_session_a',
-          ts: Date.now(),
-          seq: 1,
-          epoch: 1,
-          source: 'daemon',
-          confidence: 'high',
-          type: 'user.message',
-          payload: {
-            text: `#1:(${uploadPath})`,
-            attachments: [{ id: path.basename(uploadPath), daemonPath: uploadPath }],
+      if (targetSession === 'deck_session_b') {
+        return [
+          {
+            eventId: 'process-user-msg-no-shared-actor',
+            sessionId: 'deck_session_b',
+            ts: Date.now(),
+            seq: 1,
+            epoch: 1,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'user.message',
+            payload: {
+              text: `#1:(${unboundLegacyUploadPath}) #2:(${crossSessionUploadPath})`,
+              attachments: [
+                { id: path.basename(unboundLegacyUploadPath), daemonPath: unboundLegacyUploadPath },
+                { id: path.basename(crossSessionUploadPath), daemonPath: crossSessionUploadPath },
+              ],
+            },
           },
-        }] as never;
+          {
+            eventId: 'transport-user-msg-with-shared-actor',
+            sessionId: 'deck_session_b',
+            ts: Date.now(),
+            seq: 2,
+            epoch: 1,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'user.message',
+            payload: {
+              text: `#1:(${unboundLegacyUploadPath})`,
+              sharedActor: {
+                origin: 'shared-tab',
+                effectiveActorRole: 'participant',
+                snapshot: { target: { kind: 'session', sessionName: 'deck_session_b' } },
+              },
+            },
+          },
+        ] as never;
       }
       return [] as never;
     });
     vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
     mockRealpath.mockImplementation(async (target) => String(target));
 
-    const sharedActor = {
+    const sharedActorB = {
       origin: 'shared-tab',
       effectiveActorRole: 'participant',
       snapshot: { target: { kind: 'session', sessionName: 'deck_session_b' } },
     };
 
+    // 1) Cross-session entry bound to deck_session_a is rejected on deck_session_b across both branches.
+    mockLookupAttachment.mockImplementation((target: string) => (
+      target === crossSessionUploadPath
+        ? {
+            id: path.basename(crossSessionUploadPath),
+            daemonPath: crossSessionUploadPath,
+            source: 'upload',
+            sessionName: 'deck_session_a',
+            createdAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+          }
+        : target === unboundLegacyUploadPath
+          ? {
+              id: path.basename(unboundLegacyUploadPath),
+              daemonPath: unboundLegacyUploadPath,
+              source: 'upload',
+              createdAt: Date.now(),
+              expiresAt: Date.now() + 60_000,
+            }
+          : undefined
+    ));
+
     handleWebCommand({
       type: 'fs.read',
-      path: uploadPath,
+      path: crossSessionUploadPath,
       requestId: 'read-cross-session-regular',
       sessionName: 'deck_session_b',
-      sharedActor,
+      sharedActor: sharedActorB,
     }, mockServerLink as any);
     handleWebCommand({
       type: 'fs.read',
-      path: uploadPath,
+      path: crossSessionUploadPath,
       requestId: 'read-cross-session-chat',
       sessionName: 'deck_session_b',
       chatFileReference: true,
-      sharedActor,
+      sharedActor: sharedActorB,
+    }, mockServerLink as any);
+    // 2) Unbound legacy upload entry (no sessionName) is also rejected for shared-tab across both branches.
+    handleWebCommand({
+      type: 'fs.read',
+      path: unboundLegacyUploadPath,
+      requestId: 'read-unbound-legacy-regular',
+      sessionName: 'deck_session_b',
+      sharedActor: sharedActorB,
+    }, mockServerLink as any);
+    handleWebCommand({
+      type: 'fs.read',
+      path: unboundLegacyUploadPath,
+      requestId: 'read-unbound-legacy-chat',
+      sessionName: 'deck_session_b',
+      chatFileReference: true,
+      sharedActor: sharedActorB,
     }, mockServerLink as any);
     await flushAsync();
 
     expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
     expect(sent).toEqual([
-      expect.objectContaining({
-        type: 'fs.read_response',
-        requestId: 'read-cross-session-regular',
-        status: 'error',
-        error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
-      }),
-      expect.objectContaining({
-        type: 'fs.read_response',
-        requestId: 'read-cross-session-chat',
-        status: 'error',
-        error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
-      }),
+      expect.objectContaining({ type: 'fs.read_response', requestId: 'read-cross-session-regular', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }),
+      expect.objectContaining({ type: 'fs.read_response', requestId: 'read-cross-session-chat', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }),
+      expect.objectContaining({ type: 'fs.read_response', requestId: 'read-unbound-legacy-regular', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }),
+      expect.objectContaining({ type: 'fs.read_response', requestId: 'read-unbound-legacy-chat', status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }),
     ]);
 
+    // 3) Owner legacy session preview (no sharedActor, unbound entry) and whole-server reads remain preserved.
     sent.length = 0;
     handleWebCommand({
       type: 'fs.read',
-      path: uploadPath,
-      requestId: 'read-owner-session-a-chat',
-      sessionName: 'deck_session_a',
-      chatFileReference: true,
-    }, mockServerLink as any);
-    await flushAsync();
-    expect(sent).toEqual([]);
-    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(uploadPath, 'read-owner-session-a-chat', expect.any(Function));
-  });
-
-  it('keeps shared-tab participant tagged text unable to self-authorize another session upload while allowing whole-server reads', async () => {
-    const projectDirB = path.join(homedir(), 'project-b');
-    const uploadRoot = path.join(homedir(), '.imcodes', 'uploads');
-    const uploadPath = path.join(uploadRoot, '772836a75fc67a4ff38c2dcedc9afe77.png');
-    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_session_b', projectDir: projectDirB } as never);
-    mockLookupAttachment.mockReturnValue({
-      id: path.basename(uploadPath),
-      daemonPath: uploadPath,
-      source: 'upload',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 60_000,
-    });
-    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
-      eventId: 'shared-guest-forged-tag',
-      sessionId: 'deck_session_b',
-      ts: Date.now(),
-      seq: 1,
-      epoch: 1,
-      source: 'daemon',
-      confidence: 'high',
-      type: 'user.message',
-      payload: {
-        text: `#1:(${uploadPath})`,
-        sharedActor: {
-          origin: 'shared-tab',
-          effectiveActorRole: 'participant',
-          snapshot: { target: { kind: 'session', sessionName: 'deck_session_b' } },
-        },
-      },
-    }] as never);
-    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
-    mockRealpath.mockImplementation(async (target) => String(target));
-
-    handleWebCommand({
-      type: 'fs.read',
-      path: uploadPath,
-      requestId: 'read-forged-guest-tag',
+      path: unboundLegacyUploadPath,
+      requestId: 'read-owner-legacy-chat',
       sessionName: 'deck_session_b',
       chatFileReference: true,
     }, mockServerLink as any);
-    await flushAsync();
-
-    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
-    expect(sent[0]).toMatchObject({
-      type: 'fs.read_response',
-      requestId: 'read-forged-guest-tag',
-      status: 'error',
-      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
-    });
-
-    // Whole-server targetless read (both owner and shared-server) remains allowed.
-    sent.length = 0;
     handleWebCommand({
       type: 'fs.read',
-      path: uploadPath,
+      path: crossSessionUploadPath,
       requestId: 'read-whole-server-upload',
     }, mockServerLink as any);
     handleWebCommand({
       type: 'fs.read',
-      path: uploadPath,
+      path: crossSessionUploadPath,
       requestId: 'read-shared-server-upload',
       sharedActor: {
         origin: 'shared-server',
@@ -429,8 +418,75 @@ describe('fs.ls handler', () => {
       },
     }, mockServerLink as any);
     await flushAsync();
-    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(uploadPath, 'read-whole-server-upload', expect.any(Function));
-    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(uploadPath, 'read-shared-server-upload', expect.any(Function));
+    expect(sent).toEqual([]);
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(unboundLegacyUploadPath, 'read-owner-legacy-chat', expect.any(Function));
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-whole-server-upload', expect.any(Function));
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(crossSessionUploadPath, 'read-shared-server-upload', expect.any(Function));
+  });
+
+  it('stamps sharedActor onto process user.message and blocks @upload attachment smuggling across sessions', async () => {
+    const projectDirB = path.join(homedir(), 'project-proc-b');
+    const uploadRoot = path.join(homedir(), '.imcodes', 'uploads');
+    const foreignUpload = path.join(uploadRoot, '112836a75fc67a4ff38c2dcedc9afe11.txt');
+    const sameSessionUpload = path.join(uploadRoot, '222836a75fc67a4ff38c2dcedc9afe22.txt');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      name: 'deck_proc_b',
+      projectName: 'proj-b',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      projectDir: projectDirB,
+      state: 'idle',
+    } as never);
+    mockLookupAttachment.mockImplementation((target: string) => {
+      if (target === foreignUpload) {
+        return {
+          id: path.basename(foreignUpload),
+          daemonPath: foreignUpload,
+          source: 'upload',
+          sessionName: 'deck_proc_a',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+        };
+      }
+      if (target === sameSessionUpload) {
+        return {
+          id: path.basename(sameSessionUpload),
+          daemonPath: sameSessionUpload,
+          source: 'upload',
+          sessionName: 'deck_proc_b',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+        };
+      }
+      return undefined;
+    });
+    const emitSpy = vi.spyOn(timelineEmitter, 'emit');
+    const sharedActor = {
+      origin: 'shared-tab',
+      effectiveActorRole: 'participant',
+      snapshot: { target: { kind: 'session', sessionName: 'deck_proc_b' } },
+    };
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proc_b',
+      commandId: 'cmd-proc-shared-1',
+      text: `@${foreignUpload} @${sameSessionUpload} hello`,
+      sharedActor,
+    }, mockServerLink as any);
+    await flushAsync();
+
+    const userEventCall = emitSpy.mock.calls.find(
+      ([session, type]) => session === 'deck_proc_b' && type === 'user.message',
+    );
+    expect(userEventCall).toBeDefined();
+    expect(userEventCall?.[2]).toMatchObject({
+      sharedActor,
+      attachments: [expect.objectContaining({ id: path.basename(sameSessionUpload), daemonPath: sameSessionUpload })],
+    });
+    expect((userEventCall?.[2] as { attachments?: Array<{ daemonPath?: string }> }).attachments)
+      .not.toContainEqual(expect.objectContaining({ daemonPath: foreignUpload }));
   });
 
   it('allows an assistant-published upload only in the publishing session across both read branches', async () => {
@@ -469,11 +525,23 @@ describe('fs.ls handler', () => {
     vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
     mockRealpath.mockImplementation(async (target) => String(target));
 
+    const sharedActorA = {
+      origin: 'shared-tab',
+      effectiveActorRole: 'participant',
+      snapshot: { target: { kind: 'session', sessionName: 'deck_pub_a' } },
+    };
+    const sharedActorB = {
+      origin: 'shared-tab',
+      effectiveActorRole: 'participant',
+      snapshot: { target: { kind: 'session', sessionName: 'deck_pub_b' } },
+    };
+
     handleWebCommand({
       type: 'fs.read',
       path: uploadPath,
       requestId: 'read-pub-b-regular',
       sessionName: 'deck_pub_b',
+      sharedActor: sharedActorB,
     }, mockServerLink as any);
     handleWebCommand({
       type: 'fs.read',
@@ -481,6 +549,7 @@ describe('fs.ls handler', () => {
       requestId: 'read-pub-b-chat',
       sessionName: 'deck_pub_b',
       chatFileReference: true,
+      sharedActor: sharedActorB,
     }, mockServerLink as any);
     await flushAsync();
     expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
@@ -505,6 +574,7 @@ describe('fs.ls handler', () => {
       path: uploadPath,
       requestId: 'read-pub-a-regular',
       sessionName: 'deck_pub_a',
+      sharedActor: sharedActorA,
     }, mockServerLink as any);
     handleWebCommand({
       type: 'fs.read',
@@ -512,6 +582,7 @@ describe('fs.ls handler', () => {
       requestId: 'read-pub-a-chat',
       sessionName: 'deck_pub_a',
       chatFileReference: true,
+      sharedActor: sharedActorA,
     }, mockServerLink as any);
     await flushAsync();
     expect(sent).toEqual([]);

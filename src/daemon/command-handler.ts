@@ -6119,6 +6119,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       serverLink,
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(isVerbatimRequested ? { verbatim: true } : {}),
+      ...(sharedActor ? { userMessageMetadata: { sharedActor } } : {}),
     });
   } catch (err) {
     logger.error({ sessionName, err }, 'session.send failed');
@@ -6189,6 +6190,8 @@ async function sendProcessSessionMessage(
       cronRun?: CronRunTimelineProjection;
       /** Author of a non-human message (shared/chat-message-origin.ts). */
       messageOrigin?: ChatMessageOrigin;
+      /** Non-server shared actor stamp matching transport user.message events. */
+      sharedActor?: SharedActorEnvelope;
     }>;
   },
 ): Promise<void> {
@@ -6389,6 +6392,8 @@ export async function sendProcessSessionMessageForAutomation(
       cronRun?: CronRunTimelineProjection;
       /** Author of a non-human message (shared/chat-message-origin.ts). */
       messageOrigin?: ChatMessageOrigin;
+      /** Non-server shared actor stamp matching transport user.message events. */
+      sharedActor?: SharedActorEnvelope;
     }>;
   },
 ): Promise<'sent' | 'queued'> {
@@ -10242,65 +10247,33 @@ function extractAttachmentEntrySessionName(entry: unknown): string {
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
-function isSameResolvedUploadPath(candidate: string, registeredPath: string, realTarget: string): boolean {
-  const expanded = candidate.startsWith('~') ? candidate.replace(/^~/, homedir()) : candidate;
-  const resolved = nodePath.resolve(expanded);
-  return resolved === registeredPath || resolved === realTarget;
-}
-
-async function hasSessionUploadAttachmentGrant(
-  sessionName: string,
-  entryId: string,
-  registeredPath: string,
-  realTarget: string,
-): Promise<boolean> {
-  let events: Awaited<ReturnType<typeof timelineStore.readByTypesPreferred>>;
-  try {
-    events = await timelineStore.readByTypesPreferred(sessionName, ['user.message'], { limit: 5_000 });
-  } catch {
-    return false;
-  }
-  for (const event of events) {
-    if (event.sessionId !== sessionName || event.type !== 'user.message' || event.hidden === true) continue;
-    const attachments = event.payload?.attachments;
-    if (Array.isArray(attachments)) {
-      for (const att of attachments) {
-        if (!att || typeof att !== 'object') continue;
-        const record = att as { id?: unknown; daemonPath?: unknown };
-        if (typeof record.id === 'string' && record.id === entryId) return true;
-        if (typeof record.daemonPath === 'string' && isSameResolvedUploadPath(record.daemonPath, registeredPath, realTarget)) {
-          return true;
-        }
-      }
-    }
-    if (!isNonServerSharedActor(event.payload?.sharedActor) && typeof event.payload?.text === 'string') {
-      for (const match of event.payload.text.matchAll(TAGGED_ATTACHMENT_REFERENCE_RE)) {
-        const refPath = match[2];
-        if (refPath && isSameResolvedUploadPath(refPath, registeredPath, realTarget)) return true;
-      }
-    }
-  }
-  return false;
-}
-
 /**
  * Shared file reads are normally confined to the session project root. Chat
  * attachments are the one deliberate exception: uploads live under the
  * daemon-owned ~/.imcodes/uploads directory, outside every project root.
  *
- * Keep the exception capability-based AND session-scoped rather than global:
- * the exact path must be a live upload entry inside the canonical upload root,
- * and must carry trusted evidence tying it to `sessionName` (explicit entry
- * session binding or same-session user attachment history). Uploads from other
- * sessions or unbound global entries fail closed.
+ * Keep the exception capability-based AND session-bound rather than trusting
+ * global registry entries or unproven timeline text: non-server shared actors
+ * require an explicit same-session `entry.sessionName` binding minted at the
+ * authenticated upload entrypoint. Legacy owner/whole-server attachment previews
+ * keep working when `entry.sessionName` is absent, while explicit cross-session
+ * bindings fail closed.
  */
-async function resolveRegisteredUploadReadTarget(sessionName: string, rawPath: string): Promise<string | null> {
+async function resolveRegisteredUploadReadTarget(
+  sessionName: string,
+  rawPath: string,
+  sharedActor?: unknown,
+): Promise<string | null> {
   if (!sessionName) return null;
   const entry = lookupAttachment(rawPath);
   if (!entry || entry.source !== 'upload' || Date.now() > entry.expiresAt) return null;
 
   const entrySessionName = extractAttachmentEntrySessionName(entry);
-  if (entrySessionName && entrySessionName !== sessionName) return null;
+  if (isNonServerSharedActor(sharedActor)) {
+    if (!entrySessionName || entrySessionName !== sessionName) return null;
+  } else if (entrySessionName && entrySessionName !== sessionName) {
+    return null;
+  }
 
   const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
   const registeredPath = nodePath.resolve(entry.daemonPath);
@@ -10314,9 +10287,7 @@ async function resolveRegisteredUploadReadTarget(sessionName: string, rawPath: s
       fsRealpath(registeredPath),
     ]);
     if (!isSameOrInsidePath(realRoot, realTarget) || !isPathAllowed(realTarget)) return null;
-    if (entrySessionName === sessionName) return realTarget;
-    const authorized = await hasSessionUploadAttachmentGrant(sessionName, entry.id, registeredPath, realTarget);
-    return authorized ? realTarget : null;
+    return realTarget;
   } catch {
     return null;
   }
@@ -10342,7 +10313,11 @@ async function resolveAuthorizedSessionOutOfRootReadTarget(input: {
   if (!sessionName) {
     return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
   }
-  const registeredUpload = await resolveRegisteredUploadReadTarget(sessionName, input.rawPath);
+  const registeredUpload = await resolveRegisteredUploadReadTarget(
+    sessionName,
+    input.rawPath,
+    input.cmd.sharedActor,
+  );
   if (registeredUpload) {
     return { ok: true, realPath: registeredUpload, matchCount: 1 };
   }

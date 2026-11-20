@@ -707,6 +707,7 @@ interface UploadCommitIntent {
   resolved: string;
   size: number;
   destinationDirectory?: string;
+  sessionName?: string;
 }
 
 function commitIntentPathFor(finalPath: string): string {
@@ -742,6 +743,7 @@ function parseUploadCommitIntent(raw: string): UploadCommitIntent | null {
   if (record.mime !== undefined && typeof record.mime !== 'string') return null;
   if (typeof record.size !== 'number' || !Number.isSafeInteger(record.size) || record.size < 0) return null;
   if (record.destinationDirectory !== undefined && typeof record.destinationDirectory !== 'string') return null;
+  if (record.sessionName !== undefined && typeof record.sessionName !== 'string') return null;
   return record as unknown as UploadCommitIntent;
 }
 
@@ -801,6 +803,7 @@ export async function recoverInterruptedUploadCommits(): Promise<number> {
           size: intent.size,
           ...(intent.mime ? { mime: intent.mime } : {}),
           ...(intent.destinationDirectory ? { destinationDirectory: intent.destinationDirectory } : {}),
+          ...(intent.sessionName ? { sessionName: intent.sessionName } : {}),
         });
         recovered += 1;
       }
@@ -2102,6 +2105,7 @@ async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, 
     size: transfer.received,
     ...(authority.mime ? { mime: authority.mime } : {}),
     ...(authority.destinationDirectory ? { destinationDirectory: authority.destinationDirectory } : {}),
+    ...(authority.sessionName ? { sessionName: authority.sessionName } : {}),
   };
   // Written BEFORE the rename: from here on, a crash is recoverable in one
   // direction or the other, never into an unreferenced published file.

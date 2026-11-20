@@ -1151,4 +1151,59 @@ describe('file-transfer local handle hardening', () => {
     await transfer.handleFileDownload({ type: FILE_TRANSFER_MSG.DOWNLOAD, downloadId: 'download-replace', attachmentId }, downloaded.serverLink);
     expect(downloaded.sent).toEqual([{ type: FILE_TRANSFER_MSG.DOWNLOAD_ERROR, downloadId: 'download-replace', message: 'download_failed' }]);
   });
+
+  it('persists and recovers upload sessionName bindings across handleFileUpload, handleFileUploadFetch, and finalizeDirectUploadedFile', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const link = createServerLinkMock();
+    const uploadBytes = Buffer.from('sample upload payload', 'utf8');
+
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'up-inline-sess',
+      filename: 'b'.repeat(32) + '.txt',
+      originalName: 'note.txt',
+      mime: 'text/plain',
+      size: uploadBytes.length,
+      content: uploadBytes.toString('base64'),
+      sessionName: 'deck_session_a',
+    }, link.serverLink as never);
+    const doneInline = link.sent.at(-1) as { attachment: { daemonPath: string } };
+    expect((transfer.lookupAttachment(doneInline.attachment.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_a');
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(uploadBytes, {
+      headers: { 'content-length': String(uploadBytes.length) },
+    })));
+    await transfer.handleFileUploadFetch({
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+      uploadId: 'up-fetch-sess',
+      filename: 'c'.repeat(32) + '.txt',
+      originalName: 'fetch.txt',
+      mime: 'text/plain',
+      size: uploadBytes.length,
+      downloadUrl: 'https://relay.example/fetch',
+      sessionName: 'deck_session_b',
+    }, link.serverLink as never);
+    const doneFetch = link.sent.at(-1) as { attachment: { daemonPath: string } };
+    expect((transfer.lookupAttachment(doneFetch.attachment.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_b');
+
+    const directPath = path.join(fakeHome, '.imcodes', 'uploads', 'd'.repeat(32) + '.txt');
+    await writeFile(directPath, uploadBytes);
+    const directRef = await transfer.finalizeDirectUploadedFile({
+      clientUploadId: 'client-direct-sess',
+      filename: path.basename(directPath),
+      originalName: 'direct.txt',
+      mime: 'text/plain',
+      resolved: directPath,
+      size: uploadBytes.length,
+      sessionName: 'deck_session_c',
+    });
+    expect((transfer.lookupAttachment(directRef.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_c');
+
+    // Reload module to simulate daemon restart and verify .meta.json restores sessionName.
+    const reloaded = await loadFileTransferHandler(fakeHome);
+    await reloaded.initFileTransfer();
+    expect((reloaded.lookupAttachment(doneInline.attachment.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_a');
+    expect((reloaded.lookupAttachment(doneFetch.attachment.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_b');
+    expect((reloaded.lookupAttachment(directRef.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_c');
+  });
 });

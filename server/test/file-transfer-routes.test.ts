@@ -1216,6 +1216,25 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('downloadUrl');
   });
 
+  it('forwards authorized sessionName on POST /api/server/:id/upload to standard daemon frames', async () => {
+    hasDaemonCapabilityMock.mockReturnValue(false);
+
+    const form = new FormData();
+    form.append('file', new File(['sample'], 'note.txt', { type: 'text/plain' }));
+
+    const res = await makeApp().request('/api/server/srv-1/upload?sessionName=deck_session_a', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: form,
+    });
+
+    expect(res.status).toBe(200);
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+      type: 'file.upload',
+      sessionName: 'deck_session_a',
+    }));
+  });
+
   it('streams daemon fetch progress for browsers that opt in', async () => {
     sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, _message, _timeoutMs, onProgress) => {
       onProgress?.({

@@ -118,10 +118,16 @@ interface AttachmentEntry {
   expiresAt: number;
   /** Stable browser upload identity used to deduplicate direct → relay fallback. */
   clientUploadId?: string;
+  /** Authorized session name bound at upload time for single-tab share isolation. */
+  sessionName?: string;
   /** Local-handle identity prevents path replacement between mint and read. */
   device?: number;
   inode?: number;
   mtimeMs?: number;
+}
+
+function normalizeAttachmentSessionName(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
 interface DownloadTarget {
@@ -401,6 +407,7 @@ async function finalizeUploadedFile(params: {
   serverLink: FileTransferSender;
   clientUploadId?: string;
   destinationDirectory?: string;
+  sessionName?: string;
 }): Promise<void> {
   const {
     uploadId,
@@ -412,7 +419,9 @@ async function finalizeUploadedFile(params: {
     serverLink,
     clientUploadId,
     destinationDirectory,
+    sessionName,
   } = params;
+  const boundSessionName = normalizeAttachmentSessionName(sessionName);
 
   if (destinationDirectory) {
     const destination = await commitUploadedFileToDirectory(resolved, destinationDirectory, originalName ?? '');
@@ -431,7 +440,12 @@ async function finalizeUploadedFile(params: {
   }
 
   const metaPath = uploadMetadataPath(resolved);
-  await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime, clientUploadId })).catch(() => {});
+  await writeFile(metaPath, JSON.stringify({
+    originalName: originalName || filename,
+    mime,
+    clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
+  })).catch(() => {});
 
   const now = Date.now();
   const attachment: AttachmentRef = {
@@ -457,6 +471,7 @@ async function finalizeUploadedFile(params: {
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
     clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
   });
 
   const response: FileUploadDone = {
@@ -549,6 +564,7 @@ export async function finalizeDirectUploadedFile(params: {
   resolved: string;
   size: number;
   destinationDirectory?: string;
+  sessionName?: string;
 }): Promise<AttachmentRef> {
   if (params.destinationDirectory) {
     const destination = await commitUploadedFileToDirectory(
@@ -566,11 +582,13 @@ export async function finalizeDirectUploadedFile(params: {
       params.clientUploadId,
     );
   }
+  const boundSessionName = normalizeAttachmentSessionName(params.sessionName);
   const now = Date.now();
   await writeFile(uploadMetadataPath(params.resolved), JSON.stringify({
     originalName: params.originalName,
     mime: params.mime,
     clientUploadId: params.clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
   })).catch(() => {});
   const entry: AttachmentEntry = {
     id: params.filename,
@@ -582,6 +600,7 @@ export async function finalizeDirectUploadedFile(params: {
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
     clientUploadId: params.clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
   };
   attachmentRegistry.set(params.filename, entry);
   return attachmentEntryToRef(entry);
@@ -753,11 +772,13 @@ async function recoverRegistry(): Promise<void> {
           let origName = child;
           let mime: string | undefined;
           let clientUploadId: string | undefined;
+          let sessionName: string | undefined;
           try {
-            const meta = JSON.parse(await readFile(path.join(filePath, '.meta.json'), 'utf8')) as { originalName?: string; mime?: string; clientUploadId?: string };
+            const meta = JSON.parse(await readFile(path.join(filePath, '.meta.json'), 'utf8')) as { originalName?: string; mime?: string; clientUploadId?: string; sessionName?: string };
             if (meta.originalName) origName = meta.originalName;
             if (meta.mime) mime = meta.mime;
             if (typeof meta.clientUploadId === 'string') clientUploadId = meta.clientUploadId;
+            sessionName = normalizeAttachmentSessionName(meta.sessionName);
           } catch { /* no sidecar or invalid */ }
           if (now - childStat.mtimeMs > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) continue;
           attachmentRegistry.set(file, {
@@ -770,6 +791,7 @@ async function recoverRegistry(): Promise<void> {
             createdAt: childStat.mtimeMs,
             expiresAt: childStat.mtimeMs + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
             clientUploadId,
+            ...(sessionName ? { sessionName } : {}),
           });
           continue;
         }
@@ -781,12 +803,14 @@ async function recoverRegistry(): Promise<void> {
         let origName: string = file;
         let mime: string | undefined;
         let clientUploadId: string | undefined;
+        let sessionName: string | undefined;
         try {
           const metaRaw = await readFile(filePath + '.meta.json', 'utf-8');
-          const meta = JSON.parse(metaRaw) as { originalName?: string; mime?: string; clientUploadId?: string };
+          const meta = JSON.parse(metaRaw) as { originalName?: string; mime?: string; clientUploadId?: string; sessionName?: string };
           if (meta.originalName) origName = meta.originalName;
           if (meta.mime) mime = meta.mime;
           if (typeof meta.clientUploadId === 'string') clientUploadId = meta.clientUploadId;
+          sessionName = normalizeAttachmentSessionName(meta.sessionName);
         } catch { /* no sidecar or invalid */ }
 
         attachmentRegistry.set(file, {
@@ -799,6 +823,7 @@ async function recoverRegistry(): Promise<void> {
           createdAt: fileStat.mtimeMs,
           expiresAt: fileStat.mtimeMs + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
           clientUploadId,
+          ...(sessionName ? { sessionName } : {}),
         });
       } catch { /* skip unreadable files */ }
     }
@@ -853,6 +878,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
       serverLink,
       clientUploadId: msg.clientUploadId,
       destinationDirectory: msg.destinationDirectory,
+      sessionName: msg.sessionName,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
@@ -902,6 +928,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
       serverLink,
       clientUploadId: msg.clientUploadId,
       destinationDirectory: msg.destinationDirectory,
+      sessionName: msg.sessionName,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
