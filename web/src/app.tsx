@@ -6825,6 +6825,9 @@ function InternalMainApp() {
     }
   }, [auth?.baseUrl, clearAuthState, holdAuthCredentialCleanupGate, nativeServerUrl]);
 
+  const lastNavIntentKeyRef = useRef<string | null>(null);
+  const lastAutoFocusedRef = useRef<{ key: string; element: HTMLDivElement } | null>(null);
+
   const resetServerScopedStateForSwitch = useCallback((nextServerId?: string | null) => {
     staleSubSessionsSnapshotRef.current = rawSubSessionsRef.current;
     managedSharesGenerationRef.current += 1;
@@ -6850,6 +6853,9 @@ function InternalMainApp() {
     setOpenSubIdsRaw(new Set());
     setRetainedOpenSubIds(new Set());
     setMaximizedSubIds(new Set());
+    focusedSubIdRef.current = null;
+    setFocusedSubIdState(null);
+    lastAutoFocusedRef.current = null;
     setActiveSession(null, { remember: false, keepSubWindows: true });
     setSharedActiveDispatchIds(new Map());
     setDaemonStats(null);
@@ -8073,6 +8079,142 @@ function InternalMainApp() {
   const viewModeNavRef = useRef(viewMode);
   viewModeNavRef.current = viewMode;
 
+  const serverSwitchFocusGuardRef = useRef<{ token: number; cleanup: () => void } | null>(null);
+  const serverSwitchFocusTokenRef = useRef(0);
+  const pendingAutoFocusTargetRef = useRef<{ key: string; sessionName: string; isSub: boolean } | null>(null);
+  const attemptAutoFocusForTargetRef = useRef<(target: { key: string; sessionName: string; isSub: boolean } | null) => boolean>(() => false);
+
+  const cancelServerSwitchFocusGuard = useCallback(() => {
+    serverSwitchFocusTokenRef.current += 1;
+    const active = serverSwitchFocusGuardRef.current;
+    serverSwitchFocusGuardRef.current = null;
+    active?.cleanup();
+  }, []);
+
+  const armServerSwitchFocusGuard = useCallback(() => {
+    cancelServerSwitchFocusGuard();
+    if (
+      isMobileRef.current
+      || hasBlockingComposerOverlayRef.current
+      || hasDomBlockingOverlay()
+      || manualDashboardRef.current
+    ) {
+      return;
+    }
+    const activeAtSwitch = typeof document !== 'undefined' ? document.activeElement : null;
+    if (activeAtSwitch?.closest?.('.floating-panel')) {
+      return;
+    }
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    const token = serverSwitchFocusTokenRef.current;
+    let timerId: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      if (serverSwitchFocusTokenRef.current === token) {
+        cancelServerSwitchFocusGuard();
+      }
+    }, 2500);
+    let rafId: number | null = null;
+    let disposed = false;
+
+    const isNeutralActive = () => {
+      const el = document.activeElement;
+      return !el || el === document.body || el === document.documentElement;
+    };
+
+    const reassertIfEligible = () => {
+      if (disposed || serverSwitchFocusTokenRef.current !== token) return;
+      if (
+        isMobileRef.current
+        || hasBlockingComposerOverlayRef.current
+        || hasDomBlockingOverlay()
+        || manualDashboardRef.current
+      ) {
+        return;
+      }
+      const curActive = document.activeElement;
+      if (curActive?.closest?.('.floating-panel')) {
+        cancelServerSwitchFocusGuard();
+        return;
+      }
+      if (isNeutralActive() && pendingAutoFocusTargetRef.current) {
+        attemptAutoFocusForTargetRef.current(pendingAutoFocusTargetRef.current);
+      }
+    };
+
+    const scheduleCheck = () => {
+      if (disposed || serverSwitchFocusTokenRef.current !== token) return;
+      queueMicrotask(reassertIfEligible);
+      if (typeof requestAnimationFrame === 'function') {
+        if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(rafId);
+        }
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          reassertIfEligible();
+        });
+      }
+    };
+
+    const onPointerDown = (e: Event) => {
+      const targetEl = e.target as Element | null;
+      if (!targetEl?.closest?.('[contenteditable="true"], .session-input')) {
+        cancelServerSwitchFocusGuard();
+      }
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Tab') {
+        cancelServerSwitchFocusGuard();
+      }
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const targetEl = e.target as Element | null;
+      if (!targetEl || targetEl === document.body || targetEl === document.documentElement) return;
+      const pending = pendingAutoFocusTargetRef.current;
+      const expectedEl = pending ? inputRefsMap.current.get(pending.sessionName) : null;
+      if (expectedEl && (targetEl === expectedEl || expectedEl.contains(targetEl))) {
+        return;
+      }
+      cancelServerSwitchFocusGuard();
+    };
+
+    const onFocusOut = () => {
+      scheduleCheck();
+    };
+
+    const onSupervisionTaskPairs = () => {
+      scheduleCheck();
+    };
+
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    document.addEventListener('focusin', onFocusIn, true);
+    document.addEventListener('focusout', onFocusOut, true);
+    window.addEventListener('supervision:task-pairs', onSupervisionTaskPairs);
+
+    const cleanup = () => {
+      if (disposed) return;
+      disposed = true;
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+      document.removeEventListener('focusin', onFocusIn, true);
+      document.removeEventListener('focusout', onFocusOut, true);
+      window.removeEventListener('supervision:task-pairs', onSupervisionTaskPairs);
+    };
+
+    serverSwitchFocusGuardRef.current = { token, cleanup };
+  }, [cancelServerSwitchFocusGuard]);
+
+  useEffect(() => () => cancelServerSwitchFocusGuard(), [cancelServerSwitchFocusGuard]);
+
   const navigateServerByStep = useCallback((
     stepDelta: number,
     shortcutKeycaps: readonly string[],
@@ -8107,28 +8249,15 @@ function InternalMainApp() {
         nonce: (prev?.nonce ?? 0) + 1,
       }));
       if (targetSharedEntry) {
+        armServerSwitchFocusGuard();
         void handleOpenSharedEntryNavRef.current(targetSharedEntry);
       } else {
+        armServerSwitchFocusGuard();
         void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
-        setTimeout(() => {
-          if (
-            isMobileRef.current
-            || hasBlockingComposerOverlayRef.current
-            || hasDomBlockingOverlay()
-            || viewModeNavRef.current !== 'chat'
-          ) {
-            return;
-          }
-          const activeSession = activeSessionRef.current;
-          if (activeSession) {
-            const el = inputRefsMap.current.get(activeSession);
-            if (el) focusComposerElement(el);
-          }
-        }, 100);
       }
     }
     return true;
-  }, []);
+  }, [armServerSwitchFocusGuard]);
 
   const navigateTabByStep = useCallback((
     stepDelta: number,
@@ -8372,8 +8501,6 @@ function InternalMainApp() {
     return null;
   }, [isMobile, selectedServerId, manualDashboard, focusedSubId, openSubIds, activeSession, viewMode]);
 
-  const lastNavIntentKeyRef = useRef<string | null>(null);
-  const lastAutoFocusedRef = useRef<{ key: string; element: HTMLDivElement } | null>(null);
   const [subQuickFocusTick, setSubQuickFocusTick] = useState(0);
   if (lastNavIntentKeyRef.current !== navigationIntentKey) {
     lastNavIntentKeyRef.current = navigationIntentKey;
@@ -8405,17 +8532,22 @@ function InternalMainApp() {
     return null;
   }, [isMobile, selectedServerId, manualDashboard, focusedSubId, openSubIds, subSessions, activeSession, sessions, viewMode]);
 
-  const pendingAutoFocusTargetRef = useRef<{ key: string; sessionName: string; isSub: boolean } | null>(null);
   pendingAutoFocusTargetRef.current = autoFocusTarget;
 
   const attemptAutoFocusForTarget = useCallback((target: { key: string; sessionName: string; isSub: boolean } | null): boolean => {
     if (!target || isMobileRef.current || hasBlockingComposerOverlayRef.current || hasDomBlockingOverlay()) {
       return false;
     }
+    const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+    if (activeEl?.closest?.('.floating-panel')) {
+      return false;
+    }
     const inputEl = inputRefsMap.current.get(target.sessionName);
     if (!inputEl || !inputEl.isConnected) return false;
+    const neutralActive = !activeEl || activeEl === document.body || activeEl === document.documentElement;
+    const guardReassert = Boolean(serverSwitchFocusGuardRef.current && neutralActive);
     const prev = lastAutoFocusedRef.current;
-    if (prev && prev.key === target.key && prev.element === inputEl) {
+    if (prev && prev.key === target.key && prev.element === inputEl && !guardReassert) {
       return true;
     }
     if (target.isSub) {
@@ -8432,6 +8564,7 @@ function InternalMainApp() {
     }
     return focused;
   }, []);
+  attemptAutoFocusForTargetRef.current = attemptAutoFocusForTarget;
 
   const registerComposerInputRef = useCallback((sessionName: string, el: HTMLDivElement | null) => {
     if (el) {
@@ -8452,8 +8585,11 @@ function InternalMainApp() {
   useEffect(() => {
     if (!autoFocusTarget || hasBlockingComposerOverlay) return;
     const currentEl = inputRefsMap.current.get(autoFocusTarget.sessionName);
+    const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+    const neutralActive = !activeEl || activeEl === document.body || activeEl === document.documentElement;
+    const guardReassert = Boolean(serverSwitchFocusGuardRef.current && neutralActive);
     const prev = lastAutoFocusedRef.current;
-    if (prev && prev.key === autoFocusTarget.key && currentEl && prev.element === currentEl && currentEl.isConnected) {
+    if (prev && prev.key === autoFocusTarget.key && currentEl && prev.element === currentEl && currentEl.isConnected && !guardReassert) {
       return;
     }
 

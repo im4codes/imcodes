@@ -130,7 +130,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   return (
     <>
       {mode === 'terminal' ? (
-        <TerminalView sessionName={sessionName} ws={ctx.ws} connected={ctx.connected} mobileInput={isShell} />
+        <TerminalView sessionName={sessionName} ws={ctx.ws} connected={ctx.connected} autoFocus={false} mobileInput={isShell} />
       ) : (
         <ChatView
           events={events}

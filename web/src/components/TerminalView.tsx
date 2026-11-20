@@ -20,6 +20,8 @@ interface Props {
   connected?: boolean;
   /** When false, keep the terminal mounted but pause expensive live work. */
   active?: boolean;
+  /** When false, do not auto-focus the terminal on desktop mount (for previews/pinned/background views). */
+  autoFocus?: boolean;
   /** Optimize for embedded preview cards: coalesce raw writes and reduce idle work. */
   preview?: boolean;
   /** Registers this view's frame handler; the returned function unregisters it. */
@@ -93,7 +95,7 @@ export function joinWrappedTerminalSelection(selection: string, continuationRows
   return joined;
 }
 
-export function TerminalView({ sessionName, ws, connected, active = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput, onRestart }: Props) {
+export function TerminalView({ sessionName, ws, connected, active = true, autoFocus = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput, onRestart }: Props) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -103,6 +105,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   wsRef.current = ws;
   const activeRef = useRef(active);
   activeRef.current = active;
+  const autoFocusRef = useRef(autoFocus);
+  autoFocusRef.current = autoFocus;
   const previewRef = useRef(preview);
   previewRef.current = preview;
   const pendingRawChunksRef = useRef<Uint8Array[]>([]);
@@ -407,9 +411,23 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
           fitDone = true;
         }
       }, 400);
-      // Auto-focus terminal on mount for desktop keyboard input
-      if (!isMobileRef.current) {
-        requestFrame(() => term.focus());
+      // Auto-focus terminal on mount for desktop keyboard input only when explicitly active, non-preview, autoFocus enabled, and container is visible
+      if (!isMobileRef.current && !previewRef.current && activeRef.current && autoFocusRef.current !== false) {
+        requestFrame(() => {
+          const el = containerRef.current;
+          if (
+            !isMobileRef.current
+            && !previewRef.current
+            && activeRef.current
+            && autoFocusRef.current !== false
+            && el
+            && el.isConnected
+            && el.clientWidth > 0
+            && el.clientHeight > 0
+          ) {
+            term.focus();
+          }
+        });
       }
     }
 

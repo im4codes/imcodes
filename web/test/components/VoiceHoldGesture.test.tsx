@@ -2153,10 +2153,21 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.activeElement).not.toBe(input);
 
     // 3. External inputRef via focusComposerElement enters editable state when idle
+    const focusSpy = vi.spyOn(input, 'focus');
     expect(focusComposerElement(inputRef.current, { moveCursorToEnd: true })).toBe(true);
+    expect(focusSpy).toHaveBeenCalledWith({ preventScroll: true });
+    focusSpy.mockRestore();
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
     expect(document.activeElement).toBe(input);
+
+    // Returns false when focus is blocked/refused so element is not activeElement
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+    const noopFocusSpy = vi.spyOn(input, 'focus').mockImplementation(() => {});
+    expect(focusComposerElement(inputRef.current)).toBe(false);
+    noopFocusSpy.mockRestore();
 
     // 4. Blur again -> 240ms hold locks to read-only and refuses focusComposerElement interruption
     input.blur();

@@ -1198,6 +1198,7 @@ export function SubSessionWindow({
               ws={ws}
               connected={connected}
               active={(isShell || active) && viewMode === 'terminal'}
+              autoFocus={active && viewMode === 'terminal'}
               onDiff={(apply) => onDiff(sub.sessionName, apply)}
               onHistory={(apply) => onHistory(sub.sessionName, apply)}
               onFitFn={(fn) => { termFitFnRef.current = fn; }}

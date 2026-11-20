@@ -11807,4 +11807,179 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(tabPreviewFb.getAttribute('data-read-only')).toBe('true');
     expect(tabPreviewFb.getAttribute('data-can-share')).toBe('false');
   }, 20_000);
+
+  it('preserves composer focus across >100ms delayed server switch hydration, rapid repeats, and async task-pair mounts', async () => {
+    let resolveSrv2!: (v: unknown) => void;
+    const srv2Deferred = new Promise((r) => { resolveSrv2 = r; });
+    let resolveSrv3!: (v: unknown) => void;
+    const srv3Deferred = new Promise((r) => { resolveSrv3 = r; });
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-3', name: 'Server Three', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') return srv2Deferred;
+      if (path === '/api/server/srv-3/sessions') return srv3Deferred;
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // Rapid consecutive Alt+k switches (<50ms apart): srv-1 -> srv-2 -> srv-3
+    alphaComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+
+    // Simulate >150ms delayed /sessions response for srv-3 (and stale srv-2 resolving before or after)
+    await new Promise((r) => setTimeout(r, 160));
+    await act(async () => {
+      resolveSrv2({
+        sessions: [
+          { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+        ],
+      });
+      resolveSrv3({
+        sessions: [
+          { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+        ],
+      });
+    });
+
+    const gammaComposer = await screen.findByTestId('pane-composer-deck_gamma_brain');
+    await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+    // Async TaskPairStatusPanel / supervision:task-pairs arrival causing a transient blur to body must re-assert focus to gammaComposer
+    act(() => {
+      gammaComposer.blur();
+      document.body.focus();
+      const snapshot = {
+        authoritative: true,
+        serverId: 'srv-3',
+        tasks: [
+          { taskId: 'task-3', title: 'Async Task Bar', status: 'working', updatedAt: 100, pair: { status: 'working', executor: 'deck_sub_g1', auditor: 'none' } },
+        ],
+      };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = snapshot;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: snapshot }));
+    });
+    await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+    // User focusing/clicking another control cancels the switch guard and never steals focus back
+    const unrelatedBtn = screen.getByText('server-toggle-sidebar');
+    fireEvent.pointerDown(unrelatedBtn);
+    unrelatedBtn.focus();
+    expect(document.activeElement).toBe(unrelatedBtn);
+    act(() => {
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: { authoritative: true, serverId: 'srv-3', tasks: [] },
+      }));
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(document.activeElement).toBe(unrelatedBtn);
+  }, 20_000);
+
+  it('preserves target composer focus when switching via serverNext to a delayed shared server', async () => {
+    let resolveSharedOpen!: (v: unknown) => void;
+    const sharedOpenDeferred = new Promise((r) => { resolveSharedOpen = r; });
+
+    const sharedServerEntry = {
+      id: 'share-srv-2',
+      serverId: 'srv-shared',
+      serverName: 'Shared Beta',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedServerEntry]);
+    openSharedEntryMock.mockReturnValue(sharedOpenDeferred);
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Alpha Server', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+    await screen.findByText('server-select-srv-shared');
+
+    alphaComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedServerEntry.target));
+
+    await new Promise((r) => setTimeout(r, 150));
+    await act(async () => {
+      resolveSharedOpen({
+        server: { id: 'srv-shared', name: 'Shared Beta', status: 'active', lastHeartbeatAt: Date.now() },
+        target: sharedServerEntry.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-srv-2'],
+          primaryShareId: 'share-srv-2',
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_shared_one', title: 'Shared One', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+        ],
+        subSessions: [],
+      });
+    });
+
+    const sharedComposer = await screen.findByTestId('pane-composer-deck_shared_one');
+    await waitFor(() => expect(document.activeElement).toBe(sharedComposer));
+
+    act(() => {
+      sharedComposer.blur();
+      document.body.focus();
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+        detail: { authoritative: true, serverId: 'srv-shared', tasks: [] },
+      }));
+    });
+    await waitFor(() => expect(document.activeElement).toBe(sharedComposer));
+  }, 20_000);
 });

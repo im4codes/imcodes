@@ -803,3 +803,85 @@ describe('TerminalView — Space / window resume fit debouncing', () => {
     expect(view.sendSnapshotRequest).not.toHaveBeenCalled();
   });
 });
+
+describe('TerminalView desktop autoFocus guard', () => {
+  const origWidthDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+  const origHeightDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
+  const prevRaf = globalThis.requestAnimationFrame;
+  const prevCancelRaf = globalThis.cancelAnimationFrame;
+  const prevMatchMedia = globalThis.matchMedia;
+  const prevInnerWidth = window.innerWidth;
+  const origMaxTouchDesc = Object.getOwnPropertyDescriptor(navigator, 'maxTouchPoints');
+  let mockClientWidth = 800;
+  let mockClientHeight = 600;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    mockClientWidth = 800;
+    mockClientHeight = 600;
+    Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => mockClientWidth });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => mockClientHeight });
+    Object.defineProperty(globalThis, 'requestAnimationFrame', {
+      value: (cb: FrameRequestCallback) => window.setTimeout(() => cb(Date.now()), 16),
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+      value: (id: number) => { window.clearTimeout(id); },
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280, writable: true });
+    Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: 0 });
+    Object.defineProperty(globalThis, 'matchMedia', {
+      configurable: true,
+      writable: true,
+      value: (q: string) => ({
+        matches: q === '(hover: hover) and (pointer: fine)',
+        media: q,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }),
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, 'requestAnimationFrame', { value: prevRaf, configurable: true, writable: true });
+    Object.defineProperty(globalThis, 'cancelAnimationFrame', { value: prevCancelRaf, configurable: true, writable: true });
+    Object.defineProperty(globalThis, 'matchMedia', { value: prevMatchMedia, configurable: true, writable: true });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: prevInnerWidth, writable: true });
+    if (origMaxTouchDesc) Object.defineProperty(navigator, 'maxTouchPoints', origMaxTouchDesc);
+    if (origWidthDesc) Object.defineProperty(HTMLElement.prototype, 'clientWidth', origWidthDesc);
+    if (origHeightDesc) Object.defineProperty(HTMLElement.prototype, 'clientHeight', origHeightDesc);
+  });
+
+  it('auto-focuses on desktop mount when active, non-preview, autoFocus default true, and container is visible', () => {
+    const { unmount } = render(<TerminalView sessionName="focus-allowed" />);
+    const termInstance = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+    vi.advanceTimersByTime(50);
+    expect(termInstance.focus).toHaveBeenCalledTimes(1);
+    unmount();
+  });
+
+  it('does not auto-focus on desktop mount when preview, active={false}, autoFocus={false}, or zero-sized container', () => {
+    const cases: Array<{ name: string; props: { preview?: boolean; active?: boolean; autoFocus?: boolean }; zeroSize?: boolean }> = [
+      { name: 'preview', props: { preview: true } },
+      { name: 'inactive', props: { active: false } },
+      { name: 'autofocus-disabled', props: { autoFocus: false } },
+      { name: 'hidden-zero-size', props: {}, zeroSize: true },
+    ];
+
+    for (const c of cases) {
+      mockClientWidth = c.zeroSize ? 0 : 800;
+      mockClientHeight = c.zeroSize ? 0 : 600;
+      (TerminalMock as unknown as ReturnType<typeof vi.fn>).mockClear();
+      const { unmount } = render(<TerminalView sessionName={`no-focus-${c.name}`} {...c.props} />);
+      const termInstance = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+      vi.advanceTimersByTime(50);
+      expect(termInstance.focus).not.toHaveBeenCalled();
+      unmount();
+    }
+  });
+});

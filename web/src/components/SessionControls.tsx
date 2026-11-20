@@ -3056,7 +3056,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     clearComposerVoiceTouchLock(el, false);
     composerFocusedRef.current = true;
     setComposerFocused(true);
-    el.focus();
+    try {
+      el.focus({ preventScroll: true });
+    } catch {
+      el.focus();
+    }
+    if (document.activeElement !== el) {
+      composerFocusedRef.current = false;
+      setComposerFocused(false);
+      clearComposerVoiceTouchLock(el, inputDisabledRef.current || voiceHoldReadyRef.current);
+      return false;
+    }
     if (options?.moveCursorToEnd) {
       moveCaretToEnd(el);
     }
