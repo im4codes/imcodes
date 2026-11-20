@@ -1033,6 +1033,7 @@ export function CloudDocsMainChatFloat({
               agentType={session.agentType}
               onResendFailed={handleResendFailed}
               hideFilePanel
+              hideTaskPairPanel
             />
           </div>
 

@@ -258,6 +258,8 @@ interface Props {
   taskPairPanelVisitKey?: string;
   /** Compact floating panels hide the split file-panel toggle so narrow views stay unobstructed. */
   hideFilePanel?: boolean;
+  /** Compact floating mini chats hide the docked task-pair status bar. */
+  hideTaskPairPanel?: boolean;
 }
 
 function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
@@ -2899,7 +2901,7 @@ function VirtualizedViewItems({ items, contentRevision, scrollRef, enabled, reve
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
-function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, canManageFileShares = true, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false }: Props) {
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, onCloudDocClick, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, canManageFileShares = true, scopeTaskPairs = false, taskPairPanelVisitKey, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false, hideFilePanel = false, hideTaskPairPanel = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -5203,7 +5205,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             )}
           </div>
         )}
-        {!!sessionId && <TaskPairStatusPanelHost visible={visible} events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} />}
+        {!!sessionId && !hideTaskPairPanel && <TaskPairStatusPanelHost visible={visible} events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} />}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}

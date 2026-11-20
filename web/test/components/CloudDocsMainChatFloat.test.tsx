@@ -44,6 +44,7 @@ vi.mock('../../src/components/ChatView.js', async () => {
       visible?: boolean;
       preview?: boolean;
       hideFilePanel?: boolean;
+      hideTaskPairPanel?: boolean;
       onScrollBottomFn?: (fn: () => void) => void;
     }) => {
       chatViewPropsSpy(props);
@@ -328,6 +329,7 @@ describe('CloudDocsMainChatFloat', () => {
     const lastProps = chatViewPropsSpy.mock.calls.at(-1)?.[0] as Record<string, unknown>;
     expect(lastProps.preview).toBeUndefined();
     expect(lastProps.hideFilePanel).toBe(true);
+    expect(lastProps.hideTaskPairPanel).toBe(true);
     expect(typeof lastProps.onLoadOlder).toBe('function');
     expect(typeof lastProps.onLoadMessageContext).toBe('function');
     expect(typeof lastProps.hasOlderHistory).toBe('boolean');

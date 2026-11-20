@@ -42,7 +42,7 @@ import {
   SUPERVISION_USER_PROMPT_LABEL_KEYS,
   SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
 } from '../../../shared/supervision-config.js';
-import { TASK_PAIR_HEARTBEAT_AUTOMATION_KIND } from '../../../shared/task-pair.js';
+import { TASK_PAIR_HEARTBEAT_AUTOMATION_KIND, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -3456,5 +3456,44 @@ describe('ChatView', () => {
     } finally {
       localStorage.removeItem('chatFilePanelOpen:deck_minichat_fp');
     }
+  });
+
+  it('hides TaskPairStatusPanelHost when hideTaskPairPanel is true while keeping it visible by default', () => {
+    const taskPairEvents = [
+      {
+        eventId: 'tp-1',
+        sessionId: 'deck_minichat_tp',
+        ts: 1000,
+        seq: 1,
+        type: TASK_PAIR_TIMELINE_EVENT,
+        payload: {
+          taskId: 'tsk_hide_panel',
+          toStatus: 'working',
+          title: 'Mini chat task status',
+          executor: 'deck_sub_1',
+          auditor: 'deck_sub_2',
+          round: 0,
+        },
+      },
+    ];
+
+    const { container: normalContainer } = render(
+      <ChatView
+        events={taskPairEvents}
+        loading={false}
+        sessionId="deck_minichat_tp"
+      />,
+    );
+    expect(normalContainer.querySelector('[data-testid="task-pair-status-panel"]')).toBeTruthy();
+
+    const { container: hiddenContainer } = render(
+      <ChatView
+        events={taskPairEvents}
+        loading={false}
+        sessionId="deck_minichat_tp"
+        hideTaskPairPanel
+      />,
+    );
+    expect(hiddenContainer.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
   });
 });
