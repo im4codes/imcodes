@@ -317,7 +317,7 @@ export function SubSessionWindow({
   // When no FileBrowser list consumer is mounted, sends lightweight summaryOnly
   // count requests; when cwd matches FileBrowser, shares/reuses its updates.
   // Gated on `visible` so hidden/minimized retained windows don't poll every 30s.
-  const gitChangesCount = useSharedGitChangesCount(ws, visible ? (sub.cwd ?? null) : null);
+  const gitChangesCount = useSharedGitChangesCount(ws, visible ? (sub.cwd ?? null) : null, { serverId });
 
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.

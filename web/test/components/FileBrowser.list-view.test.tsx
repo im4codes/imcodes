@@ -28,6 +28,7 @@ vi.mock('react-i18next', () => {
 });
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests } from '../../src/components/FileBrowser.js';
+import { clearFileBrowserCache } from '../../src/file-browser-cache.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { fileBrowserSortStorageKey } from '../../src/file-browser-list-view.js';
 import { fileBrowserColumnsStorageKey, fileBrowserTableMinWidth, FILE_BROWSER_HIDEABLE_COLUMNS } from '../../src/file-browser-list-view.js';
@@ -111,6 +112,7 @@ beforeEach(() => {
   vi.setSystemTime(NOW);
   localStorage.clear();
   __resetFileBrowserSharedChangesForTests();
+  clearFileBrowserCache();
 });
 
 describe('FileBrowser table view', () => {

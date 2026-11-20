@@ -95,6 +95,12 @@ import {
   type SharedChangesRequestStatus,
 } from '../git-status-store.js';
 import { filePreviewStatesEqual } from '../file-preview-state.js';
+import {
+  getFileBrowserCache,
+  makeFileBrowserCacheKey,
+  mergePreservedExpandedChildren,
+  setFileBrowserCache,
+} from '../file-browser-cache.js';
 import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
 import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
 import { prewarmOnlyOfficeComponents } from '../onlyoffice-preload.js';
@@ -522,6 +528,17 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
+function findNodeChildren(nodes: FsNode[], targetId: string): FsNode[] | undefined {
+  for (const node of nodes) {
+    if (node.id === targetId) return node.children;
+    if (node.children?.length) {
+      const found = findNodeChildren(node.children, targetId);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
 function findNodePath(nodes: FsNode[], targetId: string): string[] | null {
   for (const node of nodes) {
     if (node.id === targetId) return [node.id];
@@ -658,20 +675,33 @@ export function FileBrowser({
   ));
   // A cached tree has no file details and no record of how it was listed, so
   // the table view always lists afresh.
-  const loadSnapshot: typeof loadFileBrowserSnapshot = (...args) => (listView ? null : loadFileBrowserSnapshot(...args));
-  const initialTreeSnapshot = loadSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
-  const [data, setData] = useState<FsNode[]>([
-    {
-      id: startPath,
-      name: startPath,
-      isDir: true,
-      children: initialTreeSnapshot?.rootChildren ?? [],
-    },
-  ]);
+  const loadSnapshot: typeof loadFileBrowserSnapshot = (...args) => (listView || scopedSessionName ? null : loadFileBrowserSnapshot(...args));
+  const initialCacheKey = makeFileBrowserCacheKey({
+    serverId,
+    scopedSessionName,
+    startPath,
+    includeFiles,
+    showHidden: DEFAULT_SHOW_HIDDEN_FILES,
+    listView: Boolean(listView),
+  });
+  const initialMemoryCache = getFileBrowserCache(initialCacheKey);
+  const initialTreeSnapshot = initialMemoryCache ? null : loadSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
+  const [data, setData] = useState<FsNode[]>(() => (
+    initialMemoryCache?.data.length
+      ? initialMemoryCache.data
+      : [
+          {
+            id: startPath,
+            name: startPath,
+            isDir: true,
+            children: initialTreeSnapshot?.rootChildren ?? [],
+          },
+        ]
+  ));
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(
     () => new Set(highlightPath ? [highlightPath] : []),
   );
-  const [currentLabel, setCurrentLabel] = useState(initialTreeSnapshot?.currentLabel ?? startPath);
+  const [currentLabel, setCurrentLabel] = useState(() => initialMemoryCache?.currentLabel ?? initialTreeSnapshot?.currentLabel ?? startPath);
   // Refs so callbacks/handlers that are defined BEFORE `navigateTo` / read
   // `currentLabel` (fetchPreview, the WS message handler) can use the latest
   // value without a declaration-order or stale-closure problem.
@@ -684,7 +714,7 @@ export function FileBrowser({
   // ":downloads:" sentinel) label jumpTo set before the request even went
   // out. A failed root navigation reverts HERE, not to whatever currentLabel
   // happens to be at that moment.
-  const lastGoodLabelRef = useRef(initialTreeSnapshot?.currentLabel ?? startPath);
+  const lastGoodLabelRef = useRef(initialMemoryCache?.currentLabel ?? initialTreeSnapshot?.currentLabel ?? startPath);
   useEffect(() => { onCurrentPathChange?.(currentLabel); }, [currentLabel, onCurrentPathChange]);
   const dataRef = useRef(data);
   useEffect(() => { dataRef.current = data; }, [data]);
@@ -787,7 +817,9 @@ export function FileBrowser({
   const navSearchBasePathRef = useRef<string>('');
   const navSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
-  const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
+  const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(
+    () => (initialMemoryCache ? new Map(initialMemoryCache.modifiedFiles) : new Map()),
+  ); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   // Restore last active tab from localStorage
   const [treeWidth, setTreeWidth] = useState<number>(() => {
@@ -908,7 +940,7 @@ export function FileBrowser({
   useEffect(() => {
     const root = data[0];
     if (!root || root.isLoading || !root.children) return;
-    if (!listView) saveFileBrowserSnapshot(startPath, includeFiles, showHidden, currentLabel, root.children, serverId);
+    if (!listView && !scopedSessionName) saveFileBrowserSnapshot(startPath, includeFiles, showHidden, currentLabel, root.children, serverId);
   }, [currentLabel, data, includeFiles, listView, serverId, showHidden, startPath]);
 
   const getActivePreviewCycle = useCallback((path?: string): PendingPreviewRequest | null => {
@@ -1092,8 +1124,17 @@ export function FileBrowser({
           previewErrorPathRef.current = loadingPath;
           setPreview({ status: 'error', path: loadingPath, error: tRef.current('file_browser.preview_error') });
         }
-        // Re-fetch root and changes
-        if (mountedRef.current) fetchDir(startPath);
+        // Re-fetch root, expanded subdirectories (without collapsing), and changes
+        if (mountedRef.current) {
+          fetchDir(startPath);
+          const expandedSubs = [...expandedPathsRef.current]
+            .filter((p) => p && p !== startPath && p !== '~')
+            .slice(0, 8);
+          for (const subPath of expandedSubs) {
+            fetchDir(subPath, { skipGitStatus: true });
+          }
+          refreshChangesRef.current();
+        }
         return;
       }
 
@@ -1168,13 +1209,18 @@ export function FileBrowser({
         loadedRef.current.add(nodeId);
         if (resolvedParent !== nodeId) loadedRef.current.add(resolvedParent);
 
-        setData((prev) => updateNode(prev, nodeId, {
-          id: resolvedParent,
-          name: resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
-          children,
-          isLoading: false,
-          listing,
-        }));
+        setData((prev) => {
+          const targetId = findNodeChildren(prev, nodeId) !== undefined
+            ? nodeId
+            : (nodeId === startPath && prev.length === 1 ? prev[0].id : nodeId);
+          return updateNode(prev, targetId, {
+            id: resolvedParent,
+            name: resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
+            children: mergePreservedExpandedChildren(children, findNodeChildren(prev, targetId), expandedPathsRef.current),
+            isLoading: false,
+            listing,
+          });
+        });
         // Keep the node expanded after its ID changes from alias (e.g. '~') to resolved path
         if (resolvedParent !== nodeId) {
           setExpandedPaths((prev) => {
@@ -1616,7 +1662,6 @@ export function FileBrowser({
             for (const nodeId of parentNodePath) next.add(nodeId);
             return next;
           });
-          setCurrentLabel(parentDir);
           fetchDir(parentDir);
         } else {
           navigateToRef.current(parentDir);
@@ -1673,7 +1718,38 @@ export function FileBrowser({
     }
   }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, scopedSessionName, trackPendingPreviewRequest, ws]);
 
-  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(
+    () => new Set(initialMemoryCache?.expandedPaths.length ? initialMemoryCache.expandedPaths : [startPath]),
+  );
+  const expandedPathsRef = useRef(expandedPaths);
+  expandedPathsRef.current = expandedPaths;
+  const fbCacheKey = useMemo(
+    () => makeFileBrowserCacheKey({
+      serverId,
+      scopedSessionName,
+      startPath,
+      includeFiles,
+      showHidden,
+      listView: Boolean(listView),
+    }),
+    [includeFiles, listView, scopedSessionName, serverId, showHidden, startPath],
+  );
+  const hydratedCacheKeyRef = useRef(fbCacheKey);
+  const refreshChangesRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    const root = data[0];
+    if (!root || root.isLoading || !root.children) return;
+    const hasLoaded = loadedRef.current.has(root.id);
+    if (!hasLoaded && root.children.length === 0 && expandedPaths.size <= 1 && modifiedFiles.size === 0) return;
+    setFileBrowserCache(fbCacheKey, {
+      data,
+      currentLabel,
+      expandedPaths: [...expandedPaths],
+      modifiedFiles: [...modifiedFiles.entries()],
+      updatedAt: Date.now(),
+    });
+  }, [currentLabel, data, expandedPaths, fbCacheKey, modifiedFiles]);
 
   const buildChildPath = useCallback((parentPath: string, childName: string) => {
     const sep = parentPath.includes('\\') ? '\\' : '/';
@@ -1872,12 +1948,12 @@ export function FileBrowser({
   // Load root on mount and re-load when ws changes (server switch).
   // fetchDir changes when ws changes (useCallback dep), so this also re-runs on server switch.
   const prevWsRef = useRef(ws);
+  const initialRefreshDoneRef = useRef(false);
   useEffect(() => {
+    let expandedToRefresh: string[] = [];
     if (ws !== prevWsRef.current) {
-      prevWsRef.current = ws;
-      // Clear stale state from previous ws instance
+      // Clear stale in-flight state from previous ws instance
       clearNavSearch();
-      loadedRef.current.clear();
       pendingRef.current.clear();
       clearAllPendingPreviewRequests();
       pendingCreateFileRef.current.clear();
@@ -1885,13 +1961,37 @@ export function FileBrowser({
       activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
-      const cached = loadSnapshot(startPath, includeFiles, showHidden, serverId);
-      setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
-      setCurrentLabel(cached?.currentLabel ?? startPath);
+    }
+    if (ws !== prevWsRef.current || hydratedCacheKeyRef.current !== fbCacheKey) {
+      prevWsRef.current = ws;
+      hydratedCacheKeyRef.current = fbCacheKey;
+      loadedRef.current.clear();
+      const mem = getFileBrowserCache(fbCacheKey);
+      const cached = mem ? null : loadSnapshot(startPath, includeFiles, showHidden, serverId);
+      setData(
+        mem?.data.length
+          ? mem.data
+          : [{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }],
+      );
+      const nextLabel = mem?.currentLabel ?? cached?.currentLabel ?? startPath;
+      setCurrentLabel(nextLabel);
+      lastGoodLabelRef.current = nextLabel;
+      const nextExpanded = mem && mem.expandedPaths.length > 0 ? mem.expandedPaths : [startPath];
+      setExpandedPaths(new Set(nextExpanded));
+      setModifiedFiles(mem ? new Map(mem.modifiedFiles) : new Map());
       setError(null);
+      expandedToRefresh = nextExpanded.filter((p) => p && p !== startPath && p !== '~').slice(0, 8);
+    } else if (!initialRefreshDoneRef.current) {
+      initialRefreshDoneRef.current = true;
+      expandedToRefresh = [...expandedPathsRef.current]
+        .filter((p) => p && p !== startPath && p !== '~')
+        .slice(0, 8);
     }
     fetchDir(startPath);
-  }, [clearAllPendingPreviewRequests, clearNavSearch, fetchDir, includeFiles, listView, serverId, showHidden, startPath]);
+    for (const subPath of expandedToRefresh) {
+      fetchDir(subPath, { skipGitStatus: true });
+    }
+  }, [clearAllPendingPreviewRequests, clearNavSearch, fbCacheKey, fetchDir, includeFiles, listView, serverId, showHidden, startPath, ws]);
 
   // Opening a File Browser is the only eager direct-file action.  This creates
   // an inert tab+daemon lease (no path, handle, session scope, or file
@@ -1905,13 +2005,15 @@ export function FileBrowser({
 
   useEffect(() => {
     setChangesVisibleLimit(CHANGES_RENDER_BATCH_SIZE);
-    setChangesFiles([]);
-    setChangesMeta({ totalCount: 0, truncated: false });
     if (!changesRootPath) {
+      setChangesFiles([]);
+      setChangesMeta({ totalCount: 0, truncated: false });
       return;
     }
-    const cacheKey = getSharedChangesKey(ws, changesRootPath);
+    const cacheKey = getSharedChangesKey(ws, changesRootPath, serverId, scopedSessionName);
+    let receivedFilesSync = false;
     const unsubscribeFiles = subscribeSharedChanges(cacheKey, (files) => {
+      receivedFilesSync = true;
       if (!mountedRef.current) return;
       setChangesFiles(files);
       setModifiedFiles((prev) => {
@@ -1923,10 +2025,18 @@ export function FileBrowser({
         return next;
       });
     });
+    if (!receivedFilesSync) {
+      setChangesFiles([]);
+    }
+    let receivedMetaSync = false;
     const unsubscribeMeta = subscribeSharedChangesMeta(cacheKey, (meta) => {
+      receivedMetaSync = true;
       if (!mountedRef.current) return;
       setChangesMeta(meta);
     });
+    if (!receivedMetaSync) {
+      setChangesMeta({ totalCount: 0, truncated: false });
+    }
     const unsubscribeStatus = subscribeSharedChangesStatus(cacheKey, (status) => {
       if (!mountedRef.current) return;
       if (changesRefreshFeedbackTimerRef.current) {
@@ -2125,7 +2235,7 @@ export function FileBrowser({
       }
       lastChangesRefreshPathRef.current = changesRootPath;
       lastChangesRefreshRef.current = now;
-      requestSharedChanges(ws, changesRootPath, false, scopedSessionName);
+      requestSharedChanges(ws, changesRootPath, false, scopedSessionName, serverId);
     } else {
       // Schedule for when rate limit clears
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
@@ -2133,10 +2243,13 @@ export function FileBrowser({
         if (!mountedRef.current) return;
         lastChangesRefreshPathRef.current = changesRootPath;
         lastChangesRefreshRef.current = Date.now();
-        requestSharedChanges(ws, changesRootPath, true, scopedSessionName);
+        requestSharedChanges(ws, changesRootPath, true, scopedSessionName, serverId);
       }, CHANGES_RATE_LIMIT_MS - elapsed);
     }
-  }, [changesRootPath, scopedSessionName, ws]);
+  }, [changesRootPath, scopedSessionName, serverId, ws]);
+  refreshChangesRef.current = () => {
+    if (changesVisible) refreshChanges();
+  };
 
   // Initial fetch on mount
   useEffect(() => {
@@ -2159,15 +2272,6 @@ export function FileBrowser({
     if (refreshTrigger === undefined || refreshTrigger === 0) return;
     refreshChanges();
   }, [changesVisible, refreshTrigger, refreshChanges]);
-
-  // Reload tree when showHidden changes
-  useEffect(() => {
-    loadedRef.current.clear();
-    const cached = loadSnapshot(startPath, includeFiles, showHidden, serverId);
-    setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
-    setCurrentLabel(cached?.currentLabel ?? startPath);
-    fetchDir(startPath);
-  }, [fetchDir, includeFiles, listView, serverId, showHidden, startPath]);
 
   const toggleExpand = useCallback((nodeId: string) => {
     setExpandedPaths((prev) => {
@@ -3211,7 +3315,7 @@ export function FileBrowser({
             disabled={changesRefreshStatus === 'refreshing'}
             onClick={() => {
               try {
-                requestSharedChanges(ws, changesRootPath!, true, scopedSessionName);
+                requestSharedChanges(ws, changesRootPath!, true, scopedSessionName, serverId);
               } catch {
                 setChangesRefreshStatus('error');
               }

@@ -10,6 +10,7 @@ import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { forceRefreshSharedChangesForCheckout } from '../git-status-store.js';
 import { ingestSessionRepoContext, getSessionRepoContext } from '../session-repo-context-store.js';
+import { getRepoPageCache, makeRepoPageCacheKey, setRepoPageCache } from '../repo-page-cache.js';
 import { RepoCallbackModal, type RepoCallbackTargetOption } from '../components/RepoCallbackModal.js';
 import { loadRepoCallbackPrefs } from '../repo-callback-prefs.js';
 
@@ -212,8 +213,20 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
     [projectDir, scopeToSessionRoot],
   );
 
-  const [context, setContext] = useState<RepoContext | null>(null);
-  const [detectLoading, setDetectLoading] = useState(true);
+  const repoCacheKey = makeRepoPageCacheKey({
+    serverId,
+    sessionId,
+    scopeToSessionRoot,
+    projectDir,
+  });
+  const initialRepoCacheRef = useRef<{ key: string; entry: ReturnType<typeof getRepoPageCache> } | null>(null);
+  if (initialRepoCacheRef.current === null || initialRepoCacheRef.current.key !== repoCacheKey) {
+    initialRepoCacheRef.current = { key: repoCacheKey, entry: getRepoPageCache(repoCacheKey) };
+  }
+  const initialRepoCache = initialRepoCacheRef.current.entry;
+
+  const [context, setContext] = useState<RepoContext | null>(() => initialRepoCache?.context ?? null);
+  const [detectLoading, setDetectLoading] = useState(() => !initialRepoCache?.context);
   const [detectError, setDetectError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>(() => {
     if (initialTab) return initialTab;
@@ -221,33 +234,39 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
     return saved && ['issues', 'prs', 'branches', 'commits', 'actions'].includes(saved) ? saved as TabKey : 'issues';
   });
 
-  const [tabs, setTabs] = useState<Record<TabKey, TabState>>({
-    issues: emptyTab(),
-    prs: emptyTab(),
-    branches: emptyTab(),
-    commits: emptyTab(),
-    actions: emptyTab(),
-  });
+  const [tabs, setTabs] = useState<Record<TabKey, TabState>>(() => (
+    initialRepoCache?.tabs ?? {
+      issues: emptyTab(),
+      prs: emptyTab(),
+      branches: emptyTab(),
+      commits: emptyTab(),
+      actions: emptyTab(),
+    }
+  ));
 
   // ── Expand/collapse detail state ──────────────────────────────────────
-  const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  const [detailData, setDetailData] = useState<Map<string, any>>(new Map());
-  const [detailState, setDetailState] = useState<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
+  const [expandedKey, setExpandedKey] = useState<string | null>(() => initialRepoCache?.expandedKey ?? null);
+  const [detailData, setDetailData] = useState<Map<string, any>>(() => new Map(initialRepoCache?.detailData ?? []));
+  const [detailState, setDetailState] = useState<Map<string, 'loading' | 'loaded' | 'error'>>(
+    () => new Map((initialRepoCache?.detailData ?? []).map(([k]) => [k, 'loaded' as const])),
+  );
   const [checkoutPendingBranch, setCheckoutPendingBranch] = useState<string | null>(null);
   const [checkoutFeedback, setCheckoutFeedback] = useState<CheckoutFeedback>(null);
   const [callbackModalOpen, setCallbackModalOpen] = useState(false);
-  const [callbacks, setCallbacks] = useState<CallbackTaskRecord[]>([]);
-  const [callbackRuntimeEnabled, setCallbackRuntimeEnabled] = useState(false);
+  const [callbacks, setCallbacks] = useState<CallbackTaskRecord[]>(() => initialRepoCache?.callbacks ?? []);
+  const [callbackRuntimeEnabled, setCallbackRuntimeEnabled] = useState(() => initialRepoCache?.callbackRuntimeEnabled ?? false);
   const [callbackChecking, setCallbackChecking] = useState(false);
-  const [callbackLastCheckedAt, setCallbackLastCheckedAt] = useState<number | undefined>(undefined);
-  const [callbackLastError, setCallbackLastError] = useState<string | undefined>(undefined);
+  const [callbackLastCheckedAt, setCallbackLastCheckedAt] = useState<number | undefined>(() => initialRepoCache?.callbackLastCheckedAt);
+  const [callbackLastError, setCallbackLastError] = useState<string | undefined>(() => initialRepoCache?.callbackLastError);
 
   // Track pending requestIds to discard stale responses
   const pendingRef = useRef<Set<string>>(new Set());
   const detailReqRef = useRef<Map<string, DetailRequestMeta>>(new Map());
   const tabReqRef = useRef<Map<string, TabRequestMeta>>(new Map());
-  const detailDataRef = useRef<Map<string, any>>(new Map());
-  const detailStateRef = useRef<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
+  const detailDataRef = useRef<Map<string, any>>(new Map(initialRepoCache?.detailData ?? []));
+  const detailStateRef = useRef<Map<string, 'loading' | 'loaded' | 'error'>>(
+    new Map((initialRepoCache?.detailData ?? []).map(([k]) => [k, 'loaded' as const])),
+  );
   // Track detect requestId separately
   const detectReqRef = useRef<string | null>(null);
   const checkoutReqRef = useRef<string | null>(null);
@@ -268,8 +287,18 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
   const actionStepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusedActionTargetKey, setFocusedActionTargetKey] = useState<string | null>(null);
   const [focusedActionTargetReplayClass, setFocusedActionTargetReplayClass] = useState<'repo-action-focus-a' | 'repo-action-focus-b'>('repo-action-focus-a');
-  const contextRef = useRef<RepoContext | null>(null);
+  const contextRef = useRef<RepoContext | null>(initialRepoCache?.context ?? null);
   const tabsRef = useRef(tabs);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const hydratedRepoCacheKeyRef = useRef(repoCacheKey);
+  const staleFromCacheTabsRef = useRef<Set<TabKey>>(
+    new Set(
+      initialRepoCache
+        ? (Object.keys(initialRepoCache.tabs) as TabKey[]).filter((k) => initialRepoCache.tabs[k].fetched)
+        : [],
+    ),
+  );
 
   useEffect(() => {
     if (!initialTab) return;
@@ -286,6 +315,32 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
   useEffect(() => {
     detailStateRef.current = detailState;
   }, [detailState]);
+
+  useEffect(() => {
+    const hasAnyTab = (Object.values(tabs) as TabState[]).some((tab) => tab.fetched);
+    if (!context && !hasAnyTab && detailData.size === 0 && callbacks.length === 0) return;
+    setRepoPageCache(repoCacheKey, {
+      context,
+      tabs,
+      expandedKey,
+      detailData: [...detailData.entries()],
+      callbacks,
+      callbackRuntimeEnabled,
+      callbackLastCheckedAt,
+      callbackLastError,
+      updatedAt: Date.now(),
+    });
+  }, [
+    repoCacheKey,
+    context,
+    tabs,
+    expandedKey,
+    detailData,
+    callbacks,
+    callbackRuntimeEnabled,
+    callbackLastCheckedAt,
+    callbackLastError,
+  ]);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -304,13 +359,13 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
   }, []);
 
   const applyDetectContext = useCallback((rawContext: unknown): boolean => {
-    const accepted = ingestSessionRepoContext({ sessionId, projectDir, context: rawContext });
+    const accepted = ingestSessionRepoContext({ sessionId, projectDir, serverId, context: rawContext });
     const realDir = (rawContext as any)?.projectDir;
     if (typeof realDir === 'string' && realDir.trim() && realDir !== projectDir) {
-      ingestSessionRepoContext({ sessionId, projectDir: realDir.trim(), context: rawContext });
+      ingestSessionRepoContext({ sessionId, projectDir: realDir.trim(), serverId, context: rawContext });
     }
     if (!accepted) return false;
-    const shared = getSessionRepoContext(sessionId, projectDir);
+    const shared = getSessionRepoContext(sessionId, projectDir, serverId);
     const nextContext = mapDetectToContext(rawContext);
     if (shared?.currentBranch && !nextContext.currentBranch) nextContext.currentBranch = shared.currentBranch;
     if (typeof shared?.repoGeneration === 'number') nextContext.repoGeneration = shared.repoGeneration;
@@ -318,7 +373,7 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
     contextRef.current = nextContext;
     setContext(nextContext);
     return true;
-  }, [projectDir, sessionId]);
+  }, [projectDir, serverId, sessionId]);
 
   const isBranchScopedRequestStale = useCallback((meta: Pick<TabRequestMeta, 'key' | 'branch' | 'repoGeneration'>) => {
     if (meta.key !== 'branches' && meta.key !== 'commits') return false;
@@ -449,22 +504,46 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
   }, [ws, requestProjectDir, sessionId]);
 
   useEffect(() => {
-    contextRef.current = null;
-    setContext(null);
-    setDetectLoading(true);
+    if (hydratedRepoCacheKeyRef.current === repoCacheKey) {
+      return;
+    }
+    hydratedRepoCacheKeyRef.current = repoCacheKey;
+    const cached = getRepoPageCache(repoCacheKey);
+    const nextTabs = cached?.tabs ?? {
+      issues: emptyTab(),
+      prs: emptyTab(),
+      branches: emptyTab(),
+      commits: emptyTab(),
+      actions: emptyTab(),
+    };
+    staleFromCacheTabsRef.current = new Set(
+      (Object.keys(nextTabs) as TabKey[]).filter((k) => nextTabs[k].fetched),
+    );
+    contextRef.current = cached?.context ?? null;
+    setContext(cached?.context ?? null);
+    setDetectLoading(!cached?.context);
     setDetectError(null);
+    setTabs(nextTabs);
     for (const requestId of detailReqRef.current.keys()) {
       pendingRef.current.delete(requestId);
     }
-    setExpandedKey(null);
-    setDetailData(new Map());
-    setDetailState(new Map());
+    setExpandedKey(cached?.expandedKey ?? null);
+    const nextDetailData = new Map(cached?.detailData ?? []);
+    const nextDetailState = new Map<string, 'loading' | 'loaded' | 'error'>(
+      (cached?.detailData ?? []).map(([k]) => [k, 'loaded' as const]),
+    );
+    detailDataRef.current = nextDetailData;
+    detailStateRef.current = nextDetailState;
+    setDetailData(nextDetailData);
+    setDetailState(nextDetailState);
+    setCallbacks(cached?.callbacks ?? []);
+    setCallbackRuntimeEnabled(cached?.callbackRuntimeEnabled ?? false);
+    setCallbackLastCheckedAt(cached?.callbackLastCheckedAt);
+    setCallbackLastError(cached?.callbackLastError);
     setCheckoutPendingBranch(null);
     checkoutPendingBranchRef.current = null;
     setCheckoutFeedback(null);
     setFocusedActionTargetKey(null);
-    detailDataRef.current = new Map();
-    detailStateRef.current = new Map();
     detailReqRef.current.clear();
     tabReqRef.current.clear();
     checkoutReqRef.current = null;
@@ -483,10 +562,10 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
     for (const timer of detailRetryTimersRef.current.values()) clearTimeout(timer);
     detailRetryTimersRef.current.clear();
     detailRetryCountRef.current.clear();
-  }, [projectDir]);
+  }, [repoCacheKey]);
 
   useEffect(() => {
-    doDetect();
+    doDetect({ preserveUi: Boolean(contextRef.current) });
     return () => {
       if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
       if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
@@ -500,10 +579,15 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
   // ── Tab data fetching ────────────────────────────────────────────────────
 
   const fetchTab = useCallback((key: TabKey, page = 1, force = false, opts?: { preserveUi?: boolean }) => {
+    staleFromCacheTabsRef.current.delete(key);
     const preserveUi = opts?.preserveUi === true;
+    const existingTab = tabsRef.current[key];
+    const hasExistingData = preserveUi && existingTab.fetched;
     if (!preserveUi) {
       updateTab(key, { loading: true, error: null });
       if (page === 1) tabRetryCountRef.current.delete(key);
+    } else if (hasExistingData) {
+      updateTab(key, { loading: false, refreshing: true });
     } else {
       updateTab(key, { loading: true });
     }
@@ -528,8 +612,8 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
           break;
       }
     } catch (err) {
-      const existingTab = tabsRef.current[key];
-      const hasExistingData = existingTab.fetched;
+      const latestTab = tabsRef.current[key];
+      const hasCachedData = latestTab.fetched;
       const nextRetry = (tabRetryCountRef.current.get(key) ?? 0) + 1;
       if (isTransientWsSendError(err) && nextRetry <= MAX_SILENT_RETRIES) {
         tabRetryCountRef.current.set(key, nextRetry);
@@ -537,10 +621,10 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
         if (existingTimer) clearTimeout(existingTimer);
         tabRetryTimersRef.current.set(key, setTimeout(() => {
           tabRetryTimersRef.current.delete(key);
-          fetchTab(key, page, force, { preserveUi: hasExistingData || preserveUi });
+          fetchTab(key, page, force, { preserveUi: hasCachedData || preserveUi });
         }, RETRY_DELAY_MS));
         updateTab(key, {
-          loading: !hasExistingData,
+          loading: !hasCachedData,
           refreshing: false,
           error: null,
         });
@@ -551,8 +635,8 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
       updateTab(key, {
         loading: false,
         refreshing: false,
-        error: hasExistingData ? null : `Send failed: ${message}`,
-        fetched: hasExistingData,
+        error: hasCachedData ? null : `Send failed: ${message}`,
+        fetched: hasCachedData,
       });
       return;
     }
@@ -566,20 +650,28 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
     });
   }, [ws, requestProjectDir, sessionId, updateTab, getActiveBranch, getActiveRepoGeneration]);
 
-  // Lazy-load: fetch tab data on first activation
+  // Lazy-load: fetch tab data on first activation, or silently refresh cached tab
   useEffect(() => {
     if (!context) return; // wait until detect completes
     const tab = tabs[activeTab];
     if (!tab.fetched && !tab.loading) {
       fetchTab(activeTab);
+    } else if (tab.fetched && staleFromCacheTabsRef.current.has(activeTab) && !tab.refreshing && !tab.loading) {
+      staleFromCacheTabsRef.current.delete(activeTab);
+      fetchTab(activeTab, 1, false, { preserveUi: true });
     }
   }, [activeTab, context, tabs, fetchTab]);
 
   // Auto-fetch CI/CD on detect complete (so auto-refresh works even if tab not visited)
   useEffect(() => {
-    if (!context || tabs.actions.fetched || tabs.actions.loading) return;
-    fetchTab('actions');
-  }, [context, tabs.actions.fetched, tabs.actions.loading, fetchTab]);
+    if (!context) return;
+    if (!tabs.actions.fetched && !tabs.actions.loading) {
+      fetchTab('actions');
+    } else if (tabs.actions.fetched && staleFromCacheTabsRef.current.has('actions') && !tabs.actions.refreshing && !tabs.actions.loading) {
+      staleFromCacheTabsRef.current.delete('actions');
+      fetchTab('actions', 1, false, { preserveUi: true });
+    }
+  }, [context, tabs.actions.fetched, tabs.actions.loading, tabs.actions.refreshing, fetchTab]);
 
   useEffect(() => {
     if (!focusLatestAction?.token || lastFocusTokenRef.current === focusLatestAction.token) return;
@@ -592,9 +684,6 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
     if (scopeToSessionRoot) return;
     let cancelled = false;
     callbackLiveStatusReceivedRef.current = false;
-    setCallbacks([]);
-    setCallbackRuntimeEnabled(false);
-    setCallbackLastError(undefined);
     if (serverId && requestProjectDir) {
       void loadRepoCallbackPrefs(serverId, requestProjectDir)
         .then((loaded) => {
@@ -648,7 +737,12 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
         latestActionDetailRef.current = null;
         pendingCiFailureRef.current.clear();
         deliveredCiEventRef.current.clear();
-        doDetect({ preserveUi: true });
+        doDetect({ preserveUi: Boolean(contextRef.current) });
+        const currentActiveTab = activeTabRef.current;
+        if (tabsRef.current[currentActiveTab]?.fetched) {
+          staleFromCacheTabsRef.current.delete(currentActiveTab);
+          fetchTab(currentActiveTab, 1, false, { preserveUi: true });
+        }
         return;
       }
 
@@ -729,11 +823,14 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
           if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
           const nextRetry = detectRetryCountRef.current + 1;
           detectRetryCountRef.current = nextRetry;
-          if (context && nextRetry <= MAX_SILENT_RETRIES) {
+          if (contextRef.current && nextRetry <= MAX_SILENT_RETRIES) {
             if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
             detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
-          } else if (!context) {
+            setDetectLoading(false);
+          } else if (!contextRef.current) {
             setDetectError(msg.error);
+            setDetectLoading(false);
+          } else {
             setDetectLoading(false);
           }
         } else {
@@ -742,7 +839,7 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
             tabReqRef.current.delete(msg.requestId);
             const retryKey = meta.key;
             const nextRetry = (tabRetryCountRef.current.get(retryKey) ?? 0) + 1;
-            const existingTab = tabs[meta.key];
+            const existingTab = tabsRef.current[meta.key];
             const hasExistingData = existingTab.fetched;
             if (hasExistingData && nextRetry <= MAX_SILENT_RETRIES) {
               tabRetryCountRef.current.set(retryKey, nextRetry);
@@ -822,14 +919,17 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
             branches: emptyTab(),
             commits: emptyTab(),
           }));
+          staleFromCacheTabsRef.current.delete('branches');
+          staleFromCacheTabsRef.current.delete('commits');
           doDetect({ preserveUi: true, force: true });
-          fetchTab('branches', 1, true, { preserveUi: true });
-          fetchTab('commits', 1, true, { preserveUi: true });
+          fetchTab('branches', 1, true);
+          fetchTab('commits', 1, true);
           forceRefreshSharedChangesForCheckout(
             ws,
             requestProjectDir,
             generation ?? undefined,
             scopeToSessionRoot ? sessionId ?? undefined : undefined,
+            serverId,
           );
         }
         return;
@@ -954,6 +1054,7 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
         // Stale response check — projectDir must match
         if (!responseMatchesProject(m.projectDir)) return;
         if (isBranchScopedRequestStale(meta)) return;
+        staleFromCacheTabsRef.current.delete(tabKey);
         setTabs(prev => {
           const existing = prev[tabKey];
           const isLoadMore = m.page > 1;

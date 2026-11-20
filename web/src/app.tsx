@@ -179,7 +179,9 @@ import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDelive
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
-import { useSharedGitChangesCount, requestSharedChangesCount } from './git-status-store.js';
+import { useSharedGitChangesCount, requestSharedChangesCount, clearSharedChangesCache } from './git-status-store.js';
+import { clearFileBrowserCache } from './file-browser-cache.js';
+import { clearRepoPageCache } from './repo-page-cache.js';
 import {
   applyFilePreviewRequestUpdate,
   normalizePreviewViewMode,
@@ -200,7 +202,7 @@ import type { TrailingAskQuestion } from './find-pending-question.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
 import { buildRepoCallbackTargetOptions } from './repo-callback-prefs.js';
-import { ingestSessionRepoContext } from './session-repo-context-store.js';
+import { ingestSessionRepoContext, clearSessionRepoContexts } from './session-repo-context-store.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
@@ -1141,6 +1143,13 @@ function InternalMainApp() {
     manualStoppedMainSessionsRef.current.clear();
     setDiscussions([]);
     setRepoContexts(new Map());
+    repoContextsByServerRef.current.clear();
+    repoContextsOwnerServerIdRef.current = null;
+    lastKnownSidebarScopeByServerRef.current.clear();
+    clearFileBrowserCache();
+    clearRepoPageCache();
+    clearSharedChangesCache();
+    clearSessionRepoContexts();
     if (preserveSharedRoute) {
       initialHashStateRef.current = sharedRoute;
       initialSharedTabRestoreRef.current = sharedRestoreMarker;
@@ -3128,6 +3137,9 @@ function InternalMainApp() {
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
+  const repoContextsByServerRef = useRef<Map<string, Map<string, any>>>(new Map());
+  const repoContextsOwnerServerIdRef = useRef<string | null>(selectedServerId);
+  const lastKnownSidebarScopeByServerRef = useRef<Map<string, { activeSession: string; projectDir: string }>>(new Map());
 
   // ── Settings / Admin ────────────────────────────────────────────────────────
   const [showSettingsPage, setShowSettingsPage] = useState(false);
@@ -5925,9 +5937,15 @@ function InternalMainApp() {
           // Normalize shape: repo.detected wraps in { context }, detect_response spreads at top level.
           const context = (msg as any).context ?? msg;
           const normalized = { ...context, context, projectDir: dir };
+          const ownerServerId = selectedServerIdRef.current;
+          repoContextsOwnerServerIdRef.current = ownerServerId;
           setRepoContexts((prev) => {
             const next = new Map(prev);
             next.set(dir, normalized);
+            if (ownerServerId) {
+              repoContextsByServerRef.current.delete(ownerServerId);
+              repoContextsByServerRef.current.set(ownerServerId, next);
+            }
             return next;
           });
           const sessionIds = new Set<string>();
@@ -5948,14 +5966,14 @@ function InternalMainApp() {
             }
           }
           if (sessionIds.size === 0) {
-            ingestSessionRepoContext({ projectDir: dir, context });
+            ingestSessionRepoContext({ projectDir: dir, serverId: ownerServerId, context });
           } else {
             for (const sessionId of sessionIds) {
-              ingestSessionRepoContext({ sessionId, projectDir: dir, context });
+              ingestSessionRepoContext({ sessionId, projectDir: dir, serverId: ownerServerId, context });
               if (dir !== FS_SESSION_ROOT_PATH) {
-                ingestSessionRepoContext({ sessionId, projectDir: FS_SESSION_ROOT_PATH, context });
+                ingestSessionRepoContext({ sessionId, projectDir: FS_SESSION_ROOT_PATH, serverId: ownerServerId, context });
               } else if (activeSessionObj?.projectDir) {
-                ingestSessionRepoContext({ sessionId, projectDir: activeSessionObj.projectDir, context });
+                ingestSessionRepoContext({ sessionId, projectDir: activeSessionObj.projectDir, serverId: ownerServerId, context });
               }
             }
           }
@@ -5974,9 +5992,15 @@ function InternalMainApp() {
             : error === 'cli_error' ? 'cli_error'
             : null;
           if (status) {
+            const ownerServerId = selectedServerIdRef.current;
+            repoContextsOwnerServerIdRef.current = ownerServerId;
             setRepoContexts((prev) => {
               const next = new Map(prev);
               next.set(dir, { status, context: { status }, projectDir: dir });
+              if (ownerServerId) {
+                repoContextsByServerRef.current.delete(ownerServerId);
+                repoContextsByServerRef.current.set(ownerServerId, next);
+              }
               return next;
             });
           }
@@ -6726,6 +6750,13 @@ function InternalMainApp() {
     setSharedEntriesError(null);
     setDiscussions([]);
     setRepoContexts(new Map());
+    repoContextsByServerRef.current.clear();
+    repoContextsOwnerServerIdRef.current = null;
+    lastKnownSidebarScopeByServerRef.current.clear();
+    clearFileBrowserCache();
+    clearRepoPageCache();
+    clearSharedChangesCache();
+    clearSessionRepoContexts();
     setManualDashboard(false);
     setAutoEnteringRecent(false);
   }, [auth?.baseUrl, nativeServerUrl, setActiveSession]);
@@ -6799,8 +6830,24 @@ function InternalMainApp() {
     setConnected(false);
     setConnecting(true);
     setLatencyMs(null);
+    const prevOwnerServerId = repoContextsOwnerServerIdRef.current ?? selectedServerIdRef.current;
+    if (prevOwnerServerId && repoContextsRef.current.size > 0) {
+      repoContextsByServerRef.current.delete(prevOwnerServerId);
+      repoContextsByServerRef.current.set(prevOwnerServerId, new Map(repoContextsRef.current));
+      while (repoContextsByServerRef.current.size > 20) {
+        const oldestKey = repoContextsByServerRef.current.keys().next().value;
+        if (oldestKey === undefined) break;
+        repoContextsByServerRef.current.delete(oldestKey);
+      }
+    }
     setDiscussions([]);
-    setRepoContexts(new Map());
+    const restoredRepoContexts = nextServerId ? repoContextsByServerRef.current.get(nextServerId) : undefined;
+    if (restoredRepoContexts && nextServerId) {
+      repoContextsByServerRef.current.delete(nextServerId);
+      repoContextsByServerRef.current.set(nextServerId, restoredRepoContexts);
+    }
+    setRepoContexts(restoredRepoContexts ? new Map(restoredRepoContexts) : new Map());
+    repoContextsOwnerServerIdRef.current = nextServerId ?? null;
     setManagedShares([]);
   }, [resetServerScopedOverlaysAndTargets, setActiveSession]);
 
@@ -7074,7 +7121,7 @@ function InternalMainApp() {
       if (ownedServer) {
         const switchingServers = ownedServer.id !== selectedServerIdRef.current;
         if (switchingServers) {
-          resetServerScopedStateForSwitch();
+          resetServerScopedStateForSwitch(ownedServer.id);
         } else if (selectedShareTarget !== null) {
           resetServerScopedOverlaysAndTargets();
         }
@@ -8659,6 +8706,12 @@ function InternalMainApp() {
 
   const renderSidebarPinnedPanels = (onAfterPreview?: () => void) => {
     const sessionsLoading = !sessionsLoaded && Boolean(selectedServerId);
+    const isTabShareScope = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
+    const cachedSidebarScope = (!isTabShareScope && sessionsLoading && selectedServerId)
+      ? lastKnownSidebarScopeByServerRef.current.get(selectedServerId)
+      : undefined;
+    const sidebarActiveSession = activeSession ?? cachedSidebarScope?.activeSession ?? null;
+    const sidebarProjectDir = activeSessionInfo?.projectDir ?? cachedSidebarScope?.projectDir;
     const sharedCtx: PanelRenderContext = {
       ws: wsRef.current,
       connected,
@@ -8673,8 +8726,8 @@ function InternalMainApp() {
       onOpenLocalWebPreview: openLocalWebPreviewFromChat,
       onCloudDocClick: openCloudDocPreview,
       onPreviewStateChange: handlePreviewStateChange,
-      activeSession,
-      activeProjectDir: activeSessionInfo?.projectDir,
+      activeSession: sidebarActiveSession,
+      activeProjectDir: sidebarProjectDir,
       sessionsLoading,
       sharedAccessRole,
       shareTargetKind: selectedShareTarget?.kind ?? null,
@@ -8711,6 +8764,23 @@ function InternalMainApp() {
     ));
   };
 
+  // Remember the last hydrated sidebar scope per owned server so switching back
+  // renders cached FileBrowser/RepoPage immediately instead of flashing loading.
+  useEffect(() => {
+    if (!sessionsLoaded || !selectedServerId || selectedShareTarget) return;
+    if (!activeSession || !activeSessionInfo?.projectDir) return;
+    lastKnownSidebarScopeByServerRef.current.delete(selectedServerId);
+    lastKnownSidebarScopeByServerRef.current.set(selectedServerId, {
+      activeSession,
+      projectDir: activeSessionInfo.projectDir,
+    });
+    while (lastKnownSidebarScopeByServerRef.current.size > 20) {
+      const oldestKey = lastKnownSidebarScopeByServerRef.current.keys().next().value;
+      if (oldestKey === undefined) break;
+      lastKnownSidebarScopeByServerRef.current.delete(oldestKey);
+    }
+  }, [sessionsLoaded, selectedServerId, selectedShareTarget, activeSession, activeSessionInfo?.projectDir]);
+
   // Auto-pin file browser to sidebar on first session activation.
   // Respects user preference: once they have any pinned panels saved, don't interfere.
   const autoPinnedRef = useRef(false);
@@ -8732,7 +8802,11 @@ function InternalMainApp() {
   // Uses useSharedGitChangesCount — sends lightweight summaryOnly requests when
   // no FileBrowser list consumer is open, and shares/reuses the cache with
   // FileBrowser and SubSessionWindow when paths match.
-  const gitChangesCount = useSharedGitChangesCount(wsRef.current, activeSessionInfo?.projectDir ?? null);
+  const cachedBadgeScope = (!selectedShareTarget && !sessionsLoaded && selectedServerId)
+    ? lastKnownSidebarScopeByServerRef.current.get(selectedServerId)
+    : undefined;
+  const badgeProjectDir = activeSessionInfo?.projectDir ?? cachedBadgeScope?.projectDir ?? null;
+  const gitChangesCount = useSharedGitChangesCount(wsRef.current, badgeProjectDir, { serverId: selectedServerId });
 
   // Nudge the shared cache when the agent finishes a tool call or goes idle,
   // so the badge reflects new/modified files without waiting for the 30s poll.
@@ -8745,7 +8819,7 @@ function InternalMainApp() {
       if (msg.type !== 'timeline.event') return;
       const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
       if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
-        requestSharedChangesCount(ws, dir);
+        requestSharedChangesCount(ws, dir, false, undefined, selectedServerIdRef.current);
       }
     });
     return () => { unsub(); };

@@ -16,6 +16,8 @@ import {
   subscribeSharedChangesStatus,
   useSharedGitChangesCount,
   getSharedChangesKey,
+  clearSharedChangesCache,
+  SHARED_CHANGES_MAX_ENTRIES,
   __resetSharedChangesForTests,
   SHARED_CHANGES_INFLIGHT_TIMEOUT_MS,
   type ChangeFile,
@@ -359,5 +361,88 @@ describe('git-status-store — refresh resilience', () => {
 
   it('exposes useSharedGitChangesCount helper', () => {
     expect(typeof useSharedGitChangesCount).toBe('function');
+  });
+
+  it('preserves cached files/meta across WsClient instances by serverId, enforces bounded LRU, and clears cleanly', () => {
+    const first = makeFakeWs();
+    const key1 = getSharedChangesKey(first.ws, '/srv/shared-path', 'srv-1');
+    const listener1 = vi.fn();
+    const unsub1 = subscribeSharedChanges(key1, listener1);
+    requestSharedChanges(first.ws, '/srv/shared-path', false, undefined, 'srv-1');
+    first.emit({
+      type: 'fs.git_status_response',
+      requestId: 'req-1',
+      path: '/srv/shared-path',
+      resolvedPath: '/srv/shared-path',
+      status: 'ok',
+      files: [{ path: '/srv/shared-path/a.ts', code: 'M' }],
+      totalCount: 1,
+      truncated: false,
+    } as ServerMessage);
+    expect(listener1).toHaveBeenLastCalledWith([{ path: '/srv/shared-path/a.ts', code: 'M' }]);
+    unsub1();
+
+    // New WsClient for same serverId + repoPath receives cached list immediately
+    const second = makeFakeWs();
+    const key1Rebound = getSharedChangesKey(second.ws, '/srv/shared-path', 'srv-1');
+    expect(key1Rebound).toBe(key1);
+    const listener2 = vi.fn();
+    const unsub2 = subscribeSharedChanges(key1Rebound, listener2);
+    expect(listener2).toHaveBeenCalledWith([{ path: '/srv/shared-path/a.ts', code: 'M' }]);
+    unsub2();
+
+    // Different serverId with identical path is strictly isolated
+    const otherServerKey = getSharedChangesKey(second.ws, '/srv/shared-path', 'srv-2');
+    expect(otherServerKey).not.toBe(key1);
+    const otherListener = vi.fn();
+    const unsubOther = subscribeSharedChanges(otherServerKey, otherListener);
+    expect(otherListener).not.toHaveBeenCalled();
+    unsubOther();
+
+    // Tab-share sessionName scopes are strictly isolated
+    const shareAKey = getSharedChangesKey(second.ws, FS_SESSION_ROOT_PATH, 'srv-1', 'sess-a');
+    const shareBKey = getSharedChangesKey(second.ws, FS_SESSION_ROOT_PATH, 'srv-1', 'sess-b');
+    expect(shareAKey).not.toBe(shareBKey);
+
+    // Bounded LRU eviction beyond SHARED_CHANGES_MAX_ENTRIES (30)
+    for (let i = 0; i <= SHARED_CHANGES_MAX_ENTRIES + 2; i++) {
+      const repoPath = `/srv/lru-${i}`;
+      const k = getSharedChangesKey(second.ws, repoPath, 'srv-lru');
+      const unsub = subscribeSharedChanges(k, vi.fn());
+      requestSharedChanges(second.ws, repoPath, true, undefined, 'srv-lru');
+      second.emit({
+        type: 'fs.git_status_response',
+        requestId: `req-${i + 1}`,
+        path: repoPath,
+        resolvedPath: repoPath,
+        status: 'ok',
+        files: [{ path: `${repoPath}/f.ts`, code: 'A' }],
+        totalCount: 1,
+        truncated: false,
+      } as ServerMessage);
+      unsub();
+    }
+    const oldestEvicted = vi.fn();
+    const unsubOldest = subscribeSharedChanges(getSharedChangesKey(second.ws, '/srv/lru-0', 'srv-lru'), oldestEvicted);
+    expect(oldestEvicted).not.toHaveBeenCalled();
+    unsubOldest();
+
+    const newestRetained = vi.fn();
+    const unsubNewest = subscribeSharedChanges(
+      getSharedChangesKey(second.ws, `/srv/lru-${SHARED_CHANGES_MAX_ENTRIES + 2}`, 'srv-lru'),
+      newestRetained,
+    );
+    expect(newestRetained).toHaveBeenCalledTimes(1);
+    unsubNewest();
+
+    // clearSharedChangesCache wipes all cached entries
+    clearSharedChangesCache();
+    const afterClear = vi.fn();
+    const unsubAfterClear = subscribeSharedChanges(
+      getSharedChangesKey(second.ws, `/srv/lru-${SHARED_CHANGES_MAX_ENTRIES + 2}`, 'srv-lru'),
+      afterClear,
+    );
+    expect(afterClear).not.toHaveBeenCalled();
+    unsubAfterClear();
   });
 });

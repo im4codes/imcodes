@@ -93,6 +93,7 @@ vi.mock('../src/git-status-store.js', () => ({
   useSharedGitChangesCount: () => 0,
   requestSharedChangesCount: vi.fn(),
   subscribeSharedChangesMeta: vi.fn(() => () => {}),
+  clearSharedChangesCache: vi.fn(),
 }));
 
 vi.mock('../src/components/QuickInputPanel.js', () => ({

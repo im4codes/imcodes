@@ -58,19 +58,27 @@ export const SHARED_CHANGES_TTL_MS = 5_000;
 /** If no response comes back for this long, treat the in-flight request as
  *  lost and fire a new one instead of queuing behind it forever. */
 export const SHARED_CHANGES_INFLIGHT_TIMEOUT_MS = 15_000;
+export const SHARED_CHANGES_MAX_ENTRIES = 30;
 
 const sharedChangesByKey = new Map<string, SharedChangesEntry>();
-const sharedChangesRequestMeta = new Map<string, { key: string; summaryOnly: boolean }>();
+const sharedChangesRequestMeta = new Map<string, { key: string; summaryOnly: boolean; serverId?: string | null }>();
 const checkoutRefreshGenerationByKey = new Map<string, number>();
 const wsIds = new WeakMap<WsClient, number>();
 const wsBridges = new WeakMap<WsClient, () => void>();
 let nextWsId = 1;
 
-/** Test-only reset. WeakMaps can't be cleared, but they're GC'd with the ws. */
-export function __resetSharedChangesForTests(): void {
+export function clearSharedChangesCache(): void {
+  for (const entry of sharedChangesByKey.values()) {
+    entry.ws = null;
+  }
   sharedChangesByKey.clear();
   sharedChangesRequestMeta.clear();
   checkoutRefreshGenerationByKey.clear();
+}
+
+/** Test-only reset. WeakMaps can't be cleared, but they're GC'd with the ws. */
+export function __resetSharedChangesForTests(): void {
+  clearSharedChangesCache();
   nextWsId = 1;
 }
 
@@ -83,34 +91,68 @@ function getWsId(ws: WsClient): number {
   return id;
 }
 
-export function getSharedChangesKey(ws: WsClient, repoPath: string): string {
-  return `${getWsId(ws)}::${repoPath}`;
+export function getSharedChangesKey(
+  ws: WsClient,
+  repoPath: string,
+  serverId?: string | null,
+  sessionName?: string | null,
+): string {
+  const trimmedServer = serverId?.trim();
+  const trimmedSession = sessionName?.trim();
+  const wsOrServer = trimmedServer ? `srv:${trimmedServer}` : `${getWsId(ws)}`;
+  return trimmedSession
+    ? `${wsOrServer}::ses:${trimmedSession}::${repoPath}`
+    : `${wsOrServer}::${repoPath}`;
+}
+
+function touchSharedEntry(key: string, entry: SharedChangesEntry): void {
+  sharedChangesByKey.delete(key);
+  sharedChangesByKey.set(key, entry);
+}
+
+function evictUnusedSharedEntries(): void {
+  if (sharedChangesByKey.size <= SHARED_CHANGES_MAX_ENTRIES) return;
+  for (const [candidateKey, candidate] of sharedChangesByKey) {
+    if (sharedChangesByKey.size <= SHARED_CHANGES_MAX_ENTRIES) break;
+    if (
+      candidate.listeners.size === 0
+      && candidate.metaListeners.size === 0
+      && candidate.statusListeners.size === 0
+      && !candidate.inFlightRequestId
+    ) {
+      candidate.ws = null;
+      sharedChangesByKey.delete(candidateKey);
+    }
+  }
 }
 
 function getEntry(key: string): SharedChangesEntry {
   let entry = sharedChangesByKey.get(key);
-  if (!entry) {
-    entry = {
-      repoPath: '',
-      files: [],
-      totalCount: 0,
-      truncated: false,
-      updatedAt: 0,
-      fullFilesUpdatedAt: 0,
-      summaryUpdatedAt: 0,
-      inFlightRequestId: null,
-      inFlightSummaryOnly: false,
-      inFlightStartedAt: 0,
-      queued: false,
-      queuedNeedsFull: false,
-      listeners: new Set(),
-      metaListeners: new Set(),
-      status: 'idle',
-      statusListeners: new Set(),
-      ws: null,
-    };
-    sharedChangesByKey.set(key, entry);
+  if (entry) {
+    touchSharedEntry(key, entry);
+    return entry;
   }
+  entry = {
+    repoPath: '',
+    files: [],
+    totalCount: 0,
+    truncated: false,
+    updatedAt: 0,
+    fullFilesUpdatedAt: 0,
+    summaryUpdatedAt: 0,
+    inFlightRequestId: null,
+    inFlightSummaryOnly: false,
+    inFlightStartedAt: 0,
+    queued: false,
+    queuedNeedsFull: false,
+    listeners: new Set(),
+    metaListeners: new Set(),
+    status: 'idle',
+    statusListeners: new Set(),
+    ws: null,
+  };
+  sharedChangesByKey.set(key, entry);
+  evictUnusedSharedEntries();
   return entry;
 }
 
@@ -121,7 +163,15 @@ function cleanupEntryIfUnused(key: string, entry: SharedChangesEntry): void {
     && entry.statusListeners.size === 0
     && !entry.inFlightRequestId
   ) {
-    sharedChangesByKey.delete(key);
+    entry.ws = null;
+    entry.queued = false;
+    entry.queuedNeedsFull = false;
+    if (entry.fullFilesUpdatedAt === 0 && entry.summaryUpdatedAt === 0) {
+      sharedChangesByKey.delete(key);
+    } else {
+      touchSharedEntry(key, entry);
+      evictUnusedSharedEntries();
+    }
   }
 }
 
@@ -213,8 +263,9 @@ function requestSharedChangesInternal(
   force: boolean,
   sessionName: string | undefined,
   preferSummaryOnly: boolean,
+  serverId?: string | null,
 ): void {
-  const key = getSharedChangesKey(ws, repoPath);
+  const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
   const entry = getEntry(key);
   entry.ws = ws;
   entry.repoPath = repoPath;
@@ -278,17 +329,29 @@ function requestSharedChangesInternal(
   entry.inFlightStartedAt = Date.now();
   entry.queued = false;
   entry.queuedNeedsFull = false;
-  sharedChangesRequestMeta.set(requestId, { key, summaryOnly });
+  sharedChangesRequestMeta.set(requestId, { key, summaryOnly, serverId });
   publishStatus(key, 'refreshing');
 }
 
-export function requestSharedChanges(ws: WsClient, repoPath: string, force = false, sessionName?: string): void {
-  requestSharedChangesInternal(ws, repoPath, force, sessionName, false);
+export function requestSharedChanges(
+  ws: WsClient,
+  repoPath: string,
+  force = false,
+  sessionName?: string,
+  serverId?: string | null,
+): void {
+  requestSharedChangesInternal(ws, repoPath, force, sessionName, false, serverId);
 }
 
 /** Lightweight count-only refresh used by folder badges when no list consumer is active. */
-export function requestSharedChangesCount(ws: WsClient, repoPath: string, force = false, sessionName?: string): void {
-  requestSharedChangesInternal(ws, repoPath, force, sessionName, true);
+export function requestSharedChangesCount(
+  ws: WsClient,
+  repoPath: string,
+  force = false,
+  sessionName?: string,
+  serverId?: string | null,
+): void {
+  requestSharedChangesInternal(ws, repoPath, force, sessionName, true, serverId);
 }
 
 export function forceRefreshSharedChangesForCheckout(
@@ -296,13 +359,14 @@ export function forceRefreshSharedChangesForCheckout(
   repoPath: string,
   repoGeneration?: number,
   sessionName?: string,
+  serverId?: string | null,
 ): void {
-  const key = getSharedChangesKey(ws, repoPath);
+  const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
   if (typeof repoGeneration === 'number' && Number.isFinite(repoGeneration)) {
     if (checkoutRefreshGenerationByKey.get(key) === repoGeneration) return;
     checkoutRefreshGenerationByKey.set(key, repoGeneration);
   }
-  requestSharedChanges(ws, repoPath, true, sessionName);
+  requestSharedChanges(ws, repoPath, true, sessionName, serverId);
 }
 
 export function settleSharedChangesRequest(
@@ -348,8 +412,9 @@ export function settleSharedChangesRequest(
     const needsFull = entry.queuedNeedsFull || entry.listeners.size > 0;
     entry.queued = false;
     entry.queuedNeedsFull = false;
-    requestSharedChangesInternal(entry.ws, entry.repoPath, true, entry.sessionName, !needsFull);
+    requestSharedChangesInternal(entry.ws, entry.repoPath, true, entry.sessionName, !needsFull, requestMeta.serverId);
   }
+  cleanupEntryIfUnused(key, entry);
   return true;
 }
 
@@ -397,25 +462,33 @@ function ensureWsBridge(ws: WsClient): void {
 export function useSharedGitChanges(
   ws: WsClient | null,
   repoPath: string | null | undefined,
-  opts: { pollMs?: number } = {},
+  opts: { pollMs?: number; serverId?: string | null; sessionName?: string | null } = {},
 ): ChangeFile[] {
-  const { pollMs = 30_000 } = opts;
-  const [files, setFiles] = useState<ChangeFile[]>([]);
+  const { pollMs = 30_000, serverId = null, sessionName = null } = opts;
+  const [files, setFiles] = useState<ChangeFile[]>(() => {
+    if (!ws || !repoPath) return [];
+    const entry = sharedChangesByKey.get(getSharedChangesKey(ws, repoPath, serverId, sessionName));
+    return entry && entry.fullFilesUpdatedAt > 0 ? entry.files : [];
+  });
 
   useEffect(() => {
     if (!ws || !repoPath) {
       setFiles([]);
       return;
     }
-    const key = getSharedChangesKey(ws, repoPath);
+    const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
+    const cached = sharedChangesByKey.get(key);
+    if (!cached || cached.fullFilesUpdatedAt === 0) {
+      setFiles([]);
+    }
     const unsub = subscribeSharedChanges(key, (next) => setFiles(next));
-    requestSharedChanges(ws, repoPath);
-    const timer = pollMs > 0 ? setInterval(() => requestSharedChanges(ws, repoPath), pollMs) : null;
+    requestSharedChanges(ws, repoPath, false, sessionName ?? undefined, serverId);
+    const timer = pollMs > 0 ? setInterval(() => requestSharedChanges(ws, repoPath, false, sessionName ?? undefined, serverId), pollMs) : null;
     return () => {
       unsub();
       if (timer) clearInterval(timer);
     };
-  }, [ws, repoPath, pollMs]);
+  }, [ws, repoPath, pollMs, serverId, sessionName]);
 
   return files;
 }
@@ -424,25 +497,33 @@ export function useSharedGitChanges(
 export function useSharedGitChangesCount(
   ws: WsClient | null,
   repoPath: string | null | undefined,
-  opts: { pollMs?: number } = {},
+  opts: { pollMs?: number; serverId?: string | null; sessionName?: string | null } = {},
 ): number {
-  const { pollMs = 30_000 } = opts;
-  const [totalCount, setTotalCount] = useState(0);
+  const { pollMs = 30_000, serverId = null, sessionName = null } = opts;
+  const [totalCount, setTotalCount] = useState<number>(() => {
+    if (!ws || !repoPath) return 0;
+    const entry = sharedChangesByKey.get(getSharedChangesKey(ws, repoPath, serverId, sessionName));
+    return entry && (entry.summaryUpdatedAt > 0 || entry.fullFilesUpdatedAt > 0) ? entry.totalCount : 0;
+  });
 
   useEffect(() => {
     if (!ws || !repoPath) {
       setTotalCount(0);
       return;
     }
-    const key = getSharedChangesKey(ws, repoPath);
+    const key = getSharedChangesKey(ws, repoPath, serverId, sessionName);
+    const cached = sharedChangesByKey.get(key);
+    if (!cached || (cached.summaryUpdatedAt === 0 && cached.fullFilesUpdatedAt === 0)) {
+      setTotalCount(0);
+    }
     const unsub = subscribeSharedChangesMeta(key, (meta) => setTotalCount(meta.totalCount));
-    requestSharedChangesCount(ws, repoPath);
-    const timer = pollMs > 0 ? setInterval(() => requestSharedChangesCount(ws, repoPath), pollMs) : null;
+    requestSharedChangesCount(ws, repoPath, false, sessionName ?? undefined, serverId);
+    const timer = pollMs > 0 ? setInterval(() => requestSharedChangesCount(ws, repoPath, false, sessionName ?? undefined, serverId), pollMs) : null;
     return () => {
       unsub();
       if (timer) clearInterval(timer);
     };
-  }, [ws, repoPath, pollMs]);
+  }, [ws, repoPath, pollMs, serverId, sessionName]);
 
   return totalCount;
 }

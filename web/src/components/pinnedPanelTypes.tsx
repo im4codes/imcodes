@@ -48,7 +48,7 @@ function resolveFollowCurrentProjectScope(panel: PinnedPanel, ctx: PanelRenderCo
   activeSession: string | undefined;
 } {
   const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
-  if (!isTabShare && ctx.sessionsLoading) {
+  if (!isTabShare && ctx.sessionsLoading && !nonEmptyString(ctx.activeProjectDir)) {
     return { loading: true, isTabShare, projectDir: undefined, activeSession: undefined };
   }
   const allowCaptured = canUseCapturedPanelProps(panel, ctx);

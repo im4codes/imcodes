@@ -555,4 +555,35 @@ describe('pinned panel server-switch isolation', () => {
     expect(cronManagerProps).toHaveLength(1);
     expect(cronManagerProps[0]).toMatchObject({ projectName: 'srv2_app', activeSession: 'deck_srv2_brain' });
   });
+
+  it('renders follow-current FileBrowser and RepoPage immediately when cached scope is provided during sessionsLoading, without trusting legacy panel props', () => {
+    const followPins = [
+      { id: 'fb', type: 'filebrowser', props: { serverId: 'srv-old', sessionName: 'deck_old', projectDir: '/wrong/dir' } },
+      { id: 'rp', type: 'repopage', props: { serverId: 'srv-old', sessionName: 'deck_old', projectDir: '/wrong/dir' } },
+    ];
+
+    for (const panel of followPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-1',
+        activeSession: 'deck_srv1_brain',
+        activeProjectDir: '/srv1/cached-proj',
+        sessions: [],
+        sessionsLoading: true,
+      }))}</>);
+    }
+
+    expect(fileBrowserProps).toHaveLength(1);
+    expect(fileBrowserProps[0]).toMatchObject({
+      serverId: 'srv-1',
+      initialPath: '/srv1/cached-proj',
+      sessionName: 'deck_srv1_brain',
+    });
+    expect(repoPageProps).toHaveLength(1);
+    expect(repoPageProps[0]).toMatchObject({
+      serverId: 'srv-1',
+      projectDir: '/srv1/cached-proj',
+      sessionId: 'deck_srv1_brain',
+    });
+  });
 });

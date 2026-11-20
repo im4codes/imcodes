@@ -58,6 +58,13 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 
 import { FileBrowser, CHANGES_RENDER_BATCH_SIZE, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
+import {
+  clearFileBrowserCache,
+  FILE_BROWSER_CACHE_MAX_ENTRIES,
+  getFileBrowserCache,
+  makeFileBrowserCacheKey,
+  setFileBrowserCache,
+} from '../../src/file-browser-cache.js';
 import { NodeGroupsNavContext } from '../../src/components/node-groups-nav.js';
 import * as api from '../../src/api.js';
 import { resolvePreviewPath } from '../../src/components/ChatView.js';
@@ -73,6 +80,8 @@ import {
 // Cleanup DOM/timers after each test
 afterEach(() => {
   __resetDownloadTransfersForTests();
+  __resetFileBrowserSharedChangesForTests();
+  clearFileBrowserCache();
   vi.useRealTimers();
   cleanup();
 });
@@ -4123,5 +4132,234 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
     expect(document.querySelectorAll('.fb-changes-item')).toHaveLength(CHANGES_RENDER_BATCH_SIZE);
     expect(screen.getByTestId('fb-changes-load-more')).toBeTruthy();
     expect(screen.queryByTestId('fb-changes-truncated-notice')).toBeNull();
+  });
+});
+
+describe('FileBrowser — memory LRU cache, isolation, and expanded subtree preservation', () => {
+  function makeTrackedWs() {
+    const handlers = new Set<(msg: ServerMessage) => void>();
+    let seq = 0;
+    const reqByPath = new Map<string, string>();
+    const fsListDir = vi.fn((path: string) => {
+      const id = `ls-${++seq}`;
+      reqByPath.set(path, id);
+      return id;
+    });
+    const fsGitStatus = vi.fn((_path: string, _opts?: any) => `git-${++seq}`);
+    const ws = {
+      connected: true,
+      onMessage: vi.fn((cb: (msg: ServerMessage) => void) => {
+        handlers.add(cb);
+        return () => { handlers.delete(cb); };
+      }),
+      fsListDir,
+      fsGitStatus,
+      fsReadFile: vi.fn(() => `read-${++seq}`),
+      fsGitDiff: vi.fn(() => `diff-${++seq}`),
+      forgetOwnedDataRequest: vi.fn(),
+    } as unknown as WsClient;
+    const emit = (msg: ServerMessage) => {
+      for (const cb of [...handlers]) cb(msg);
+    };
+    return { ws, fsListDir, fsGitStatus, reqByPath, emit };
+  }
+
+  it('hydrates tree, expanded subdirs, modified badges, and changes immediately on remount and refreshes silently without collapsing', async () => {
+    const first = makeTrackedWs();
+    const { unmount } = render(
+      <FileBrowser
+        ws={first.ws}
+        serverId="srv-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        changesRootPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      first.emit({
+        type: 'fs.ls_response',
+        requestId: first.reqByPath.get('/srv/proj'),
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        entries: [
+          { name: 'src', isDir: true },
+          { name: 'README.md', isDir: false },
+        ],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('src')).toBeTruthy();
+    expect(screen.getByText('README.md')).toBeTruthy();
+
+    // Expand src/
+    await act(async () => {
+      fireEvent.click(screen.getByText('src'));
+    });
+    await act(async () => {
+      first.emit({
+        type: 'fs.ls_response',
+        requestId: first.reqByPath.get('/srv/proj/src'),
+        path: '/srv/proj/src',
+        resolvedPath: '/srv/proj/src',
+        status: 'ok',
+        entries: [{ name: 'index.ts', isDir: false }],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('index.ts')).toBeTruthy();
+
+    // Switch to Changes tab briefly so git-status-store caches changes list & count, then switch back to Files
+    await act(async () => {
+      fireEvent.click(screen.getByText('file_browser.tab_changes'));
+    });
+    const sharedChangesReqId = first.fsGitStatus.mock.results[first.fsGitStatus.mock.results.length - 1]?.value;
+    await act(async () => {
+      first.emit({
+        type: 'fs.git_status_response',
+        requestId: sharedChangesReqId,
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        files: [{ path: '/srv/proj/src/index.ts', code: 'M' }],
+        totalCount: 1,
+        truncated: false,
+      } as unknown as ServerMessage);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('file_browser.tab_files'));
+    });
+    expect(document.querySelector('.fb-panel-tab-badge')?.textContent).toBe('1');
+    unmount();
+
+    // Remount with a fresh WS for same serverId + path: renders immediately without waiting
+    const second = makeTrackedWs();
+    render(
+      <FileBrowser
+        ws={second.ws}
+        serverId="srv-1"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        changesRootPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(screen.getAllByText('src').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('index.ts')).toBeTruthy();
+    expect(document.querySelector('.fb-panel-tab-badge')?.textContent).toBe('1');
+    // Background refresh requested for both root and expanded subdir
+    expect(second.fsListDir).toHaveBeenCalledWith('/srv/proj', true, false);
+    expect(second.fsListDir).toHaveBeenCalledWith('/srv/proj/src', true, false);
+
+    // Fresh root response arrives: must preserve expanded src/ children without collapsing!
+    await act(async () => {
+      second.emit({
+        type: 'fs.ls_response',
+        requestId: second.reqByPath.get('/srv/proj'),
+        path: '/srv/proj',
+        resolvedPath: '/srv/proj',
+        status: 'ok',
+        entries: [
+          { name: 'src', isDir: true },
+          { name: 'README.md', isDir: false },
+          { name: 'NEW_FILE.ts', isDir: false },
+        ],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('NEW_FILE.ts')).toBeTruthy();
+    expect(screen.getByText('index.ts')).toBeTruthy();
+
+    // Strict isolation: different serverId with same initialPath sees empty initial tree
+    cleanup();
+    const otherServer = makeTrackedWs();
+    render(
+      <FileBrowser
+        ws={otherServer.ws}
+        serverId="srv-2"
+        mode="file-multi"
+        layout="panel"
+        initialPath="/srv/proj"
+        changesRootPath="/srv/proj"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('index.ts')).toBeNull();
+    expect(screen.queryByText('NEW_FILE.ts')).toBeNull();
+    expect(document.querySelector('.fb-panel-tab-badge')).toBeNull();
+  });
+
+  it('isolates tab-share caches by sessionName and evicts oldest LRU entry beyond capacity', async () => {
+    const shareA = makeTrackedWs();
+    const { unmount } = render(
+      <FileBrowser
+        ws={shareA.ws}
+        serverId="srv-1"
+        sessionName="sess-a"
+        scopeToSessionRoot
+        mode="file-multi"
+        layout="panel"
+        initialPath="__session_root__"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      shareA.emit({
+        type: 'fs.ls_response',
+        requestId: shareA.reqByPath.get('__session_root__'),
+        path: '__session_root__',
+        resolvedPath: '__session_root__',
+        status: 'ok',
+        entries: [{ name: 'share-a-secret.txt', isDir: false }],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('share-a-secret.txt')).toBeTruthy();
+    unmount();
+
+    // Different sessionName with same __session_root__ must NOT see sess-a cache
+    const shareB = makeTrackedWs();
+    render(
+      <FileBrowser
+        ws={shareB.ws}
+        serverId="srv-1"
+        sessionName="sess-b"
+        scopeToSessionRoot
+        mode="file-multi"
+        layout="panel"
+        initialPath="__session_root__"
+        onConfirm={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('share-a-secret.txt')).toBeNull();
+
+    // Bounded LRU eviction beyond FILE_BROWSER_CACHE_MAX_ENTRIES (20)
+    for (let i = 0; i <= FILE_BROWSER_CACHE_MAX_ENTRIES; i++) {
+      const k = makeFileBrowserCacheKey({
+        serverId: 'srv-lru',
+        startPath: `/proj/${i}`,
+        includeFiles: true,
+        showHidden: true,
+      });
+      setFileBrowserCache(k, {
+        data: [{ id: `/proj/${i}`, name: `p${i}`, isDir: true, children: [] }],
+        currentLabel: `/proj/${i}`,
+        expandedPaths: [`/proj/${i}`],
+        modifiedFiles: [],
+        updatedAt: Date.now(),
+      });
+    }
+    expect(getFileBrowserCache(makeFileBrowserCacheKey({
+      serverId: 'srv-lru',
+      startPath: '/proj/0',
+      includeFiles: true,
+      showHidden: true,
+    }))).toBeNull();
+    expect(getFileBrowserCache(makeFileBrowserCacheKey({
+      serverId: 'srv-lru',
+      startPath: `/proj/${FILE_BROWSER_CACHE_MAX_ENTRIES}`,
+      includeFiles: true,
+      showHidden: true,
+    }))).not.toBeNull();
   });
 });

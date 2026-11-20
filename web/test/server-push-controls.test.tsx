@@ -316,6 +316,7 @@ vi.mock('../src/git-status-store.js', () => ({
   requestSharedChanges: vi.fn(),
   requestSharedChangesCount: vi.fn(),
   subscribeSharedChangesMeta: vi.fn(() => () => {}),
+  clearSharedChangesCache: vi.fn(),
 }));
 vi.mock('../src/watch-bridge.js', () => ({
   onWatchCommand: () => Promise.resolve(() => {}),

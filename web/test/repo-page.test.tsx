@@ -88,6 +88,13 @@ vi.mock('react-i18next', () => ({
 import { RepoPage } from '../src/pages/RepoPage.js';
 import type { WsClient, ServerMessage } from '../src/ws-client.js';
 import { __resetSessionRepoContextStoreForTests } from '../src/session-repo-context-store.js';
+import {
+  clearRepoPageCache,
+  getRepoPageCache,
+  makeRepoPageCacheKey,
+  REPO_PAGE_CACHE_MAX_ENTRIES,
+  setRepoPageCache,
+} from '../src/repo-page-cache.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 
 // ── WsClient mock factory ─────────────────────────────────────────────────
@@ -303,6 +310,7 @@ describe('RepoPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     __resetSessionRepoContextStoreForTests();
+    clearRepoPageCache();
   });
 
   // 1. Renders overview header
@@ -1198,5 +1206,137 @@ describe('RepoPage', () => {
     // No provider badge or owner/repo should be rendered since info is null
     expect(screen.queryByText('github')).toBeNull();
     expect(screen.queryByText('gitlab')).toBeNull();
+  });
+
+  it('hydrates cached context, tabs, expanded details, and callbacks on remount and refreshes silently', async () => {
+    const first = makeWs();
+    const { unmount } = render(
+      <RepoPage ws={first.ws} serverId="srv-1" projectDir={PROJECT_DIR} onBack={vi.fn()} />,
+    );
+
+    await act(async () => {
+      first.respondDetect({
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets', currentBranch: 'main', defaultBranch: 'main' },
+        repoGeneration: 1,
+      });
+    });
+    await act(async () => {
+      first.respondTab('repo.issues_response', PROJECT_DIR, [
+        { number: 42, title: 'Cached Issue', state: 'open', author: 'alice', labels: [], updatedAt: Date.now(), url: '' },
+      ]);
+      first.respondTab('repo.actions_response', PROJECT_DIR, []);
+      first.emit({
+        type: 'repo.callback_status_response',
+        projectDir: PROJECT_DIR,
+        enabled: true,
+        checking: false,
+        callbacks: [
+          {
+            callbackId: 'cb-1',
+            projectDir: PROJECT_DIR,
+            title: 'CI Check',
+            status: 'completed',
+            targetSession: 'deck_brain',
+            createdAt: 1000,
+            updatedAt: 2000,
+          },
+        ],
+      } as unknown as ServerMessage);
+    });
+    expect(screen.getByText('Cached Issue')).toBeDefined();
+    unmount();
+
+    // Remount with a fresh WS: cached content renders immediately without Loading...
+    const second = makeWs();
+    render(
+      <RepoPage ws={second.ws} serverId="srv-1" projectDir={PROJECT_DIR} onBack={vi.fn()} />,
+    );
+    expect(screen.getByText('Cached Issue')).toBeDefined();
+    expect(screen.queryByText('Loading...')).toBeNull();
+    expect(second.repoDetect).toHaveBeenCalledTimes(1);
+    expect(second.repoListIssues).toHaveBeenCalledTimes(1);
+
+    // Different serverId with identical projectDir must NOT leak srv-1 cache
+    cleanup();
+    const otherServer = makeWs();
+    render(
+      <RepoPage ws={otherServer.ws} serverId="srv-2" projectDir={PROJECT_DIR} onBack={vi.fn()} />,
+    );
+    expect(screen.queryByText('Cached Issue')).toBeNull();
+    expect(screen.getAllByText('Loading...').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('isolates tab-share scope and clears cache cleanly on clearRepoPageCache()', async () => {
+    const shared = makeWs();
+    const { unmount } = render(
+      <RepoPage
+        ws={shared.ws}
+        serverId="srv-1"
+        sessionId="sess-share-a"
+        scopeToSessionRoot
+        projectDir={FS_SESSION_ROOT_PATH}
+        onBack={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      shared.respondDetect({ status: 'ok', info: { platform: 'github', owner: 'acme', repo: 'shared-a' } });
+    });
+    await act(async () => {
+      shared.respondTab('repo.issues_response', FS_SESSION_ROOT_PATH, [
+        { number: 7, title: 'Share A Issue', state: 'open', author: 'bob', labels: [], updatedAt: Date.now(), url: '' },
+      ]);
+    });
+    expect(screen.getByText('Share A Issue')).toBeDefined();
+    unmount();
+
+    // Another shared session with the same FS_SESSION_ROOT_PATH must not see Share A cache
+    const otherShare = makeWs();
+    render(
+      <RepoPage
+        ws={otherShare.ws}
+        serverId="srv-1"
+        sessionId="sess-share-b"
+        scopeToSessionRoot
+        projectDir={FS_SESSION_ROOT_PATH}
+        onBack={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('Share A Issue')).toBeNull();
+    expect(screen.getAllByText('Loading...').length).toBeGreaterThanOrEqual(1);
+    cleanup();
+
+    // Clearing cache drops Share A entry too
+    clearRepoPageCache();
+    const afterClear = makeWs();
+    render(
+      <RepoPage
+        ws={afterClear.ws}
+        serverId="srv-1"
+        sessionId="sess-share-a"
+        scopeToSessionRoot
+        projectDir={FS_SESSION_ROOT_PATH}
+        onBack={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('Share A Issue')).toBeNull();
+    expect(screen.getAllByText('Loading...').length).toBeGreaterThanOrEqual(1);
+
+    // Bounded LRU eviction beyond REPO_PAGE_CACHE_MAX_ENTRIES (24)
+    const emptyTab = { items: [], page: 1, hasMore: false, loading: false, refreshing: false, error: null, fetched: false };
+    for (let i = 0; i <= REPO_PAGE_CACHE_MAX_ENTRIES; i++) {
+      const k = makeRepoPageCacheKey({ serverId: 'srv-lru', projectDir: `/repo/${i}` });
+      setRepoPageCache(k, {
+        context: { status: 'ok', owner: 'acme', repo: `r-${i}` },
+        tabs: { issues: { ...emptyTab }, prs: { ...emptyTab }, branches: { ...emptyTab }, commits: { ...emptyTab }, actions: { ...emptyTab } },
+        expandedKey: null,
+        detailData: [],
+        callbacks: [],
+        callbackRuntimeEnabled: false,
+        updatedAt: Date.now(),
+      });
+    }
+    expect(getRepoPageCache(makeRepoPageCacheKey({ serverId: 'srv-lru', projectDir: '/repo/0' }))).toBeNull();
+    expect(getRepoPageCache(makeRepoPageCacheKey({ serverId: 'srv-lru', projectDir: `/repo/${REPO_PAGE_CACHE_MAX_ENTRIES}` }))).not.toBeNull();
   });
 });

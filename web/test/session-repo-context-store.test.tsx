@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
 import {
   __resetSessionRepoContextStoreForTests,
+  clearSessionRepoContexts,
   getSessionRepoContext,
   ingestSessionRepoContext,
 } from '../src/session-repo-context-store.js';
@@ -186,6 +187,28 @@ describe('session repo context store and summary', () => {
 
     // Lookup with FS_SESSION_ROOT_PATH should fall back to the session's concrete path
     expect(getSessionRepoContext('deck_proj_other', FS_SESSION_ROOT_PATH)?.currentBranch).toBe('feature/concrete-branch');
+  });
+
+  it('isolates context across serverId for identical projectDir and clears via clearSessionRepoContexts()', () => {
+    ingestSessionRepoContext({
+      sessionId: 'deck_brain',
+      projectDir: '/repo/shared',
+      serverId: 'srv-1',
+      context: { status: 'ok', info: { currentBranch: 'branch-srv1' }, repoGeneration: 10 },
+    });
+    ingestSessionRepoContext({
+      sessionId: 'deck_brain',
+      projectDir: '/repo/shared',
+      serverId: 'srv-2',
+      context: { status: 'ok', info: { currentBranch: 'branch-srv2' }, repoGeneration: 2 },
+    });
+
+    expect(getSessionRepoContext('deck_brain', '/repo/shared', 'srv-1')?.currentBranch).toBe('branch-srv1');
+    expect(getSessionRepoContext('deck_brain', '/repo/shared', 'srv-2')?.currentBranch).toBe('branch-srv2');
+
+    clearSessionRepoContexts();
+    expect(getSessionRepoContext('deck_brain', '/repo/shared', 'srv-1')).toBeNull();
+    expect(getSessionRepoContext('deck_brain', '/repo/shared', 'srv-2')).toBeNull();
   });
 });
 
