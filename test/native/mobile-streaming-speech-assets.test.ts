@@ -355,6 +355,16 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(android).toContain('engine.setVoice(');
     expect(android).toContain('AudioFocusRequest.Builder');
     expect(android).toContain(`notifyListeners("${STREAMING_SPEECH_TTS_STATE_EVENT}"`);
+    const iosInfoPlist = await readFile(new URL('../../web/ios/App/App/Info.plist', import.meta.url), 'utf8');
+    expect(iosInfoPlist).toContain('<string>remote-notification</string>');
+    expect(iosInfoPlist).toContain('<string>audio</string>');
+    expect(ios).toContain('enum TtsBackgroundLifecyclePolicy');
+    expect(ios).toContain('allowWarmHold && audioSessionActive');
+    const didEnterBackgroundBody = ios.slice(ios.indexOf('func didEnterBackground('), ios.indexOf('func engineConfigurationChanged('));
+    expect(didEnterBackgroundBody).not.toContain('stopTtsPlaybackOnMain');
+    const androidOnPauseBody = android.slice(android.indexOf('protected void handleOnPause()'), android.indexOf('protected void handleOnDestroy()'));
+    expect(androidOnPauseBody).toContain('stopCapture(false);');
+    expect(androidOnPauseBody).not.toContain('stopTtsInternal');
 
     expect(qwenAsr).toContain('modelId: String = "aufklarer/Qwen3-ASR-0.6B-MLX-4bit"');
     expect(qwenAsr).toContain('case .small: return .small');
@@ -536,7 +546,7 @@ public class AudioFocusRequest {
   public static class Builder {
     public Builder(int gain){}
     public Builder setAudioAttributes(AudioAttributes attrs){ return this; }
-    public Builder setOnAudioFocusChangeListener(AudioManager.OnAudioFocusChangeListener l){ return this; }
+    public Builder setOnAudioFocusChangeListener(AudioManager.OnAudioFocusChangeListener l){ AudioManager.lastFocusListener = l; return this; }
     public AudioFocusRequest build(){ return new AudioFocusRequest(); }
   }
 }`,
@@ -544,10 +554,11 @@ public class AudioFocusRequest {
 public class AudioManager {
   public static final int AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK = 3, AUDIOFOCUS_REQUEST_GRANTED = 1, STREAM_MUSIC = 3, AUDIOFOCUS_LOSS = -1, AUDIOFOCUS_LOSS_TRANSIENT = -2;
   public static volatile int focusRequests = 0, focusAbandons = 0;
-  public static void reset(){ focusRequests = 0; focusAbandons = 0; }
+  public static volatile OnAudioFocusChangeListener lastFocusListener = null;
+  public static void reset(){ focusRequests = 0; focusAbandons = 0; lastFocusListener = null; }
   public interface OnAudioFocusChangeListener { void onAudioFocusChange(int focusChange); }
   public int requestAudioFocus(AudioFocusRequest req){ focusRequests++; return AUDIOFOCUS_REQUEST_GRANTED; }
-  public int requestAudioFocus(OnAudioFocusChangeListener l, int stream, int hint){ focusRequests++; return AUDIOFOCUS_REQUEST_GRANTED; }
+  public int requestAudioFocus(OnAudioFocusChangeListener l, int stream, int hint){ lastFocusListener = l; focusRequests++; return AUDIOFOCUS_REQUEST_GRANTED; }
   public int abandonAudioFocusRequest(AudioFocusRequest req){ focusAbandons++; return AUDIOFOCUS_REQUEST_GRANTED; }
   public int abandonAudioFocus(OnAudioFocusChangeListener l){ focusAbandons++; return AUDIOFOCUS_REQUEST_GRANTED; }
 }`,
@@ -1110,7 +1121,7 @@ public class OrtEnvironment {
 }`,
       'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin; import com.imcodes.speech.SpeechGainTest; import com.getcapacitor.PluginCall; import ai.onnxruntime.*; import android.media.AudioRecord; import android.media.MediaRecorder; import android.media.audiofx.AutomaticGainControl; import java.util.concurrent.*;
 public class Harness {
- static class Subject extends StreamingSpeechPlugin {void destroy(){handleOnDestroy();}}
+ static class Subject extends StreamingSpeechPlugin {void pause(){handleOnPause();} void destroy(){handleOnDestroy();}}
  static void await(CountDownLatch l)throws Exception{if(!l.await(4,TimeUnit.SECONDS))throw new AssertionError("timeout");}
  static void check(boolean b,Object message){if(!b)throw new AssertionError(message);}
  static long finals(Subject p){return p.events.stream().filter(x->x.contains("isFinal=true")).count();}
@@ -1239,9 +1250,36 @@ public class Harness {
   ttsPlugin.isSpeaking(isSpeakingCall);
   await(isSpeakingCall.done);
   check(isSpeakingCall.value.contains("speaking=true"), isSpeakingCall.value);
+  // Pausing / locking screen must NOT interrupt active TTS or abandon audio focus prematurely.
+  ttsPlugin.pause();
+  check(android.speech.tts.TextToSpeech.stopCalls == 0, "handleOnPause must not stop active TTS");
+  check(android.media.AudioManager.focusAbandons == 0, "handleOnPause must not abandon TTS audio focus");
+  PluginCall isSpeakingAfterPause = new PluginCall();
+  ttsPlugin.isSpeaking(isSpeakingAfterPause);
+  await(isSpeakingAfterPause.done);
+  check(isSpeakingAfterPause.value.contains("speaking=true"), "TTS must keep speaking across handleOnPause: " + isSpeakingAfterPause.value);
   android.speech.tts.TextToSpeech.latest.emitDone(android.speech.tts.TextToSpeech.utteranceIds.get(android.speech.tts.TextToSpeech.utteranceIds.size() - 1));
   check(android.media.AudioManager.focusAbandons == 1, "expected AudioFocus abandon on done");
   check(ttsPlugin.events.stream().anyMatch(x -> x.contains("status=started")) && ttsPlugin.events.stream().anyMatch(x -> x.contains("status=stopped")), ttsPlugin.events);
+
+  // Audio focus loss must still stop active TTS and abandon audio focus.
+  PluginCall focusSpeak = new PluginCall().setArg("text", "Interrupt me on call").setArg("lang", "en-US");
+  ttsPlugin.speak(focusSpeak);
+  await(focusSpeak.done);
+  android.speech.tts.TextToSpeech.latest.emitStart(android.speech.tts.TextToSpeech.utteranceIds.get(android.speech.tts.TextToSpeech.utteranceIds.size() - 1));
+  check(android.media.AudioManager.lastFocusListener != null, "expected focus listener registration");
+  android.media.AudioManager.lastFocusListener.onAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS);
+  check(android.speech.tts.TextToSpeech.stopCalls >= 1, "AUDIOFOCUS_LOSS must stop TTS");
+  check(android.media.AudioManager.focusAbandons == 2, "AUDIOFOCUS_LOSS must abandon audio focus");
+
+  // handleOnPause must still immediately stop active STT capture.
+  AudioRecord.chunksPerStart = 100;
+  PluginCall sttBeforePause = new PluginCall();
+  ttsPlugin.start(sttBeforePause);
+  await(sttBeforePause.done);
+  check(AudioRecord.latest.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING, "expected active recording before pause");
+  ttsPlugin.pause();
+  check(AudioRecord.latest.getRecordingState() == 0, "handleOnPause must stop STT capture");
 
   // Primary-subtag offline fallback & null/throwing getVoices fallback to setLanguage
   android.speech.tts.TextToSpeech.lastVoice = null;
@@ -2382,6 +2420,39 @@ print("TTS_VOICE_SELECTOR:PASS")
 `);
   await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
   expect((await runNativeOrThrow(binFile, [], { timeout: 30000 })).trim()).toBe('TTS_VOICE_SELECTOR:PASS');
+}, 180_000);
+
+it.skipIf(!swiftCompiler)('executes the actual Swift TtsBackgroundLifecyclePolicy across backgrounding, active TTS, capture races, and interruptions', async () => {
+  await setup();
+  const plugin = await readFile(new URL('../../web/plugins/streaming-speech/ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', import.meta.url), 'utf8');
+  const start = plugin.indexOf('enum TtsLifecycleEvent: Equatable {');
+  const end = plugin.indexOf('/// Pure Foundation/Dispatch session coordinator');
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const policySlice = plugin.slice(start, end);
+  const swiftFile = join(root, 'TtsBackgroundLifecycleTest.swift');
+  const binFile = join(root, 'tts-background-lifecycle-test');
+  await writeFile(swiftFile, `import Foundation
+${policySlice}
+func require(_ cond: @autoclosure () -> Bool, _ msg: String) {
+    if !cond() { FileHandle.standardError.write(Data(("FAIL: " + msg + "\\n").utf8)); exit(1) }
+}
+for event in [TtsLifecycleEvent.willResignActive, .didEnterBackground] {
+    let ttsOnly = TtsBackgroundLifecyclePolicy.decide(event: event, isTtsActive: true, hasActiveCapture: false)
+    require(ttsOnly == TtsLifecycleDecision(shouldStopCapture: false, shouldStopTts: false, shouldDeactivateAudioSession: false, shouldScheduleWarmHold: false), "active TTS must not stop TTS or touch AVAudioSession on \\(event)")
+    let ttsWithCaptureRace = TtsBackgroundLifecyclePolicy.decide(event: event, isTtsActive: true, hasActiveCapture: true)
+    require(ttsWithCaptureRace == TtsLifecycleDecision(shouldStopCapture: true, shouldStopTts: false, shouldDeactivateAudioSession: false, shouldScheduleWarmHold: false), "active TTS with capture race must stop capture without deactivating or warm-hold on \\(event)")
+    let idleOrStt = TtsBackgroundLifecyclePolicy.decide(event: event, isTtsActive: false, hasActiveCapture: true)
+    require(idleOrStt == TtsLifecycleDecision(shouldStopCapture: true, shouldStopTts: false, shouldDeactivateAudioSession: true, shouldScheduleWarmHold: false), "inactive TTS must stop capture and deactivate session on \\(event)")
+}
+let interruptionBegan = TtsBackgroundLifecyclePolicy.decide(event: .audioSessionInterruptionBegan, isTtsActive: true, hasActiveCapture: false)
+require(interruptionBegan == TtsLifecycleDecision(shouldStopCapture: true, shouldStopTts: true, shouldDeactivateAudioSession: true, shouldScheduleWarmHold: false), "AVAudioSession interruption began must stop TTS and deactivate session")
+let interruptionEnded = TtsBackgroundLifecyclePolicy.decide(event: .audioSessionInterruptionEnded, isTtsActive: true, hasActiveCapture: false)
+require(interruptionEnded == TtsLifecycleDecision(shouldStopCapture: false, shouldStopTts: false, shouldDeactivateAudioSession: false, shouldScheduleWarmHold: false), "AVAudioSession interruption ended must be a no-op")
+print("TTS_BACKGROUND_LIFECYCLE:PASS")
+`);
+  await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
+  expect((await runNativeOrThrow(binFile, [], { timeout: 30000 })).trim()).toBe('TTS_BACKGROUND_LIFECYCLE:PASS');
 }, 180_000);
 
 const swiftWindowCases = `

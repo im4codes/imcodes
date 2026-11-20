@@ -105,6 +105,64 @@ enum TtsVoiceSelector {
     }
 }
 
+// MARK: - Background TTS Lifecycle Policy
+
+enum TtsLifecycleEvent: Equatable {
+    case willResignActive
+    case didEnterBackground
+    case audioSessionInterruptionBegan
+    case audioSessionInterruptionEnded
+}
+
+struct TtsLifecycleDecision: Equatable {
+    let shouldStopCapture: Bool
+    let shouldStopTts: Bool
+    let shouldDeactivateAudioSession: Bool
+    let shouldScheduleWarmHold: Bool
+}
+
+enum TtsBackgroundLifecyclePolicy {
+    static func decide(
+        event: TtsLifecycleEvent,
+        isTtsActive: Bool,
+        hasActiveCapture: Bool
+    ) -> TtsLifecycleDecision {
+        switch event {
+        case .audioSessionInterruptionEnded:
+            return TtsLifecycleDecision(
+                shouldStopCapture: false,
+                shouldStopTts: false,
+                shouldDeactivateAudioSession: false,
+                shouldScheduleWarmHold: false
+            )
+        case .audioSessionInterruptionBegan:
+            return TtsLifecycleDecision(
+                shouldStopCapture: true,
+                shouldStopTts: isTtsActive,
+                shouldDeactivateAudioSession: true,
+                shouldScheduleWarmHold: false
+            )
+        case .willResignActive, .didEnterBackground:
+            if isTtsActive {
+                // Keep AVAudioSession alive for the active utterance; stop capture only if a race left STT open,
+                // never deactivating or scheduling warm-hold while TTS is speaking.
+                return TtsLifecycleDecision(
+                    shouldStopCapture: hasActiveCapture,
+                    shouldStopTts: false,
+                    shouldDeactivateAudioSession: false,
+                    shouldScheduleWarmHold: false
+                )
+            }
+            return TtsLifecycleDecision(
+                shouldStopCapture: true,
+                shouldStopTts: false,
+                shouldDeactivateAudioSession: true,
+                shouldScheduleWarmHold: false
+            )
+        }
+    }
+}
+
 /// Pure Foundation/Dispatch session coordinator managing capture ownership, foreground Metal
 /// gating, serial inbox draining, and lossless background/stop error reporting.
 final class SpeechCoordinator {
@@ -722,6 +780,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     private var ttsUtteranceId: UInt64 = 0
     private var ttsUtteranceMap: [ObjectIdentifier: UInt64] = [:]
     private var ttsSpeaking = false
+    private var ttsPreparingPlayback = false
+    private var isTtsPlaybackActiveOnMain: Bool {
+        ttsSpeaking || ttsPreparingPlayback || (speechSynthesizer?.isSpeaking ?? false)
+    }
     // Resident recognizer model kept across sessions on worker; Metal state is guarded for foreground use.
     private var recognizer: SpeechRecognizer?
 
@@ -1015,7 +1077,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         }
     }
 
-    private func stopCaptureAudioOnAudioQueue(deactivateSession: Bool, forceTeardown: Bool) {
+    private func stopCaptureAudioOnAudioQueue(deactivateSession: Bool, forceTeardown: Bool, allowWarmHold: Bool = true) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
         cancelWarmHoldDeactivationOnAudioQueue()
         if tapInstalled {
@@ -1040,7 +1102,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                 try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
                 audioSessionActive = false
             }
-        } else if audioSessionActive {
+        } else if allowWarmHold && audioSessionActive {
             scheduleWarmHoldDeactivationOnAudioQueue()
         }
     }
@@ -1195,32 +1257,59 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         }
     }
 
+    private func handleLifecycleEventOnMain(_ event: TtsLifecycleEvent) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let hasActiveCapture = (activeMainOwner != 0 || startingCall != nil || coordinator.hasActiveCapture)
+        let decision = TtsBackgroundLifecyclePolicy.decide(
+            event: event,
+            isTtsActive: isTtsPlaybackActiveOnMain,
+            hasActiveCapture: hasActiveCapture
+        )
+        if decision.shouldStopCapture {
+            if startingCall != nil {
+                let message = event == .didEnterBackground
+                    ? "Speech requires a foreground app"
+                    : "Offline speech interrupted during startup"
+                settleStartingCall(errorMessage: message)
+            }
+            endCapture(
+                nil,
+                deactivateSession: decision.shouldDeactivateAudioSession,
+                allowWarmHold: decision.shouldScheduleWarmHold
+            )
+        }
+        if decision.shouldStopTts {
+            stopTtsPlaybackOnMain(deactivateSession: decision.shouldDeactivateAudioSession)
+        }
+    }
+
     @objc private func interrupted(_ notification: Notification) {
+        let event: TtsLifecycleEvent
         if notification.name == UIApplication.willResignActiveNotification {
             coordinator.setBackgrounded(true)
-        } else if notification.name == AVAudioSession.interruptionNotification,
-           let value = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-           value != AVAudioSession.InterruptionType.began.rawValue { return }
+            event = .willResignActive
+        } else if notification.name == AVAudioSession.interruptionNotification {
+            guard let value = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: value) else { return }
+            switch type {
+            case .began:
+                event = .audioSessionInterruptionBegan
+            case .ended:
+                event = .audioSessionInterruptionEnded
+            @unknown default:
+                return
+            }
+        } else {
+            return
+        }
         DispatchQueue.main.async {
-            if self.startingCall != nil {
-                self.settleStartingCall(errorMessage: "Offline speech interrupted during startup")
-            }
-            self.endCapture(nil)
-            if self.ttsSpeaking || (self.speechSynthesizer?.isSpeaking ?? false) {
-                self.stopTtsPlaybackOnMain(deactivateSession: true)
-            }
+            self.handleLifecycleEventOnMain(event)
         }
     }
     @objc private func didEnterBackground(_ notification: Notification) {
         coordinator.setBackgrounded(true)
         DispatchQueue.main.async {
-            if self.startingCall != nil {
-                self.settleStartingCall(errorMessage: "Speech requires a foreground app")
-            }
-            self.endCapture(nil)
-            if self.ttsSpeaking || (self.speechSynthesizer?.isSpeaking ?? false) {
-                self.stopTtsPlaybackOnMain(deactivateSession: true)
-            }
+            self.handleLifecycleEventOnMain(.didEnterBackground)
         }
     }
     @objc private func engineConfigurationChanged(_ notification: Notification) {
@@ -1261,7 +1350,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     }
     // Capture teardown dispatches CoreAudio/AVAudioSession work off main onto audioQueue;
     // serial decoder flush still precedes .stopped emission and stop() resolution.
-    private func endCapture(_ call: CAPPluginCall?, deactivateSession: Bool = true, forceTeardown: Bool = false) {
+    private func endCapture(_ call: CAPPluginCall?, deactivateSession: Bool = true, forceTeardown: Bool = false, allowWarmHold: Bool = true) {
         cancelWarmupWatchdog()
         activeMainOwner = 0
         coordinator.endCapture(
@@ -1273,7 +1362,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             },
             stopAudio: {
                 audioQueue.async { [weak self] in
-                    self?.stopCaptureAudioOnAudioQueue(deactivateSession: deactivateSession, forceTeardown: forceTeardown)
+                    self?.stopCaptureAudioOnAudioQueue(deactivateSession: deactivateSession, forceTeardown: forceTeardown, allowWarmHold: allowWarmHold)
                 }
             }
         )
@@ -1377,6 +1466,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         ttsUtteranceId &+= 1
         ttsUtteranceMap.removeAll()
         let wasSpeaking = ttsSpeaking || (speechSynthesizer?.isSpeaking ?? false)
+        ttsPreparingPlayback = false
         ttsSpeaking = false
         if let synth = speechSynthesizer, synth.isSpeaking || synth.isPaused {
             synth.stopSpeaking(at: .immediate)
@@ -1413,6 +1503,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             }
             self.ttsUtteranceId &+= 1
             let requestId = self.ttsUtteranceId
+            self.ttsPreparingPlayback = true
             if let synth = self.speechSynthesizer, synth.isSpeaking || synth.isPaused {
                 synth.stopSpeaking(at: .immediate)
             }
@@ -1424,6 +1515,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                 } catch {
                     DispatchQueue.main.async {
                         if self.ttsUtteranceId == requestId {
+                            self.ttsPreparingPlayback = false
                             self.ttsSpeaking = false
                             self.notifyListeners("ttsState", data: ["status": "error", "message": error.localizedDescription])
                             call.reject("System TTS audio session failed", nil, error)
@@ -1448,6 +1540,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                         utterance.voice = voice
                     }
                     self.ttsUtteranceMap[ObjectIdentifier(utterance)] = requestId
+                    self.ttsPreparingPlayback = false
                     self.ttsSpeaking = true
                     synth.speak(utterance)
                     call.resolve()

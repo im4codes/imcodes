@@ -1143,7 +1143,6 @@ public class StreamingSpeechPlugin extends Plugin {
     @Override
     protected void handleOnPause() {
         stopCapture(false);
-        stopTtsInternal(true);
     }
 
     @Override
