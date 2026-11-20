@@ -13,6 +13,7 @@ import { resolveServerMemberAccessOrShareDeny, resolveHttpShareAccessForCoveredS
 import { issueOwnerMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import type { Database } from '../db/client.js';
 import {
+  CRON_EXACT_SEND_CAPABILITY_V1,
   CRON_MSG,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
@@ -63,10 +64,31 @@ async function prepareCronAction(env: Env, job: DbCronJob): Promise<PreparedCron
   return { ok: true, action: registered.action };
 }
 
-type CronProvenanceRow = { creator_user_id: string; shared: boolean };
-type CronProvenanceLookup =
+export type CronProvenanceRow = { creator_user_id: string; shared: boolean };
+export type CronProvenanceLookup =
   | { ok: true; row: CronProvenanceRow | null }
   | { ok: false; error: unknown };
+
+export type DispatchJobNowOptions = {
+  verifiedProvenance?: CronProvenanceLookup;
+  skipReload?: boolean;
+};
+
+type CronJobWithJoinedProvenance = DbCronJob & {
+  prov_present?: boolean;
+  prov_creator_user_id?: string | null;
+  prov_shared?: boolean | null;
+};
+
+function extractJoinedProvenance(row: CronJobWithJoinedProvenance): CronProvenanceLookup | undefined {
+  if (row.prov_present === undefined) return undefined;
+  return {
+    ok: true,
+    row: row.prov_present && row.prov_creator_user_id
+      ? { creator_user_id: row.prov_creator_user_id, shared: Boolean(row.prov_shared) }
+      : null,
+  };
+}
 
 async function readCronJobProvenance(db: Database, jobId: string): Promise<CronProvenanceLookup> {
   if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') {
@@ -87,23 +109,29 @@ type SharedCronDispatchAuth =
   | { authorized: false }
   | { authorized: true; exactTargetSessionName?: string };
 
-async function readJobAndProvenanceSnapshot(
+export async function readCronJobAndProvenanceLocked(
   db: Database,
-  fallbackJob: DbCronJob,
-): Promise<{ job: DbCronJob; provenance: CronProvenanceLookup }> {
-  const readPair = async (conn: Database): Promise<{ job: DbCronJob; provenance: CronProvenanceLookup }> => {
-    const freshRow = typeof (conn as { queryOne?: unknown })?.queryOne === 'function'
-      ? await conn.queryOne<DbCronJob>('SELECT * FROM cron_jobs WHERE id = $1', [fallbackJob.id])
-      : null;
-    const job = freshRow ?? fallbackJob;
-    const provenance = await readCronJobProvenance(conn, job.id);
-    return { job, provenance };
-  };
-  const txFn = (db as Database & { transaction?: (fn: (tx: Database) => Promise<unknown>) => Promise<unknown> }).transaction;
-  if (typeof txFn === 'function') {
-    return await txFn.call(db, async (tx) => readPair(tx)) as { job: DbCronJob; provenance: CronProvenanceLookup };
+  jobId: string,
+): Promise<{ job: DbCronJob | null; provenance: CronProvenanceLookup }> {
+  if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') {
+    return { job: null, provenance: { ok: true, row: null } };
   }
-  return readPair(db);
+  const row = await db.queryOne<CronJobWithJoinedProvenance>(
+    `SELECT j.*,
+            p.creator_user_id AS prov_creator_user_id,
+            p.shared AS prov_shared,
+            (p.job_id IS NOT NULL) AS prov_present
+       FROM cron_jobs j
+       LEFT JOIN cron_job_provenance p ON p.job_id = j.id
+      WHERE j.id = $1
+      FOR UPDATE OF j`,
+    [jobId],
+  );
+  if (!row) return { job: null, provenance: { ok: true, row: null } };
+  const joinedProv = extractJoinedProvenance(row);
+  if (joinedProv) return { job: row, provenance: joinedProv };
+  const provenance = await readCronJobProvenance(db, row.id);
+  return { job: row, provenance };
 }
 
 async function verifySharedCronCreatorStillAuthorized(
@@ -293,10 +321,25 @@ async function issueCronOwnerAuthority(
 }
 
 /** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
-export async function dispatchJobNow(env: Env, passedJob: DbCronJob): Promise<void> {
-  const snapshot = await readJobAndProvenanceSnapshot(env.DB, passedJob);
-  const job = snapshot.job;
-  const provenance = snapshot.provenance;
+export async function dispatchJobNow(
+  env: Env,
+  passedJob: DbCronJob,
+  opts?: DispatchJobNowOptions,
+): Promise<void> {
+  let job = passedJob;
+  let provenance: CronProvenanceLookup;
+  if (opts?.skipReload && opts.verifiedProvenance) {
+    provenance = opts.verifiedProvenance;
+  } else if (typeof (env.DB as { queryOne?: unknown })?.queryOne === 'function') {
+    const loaded = await readCronJobAndProvenanceLocked(env.DB, passedJob.id);
+    if (!loaded.job) {
+      throw new Error('cron_not_found');
+    }
+    job = loaded.job;
+    provenance = loaded.provenance;
+  } else {
+    provenance = await readCronJobProvenance(env.DB, passedJob.id);
+  }
   if (!provenance.ok) {
     throw provenance.error instanceof Error ? provenance.error : new Error('cron_provenance_read_failed');
   }
@@ -321,8 +364,8 @@ export async function dispatchJobNow(env: Env, passedJob: DbCronJob): Promise<vo
     throw new Error('daemon_offline');
   }
   if (auth.exactTargetSessionName && action.type === 'send') {
-    const supportsExact = typeof (bridge as { supportsExactCronSend?: unknown }).supportsExactCronSend === 'function'
-      && (bridge as { supportsExactCronSend: () => boolean }).supportsExactCronSend();
+    const supportsExact = typeof (bridge as { hasDaemonCapability?: unknown }).hasDaemonCapability === 'function'
+      && (bridge as { hasDaemonCapability: (cap: string) => boolean }).hasDaemonCapability(CRON_EXACT_SEND_CAPABILITY_V1);
     if (!supportsExact) {
       await logExecution(env, randomHex(12), job.id, 'error', 'daemon_upgrade_required_exact_cron_send');
       throw new Error('daemon_upgrade_required_exact_cron_send');
@@ -374,15 +417,21 @@ async function claimDueJobs(
   env: Env,
   now: number,
 ): Promise<ClaimedCronJob[]> {
-  const selectDue = async (db: typeof env.DB): Promise<ClaimedCronJob[]> => (
-    db.query<DbCronJob & { previous_run_at?: number | null }>(
-      `SELECT *, last_run_at AS previous_run_at FROM cron_jobs
-       WHERE status = $2 AND next_run_at <= $1
-         AND (expires_at IS NULL OR expires_at >= $1)
-         AND ${activeUserExistsSql('cron_jobs.user_id')}
-       ORDER BY next_run_at ASC
-       LIMIT 50
-       FOR UPDATE SKIP LOCKED`,
+  const selectDue = async (db: typeof env.DB): Promise<Array<ClaimedCronJob & CronJobWithJoinedProvenance>> => (
+    db.query<ClaimedCronJob & CronJobWithJoinedProvenance>(
+      `SELECT j.*,
+              j.last_run_at AS previous_run_at,
+              p.creator_user_id AS prov_creator_user_id,
+              p.shared AS prov_shared,
+              (p.job_id IS NOT NULL) AS prov_present
+         FROM cron_jobs j
+         LEFT JOIN cron_job_provenance p ON p.job_id = j.id
+        WHERE j.status = $2 AND j.next_run_at <= $1
+          AND (j.expires_at IS NULL OR j.expires_at >= $1)
+          AND ${activeUserExistsSql('j.user_id')}
+        ORDER BY j.next_run_at ASC
+        LIMIT 50
+        FOR UPDATE OF j SKIP LOCKED`,
       [now, CRON_STATUS.ACTIVE],
     )
   );
@@ -398,7 +447,7 @@ async function claimDueJobs(
       const jobs = await selectDue(tx);
       const claimed: ClaimedCronJob[] = [];
       for (const job of jobs) {
-        const snapshotProvenance = await readCronJobProvenance(tx, job.id);
+        const snapshotProvenance = extractJoinedProvenance(job) ?? await readCronJobProvenance(tx, job.id);
         const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
         const result = await tx.execute(
           'UPDATE cron_jobs SET last_run_at = $1, next_run_at = $2 WHERE id = $3 AND status = $4 AND next_run_at <= $1',
@@ -450,10 +499,16 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
   }).transaction!;
   const now = Date.now();
   return transaction.call<typeof env.DB, [(tx: typeof env.DB) => Promise<ClaimedCronJob[]>], Promise<ClaimedCronJob[]>>(env.DB, async (tx) => {
-    const rows = await tx.query<ClaimedCronJob & { execution_detail?: string | null }>(
-      `SELECT j.*, e.id AS execution_id, e.detail AS execution_detail
+    const rows = await tx.query<ClaimedCronJob & CronJobWithJoinedProvenance & { execution_detail?: string | null }>(
+      `SELECT j.*,
+              e.id AS execution_id,
+              e.detail AS execution_detail,
+              p.creator_user_id AS prov_creator_user_id,
+              p.shared AS prov_shared,
+              (p.job_id IS NOT NULL) AS prov_present
          FROM cron_executions e
          JOIN cron_jobs j ON j.id = e.job_id
+         LEFT JOIN cron_job_provenance p ON p.job_id = j.id
         WHERE (e.status = 'pending_dispatch'
            OR (e.status = 'dispatching' AND e.created_at <= $1))
           AND ${activeUserExistsSql('j.user_id')}
@@ -464,7 +519,7 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
     );
     const claimed: ClaimedCronJob[] = [];
     for (const row of rows.filter((candidate) => typeof candidate.execution_id === 'string' && candidate.execution_id.length > 0)) {
-      const snapshotProvenance = await readCronJobProvenance(tx, row.id);
+      const snapshotProvenance = extractJoinedProvenance(row) ?? await readCronJobProvenance(tx, row.id);
       let detail: { previousRunAt?: number | null; nextRunAt?: number } = {};
       try {
         detail = row.execution_detail ? JSON.parse(row.execution_detail) as typeof detail : {};
@@ -555,8 +610,8 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         continue;
       }
       if (auth.exactTargetSessionName && action.type === 'send') {
-        const supportsExact = typeof (bridge as { supportsExactCronSend?: unknown }).supportsExactCronSend === 'function'
-          && (bridge as { supportsExactCronSend: () => boolean }).supportsExactCronSend();
+        const supportsExact = typeof (bridge as { hasDaemonCapability?: unknown }).hasDaemonCapability === 'function'
+          && (bridge as { hasDaemonCapability: (cap: string) => boolean }).hasDaemonCapability(CRON_EXACT_SEND_CAPABILITY_V1);
         if (!supportsExact) {
           logger.error({ jobId: job.id }, 'Daemon does not support exact scoped cron send; refusing dispatch');
           if (job.execution_id) {

@@ -1,3 +1,4 @@
+import { CRON_EXACT_SEND_CAPABILITY_V1 } from '../../shared/cron-types.js';
 import { R2_RELAY_CAPABILITY } from '../../shared/r2-relay.js';
 import { SESSION_INCOGNITO_CAPABILITY, SESSION_INCOGNITO_SERVER_READY } from '../../shared/session-incognito-types.js';
 import os from 'node:os';
@@ -331,6 +332,7 @@ const DAEMON_STATIC_CAPABILITIES = [
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   ASK_ANSWER_ACK_CAPABILITY_V1,
+  CRON_EXACT_SEND_CAPABILITY_V1,
 ] as const;
 
 export function directFileTransferDaemonCapabilities(available: boolean): readonly string[] {
@@ -654,7 +656,6 @@ export class ServerLink {
       serverId: this.serverId,
       token: this.token,
       daemonVersion: this.daemonVersion,
-      cronExactSend: true,
       [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
         DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
     });

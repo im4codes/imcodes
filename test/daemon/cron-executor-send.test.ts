@@ -460,4 +460,81 @@ describe('executeCronJob structured send actions', () => {
 
     __setCronExactSelfSenderForTests(null);
   });
+
+  it('preserves normal sibling and broadcast sends for whole-server crons even when targetSessionName is set without ownerMachineAuthority', async () => {
+    const { dispatchCronSend: realDispatchCronSend } = await import('../../src/daemon/send-tool.js');
+    const exactSelfSender = vi.fn(async () => 'sent' as const);
+    const dispatchMessage = vi.fn(async () => 'sent' as const);
+
+    const execSub = {
+      name: 'deck_sub_exec1',
+      agentType: 'codex-sdk',
+      state: 'idle',
+      projectName: 'myapp',
+      projectDir: '/home/user/myapp',
+      parentSession: 'deck_myapp_brain',
+    };
+    const w1 = {
+      name: 'deck_myapp_w1',
+      agentType: 'claude-code',
+      state: 'idle',
+      projectName: 'myapp',
+      projectDir: '/home/user/myapp',
+      role: 'w1',
+      label: 'Worker 1',
+    };
+    const w2 = {
+      name: 'deck_myapp_w2',
+      agentType: 'claude-code',
+      state: 'idle',
+      projectName: 'myapp',
+      projectDir: '/home/user/myapp',
+      role: 'w2',
+      label: 'Worker 2',
+    };
+    const sessions = [makeSession(), execSub, w1, w2];
+    (getSession as ReturnType<typeof vi.fn>).mockImplementation((n: string) => sessions.find((s) => s.name === n));
+    (listSessions as ReturnType<typeof vi.fn>).mockReturnValue(sessions);
+
+    __setCronExactSelfSenderForTests(exactSelfSender);
+    __setCronSendDispatcherForTests((input) => realDispatchCronSend(input, {
+      listSessions: () => listSessions() as any,
+      getSession: (n) => getSession(n) as any,
+      dispatchMessage,
+    }));
+
+    // 1) Whole-server cron with explicit execution targetSessionName & NO ownerMachineAuthority sends to another sibling
+    await executeCronJob({
+      ...makeSendMsg(),
+      executionId: 'exec-whole-srv-sibling',
+      targetSessionName: 'deck_sub_exec1',
+      action: { type: 'send', target: 'deck_myapp_w2', message: 'ping w2', onlyWhenIdle: false },
+    }, mockServerLink);
+
+    expect(exactSelfSender).not.toHaveBeenCalled();
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect((dispatchMessage.mock.calls[0] as any)?.[0]?.name).toBe('deck_myapp_w2');
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      executionId: 'exec-whole-srv-sibling',
+      status: 'dispatched',
+    }));
+
+    // 2) Whole-server cron with explicit targetSessionName & NO ownerMachineAuthority can still broadcast
+    dispatchMessage.mockClear();
+    await executeCronJob({
+      ...makeSendMsg(),
+      executionId: 'exec-whole-srv-bcast',
+      targetSessionName: 'deck_sub_exec1',
+      action: { type: 'send', target: 'brain', message: 'broadcast all', broadcast: true, onlyWhenIdle: false },
+    }, mockServerLink);
+
+    const deliveredTargets = dispatchMessage.mock.calls.map((c: any) => c[0].name).sort();
+    expect(deliveredTargets).toEqual(['deck_myapp_brain', 'deck_myapp_w1', 'deck_myapp_w2']);
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      executionId: 'exec-whole-srv-bcast',
+      status: 'dispatched',
+    }));
+
+    __setCronExactSelfSenderForTests(null);
+  });
 });

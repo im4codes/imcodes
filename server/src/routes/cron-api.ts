@@ -27,7 +27,7 @@ import {
 import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
 import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
-import { dispatchJobNow } from '../cron/job-dispatch.js';
+import { dispatchJobNow, readCronJobAndProvenanceLocked, type CronProvenanceLookup } from '../cron/job-dispatch.js';
 import { WsBridge } from '../ws/bridge.js';
 import { RESOURCE_TOPICS } from '../../../shared/resource-events.js';
 import { AUTHORIZATION_HEADER, CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
@@ -1209,31 +1209,68 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
   if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
+  if (!jobId) return c.json({ error: 'not_found' }, 404);
 
-  const job = await c.env.DB.queryOne<DbCronJob>(
+  const initialJob = await c.env.DB.queryOne<DbCronJob>(
     'SELECT * FROM cron_jobs WHERE id = $1',
     [jobId],
   );
-  if (!job) return c.json({ error: 'not_found' }, 404);
-  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
-  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!initialJob) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(initialJob.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, initialJob.server_id);
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const userId = authority.actorUserId;
   const pinnedSessionName = pinnedSessionForAuthority(authority);
 
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  if (!await isSharedCronMutationAllowed(c.env.DB, {
-    job,
-    sharedScope: access.scope.shared,
-    isParticipantDaemon: authority.kind === 'participant_daemon',
-    actingUserId: userId,
-  })) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-  }
+  type TriggerTxResult =
+    | { kind: 'ok'; job: DbCronJob; provenance: CronProvenanceLookup }
+    | { kind: 'not_found' }
+    | { kind: 'conflict' }
+    | { kind: 'forbidden'; reason: string };
+
+  const txResult: TriggerTxResult = await runCronWriteTx(c.env.DB, async (tx): Promise<TriggerTxResult> => {
+    const locked = await readCronJobAndProvenanceLocked(tx, jobId);
+    if (!locked.job || isWrongPodStickyServer(locked.job.server_id, routeServerId)) {
+      return { kind: 'not_found' };
+    }
+    if (!locked.provenance.ok) {
+      throw locked.provenance.error instanceof Error
+        ? locked.provenance.error
+        : new Error('cron_provenance_read_failed');
+    }
+    if (locked.job.server_id !== initialJob.server_id || locked.job.user_id !== initialJob.user_id) {
+      return { kind: 'conflict' };
+    }
+
+    const access = await resolveCronJobScope(c, {
+      userId,
+      job: locked.job,
+      mode: 'write',
+      pinnedSessionName,
+      db: tx,
+    });
+    if (!access.ok) return { kind: 'forbidden', reason: access.reason };
+    if (!await isSharedCronMutationAllowed(tx, {
+      job: locked.job,
+      sharedScope: access.scope.shared,
+      isParticipantDaemon: authority.kind === 'participant_daemon',
+      actingUserId: userId,
+      provenance: locked.provenance.row,
+    })) {
+      return { kind: 'forbidden', reason: 'share-direct-surface-denied' };
+    }
+    return { kind: 'ok', job: locked.job, provenance: locked.provenance };
+  });
+
+  if (txResult.kind === 'not_found') return c.json({ error: 'not_found' }, 404);
+  if (txResult.kind === 'conflict') return c.json({ error: 'cron_concurrent_modification' }, 409);
+  if (txResult.kind === 'forbidden') return c.json({ error: 'forbidden', reason: txResult.reason }, 403);
 
   try {
-    await dispatchJobNow(c.env, job);
+    await dispatchJobNow(c.env, txResult.job, {
+      skipReload: true,
+      verifiedProvenance: txResult.provenance,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return c.json({ error: msg }, 400);

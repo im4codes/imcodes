@@ -5,6 +5,9 @@ import { OWNER_MACHINE_AUTHORITY_FIELD } from './shared-machine-authority.js';
 
 export type CronActionType = 'command' | 'p2p' | 'send';
 
+/** Static capability advertised by daemons supporting exact scoped cron send binding & self-delivery. */
+export const CRON_EXACT_SEND_CAPABILITY_V1 = 'cron_exact_send_v1';
+
 /**
  * Body `error` of a cron API 401 for a request that names a server (`X-Server-Id`) but carries no credential at all: a
  * daemon that predates the credential the cron API now requires. Daemons print the body's `error`, so the code is the

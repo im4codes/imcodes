@@ -417,9 +417,12 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   if (action.type === 'send') {
+    // Only an explicit server-authorized `exactTargetSessionName` engages exact-session mode.
+    // Whole-server shares with an explicit execution `targetSessionName` and no owner token
+    // must keep normal sibling/broadcast send semantics.
     const exactTarget = typeof msg.exactTargetSessionName === 'string' && msg.exactTargetSessionName.trim()
       ? msg.exactTargetSessionName.trim()
-      : (targetSessionName && !ownerMachineAuthority ? name : null);
+      : null;
 
     if (exactTarget) {
       if (action.broadcast === true) {

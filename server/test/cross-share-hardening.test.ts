@@ -229,6 +229,33 @@ describe('cross-share & platform hardening regressions', () => {
               revoked_at: null,
             };
           }
+          if (s.includes('from cron_jobs')) {
+            const jid = params[0] as string;
+            if (jid === 'cron-bare') {
+              return {
+                id: 'cron-bare', server_id: 'srv-1', user_id: 'owner-1', name: 'bare',
+                cron_expr: '0 9 * * *', project_name: 'proj', target_role: 'brain', target_session_name: null,
+                action: JSON.stringify({ type: 'command', command: '/status' }),
+                timezone: null, status: 'active', next_run_at: now, expires_at: null, completion_policy: 'recurring',
+              };
+            }
+            if (jid === 'cron-cross-send') {
+              return {
+                id: 'cron-cross-send', server_id: 'srv-1', user_id: 'owner-1', name: 'cross',
+                cron_expr: '0 9 * * *', project_name: 'proj', target_role: 'brain', target_session_name: 'deck_sub_allowed1',
+                action: JSON.stringify({ type: 'send', target: 'w1', text: 'hi' }),
+                timezone: null, status: 'active', next_run_at: now, expires_at: null, completion_policy: 'recurring',
+              };
+            }
+            if (jid === 'cron-own-sub') {
+              return {
+                id: 'cron-own-sub', server_id: 'srv-1', user_id: 'owner-1', name: 'own',
+                cron_expr: '0 9 * * *', project_name: 'proj', target_role: 'brain', target_session_name: 'deck_sub_allowed1',
+                action: JSON.stringify({ type: 'command', command: '/status' }),
+                timezone: null, status: 'active', next_run_at: now, expires_at: null, completion_policy: 'recurring',
+              };
+            }
+          }
           if (s.includes('from cron_job_provenance')) {
             return { creator_user_id: 'part-1', shared: true };
           }
@@ -755,8 +782,9 @@ describe('cross-share & platform hardening regressions', () => {
         queryOne: async (sql: string) => {
           { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
           const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-          if (s.includes('from cron_job_provenance')) throw new Error('db_provenance_read_timeout');
+          if (s.includes('cron_job_provenance')) throw new Error('db_provenance_read_timeout');
           if (s.includes('from servers where id')) return { user_id: 'owner-1', owner_status: 'active', actor_status: 'active' };
+          if (s.includes('from cron_jobs')) return baseJob;
           return null;
         },
         query: async (sql: string) => {
@@ -867,7 +895,23 @@ describe('cross-share & platform hardening regressions', () => {
           if (s.includes('from cron_job_provenance')) {
             return existingJobProvenance;
           }
-          if (s.includes('from cron_jobs where id') && params[0] === 'job-sub-1') {
+          if (s.includes('from cron_jobs') && params[0] === 'cron-sub-bcast') {
+            return {
+              id: 'cron-sub-bcast', server_id: 'srv-1', user_id: 'owner-1', name: 'sub-bcast',
+              cron_expr: '0 9 * * *', project_name: 'proj', target_role: 'brain', target_session_name: 'deck_sub_allowed1',
+              action: JSON.stringify({ type: 'send', target: 'deck_sub_allowed1', message: 'hi', broadcast: true }),
+              timezone: null, expires_at: null, completion_policy: 'recurring', last_run_at: null, next_run_at: now + 60_000, status: 'active',
+            };
+          }
+          if (s.includes('from cron_jobs') && params[0] === 'cron-main-bcast') {
+            return {
+              id: 'cron-main-bcast', server_id: 'srv-1', user_id: 'owner-1', name: 'main-bcast',
+              cron_expr: '0 9 * * *', project_name: 'proj', target_role: 'brain', target_session_name: 'deck_proj_brain',
+              action: JSON.stringify({ type: 'send', target: 'deck_proj_brain', message: 'hi', broadcast: true }),
+              timezone: null, expires_at: null, completion_policy: 'recurring', last_run_at: null, next_run_at: now + 60_000, status: 'active',
+            };
+          }
+          if (s.includes('from cron_jobs') && params[0] === 'job-sub-1') {
             return {
               id: params[0],
               user_id: 'owner-1',
@@ -1251,7 +1295,7 @@ describe('cross-share & platform hardening regressions', () => {
           if (s.includes('from cron_job_provenance where job_id')) {
             return { creator_user_id: claimCommitted ? 'part-active' : 'part-revoked', shared: true };
           }
-          if (s.includes('from cron_jobs where id')) {
+          if (s.includes('from cron_jobs')) {
             return {
               id: params[0],
               server_id: 'srv-1',
@@ -1357,7 +1401,7 @@ describe('cross-share & platform hardening regressions', () => {
           publishResourceChanged: vi.fn(),
           get: () => ({
             isDaemonConnected: () => true,
-            supportsExactCronSend: () => supportsExact,
+            hasDaemonCapability: (cap: string) => supportsExact && cap === 'cron_exact_send_v1',
             sendToDaemon,
           }),
         },
@@ -1395,6 +1439,29 @@ describe('cross-share & platform hardening regressions', () => {
         },
       ];
       let provCreator = 'part-sub';
+      const subSendJob = {
+        id: 'cron-sub-exact-send',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'sub-exact-send',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: 'deck_sub_allowed1',
+        action: JSON.stringify({ type: 'send', target: 'deck_sub_allowed1', message: 'ping self' }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now + 60_000,
+        status: 'active',
+      };
+      const mainRoleSendJob = {
+        ...subSendJob,
+        id: 'cron-main-role-send',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'send', target: 'w1', message: 'ping w1' }),
+      };
       const db = {
         queryOne: async (sql: string, params: unknown[] = []) => {
           { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
@@ -1410,6 +1477,8 @@ describe('cross-share & platform hardening regressions', () => {
               revoked_at: null,
             };
           }
+          if (s.includes('from cron_jobs') && params[0] === 'cron-sub-exact-send') return subSendJob;
+          if (s.includes('from cron_jobs') && params[0] === 'cron-main-role-send') return mainRoleSendJob;
           if (s.includes('from sessions where server_id')) return { project_name: 'proj', role: 'brain' };
           if (s.includes('from sub_sessions where id')) {
             return { id: params[0], server_id: 'srv-1', closed_at: null, parent_session: 'deck_proj_brain', execution_clone_metadata: null };
@@ -1455,28 +1524,11 @@ describe('cross-share & platform hardening regressions', () => {
         })).status).toBe(403);
       }
 
-      // Old daemon (supportsExactCronSend === false) rejects fixed-scope shared cron send without sending
-      const subSendJob = {
-        id: 'cron-sub-exact-send',
-        server_id: 'srv-1',
-        user_id: 'owner-1',
-        name: 'sub-exact-send',
-        cron_expr: '0 9 * * *',
-        project_name: 'proj',
-        target_role: 'brain',
-        target_session_name: 'deck_sub_allowed1',
-        action: JSON.stringify({ type: 'send', target: 'deck_sub_allowed1', message: 'ping self' }),
-        timezone: null,
-        expires_at: null,
-        completion_policy: 'recurring',
-        last_run_at: null,
-        next_run_at: now + 60_000,
-        status: 'active',
-      };
+      // Old daemon (cron_exact_send_v1 capability absent) rejects fixed-scope shared cron send without sending
       await expect(dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, subSendJob as never)).rejects.toThrow('daemon_upgrade_required_exact_cron_send');
       expect(sendToDaemon).not.toHaveBeenCalled();
 
-      // Upgraded daemon (supportsExactCronSend === true) sets exactTargetSessionName & canonicalizes target
+      // Upgraded daemon (cron_exact_send_v1 capability present) sets exactTargetSessionName & canonicalizes target
       supportsExact = true;
       await dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, subSendJob as never);
       expect(sendToDaemon).toHaveBeenCalledTimes(1);
@@ -1486,16 +1538,215 @@ describe('cross-share & platform hardening regressions', () => {
 
       provCreator = 'part-main';
       sendToDaemon.mockClear();
-      await dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, {
-        ...subSendJob,
-        id: 'cron-main-role-send',
-        target_session_name: null,
-        action: JSON.stringify({ type: 'send', target: 'w1', message: 'ping w1' }),
-      } as never);
+      await dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, mainRoleSendJob as never);
       expect(sendToDaemon).toHaveBeenCalledTimes(1);
       const mainMsg = JSON.parse(sendToDaemon.mock.calls[0]![0] as string);
       expect(mainMsg.exactTargetSessionName).toBe('deck_proj_w1');
       expect(mainMsg.action.target).toBe('deck_proj_w1');
+    });
+
+    it('binds POST /trigger caller authorization and dispatch to one locked (job, provenance) version and handles deletion, scope shift, and provenance failure cleanly', async () => {
+      const sendToDaemon = vi.fn();
+      vi.doMock('../src/ws/bridge.js', () => ({
+        WsBridge: {
+          publishResourceChanged: vi.fn(),
+          get: () => ({
+            isDaemonConnected: () => true,
+            hasDaemonCapability: () => true,
+            sendToDaemon,
+          }),
+        },
+      }));
+      const { cronApiRoutes } = await import('../src/routes/cron-api.js');
+      const { dispatchJobNow } = await import('../src/cron/job-dispatch.js');
+      const { signJwt } = await import('../src/security/crypto.js');
+      const now = Date.now();
+
+      type StoredTriggerJob = Record<string, unknown> & {
+        prov_present?: boolean;
+        prov_creator_user_id?: string | null;
+        prov_shared?: boolean | null;
+      };
+      const jobsMap = new Map<string, StoredTriggerJob>();
+      let onTxStart: (() => void) | null = null;
+      let throwJoinedRead = false;
+
+      const db = {
+        queryOne: async (sql: string, params: unknown[] = []) => {
+          { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
+          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+          if (s.startsWith('select exists (')) return { exists: true };
+          if (s.includes('from servers where id')) {
+            return {
+              token_hash: DAEMON_TOKEN_HASH,
+              owner_status: 'active',
+              actor_status: 'active',
+              user_id: 'owner-1',
+              node_role: NODE_ROLE.FULL,
+              revoked_at: null,
+            };
+          }
+          if (s.includes('from cron_jobs') && s.includes('left join cron_job_provenance')) {
+            if (throwJoinedRead) throw new Error('trigger_provenance_join_failed');
+            return jobsMap.get(params[0] as string) ?? null;
+          }
+          if (s.includes('from cron_jobs where id')) {
+            return jobsMap.get(params[0] as string) ?? null;
+          }
+          if (s.includes('from sessions where server_id')) return { project_name: 'proj', role: 'brain' };
+          if (s.includes('from sub_sessions where id')) {
+            return { id: params[0], server_id: 'srv-1', closed_at: null, parent_session: 'deck_other_brain', execution_clone_metadata: null };
+          }
+          return null;
+        },
+        query: async (sql: string, params: unknown[] = []) => {
+          const s = sql.toLowerCase();
+          if ((s.includes('union all') || s.includes('from session_shares')) && params.includes('part-main')) {
+            return [{
+              id: 'share-main-trig',
+              server_id: 'srv-1',
+              target_kind: 'main',
+              session_name: 'deck_proj_brain',
+              target_user_id: 'part-main',
+              role: 'participant',
+              created_by: 'owner-1',
+              created_at: 1,
+              updated_at: 1,
+              expires_at: null,
+              revoked_at: null,
+            }];
+          }
+          return [];
+        },
+        execute: async () => ({ changes: 1 }),
+        transaction: async <T>(fn: (tx: Database) => Promise<T>): Promise<T> => {
+          onTxStart?.();
+          return fn(db as unknown as Database);
+        },
+      } as unknown as Database;
+
+      const app = new Hono<{ Bindings: Env }>();
+      app.use('*', async (c, next) => {
+        c.env = { DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env;
+        await next();
+      });
+      app.route('/api/server/:serverId/cron', cronApiRoutes);
+
+      const partHeaders = { Authorization: `Bearer ${signJwt({ sub: 'part-main', type: 'web' }, JWT_KEY, 3600)}` };
+      const ownerHeaders = { Authorization: `Bearer ${signJwt({ sub: 'owner-1', type: 'web' }, JWT_KEY, 3600)}` };
+
+      // 1) Scope change between initial SELECT and locked tx -> 403, 0 dispatches
+      jobsMap.set('job-trig-race', {
+        id: 'job-trig-race',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'trig-race',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now + 60_000,
+        status: 'active',
+        prov_present: true,
+        prov_creator_user_id: 'part-main',
+        prov_shared: true,
+      });
+      onTxStart = () => {
+        const cur = jobsMap.get('job-trig-race')!;
+        jobsMap.set('job-trig-race', { ...cur, project_name: 'other-proj', target_session_name: 'deck_sub_other' });
+      };
+      const shiftedRes = await app.request('/api/server/srv-1/cron/job-trig-race/trigger', { method: 'POST', headers: partHeaders });
+      expect(shiftedRes.status).toBe(403);
+      expect(sendToDaemon).not.toHaveBeenCalled();
+
+      // 2) Concurrent deletion before locked tx -> 404 (and direct dispatchJobNow throws cron_not_found), 0 dispatches
+      onTxStart = () => { jobsMap.delete('job-trig-race'); };
+      const deletedRes = await app.request('/api/server/srv-1/cron/job-trig-race/trigger', { method: 'POST', headers: partHeaders });
+      expect(deletedRes.status).toBe(404);
+      expect(sendToDaemon).not.toHaveBeenCalled();
+      await expect(dispatchJobNow({ DB: db, JWT_SIGNING_KEY: JWT_KEY } as Env, { id: 'job-trig-race' } as never)).rejects.toThrow('cron_not_found');
+
+      // 3) Provenance join read failure -> 500 fail-closed, 0 dispatches
+      jobsMap.set('job-trig-err', {
+        id: 'job-trig-err',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'trig-err',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now + 60_000,
+        status: 'active',
+      });
+      onTxStart = null;
+      throwJoinedRead = true;
+      const errRes = await app.request('/api/server/srv-1/cron/job-trig-err/trigger', { method: 'POST', headers: partHeaders });
+      expect(errRes.status).toBe(500);
+      expect(sendToDaemon).not.toHaveBeenCalled();
+      throwJoinedRead = false;
+
+      // 4) Same-version positive controls: shared participant AND legacy owner row (prov_present: false) both dispatch
+      jobsMap.set('job-trig-ok', {
+        id: 'job-trig-ok',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'trig-ok',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: '/ok' }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now + 60_000,
+        status: 'active',
+        prov_present: true,
+        prov_creator_user_id: 'part-main',
+        prov_shared: true,
+      });
+      const okPart = await app.request('/api/server/srv-1/cron/job-trig-ok/trigger', { method: 'POST', headers: partHeaders });
+      expect(okPart.status).toBe(200);
+      expect(sendToDaemon).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(sendToDaemon.mock.calls[0]![0] as string).action).toEqual({ type: 'command', command: '/ok' });
+
+      sendToDaemon.mockClear();
+      jobsMap.set('job-legacy-owner', {
+        id: 'job-legacy-owner',
+        server_id: 'srv-1',
+        user_id: 'owner-1',
+        name: 'legacy-owner',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: '/legacy' }),
+        timezone: null,
+        expires_at: null,
+        completion_policy: 'recurring',
+        last_run_at: null,
+        next_run_at: now + 60_000,
+        status: 'active',
+        prov_present: false,
+        prov_creator_user_id: null,
+        prov_shared: null,
+      });
+      const okOwner = await app.request('/api/server/srv-1/cron/job-legacy-owner/trigger', { method: 'POST', headers: ownerHeaders });
+      expect(okOwner.status).toBe(200);
+      expect(sendToDaemon).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(sendToDaemon.mock.calls[0]![0] as string).action).toEqual({ type: 'command', command: '/legacy' });
     });
   });
 });
