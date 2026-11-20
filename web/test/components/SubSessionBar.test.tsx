@@ -2823,6 +2823,101 @@ describe('SubSessionBar', () => {
     }
   });
 
+  it('renders the live tech clock to the left of mobile-subsession-footer-badge in standalone and inline footer modes', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 12, 7, 8, 9));
+    try {
+      const sub = makeSubSession();
+      const view = render(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="online"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+
+      const footer = view.getByTestId('mobile-subsession-footer-status');
+      const clock = view.getByTestId('mobile-subsession-footer-clock');
+      const badge = view.getByTestId('mobile-subsession-footer-badge');
+      expect(footer.contains(clock)).toBe(true);
+      expect(clock.classList.contains('daemon-local-clock')).toBe(true);
+      expect(clock.classList.contains('subcard-mobile-footer-clock')).toBe(true);
+      expect(clock.compareDocumentPosition(badge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(clock.querySelector('.daemon-local-clock-date')?.textContent).toBe('2026-05-12');
+      expect(clock.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:09');
+
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(clock.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:10');
+
+      // Inline toolbar footer mode (empty collapsed mobile) with offline badge and no stats
+      view.rerender(
+        <SubSessionBar
+          subSessions={[]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="offline"
+          onNew={vi.fn()}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+
+      const inlineFooter = view.getByTestId('mobile-subsession-footer-status');
+      const inlineClock = view.getByTestId('mobile-subsession-footer-clock');
+      const inlineBadge = view.getByTestId('mobile-subsession-footer-badge');
+      expect(inlineFooter.classList.contains('subcard-mobile-footer-status-inline')).toBe(true);
+      expect(inlineClock.compareDocumentPosition(inlineBadge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(inlineClock.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:10');
+
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(inlineClock.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:11');
+
+      // Connecting state without stats still renders clock cleanly before badge
+      view.rerender(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="connecting"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      const connectingClock = view.getByTestId('mobile-subsession-footer-clock');
+      const connectingBadge = view.getByTestId('mobile-subsession-footer-badge');
+      expect(connectingClock.compareDocumentPosition(connectingBadge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(connectingClock.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:11');
+      view.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('adds .incognito class on SubSessionBar buttons and applies dashed border + distinct incognito control styles in CSS', () => {
     const cssPath = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/styles.css');
     const css = readFileSync(cssPath, 'utf8');

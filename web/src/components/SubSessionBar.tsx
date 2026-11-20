@@ -868,7 +868,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [showDaemonDetails, setShowDaemonDetails] = useState(false);
   const [subSessionContextMenu, setSubSessionContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
-  const localClockNow = useNowTicker(!!stats && (desktopLayoutCapable || showDaemonDetails));
+  const showMobileFooter = isMobile && !!daemonBadgeState;
+  const localClockNow = useNowTicker(showMobileFooter || (!!stats && (desktopLayoutCapable || showDaemonDetails)));
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
   const quickClosedStorageKey = useMemo(
     () => subSessionQuickClosedStorageKey(serverId, quickClosePersistenceScope),
@@ -1823,7 +1824,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     : null;
 
   const hasSubSessions = subSessions.length > 0;
-  const showMobileFooter = isMobile && !!daemonBadgeState;
   const inlineMobileFooterInToolbar = showMobileFooter
     && !hasSubSessions
     && (collapsed || (!onNew && discussions.length === 0));
@@ -1836,6 +1836,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         class={`subcard-mobile-footer-status${inline ? ' subcard-mobile-footer-status-inline' : ''}`}
         data-testid="mobile-subsession-footer-status"
       >
+        <span class="daemon-local-clock subcard-mobile-footer-clock" data-testid="mobile-subsession-footer-clock">
+          {renderTechClock(localClockText)}
+        </span>
         <span
           class={`badge ${
             daemonBadgeState === 'online'

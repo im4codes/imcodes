@@ -1759,6 +1759,18 @@ describe('styles.css regression contracts', () => {
     expect(inlineFooterRule).toMatch(/left:\s*50%/);
     expect(inlineFooterRule).toMatch(/transform:\s*translate\(-50%,\s*-50%\)/);
 
+    const mobileFooterClockRule = cssWithoutComments.match(/^\.subcard-mobile-footer-clock\s*\{[^}]*\}/m)?.[0];
+    expect(mobileFooterClockRule).toBeTruthy();
+    expect(mobileFooterClockRule).toMatch(/font-size:\s*9px/);
+    expect(mobileFooterClockRule).toMatch(/flex-shrink:\s*0/);
+
+    const mobileFooterBadgeRule = cssWithoutComments.match(/^\.subcard-mobile-footer-status\s+\.badge\s*\{[^}]*\}/m)?.[0];
+    expect(mobileFooterBadgeRule).toBeTruthy();
+    expect(mobileFooterBadgeRule).toMatch(/flex-shrink:\s*0/);
+
+    const narrowMobileBlocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*380px\)/);
+    expect(narrowMobileBlocks.some((b) => b.includes('.subcard-mobile-footer-status-inline .subcard-mobile-footer-clock .daemon-local-clock-date'))).toBe(true);
+
     // Keyboard open / input-focused continues to hide the entire .subcard-bar (including the footer inside it)
     expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.input-focused\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);
     expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.kb-open\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);

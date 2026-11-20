@@ -8864,19 +8864,36 @@ html.mobile-nav-gesture-active .chat-view {
   top: 50%;
   transform: translate(-50%, -50%);
   padding: 0 2px;
-  max-width: calc(100% - 140px);
+  max-width: calc(100% - 104px);
   pointer-events: none;
+}
+.subcard-mobile-footer-clock {
+  font-size: 9px;
+  line-height: 1.15;
+  padding-left: 0;
+  flex-shrink: 0;
+  gap: 0;
 }
 .subcard-mobile-footer-status .badge {
   font-size: 9px;
   padding: 0 5px;
   line-height: 1.15;
+  flex-shrink: 0;
 }
 .subcard-mobile-footer-version {
   font-size: 9px;
   line-height: 1.15;
   color: #475569;
   white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 380px) {
+  .subcard-mobile-footer-status-inline .subcard-mobile-footer-clock .daemon-local-clock-date,
+  .subcard-mobile-footer-status-inline .subcard-mobile-footer-clock .daemon-local-clock-space {
+    display: none;
+  }
 }
 
 /* Desktop vertical sub-session rail. It is an ordinary flex child between the
