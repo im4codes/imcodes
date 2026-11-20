@@ -3680,4 +3680,64 @@ describe('ChatView', () => {
     expect(onLoadOlder).not.toHaveBeenCalled();
     expect(container.querySelector('.chat-scroll-btn')).toBeNull();
   });
+
+  it('pins pre-seeded initial mount synchronously before any requestAnimationFrame flushes', () => {
+    const queuedFrames: FrameRequestCallback[] = [];
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      queuedFrames.push(cb);
+      return queuedFrames.length;
+    });
+    const cafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined);
+
+    let scrollTopValue = 0;
+    const isChatViewEl = (el: HTMLElement) =>
+      el.classList.contains('chat-view') && !el.classList.contains('chat-view-preview');
+    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? scrollTopValue : 0; },
+      set(this: HTMLElement, v: number) { if (isChatViewEl(this)) scrollTopValue = v; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? 2_400 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? 400 : 0; },
+    });
+
+    try {
+      const preSeeded = Array.from({ length: 15 }, (_, idx) => ({
+        eventId: `preseeded-${idx + 1}`,
+        type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+        ts: 1000 + idx,
+        epoch: 1,
+        seq: idx + 1,
+        sessionId: 'deck_preseeded_sync',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `message ${idx + 1}`, streaming: false },
+      }));
+
+      render(
+        <ChatView
+          events={preSeeded as any}
+          loading={false}
+          hasOlderHistory={false}
+          serverId="srv-preseeded-sync"
+          sessionId="deck_preseeded_sync"
+        />,
+      );
+
+      // Before flushing any rAF, synchronous layout commit must already be pinned at the bottom.
+      expect(scrollTopValue).toBeGreaterThanOrEqual(2_400 - 400);
+      expect(queuedFrames.length).toBeGreaterThan(0);
+    } finally {
+      rafSpy.mockRestore();
+      cafSpy.mockRestore();
+      for (const prop of ['scrollTop', 'scrollHeight', 'clientHeight']) {
+        delete (HTMLElement.prototype as unknown as Record<string, unknown>)[prop];
+      }
+    }
+  });
 });

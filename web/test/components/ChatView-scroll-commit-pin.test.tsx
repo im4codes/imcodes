@@ -561,4 +561,37 @@ describe('ChatView — scroll ownership across commits', () => {
     expect(geometry.scrollTop).toBe(500);
     expect(view.container.querySelector('.chat-scroll-btn')).not.toBeNull();
   });
+
+  it('pins pre-seeded initial mount to the bottom synchronously before any rAF runs', () => {
+    geometry.scrollHeight = 1400;
+    const view = render(
+      <ChatView
+        events={events(15) as never}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-preseeded-short"
+        sessionId={SESSION}
+      />,
+    );
+    // Do NOT flush rAFs: initial mount commit itself must have pinned scrollTop before paint.
+    expect(geometry.scrollTop).toBe(1400 - geometry.clientHeight);
+    view.unmount();
+
+    geometry.scrollTop = 0;
+    geometry.scrollHeight = 2160;
+    const virtualView = render(
+      <ChatView
+        events={events(30) as never}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-preseeded-virtual"
+        sessionId={SESSION}
+      />,
+    );
+    const scrollEl = virtualView.container.querySelector('.chat-view') as HTMLDivElement;
+    // Still before any rAF runs: synchronous commit must sit at bottom with tail mounted.
+    expect(geometry.scrollTop).toBe(2160 - geometry.clientHeight);
+    expect(scrollEl.querySelector('[data-event-id="evt-29"]')).not.toBeNull();
+    expect(scrollEl.querySelector('[data-event-id="evt-0"]')).toBeNull();
+  });
 });

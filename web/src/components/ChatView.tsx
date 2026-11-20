@@ -4012,7 +4012,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const pendingScrollFrameRef = useRef<number | null>(null);
   const pendingEngageFollowRef = useRef(false);
   const hasInitialPinCompletedRef = useRef(false);
-  const scopeChangedPendingPinRef = useRef(false);
   const lastVisibleTsRef = useRef(0);
   // Single-flight frame for every "follow the bottom" request in this view.
   // These fire from timeline updates, scroll handling and ResizeObserver — all
@@ -4346,14 +4345,11 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const prevRenderedRevisionRef = useRef(renderedRevision);
   const prevLoadingRef = useRef(loading);
   const prevScrollScopeRef = useRef<string>(scrollScopeKey);
-  const wasEmptyAtScopeStartRef = useRef(lastVisibleTs === 0);
 
   // Reset scroll tracking synchronously when (serverId, sessionId) changes on a reused instance.
   useLayoutEffect(() => {
     if (prevScrollScopeRef.current === scrollScopeKey) return;
     prevScrollScopeRef.current = scrollScopeKey;
-    wasEmptyAtScopeStartRef.current = lastVisibleTs === 0;
-    scopeChangedPendingPinRef.current = true;
     autoScrollRef.current = true;
     pendingEngageFollowRef.current = !preview;
     hasInitialScrolledRef.current = false;
@@ -4363,24 +4359,20 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     lastScrollTopRef.current = 0;
     userScrollUpUntilRef.current = 0;
     suppressLoadOlder();
-    if (!preview && visible && lastVisibleTs > 0 && scrollRef.current) {
-      pinScrollToBottomNow(scrollRef.current);
-    }
   }, [scrollScopeKey]);
 
   // Synchronous scroll-to-bottom BEFORE paint on initial history load.
   // useLayoutEffect runs after DOM mutation but before the browser paints,
   // so the user never sees content at the top position.
   useLayoutEffect(() => {
-    if (preview) return;
+    if (preview || !visible) return;
     if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
       hasInitialScrolledRef.current = true;
-      // Pin synchronously before paint when async hydration transitions 0 -> N events
-      // or when switching scope so scrollTop=0 cannot trigger a spurious disengageFollow
-      // before the rAF runs, and schedule a non-engaging rAF pass for post-paint settle.
-      if (autoScrollRef.current) {
-        if ((wasEmptyAtScopeStartRef.current || scopeChangedPendingPinRef.current) && visible && scrollRef.current) {
-          scopeChangedPendingPinRef.current = false;
+      // Pin synchronously before paint whenever initial content renders (both
+      // pre-seeded and async-hydrated) so the first painted frame never sits
+      // at scrollTop=0, and schedule a non-engaging rAF pass for post-paint settle.
+      if (autoScrollRef.current && Date.now() >= userScrollUpUntilRef.current) {
+        if (scrollRef.current) {
           pinScrollToBottomNow(scrollRef.current);
         }
         scrollToBottom(false);
