@@ -1,11 +1,11 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MenuItemOptionsLike } from '../src/menu.js';
 import { MAIN_WINDOW_WEB_PREFERENCES } from '../src/security.js';
-import { openAddServerPrompt } from '../src/server-prompt.js';
+import { buildWelcomeDataUrl, openAddServerPrompt } from '../src/server-prompt.js';
 import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
 
 function createFakeShellWindow(opts: {
@@ -254,5 +254,161 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     expect(goodEv.preventDefault).toHaveBeenCalledTimes(1);
     await expect(resultPromise).resolves.toEqual({ origin: 'https://my.im.codes', label: 'Office' });
     expect(closed).toBe(true);
+  });
+
+  it('renders interactive ServerSetupPage-style welcome screen, supports /connect, /add, /remove, local bound detection, invalid URL errors, and Switch Server menu', async () => {
+    const fakeHome = mkdtempSync(path.join(os.tmpdir(), 'imcodes-pc-app-home-'));
+    try {
+      // Valid ~/.imcodes/server.json is surfaced read-only as a one-click detected entry
+      writeFileSync(
+        path.join(fakeHome, 'server.json'),
+        JSON.stringify({
+          serverId: 'srv-1',
+          token: 'tok-1',
+          workerUrl: 'https://im.zhinet.work/subpath',
+          serverName: 'My Work Mac',
+          boundAt: 1000,
+        }),
+      );
+
+      let latestMenu: MenuItemOptionsLike[] = [];
+      let createdWin!: ReturnType<typeof createFakeShellWindow>;
+
+      const shell = createPcAppShell({
+        platform: 'darwin',
+        appName: 'IM.codes',
+        userDataDir: tempDir,
+        welcomeLocale: 'zh-CN',
+        bindDeps: { imcodesHome: fakeHome },
+        createMainWindow: (opts) => {
+          createdWin = createFakeShellWindow({ webPreferences: opts.webPreferences });
+          return createdWin;
+        },
+        createPromptWindow: () => {
+          throw new Error('unused');
+        },
+        setApplicationMenu: (template) => {
+          latestMenu = template;
+        },
+        openExternal: () => {},
+        showSaveDialogSync: () => undefined,
+        showMessageBox: async () => ({ response: 1 }),
+      });
+
+      await shell.ensureWindow();
+      const welcomeHtml = decodeURIComponent(createdWin.webContents.getURL().replace('data:text/html;charset=utf-8,', ''));
+      expect(welcomeHtml).toContain("default-src 'none'; style-src 'unsafe-inline';");
+      expect(welcomeHtml).toContain('选择或添加 IM.codes 服务器');
+      expect(welcomeHtml).toContain('https://app.im.codes');
+      expect(welcomeHtml).toContain('https://im.zhinet.work');
+      expect(welcomeHtml).toContain('本机已绑定');
+      expect(welcomeHtml).toContain('https://imcodes-welcome.local/connect?url=https%3A%2F%2Fim.zhinet.work');
+      expect(welcomeHtml).toContain('action="https://imcodes-welcome.local/add"');
+
+      // Backward-compatible signature check
+      expect(decodeURIComponent(buildWelcomeDataUrl())).toContain('https://app.im.codes');
+      expect(decodeURIComponent(buildWelcomeDataUrl(0))).toContain('https://imcodes-welcome.local/add');
+
+      // Invalid URL submission renders inline role="alert" banner and preserves inputs
+      for (const badUrl of ['javascript:alert(1)', 'file:///etc/passwd', 'http://evil.com', 'https://u:p@host.example']) {
+        const badEv = { preventDefault: vi.fn() };
+        createdWin.webContentsEmitter.emit(
+          'will-navigate',
+          badEv,
+          `https://imcodes-welcome.local/add?url=${encodeURIComponent(badUrl)}&label=Bad`,
+        );
+        expect(badEv.preventDefault).toHaveBeenCalled();
+        await vi.waitFor(() => {
+          const html = decodeURIComponent(createdWin.webContents.getURL());
+          expect(html).toContain('role="alert"');
+          expect(html).toContain('value="Bad"');
+        });
+        expect(shell.controller.getActiveOrigin()).toBeNull();
+        expect(shell.store.list()).toEqual([]);
+      }
+
+      // Submitting valid custom URL via /add persists normalized origin + label and selects server
+      const addEv = { preventDefault: vi.fn() };
+      createdWin.webContentsEmitter.emit(
+        'will-navigate',
+        addEv,
+        'https://imcodes-welcome.local/add?url=https%3A%2F%2Fcustom.im.codes%2Fapp&label=Custom',
+      );
+      expect(addEv.preventDefault).toHaveBeenCalled();
+      await vi.waitFor(() => {
+        expect(shell.controller.getActiveOrigin()).toBe('https://custom.im.codes');
+      });
+      expect(shell.store.list().map((s) => s.origin)).toEqual(['https://custom.im.codes']);
+
+      // Menu has Switch Server… which returns to interactive welcome screen while preserving saved server + Add Server…
+      const switchItem = findMenuItem(latestMenu, 'server:switch');
+      expect(switchItem).toBeDefined();
+      expect(findMenuItem(latestMenu, 'server:add')).toBeDefined();
+      switchItem?.click?.();
+      await vi.waitFor(() => {
+        expect(shell.controller.getActiveOrigin()).toBeNull();
+        expect(createdWin.webContents.getURL().startsWith('data:text/html')).toBe(true);
+      });
+      const returnedHtml = decodeURIComponent(createdWin.webContents.getURL());
+      expect(returnedHtml).toContain('https://imcodes-welcome.local/remove?url=https%3A%2F%2Fcustom.im.codes');
+
+      // Clicking remove link deletes custom server and refreshes welcome page without removing default
+      const removeEv = { preventDefault: vi.fn() };
+      createdWin.webContentsEmitter.emit(
+        'will-navigate',
+        removeEv,
+        'https://imcodes-welcome.local/remove?url=https%3A%2F%2Fcustom.im.codes',
+      );
+      expect(removeEv.preventDefault).toHaveBeenCalled();
+      await vi.waitFor(() => {
+        expect(shell.store.list()).toEqual([]);
+      });
+
+      // Clicking detected server card connects directly
+      const connectEv = { preventDefault: vi.fn() };
+      createdWin.webContentsEmitter.emit(
+        'will-navigate',
+        connectEv,
+        'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fim.zhinet.work',
+      );
+      expect(connectEv.preventDefault).toHaveBeenCalled();
+      await vi.waitFor(() => {
+        expect(shell.controller.getActiveOrigin()).toBe('https://im.zhinet.work');
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it('silently ignores missing, corrupt, or non-https local server.json when building welcome screen', async () => {
+    const badHome = mkdtempSync(path.join(os.tmpdir(), 'imcodes-pc-app-badhome-'));
+    try {
+      writeFileSync(path.join(badHome, 'server.json'), '{not-valid-json');
+      let createdWin!: ReturnType<typeof createFakeShellWindow>;
+      const shell = createPcAppShell({
+        platform: 'linux',
+        appName: 'IM.codes',
+        userDataDir: tempDir,
+        bindDeps: { imcodesHome: badHome },
+        createMainWindow: (opts) => {
+          createdWin = createFakeShellWindow({ webPreferences: opts.webPreferences });
+          return createdWin;
+        },
+        createPromptWindow: () => {
+          throw new Error('unused');
+        },
+        setApplicationMenu: () => {},
+        openExternal: () => {},
+        showSaveDialogSync: () => undefined,
+        showMessageBox: async () => ({ response: 1 }),
+      });
+
+      await shell.ensureWindow();
+      const html = decodeURIComponent(createdWin.webContents.getURL());
+      expect(html).toContain('https://app.im.codes');
+      expect(shell.controller.getActiveOrigin()).toBeNull();
+    } finally {
+      rmSync(badHome, { recursive: true, force: true });
+    }
   });
 });

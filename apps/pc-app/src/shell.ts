@@ -14,11 +14,14 @@ import {
 } from './security.js';
 import {
   buildWelcomeDataUrl,
+  DEFAULT_SERVER_ORIGIN,
   openAddServerPrompt,
+  WELCOME_SUBMIT_ORIGIN,
   type PromptWindowFactory,
   type ServerPromptInput,
+  type WelcomeDataUrlOptions,
 } from './server-prompt.js';
-import { ServerStore } from './servers.js';
+import { normalizeServerOrigin, ServerStore } from './servers.js';
 import { TrustedOriginController, type TrustedWindowLike } from './trust.js';
 
 export const DOCS_HELP_URL = 'https://docs.im.codes';
@@ -64,6 +67,8 @@ export interface PcAppShellDeps {
   }) => Promise<{ response: number }>;
   showNotification?: (options: { title: string; body: string }) => void;
   promptAddServer?: () => Promise<ServerPromptInput | null>;
+  detectLocalBoundOrigin?: () => string | { origin: string; label?: string } | null;
+  welcomeLocale?: string;
   onBindFallback?: (trustedOrigin: string | null) => Promise<void> | void;
   bindDeps?: Partial<
     Omit<
@@ -85,6 +90,7 @@ export interface PcAppShellInstance {
   bind: BindCoordinator;
   getWindow: () => ShellWindowLike | null;
   ensureWindow: () => Promise<ShellWindowLike>;
+  showServerPicker: () => Promise<void>;
   addAndSelectServer: (rawUrl: string, label?: string) => Promise<string>;
   selectServer: (origin: string) => Promise<string>;
   removeServer: (origin: string) => Promise<boolean>;
@@ -120,14 +126,58 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     return undefined;
   };
 
+  const detectLocalBoundServer = (): { origin: string; label?: string } | null => {
+    if (deps.detectLocalBoundOrigin) {
+      try {
+        const raw = deps.detectLocalBoundOrigin();
+        if (!raw) return null;
+        const originRaw = typeof raw === 'string' ? raw : raw.origin;
+        const origin = normalizeServerOrigin(originRaw);
+        const label = typeof raw === 'string' ? undefined : raw.label?.trim() || undefined;
+        return { origin, ...(label ? { label } : {}) };
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const summary = bind.getBoundSummary();
+      if (!summary?.workerUrl) return null;
+      const origin = normalizeServerOrigin(summary.workerUrl);
+      const label = summary.serverName?.trim() || undefined;
+      return { origin, ...(label ? { label } : {}) };
+    } catch {
+      return null;
+    }
+  };
+
+  const loadWelcomeScreen = async (
+    win: ShellWindowLike,
+    extra?: Pick<WelcomeDataUrlOptions, 'initialUrl' | 'initialLabel' | 'errorMessage'>,
+  ) => {
+    controller.clearActiveOrigin();
+    await win.loadURL(
+      buildWelcomeDataUrl({
+        servers: store.list(),
+        detectedServer: detectLocalBoundServer(),
+        locale: deps.welcomeLocale,
+        ...extra,
+      }),
+    );
+  };
+
   const loadWelcomeOrLastServer = async (win: ShellWindowLike) => {
     const lastOrigin = store.getLastOrigin();
     if (lastOrigin && store.trustedOrigins().has(lastOrigin)) {
       await controller.selectServer(lastOrigin);
       return;
     }
-    controller.clearActiveOrigin();
-    await win.loadURL(buildWelcomeDataUrl(store.list().length));
+    await loadWelcomeScreen(win);
+  };
+
+  const showServerPicker = async () => {
+    const win = await ensureWindow();
+    await loadWelcomeScreen(win);
+    rebuildMenu();
   };
 
   const handleAddServer = async () => {
@@ -171,8 +221,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       if (next && store.trustedOrigins().has(next)) {
         await controller.selectServer(next);
       } else {
-        controller.clearActiveOrigin();
-        await mainWindow.loadURL(buildWelcomeDataUrl(store.list().length));
+        await loadWelcomeScreen(mainWindow);
       }
     }
     rebuildMenu();
@@ -207,6 +256,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       boundServer: bind.getBoundSummary(),
       onSelectServer: (origin) => void handleSelectServer(origin),
       onAddServer: () => void handleAddServer(),
+      onSwitchServer: () => void showServerPicker(),
       onRemoveServer: (origin) => void handleRemoveServer(origin),
       onReload: () => {
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -259,6 +309,81 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       externalDocsHosts: deps.externalDocsHosts,
     });
 
+    win.webContents.on('will-navigate', (event, rawTarget) => {
+      let parsed: URL;
+      try {
+        parsed = new URL(rawTarget);
+      } catch {
+        return;
+      }
+      if (parsed.origin !== WELCOME_SUBMIT_ORIGIN) {
+        return;
+      }
+      event.preventDefault();
+      // Only honor welcome virtual navigation while on the sandboxed welcome data: page (no active remote origin).
+      if (controller.getActiveOrigin() !== null || !win.webContents.getURL().startsWith('data:text/html')) {
+        return;
+      }
+
+      if (parsed.pathname === '/connect') {
+        const rawUrl = parsed.searchParams.get('url') ?? '';
+        void (async () => {
+          try {
+            const origin = normalizeServerOrigin(rawUrl);
+            if (!store.trustedOrigins().has(origin)) {
+              const detected = detectLocalBoundServer();
+              const label = detected?.origin === origin ? detected.label : undefined;
+              store.addServer(origin, label);
+            }
+            await controller.selectServer(origin);
+            rebuildMenu();
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            await loadWelcomeScreen(win, { initialUrl: rawUrl, errorMessage });
+          }
+        })();
+        return;
+      }
+
+      if (parsed.pathname === '/add') {
+        const rawUrl = parsed.searchParams.get('url') ?? '';
+        const rawLabel = parsed.searchParams.get('label') ?? '';
+        const cleanLabel = rawLabel.trim() || undefined;
+        void (async () => {
+          try {
+            const origin = normalizeServerOrigin(rawUrl);
+            store.addServer(origin, cleanLabel);
+            await controller.selectServer(origin);
+            rebuildMenu();
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            await loadWelcomeScreen(win, {
+              initialUrl: rawUrl,
+              initialLabel: rawLabel,
+              errorMessage,
+            });
+          }
+        })();
+        return;
+      }
+
+      if (parsed.pathname === '/remove') {
+        const rawUrl = parsed.searchParams.get('url') ?? '';
+        void (async () => {
+          try {
+            const origin = normalizeServerOrigin(rawUrl);
+            if (origin !== DEFAULT_SERVER_ORIGIN) {
+              store.removeServer(origin);
+            }
+          } catch {
+            // Ignore malformed remove target
+          }
+          await loadWelcomeScreen(win);
+          rebuildMenu();
+        })();
+      }
+    });
+
     win.webContents.on('did-navigate', () => {
       controller.notifyDidNavigate();
     });
@@ -285,6 +410,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     bind,
     getWindow: () => mainWindow,
     ensureWindow,
+    showServerPicker,
     addAndSelectServer: async (rawUrl, label) => {
       await ensureWindow();
       const saved = store.addServer(rawUrl, label);

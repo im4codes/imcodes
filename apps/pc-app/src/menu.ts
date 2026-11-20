@@ -21,6 +21,7 @@ export interface AppMenuOptions {
   boundServer?: BoundServerSummary | null;
   onSelectServer: (origin: string) => void;
   onAddServer: () => void;
+  onSwitchServer?: () => void;
   onRemoveServer: (origin: string) => void;
   onReload: () => void;
   onForceReload: () => void;
@@ -47,6 +48,7 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     boundServer,
     onSelectServer,
     onAddServer,
+    onSwitchServer,
     onRemoveServer,
     onReload,
     onForceReload,
@@ -83,6 +85,14 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     submenu: [
       ...serverItems,
       { type: 'separator' },
+      ...(onSwitchServer
+        ? [{
+            id: 'server:switch',
+            label: 'Switch Server…',
+            accelerator: 'CmdOrCtrl+Shift+S',
+            click: onSwitchServer,
+          } satisfies MenuItemOptionsLike]
+        : []),
       {
         id: 'server:add',
         label: 'Add Server…',

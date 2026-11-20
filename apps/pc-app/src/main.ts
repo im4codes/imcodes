@@ -16,6 +16,7 @@ export async function startPcApp(): Promise<void> {
     platform: process.platform,
     appName: 'IM.codes',
     userDataDir: app.getPath('userData'),
+    welcomeLocale: app.getLocale(),
     createMainWindow: (opts) => new BrowserWindow(opts),
     createPromptWindow: (opts) => {
       const parent = pcShell.getWindow();

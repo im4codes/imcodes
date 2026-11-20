@@ -11,6 +11,7 @@ import {
   MAIN_WINDOW_WEB_PREFERENCES,
 } from '../src/security.js';
 import { ServerStore } from '../src/servers.js';
+import { createPcAppShell, type ShellWindowLike } from '../src/shell.js';
 import { currentTrustedOrigin, TrustedOriginController, UntrustedOriginError } from '../src/trust.js';
 
 class MockWebContents extends EventEmitter {
@@ -310,5 +311,64 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
         currentPageOrigin: 'https://app.im.codes',
       }),
     ).toBe(true);
+  });
+
+  it('rejects imcodes-welcome.local virtual actions when a remote origin is loaded or current page is not data:text/html welcome', async () => {
+    const session = new MockSession();
+    const wc = new MockWebContents(session);
+    const win: ShellWindowLike = {
+      isDestroyed: () => false,
+      loadURL: async (nextUrl: string) => {
+        wc.url = nextUrl;
+      },
+      on: vi.fn(),
+      webContents: Object.assign(wc, {
+        reload: vi.fn(),
+        reloadIgnoringCache: vi.fn(),
+        toggleDevTools: vi.fn(),
+      }),
+    };
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      bindDeps: { imcodesHome: tempDir },
+      createMainWindow: () => win,
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: () => {},
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 1 }),
+    });
+
+    await shell.addAndSelectServer('https://app.im.codes');
+    expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes');
+    expect(wc.url).toBe('https://app.im.codes');
+
+    // Loaded remote web page must NEVER trigger welcome /add, /connect, or /remove
+    for (const virtualUrl of [
+      'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example&label=Evil',
+      'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fevil.example',
+      'https://imcodes-welcome.local/remove?url=https%3A%2F%2Fapp.im.codes',
+    ]) {
+      const ev = { preventDefault: vi.fn() };
+      wc.emit('will-navigate', ev, virtualUrl);
+      expect(ev.preventDefault).toHaveBeenCalled();
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes');
+    expect(shell.store.list().map((s) => s.origin)).toEqual(['https://app.im.codes']);
+
+    // Even if activeOrigin is cleared, non-data:text/html URL must NOT trigger welcome actions
+    shell.controller.clearActiveOrigin();
+    wc.url = 'https://evil.example/spoof';
+    const spoofEv = { preventDefault: vi.fn() };
+    wc.emit('will-navigate', spoofEv, 'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example');
+    expect(spoofEv.preventDefault).toHaveBeenCalled();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(shell.store.list().map((s) => s.origin)).toEqual(['https://app.im.codes']);
   });
 });
