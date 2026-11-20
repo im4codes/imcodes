@@ -9,6 +9,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
   SDK_SUBAGENT_REDACTED_VALUE,
   SDK_SUBAGENT_SAFE_RAW_MAX_TOTAL_BYTES,
+  buildGenericRuntimeSubagentTool,
   buildSdkBackgroundShellToolEvent,
   buildSdkSubagentSafeDetail,
   buildSdkSubagentWakePrompt,
@@ -19,6 +20,7 @@ import {
   readSdkSubagentStartedAtMs,
   parseSdkSubagentDetail,
   parseSdkRuntimeSubagentTag,
+  resolveSdkSubagentModel,
   sdkSubagentDedupSignature,
   startsWithSdkRuntimeSubagentTag,
   SDK_SUBAGENT_WAKE_PROMPT_HEADER,
@@ -309,6 +311,8 @@ describe('sdk-subagent-status shared contract', () => {
       meta: {
         ...makeDetail().meta,
         parentToolUseId: 'tool-1',
+        agentName: 'Researcher',
+        model: 'claude-sonnet-4-6',
         receiverCount: 3,
         runningChildCount: 2,
         childStatusSummary: 'running:2 completed:1',
@@ -321,6 +325,8 @@ describe('sdk-subagent-status shared contract', () => {
       meta: expect.objectContaining({
         canonicalKey: 'claude:deck:task-1',
         normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        agentName: 'Researcher',
+        model: 'claude-sonnet-4-6',
         receiverCount: 3,
         runningChildCount: 2,
         childStatusSummary: 'running:2 completed:1',
@@ -329,6 +335,35 @@ describe('sdk-subagent-status shared contract', () => {
     expect(JSON.stringify(minimal)).not.toContain('SECRET_PROMPT');
     expect(JSON.stringify(minimal)).not.toContain('parentToolUseId');
     expect(JSON.stringify(minimal)).not.toContain('large output');
+  });
+
+  it('resolves explicit sub-agent models, aliases, and inherit/default fallbacks without leaking placeholders', () => {
+    expect(resolveSdkSubagentModel(['inherit', 'claude-opus-4-6'])).toBe('claude-opus-4-6');
+    expect(resolveSdkSubagentModel(['default', 'auto'], 'gemini-4-hydrogen-high')).toBe('gemini-4-hydrogen-high');
+    expect(resolveSdkSubagentModel(['INHERIT'], 'default')).toBeUndefined();
+    expect(resolveSdkSubagentModel([undefined], undefined)).toBeUndefined();
+
+    const inherited = buildGenericRuntimeSubagentTool({
+      sessionId: 'sess-1',
+      provider: SDK_SUBAGENT_PROVIDERS.QWEN,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT,
+      providerLabel: 'Qwen',
+      action: 'runtime',
+      payload: { agent_path: 'child-1', status: 'running', model: 'inherit' },
+      fallbackModel: 'qwen3-coder',
+    });
+    expect(inherited?.detail?.meta?.model).toBe('qwen3-coder');
+
+    const aliased = buildGenericRuntimeSubagentTool({
+      sessionId: 'sess-1',
+      provider: SDK_SUBAGENT_PROVIDERS.GEMINI_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT,
+      providerLabel: 'Gemini',
+      action: 'runtime',
+      payload: { agent_path: 'child-2', status: 'running', agentModel: 'gemini-2.5-pro' },
+      fallbackModel: 'gemini-2.5-flash',
+    });
+    expect(aliased?.detail?.meta?.model).toBe('gemini-2.5-pro');
   });
 
   it('excludes raw-only changes from SDK sub-agent dedup signatures', () => {

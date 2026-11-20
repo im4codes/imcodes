@@ -790,6 +790,13 @@ export class AgySdkProvider implements TransportProvider {
 
   // ── Stream parsing ─────────────────────────────────────────────────────────
 
+  private getAgySubagentTracker(sessionId: string, state: AgySessionState): AgySubagentTracker {
+    return state.subagents ??= new AgySubagentTracker(
+      state.conversationId ?? sessionId,
+      () => state.childModel ?? state.model,
+    );
+  }
+
   private handleLine(sessionId: string, state: AgySessionState, line: string): void | Promise<void> {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -802,7 +809,7 @@ export class AgySdkProvider implements TransportProvider {
     const event = asRecord(parsed);
     if (isSdkRuntimeSubagentEventName(event.event)) {
       if (state.cancelled) return;
-      for (const child of (state.subagents ??= new AgySubagentTracker(state.conversationId ?? sessionId)).snapshot(event)) {
+      for (const child of this.getAgySubagentTracker(sessionId, state).snapshot(event)) {
         for (const cb of this.toolCallCallbacks) cb(sessionId, child);
       }
       return;
@@ -970,7 +977,7 @@ export class AgySdkProvider implements TransportProvider {
         ...(done && output !== undefined ? { output } : {}),
       };
 
-      const tracker = state.subagents ??= new AgySubagentTracker(state.conversationId ?? sessionId);
+      const tracker = this.getAgySubagentTracker(sessionId, state);
       const children = tracker.tool(tool);
       for (const event of children.length ? children : [tool]) {
         for (const cb of this.toolCallCallbacks) cb(sessionId, event);

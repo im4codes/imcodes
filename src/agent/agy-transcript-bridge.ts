@@ -4,7 +4,7 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
 export interface AgyTranscriptRow {
-  step_index: number; type: string; status: string; source?: string; content?: string;
+  step_index: number; type: string; status: string; source?: string; content?: string; model?: string;
   tool_calls?: Array<{ name?: string; args?: unknown }>;
   input_tokens?: number; output_tokens?: number; cache_read_tokens?: number;
 }

@@ -1,7 +1,7 @@
 import type { ToolCallEvent } from '../../shared/agent-message.js';
 import { SDK_SUBAGENT_DETAIL_KIND, SDK_SUBAGENT_PROVIDERS, SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_SCHEMA_VERSION, SDK_SUBAGENT_STATUS, buildSdkSubagentSafeDetail, makeAgySubagentCanonicalKey,
-  type SdkSubagentNormalizedStatus } from '../../shared/sdk-subagent-status.js';
+  resolveSdkSubagentModel, type SdkSubagentNormalizedStatus } from '../../shared/sdk-subagent-status.js';
 
 const record = (v: unknown): Record<string, unknown> => {
   if (typeof v === 'string') { try { return record(JSON.parse(v)); } catch { return {}; } }
@@ -116,6 +116,22 @@ const extractToolTarget = (row: Record<string, unknown>): string | undefined => 
 
 interface Child { key: string; id: string; name?: string; model?: string; prompt?: string; started: number; state: SdkSubagentNormalizedStatus; toolId?: string; }
 
+function readAgyRowModel(row: Record<string, unknown>, previousModel?: string, parentModel?: string): string | undefined {
+  return resolveSdkSubagentModel([
+    row.model,
+    row.Model,
+    row.modelId,
+    row.model_id,
+    row.agentModel,
+    row.agent_model,
+    row.requestedModel,
+    row.requested_model,
+    row.activeModel,
+    row.active_model,
+    previousModel,
+  ], parentModel);
+}
+
 /** Shared AG tool/snapshot adapter. Parent tool completion is not proof that a
  * background child completed; explicit native child state/kill is authoritative.
  * Definition/list operations do not invent an active execution. */
@@ -124,7 +140,7 @@ export class AgySubagentTracker {
   private unbound = new Set<string>();
   private nativeChildren = new Set<string>();
   private toolChildren = new Map<string, string[]>();
-  constructor(private parent: string) {}
+  constructor(private parent: string, private getParentModel?: () => string | undefined) {}
 
   /** Number of child runs that are still genuinely active. */
   activeCount(): number {
@@ -189,7 +205,7 @@ export class AgySubagentTracker {
       if (previous && previous.state !== SDK_SUBAGENT_STATUS.RUNNING && normalized === SDK_SUBAGENT_STATUS.RUNNING) continue;
       const child: Child = { key: previous?.key ?? makeAgySubagentCanonicalKey(this.parent, id), id,
         name: string(row.role, row.Role, row.name, row.TypeName) ?? previous?.name,
-        model: string(row.model, row.Model) ?? previous?.model, prompt: previous?.prompt,
+        model: readAgyRowModel(row, previous?.model, this.getParentModel?.()), prompt: previous?.prompt,
         started: previous?.started ?? Date.now(), state: normalized, toolId: previous?.toolId ?? toolId };
       if (placeholder && placeholder !== id) this.children.delete(placeholder);
       if (placeholder) this.unbound.delete(placeholder);
@@ -248,7 +264,7 @@ export class AgySubagentTracker {
       const previous = this.children.get(id);
       const child: Child = { key: previous?.key ?? makeAgySubagentCanonicalKey(this.parent, id), id,
         name: string(row.Role, row.role, row.name, row.TypeName, row.type) ?? previous?.name,
-        model: string(row.Model, row.model) ?? previous?.model,
+        model: readAgyRowModel(row, previous?.model, this.getParentModel?.()),
         prompt: string(row.Prompt, row.prompt, row.description) ?? previous?.prompt,
         started: previous?.started ?? Date.now(), state: tool.status === 'error' ? SDK_SUBAGENT_STATUS.ERROR
           : kill && tool.status === 'complete' ? SDK_SUBAGENT_STATUS.INTERRUPTED

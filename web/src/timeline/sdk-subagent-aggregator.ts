@@ -322,17 +322,44 @@ function getRunningContribution(row: SdkSubagentStatusRow): number {
 }
 
 function suppressClaudeRuntimeFallbackRows(rows: RowState[]): RowState[] {
-  const structuredToolUseIds = new Set(
-    rows
-      .filter((row) => row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK && row.parentToolUseId)
-      .map((row) => row.parentToolUseId as string),
-  );
+  const fallbackByToolUseId = new Map<string, RowState>();
+  const structuredToolUseIds = new Set<string>();
+  for (const row of rows) {
+    if (row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT) {
+      const toolUseId = row.parentToolUseId ?? row.parentItemId;
+      if (toolUseId) fallbackByToolUseId.set(toolUseId, row);
+    } else if (row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK && row.parentToolUseId) {
+      structuredToolUseIds.add(row.parentToolUseId);
+    }
+  }
   if (structuredToolUseIds.size === 0) return rows;
-  return rows.filter((row) => {
-    if (row.providerKind !== SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT) return true;
-    const toolUseId = row.parentToolUseId ?? row.parentItemId;
-    return !toolUseId || !structuredToolUseIds.has(toolUseId);
+  return rows.flatMap((row) => {
+    if (row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT) {
+      const toolUseId = row.parentToolUseId ?? row.parentItemId;
+      return !toolUseId || !structuredToolUseIds.has(toolUseId) ? [row] : [];
+    }
+    if (row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK && row.parentToolUseId) {
+      const fallback = fallbackByToolUseId.get(row.parentToolUseId);
+      if (fallback) {
+        return [{
+          ...row,
+          model: row.model ?? fallback.model,
+          agentName: row.agentName ?? fallback.agentName,
+        }];
+      }
+    }
+    return [row];
   });
+}
+
+function mergeRowState(previous: RowState | undefined, next: RowState): RowState {
+  return {
+    ...next,
+    agentName: next.agentName ?? previous?.agentName,
+    model: next.model ?? previous?.model,
+    firstOrder: previous?.firstOrder ?? next.firstOrder,
+    startTs: mergeStartTs(previous, next),
+  };
 }
 
 export function deriveSdkSubagentStatusRows(
@@ -368,11 +395,7 @@ export function deriveSdkSubagentStatusRows(
       if (next) {
         const previous = rowsByCanonicalKey.get(next.canonicalKey);
         if (!(previous && isTerminalish(previous) && next.active && !isTerminalish(next))) {
-          rowsByCanonicalKey.set(next.canonicalKey, {
-            ...next,
-            firstOrder: previous?.firstOrder ?? next.firstOrder,
-            startTs: mergeStartTs(previous, next),
-          });
+          rowsByCanonicalKey.set(next.canonicalKey, mergeRowState(previous, next));
         }
       }
       const diagnostic = makeDiagnosticFromDetail(
@@ -395,11 +418,7 @@ export function deriveSdkSubagentStatusRows(
     if (previous && isTerminalish(previous) && next.active && !isTerminalish(next)) {
       return;
     }
-    rowsByCanonicalKey.set(next.canonicalKey, {
-      ...next,
-      firstOrder: previous?.firstOrder ?? next.firstOrder,
-      startTs: mergeStartTs(previous, next),
-    });
+    rowsByCanonicalKey.set(next.canonicalKey, mergeRowState(previous, next));
   });
 
   for (const [canonicalKey, row] of rowsByCanonicalKey.entries()) {

@@ -542,4 +542,67 @@ describe('deriveSdkSubagentStatusRows', () => {
       },
     ]);
   });
+
+  it('preserves model and agentName across later events omitting them and across Claude runtime suppression', () => {
+    const startWithModel = makeEvent('agy-start', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey: 'agy:conv-1:child-model',
+      agentName: 'Codebase Researcher',
+      model: 'gemini-4-hydrogen-high',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 10_000, seq: 1 });
+    const doneWithoutModel = makeEvent('agy-done', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+      canonicalKey: 'agy:conv-1:child-model',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }), { type: 'tool.result', ts: NOW - 2_000, seq: 2 });
+
+    const claudeFallback = makeEvent('claude-fb', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+      canonicalKey: 'claude:deck_main:runtime:tu-1',
+      parentToolUseId: 'tu-1',
+      agentName: 'Explore',
+      model: 'claude-haiku-4-5-20251001',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 5_000, seq: 3 });
+    const claudeTaskNoModel = makeEvent('claude-task', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+      canonicalKey: 'claude:deck_main:task-1',
+      parentToolUseId: 'tu-1',
+      taskId: 'task-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    }), { type: 'tool.result', ts: NOW - 1_000, seq: 4 });
+
+    const result = deriveSdkSubagentStatusRows([
+      startWithModel,
+      doneWithoutModel,
+      claudeFallback,
+      claudeTaskNoModel,
+    ], NOW);
+
+    expect(result.rows).toMatchObject([
+      {
+        canonicalKey: 'claude:deck_main:task-1',
+        agentName: 'Explore',
+        model: 'claude-haiku-4-5-20251001',
+      },
+      {
+        canonicalKey: 'agy:conv-1:child-model',
+        agentName: 'Codebase Researcher',
+        model: 'gemini-4-hydrogen-high',
+      },
+    ]);
+  });
 });

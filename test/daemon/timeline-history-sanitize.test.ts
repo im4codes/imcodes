@@ -567,4 +567,45 @@ describe('timeline history transport sanitization', () => {
     expect(JSON.stringify(result.events[0])).not.toContain('raw');
     expect(JSON.stringify(result.events[0])).not.toContain('description');
   });
+
+  it('retains sdkSubagent model and agentName across minimal history payload replay', () => {
+    const oversized = event({
+      eventId: 'sdk-minimal-model-replay',
+      type: 'tool.call',
+      ts: 100,
+      seq: 10,
+      hidden: true,
+      payload: {
+        tool: 'Agent',
+        output: 'z'.repeat(20 * 1024),
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: 'Antigravity sub-agent Codebase Researcher',
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+            canonicalKey: 'agy:parent:child-1',
+            normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+            active: true,
+            terminal: false,
+            agentName: 'Codebase Researcher',
+            model: 'gemini-4-hydrogen-high',
+          },
+        },
+      },
+    });
+
+    const result = sanitizeTimelineHistoryEventsForTransport([oversized]);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.payload.detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      meta: {
+        canonicalKey: 'agy:parent:child-1',
+        agentName: 'Codebase Researcher',
+        model: 'gemini-4-hydrogen-high',
+      },
+    });
+  });
 });

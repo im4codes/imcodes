@@ -210,4 +210,63 @@ describe('AG native child lifecycle adapter', () => {
     expect(tracker.activeCount()).toBe(1);
   });
 
+  it('resolves AG sub-agent model aliases, inherits parent active model without overwriting existing runs, and refines from child updates', () => {
+    let parentModel: string | undefined;
+    const tracker = new AgySubagentTracker('parent', () => parentModel);
+
+    // 1. inherit with unknown parent model keeps meta.model undefined (never renders "inherit").
+    const unknownParent = tracker.tool({
+      id: 'launch-unknown-parent',
+      name: 'invoke_subagent',
+      status: 'running',
+      input: { Role: 'Researcher', Model: 'inherit', Prompt: 'inspect' },
+    })[0];
+    expect(unknownParent.detail?.meta?.model).toBeUndefined();
+
+    // 2. Parent model becomes known -> newly launched omitted/default child resolves to parentModel.
+    parentModel = 'gemini-4-pro-high';
+    const inheritedChild = tracker.tool({
+      id: 'launch-inherited',
+      name: 'invoke_subagent',
+      status: 'running',
+      input: { Role: 'Explorer', Model: 'default', Prompt: 'explore' },
+    })[0];
+    expect(inheritedChild.detail?.meta?.model).toBe('gemini-4-pro-high');
+
+    const boundInherited = tracker.tool({
+      id: 'launch-inherited',
+      name: 'invoke_subagent',
+      status: 'complete',
+      output: JSON.stringify({ conversationId: 'conv-inherited', status: 'running' }),
+    })[0];
+    expect(boundInherited.detail?.meta?.model).toBe('gemini-4-pro-high');
+
+    // 3. Explicit alias field overrides parentModel.
+    const aliasedChild = tracker.tool({
+      id: 'launch-aliased',
+      name: 'invoke_subagent',
+      status: 'running',
+      input: { Role: 'Fast', modelId: 'gemini-4-flash', Prompt: 'quick' },
+    })[0];
+    expect(aliasedChild.detail?.meta?.model).toBe('gemini-4-flash');
+
+    // 4. Switching parent model mid-session does NOT overwrite already-started child's captured launch model.
+    parentModel = 'gemini-4-argon-high';
+    const progressInherited = tracker.snapshot({ conversationId: 'conv-inherited', status: 'running' })[0];
+    expect(progressInherited.detail?.meta?.model).toBe('gemini-4-pro-high');
+
+    // 5. Explicit model reported in later child snapshot (e.g., transcript PLANNER_RESPONSE.model) refines it.
+    const refined = tracker.snapshot({ conversationId: 'conv-inherited', status: 'completed', model: 'gemini-4-hydrogen-high' })[0];
+    expect(refined.detail?.meta?.model).toBe('gemini-4-hydrogen-high');
+
+    // 6. Newly started child after parent switch picks up new parentModel.
+    const newerChild = tracker.tool({
+      id: 'launch-newer',
+      name: 'invoke_subagent',
+      status: 'running',
+      input: { Role: 'Reviewer', Prompt: 'review' },
+    })[0];
+    expect(newerChild.detail?.meta?.model).toBe('gemini-4-argon-high');
+  });
+
 });

@@ -188,6 +188,38 @@ describe('AG native ACP', () => {
     expect(one[0].id).not.toBe(two[0].id);
     expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe('complete');
     expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe('error');
+    expect(child.some(t => t.detail?.meta?.model === 'model-a')).toBe(true);
+
+    // Active child transcript PLANNER_RESPONSE model overrides inherited model cleanly.
+    const state = (provider as any).sessions.get(id);
+    (provider as any).handleSessionUpdate({
+      sessionId: state.acpSessionId,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'launch-transcript-model',
+        title: 'Run invoke_subagent',
+        status: 'completed',
+        rawInput: { Role: 'TranscriptChild', Prompt: 'inspect' },
+        rawOutput: JSON.stringify({ conversationId: 'child-transcript-active', status: 'running' }),
+      },
+    });
+    expect(events.at(-1)?.detail?.meta).toMatchObject({
+      agentPath: 'child-transcript-active',
+      model: 'model-a',
+      active: true,
+    });
+    (provider as any).handleAgyTranscriptRow(id, state, 'child-transcript-active', {
+      step_index: 10,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      model: 'gemini-4-hydrogen-high',
+      tool_calls: [{ name: 'read_file', args: {} }],
+    });
+    expect(events.at(-1)?.detail?.meta).toMatchObject({
+      agentPath: 'child-transcript-active',
+      model: 'gemini-4-hydrogen-high',
+      active: true,
+    });
 
   });
   it.each(['acp-child-json','acp-child-text','acp-child-inline','acp-child-update-only'])('tracks ACP-only launch results through real child and parent transcript callbacks (%s)',async scenario=>{

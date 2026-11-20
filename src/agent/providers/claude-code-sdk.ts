@@ -79,6 +79,7 @@ import {
   buildSdkSubagentSafeDetail,
   makeClaudeSubagentCanonicalKey,
   readSdkSubagentStartedAtMs,
+  resolveSdkSubagentModel,
   sanitizeSdkSubagentText,
   sdkSubagentDedupSignature,
   type SdkSubagentDetail,
@@ -225,6 +226,9 @@ interface ClaudeSdkSessionState {
   retainedSubagentMode: boolean;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string; startedAtMs: number }>;
+  modelByToolUseId: Map<string, string>;
+  streamModelByToolUseId: Map<string, string>;
+  runtimeSubagentModelsByKey: Map<string, string>;
   runtimeSubagentStartedAtByKey: Map<string, number>;
   emittedToolStates: Map<string, string>;
   subagentTasks: Map<string, ClaudeTaskState>;
@@ -661,6 +665,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       retainedSubagentMode: false,
       toolCalls: new Map(),
       runtimeAgentToolCalls: new Map(),
+      modelByToolUseId: existing?.modelByToolUseId ?? new Map(),
+      streamModelByToolUseId: existing?.streamModelByToolUseId ?? new Map(),
+      runtimeSubagentModelsByKey: existing?.runtimeSubagentModelsByKey ?? new Map(),
       runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       emittedToolStates: new Map(),
       subagentTasks: existing?.subagentTasks ?? new Map(),
@@ -1619,6 +1626,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         if (msg.parent_tool_use_id == null) {
           state.currentText = '';
           state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        } else {
+          this.recordClaudeChildStreamModel(
+            sessionId,
+            state,
+            this.pickString(msg.parent_tool_use_id),
+            this.pickShortString(event.message?.model),
+          );
         }
         // Anthropic-compatible streaming responses publish the authoritative
         // prompt-cache split on message_start. MiniMax follows that contract,
@@ -1747,7 +1761,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // Subagent lifecycle/progress is projected through the dedicated task
       // snapshots; its private assistant text and internal tool blocks must
       // never mutate or render as the foreground assistant message.
-      if (!isTopLevelMessage) return;
+      if (!isTopLevelMessage) {
+        this.recordClaudeChildStreamModel(
+          sessionId,
+          state,
+          this.pickString(msg.parent_tool_use_id),
+          this.pickShortString(msg.message?.model),
+        );
+        return;
+      }
       const assistantMessageId = typeof msg.message?.id === 'string' && msg.message.id
         ? msg.message.id
         : undefined;
@@ -2217,12 +2239,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         if (spawnDepth > 1) task.nested = true;
       }
       task.description = this.pickShortString(msg.description) ?? task.description;
-      task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
+      task.model = this.resolveClaudeTaskModel(state, task, this.readRuntimeSubagentModel(msg));
       task.workflowName = this.pickShortString(msg.workflow_name) ?? task.workflowName;
       this.applyClaudeTaskStatus(task, 'running');
     } else if (msg.subtype === 'task_progress') {
       task.description = this.pickShortString(msg.description) ?? task.description;
-      task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
+      task.model = this.resolveClaudeTaskModel(state, task, this.readRuntimeSubagentModel(msg));
       task.summary = this.pickShortString(msg.summary) ?? task.summary;
       task.lastToolName = this.pickShortString(msg.last_tool_name) ?? task.lastToolName;
       task.usage = this.normalizeClaudeTaskUsage(msg.usage) ?? task.usage;
@@ -2230,7 +2252,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     } else if (msg.subtype === 'task_updated') {
       const patch = this.asRecord(msg.patch);
       task.description = this.pickShortString(patch?.description) ?? task.description;
-      task.model = this.readRuntimeSubagentModel(patch ?? {}) ?? task.model;
+      task.model = this.resolveClaudeTaskModel(state, task, this.readRuntimeSubagentModel(patch ?? {}));
       task.error = this.pickShortString(patch?.error) ?? task.error;
       if (typeof patch?.is_backgrounded === 'boolean') task.backgrounded = patch.is_backgrounded;
       this.applyClaudeTaskStatus(task, this.pickString(patch?.status));
@@ -2243,7 +2265,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // of allowing rejected status metadata to overwrite the visible result.
       if (statusAccepted) {
         task.summary = this.pickShortString(msg.summary) ?? task.summary;
-        task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
+        task.model = this.resolveClaudeTaskModel(state, task, this.readRuntimeSubagentModel(msg));
         task.outputFile = this.pickShortString(msg.output_file) ?? task.outputFile;
         task.usage = this.normalizeClaudeTaskUsage(msg.usage) ?? task.usage;
       }
@@ -2256,7 +2278,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     // TransportSessionRuntime treats the row as a foreground open tool and
     // synthesizes a false success when the parent turn settles, even though the
     // background process is still running.
-    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) task.backgrounded = true;
+    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) {
+      task.backgrounded = true;
+      task.model = undefined;
+    }
 
     if (task.terminal && !task.parentWakeHandled) {
       task.parentWakeHandled = true;
@@ -2388,7 +2413,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const statusMapping = this.normalizeClaudeRuntimeSubagentStatus(rawStatus, missingIdDiagnostic);
     const canonicalKey = makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
     const agentName = this.readRuntimeSubagentName(record);
-    const model = this.readRuntimeSubagentModel(record);
+    const model = resolveSdkSubagentModel(
+      [this.readRuntimeSubagentModel(record), state.runtimeSubagentModelsByKey.get(canonicalKey)],
+      state.model,
+    );
+    if (model) state.runtimeSubagentModelsByKey.set(canonicalKey, model);
     const prompt = this.readRuntimeSubagentPrompt(record);
     const backgrounded = this.readRuntimeSubagentBackgrounded(record);
     const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
@@ -2474,11 +2503,59 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private readRuntimeSubagentModel(record: Record<string, unknown>): string | undefined {
-    return this.pickShortString(record.model)
-      ?? this.pickShortString(record.agentModel)
-      ?? this.pickShortString(record.agent_model)
-      ?? this.pickShortString(record.modelId)
-      ?? this.pickShortString(record.model_id);
+    return resolveSdkSubagentModel([
+      record.model,
+      record.Model,
+      record.agentModel,
+      record.agent_model,
+      record.modelId,
+      record.model_id,
+      record.requestedModel,
+      record.requested_model,
+      record.activeModel,
+      record.active_model,
+    ]);
+  }
+
+  private resolveClaudeTaskModel(
+    state: ClaudeSdkSessionState,
+    task: ClaudeTaskState,
+    explicitModel?: string,
+  ): string | undefined {
+    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) return undefined;
+    const streamModel = task.toolUseId ? state.streamModelByToolUseId.get(task.toolUseId) : undefined;
+    const cachedToolModel = task.toolUseId ? state.modelByToolUseId.get(task.toolUseId) : undefined;
+    const resolved = resolveSdkSubagentModel(
+      [streamModel, explicitModel, cachedToolModel, task.model],
+      state.model,
+    );
+    if (resolved && task.toolUseId) state.modelByToolUseId.set(task.toolUseId, resolved);
+    return resolved;
+  }
+
+  private recordClaudeChildStreamModel(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    parentToolUseId: string | undefined,
+    rawModel: string | undefined,
+  ): void {
+    if (!parentToolUseId) return;
+    const childModel = resolveSdkSubagentModel([rawModel]);
+    if (!childModel) return;
+    state.streamModelByToolUseId.set(parentToolUseId, childModel);
+    state.modelByToolUseId.set(parentToolUseId, childModel);
+    const runtimeCall = state.runtimeAgentToolCalls.get(parentToolUseId);
+    if (runtimeCall && runtimeCall.model !== childModel) {
+      runtimeCall.model = childModel;
+      this.emitClaudeRuntimeAgentToolSnapshot(sessionId, state, parentToolUseId, runtimeCall, 'running');
+    }
+    for (const task of state.subagentTasks.values()) {
+      if (task.toolUseId !== parentToolUseId || task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) continue;
+      if (task.model !== childModel) {
+        task.model = childModel;
+        this.emitClaudeSubagentSnapshot(sessionId, state, task);
+      }
+    }
   }
 
   private readRuntimeSubagentStatus(record: Record<string, unknown>): string | undefined {
@@ -2693,7 +2770,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     for (const [taskId, task] of state.subagentTasks) {
       if (task.terminal || !task.active) {
         state.subagentTasks.delete(taskId);
-        if (task.toolUseId) state.nestedClaudeToolUseIds.delete(task.toolUseId);
+        if (task.toolUseId) {
+          state.nestedClaudeToolUseIds.delete(task.toolUseId);
+          state.modelByToolUseId.delete(task.toolUseId);
+          state.streamModelByToolUseId.delete(task.toolUseId);
+        }
       }
     }
   }
@@ -2791,39 +2872,56 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const existing = state.runtimeAgentToolCalls.get(tool.id);
     if (!existing && status !== 'running') return;
     const agentPath = existing?.agentPath ?? tool.id;
-    const prompt = existing?.prompt ?? this.readRuntimeSubagentPrompt(input ?? {});
-    const agentName = existing?.agentName
-      ?? this.pickShortString(input?.subagent_type)
+    const prompt = this.readRuntimeSubagentPrompt(input ?? {}) ?? existing?.prompt;
+    const agentName = this.pickShortString(input?.subagent_type)
       ?? this.pickShortString(input?.agent_type)
       ?? this.pickShortString(input?.type)
-      ?? this.pickShortString(input?.name);
-    const model = existing?.model ?? this.readRuntimeSubagentModel(input ?? {});
-    const canonicalKey = existing?.canonicalKey
-      ?? makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
-    const startedAtMs = existing?.startedAtMs ?? Date.now();
-    if (status === 'running' && !existing) {
-      state.runtimeAgentToolCalls.set(tool.id, {
-        canonicalKey,
-        agentPath,
-        startedAtMs,
-        ...(agentName ? { agentName } : {}),
-        ...(model ? { model } : {}),
-        ...(prompt ? { prompt } : {}),
-      });
+      ?? this.pickShortString(input?.name)
+      ?? existing?.agentName;
+    const streamModel = state.streamModelByToolUseId.get(tool.id);
+    const inputModel = this.readRuntimeSubagentModel(input ?? {});
+    const model = resolveSdkSubagentModel(
+      [streamModel, inputModel, existing?.model, state.modelByToolUseId.get(tool.id)],
+      state.model,
+    );
+    if (model) state.modelByToolUseId.set(tool.id, model);
+    const entry = {
+      canonicalKey: existing?.canonicalKey
+        ?? makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`),
+      agentPath,
+      startedAtMs: existing?.startedAtMs ?? Date.now(),
+      ...(agentName ? { agentName } : {}),
+      ...(model ? { model } : {}),
+      ...(prompt ? { prompt } : {}),
+    };
+    if (status === 'running') {
+      state.runtimeAgentToolCalls.set(tool.id, entry);
     }
+    this.emitClaudeRuntimeAgentToolSnapshot(sessionId, state, tool.id, entry, status, tool.output);
+    if (status !== 'running') state.runtimeAgentToolCalls.delete(tool.id);
+  }
+
+  private emitClaudeRuntimeAgentToolSnapshot(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    toolId: string,
+    entry: { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string; startedAtMs: number },
+    status: 'running' | 'complete' | 'error',
+    toolOutput?: unknown,
+  ): void {
     const rawStatus = status === 'running' ? 'running' : status === 'complete' ? 'completed' : 'failed';
-    const output = status === 'running' ? undefined : sanitizeSdkSubagentText(tool.output) ?? rawStatus;
+    const output = status === 'running' ? undefined : sanitizeSdkSubagentText(toolOutput) ?? rawStatus;
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
-      summary: agentName ? `Claude sub-agent ${agentName}` : `Claude sub-agent ${agentPath}`,
-      ...(prompt ? { input: { action: 'claude-agent-tool', description: prompt } } : {}),
+      summary: entry.agentName ? `Claude sub-agent ${entry.agentName}` : `Claude sub-agent ${entry.agentPath}`,
+      ...(entry.prompt ? { input: { action: 'claude-agent-tool', description: entry.prompt } } : {}),
       ...(output ? { output } : {}),
       meta: {
         isSdkSubagent: true,
         schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
         provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
         providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
-        canonicalKey,
+        canonicalKey: entry.canonicalKey,
         normalizedStatus: status === 'running'
           ? SDK_SUBAGENT_STATUS.RUNNING
           : status === 'complete'
@@ -2833,23 +2931,22 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         active: status === 'running',
         terminal: status !== 'running',
         parentSessionId: state.resumeId,
-        parentToolUseId: tool.id,
-        parentItemId: tool.id,
-        agentPath,
-        ...(agentName ? { agentName } : {}),
-        ...(model ? { model } : {}),
-        startedAtMs,
+        parentToolUseId: toolId,
+        parentItemId: toolId,
+        agentPath: entry.agentPath,
+        ...(entry.agentName ? { agentName: entry.agentName } : {}),
+        ...(entry.model ? { model: entry.model } : {}),
+        startedAtMs: entry.startedAtMs,
       },
     } satisfies SdkSubagentDetail, { allowRaw: false });
     this.emitSubagentToolCall(sessionId, state, {
-      id: canonicalKey,
+      id: entry.canonicalKey,
       name: 'Agent',
       status: status === 'running' ? 'running' : status === 'complete' ? 'complete' : 'error',
       ...(detail.input ? { input: detail.input } : {}),
       ...(detail.output ? { output: detail.output } : {}),
       detail,
     });
-    if (status !== 'running') state.runtimeAgentToolCalls.delete(tool.id);
   }
 
   private applyClaudeTaskStatus(task: ClaudeTaskState, rawStatus: string | undefined): boolean {
@@ -3027,7 +3124,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ...(task.lastToolName ? { lastToolName: task.lastToolName } : {}),
       ...(task.taskType ? { taskType: task.taskType } : {}),
       ...(task.workflowName ? { workflowName: task.workflowName } : {}),
-      ...(task.model ? { model: task.model } : {}),
+      ...(task.taskType !== CLAUDE_LOCAL_BASH_TASK_TYPE && task.model ? { model: task.model } : {}),
       ...(typeof task.backgrounded === 'boolean' ? { backgrounded: task.backgrounded } : {}),
       startedAtMs: task.startedAtMs,
       ...(task.usage?.total_tokens !== undefined ? { usageTotalTokens: task.usage.total_tokens } : {}),

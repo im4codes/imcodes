@@ -1406,6 +1406,13 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.sessions.get(sessionId) !== state || state.cancelled) bridge.close();
   }
 
+  private getAgySubagentTracker(sessionId: string, state: KimiSdkSessionState): AgySubagentTracker {
+    return state.agySubagents ??= new AgySubagentTracker(
+      state.acpSessionId ?? sessionId,
+      () => (this.profile.strictModelSelection ? (state.turnModel ?? state.confirmedModel ?? state.model) : state.model),
+    );
+  }
+
   private publishAgySubagents(sessionId: string, state: KimiSdkSessionState, events: ToolCallEvent[]): void {
     for (const event of events) {
       for (const cb of this.toolCallCallbacks) cb(sessionId, event);
@@ -1419,24 +1426,34 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   private handleAgyTranscriptRow(sessionId: string, state: KimiSdkSessionState, nativeId: string, row: AgyTranscriptRow, cursor?: AgyTranscriptCursor): void {
-    const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
+    const tracker = this.getAgySubagentTracker(sessionId, state);
     const publish = (events: ToolCallEvent[]) => this.publishAgySubagents(sessionId, state, events);
     if (nativeId !== state.acpSessionId) {
       if (row.status === 'RUNNING') return;
+      const rowModel = typeof row.model === 'string' && row.model.trim() ? row.model.trim() : undefined;
       if (row.type === 'SYSTEM_ERROR' || row.status === 'ERROR') {
         publish(tracker.snapshot(
-          { conversationId: nativeId, status: 'error', ...(row.content?.trim() ? { stateDetail: row.content } : {}) },
+          { conversationId: nativeId, status: 'error', ...(rowModel ? { model: rowModel } : {}), ...(row.content?.trim() ? { stateDetail: row.content } : {}) },
           'native_error',
         ));
         state.agyBridges?.get(nativeId)?.close();
         return;
       }
-      if (row.type === 'PLANNER_RESPONSE' && !row.tool_calls?.length) {
+      if (row.type === 'PLANNER_RESPONSE') {
+        if (row.tool_calls?.length) {
+          if (rowModel) {
+            publish(tracker.snapshot(
+              { conversationId: nativeId, status: 'running', model: rowModel },
+              'native_progress',
+            ));
+          }
+          return;
+        }
         const terminalStatus = row.status === 'CANCELLED' || row.status === 'CANCELED' || row.status === 'INTERRUPTED'
           ? 'cancelled'
           : 'completed';
         publish(tracker.snapshot(
-          { conversationId: nativeId, status: terminalStatus, ...(row.content?.trim() ? { stateDetail: row.content } : {}) },
+          { conversationId: nativeId, status: terminalStatus, ...(rowModel ? { model: rowModel } : {}), ...(row.content?.trim() ? { stateDetail: row.content } : {}) },
           terminalStatus === 'cancelled' ? 'native_cancelled' : 'native_completion',
         ));
         state.agyBridges?.get(nativeId)?.close(); // Retain cursor for an explicit send_message reuse, never replay its old completion.
@@ -3571,7 +3588,7 @@ export class KimiSdkProvider implements TransportProvider {
     const updateRecord = update as unknown as Record<string, unknown>;
     if (this.id === AGY_SDK_PROVIDER_ID && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
       this.publishAgySubagents(routeId, state,
-        (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? routeId)).snapshot(updateRecord));
+        this.getAgySubagentTracker(routeId, state).snapshot(updateRecord));
       return;
     }
     if (this.profile.runtimeSubagent && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
@@ -3720,7 +3737,7 @@ export class KimiSdkProvider implements TransportProvider {
       const child = parseSdkRuntimeSubagentTag(chunkText);
       if (child) {
         this.publishAgySubagents(sessionId, state,
-          (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId)).snapshot(child));
+          this.getAgySubagentTracker(sessionId, state).snapshot(child));
         return;
       }
       if (startsWithSdkRuntimeSubagentTag(chunkText)) return;
@@ -3870,7 +3887,7 @@ export class KimiSdkProvider implements TransportProvider {
     };
     if (this.id === AGY_SDK_PROVIDER_ID) {
       if (/^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title))) this.useAgyNativeOutput(state, merged.toolCallId);
-      const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
+      const tracker = this.getAgySubagentTracker(sessionId, state);
       const outputValue = normalizedStatus === 'running'
         ? undefined
         : (merged.rawOutput !== undefined

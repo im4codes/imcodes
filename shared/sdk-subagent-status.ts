@@ -366,7 +366,18 @@ export function buildGenericRuntimeSubagentTool(options: GenericRuntimeSubagentT
     || record.is_backgrounded === true
     || record.background === true;
   const agentName = sanitizeSdkSubagentText(record.name ?? record.nickname, 80);
-  const model = sanitizeSdkSubagentText(record.model ?? options.fallbackModel, 120);
+  const model = resolveSdkSubagentModel([
+    record.model,
+    record.Model,
+    record.modelId,
+    record.model_id,
+    record.agentModel,
+    record.agent_model,
+    record.requestedModel,
+    record.requested_model,
+    record.activeModel,
+    record.active_model,
+  ], options.fallbackModel);
   const prompt = sanitizeSdkSubagentText(record.prompt ?? record.description);
   const fullRequest = readSdkSubagentFullRequest(record);
   const canonicalKey = normalizeSdkSubagentCanonicalKey(
@@ -495,6 +506,23 @@ export function sanitizeSdkSubagentText(value: unknown, maxLength = SDK_SUBAGENT
   if (!normalized) return undefined;
   const redacted = normalized.replace(SENSITIVE_TEXT_RE, SDK_SUBAGENT_REDACTED_VALUE);
   return redacted.length <= maxLength ? redacted : `${redacted.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+const SUBAGENT_INHERIT_MODEL_RE = /^(?:inherit|default|auto)$/i;
+
+/** Resolves a concrete sub-agent model id from candidate fields, ignoring inherit/default placeholders. */
+export function resolveSdkSubagentModel(
+  candidates: readonly unknown[],
+  fallbackModel?: unknown,
+): string | undefined {
+  for (const candidate of candidates) {
+    const normalized = sanitizeSdkSubagentText(candidate, 120);
+    if (!normalized || SUBAGENT_INHERIT_MODEL_RE.test(normalized)) continue;
+    return normalized;
+  }
+  const fallback = sanitizeSdkSubagentText(fallbackModel, 120);
+  if (!fallback || SUBAGENT_INHERIT_MODEL_RE.test(fallback)) return undefined;
+  return fallback;
 }
 
 function safeFiniteNumber(value: unknown, max = Number.MAX_SAFE_INTEGER): number | undefined {
@@ -678,6 +706,8 @@ export function buildSdkSubagentMinimalReplayDetail(detail: SdkSubagentDetail): 
       ...(typeof safe.meta.receiverCount === 'number' ? { receiverCount: safe.meta.receiverCount } : {}),
       ...(typeof safe.meta.runningChildCount === 'number' ? { runningChildCount: safe.meta.runningChildCount } : {}),
       ...(typeof safe.meta.startedAtMs === 'number' ? { startedAtMs: safe.meta.startedAtMs } : {}),
+      ...(safe.meta.agentName ? { agentName: safe.meta.agentName } : {}),
+      ...(safe.meta.model ? { model: safe.meta.model } : {}),
       ...(safe.meta.rawStatus ? { rawStatus: safe.meta.rawStatus } : {}),
       ...(safe.meta.childStatusSummary ? { childStatusSummary: safe.meta.childStatusSummary } : {}),
     },

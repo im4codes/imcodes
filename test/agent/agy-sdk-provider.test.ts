@@ -1135,6 +1135,7 @@ describe('AgySdkProvider (fake agy process)', () => {
         active: true,
         terminal: false,
         backgrounded: true,
+        model: 'gemini-4-hydrogen-high',
       },
     });
   });

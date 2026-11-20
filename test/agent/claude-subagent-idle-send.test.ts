@@ -1042,4 +1042,167 @@ describe('claude-code-sdk — sending while only a subagent runs', () => {
     expect(provider.getSessionDiagnostics('route-drained-child-old-result')?.currentQueryActive).toBe(false);
     await provider.endSession('route-drained-child-old-result');
   });
+
+  it('resolves Claude native subagent models across Agent fallback, task lifecycle, child stream frames, parent switches, and excludes local_bash', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: SESSION, model: 'claude-sonnet-4-6' },
+      // 1. Agent without explicit model falls back to parent model and transfers to task_started / task_notification.
+      {
+        type: 'assistant',
+        session_id: SESSION,
+        parent_tool_use_id: null,
+        message: {
+          content: [{ type: 'tool_use', id: 'tu-inherit', name: 'Agent', input: { subagent_type: 'Explore', model: 'inherit', prompt: 'scan repo' } }],
+          stop_reason: 'tool_use',
+        },
+      },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: SESSION,
+        task_id: 'task-inherit',
+        tool_use_id: 'tu-inherit',
+        task_type: 'local_agent',
+        description: 'scan repo',
+      },
+      // 2. Streaming Agent starts empty {} (takes parent model), then assistant provides model: 'haiku', then child stream refines to full API model without leaking deltas/tools.
+      {
+        type: 'stream_event',
+        session_id: SESSION,
+        parent_tool_use_id: null,
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'tu-child-stream', name: 'Agent', input: {} },
+        },
+      },
+      {
+        type: 'assistant',
+        session_id: SESSION,
+        parent_tool_use_id: null,
+        message: {
+          content: [{ type: 'tool_use', id: 'tu-child-stream', name: 'Agent', input: { subagent_type: 'Research', model: 'haiku', prompt: 'check api' } }],
+          stop_reason: 'tool_use',
+        },
+      },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: SESSION,
+        task_id: 'task-child-stream',
+        tool_use_id: 'tu-child-stream',
+        task_type: 'local_agent',
+        description: 'check api',
+      },
+      {
+        type: 'stream_event',
+        session_id: SESSION,
+        parent_tool_use_id: 'tu-child-stream',
+        event: {
+          type: 'message_start',
+          message: { id: 'child-msg-1', model: 'claude-haiku-4-5-20251001', usage: { input_tokens: 10, output_tokens: 1 } },
+        },
+      },
+      {
+        type: 'stream_event',
+        session_id: SESSION,
+        parent_tool_use_id: 'tu-child-stream',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'child-internal-bash', name: 'Bash', input: { command: 'ls' } },
+        },
+      },
+      {
+        type: 'stream_event',
+        session_id: SESSION,
+        parent_tool_use_id: 'tu-child-stream',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'LEAKED_CHILD_TEXT' } },
+      },
+      {
+        type: 'assistant',
+        session_id: SESSION,
+        parent_tool_use_id: 'tu-child-stream',
+        message: {
+          id: 'child-msg-2',
+          model: 'claude-haiku-4-5-20251001',
+          content: [{ type: 'text', text: 'LEAKED_CHILD_ASSISTANT' }],
+        },
+      },
+      // 3. local_bash background task must NEVER receive an LLM model.
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: SESSION,
+        task_id: 'task-bash',
+        tool_use_id: 'tu-bash',
+        task_type: 'local_bash',
+        description: 'npm test',
+      },
+      // 4. Parent switches model mid-session; task-inherit must keep its captured claude-sonnet-4-6, while new task picks up claude-opus-4-6.
+      { type: 'system', subtype: 'init', session_id: SESSION, model: 'claude-opus-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: SESSION,
+        task_id: 'task-inherit',
+        tool_use_id: 'tu-inherit',
+        status: 'completed',
+        summary: 'Inherited scan done',
+      },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: SESSION,
+        task_id: 'task-new-opus',
+        tool_use_id: 'tu-new-opus',
+        task_type: 'local_agent',
+        description: 'deep analysis',
+      },
+      {
+        type: 'assistant',
+        session_id: SESSION,
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Foreground finished cleanly.' }], stop_reason: 'end_turn' },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    const tools: Array<Record<string, any>> = [];
+    const deltas: string[] = [];
+    provider.onToolCall((_sid, tool) => tools.push(tool as Record<string, any>));
+    provider.onDelta((_sid, delta) => deltas.push(String(delta.delta ?? '')));
+
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-claude-subagent-models',
+      sessionName: 'deck_project_claude_subagent_models',
+      cwd: '/tmp/project',
+      resumeId: SESSION,
+    } as never);
+    await provider.send('route-claude-subagent-models', 'run agents');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // Verify no child deltas or internal child tools leaked to foreground.
+    expect(deltas.some((d) => d.includes('LEAKED_CHILD'))).toBe(false);
+    expect(tools.some((t) => t.id === 'child-internal-bash')).toBe(false);
+
+    const sdkEvents = tools.filter((t) => t.detail?.kind === 'sdkSubagent');
+    const inheritStarted = sdkEvents.find((t) => t.detail?.meta?.taskId === 'task-inherit' && t.detail?.meta?.active === true);
+    const inheritDone = sdkEvents.find((t) => t.detail?.meta?.taskId === 'task-inherit' && t.detail?.meta?.terminal === true);
+    expect(inheritStarted?.detail?.meta?.model).toBe('claude-sonnet-4-6');
+    expect(inheritDone?.detail?.meta?.model).toBe('claude-sonnet-4-6');
+
+    const childStreamTasks = sdkEvents.filter((t) => t.detail?.meta?.taskId === 'task-child-stream');
+    expect(childStreamTasks[0]?.detail?.meta?.model).toBe('haiku');
+    expect(childStreamTasks.at(-1)?.detail?.meta?.model).toBe('claude-haiku-4-5-20251001');
+
+    const bashTask = sdkEvents.find((t) => t.detail?.meta?.taskId === 'task-bash');
+    expect(bashTask?.detail?.meta?.model).toBeUndefined();
+
+    const newOpusTask = sdkEvents.find((t) => t.detail?.meta?.taskId === 'task-new-opus');
+    expect(newOpusTask?.detail?.meta?.model).toBe('claude-opus-4-6');
+
+    await provider.endSession('route-claude-subagent-models');
+  });
 });
