@@ -1250,5 +1250,112 @@ describe('push preferences and registration routes', () => {
         fetchSpy.mockRestore();
       }
     });
+
+    it('P0-4: sends PUSH_RELAY_CLIENT_SECRET with redirect:error to explicitly configured PUSH_RELAY_URL, authenticates end-to-end against POST /api/push/relay, and never leaks secret to default app.im.codes', async () => {
+      const relayApp = new Hono();
+      relayApp.use('/*', async (c, next) => {
+        (c as any).set('clientIp', '203.0.113.44');
+        (c as any).env = {
+          DB: mockDb,
+          PUSH_RELAY_SECRET: 'shared-relay-secret-v1',
+          JPUSH_APP_KEY: 'relay-jpush-key',
+          JPUSH_MASTER_SECRET: 'relay-jpush-secret',
+        };
+        return next();
+      });
+      relayApp.route('/api/push', pushRoutes);
+
+      const seenCalls: Array<{ url: string; auth: string | null; redirect: string | undefined; relayStatus?: number }> = [];
+      const originalFetch = globalThis.fetch;
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        const url = String(input);
+        const headers = new Headers(init?.headers);
+        const auth = headers.get('Authorization');
+        if (url === 'https://relay.example.test/api/push/relay') {
+          const relayRes = await relayApp.request('/api/push/relay', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(auth ? { Authorization: auth } : {}),
+            },
+            body: typeof init?.body === 'string' ? init.body : undefined,
+          });
+          seenCalls.push({ url, auth, redirect: init?.redirect, relayStatus: relayRes.status });
+          return relayRes;
+        }
+        if (url.includes('api.jpush.cn')) {
+          return new Response(JSON.stringify({ sendno: '1', msg_id: 'ok-1' }), { status: 200 });
+        }
+        seenCalls.push({ url, auth, redirect: init?.redirect });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      });
+
+      const validPushRow = {
+        token: 'jpush-reg-end2end-1',
+        platform: PUSH_PLATFORM_ANDROID_JPUSH,
+        notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+        push_enabled_server_ids: ['srv-relay-1'],
+        push_notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+      };
+
+      try {
+        // 1. Matching PUSH_RELAY_CLIENT_SECRET authenticates cleanly against PUSH_RELAY_SECRET
+        mockDb.query.mockResolvedValueOnce([validPushRow]);
+        mockDb.query.mockResolvedValueOnce([{ badge_count: 1 }]);
+        await dispatchPush(
+          { userId: 'u-relay', serverId: 'srv-relay-1', title: 'Hi', body: 'Matched', type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE },
+          {
+            DB: mockDb as any,
+            PUSH_RELAY_URL: 'https://relay.example.test/',
+            PUSH_RELAY_CLIENT_SECRET: 'shared-relay-secret-v1',
+          } as any,
+        );
+        expect(seenCalls[0]).toMatchObject({
+          url: 'https://relay.example.test/api/push/relay',
+          auth: 'Bearer shared-relay-secret-v1',
+          redirect: 'error',
+          relayStatus: 200,
+        });
+
+        // 2. Mismatched PUSH_RELAY_CLIENT_SECRET is rejected (401) by relay endpoint
+        seenCalls.length = 0;
+        mockDb.query.mockResolvedValueOnce([validPushRow]);
+        mockDb.query.mockResolvedValueOnce([{ badge_count: 2 }]);
+        await dispatchPush(
+          { userId: 'u-relay', serverId: 'srv-relay-1', title: 'Hi', body: 'Mismatch', type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE },
+          {
+            DB: mockDb as any,
+            PUSH_RELAY_URL: 'https://relay.example.test',
+            PUSH_RELAY_CLIENT_SECRET: 'wrong-secret',
+          } as any,
+        );
+        expect(seenCalls[0]).toMatchObject({
+          url: 'https://relay.example.test/api/push/relay',
+          auth: 'Bearer wrong-secret',
+          redirect: 'error',
+          relayStatus: 401,
+        });
+
+        // 3. Default relay destination (PUSH_RELAY_URL unset) NEVER receives PUSH_RELAY_CLIENT_SECRET
+        seenCalls.length = 0;
+        mockDb.query.mockResolvedValueOnce([validPushRow]);
+        mockDb.query.mockResolvedValueOnce([{ badge_count: 3 }]);
+        await dispatchPush(
+          { userId: 'u-relay', serverId: 'srv-relay-1', title: 'Hi', body: 'Default', type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE },
+          {
+            DB: mockDb as any,
+            PUSH_RELAY_CLIENT_SECRET: 'should-never-leave-host',
+          } as any,
+        );
+        expect(seenCalls[0]).toMatchObject({
+          url: 'https://app.im.codes/api/push/relay',
+          auth: null,
+          redirect: 'error',
+        });
+      } finally {
+        fetchSpy.mockRestore();
+        globalThis.fetch = originalFetch;
+      }
+    });
   });
 });

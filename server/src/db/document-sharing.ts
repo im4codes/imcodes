@@ -739,6 +739,38 @@ export type VerifyExternalShareResult =
 /**
  * Scheme 1: Verify external link token + optional accessCode + bind or verify first-device / Passkey lock.
  */
+export interface ResolvedClientDeviceCredential {
+  deviceToken: string;
+  migratedLegacyUserCookie: boolean;
+  rejected: boolean;
+}
+
+/**
+ * Resolve a client-supplied deviceToken, rejecting bare internal/credential prefixes
+ * except legacy `user:<authenticatedUserId>` compatibility values which are cleared
+ * so binding derives strictly from the authenticated user session.
+ */
+export function resolveClientDeviceCredential(
+  rawDeviceToken: string | null | undefined,
+  authenticatedUserId: string | null | undefined,
+): ResolvedClientDeviceCredential {
+  const trimmed = rawDeviceToken?.trim() ?? '';
+  if (!trimmed) {
+    return { deviceToken: '', migratedLegacyUserCookie: false, rejected: false };
+  }
+  if (/^user:/i.test(trimmed)) {
+    const claimedUserId = trimmed.slice(5);
+    if (authenticatedUserId && claimedUserId === authenticatedUserId) {
+      return { deviceToken: '', migratedLegacyUserCookie: true, rejected: false };
+    }
+    return { deviceToken: '', migratedLegacyUserCookie: false, rejected: true };
+  }
+  if (/^(?:passkey:|cred_)/i.test(trimmed)) {
+    return { deviceToken: '', migratedLegacyUserCookie: false, rejected: true };
+  }
+  return { deviceToken: trimmed, migratedLegacyUserCookie: false, rejected: false };
+}
+
 export async function verifyAndBindExternalShareDevice(
   db: Database,
   input: VerifyExternalShareInput,
@@ -828,14 +860,15 @@ export async function verifyAndBindExternalShareDevice(
     }
   }
 
-  // Reject attempts to pass the stored boundDeviceHash itself as the raw deviceToken
-  const rawSuppliedDevice = input.deviceToken?.trim() ?? '';
+  // Reject attempts to pass the stored boundDeviceHash itself as the raw deviceToken,
+  // and reject bare passkey/credential prefixes (while migrating legacy `user:<self>` cookies).
+  const cred = resolveClientDeviceCredential(input.deviceToken, input.userId);
+  if (cred.rejected) {
+    return { ok: false, status: 403, error: 'invalid_device_token' };
+  }
+  const rawSuppliedDevice = cred.deviceToken;
   if (rawSuppliedDevice && share.boundDeviceHash && rawSuppliedDevice === share.boundDeviceHash) {
     return { ok: false, status: 403, error: 'device_locked_to_another_device' };
-  }
-  // Reject bare passkey / credential / user identifiers supplied directly as deviceToken
-  if (rawSuppliedDevice && /^(?:passkey:|cred_|user:)/i.test(rawSuppliedDevice)) {
-    return { ok: false, status: 403, error: 'invalid_device_token' };
   }
 
   const defaultGeneratedToken = share.accessCodeHash
@@ -845,15 +878,22 @@ export async function verifyAndBindExternalShareDevice(
       })()
     : `dev_${randomHex(24)}`;
 
-  // Determine candidate device credential token
+  const authUserToken = input.userId?.trim() ? `user:${input.userId.trim()}` : '';
+  const boundToCurrentUser = Boolean(
+    authUserToken && share.boundDeviceHash && sha256Hex(authUserToken) === share.boundDeviceHash,
+  );
+
+  // Determine candidate device credential token (prefer matching user lock if share is already bound to authUserToken)
   const candidateToken =
     verifiedPasskeyToken
       ? verifiedPasskeyToken
-      : rawSuppliedDevice
-        ? rawSuppliedDevice
-        : input.userId?.trim()
-          ? `user:${input.userId.trim()}`
-          : defaultGeneratedToken;
+      : boundToCurrentUser && (!rawSuppliedDevice || sha256Hex(rawSuppliedDevice) !== share.boundDeviceHash)
+        ? authUserToken
+        : rawSuppliedDevice
+          ? rawSuppliedDevice
+          : authUserToken
+            ? authUserToken
+            : defaultGeneratedToken;
 
   const candidateHash = sha256Hex(candidateToken);
 
@@ -1128,15 +1168,19 @@ export async function resolveEffectiveDocumentAccess(
       }
     }
 
-    const rawSuppliedDevice = input.deviceToken?.trim() ?? '';
-
-    // Reject bare passkey / credential / user identifiers supplied directly as deviceToken
-    if (rawSuppliedDevice && /^(?:passkey:|cred_|user:)/i.test(rawSuppliedDevice)) {
+    const cred = resolveClientDeviceCredential(input.deviceToken, userId);
+    if (cred.rejected) {
       return denied('device_locked');
     }
 
-    const suppliedDeviceToken = rawSuppliedDevice
-      || (userId ? `user:${userId}` : '');
+    const authUserToken = userId ? `user:${userId}` : '';
+    const boundToCurrentUser = Boolean(
+      authUserToken && extRow.bound_device_hash && sha256Hex(authUserToken) === extRow.bound_device_hash,
+    );
+    const suppliedDeviceToken =
+      boundToCurrentUser && (!cred.deviceToken || sha256Hex(cred.deviceToken) !== extRow.bound_device_hash)
+        ? authUserToken
+        : (cred.deviceToken || authUserToken);
 
     // Reject attempts to pass the stored bound_device_hash itself as raw deviceToken
     if (suppliedDeviceToken && extRow.bound_device_hash && suppliedDeviceToken === extRow.bound_device_hash) {

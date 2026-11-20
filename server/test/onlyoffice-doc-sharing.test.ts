@@ -2960,6 +2960,216 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(await hugeCbRes.json()).toMatchObject({ error: 1, message: 'file_too_large' });
     fetchSpy.mockRestore();
   });
+
+  it('P0-1 upgrade compat: accepts legacy user:<self> cookies/tokens for authenticated owners, blocks unauth/wrong-user spoofing, and preserves unrelated PIN/Passkey cookies', async () => {
+    const resUserShare = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: bearer('owner-1') },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'external_link',
+        deviceLockEnabled: true,
+        role: 'editor',
+      }),
+    });
+    expect(resUserShare.status).toBe(201);
+    const { shareToken: userShareTok } = (await resUserShare.json()) as { shareToken: string };
+
+    // Simulate pre-upgrade bind for user-bob
+    const initialVerify = await app.request(`/api/doc-shares/external/${userShareTok}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: bearer('user-bob') },
+      body: JSON.stringify({}),
+    });
+    expect(initialVerify.status).toBe(200);
+    expect((await initialVerify.json()).deviceToken).toBe('');
+
+    // 1. Authenticated user-bob arriving with stale legacy cookie OR legacy client deviceToken='user:user-bob'
+    // still passes verify, browse, and ONLYOFFICE config while clearing only the stale user: cookie!
+    const verifyLegacySelf = await app.request(`/api/doc-shares/external/${userShareTok}/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: bearer('user-bob'),
+        Cookie: 'imcodes_doc_device=user:user-bob',
+      },
+      body: JSON.stringify({ deviceToken: 'user:user-bob' }),
+    });
+    expect(verifyLegacySelf.status).toBe(200);
+    expect(verifyLegacySelf.headers.get('set-cookie') ?? '').toContain('imcodes_doc_device=;');
+
+    const browseLegacySelf = await app.request(`/api/doc-shares/external/${userShareTok}/browse`, {
+      headers: {
+        Authorization: bearer('user-bob'),
+        Cookie: 'imcodes_doc_device=user:user-bob',
+      },
+    });
+    expect(browseLegacySelf.status).toBe(200);
+    expect(browseLegacySelf.headers.get('set-cookie') ?? '').toContain('imcodes_doc_device=;');
+
+    const cfgLegacySelf = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&shareToken=${userShareTok}`,
+      {
+        headers: {
+          Authorization: bearer('user-bob'),
+          Cookie: 'imcodes_doc_device=user:user-bob',
+        },
+      },
+    );
+    expect(cfgLegacySelf.status).toBe(200);
+    expect(cfgLegacySelf.headers.get('set-cookie') ?? '').toContain('imcodes_doc_device=;');
+
+    // 2. Unauthenticated or mismatched user presenting user:user-bob is ALWAYS rejected
+    const unauthSpoofVerify = await app.request(`/api/doc-shares/external/${userShareTok}/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: 'imcodes_doc_device=user:user-bob',
+      },
+      body: JSON.stringify({ deviceToken: 'user:user-bob' }),
+    });
+    expect(unauthSpoofVerify.status).toBe(403);
+    expect((await unauthSpoofVerify.json()).error).toBe('invalid_device_token');
+
+    const unauthSpoofBrowse = await app.request(`/api/doc-shares/external/${userShareTok}/browse`, {
+      headers: { Cookie: 'imcodes_doc_device=user:user-bob' },
+    });
+    expect(unauthSpoofBrowse.status).toBe(403);
+
+    const wrongUserSpoofVerify = await app.request(`/api/doc-shares/external/${userShareTok}/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: bearer('user-carol'),
+        Cookie: 'imcodes_doc_device=user:user-bob',
+      },
+      body: JSON.stringify({}),
+    });
+    expect(wrongUserSpoofVerify.status).toBe(403);
+    expect((await wrongUserSpoofVerify.json()).error).toBe('invalid_device_token');
+
+    // 3. Preserves unrelated valid dpin_ / pkey_ device cookie across user verify AND auth-relay OAuth callback
+    const verifyPreservesPinCookie = await app.request(`/api/doc-shares/external/${userShareTok}/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: bearer('user-bob'),
+        Cookie: 'imcodes_doc_device=dpin_unrelated.sharepinproof',
+      },
+      body: JSON.stringify({}),
+    });
+    expect(verifyPreservesPinCookie.status).toBe(200);
+    expect(verifyPreservesPinCookie.headers.get('set-cookie') ?? '').not.toContain('imcodes_doc_device=;');
+
+    const stateJwt = signJwt(
+      { type: 'doc-auth-relay-state', nonce: 'nonce-preserve', provider: 'github', redirectPath: '/', shareToken: userShareTok },
+      JWT_KEY,
+      300,
+    );
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const u = String(input);
+        if (u.includes('github.com/login/oauth/access_token')) {
+          return new Response(JSON.stringify({ access_token: 'gh-tok' }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ id: 9911, login: 'bob-gh', name: 'Bob GH' }), { status: 200 });
+      }),
+    );
+    try {
+      const oauthRes = await app.request(
+        `/api/doc-shares/auth-relay/callback?provider=github&code=ok&state=${encodeURIComponent(stateJwt)}&format=json`,
+        {
+          headers: {
+            Cookie: 'doc_oauth_state=nonce-preserve; imcodes_doc_device=dpin_unrelated.sharepinproof',
+          },
+        },
+      );
+      expect(oauthRes.status).toBe(200);
+      expect(oauthRes.headers.get('set-cookie') ?? '').not.toContain('imcodes_doc_device=;');
+
+      const oauthClearsLegacyRes = await app.request(
+        `/api/doc-shares/auth-relay/callback?provider=github&code=ok&state=${encodeURIComponent(stateJwt)}&format=json`,
+        {
+          headers: {
+            Cookie: 'doc_oauth_state=nonce-preserve; imcodes_doc_device=user:user-bob',
+          },
+        },
+      );
+      expect(oauthClearsLegacyRes.status).toBe(200);
+      expect(oauthClearsLegacyRes.headers.get('set-cookie') ?? '').toContain('imcodes_doc_device=;');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('P0-3: binds ONLYOFFICE file download JWTs strictly to target file URL, token, and optional download operation', async () => {
+    const publicApp = buildApp(
+      makeEnv(store.db, {
+        ONLYOFFICE_ENABLED: 'true',
+        ONLYOFFICE_JWT_SECRET: 'onlyoffice-jwt-secret-key-test!!',
+        ONLYOFFICE_PUBLIC_URL: 'https://docs.example.com/onlyoffice',
+        SERVER_URL: 'http://localhost:19138',
+      }),
+    );
+
+    const shareRes = await publicApp.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: bearer('owner-1') },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'user',
+        targetUserId: 'user-bob',
+        role: 'viewer',
+        allowDownload: false,
+      }),
+    });
+    expect(shareRes.status).toBe(201);
+
+    const cfgRes = await publicApp.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}`,
+      { headers: { Authorization: bearer('user-bob') } },
+    );
+    expect(cfgRes.status).toBe(200);
+    const cfg = (await cfgRes.json()) as { config: { document: { url: string } } };
+    const fileUrl = new URL(cfg.config.document.url);
+    const ooSecret = 'onlyoffice-jwt-secret-key-test!!';
+
+    // 1. Valid operation=download and public-proxy URL are accepted
+    const opDownloadJwt = signJwt({ url: cfg.config.document.url, operation: 'download' }, ooSecret, 300);
+    expect(
+      (await publicApp.request(`${fileUrl.pathname}${fileUrl.search}`, {
+        headers: { Authorization: `Bearer ${opDownloadJwt}` },
+      })).status,
+    ).toBe(200);
+
+    const proxiedUrl = `https://docs.example.com/onlyoffice${fileUrl.pathname}${fileUrl.search}`;
+    const proxiedJwt = signJwt({ url: proxiedUrl }, ooSecret, 300);
+    expect(
+      (await publicApp.request(`${fileUrl.pathname}${fileUrl.search}`, {
+        headers: { Authorization: `Bearer ${proxiedJwt}` },
+      })).status,
+    ).toBe(200);
+
+    // 2. Wrong operation, missing url, untrusted base URL, or another file token's URL -> 401
+    for (const badPayload of [
+      { url: cfg.config.document.url, operation: 'converter' },
+      { operation: 'download' },
+      { url: `https://evil.attacker.invalid${fileUrl.pathname}${fileUrl.search}` },
+      { url: `http://localhost:19138/api/server/srv-1/onlyoffice/file/different-doc-token?serverId=srv-1` },
+      { url: `http://localhost:19138${fileUrl.pathname}?serverId=srv-other` },
+    ]) {
+      const badJwt = signJwt(badPayload, ooSecret, 300);
+      const res = await publicApp.request(`${fileUrl.pathname}${fileUrl.search}`, {
+        headers: { Authorization: `Bearer ${badJwt}` },
+      });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toMatchObject({ error: 'invalid_onlyoffice_jwt' });
+    }
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

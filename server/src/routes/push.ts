@@ -511,13 +511,15 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   // → this is a self-hosted instance, relay everything through the central
   // server (app.im.codes by default) which holds all credentials.
   const isSelfHosted = !hasApns && !hasFcm && !hasJpush;
-  const relayUrl = isSelfHosted ? (env.PUSH_RELAY_URL || 'https://app.im.codes') : null;
+  const configuredRelayUrl = env.PUSH_RELAY_URL?.trim();
+  const relayUrl = isSelfHosted ? (configuredRelayUrl || 'https://app.im.codes') : null;
+  const relayClientSecret = configuredRelayUrl ? (env.PUSH_RELAY_CLIENT_SECRET?.trim() || undefined) : undefined;
 
   for (const { token, platform } of matchingTokens) {
     try {
       if (relayUrl) {
         // Self-hosted: relay through central server
-        await relayPush(relayUrl, token, platform, payload);
+        await relayPush(relayUrl, token, platform, payload, relayClientSecret);
       } else if (platform === PUSH_PLATFORM_IOS && hasApns) {
         await sendApns(token, payload, env);
       } else if (platform === PUSH_PLATFORM_ANDROID_FCM && hasFcm) {
@@ -535,10 +537,21 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
 }
 
 /** Relay push through a central server (for self-hosted instances without APNs keys). */
-async function relayPush(relayBaseUrl: string, token: string, platform: string, payload: PushPayload): Promise<void> {
-  const res = await fetch(`${relayBaseUrl}/api/push/relay`, {
+async function relayPush(
+  relayBaseUrl: string,
+  token: string,
+  platform: string,
+  payload: PushPayload,
+  relaySecret?: string,
+): Promise<void> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (relaySecret) {
+    headers.Authorization = `Bearer ${relaySecret}`;
+  }
+  const normalizedBase = relayBaseUrl.replace(/\/+$/, '');
+  const res = await fetch(`${normalizedBase}/api/push/relay`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       token,
       platform,
@@ -548,6 +561,7 @@ async function relayPush(relayBaseUrl: string, token: string, platform: string, 
       data: payload.data,
       type: payload.type,
     }),
+    redirect: 'error',
     signal: AbortSignal.timeout(10_000),
   });
 

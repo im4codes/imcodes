@@ -22,6 +22,7 @@ import {
   parseTeamShareTargetUserId,
   recordVerifiedExternalSharePin,
   redeemMagicInviteShare,
+  resolveClientDeviceCredential,
   resolveEffectiveDocumentAccess,
   revokeDocumentShare,
   updateDocumentShare,
@@ -42,6 +43,13 @@ import {
 export const documentSharingRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
 type RouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
+
+function clearLegacyUserDeviceCookieIfPresent(c: RouteContext, authenticatedUserId?: string | null): void {
+  const cookieVal = getCookie(c, DOC_DEVICE_COOKIE)?.trim();
+  if (!cookieVal || !/^user:/i.test(cookieVal)) return;
+  if (authenticatedUserId && cookieVal.slice(5) !== authenticatedUserId) return;
+  deleteCookie(c, DOC_DEVICE_COOKIE, { path: '/' });
+}
 
 const externalShareRateLimiter = new MemoryRateLimiter();
 const EXTERNAL_SHARE_RATE_WINDOW_MS = 60_000;
@@ -429,7 +437,7 @@ documentSharingRoutes.post('/doc-shares/external/:token/verify', async (c): Prom
 
   const isUserBoundToken = result.deviceToken.startsWith('user:');
   if (isUserBoundToken) {
-    deleteCookie(c, DOC_DEVICE_COOKIE, { path: '/' });
+    clearLegacyUserDeviceCookieIfPresent(c, auth?.userId ?? null);
   } else {
     setCookie(c, DOC_DEVICE_COOKIE, result.deviceToken, {
       httpOnly: true,
@@ -477,17 +485,23 @@ documentSharingRoutes.get('/doc-shares/external/:token/browse', async (c): Promi
     }
   }
 
-  let deviceToken = extractDeviceToken(c);
+  const rawSuppliedDeviceToken = extractDeviceToken(c);
+  const clientCred = resolveClientDeviceCredential(rawSuppliedDeviceToken, auth?.userId ?? null);
+  let deviceToken = clientCred.rejected ? rawSuppliedDeviceToken : (clientCred.deviceToken || null);
 
   // If access code is configured on an external_link, require either verified deviceToken or matching accessCode param/header
   if (share.shareMode !== 'magic_invite' && share.accessCodeHash) {
     const suppliedCode = c.req.query('accessCode')?.trim() || c.req.header('x-doc-access-code')?.trim() || '';
     const codeMatches = Boolean(suppliedCode && sha256Hex(suppliedCode) === share.accessCodeHash);
     if (codeMatches) {
-      if (!deviceToken) {
-        deviceToken = `dpin_inline.${sha256Hex(`doc-pin-proof:v1:${share.id}:${share.accessCodeHash}:inline`)}`;
+      if (clientCred.migratedLegacyUserCookie && auth?.userId) {
+        recordVerifiedExternalSharePin(share.id, share.accessCodeHash, `user:${auth.userId}`);
+      } else {
+        if (!deviceToken) {
+          deviceToken = `dpin_inline.${sha256Hex(`doc-pin-proof:v1:${share.id}:${share.accessCodeHash}:inline`)}`;
+        }
+        recordVerifiedExternalSharePin(share.id, share.accessCodeHash, deviceToken);
       }
-      recordVerifiedExternalSharePin(share.id, share.accessCodeHash, deviceToken);
     }
   }
 
@@ -507,6 +521,10 @@ documentSharingRoutes.get('/doc-shares/external/:token/browse', async (c): Promi
 
   if (!access.allowed || !access.role) {
     return c.json({ error: 'forbidden', reason: access.reason ?? 'access_denied' }, 403);
+  }
+
+  if (clientCred.migratedLegacyUserCookie && auth?.userId) {
+    clearLegacyUserDeviceCookieIfPresent(c, auth.userId);
   }
 
   if (share.targetKind === 'file') {
@@ -793,8 +811,8 @@ documentSharingRoutes.get('/doc-shares/auth-relay/callback', async (c): Promise<
       rawToken: shareToken,
       userId,
     }).catch(() => {});
-    deleteCookie(c, DOC_DEVICE_COOKIE, { path: '/' });
   }
+  clearLegacyUserDeviceCookieIfPresent(c);
 
   if (c.req.query('format') === 'json' || c.req.header('Accept')?.includes('application/json')) {
     return c.json({ ok: true, userId, provider, redirectTo: redirectPath });

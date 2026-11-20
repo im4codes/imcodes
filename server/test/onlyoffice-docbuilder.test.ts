@@ -8,9 +8,11 @@ import { verifyJwt } from '../src/security/crypto.js';
 import {
   OnlyOfficeServiceError,
   clearEphemeralDocBuilderScriptsForTests,
+  compileOnlyOfficeDocBuilderTemplate,
   consumeEphemeralDocBuilderScript,
   convertViaOnlyOfficeConverter,
   executeOnlyOfficeDocBuilder,
+  prepareOnlyOfficeDocBuilderScript,
   selectDocBuilderOutputCandidate,
   signDocBuilderScriptToken,
   storeEphemeralDocBuilderScript,
@@ -524,5 +526,168 @@ describe('onlyoffice-docbuilder service', () => {
         key: 'conv-big',
       }),
     ).rejects.toThrow(OnlyOfficeServiceError);
+  });
+
+  it('P0-2: isolates raw DocBuilder execution, enforces trusted templates & worker sandbox, and rejects builderJS/tmp/obfuscation/dynamic calls before reaching ONLYOFFICE', async () => {
+    let sharedHits = 0;
+    let isolatedHits = 0;
+    let capturedScript = '';
+
+    const mockSharedOo = await startMockServer((req, rawBody, res) => {
+      sharedHits += 1;
+      if (req.url === '/docbuilder') {
+        const body = JSON.parse(rawBody) as { url?: string };
+        const tok = String(body.url ?? '').split('/').pop() ?? '';
+        const claims = verifyDocBuilderScriptToken(tok, JWT_KEY);
+        if (claims) {
+          capturedScript = consumeEphemeralDocBuilderScript(claims.scriptId) ?? '';
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            error: 0,
+            end: true,
+            urls: { 'generated.docx': `${mockSharedOo.baseUrl}/cache/generated.docx` },
+          }),
+        );
+        return;
+      }
+      if (req.url === '/cache/generated.docx') {
+        res.end(Buffer.from('PK\x03\x04template-docx'));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    servers.push(mockSharedOo);
+
+    const mockIsolatedOo = await startMockServer((req, rawBody, res) => {
+      isolatedHits += 1;
+      if (req.url === '/docbuilder') {
+        const body = JSON.parse(rawBody) as { url?: string };
+        const tok = String(body.url ?? '').split('/').pop() ?? '';
+        const claims = verifyDocBuilderScriptToken(tok, JWT_KEY);
+        if (claims) {
+          consumeEphemeralDocBuilderScript(claims.scriptId);
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            error: 0,
+            end: true,
+            urls: { 'generated.docx': `${mockIsolatedOo.baseUrl}/cache/iso.docx` },
+          }),
+        );
+        return;
+      }
+      if (req.url === '/cache/iso.docx') {
+        res.end(Buffer.from('PK\x03\x04isolated-docx'));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    servers.push(mockIsolatedOo);
+
+    // 1. Trusted data-only template runs on shared ONLYOFFICE without dynamic script injection
+    const injectedTitle = '"); builderJS.OpenFile("/etc/passwd"); //';
+    const tplResult = await executeOnlyOfficeDocBuilder({
+      env: {
+        ONLYOFFICE_ENABLED: 'true',
+        ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
+        ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: 'true',
+        ONLYOFFICE_JWT_SECRET: OO_SECRET,
+        SERVER_URL: 'http://127.0.0.1:19138',
+        JWT_SIGNING_KEY: JWT_KEY,
+      },
+      template: 'create_document',
+      argument: { type: 'docx', title: injectedTitle, text: 'Hello from template' },
+      requiredExt: '.docx',
+    });
+    expect(tplResult.bytes.toString('utf8')).toBe('PK\x03\x04template-docx');
+    expect(sharedHits).toBe(2);
+    expect(capturedScript).not.toContain(injectedTitle);
+    expect(capturedScript).toContain('builder.CreateFile("docx");');
+
+    // Trusted append_text embeds server inputUrl directly without trusting external user URL
+    const compiledAppend = compileOnlyOfficeDocBuilderTemplate('append_text', {
+      inputUrl: 'http://127.0.0.1:19138/api/cloud-docs/onlyoffice/file/signed-tok',
+      outputType: '.docx',
+    });
+    expect(compiledAppend).toContain('builder.OpenFile("http://127.0.0.1:19138/api/cloud-docs/onlyoffice/file/signed-tok");');
+
+    // 2. When REQUIRE_ISOLATED=true and ONLYOFFICE_DOCBUILDER_ISOLATED_URL is unset, raw script fails closed
+    sharedHits = 0;
+    await expect(
+      executeOnlyOfficeDocBuilder({
+        env: {
+          ONLYOFFICE_ENABLED: 'true',
+          ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
+          ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: 'true',
+          ONLYOFFICE_JWT_SECRET: OO_SECRET,
+          SERVER_URL: 'http://127.0.0.1:19138',
+          JWT_SIGNING_KEY: JWT_KEY,
+        },
+        script: 'builder.CreateFile("docx");',
+      }),
+    ).rejects.toMatchObject({ code: CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED, statusCode: 503 });
+    expect(sharedHits).toBe(0);
+
+    // 3. When ONLYOFFICE_DOCBUILDER_ISOLATED_URL is set, raw script routes only to isolated runner
+    const isoResult = await executeOnlyOfficeDocBuilder({
+      env: {
+        ONLYOFFICE_ENABLED: 'true',
+        ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
+        ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockIsolatedOo.baseUrl,
+        ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: 'true',
+        ONLYOFFICE_JWT_SECRET: OO_SECRET,
+        SERVER_URL: 'http://127.0.0.1:19138',
+        JWT_SIGNING_KEY: JWT_KEY,
+      },
+      script: 'builder.CreateFile("docx");',
+    });
+    expect(isoResult.bytes.toString('utf8')).toBe('PK\x03\x04isolated-docx');
+    expect(sharedHits).toBe(0);
+    expect(isolatedHits).toBe(2);
+
+    // 4. Whole-class bypass matrix rejected before ANY network call to Document Server
+    isolatedHits = 0;
+    const attackScripts = [
+      'builderJS.OpenFile("http://169.254.169.254/latest/meta-data/");',
+      'builderJS.CreateFile("docx"); builderJS.SaveFile("docx", "out.docx");',
+      'builder.OpenTmpFile("file:///etc/passwd");',
+      'builder.SaveTmpFile("docx", "/tmp/pwn.docx");',
+      'builder.SetTmpFolder("/etc");',
+      'Api.CreateImage("http://127.0.0.1:8080/ssrf.png");',
+      'var b = builder; b["Open" + "File"]("http://127.0.0.1:8080/");',
+      'builder.Op\\u0065nFile("http://127.0.0.1:8080/");',
+      '(0, eval)("builder.OpenFile(\\"http://127.0.0.1:8080/\\")");',
+      'new Function("builder", "builder.OpenFile(\\"http://127.0.0.1:8080/\\")")(builder);',
+      'fetch("http://169.254.169.254/latest/meta-data/");',
+      'var g = globalThis; g.process.exit(1);',
+      'var m = "Open" + "File"; var doc = Api.GetDocument(); doc[m]("http://127.0.0.1/");',
+      'Reflect.get(builder, "OpenFile")("/etc/passwd");',
+      '[].constructor.constructor("return 1")();',
+    ];
+    for (const attack of attackScripts) {
+      expect(() =>
+        prepareOnlyOfficeDocBuilderScript(attack, { inputUrl: 'http://127.0.0.1:19138/file/ok' }),
+      ).toThrowError(OnlyOfficeServiceError);
+      await expect(
+        executeOnlyOfficeDocBuilder({
+          env: {
+            ONLYOFFICE_ENABLED: 'true',
+            ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
+            ONLYOFFICE_JWT_SECRET: OO_SECRET,
+            SERVER_URL: 'http://127.0.0.1:19138',
+            JWT_SIGNING_KEY: JWT_KEY,
+          },
+          script: attack,
+          argument: { inputUrl: 'http://127.0.0.1:19138/file/ok' },
+        }),
+      ).rejects.toMatchObject({ code: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT, statusCode: 400 });
+    }
+    expect(sharedHits).toBe(0);
+    expect(isolatedHits).toBe(0);
   });
 });

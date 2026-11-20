@@ -3,7 +3,7 @@ import path from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { getCookie } from 'hono/cookie';
+import { deleteCookie, getCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
 import { authFailureResponse, resolveAuthOutcome } from '../security/authorization.js';
@@ -11,6 +11,7 @@ import {
   getDocumentShareById,
   isPathWithinSharedFolder,
   normalizeDocumentSharePath,
+  resolveClientDeviceCredential,
   resolveEffectiveDocumentAccess,
   getOnlyOfficeRoomRecord,
   upsertOnlyOfficeRoomRecord,
@@ -162,9 +163,16 @@ export function resolveOnlyOfficeJwtSecret(env: Pick<Env, 'ONLYOFFICE_JWT_SECRET
   return createHmac('sha256', env.JWT_SIGNING_KEY).update('imcodes-onlyoffice-jwt-secret').digest('hex');
 }
 
+export interface VerifyOnlyOfficeFileJwtBinding {
+  expectedDocToken: string;
+  routeKind: 'server_file' | 'cloud_doc_file';
+  expectedServerId?: string;
+}
+
 export function verifyOnlyOfficeRequestBearerJwt(
   authHeader: string | undefined,
-  env: Pick<Env, 'ONLYOFFICE_JWT_SECRET' | 'JWT_SIGNING_KEY'>,
+  env: Pick<Env, 'ONLYOFFICE_JWT_SECRET' | 'JWT_SIGNING_KEY' | 'SERVER_URL' | 'ONLYOFFICE_PUBLIC_URL' | 'ONLYOFFICE_INTERNAL_URL'>,
+  binding: VerifyOnlyOfficeFileJwtBinding,
 ): boolean {
   if (!authHeader?.startsWith('Bearer ')) return false;
   const ooSecret = resolveOnlyOfficeJwtSecret(env);
@@ -181,6 +189,83 @@ export function verifyOnlyOfficeRequestBearerJwt(
   ) {
     return false;
   }
+  if (nested.operation !== undefined) {
+    if (typeof nested.operation !== 'string' || nested.operation.trim().toLowerCase() !== 'download') {
+      return false;
+    }
+  }
+  if (typeof nested.url !== 'string' || !nested.url.trim()) {
+    return false;
+  }
+
+  let signedUrl: URL;
+  try {
+    signedUrl = new URL(nested.url.trim());
+  } catch {
+    return false;
+  }
+  if ((signedUrl.protocol !== 'http:' && signedUrl.protocol !== 'https:') || signedUrl.username || signedUrl.password) {
+    return false;
+  }
+  const decodedPath = (() => {
+    try {
+      return decodeURIComponent(signedUrl.pathname);
+    } catch {
+      return signedUrl.pathname;
+    }
+  })();
+  if (decodedPath.split('/').some((seg) => seg === '..')) {
+    return false;
+  }
+
+  const candidateBases = [
+    (env.SERVER_URL || 'http://localhost:19138').replace(/\/+$/, ''),
+    env.ONLYOFFICE_PUBLIC_URL?.trim().replace(/\/+$/, ''),
+    env.ONLYOFFICE_INTERNAL_URL?.trim().replace(/\/+$/, ''),
+  ].filter((v): v is string => Boolean(v));
+
+  let matchedRelPath: string | null = null;
+  for (const rawBase of candidateBases) {
+    try {
+      const base = new URL(rawBase);
+      if (isUrlUnderTrustedBase(signedUrl, base)) {
+        const basePath = base.pathname.replace(/\/$/, '');
+        matchedRelPath = signedUrl.pathname.slice(basePath.length);
+        break;
+      }
+    } catch {
+      // Ignore malformed optional URL config entries
+    }
+  }
+  if (!matchedRelPath) return false;
+
+  const expectedPaths =
+    binding.routeKind === 'cloud_doc_file'
+      ? [
+          `/api/cloud-docs/onlyoffice/file/${binding.expectedDocToken}`,
+          `/cloud-docs/onlyoffice/file/${binding.expectedDocToken}`,
+        ]
+      : [
+          `/api/onlyoffice/file/${binding.expectedDocToken}`,
+          `/onlyoffice/file/${binding.expectedDocToken}`,
+          ...(binding.expectedServerId
+            ? [
+                `/api/server/${binding.expectedServerId}/onlyoffice/file/${binding.expectedDocToken}`,
+                `/server/${binding.expectedServerId}/onlyoffice/file/${binding.expectedDocToken}`,
+              ]
+            : []),
+        ];
+  if (!expectedPaths.includes(matchedRelPath)) {
+    return false;
+  }
+
+  if (binding.routeKind === 'server_file' && binding.expectedServerId) {
+    const urlServerId = signedUrl.searchParams.get('serverId');
+    if (urlServerId && urlServerId !== binding.expectedServerId) {
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -1407,7 +1492,9 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
 
   const { auth } = await resolveAuthOutcome(c);
   const shareToken = extractShareToken(c);
-  const deviceToken = extractDeviceToken(c);
+  const rawSuppliedDeviceToken = extractDeviceToken(c);
+  const clientCred = resolveClientDeviceCredential(rawSuppliedDeviceToken, auth?.userId ?? null);
+  const deviceToken = clientCred.rejected ? rawSuppliedDeviceToken : (clientCred.deviceToken || null);
   const sessionName = c.req.query('sessionName')?.trim() || null;
 
   const access = await resolveLiveOnlyOfficeAccess(c.env.DB, {
@@ -1430,6 +1517,13 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
             ? 400
             : 403;
     return c.json({ error: 'forbidden', reason: access.reason ?? 'access_denied' }, status);
+  }
+
+  if (clientCred.migratedLegacyUserCookie && auth?.userId) {
+    const cookieVal = getCookie(c, DOC_DEVICE_COOKIE)?.trim();
+    if (cookieVal && /^user:/i.test(cookieVal) && cookieVal.slice(5) === auth.userId) {
+      deleteCookie(c, DOC_DEVICE_COOKIE, { path: '/' });
+    }
   }
 
   const requestedMode = c.req.query('mode');
@@ -1668,7 +1762,11 @@ async function handleOnlyOfficeFileDownload(c: RouteContext): Promise<Response> 
   // Verify ONLYOFFICE JWT when present, and require it when ONLYOFFICE_JWT_SECRET is configured and allowDownload is false
   const authHeader = c.req.header('Authorization');
   if (authHeader?.startsWith('Bearer ')) {
-    if (!verifyOnlyOfficeRequestBearerJwt(authHeader, c.env)) {
+    if (!verifyOnlyOfficeRequestBearerJwt(authHeader, c.env, {
+      expectedDocToken: token,
+      routeKind: 'server_file',
+      expectedServerId: claims.serverId,
+    })) {
       return c.json({ error: 'invalid_onlyoffice_jwt' }, 401);
     }
   } else if (c.env.ONLYOFFICE_JWT_SECRET?.trim() && (!claims.allowDownload || !liveAccess.allowDownload)) {

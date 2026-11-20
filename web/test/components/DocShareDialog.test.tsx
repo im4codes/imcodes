@@ -10,6 +10,13 @@ const apiMocks = vi.hoisted(() => ({
   createDocumentShareApi: vi.fn(),
   updateDocumentShareApi: vi.fn(),
   revokeDocumentShareApi: vi.fn(),
+  browseExternalDocShare: vi.fn(),
+  verifyExternalDocShare: vi.fn(),
+  browseSharedDocFolder: vi.fn(),
+  listDocsSharedWithMe: vi.fn(),
+  createSharedDocItem: vi.fn(),
+  redeemMagicInviteDocShare: vi.fn(),
+  buildDocAuthRelayUrl: vi.fn(() => '/auth'),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -24,14 +31,25 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
+vi.mock('../../src/components/OfficePreview.js', () => ({
+  default: () => null,
+}));
+
 vi.mock('../../src/api.js', () => ({
   listDocumentShares: apiMocks.listDocumentShares,
   createDocumentShareApi: apiMocks.createDocumentShareApi,
   updateDocumentShareApi: apiMocks.updateDocumentShareApi,
   revokeDocumentShareApi: apiMocks.revokeDocumentShareApi,
+  browseExternalDocShare: apiMocks.browseExternalDocShare,
+  verifyExternalDocShare: apiMocks.verifyExternalDocShare,
+  browseSharedDocFolder: apiMocks.browseSharedDocFolder,
+  listDocsSharedWithMe: apiMocks.listDocsSharedWithMe,
+  createSharedDocItem: apiMocks.createSharedDocItem,
+  redeemMagicInviteDocShare: apiMocks.redeemMagicInviteDocShare,
+  buildDocAuthRelayUrl: apiMocks.buildDocAuthRelayUrl,
 }));
 
-import { DocShareDialog } from '../../src/components/DocShareDialog.js';
+import { DocShareDialog, ExternalDocShareSpace } from '../../src/components/DocShareDialog.js';
 import type { DocumentShareItem, ServerDocGroup } from '../../src/api.js';
 
 function makeShare(overrides: Partial<DocumentShareItem> = {}): DocumentShareItem {
@@ -280,5 +298,67 @@ describe('DocShareDialog Controlled Node Group sharing & async guards', () => {
     view.unmount();
     slowReq3.reject(new Error('late_network_failure'));
     await Promise.resolve();
+  });
+
+  it('P0-1 upgrade compat: purges legacy user: device tokens from localStorage on init and token switch while preserving valid PIN/Passkey tokens', async () => {
+    localStorage.setItem('imcodes_doc_dev_tok-legacy-1', 'user:alice');
+    localStorage.setItem('imcodes_doc_dev_tok-pin-valid', 'dpin_valid.proof');
+    localStorage.setItem('imcodes_doc_dev_tok-legacy-2', 'user:bob');
+
+    apiMocks.browseExternalDocShare.mockResolvedValue({
+      share: {
+        id: 'ext-1',
+        serverId: 'srv-1',
+        targetKind: 'file',
+        targetPath: '/docs/spec.docx',
+        label: 'spec.docx',
+        shareMode: 'external_link',
+        participantLabel: null,
+        role: 'editor',
+        allowDownload: true,
+        deviceLockEnabled: true,
+        isDeviceBound: true,
+        hasAccessCode: false,
+        redeemedAt: null,
+        expiresAt: null,
+        revokedAt: null,
+      },
+      serverId: 'srv-1',
+      targetKind: 'file',
+      rootPath: '/docs/spec.docx',
+      path: '/docs/spec.docx',
+      role: 'editor',
+      allowDownload: true,
+      entries: [],
+    });
+
+    const view = render(<ExternalDocShareSpace token="tok-legacy-1" />);
+    await waitFor(() => expect(apiMocks.browseExternalDocShare).toHaveBeenCalled());
+    expect(localStorage.getItem('imcodes_doc_dev_tok-legacy-1')).toBeNull();
+    expect(apiMocks.browseExternalDocShare).toHaveBeenCalledWith('tok-legacy-1', {
+      path: undefined,
+      deviceToken: undefined,
+      accessCode: undefined,
+    });
+
+    // Switch to a valid dpin_ share token -> preserved and sent
+    view.rerender(<ExternalDocShareSpace token="tok-pin-valid" />);
+    await waitFor(() => expect(apiMocks.browseExternalDocShare).toHaveBeenCalledWith('tok-pin-valid', {
+      path: undefined,
+      deviceToken: 'dpin_valid.proof',
+      accessCode: undefined,
+    }));
+    expect(localStorage.getItem('imcodes_doc_dev_tok-pin-valid')).toBe('dpin_valid.proof');
+
+    // Switch to another legacy user: share token -> purged cleanly
+    view.rerender(<ExternalDocShareSpace token="tok-legacy-2" />);
+    await waitFor(() => expect(apiMocks.browseExternalDocShare).toHaveBeenCalledWith('tok-legacy-2', {
+      path: undefined,
+      deviceToken: undefined,
+      accessCode: undefined,
+    }));
+    expect(localStorage.getItem('imcodes_doc_dev_tok-legacy-2')).toBeNull();
+
+    localStorage.removeItem('imcodes_doc_dev_tok-pin-valid');
   });
 });

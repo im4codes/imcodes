@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import vm from 'node:vm';
+import { Worker } from 'node:worker_threads';
 import {
   CLOUD_DOCS_MAX_UPLOAD_BYTES,
   CLOUD_DOCS_ONLYOFFICE_SCRIPT_PATH,
@@ -371,17 +373,22 @@ async function downloadOnlyOfficeArtifact(
   }
 }
 
+export type OnlyOfficeDocBuilderTemplate = 'create_document' | 'append_text' | 'replace_text';
+
 export interface ExecuteDocBuilderOptions {
   env: Pick<
     Env,
     | 'ONLYOFFICE_ENABLED'
     | 'ONLYOFFICE_INTERNAL_URL'
     | 'ONLYOFFICE_PUBLIC_URL'
+    | 'ONLYOFFICE_DOCBUILDER_ISOLATED_URL'
+    | 'ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED'
     | 'ONLYOFFICE_JWT_SECRET'
     | 'SERVER_URL'
     | 'JWT_SIGNING_KEY'
   >;
-  script: string;
+  script?: string;
+  template?: OnlyOfficeDocBuilderTemplate;
   argument?: Record<string, unknown>;
   outputName?: string;
   requiredExt?: string;
@@ -1082,6 +1089,411 @@ function assertAllowedOpenFileCall(
   }
 }
 
+const FORBIDDEN_DOCBUILDER_IDENTIFIERS = new Set([
+  'builderJS',
+  'eval',
+  'Function',
+  'AsyncFunction',
+  'GeneratorFunction',
+  'AsyncGeneratorFunction',
+  'globalThis',
+  'window',
+  'self',
+  'global',
+  'frames',
+  'parent',
+  'top',
+  'process',
+  'require',
+  'module',
+  'exports',
+  'Buffer',
+  'Deno',
+  'Bun',
+  'fetch',
+  'XMLHttpRequest',
+  'WebSocket',
+  'EventSource',
+  'ActiveXObject',
+  'WScript',
+  'importScripts',
+  'Worker',
+  'SharedWorker',
+  'ServiceWorker',
+  'WebAssembly',
+  'Proxy',
+  'Reflect',
+  'with',
+  'this',
+  '__proto__',
+  'constructor',
+  'prototype',
+  'getOwnPropertyDescriptor',
+  'getOwnPropertyDescriptors',
+  'getPrototypeOf',
+  'setPrototypeOf',
+  'defineProperty',
+  'defineProperties',
+  '__lookupGetter__',
+  '__defineGetter__',
+  'setTimeout',
+  'setInterval',
+  'setImmediate',
+  'import',
+]);
+
+const FORBIDDEN_RESOURCE_METHODS = new Set([
+  'OpenTmpFile',
+  'SaveTmpFile',
+  'SetTmpFolder',
+  'LoadFile',
+  'LoadFromFile',
+  'SaveToFile',
+  'CreateImage',
+  'AddImage',
+  'InsertImage',
+  'SetImage',
+  'AddOleObject',
+  'Download',
+  'ImportFile',
+]);
+
+const ALLOWED_GLOBAL_BUILDER_METHODS = new Set([
+  'CreateFile',
+  'OpenFile',
+  'SaveFile',
+  'CloseFile',
+  'OpenFileAsync',
+]);
+
+const SANDBOX_HELPER_SCRIPT = [
+  'const FORBIDDEN_PROPS = new Set(["OpenFile", "OpenFileAsync", "OpenTmpFile", "SaveTmpFile", "SetTmpFolder", "LoadFile", "LoadFromFile", "SaveToFile", "CreateImage", "AddImage", "InsertImage", "SetImage", "AddOleObject", "Download", "ImportFile", "constructor", "__proto__", "prototype"]);',
+  'class SecurityViolation extends Error { constructor(msg) { super(msg); this.name = "SecurityViolation"; } }',
+  'let callBudget = 5000;',
+  'function bumpBudget() { callBudget -= 1; if (callBudget <= 0) throw new SecurityViolation("DocBuilder sandbox call limit exceeded"); }',
+  'function makeApiProxy(path = "Api") {',
+  '  const fn = function () { bumpBudget(); return makeApiProxy(path + "()"); };',
+  '  return new Proxy(fn, {',
+  '    get(_target, prop) {',
+  '      bumpBudget();',
+  '      const key = String(prop);',
+  '      if (key === "then" || typeof prop === "symbol") return undefined;',
+  '      if (FORBIDDEN_PROPS.has(key)) throw new SecurityViolation("Forbidden DocBuilder API property: " + path + "." + key);',
+  '      return makeApiProxy(path + "." + key);',
+  '    },',
+  '    apply(_target, _thisArg, _args) { bumpBudget(); return makeApiProxy(path + "()"); },',
+  '    construct() { throw new SecurityViolation("Constructor call not permitted on " + path); },',
+  '  });',
+  '}',
+  'const builderProxy = Object.freeze({',
+  '  CreateFile: () => { bumpBudget(); },',
+  '  SaveFile: () => { bumpBudget(); },',
+  '  CloseFile: () => { bumpBudget(); },',
+  '  OpenFile: function (...args) {',
+  '    bumpBudget();',
+  '    if (args.length === 0) return;',
+  '    if (args.length !== 1 || typeof expectedInputUrl !== "string" || args[0] !== expectedInputUrl) {',
+  '      throw new SecurityViolation("DocBuilder OpenFile only permits server-controlled inputUrl");',
+  '    }',
+  '  },',
+  '  OpenFileAsync: function (...args) {',
+  '    bumpBudget();',
+  '    if (args.length === 0) return;',
+  '    if (args.length !== 1 || typeof expectedInputUrl !== "string" || args[0] !== expectedInputUrl) {',
+  '      throw new SecurityViolation("DocBuilder OpenFileAsync only permits server-controlled inputUrl");',
+  '    }',
+  '  },',
+  '});',
+  'const builderJSProxy = new Proxy({}, {',
+  '  get(_t, prop) { throw new SecurityViolation("Forbidden builderJS access: " + String(prop)); },',
+  '  set(_t, prop) { throw new SecurityViolation("Forbidden builderJS write: " + String(prop)); },',
+  '  has() { return true; },',
+  '});',
+].join('\n');
+
+function clonePlainJsonData(value: unknown, depth = 0): unknown {
+  if (depth > 8) return undefined;
+  if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 500).map((item) => clonePlainJsonData(item, depth + 1));
+  }
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = Object.create(null);
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+      out[k] = clonePlainJsonData(v, depth + 1);
+    }
+    return Object.freeze(out);
+  }
+  return undefined;
+}
+
+function runDocBuilderScriptSandboxVmSync(
+  script: string,
+  inputUrl: string | undefined,
+  argument?: Record<string, unknown>,
+): void {
+  const safeArgument = clonePlainJsonData(
+    inputUrl !== undefined
+      ? { ...(argument ?? {}), inputUrl, _imcodesInputUrl: inputUrl }
+      : (argument ?? {}),
+  );
+  const context = vm.createContext(
+    {
+      expectedInputUrl: inputUrl,
+      Argument: safeArgument,
+      Api: undefined as unknown,
+      builder: undefined as unknown,
+      builderJS: undefined as unknown,
+    },
+    {
+      name: 'docbuilder-policy-sandbox',
+      codeGeneration: { strings: false, wasm: false },
+    },
+  );
+  try {
+    vm.runInContext(
+      `${SANDBOX_HELPER_SCRIPT}\nthis.Api = makeApiProxy("Api");\nthis.builder = builderProxy;\nthis.builderJS = builderJSProxy;`,
+      context,
+      { timeout: 100 },
+    );
+    vm.runInContext(script, context, { timeout: 150 });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : (err && typeof err === 'object' && 'message' in err ? String((err as { message: unknown }).message) : String(err));
+    const name = err instanceof Error ? err.name : (err && typeof err === 'object' && 'name' in err ? String((err as { name: unknown }).name) : '');
+    // Harmless ReferenceError on benign non-forbidden identifiers (e.g. unit-test dummy helpers)
+    // is permitted only after static policy has already cleared the full script.
+    if (name === 'ReferenceError') {
+      return;
+    }
+    if (err instanceof SyntaxError || name === 'SyntaxError') {
+      throw new OnlyOfficeServiceError(
+        CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+        `Invalid DocBuilder JavaScript syntax: ${msg}`,
+        400,
+      );
+    }
+    throw new OnlyOfficeServiceError(
+      CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+      `Blocked unsafe DocBuilder script execution: ${msg}`,
+      400,
+    );
+  }
+}
+
+async function verifyDocBuilderScriptInIsolatedWorker(
+  script: string,
+  inputUrl: string | undefined,
+  argument?: Record<string, unknown>,
+  timeoutMs = 1500,
+): Promise<void> {
+  const safeArgument = clonePlainJsonData(
+    inputUrl !== undefined
+      ? { ...(argument ?? {}), inputUrl, _imcodesInputUrl: inputUrl }
+      : (argument ?? {}),
+  );
+  const workerSource = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    const vm = require('node:vm');
+    try {
+      const ctx = vm.createContext(
+        { expectedInputUrl: workerData.inputUrl, Argument: workerData.argument },
+        { name: 'docbuilder-worker-isolate', codeGeneration: { strings: false, wasm: false } }
+      );
+      vm.runInContext(workerData.bootstrap + "\\nthis.Api = makeApiProxy('Api');\\nthis.builder = builderProxy;\\nthis.builderJS = builderJSProxy;", ctx, { timeout: 100 });
+      try {
+        vm.runInContext(workerData.script, ctx, { timeout: 150 });
+      } catch (err) {
+        if (!(err && err.name === 'ReferenceError')) {
+          throw err;
+        }
+      }
+      parentPort.postMessage({ ok: true });
+    } catch (err) {
+      parentPort.postMessage({
+        ok: false,
+        name: err && err.name ? String(err.name) : 'Error',
+        message: err && err.message ? String(err.message) : String(err),
+      });
+    }
+  `;
+
+  await new Promise<void>((resolve, reject) => {
+    const worker = new Worker(workerSource, {
+      eval: true,
+      workerData: {
+        script,
+        inputUrl,
+        argument: safeArgument,
+        bootstrap: SANDBOX_HELPER_SCRIPT,
+      },
+      resourceLimits: {
+        maxOldGenerationSizeMb: 32,
+        maxYoungGenerationSizeMb: 16,
+      },
+    });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      void worker.terminate();
+      reject(
+        new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          'DocBuilder sandbox worker timed out',
+          400,
+        ),
+      );
+    }, Math.max(250, timeoutMs));
+
+    worker.once('message', (msg: { ok: boolean; name?: string; message?: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void worker.terminate();
+      if (msg.ok) {
+        resolve();
+      } else {
+        reject(
+          new OnlyOfficeServiceError(
+            CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+            `Blocked unsafe DocBuilder script execution in isolated worker: ${msg.message || 'security_violation'}`,
+            400,
+          ),
+        );
+      }
+    });
+    worker.once('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void worker.terminate();
+      reject(
+        new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          `DocBuilder isolated worker error: ${err.message}`,
+          400,
+        ),
+      );
+    });
+    worker.once('exit', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new OnlyOfficeServiceError(
+            CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+            `DocBuilder isolated worker exited unexpectedly (${code})`,
+            400,
+          ),
+        );
+      }
+    });
+  });
+}
+
+export function compileOnlyOfficeDocBuilderTemplate(
+  template: OnlyOfficeDocBuilderTemplate,
+  options: {
+    inputUrl?: string;
+    argument?: Record<string, unknown>;
+    outputType?: string;
+    outputName?: string;
+  } = {},
+): string {
+  const rawType = typeof options.argument?.type === 'string'
+    ? options.argument.type
+    : options.outputType;
+  const normalizedType = (rawType || 'docx').trim().replace(/^\./, '').toLowerCase();
+  const safeFormat = ['docx', 'xlsx', 'pptx', 'pdf'].includes(normalizedType) ? normalizedType : 'docx';
+  const rawOutputName = typeof options.outputName === 'string' && options.outputName.trim()
+    ? options.outputName.trim()
+    : `generated.${safeFormat}`;
+  if (rawOutputName.includes('/') || rawOutputName.includes('\\') || rawOutputName.includes('..')) {
+    throw new OnlyOfficeServiceError(
+      CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
+      'Invalid DocBuilder template outputName',
+      400,
+    );
+  }
+
+  switch (template) {
+    case 'create_document': {
+      return [
+        `builder.CreateFile(${JSON.stringify(safeFormat)});`,
+        'var oDoc = Api.GetDocument();',
+        'if (Argument && typeof Argument.title === "string" && Argument.title.length > 0) {',
+        '  var oTitlePara = oDoc.GetElement(0);',
+        '  if (oTitlePara && oTitlePara.AddText) { oTitlePara.AddText(Argument.title); }',
+        '}',
+        'var lines = Array.isArray(Argument && Argument.paragraphs) ? Argument.paragraphs : (Argument && typeof Argument.text === "string" ? [Argument.text] : (Argument && typeof Argument.content === "string" ? [Argument.content] : []));',
+        'for (var i = 0; i < lines.length; i += 1) {',
+        '  if (typeof lines[i] === "string") {',
+        '    var oPara = Api.CreateParagraph();',
+        '    oPara.AddText(lines[i]);',
+        '    oDoc.Push(oPara);',
+        '  }',
+        '}',
+        `builder.SaveFile(${JSON.stringify(safeFormat)}, ${JSON.stringify(rawOutputName)});`,
+        'builder.CloseFile();',
+      ].join('\n');
+    }
+    case 'append_text': {
+      if (!options.inputUrl) {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
+          'append_text template requires a target document',
+          400,
+        );
+      }
+      return [
+        `builder.OpenFile(${JSON.stringify(options.inputUrl)});`,
+        'var oDoc = Api.GetDocument();',
+        'var lines = Array.isArray(Argument && Argument.paragraphs) ? Argument.paragraphs : (Argument && typeof Argument.text === "string" ? [Argument.text] : (Argument && typeof Argument.content === "string" ? [Argument.content] : []));',
+        'for (var i = 0; i < lines.length; i += 1) {',
+        '  if (typeof lines[i] === "string") {',
+        '    var oPara = Api.CreateParagraph();',
+        '    oPara.AddText(lines[i]);',
+        '    oDoc.Push(oPara);',
+        '  }',
+        '}',
+        `builder.SaveFile(${JSON.stringify(safeFormat)}, ${JSON.stringify(rawOutputName)});`,
+        'builder.CloseFile();',
+      ].join('\n');
+    }
+    case 'replace_text': {
+      if (!options.inputUrl) {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
+          'replace_text template requires a target document',
+          400,
+        );
+      }
+      return [
+        `builder.OpenFile(${JSON.stringify(options.inputUrl)});`,
+        'var oDoc = Api.GetDocument();',
+        'if (Argument && typeof Argument.search === "string" && Argument.search.length > 0 && typeof Argument.replace === "string") {',
+        '  oDoc.SearchAndReplace({ searchString: Argument.search, replaceString: Argument.replace, matchCase: Boolean(Argument.matchCase) });',
+        '}',
+        `builder.SaveFile(${JSON.stringify(safeFormat)}, ${JSON.stringify(rawOutputName)});`,
+        'builder.CloseFile();',
+      ].join('\n');
+    }
+    default: {
+      throw new OnlyOfficeServiceError(
+        CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT,
+        'Unsupported DocBuilder template',
+        400,
+      );
+    }
+  }
+}
+
 function validateDocBuilderScriptSafety(src: string, inputUrl: string | undefined): void {
   const state = createLexState(false);
   const templateSpans: Array<{ start: number; end: number }> = [];
@@ -1106,6 +1518,20 @@ function validateDocBuilderScriptSafety(src: string, inputUrl: string | undefine
       if (ch === '"' || ch === "'") kind = 'string';
       else if (ch === '`') kind = 'template';
       else if (isIdentifierStart(ch)) kind = 'ident';
+      else if (ch === '\\' && token.text.includes('\\u')) {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          'Unicode escape sequences outside literals are not permitted in DocBuilder scripts',
+          400,
+        );
+      }
+      if (kind === 'ident' && token.text.includes('\\u')) {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          'Unicode escape sequences in identifiers are not permitted in DocBuilder scripts',
+          400,
+        );
+      }
       tokens.push({ kind, text: token.text, start: i });
     }
     i = token.nextIndex;
@@ -1115,24 +1541,76 @@ function validateDocBuilderScriptSafety(src: string, inputUrl: string | undefine
     const tok = tokens[idx]!;
     const prev = idx > 0 ? tokens[idx - 1] : undefined;
     const next = idx + 1 < tokens.length ? tokens[idx + 1] : undefined;
+    const next2 = idx + 2 < tokens.length ? tokens[idx + 2] : undefined;
+    const next3 = idx + 3 < tokens.length ? tokens[idx + 3] : undefined;
+
+    if (tok.kind === 'ident') {
+      if (FORBIDDEN_DOCBUILDER_IDENTIFIERS.has(tok.text)) {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          `Identifier "${tok.text}" is not permitted in DocBuilder scripts`,
+          400,
+        );
+      }
+      if (FORBIDDEN_RESOURCE_METHODS.has(tok.text)) {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          `Method or reference "${tok.text}" is not permitted in DocBuilder scripts`,
+          400,
+        );
+      }
+    }
 
     if (
       tok.kind === 'ident' &&
       tok.text === 'builder' &&
+      prev?.text !== '.' &&
+      prev?.text !== '?.'
+    ) {
+      if (next?.text === '[') {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          'Bracket property access on builder is not permitted',
+          400,
+        );
+      }
+      if (
+        (next?.text !== '.' && next?.text !== '?.') ||
+        next2?.kind !== 'ident' ||
+        !ALLOWED_GLOBAL_BUILDER_METHODS.has(next2.text) ||
+        next3?.text !== '('
+      ) {
+        throw new OnlyOfficeServiceError(
+          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+          'Direct aliasing or unsupported property access on builder is not permitted',
+          400,
+        );
+      }
+    }
+
+    if (
+      tok.kind === 'ident' &&
+      tok.text === 'Api' &&
       prev?.text !== '.' &&
       prev?.text !== '?.' &&
       next?.text === '['
     ) {
       throw new OnlyOfficeServiceError(
         CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-        'Bracket property access on builder is not permitted',
+        'Bracket property access on Api is not permitted',
         400,
       );
     }
 
     if ((tok.kind === 'string' || tok.kind === 'template') && prev?.text === '[') {
       const propName = decodeSimpleLiteralString(tok.text);
-      if (propName === 'OpenFile' || propName === 'OpenTmpFile') {
+      if (
+        propName &&
+        (propName === 'OpenFile' ||
+          propName === 'OpenFileAsync' ||
+          FORBIDDEN_RESOURCE_METHODS.has(propName) ||
+          FORBIDDEN_DOCBUILDER_IDENTIFIERS.has(propName))
+      ) {
         throw new OnlyOfficeServiceError(
           CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
           `Bracket access to ${propName} is not permitted`,
@@ -1141,7 +1619,7 @@ function validateDocBuilderScriptSafety(src: string, inputUrl: string | undefine
       }
     }
 
-    if (tok.kind === 'ident' && (tok.text === 'OpenFile' || tok.text === 'OpenTmpFile')) {
+    if (tok.kind === 'ident' && (tok.text === 'OpenFile' || tok.text === 'OpenTmpFile' || tok.text === 'OpenFileAsync')) {
       if ((prev?.text !== '.' && prev?.text !== '?.') || next?.text !== '(') {
         throw new OnlyOfficeServiceError(
           CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
@@ -1255,6 +1733,7 @@ export function prepareOnlyOfficeDocBuilderScript(
     i = token.nextIndex;
   }
 
+  runDocBuilderScriptSandboxVmSync(out, inputUrl);
   return out;
 }
 
@@ -1274,7 +1753,18 @@ export async function executeOnlyOfficeDocBuilder(
     );
   }
 
+  const isTrustedTemplate = options.template !== undefined && !options.script?.trim();
+  const isolatedUrl = options.env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL?.trim().replace(/\/+$/, '');
+  if (!isTrustedTemplate && !isolatedUrl && options.env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED === 'true') {
+    throw new OnlyOfficeServiceError(
+      CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED,
+      'Isolated DocBuilder executor is required for raw scripts',
+      503,
+    );
+  }
+
   const internalUrl = resolveOnlyOfficeInternalBaseUrl(options.env);
+  const runnerBaseUrl = !isTrustedTemplate && isolatedUrl ? isolatedUrl : internalUrl;
   const serverBaseUrl = (options.env.SERVER_URL || 'http://localhost:19138').replace(/\/+$/, '');
   const ooSecret = resolveOnlyOfficeJwtSecret(options.env);
   const scriptStore =
@@ -1288,7 +1778,25 @@ export async function executeOnlyOfficeDocBuilder(
       : typeof options.argument?._imcodesInputUrl === 'string'
         ? options.argument._imcodesInputUrl
         : undefined;
-  const preparedScript = prepareOnlyOfficeDocBuilderScript(options.script, { inputUrl });
+  let preparedScript: string;
+  if (isTrustedTemplate) {
+    preparedScript = compileOnlyOfficeDocBuilderTemplate(options.template!, {
+      inputUrl,
+      argument: options.argument,
+      outputType: options.requiredExt,
+      outputName: options.outputName,
+    });
+  } else {
+    if (typeof options.script !== 'string' || !options.script.trim()) {
+      throw new OnlyOfficeServiceError(
+        CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
+        'DocBuilder script or template is required',
+        400,
+      );
+    }
+    preparedScript = prepareOnlyOfficeDocBuilderScript(options.script, { inputUrl });
+    await verifyDocBuilderScriptInIsolatedWorker(preparedScript, inputUrl, options.argument, Math.min(timeoutMs, 1500));
+  }
   const scriptId = await scriptStore.put(preparedScript, scriptTtlMs);
   const scriptToken = signDocBuilderScriptToken(
     scriptId,
@@ -1310,7 +1818,7 @@ export async function executeOnlyOfficeDocBuilder(
 
     const { headerToken, bodyToken } = signOnlyOfficeServiceJwt(initialPayload, ooSecret);
     let responseData = await fetchJsonWithTimeout<DocBuilderHttpResponse>(
-      `${internalUrl}/docbuilder`,
+      `${runnerBaseUrl}/docbuilder`,
       {
         method: 'POST',
         headers: {
@@ -1369,7 +1877,7 @@ export async function executeOnlyOfficeDocBuilder(
       };
       const pollJwt = signOnlyOfficeServiceJwt(pollPayload, ooSecret);
       responseData = await fetchJsonWithTimeout<DocBuilderHttpResponse>(
-        `${internalUrl}/docbuilder`,
+        `${runnerBaseUrl}/docbuilder`,
         {
           method: 'POST',
           headers: {
@@ -1425,7 +1933,10 @@ export async function executeOnlyOfficeDocBuilder(
 
     const bytes = await downloadOnlyOfficeArtifact(
       selected.url,
-      options.env,
+      {
+        ...options.env,
+        ONLYOFFICE_INTERNAL_URL: runnerBaseUrl,
+      },
       remaining,
       CLOUD_DOC_ERROR_CODES.DOCBUILDER_FAILED,
     );

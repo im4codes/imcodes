@@ -1296,5 +1296,49 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
     });
     expect(smuggledArgRes.status).toBe(400);
     expect(await smuggledArgRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
+
+    // Supports trusted data-only template create + edit and rejects builderJS/tmp/dynamic obfuscation via HTTP routes
+    const tplCreateRes = await app.request('/api/cloud-docs/docbuilder', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'docx',
+        name: 'TemplateDoc.docx',
+        template: 'create_document',
+        argument: { title: 'Quarterly Brief', text: 'Safe body' },
+      }),
+    });
+    expect(tplCreateRes.status).toBe(201);
+    expect(lastScriptDownloaded).toContain('builder.CreateFile("docx");');
+
+    const tplDoc = ((await tplCreateRes.json()) as { doc: { id: string } }).doc;
+    const tplEditRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        template: 'append_text',
+        argument: { text: 'Appended line', inputUrl: 'http://169.254.169.254/ignored' },
+      }),
+    });
+    expect(tplEditRes.status).toBe(200);
+    expect(lastScriptDownloaded).not.toContain('169.254.169.254');
+
+    const prevDownloaded = lastScriptDownloaded;
+    for (const bypassScript of [
+      'builderJS.OpenFile("http://169.254.169.254/");',
+      'builder.SaveTmpFile("docx", "/tmp/evil.docx");',
+      'Api.CreateImage("http://127.0.0.1:9000/ssrf.png");',
+      'var fn = "Open" + "TmpFile"; var d = Api.GetDocument(); d[fn]("/etc/passwd");',
+      '(0, eval)("builder.CreateFile(\\"docx\\")");',
+    ]) {
+      const badRouteRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
+        method: 'POST',
+        headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ script: bypassScript }),
+      });
+      expect(badRouteRes.status).toBe(400);
+      expect(await badRouteRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
+      expect(lastScriptDownloaded).toBe(prevDownloaded);
+    }
   });
 });

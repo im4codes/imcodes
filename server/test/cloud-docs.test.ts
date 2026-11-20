@@ -2654,4 +2654,53 @@ describe('cloud docs & recent documents', () => {
       expect(item.sharedTeamName).toBeUndefined();
     }
   });
+
+  it('P0-3: enforces strict URL, token, and optional operation=download binding on /cloud-docs/onlyoffice/file/:token', async () => {
+    const createRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'docx', name: 'StrictBind.docx', content: 'Secret payload' }),
+    });
+    expect(createRes.status).toBe(201);
+    const { doc } = (await createRes.json()) as { doc: { id: string } };
+
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'doc',
+        targetId: doc.id,
+        shareMode: 'user',
+        targetUserId: 'user-bob',
+        role: 'viewer',
+        allowDownload: false,
+      }),
+    });
+
+    const cfgRes = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config`, {
+      headers: bearerHeader('user-bob'),
+    });
+    expect(cfgRes.status).toBe(200);
+    const cfg = (await cfgRes.json()) as { config: { document: { url: string } } };
+    const docUrl = cfg.config.document.url;
+    const docPath = new URL(docUrl).pathname;
+    const ooSecret = resolveOnlyOfficeJwtSecret({ ONLYOFFICE_JWT_SECRET: OO_SECRET, JWT_SIGNING_KEY: JWT_KEY });
+
+    const okDownloadOpJwt = signJwt({ url: docUrl, operation: 'download' }, ooSecret, 300);
+    expect(
+      (await app.request(docPath, { headers: { Authorization: `Bearer ${okDownloadOpJwt}` } })).status,
+    ).toBe(200);
+
+    for (const badPayload of [
+      { url: docUrl, operation: 'converter' },
+      { operation: 'download' },
+      { url: 'http://localhost:19138/api/cloud-docs/onlyoffice/file/wrong-token-value' },
+      { url: `https://untrusted.invalid${docPath}` },
+    ]) {
+      const badJwt = signJwt(badPayload, ooSecret, 300);
+      const res = await app.request(docPath, { headers: { Authorization: `Bearer ${badJwt}` } });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toMatchObject({ error: 'invalid_onlyoffice_jwt' });
+    }
+  });
 });

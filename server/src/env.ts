@@ -44,6 +44,10 @@ export interface EnvConfig {
   ONLYOFFICE_JWT_SECRET?: string;
   ONLYOFFICE_PUBLIC_URL?: string;
   ONLYOFFICE_INTERNAL_URL?: string;
+  /** Optional isolated DocBuilder runner endpoint URL for executing raw scripts outside the shared Document Server. */
+  ONLYOFFICE_DOCBUILDER_ISOLATED_URL?: string;
+  /** When 'true', raw DocBuilder scripts require ONLYOFFICE_DOCBUILDER_ISOLATED_URL (trusted templates remain enabled). */
+  ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED?: string;
   IMCODES_CLOUD_DOCS_DIR?: string;
 
   // Server URL (used to build webhook URLs)
@@ -118,6 +122,8 @@ export interface EnvConfig {
   PUSH_RELAY_URL?: string;
   /** Optional shared bearer secret protecting POST /api/push/relay when configured. */
   PUSH_RELAY_SECRET?: string;
+  /** Optional bearer secret sent by a self-hosted instance to its explicitly configured PUSH_RELAY_URL. */
+  PUSH_RELAY_CLIENT_SECRET?: string;
 
   // Password auth
   /** Default admin password when auto-creating admin user. Default: 'imcodes' */
@@ -182,6 +188,8 @@ export function loadEnv(): EnvConfig {
     ONLYOFFICE_JWT_SECRET: process.env.ONLYOFFICE_JWT_SECRET,
     ONLYOFFICE_PUBLIC_URL: process.env.ONLYOFFICE_PUBLIC_URL,
     ONLYOFFICE_INTERNAL_URL: process.env.ONLYOFFICE_INTERNAL_URL ?? 'http://onlyoffice:80',
+    ONLYOFFICE_DOCBUILDER_ISOLATED_URL: process.env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL,
+    ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: process.env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED,
     IMCODES_CLOUD_DOCS_DIR: process.env.IMCODES_CLOUD_DOCS_DIR,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
@@ -210,6 +218,7 @@ export function loadEnv(): EnvConfig {
     JPUSH_MASTER_SECRET: process.env.JPUSH_MASTER_SECRET,
     PUSH_RELAY_URL: process.env.PUSH_RELAY_URL,
     PUSH_RELAY_SECRET: process.env.PUSH_RELAY_SECRET,
+    PUSH_RELAY_CLIENT_SECRET: process.env.PUSH_RELAY_CLIENT_SECRET,
     DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD,
     LANDING_HOST: process.env.LANDING_HOST,
     DB_POOL_MAX: process.env.DB_POOL_MAX,

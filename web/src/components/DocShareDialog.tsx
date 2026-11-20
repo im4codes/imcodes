@@ -1212,15 +1212,24 @@ export function DocShareDialog({
  * or logged-in `doc_collaborator` session).
  * Hides internal servers and AI sessions, rendering only the shared folder/document and embedded ONLYOFFICE editor.
  */
-export function ExternalDocShareSpace({ token }: { token: string }) {
-  const { t } = useTranslation();
-  const [deviceToken, setDeviceToken] = useState<string>(() => {
-    try {
-      return token ? localStorage.getItem(`imcodes_doc_dev_${token}`) || '' : '';
-    } catch {
+function readSanitizedStoredDeviceToken(shareToken: string | undefined): string {
+  if (!shareToken) return '';
+  const storageKey = `imcodes_doc_dev_${shareToken}`;
+  try {
+    const saved = localStorage.getItem(storageKey) || '';
+    if (/^user:/i.test(saved.trim())) {
+      localStorage.removeItem(storageKey);
       return '';
     }
-  });
+    return saved;
+  } catch {
+    return '';
+  }
+}
+
+export function ExternalDocShareSpace({ token }: { token: string }) {
+  const { t } = useTranslation();
+  const [deviceToken, setDeviceToken] = useState<string>(() => readSanitizedStoredDeviceToken(token));
   const [accessCode, setAccessCode] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [shareInfo, setShareInfo] = useState<ExternalShareView | null>(null);
@@ -1250,12 +1259,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   // Reset per-token state when the route token changes
   useEffect(() => {
     ++navEpochRef.current;
-    let savedDev = '';
-    try {
-      savedDev = token ? localStorage.getItem(`imcodes_doc_dev_${token}`) || '' : '';
-    } catch {
-      savedDev = '';
-    }
+    const savedDev = readSanitizedStoredDeviceToken(token);
     setDeviceToken(savedDev);
     setAccessCode('');
     setShareInfo(null);
@@ -1382,13 +1386,18 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
         deviceToken: deviceToken || undefined,
       });
       if (actionEpoch !== navEpochRef.current || actionToken !== token) return;
-      setDeviceToken(res.deviceToken);
+      const sanitizedDevToken = /^user:/i.test(res.deviceToken.trim()) ? '' : res.deviceToken;
+      setDeviceToken(sanitizedDevToken);
       try {
-        localStorage.setItem(`imcodes_doc_dev_${actionToken}`, res.deviceToken);
+        if (sanitizedDevToken) {
+          localStorage.setItem(`imcodes_doc_dev_${actionToken}`, sanitizedDevToken);
+        } else {
+          localStorage.removeItem(`imcodes_doc_dev_${actionToken}`);
+        }
       } catch {
         // Ignore storage errors
       }
-      await loadExternalBrowse(undefined, res.deviceToken, accessCode.trim() || undefined);
+      await loadExternalBrowse(undefined, sanitizedDevToken, accessCode.trim() || undefined);
     } catch (err) {
       if (actionEpoch !== navEpochRef.current || actionToken !== token) return;
       setError(err instanceof Error ? err.message : String(err));
