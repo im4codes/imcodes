@@ -3085,7 +3085,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
     return registerComposerFocusHandler(divRef.current, focusComposerForTyping);
-  });
+  }, [inputRef, focusComposerForTyping]);
   useEffect(() => () => {
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = null;
   }, [inputRef]);

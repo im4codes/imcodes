@@ -82,6 +82,12 @@ import { useNowTicker } from '../src/hooks/useNowTicker.js';
 import { TaskPairStatusPanel, collapsedStorageKey } from '../src/components/TaskPairStatusPanel.js';
 import { ChatView } from '../src/components/ChatView.js';
 import { SubSessionWindow } from '../src/components/SubSessionWindow.js';
+import {
+  extractChatFileReferences,
+  extractMarkdownLocalFileDestinations,
+  findChatFileReferencesInText,
+  normalizeLocalMarkdownDestinations,
+} from '../../shared/chat-local-path.js';
 
 describe('main-thread freeze guards & timer/observer gating', () => {
   afterEach(() => {
@@ -482,5 +488,49 @@ describe('main-thread freeze guards & timer/observer gating', () => {
         value: originalUa,
       });
     }
+  });
+
+  it('keeps chat path parsing linear on large unclosed brackets and adversarial path characters', () => {
+    const unclosedBrackets = `${'[a '.repeat(20_000)}see [report](dir/file name.md)`;
+    const t0 = performance.now();
+    expect(normalizeLocalMarkdownDestinations(unclosedBrackets)).toContain('[report](<dir/file name.md>)');
+    expect(extractMarkdownLocalFileDestinations(unclosedBrackets)).toEqual(['dir/file name.md']);
+    expect(performance.now() - t0).toBeLessThan(250);
+
+    const rootedNoDot = `${'/a'.repeat(9_500)} src/app.tsx`;
+    const rootedManyDots = `${'/a.b'.repeat(4_500)}/\n/tmp/ok.ts`;
+    const bareDashes = `${'-a'.repeat(9_500)} foo-bar.ts`;
+    const t1 = performance.now();
+    expect(findChatFileReferencesInText(rootedNoDot).map((m) => m.path)).toEqual(['src/app.tsx']);
+    expect(findChatFileReferencesInText(rootedManyDots).map((m) => m.path)).toContain('/tmp/ok.ts');
+    expect(findChatFileReferencesInText(bareDashes).map((m) => m.path)).toEqual(['foo-bar.ts']);
+    expect(extractChatFileReferences(`${'[x '.repeat(15_000)}\n/tmp/ok.ts`)).toContain('/tmp/ok.ts');
+    expect(performance.now() - t1).toBeLessThan(250);
+  });
+
+  it('keeps ChatView PATH_REGEX linear on repeated tilde/dot prefixes without separators', () => {
+    const t0 = performance.now();
+    const text = `${'~a'.repeat(9_500)} src/main.ts`;
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-tilde-path',
+            type: 'user.message',
+            ts: 1_000,
+            sessionId: 'sess-1',
+            source: 'daemon',
+            confidence: 'high',
+            payload: { text },
+          },
+        ]}
+        loading={false}
+        ws={{} as any}
+        onPreviewFile={vi.fn()}
+      />,
+    );
+    expect(performance.now() - t0).toBeLessThan(250);
+    const links = Array.from(container.querySelectorAll('.chat-path-link')).map((el) => el.textContent);
+    expect(links).toContain('src/main.ts');
   });
 });

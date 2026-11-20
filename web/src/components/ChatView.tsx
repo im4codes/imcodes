@@ -7864,7 +7864,7 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 
 // ── URL detection (must run BEFORE path detection) ────────────────────────
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
-const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
+const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}.\-~])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
 /** Split a plain-text segment into CloudDoc, URL, path, and plain-text tokens. */
 function splitPathsAndUrls(
@@ -7890,7 +7890,7 @@ function splitPathsAndUrls(
     onUrlClick,
     onOpenLocalWebPreview,
     renderPlainText: (chunkText, baseOffset) => {
-      if (!onPathClick && !onImagePreview) {
+      if ((!onPathClick && !onImagePreview) || (!chunkText.includes('/') && !chunkText.includes('\\'))) {
         return [<span key={`t${baseOffset}`}>{chunkText}</span>];
       }
       const parts: h.JSX.Element[] = [];

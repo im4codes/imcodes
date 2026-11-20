@@ -10,7 +10,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { marked, type Token, type Tokens } from 'marked';
+import { Marked, Tokenizer, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
 import {
   chatPathHasFileExtension,
@@ -614,6 +614,32 @@ export function __getChatMarkdownCacheSizeForTests(): number {
   return markdownTokenCache.size;
 }
 
+// Bound quadratic inline emphasis/strikethrough backtracking in marked when a
+// message contains thousands of unclosed `*`, `_`, or `~` delimiters (e.g. globs
+// or raw logs under the 20k markdown limit). Once the failed-scan budget for a
+// single parse pass is exhausted, remaining unclosed delimiters degrade cleanly to
+// plain text instead of wedging the main thread.
+const MAX_FAILED_INLINE_SCAN_CHARS = 120_000;
+let activeFailedInlineScanBudget = { remaining: MAX_FAILED_INLINE_SCAN_CHARS };
+const chatMarkdownLexer = new Marked({
+  breaks: true,
+  gfm: true,
+  tokenizer: {
+    emStrong(src, maskedSrc, prevChar) {
+      if (activeFailedInlineScanBudget.remaining <= 0) return undefined;
+      const token = Tokenizer.prototype.emStrong.call(this, src, maskedSrc, prevChar);
+      if (!token) activeFailedInlineScanBudget.remaining -= maskedSrc.length;
+      return token;
+    },
+    del(src, maskedSrc, prevChar) {
+      if (activeFailedInlineScanBudget.remaining <= 0) return undefined;
+      const token = Tokenizer.prototype.del.call(this, src, maskedSrc, prevChar);
+      if (!token) activeFailedInlineScanBudget.remaining -= maskedSrc.length;
+      return token;
+    },
+  },
+});
+
 function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
   const normalized = normalizeLocalMarkdownDestinations(text);
   const key = cacheKey ? `${cacheKey}:${markdownRevision(normalized)}` : `text:${markdownRevision(normalized)}`;
@@ -623,7 +649,14 @@ function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
     markdownTokenCache.set(key, hit);
     return hit.tokens;
   }
-  const tokens = marked.lexer(normalized);
+  const previousBudget = activeFailedInlineScanBudget;
+  activeFailedInlineScanBudget = { remaining: MAX_FAILED_INLINE_SCAN_CHARS };
+  let tokens: Token[];
+  try {
+    tokens = chatMarkdownLexer.lexer(normalized);
+  } finally {
+    activeFailedInlineScanBudget = previousBudget;
+  }
   markdownTokenCache.set(key, { text: normalized, tokens });
   while (markdownTokenCache.size > MARKDOWN_CACHE_LIMIT) {
     const oldest = markdownTokenCache.keys().next().value;

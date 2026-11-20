@@ -825,4 +825,29 @@ describe('streaming render mode', () => {
     expect(onPathClick).toHaveBeenCalledTimes(1);
     expect(onPathClick).toHaveBeenCalledWith('local-only.xlsx');
   });
+
+  it('bounds pathological emphasis and strikethrough backtracking while keeping normal formatting intact', () => {
+    const cases = [
+      `**bold** *italic* ~~gone~~ ${'*.ts *.tsx *.js '.repeat(1_100)}`,
+      `**real** ${'**a ** '.repeat(2_800)}`,
+      `~~real~~ ${'~~a ~~ '.repeat(2_800)}`,
+    ];
+    for (const [idx, text] of cases.entries()) {
+      expect(text.length).toBeLessThanOrEqual(RICH_TEXT_ENHANCEMENT_CHAR_LIMIT);
+      const t0 = performance.now();
+      const { container, unmount } = render(<ChatMarkdown text={text} cacheKey={`pathological-${idx}`} />);
+      const elapsedMs = performance.now() - t0;
+      if (idx === 0) {
+        expect(container.querySelector('strong')?.textContent).toBe('bold');
+        expect(container.querySelector('em')?.textContent).toBe('italic');
+        expect(container.querySelector('del')?.textContent).toBe('gone');
+      } else if (idx === 1) {
+        expect(container.querySelector('strong')?.textContent).toBe('real');
+      } else {
+        expect(container.querySelector('del')?.textContent).toBe('real');
+      }
+      expect(elapsedMs).toBeLessThan(400);
+      unmount();
+    }
+  });
 });
