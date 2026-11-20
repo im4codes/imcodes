@@ -8372,12 +8372,17 @@ function InternalMainApp() {
 
     let cancelled = false;
     let rafId: number | null = null;
+    let overlayCheckRafId: number | null = null;
     let observer: MutationObserver | null = null;
 
     const cleanupObservers = () => {
       if (rafId !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(rafId);
         rafId = null;
+      }
+      if (overlayCheckRafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(overlayCheckRafId);
+        overlayCheckRafId = null;
       }
       observer?.disconnect();
       observer = null;
@@ -8395,10 +8400,20 @@ function InternalMainApp() {
     const watchDomOverlayIfBlocked = () => {
       if (cancelled || observer || typeof MutationObserver === 'undefined' || !document.body) return;
       if (!hasDomBlockingOverlay()) return;
-      observer = new MutationObserver(() => {
+      const runOverlayCheck = () => {
+        overlayCheckRafId = null;
         if (cancelled) return;
         if (!hasDomBlockingOverlay()) {
           attemptFocus();
+        }
+      };
+      observer = new MutationObserver(() => {
+        if (cancelled) return;
+        if (typeof requestAnimationFrame === 'function') {
+          if (overlayCheckRafId !== null) return;
+          overlayCheckRafId = requestAnimationFrame(runOverlayCheck);
+        } else {
+          runOverlayCheck();
         }
       });
       observer.observe(document.body, {

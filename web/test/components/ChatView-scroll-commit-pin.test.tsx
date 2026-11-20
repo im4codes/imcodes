@@ -196,7 +196,7 @@ describe('ChatView — scroll ownership across commits', () => {
     expect(geometry.scrollTop).toBe(500);
   });
 
-  it('re-pins local DOM growth (tool card expand) in a microtask, only while following', async () => {
+  it('re-pins local DOM growth (tool card expand) in the coalesced frame, only while following', async () => {
     const { scrollEl, geometry } = await mountPinned(8);
 
     geometry.scrollHeight = 1600;
@@ -204,8 +204,9 @@ describe('ChatView — scroll ownership across commits', () => {
       const fold = document.createElement('div');
       fold.className = 'chat-tool-fold-body';
       scrollEl.appendChild(fold); // a DOM change no ChatView render owns
-      await Promise.resolve(); // MutationObserver callbacks are microtasks
+      await Promise.resolve();
     });
+    flushFrames();
     expect(geometry.scrollTop).toBe(1600 - geometry.clientHeight);
 
     // A reader who scrolled away is left alone by the same kind of growth.
@@ -217,6 +218,7 @@ describe('ChatView — scroll ownership across commits', () => {
       scrollEl.appendChild(document.createElement('div'));
       await Promise.resolve();
     });
+    flushFrames();
     expect(geometry.scrollTop).toBe(400);
   });
 
@@ -243,6 +245,7 @@ describe('ChatView — scroll ownership across commits', () => {
       scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
       await Promise.resolve();
     });
+    flushFrames();
     spy.mockRestore();
 
     const after = (scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top;
@@ -264,6 +267,7 @@ describe('ChatView — scroll ownership across commits', () => {
       scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
       await Promise.resolve();
     });
+    flushFrames();
 
     const after = (scrollEl.querySelector('[data-event-id="evt-6"]') as HTMLElement).getBoundingClientRect().top;
     expect(after).toBe(before);
@@ -311,6 +315,7 @@ describe('ChatView — scroll ownership across commits', () => {
       scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
       await Promise.resolve();
     });
+    flushFrames();
     const spacer = scrollEl.querySelector(':scope > [aria-hidden="true"]') as HTMLElement;
     expect(parseFloat(spacer.style.marginTop)).toBeLessThan(0); // hidden above the origin, not written to scrollTop
     expect((scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top).toBe(before);
@@ -364,5 +369,125 @@ describe('ChatView — scroll ownership across commits', () => {
     geometry.scrollTop = before - 40;
     act(() => { view.rerender(<ChatView events={events(30) as never} loading={false} hasOlderHistory={false} sessionId={SESSION} />); });
     expect(geometry.scrollTop).toBe(before - 40);
+  });
+
+  it('normalizes CSS zoom (1.25) in virtualized row measurement and reader-anchor restoration without looping', async () => {
+    document.documentElement.style.setProperty('--imcodes-ui-zoom', '1.25');
+    document.documentElement.style.setProperty('zoom', '1.25');
+    const zoom = 1.25;
+
+    // Re-install getBoundingClientRect scaling all coordinates/heights by active CSS zoom (1.25).
+    vi.restoreAllMocks();
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver as unknown as typeof ResizeObserver);
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver as unknown as typeof IntersectionObserver);
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      queuedFrames.push(cb);
+      return queuedFrames.length;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined);
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      if (!el.isConnected) return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) } as DOMRect;
+      const eventId = el.getAttribute?.('data-event-id');
+      if (eventId) {
+        const cssTop = Number(eventId.replace('evt-', '')) * 100 + geometry.aboveShift + topOffsetDelta(el) - geometry.scrollTop;
+        return { x: 0, y: cssTop * zoom, top: cssTop * zoom, left: 0, right: 0, bottom: (cssTop + 100) * zoom, width: 0, height: 100 * zoom, toJSON: () => ({}) } as DOMRect;
+      }
+      if (el.dataset?.virtualKey) {
+        const inner = el.querySelector?.('[data-event-id]')?.getAttribute('data-event-id');
+        const index = inner ? Number(inner.replace('evt-', '')) : 0;
+        const cssTop = index * 72 + geometry.aboveShift + topOffsetDelta(el) - geometry.scrollTop;
+        return { x: 0, y: cssTop * zoom, top: cssTop * zoom, left: 0, right: 0, bottom: (cssTop + 72) * zoom, width: 0, height: 72 * zoom, toJSON: () => ({}) } as DOMRect;
+      }
+      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) } as DOMRect;
+    });
+
+    try {
+      const { scrollEl } = await mountPinned(30);
+      geometry.scrollTop = 1180;
+      fireEvent.wheel(scrollEl, { deltaY: -120 });
+      fireEvent.scroll(scrollEl);
+      recordTopOffsetBaseline(scrollEl);
+      const beforeZoomedTop = (scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top;
+
+      // Mount a 120px CSS block above rows -> 150px zoomed shift; absorber must subtract 120 (not 150) and converge cleanly.
+      geometry.aboveShift = 120;
+      geometry.scrollHeight += 120;
+      await act(async () => {
+        scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
+        await Promise.resolve();
+      });
+      flushFrames();
+
+      const afterZoomedTop = (scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top;
+      expect(topOffsetDelta(scrollEl.querySelector('[data-event-id="evt-12"]')!)).toBe(-120);
+      expect(afterZoomedTop).toBe(beforeZoomedTop);
+      expect(queuedFrames).toHaveLength(0);
+    } finally {
+      document.documentElement.style.removeProperty('--imcodes-ui-zoom');
+      document.documentElement.style.removeProperty('zoom');
+    }
+  });
+
+  it('bounds un-converging restoreReaderAnchor passes and ignores virtual spacer mutations', async () => {
+    // Override getBoundingClientRect WITHOUT topOffsetDelta so patchTopSpacer never moves evt-12.
+    vi.restoreAllMocks();
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver as unknown as typeof ResizeObserver);
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver as unknown as typeof IntersectionObserver);
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      queuedFrames.push(cb);
+      return queuedFrames.length;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined);
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      if (!el.isConnected) return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) } as DOMRect;
+      const eventId = el.getAttribute?.('data-event-id');
+      if (eventId) {
+        const top = Number(eventId.replace('evt-', '')) * 100 + geometry.aboveShift - geometry.scrollTop;
+        return { x: 0, y: top, top, left: 0, right: 0, bottom: top + 100, width: 0, height: 100, toJSON: () => ({}) } as DOMRect;
+      }
+      if (el.dataset?.virtualKey) {
+        const inner = el.querySelector?.('[data-event-id]')?.getAttribute('data-event-id');
+        const index = inner ? Number(inner.replace('evt-', '')) : 0;
+        const top = index * 72 + geometry.aboveShift - geometry.scrollTop;
+        return { x: 0, y: top, top, left: 0, right: 0, bottom: top + 72, width: 0, height: 72, toJSON: () => ({}) } as DOMRect;
+      }
+      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) } as DOMRect;
+    });
+
+    const { view, scrollEl } = await mountPinned(30);
+    geometry.scrollTop = 1180;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+
+    // Mutate virtual spacer directly -> must be ignored (0 rAF scheduled).
+    const spacer = scrollEl.querySelector('[data-virtual-spacer="true"]') as HTMLElement;
+    expect(spacer).toBeTruthy();
+    queuedFrames = [];
+    await act(async () => {
+      spacer.classList.add('spacer-touch');
+      await Promise.resolve();
+    });
+    expect(queuedFrames).toHaveLength(0);
+
+    // Trigger un-converging layout shift + multiple rapid DOM mutations -> coalesced to 1 rAF & bounded passes.
+    geometry.aboveShift = 150;
+    geometry.scrollHeight += 150;
+    await act(async () => {
+      scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
+      scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
+      scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
+      await Promise.resolve();
+    });
+    expect(queuedFrames).toHaveLength(1);
+    flushFrames();
+    expect(queuedFrames).toHaveLength(0);
+
+    // Unrelated events reference update with identical items does not re-ignite an unbounded loop.
+    act(() => {
+      view.rerender(<ChatView events={events(30) as never} loading={false} hasOlderHistory={false} sessionId={SESSION} />);
+    });
+    expect(queuedFrames).toHaveLength(0);
   });
 });

@@ -70,6 +70,7 @@ import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { attachmentDisplayName, attachmentDownloadId, isAbsoluteAttachmentPath } from '../attachment-refs.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { getActiveCssZoom } from '../ui-scale.js';
 import { formatToolDuration } from '../util/tool-duration.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
@@ -2343,8 +2344,14 @@ export function __computeRevealRenderItemLimitForTests(
   return index < 0 ? currentLimit : Math.max(currentLimit, items.length - index);
 }
 
+function readSafeCssZoom(): number {
+  const zoom = getActiveCssZoom();
+  return Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+}
+
 interface VirtualizedViewItemsProps {
   items: ViewItem[];
+  contentRevision?: string;
   scrollRef: { current: HTMLDivElement | null };
   enabled: boolean;
   /** A pinned/search target that must be mounted before its caller locates it. */
@@ -2388,7 +2395,7 @@ const VIRTUAL_ESTIMATE_MIN_SAMPLES = 6;
  * remains the owner of follow/anchor policy and therefore streaming and history
  * prepend semantics stay unchanged.
  */
-function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasuredLayout, absorbTopShiftRef, onTopOffsetReconciled, resetKey, isFollowing, renderItem }: VirtualizedViewItemsProps) {
+function VirtualizedViewItems({ items, contentRevision, scrollRef, enabled, revealKey, onMeasuredLayout, absorbTopShiftRef, onTopOffsetReconciled, resetKey, isFollowing, renderItem }: VirtualizedViewItemsProps) {
   const heightsRef = useRef(new Map<string, number>());
   const [layoutVersion, setLayoutVersion] = useState(0);
   const scrollTopRef = useRef(0);
@@ -2432,6 +2439,9 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     viewportRef.current = root.clientHeight;
     setLayoutVersion((v) => v + 1);
     const onScroll = () => {
+      if (Math.abs(root.scrollTop - scrollTopRef.current) > 1) {
+        absorbPassCountRef.current = 0;
+      }
       scrollTopRef.current = root.scrollTop;
       viewportRef.current = root.clientHeight;
       wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
@@ -2465,13 +2475,14 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   const captureViewportAnchor = () => {
     const root = scrollRef.current;
     if (!root) return;
+    const zoom = readSafeCssZoom();
     const rootTop = root.getBoundingClientRect().top;
     viewportAnchorRef.current = null;
     for (const node of root.querySelectorAll<HTMLElement>('[data-virtual-key]')) {
       const rect = node.getBoundingClientRect();
-      if (rect.bottom <= rootTop + 1) continue;
+      if ((rect.bottom - rootTop) / zoom <= 1) continue;
       const key = node.dataset.virtualKey;
-      if (key) viewportAnchorRef.current = { key, top: rect.top - rootTop };
+      if (key) viewportAnchorRef.current = { key, top: (rect.top - rootTop) / zoom };
       break;
     }
   };
@@ -2515,10 +2526,16 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     if (!absorbTopShiftRef || !enabled) return undefined;
     absorbTopShiftRef.current = (delta: number) => {
       if (!topSpacerElRef.current) return delta;
+      if (absorbPassCountRef.current >= MAX_VIRTUAL_ABSORB_PASSES) return 0;
+      absorbPassCountRef.current += 1;
       biasRef.current -= delta;
       patchTopSpacer(topSpacerBaseRef.current + biasRef.current);
-      setLayoutVersion((v) => v + 1);
       scheduleIdleReconcile();
+      if (inSyncLayoutEffectRef.current) {
+        didAbsorbThisPassRef.current = true;
+      } else {
+        setLayoutVersion((v) => v + 1);
+      }
       return 0;
     };
     return () => { absorbTopShiftRef.current = null; };
@@ -2620,6 +2637,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // ChatView (the single scroll owner) decides what to do about the viewport.
   const commitMeasuredRows = (nodes: Iterable<HTMLElement>): boolean => {
     let changed = false;
+    const zoom = readSafeCssZoom();
     for (const node of nodes) {
       const key = node.dataset.virtualKey;
       if (!key) continue;
@@ -2628,7 +2646,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       // real height with the 1px floor, so its spacer share would vanish and the
       // list below would jump by the whole row every time it left the window.
       if (!node.isConnected) continue;
-      const height = Math.max(1, Math.ceil(node.getBoundingClientRect().height));
+      const height = Math.max(1, Math.ceil(node.getBoundingClientRect().height / zoom));
       const known = heightsRef.current.get(key);
       if (known === height) continue;
       // First sight of a row is recorded (it feeds the estimate) even when it happens
@@ -2656,14 +2674,18 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // that frame showed a 15-42px gap/reverse jump.
   const lastCommitSignatureRef = useRef('');
   const lastExternalSignatureRef = useRef('');
-  const lastExternalItemsRef = useRef<ViewItem[] | null>(null);
   const lastCommitClientHeightRef = useRef(0);
   const syncLayoutPassCountRef = useRef(0);
   const rafRetryCountRef = useRef(0);
   const resizeObserverPassCountRef = useRef(0);
+  const absorbPassCountRef = useRef(0);
+  const inSyncLayoutEffectRef = useRef(false);
+  const didAbsorbThisPassRef = useRef(false);
   const pendingLayoutRafRef = useRef<number | null>(null);
+  const MAX_VIRTUAL_SYNC_LAYOUT_PASSES = 3;
   const MAX_VIRTUAL_LAYOUT_RAF_RETRIES = 2;
   const MAX_VIRTUAL_RESIZE_OBSERVER_PASSES = 6;
+  const MAX_VIRTUAL_ABSORB_PASSES = 6;
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const observedNodesRef = useRef<Set<HTMLElement>>(new Set());
   const latestLayoutHandlersRef = useRef({
@@ -2691,8 +2713,8 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       syncLayoutPassCountRef.current = 0;
       rafRetryCountRef.current = 0;
       resizeObserverPassCountRef.current = 0;
+      absorbPassCountRef.current = 0;
       lastExternalSignatureRef.current = '';
-      lastExternalItemsRef.current = null;
       if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(pendingLayoutRafRef.current);
         pendingLayoutRafRef.current = null;
@@ -2702,13 +2724,13 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     const root = scrollRef.current;
     if (!root) return;
     const clientHeight = root.clientHeight;
-    const externalSignature = `${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}:${clientHeight}:${resetKey ?? ''}:${resumeGeneration}:${revealKey ?? ''}`;
-    if (externalSignature !== lastExternalSignatureRef.current || items !== lastExternalItemsRef.current) {
+    const externalSignature = `${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}:${clientHeight}:${resetKey ?? ''}:${resumeGeneration}:${revealKey ?? ''}:${contentRevision ?? ''}`;
+    if (externalSignature !== lastExternalSignatureRef.current) {
       lastExternalSignatureRef.current = externalSignature;
-      lastExternalItemsRef.current = items;
       syncLayoutPassCountRef.current = 0;
       rafRetryCountRef.current = 0;
       resizeObserverPassCountRef.current = 0;
+      absorbPassCountRef.current = 0;
     }
     const isDocumentHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
     // Hidden/collapsed panes report 0px row rects, which commitMeasuredRows would
@@ -2739,23 +2761,29 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       rafRetryCountRef.current = 0;
       return;
     }
-    onMeasuredLayout?.(root, wasAtBottom);
+    inSyncLayoutEffectRef.current = true;
+    didAbsorbThisPassRef.current = false;
+    try {
+      onMeasuredLayout?.(root, wasAtBottom);
+    } finally {
+      inSyncLayoutEffectRef.current = false;
+    }
     scrollTopRef.current = root.scrollTop;
     captureViewportAnchor();
-    if (!changed) {
+    if (!changed && !didAbsorbThisPassRef.current) {
       syncLayoutPassCountRef.current = 0;
       rafRetryCountRef.current = 0;
       return;
     }
-    // Bound both synchronous pre-paint re-renders and cross-frame rAF retries so
-    // oscillating row heights cannot lock the main thread in a tight loop or a
-    // 60Hz rAF spin; budgets replenish when external inputs/viewport change or settle.
+    // Bound both synchronous pre-paint re-renders (including reader-anchor shift
+    // absorption) and cross-frame rAF retries so oscillating row heights or
+    // un-converging anchors cannot lock the main thread in a tight loop or 60Hz spin.
     syncLayoutPassCountRef.current += 1;
-    if (syncLayoutPassCountRef.current <= 3) {
+    if (syncLayoutPassCountRef.current <= MAX_VIRTUAL_SYNC_LAYOUT_PASSES) {
       setLayoutVersion((v) => v + 1);
       return;
     }
-    if (rafRetryCountRef.current < MAX_VIRTUAL_LAYOUT_RAF_RETRIES && pendingLayoutRafRef.current === null) {
+    if (changed && rafRetryCountRef.current < MAX_VIRTUAL_LAYOUT_RAF_RETRIES && pendingLayoutRafRef.current === null) {
       if (typeof requestAnimationFrame === 'function') {
         rafRetryCountRef.current += 1;
         pendingLayoutRafRef.current = requestAnimationFrame(() => {
@@ -2858,13 +2886,13 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   atTopRef.current = range.start === 0;
   const topStyle = topOffsetStyle(range.topSpacer + biasRef.current);
   return <>
-    <div aria-hidden="true" ref={topSpacerElRef} style={{ height: `${topStyle.height}px`, marginTop: `${topStyle.marginTop}px`, flexShrink: 0 }} />
+    <div aria-hidden="true" data-virtual-spacer="true" ref={topSpacerElRef} style={{ height: `${topStyle.height}px`, marginTop: `${topStyle.marginTop}px`, flexShrink: 0 }} />
     {items.slice(range.start, range.end).map((item) => (
       <div class="chat-virtual-item" data-virtual-key={item.key} key={item.key}>
         {renderItem(item)}
       </div>
     ))}
-    <div aria-hidden="true" style={{ height: `${range.bottomSpacer}px`, flexShrink: 0 }} />
+    <div aria-hidden="true" data-virtual-spacer="true" style={{ height: `${range.bottomSpacer}px`, flexShrink: 0 }} />
   </>;
 }
 
@@ -3463,7 +3491,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const handleChooserPickSimple = useCallback(() => {
     void showToolCallsPref.save(false);
   }, [showToolCallsPref]);
-  const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
   const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
   // Keyed by content so assistant blocks re-render only when a status changes.
   const liveAssignmentStatusesSignature = useMemo(
@@ -3474,21 +3501,23 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     () => new Map<string, LiveAssignmentStatus>(JSON.parse(liveAssignmentStatusesSignature) as Array<[string, LiveAssignmentStatus]>),
     [liveAssignmentStatusesSignature],
   );
-  useEffect(() => {
-    if (!hasSdkAgentEvents) return;
-    setSdkAgentsNow(Date.now());
-  }, [hasSdkAgentEvents, events, visible]);
+  const [sdkAgentsTickActive, setSdkAgentsTickActive] = useState(false);
+  const sdkAgentsTickerNow = useNowTicker(visible && sdkAgentsTickActive);
+  const sdkAgentsEventNowRef = useRef(sdkAgentsTickerNow);
+  const prevSdkEventsRef = useRef<readonly TimelineEvent[] | null>(null);
+  if (hasSdkAgentEvents && prevSdkEventsRef.current !== events) {
+    prevSdkEventsRef.current = events;
+    sdkAgentsEventNowRef.current = Date.now();
+  } else if (!hasSdkAgentEvents) {
+    prevSdkEventsRef.current = events;
+  }
+  const sdkAgentsNow = visible && sdkAgentsTickActive ? sdkAgentsTickerNow : sdkAgentsEventNowRef.current;
   const sdkAgentsStatus = useMemo(
     () => deriveSdkSubagentStatusRows(events, sdkAgentsNow),
     [events, sdkAgentsNow],
   );
   const runningAgentsCount = sdkAgentsStatus.runningCount;
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
-  useEffect(() => {
-    if (!visible || !hasAgentsStatusRows) return undefined;
-    const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [hasAgentsStatusRows, visible]);
   useEffect(() => {
     // Any transition back to active work or empty history clears manual idle peek
     // so finishing sub-agents always auto-close cleanly once runningCount hits 0.
@@ -3514,6 +3543,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const showAgentsPane = canShowAgentsControl
     && hasAgentsStatusRows
     && (runningAgentsCount > 0 ? desiredAgentsOpen : inspectRecentAgentsOpen);
+  useEffect(() => {
+    const next = runningAgentsCount > 0 && showAgentsPane;
+    setSdkAgentsTickActive((prev) => (prev === next ? prev : next));
+  }, [runningAgentsCount, showAgentsPane]);
   const canShowFilePanel = !preview && !hideFilePanel && !!ws;
   useLayoutEffect(() => {
     const titlebar = chatTitlebarRef.current;
@@ -3981,6 +4014,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const captureReaderAnchor = () => {
     const root = scrollRef.current;
     if (!root) return;
+    const zoom = readSafeCssZoom();
     const rootTop = root.getBoundingClientRect().top;
     // Stop at the first row that reaches into the viewport: rows above it are not
     // measured, so a long normal-flow list costs O(rows above the viewport) reads
@@ -3990,10 +4024,12 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       const id = node.getAttribute('data-event-id');
       if (!id) continue;
       const rect = node.getBoundingClientRect();
-      rows.push({ id, top: rect.top, bottom: rect.bottom });
-      if (rect.bottom > rootTop + 1) break;
+      const top = (rect.top - rootTop) / zoom;
+      const bottom = (rect.bottom - rootTop) / zoom;
+      rows.push({ id, top, bottom });
+      if (bottom > 1) break;
     }
-    readerAnchorRef.current = pickReaderAnchor(rows, rootTop, root.scrollTop);
+    readerAnchorRef.current = pickReaderAnchor(rows, 0, root.scrollTop);
   };
   const restoreReaderAnchor = () => {
     const root = scrollRef.current;
@@ -4007,15 +4043,22 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     }
     // The anchor row left the DOM (virtualized out): pick the row now in view.
     if (!node) { captureReaderAnchor(); return; }
-    const contentTop = node.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop;
+    const zoom = readSafeCssZoom();
+    const contentTop = ((node.getBoundingClientRect().top - root.getBoundingClientRect().top) / zoom) + root.scrollTop;
     const delta = computeReaderAnchorDelta(anchor.contentTop, contentTop);
     if (delta === 0) return;
     const remainder = absorbTopShiftRef.current ? absorbTopShiftRef.current(delta) : delta;
     if (remainder === 0) return; // absorbed: the row is back where it was, nothing was written
     markProgrammaticScroll();
+    const prevScrollTop = root.scrollTop;
     root.scrollTop += remainder;
-    // Content moved by `remainder`, the viewport followed it: re-record the row.
-    readerAnchorRef.current = { ...anchor, contentTop: anchor.contentTop + remainder };
+    const appliedDelta = root.scrollTop - prevScrollTop;
+    // Content moved by `appliedDelta`, the viewport followed it: re-record the row.
+    // Sync to actual contentTop when scrollTop clamped so a clamped container cannot oscillate.
+    readerAnchorRef.current = {
+      ...anchor,
+      contentTop: Math.abs(appliedDelta - remainder) > 0.5 ? contentTop : anchor.contentTop + appliedDelta,
+    };
   };
 
   // Virtualized row measurements are the only layout correction that may
@@ -4522,7 +4565,32 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (!visible || preview) return undefined;
     const el = scrollRef.current;
     if (!el || typeof MutationObserver === 'undefined') return undefined;
-    const observer = new MutationObserver(() => {
+    let frameId: number | null = null;
+    const isSpacerElement = (node: Node | null): boolean =>
+      Boolean(node && node.nodeType === 1 && (
+        (node as Element).hasAttribute?.('data-virtual-spacer')
+        || (node as Element).classList?.contains('chat-virtual-item')
+      ));
+    const isVirtualSpacerTarget = (node: Node | null): boolean => {
+      if (!node) return false;
+      const element = node.nodeType === 1 ? (node as Element) : node.parentElement;
+      return Boolean(element?.closest?.('[data-virtual-spacer="true"]'));
+    };
+    const isSpacerOnlyRecord = (record: MutationRecord): boolean => {
+      if (isVirtualSpacerTarget(record.target)) return true;
+      if (record.type === 'childList' && (record.addedNodes.length > 0 || record.removedNodes.length > 0)) {
+        for (const node of Array.from(record.addedNodes)) {
+          if (!isSpacerElement(node)) return false;
+        }
+        for (const node of Array.from(record.removedNodes)) {
+          if (!isSpacerElement(node)) return false;
+        }
+        return true;
+      }
+      return false;
+    };
+    const runAdjustment = () => {
+      frameId = null;
       if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
       if (loadingOlderRef.current || scrollAnchorRef.current) return;
       // A reader's anchor row is re-aligned; only a follower is pinned.
@@ -4532,9 +4600,26 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       markProgrammaticScroll();
       el.scrollTop = target;
       lastScrollTopRef.current = el.scrollTop;
+    };
+    const observer = new MutationObserver((records) => {
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
+      if (loadingOlderRef.current || scrollAnchorRef.current) return;
+      if (records.every(isSpacerOnlyRecord)) return;
+      if (typeof requestAnimationFrame === 'function') {
+        if (frameId !== null) return;
+        frameId = requestAnimationFrame(runAdjustment);
+      } else {
+        runAdjustment();
+      }
     });
     observer.observe(el, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'open', 'hidden', 'aria-expanded'] });
-    return () => observer.disconnect();
+    return () => {
+      if (frameId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(frameId);
+        frameId = null;
+      }
+      observer.disconnect();
+    };
   }, [preview, visible]);
 
   // Hold the bottom through the post-mount layout settle.
@@ -5082,7 +5167,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             )}
           </div>
         )}
-        {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} />}
+        {!!sessionId && <TaskPairStatusPanelHost visible={visible} events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} collapsedVisitKey={taskPairPanelVisitKey} mobileAnchorRef={chatTitlebarRef} />}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
@@ -5275,6 +5360,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           {/* No `loading` guard: whatever is already restored renders now. */}
           <VirtualizedViewItems
             items={displayViewItems}
+            contentRevision={renderedRevision}
             scrollRef={scrollRef}
             enabled={!preview}
             revealKey={virtualRevealKey}
@@ -5332,15 +5418,16 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} visible={visible} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onCloudDocClick={cloudDocClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
+                    visible={visible}
                     sessionName={sessionId ?? undefined}
                     sessions={sessions}
                     onPathClick={pathClickHandler}
@@ -6562,6 +6649,7 @@ function PeerAuditRoundChip({
 
 const ChatEvent = memo(function ChatEvent({
   event,
+  visible = true,
   sessionName,
   sessions,
   onPathClick,
@@ -6577,6 +6665,7 @@ const ChatEvent = memo(function ChatEvent({
   showTime,
 }: {
   event: TimelineEvent;
+  visible?: boolean;
   sessionName?: string;
   sessions?: readonly { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   onPathClick?: (p: string) => void;
@@ -6704,6 +6793,7 @@ const ChatEvent = memo(function ChatEvent({
           {userText && (
             <UserMessageText
               text={userText}
+              visible={visible}
               onPathClick={onPathClick}
               onCloudDocClick={onCloudDocClick}
               onUrlClick={onUrlClick}
@@ -7529,6 +7619,7 @@ export function renderedUserMessageExceedsLineLimit(
 
 function UserMessageText({
   text,
+  visible = true,
   onPathClick,
   onCloudDocClick,
   onUrlClick,
@@ -7540,6 +7631,7 @@ function UserMessageText({
   footerRight,
 }: {
   text: string;
+  visible?: boolean;
   onPathClick?: (p: string) => void;
   onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
@@ -7564,13 +7656,21 @@ function UserMessageText({
   const folded = shouldFold && !expanded;
 
   useLayoutEffect(() => {
+    if (hardLineOverflow) {
+      setRenderedOverflow((current) => current === true ? current : true);
+      return undefined;
+    }
+    if (!visible) return undefined;
     const content = contentRef.current;
-    if (!content) return;
+    if (!content) return undefined;
     let active = true;
     const measure = () => {
+      if (!active) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (content.clientWidth <= 0 && content.scrollHeight <= 0) return;
       const measured = renderedUserMessageExceedsLineLimit(content, lineLimit);
       const next = hardLineOverflow || measured;
-      if (!active || next === null) return;
+      if (next === null) return;
       setRenderedOverflow((current) => current === next ? current : next);
     };
 
@@ -7592,7 +7692,7 @@ function UserMessageText({
       window.removeEventListener('resize', measure);
       fonts?.removeEventListener?.('loadingdone', measure);
     };
-  }, [hardLineOverflow, prose, lineLimit]);
+  }, [hardLineOverflow, prose, lineLimit, visible]);
 
   return (
     <>

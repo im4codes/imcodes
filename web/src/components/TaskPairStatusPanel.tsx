@@ -5,11 +5,12 @@ import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel, collectTaskPa
 import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { applyTaskPairPanelFit, bindTaskPairPanelFit, TASK_PAIR_PANEL_MAX_HEIGHT_VAR } from '../task-pair-panel-fit.js';
 import { useTaskPairPanelWidth } from '../task-pair-panel-width.js';
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, type TaskPairStatus } from '@shared/task-pair.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
@@ -140,7 +141,7 @@ function clampElementScroll(event: { currentTarget: EventTarget | null }): void 
   resetScrollPosition(event.currentTarget);
 }
 
-export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey, mobileAnchor }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null }) {
+export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey, mobileAnchor, visible = true }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; visible?: boolean }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
   // A phone sub-session or split-executor visit shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
@@ -250,57 +251,83 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
   }, [serverId]);
-  const latest = new Map<string, TaskPairPanelRow>();
-  const reworkCounts = new Map<string, number>();
-  const taskTitles = new Map<string, string>();
-  for (const event of events) {
-    if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
-    const eventPayload = event.payload as Record<string, unknown>;
-    if (typeof eventPayload.taskId === 'string') {
-      const eventTitle = taskPairDisplayTitle(eventPayload.title, eventPayload.taskId, eventPayload.brief);
-      if (eventTitle) taskTitles.set(eventPayload.taskId, eventTitle);
-      if (eventPayload.verb === 'REWORK') {
-        reworkCounts.set(eventPayload.taskId, (reworkCounts.get(eventPayload.taskId) ?? 0) + 1);
+  const {
+    reworkCounts,
+    taskTitles,
+    groups,
+    scopedDefaultTaskId,
+    counts,
+    hasRows,
+    hasActiveDurationRow,
+  } = useMemo(() => {
+    const latest = new Map<string, TaskPairPanelRow>();
+    const nextReworkCounts = new Map<string, number>();
+    const nextTaskTitles = new Map<string, string>();
+    for (const event of events) {
+      if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
+      const eventPayload = event.payload as Record<string, unknown>;
+      if (typeof eventPayload.taskId === 'string') {
+        const eventTitle = taskPairDisplayTitle(eventPayload.title, eventPayload.taskId, eventPayload.brief);
+        if (eventTitle) nextTaskTitles.set(eventPayload.taskId, eventTitle);
+        if (eventPayload.verb === 'REWORK') {
+          nextReworkCounts.set(eventPayload.taskId, (nextReworkCounts.get(eventPayload.taskId) ?? 0) + 1);
+        }
       }
     }
-  }
-  for (const [id, resolved] of snapshotTitles) taskTitles.set(id, resolved);
-  if (snapshotRows) for (const payload of snapshotRows) if (typeof payload.taskId === 'string') latest.set(payload.taskId, { payload, startedAt: Number(payload.startedAt), updatedAt: Number(payload.updatedAt) });
-  for (const event of events) {
-    if (snapshotRows) break;
-    if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
-    const payload = event.payload as Record<string, unknown>;
-    if (typeof payload.taskId === 'string') {
-      const old = latest.get(payload.taskId);
-      latest.set(payload.taskId, { payload, startedAt: old?.startedAt ?? event.ts, updatedAt: event.ts });
+    for (const [id, resolved] of snapshotTitles) nextTaskTitles.set(id, resolved);
+    if (snapshotRows) {
+      for (const payload of snapshotRows) {
+        if (typeof payload.taskId === 'string') {
+          latest.set(payload.taskId, { payload, startedAt: Number(payload.startedAt), updatedAt: Number(payload.updatedAt) });
+        }
+      }
     }
-  }
-  for (const [id, row] of latest.entries()) {
-    const resolved = taskPairDisplayTitle(row.payload.title, id, row.payload.brief);
-    if (resolved) taskTitles.set(id, resolved);
-  }
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
-  const { allRows, groups } = groupAndOrderTaskPairRows(latest.values(), scopeSessionId);
-  const scopedDefaultTaskId = scopeSessionId
-    ? (allRows.find((row) => ['working', 'in_audit', 'awaiting_audit', 'rework'].includes(String(row.payload.toStatus)))?.payload.taskId ?? allRows[0]?.payload.taskId)
-    : undefined;
-  const counts = allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number; waiting: number }>((result, row) => {
-    if (getTaskPairWaitKind(row.payload)) { result.waiting += 1; return result; }
-    const value = row.payload.toStatus;
-    if (value === 'working' || value === 'rework') result.working += 1;
-    else if (value === 'in_audit' || value === 'awaiting_audit') result.audit += 1;
-    else if (value === 'awaiting_brain_decision') result.awaitingBrain += 1;
-    else if (value === 'queued') result.queued += 1;
-    return result;
-  }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0, waiting: 0 });
+    for (const event of events) {
+      if (snapshotRows) break;
+      if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
+      const payload = event.payload as Record<string, unknown>;
+      if (typeof payload.taskId === 'string') {
+        const old = latest.get(payload.taskId);
+        latest.set(payload.taskId, { payload, startedAt: old?.startedAt ?? event.ts, updatedAt: event.ts });
+      }
+    }
+    for (const [id, row] of latest.entries()) {
+      const resolved = taskPairDisplayTitle(row.payload.title, id, row.payload.brief);
+      if (resolved) nextTaskTitles.set(id, resolved);
+    }
+    const grouped = groupAndOrderTaskPairRows(latest.values(), scopeSessionId);
+    const nextScopedDefaultTaskId = scopeSessionId
+      ? (grouped.allRows.find((row) => ['working', 'in_audit', 'awaiting_audit', 'rework'].includes(String(row.payload.toStatus)))?.payload.taskId ?? grouped.allRows[0]?.payload.taskId)
+      : undefined;
+    const nextCounts = grouped.allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number; waiting: number }>((result, row) => {
+      if (getTaskPairWaitKind(row.payload)) { result.waiting += 1; return result; }
+      const value = row.payload.toStatus;
+      if (value === 'working' || value === 'rework') result.working += 1;
+      else if (value === 'in_audit' || value === 'awaiting_audit') result.audit += 1;
+      else if (value === 'awaiting_brain_decision') result.awaitingBrain += 1;
+      else if (value === 'queued') result.queued += 1;
+      return result;
+    }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0, waiting: 0 });
+    const nextHasActiveDurationRow = grouped.allRows.some(
+      (row) => !TASK_PAIR_TERMINAL_STATUSES.includes(row.payload.toStatus as TaskPairStatus),
+    );
+    return {
+      reworkCounts: nextReworkCounts,
+      taskTitles: nextTaskTitles,
+      groups: grouped.groups,
+      scopedDefaultTaskId: nextScopedDefaultTaskId,
+      counts: nextCounts,
+      hasRows: latest.size > 0 && grouped.allRows.length > 0,
+      hasActiveDurationRow: nextHasActiveDurationRow,
+    };
+  }, [events, snapshotRows, snapshotTitles, scopeSessionId]);
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // inline sub-window shows the strip without touching the choice. On mobile main chat (no scopeSessionId), expanding uses fullscreen
   // overlay so inline cramped measurement / --task-pair-panel-max-h must not collapse or clip it.
   const usesInlineMobileFit = isMobile && Boolean(scopeSessionId);
   const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (usesInlineMobileFit && cramped);
+  const now = useNowTicker(visible && !collapsed && hasRows && hasActiveDurationRow);
   const isFullscreen = isMobile && !scopeSessionId && !collapsed;
-  const hasRows = latest.size > 0 && allRows.length > 0;
   const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && hasRows, Boolean(scopeSessionId || collapsedVisitKey));
   useLayoutEffect(() => {
     const panel = panelRef.current;
@@ -455,7 +482,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
 }
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
-export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
+export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null }; visible?: boolean }) {
   const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events, props.serverId));
   const [authorityUnavailable, setAuthorityUnavailable] = useState(() => (

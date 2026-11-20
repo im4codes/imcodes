@@ -316,7 +316,8 @@ export function SubSessionWindow({
   // Uses the same git-status-store as the main session and FileBrowser.
   // When no FileBrowser list consumer is mounted, sends lightweight summaryOnly
   // count requests; when cwd matches FileBrowser, shares/reuses its updates.
-  const gitChangesCount = useSharedGitChangesCount(ws, sub.cwd ?? null);
+  // Gated on `visible` so hidden/minimized retained windows don't poll every 30s.
+  const gitChangesCount = useSharedGitChangesCount(ws, visible ? (sub.cwd ?? null) : null);
 
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.
@@ -928,9 +929,10 @@ export function SubSessionWindow({
     isMobile && typeof document !== 'undefined' ? resolveSessionTabsBottom(document) : 0
   ));
   useLayoutEffect(() => {
-    if (!isMobile) return;
+    if (!isMobile || !visible) return undefined;
     let raf = 0;
     let ro: ResizeObserver | null = null;
+    const observedEls = new Set<HTMLElement>();
     const vv = window.visualViewport;
 
     const update = () => {
@@ -946,27 +948,48 @@ export function SubSessionWindow({
       }
       setSubSessionBarHeight((prev) => (prev === measured ? prev : measured));
     };
-    const scheduleUpdate = () => {
-      if (raf) cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        update();
-      });
-    };
     const observeTargets = () => {
       if (typeof ResizeObserver === 'undefined') return;
-      ro?.disconnect();
-      ro = new ResizeObserver(scheduleUpdate);
+      const desired = new Set<HTMLElement>();
       for (const el of getExternalMobileSubSessionBarElements()) {
-        ro.observe(el);
+        desired.add(el);
       }
       const tabBar = document.querySelector<HTMLElement>('.tab-bar');
-      if (tabBar) ro.observe(tabBar);
+      if (tabBar) desired.add(tabBar);
       // Observe the content column too. When the tab bar is missing at this
       // moment nothing else would ever re-measure, and the window stays pinned
       // to the top of the viewport with its title bar under the app header.
       const mainContent = document.querySelector<HTMLElement>('.main');
-      if (mainContent) ro.observe(mainContent);
+      if (mainContent) desired.add(mainContent);
+
+      if (!ro) {
+        ro = new ResizeObserver(scheduleUpdate);
+      }
+      for (const el of observedEls) {
+        if (!el.isConnected || !desired.has(el)) {
+          ro.unobserve(el);
+          observedEls.delete(el);
+        }
+      }
+      for (const el of desired) {
+        if (!observedEls.has(el)) {
+          ro.observe(el);
+          observedEls.add(el);
+        }
+      }
+    };
+    const scheduleUpdate = () => {
+      if (typeof requestAnimationFrame !== 'function') {
+        observeTargets();
+        update();
+        return;
+      }
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        observeTargets();
+        update();
+      });
     };
 
     observeTargets();
@@ -975,7 +998,6 @@ export function SubSessionWindow({
     const mo = typeof MutationObserver === 'undefined'
       ? null
       : new MutationObserver(() => {
-        observeTargets();
         scheduleUpdate();
       });
     mo?.observe(document.body, {
@@ -997,6 +1019,7 @@ export function SubSessionWindow({
     return () => {
       if (raf) cancelAnimationFrame(raf);
       ro?.disconnect();
+      observedEls.clear();
       mo?.disconnect();
       window.removeEventListener('resize', scheduleUpdate);
       window.removeEventListener(UI_SCALE_EVENT, scheduleUpdate);
@@ -1005,7 +1028,7 @@ export function SubSessionWindow({
       vv?.removeEventListener('resize', scheduleUpdate);
       vv?.removeEventListener('scroll', scheduleUpdate);
     };
-  }, [isMobile]);
+  }, [isMobile, visible]);
 
   const displayGeom = useMemo(() => {
     if (!isDesktopMaximized || isMobile) return geom;
