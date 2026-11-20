@@ -180,6 +180,7 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
             const bar = document.querySelector('.subcard-bar') as HTMLElement;
             const toolbar = document.querySelector('.subcard-toolbar') as HTMLElement;
             const row = hasRow ? (document.querySelector('.subsession-row-with-close') as HTMLElement) : null;
+            const subBar = hasRow ? (document.querySelector('.subsession-bar') as HTMLElement) : null;
             const footer = document.querySelector('[data-testid="mobile-subsession-footer-status"]') as HTMLElement;
             const badge = document.querySelector('[data-testid="mobile-subsession-footer-badge"]') as HTMLElement;
             const ver = document.querySelector('[data-testid="mobile-subsession-footer-version"]') as HTMLElement;
@@ -187,6 +188,7 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
             const inputArea = document.querySelector('.subcard-input-area') as HTMLElement | null;
             const br = bar.getBoundingClientRect();
             const rr = row?.getBoundingClientRect() ?? null;
+            const sbr = subBar?.getBoundingClientRect() ?? null;
             const fr = footer.getBoundingClientRect();
             const bg = badge.getBoundingClientRect();
             const vr = ver.getBoundingClientRect();
@@ -196,6 +198,9 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
             const contentLeft = Math.min(bg.left, vr.left);
             const contentTop = Math.min(bg.top, vr.top);
             const contentBottom = Math.max(bg.bottom, vr.bottom);
+            const seqBadges = Array.from(document.querySelectorAll('.subsession-card-seq'))
+              .map((el) => el.getBoundingClientRect());
+            const seqMaxBottom = seqBadges.length > 0 ? Math.max(...seqBadges.map((r) => r.bottom)) : null;
             const toolbarOverlap = Array.from(toolbar.querySelectorAll('button')).some((btn) => {
               const r = btn.getBoundingClientRect();
               return r.width > 0 && r.height > 0
@@ -204,6 +209,9 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
             return {
               barHeight: br.height,
               rowBottom: rr?.bottom ?? null,
+              subBarBottom: sbr?.bottom ?? null,
+              seqMaxBottom,
+              footerContentTop: contentTop,
               footerTop: fr.top,
               badgeMidY: bg.top + bg.height / 2,
               verMidY: vr.top + vr.height / 2,
@@ -234,6 +242,11 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
 
           if (item.hasRow && geom.rowBottom !== null) {
             expect(geom.footerTop).toBeGreaterThanOrEqual(geom.rowBottom - 0.5);
+          }
+          if (item.name === 'collapsed') {
+            expect(geom.seqMaxBottom).not.toBeNull();
+            expect(geom.seqMaxBottom!, `${item.name} sab=${sab} seq badge unclipped by subsession-bar`).toBeLessThanOrEqual(geom.subBarBottom! + 0.5);
+            expect(geom.seqMaxBottom!, `${item.name} sab=${sab} seq badge separated above footer content`).toBeLessThanOrEqual(geom.footerContentTop);
           }
           if (sab === 34) {
             expect(geom.viewportBottomClearance, `${item.name} sab=34 viewport bottom clearance`).toBeGreaterThanOrEqual(16);

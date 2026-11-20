@@ -8686,8 +8686,8 @@ html.mobile-nav-gesture-active .chat-view {
   .subsession-card:not(.subsession-card-rail) { min-height: 42px; gap: 1px; padding: 2px 1px; }
   .subsession-bar { gap: 4px; padding: 2px 8px; }
 }
-.subcard-bar-mobile .subcard-toolbar { padding: 1px 8px; gap: 6px; }
-.subcard-bar-mobile .subcard-toolbar-btn { padding: 1px 6px; line-height: 1.25; }
+.subcard-bar-mobile .subcard-toolbar { padding: 0 8px; gap: 6px; }
+.subcard-bar-mobile .subcard-toolbar-btn { padding: 0 6px; line-height: 1.25; }
 .subcard-bar-mobile .subcard-toolbar-add { font-size: 15px; line-height: 1.15; }
 .subcard-bar-mobile-inline-footer {
   padding-bottom: min(15px, max(1px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) * 0.45)));
@@ -8712,7 +8712,7 @@ html.mobile-nav-gesture-active .chat-view {
   line-height: 1.05;
 }
 .subcard-bar-mobile .subsession-close-all-strip { min-height: 30px; margin: 1px 0 1px 8px; }
-.subcard-bar-mobile .subsession-bar { gap: 4px; padding: 1px 8px 4px; }
+.subcard-bar-mobile .subsession-bar { gap: 4px; padding: 0 8px 4px; }
 .subcard-bar-mobile .subcard-scroll { padding: 3px 10px 2px; }
 .subcard-bar-mobile-expanded .subcard {
   max-height: calc(var(--subcard-h, 250px) - max(0px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 18px)));
@@ -8730,7 +8730,7 @@ html.mobile-nav-gesture-active .chat-view {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 4px 8px max(2px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 18px));
+  padding: 1px 8px max(1px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 18px));
   line-height: 1;
   white-space: nowrap;
   overflow: hidden;
