@@ -16,6 +16,7 @@ const REVIEWED_SITES: Record<string, string> = {
   'attachment-preview-cache.ts': 'composer preview of the local File, used only as an <img> source (an image load never runs script)',
   'components/HtmlFullscreenPreview.tsx': 'the SANITISED srcDoc of util/html-safe-preview.ts (scripts/iframes/svg/objects removed, CSP script-src none), covered by HtmlSafePreview tests',
   'components/OfficePreview.tsx': 'the app\'s own pdf worker source, not a user file',
+  'tts.ts': 'synthesized TTS audio blob passed only to `new Audio(objectUrl)` (HTMLAudioElement) and revoked on end/error/abort, never opened or rendered as a document',
 };
 
 function sourceFiles(dir: string): string[] {
