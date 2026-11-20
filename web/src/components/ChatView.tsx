@@ -5099,6 +5099,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             <SessionRepoBranchSummary
               sessionId={sessionId}
               projectDir={workdir}
+              serverId={serverId}
               onOpenRepo={onViewRepo}
               className="session-repo-branch-summary-chat-titlebar"
             />

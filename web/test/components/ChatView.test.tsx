@@ -1563,6 +1563,52 @@ describe('ChatView', () => {
     expect(onViewRepo).toHaveBeenCalledTimes(1);
   });
 
+  it('threads serverId into ChatView repo branch summary and isolates identical session/project across servers', () => {
+    ingestSessionRepoContext({
+      sessionId: 'deck_test_brain',
+      projectDir: '/repo/project',
+      serverId: 'srv-1',
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/srv-1' },
+        repoGeneration: 1,
+      },
+    });
+    ingestSessionRepoContext({
+      sessionId: 'deck_test_brain',
+      projectDir: '/repo/project',
+      serverId: 'srv-2',
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/srv-2' },
+        repoGeneration: 1,
+      },
+    });
+
+    const { container, rerender } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_test_brain"
+        workdir="/repo/project"
+        serverId="srv-1"
+      />,
+    );
+    expect(container.querySelector('.session-repo-branch-summary-chat-titlebar')?.textContent).toContain('feature/srv-1');
+
+    rerender(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_test_brain"
+        workdir="/repo/project"
+        serverId="srv-2"
+      />,
+    );
+    expect(container.querySelector('.session-repo-branch-summary-chat-titlebar')?.textContent).toContain('feature/srv-2');
+    expect(container.querySelector('.session-repo-branch-summary-chat-titlebar')?.textContent).not.toContain('feature/srv-1');
+  });
+
   it('keeps preview mode pinned to the bottom during streaming updates with the same timestamp', async () => {
     const initialEvents = [
       {

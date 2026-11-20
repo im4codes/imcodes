@@ -52,6 +52,7 @@ interface SharedChangesEntry {
   statusListeners: Set<SharedChangesStatusListener>;
   ws: WsClient | null;
   sessionName?: string;
+  serverId?: string | null;
 }
 
 export const SHARED_CHANGES_TTL_MS = 5_000;
@@ -270,6 +271,7 @@ function requestSharedChangesInternal(
   entry.ws = ws;
   entry.repoPath = repoPath;
   if (sessionName !== undefined) entry.sessionName = sessionName;
+  if (serverId !== undefined) entry.serverId = serverId;
   ensureWsBridge(ws);
 
   // If any full-list consumer (e.g. FileBrowser) is subscribed, upgrade summary polls to full list.
@@ -431,7 +433,7 @@ function ensureWsBridge(ws: WsClient): void {
           const needsFull = entry.queuedNeedsFull || entry.listeners.size > 0;
           entry.queued = false;
           entry.queuedNeedsFull = false;
-          requestSharedChangesInternal(ws, entry.repoPath, false, entry.sessionName, !needsFull);
+          requestSharedChangesInternal(ws, entry.repoPath, false, entry.sessionName, !needsFull, entry.serverId);
         }
       }
       return;

@@ -210,6 +210,39 @@ describe('session repo context store and summary', () => {
     expect(getSessionRepoContext('deck_brain', '/repo/shared', 'srv-1')).toBeNull();
     expect(getSessionRepoContext('deck_brain', '/repo/shared', 'srv-2')).toBeNull();
   });
+
+  it('renders SessionRepoBranchSummary isolated by serverId for identical sessionId and projectDir', () => {
+    ingestSessionRepoContext({
+      sessionId: 'deck_brain',
+      projectDir: '/repo/shared',
+      serverId: 'srv-1',
+      context: { status: 'ok', info: { currentBranch: 'branch-srv1' }, repoGeneration: 10 },
+    });
+    ingestSessionRepoContext({
+      sessionId: 'deck_brain',
+      projectDir: '/repo/shared',
+      serverId: 'srv-2',
+      context: { status: 'ok', info: { currentBranch: 'branch-srv2' }, repoGeneration: 2 },
+    });
+
+    const { rerender } = render(
+      <SessionRepoBranchSummary sessionId="deck_brain" projectDir="/repo/shared" serverId="srv-1" />,
+    );
+    expect(screen.getByText('branch-srv1')).toBeTruthy();
+    expect(screen.queryByText('branch-srv2')).toBeNull();
+
+    rerender(
+      <SessionRepoBranchSummary sessionId="deck_brain" projectDir="/repo/shared" serverId="srv-2" />,
+    );
+    expect(screen.getByText('branch-srv2')).toBeTruthy();
+    expect(screen.queryByText('branch-srv1')).toBeNull();
+
+    rerender(
+      <SessionRepoBranchSummary sessionId="deck_brain" projectDir="/repo/shared" serverId="srv-3" />,
+    );
+    expect(screen.queryByText('branch-srv1')).toBeNull();
+    expect(screen.queryByText('branch-srv2')).toBeNull();
+  });
 });
 
 
