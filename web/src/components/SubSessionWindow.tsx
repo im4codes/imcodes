@@ -1332,6 +1332,7 @@ export function SubSessionWindow({
         onSettings={onSettings}
         onShareSession={onShareSession}
         subSessionId={sub.id}
+        hideWorkflowControls
         canManageFileShares={effectiveCanManageFileShares}
         onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}

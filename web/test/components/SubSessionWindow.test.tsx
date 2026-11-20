@@ -2277,4 +2277,39 @@ describe('SDK window startup budget', () => {
     expect(win?.classList.contains('incognito')).toBe(true);
     expect(sessionControlsSpy.mock.calls.at(-1)?.[0]?.activeSession?.incognito).toBe(true);
   });
+
+  it('passes hideWorkflowControls and subSessionId to SessionControls for sub-session windows', () => {
+    const sub = makeSubSession({
+      id: 'sub-workflow-hidden',
+      sessionName: 'deck_sub_workflow_hidden',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+      cwd: '/repo',
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      subSessionId: 'sub-workflow-hidden',
+      hideWorkflowControls: true,
+    });
+  });
 });

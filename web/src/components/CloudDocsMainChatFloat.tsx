@@ -1064,6 +1064,7 @@ export function CloudDocsMainChatFloat({
               quickData={mainChat.quickData}
               detectedModel={mainChat.detectedModel}
               compact
+              hideWorkflowControls
               activeThinking={!!activeThinkingTs}
               activeTransportTurn={activeTimelineTurn}
               transportTimelineEvents={timelineEvents}

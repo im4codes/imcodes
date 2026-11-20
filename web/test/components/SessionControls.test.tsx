@@ -12528,4 +12528,79 @@ afterEach(() => {
     expect(css).toMatch(/\.attachment-badge-toggle\s*\{/);
   });
 
+  it('hides Quick Peer Audit, Supervision dropdown, and OpenSpec when hideWorkflowControls or subSessionId is set while keeping them on main sessions', () => {
+    const ws = makeWs();
+    const brainSession = makeTransportSession({
+      name: 'deck_proj_brain',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/repo',
+      state: 'idle',
+      transportConfig: { supervision: { mode: 'off' } },
+    });
+
+    // 1. Main session renders all 3 workflow toolbar buttons when eligible
+    const mainView = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        connected
+        activeSession={brainSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(within(mainView.container).getByTestId('peer-audit-icon')).toBeTruthy();
+    expect(mainView.container.querySelector('.shortcut-btn-auto')).toBeTruthy();
+    expect(within(mainView.container).getByRole('button', { name: /openspec/i })).toBeTruthy();
+    mainView.unmount();
+
+    // 2. Mini-chat / compact float (`hideWorkflowControls`) hides all 3 while keeping Model, Thinking, Voice, Send
+    const miniView = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        connected
+        compact
+        hideWorkflowControls
+        activeSession={brainSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(miniView.container.querySelector('[data-testid="peer-audit-icon"]')).toBeNull();
+    expect(miniView.container.querySelector('.shortcut-btn-auto')).toBeNull();
+    expect(within(miniView.container).queryByRole('button', { name: /openspec/i })).toBeNull();
+    expect(miniView.container.querySelector('button[title^="Model:"]')).toBeTruthy();
+    expect(miniView.container.querySelector('.p2p-mode-btn')).toBeTruthy();
+    expect(miniView.container.querySelector('button.btn.btn-primary')).toBeTruthy();
+    miniView.unmount();
+
+    // 3. Sub-session window (`subSessionId` + `hideWorkflowControls`) hides all 3 while keeping Model, P2P, Send, and Stop
+    const subView = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        connected
+        subSessionId="sub-1"
+        hideWorkflowControls
+        activeSession={makeTransportSession({
+          name: 'deck_sub_worker',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          projectDir: '/repo',
+          state: 'idle',
+          transportConfig: { supervision: { mode: 'off' } },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(subView.container.querySelector('[data-testid="peer-audit-icon"]')).toBeNull();
+    expect(subView.container.querySelector('.shortcut-btn-auto')).toBeNull();
+    expect(within(subView.container).queryByRole('button', { name: /openspec/i })).toBeNull();
+    expect(subView.container.querySelector('button[title^="Model:"]')).toBeTruthy();
+    expect(subView.container.querySelector('.p2p-mode-btn')).toBeTruthy();
+    expect(subView.container.querySelector('button.btn.btn-primary')).toBeTruthy();
+    expect(subView.container.querySelector('.shortcut-btn-stop')).toBeTruthy();
+    subView.unmount();
+  });
+
 });

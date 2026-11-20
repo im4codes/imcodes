@@ -771,6 +771,8 @@ interface Props {
   detectedModel?: string;
   /** Hide the shortcuts row (e.g. in chat mode). */
   hideShortcuts?: boolean;
+  /** Hide workflow toolbar controls (Quick Audit, Supervision dropdown, OpenSpec) in mini floats and sub-session windows. */
+  hideWorkflowControls?: boolean;
   /** Called after a message is sent — for local UX only (e.g. optimistic display).
    *  Does not emit timeline events. The `commandId` lets the consumer reconcile
    *  the optimistic bubble with the eventual command.ack / echoed user.message.
@@ -2211,7 +2213,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, hideWorkflowControls = false, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
   const baseOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
   const handleOpenNodeGroupsFromBrowser = useCallback(() => {
     onMobileFileBrowserClose?.();
@@ -3372,8 +3374,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ? activeSession?.supervisionMode ?? SUPERVISION_MODE.OFF
     : supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
   const auditedSessionName = activeSession?.name ?? null;
+  const workflowControlsHidden = !!(hideWorkflowControls || subSessionId);
   const canQuickPeerAudit = !!(
-    activeSession
+    !workflowControlsHidden
+    && activeSession
     && serverId
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
@@ -8925,7 +8929,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
     if (isMobileLayout) showDeliveryModeNotice(append);
   };
-  const showOpenSpecControl = !!openSpecChangesPath && !isShellLike;
+  const showOpenSpecControl = !workflowControlsHidden && !!openSpecChangesPath && !isShellLike;
   const showCompactMetaControls = !!(showOpenSpecControl || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
   const composerSubSession = subSessionId
     ? subSessions?.find((session) => session.sessionName === activeSession?.name)
@@ -9413,7 +9417,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           </div>
         )}
 
-        {peerAuditOpen && auditedSessionName && typeof document !== 'undefined' && createPortal(
+        {canQuickPeerAudit && peerAuditOpen && auditedSessionName && typeof document !== 'undefined' && createPortal(
           <div
             class="peer-audit-overlay"
             data-testid="peer-audit-overlay"

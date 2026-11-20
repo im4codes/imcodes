@@ -68,6 +68,7 @@ const controlsPropsSpy = vi.fn();
 vi.mock('../../src/components/StableSessionControls.js', () => ({
   StableSessionControls: (props: {
     compact?: boolean;
+    hideWorkflowControls?: boolean;
     quotes?: string[];
     onRemoveQuote?: (index: number) => void;
     onSend?: (
@@ -826,5 +827,19 @@ describe('CloudDocsMainChatFloat', () => {
     const css = readFileSync(stylesPath, 'utf8');
     expect(css).toMatch(/html\.imcodes-window-dragging\s+iframe\s*\{\s*pointer-events:\s*none\s*!important;\s*\}/);
     expect(css).toContain('.cloud-docs-mini-chat-interaction-shield');
+  });
+
+  it('passes hideWorkflowControls to SessionControls so Quick Audit, Supervision, and OpenSpec stay hidden in mini chat', async () => {
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    render(<CloudDocsMainChatFloat mainChat={mainChat} />);
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    await screen.findByTestId('cloud-docs-mini-chat');
+
+    expect(controlsPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      compact: true,
+      hideWorkflowControls: true,
+    });
   });
 });
