@@ -1905,4 +1905,31 @@ describe('styles.css regression contracts', () => {
     expect(attentionBadgeRule).toMatch(/background:\s*#f59e0b/);
     expect(attentionBadgeRule).toMatch(/color:\s*#451a03/);
   });
+
+  it('docks expanded desktop TaskPairStatusPanel full-height inside .chat-main above .session-usage-footer with internal row scroll', () => {
+    const topLevelCss = `{\n${cssWithoutComments}\n}`;
+    const mainExpandedRule = extractDirectStyleRule(topLevelCss, /\.chat-main\s*>\s*\.task-pair-status-panel:not\(\.is-collapsed\)\s*/);
+    expect(mainExpandedRule, '.chat-main > .task-pair-status-panel:not(.is-collapsed) rule missing').toBeTruthy();
+    expect(mainExpandedRule).toMatch(/position:\s*absolute/);
+    expect(mainExpandedRule).toMatch(/top:\s*40px/);
+    expect(mainExpandedRule).toMatch(/right:\s*0/);
+    expect(mainExpandedRule).toMatch(/bottom:\s*0/);
+    expect(mainExpandedRule).toMatch(/height:\s*auto/);
+    expect(mainExpandedRule).toMatch(/max-height:\s*none/);
+    expect(mainExpandedRule).toMatch(/overflow:\s*hidden/);
+
+    const bodyRule = extractDirectStyleRule(topLevelCss, /\.task-pair-status-body\s*/) ?? '';
+    expect(bodyRule).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(bodyRule).toMatch(/min-height:\s*0/);
+    expect(bodyRule).toMatch(/overflow:\s*hidden/);
+
+    const rowsRule = extractDirectStyleRule(topLevelCss, /\.task-pair-status-rows\s*/) ?? '';
+    expect(rowsRule).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(rowsRule).toMatch(/min-height:\s*0/);
+    expect(rowsRule).toMatch(/overflow-y:\s*auto/);
+
+    const titlebarCollapsedRule = extractDirectStyleRule(topLevelCss, /\.chat-titlebar\s*>\s*\.task-pair-status-panel\.is-collapsed\s*/) ?? '';
+    expect(titlebarCollapsedRule).toMatch(/position:\s*static/);
+    expect(titlebarCollapsedRule).toMatch(/height:\s*auto/);
+  });
 });

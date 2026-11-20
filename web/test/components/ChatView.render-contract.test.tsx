@@ -694,4 +694,32 @@ describe('ChatView render capability contract', () => {
       ).toBe(false);
     },
   );
+
+  it('mounts desktop expanded TaskPairStatusPanel directly in .chat-main and portals only collapsed strip to .chat-titlebar', () => {
+    delete (window as any).__imcodesTaskPairSnapshot;
+    localStorage.clear();
+    const events = [
+      { ...ev('task_pair.event'), eventId: 'tp-dock', payload: { taskId: 'tp-dock', title: 'Docked desktop task', toStatus: 'working', executor: 'exec-1' } },
+    ] as TimelineEvent[];
+    const view = render(<ChatView events={events} loading={false} sessionId="main-brain" serverId="srv-dock" />);
+    const main = view.container.querySelector('.chat-main') as HTMLElement;
+    const titlebar = view.container.querySelector('.chat-titlebar') as HTMLElement;
+    const panel = view.container.querySelector('.task-pair-status-panel') as HTMLElement;
+
+    expect(panel.classList.contains('is-desktop')).toBe(true);
+    expect(panel.classList.contains('is-collapsed')).toBe(false);
+    expect(panel.parentElement).toBe(main);
+    expect(titlebar.querySelector('.task-pair-status-panel')).toBeNull();
+
+    // Collapsing moves strip into .chat-titlebar flex flow; re-expanding restores direct .chat-main child
+    fireEvent.click(panel.querySelector('.task-pair-status-toggle') as HTMLElement);
+    const collapsed = view.container.querySelector('.task-pair-status-panel') as HTMLElement;
+    expect(collapsed.classList.contains('is-collapsed')).toBe(true);
+    expect(collapsed.parentElement).toBe(titlebar);
+
+    fireEvent.click(collapsed.querySelector('.task-pair-status-toggle') as HTMLElement);
+    const reExpanded = view.container.querySelector('.task-pair-status-panel') as HTMLElement;
+    expect(reExpanded.classList.contains('is-collapsed')).toBe(false);
+    expect(reExpanded.parentElement).toBe(main);
+  });
 });

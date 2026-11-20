@@ -328,7 +328,41 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (usesInlineMobileFit && cramped);
   const now = useNowTicker(visible && !collapsed && hasRows && hasActiveDurationRow);
   const isFullscreen = isMobile && !scopeSessionId && !collapsed;
+  const shouldPortalToAnchor = Boolean(mobileAnchor && (isMobile || collapsed));
   const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && hasRows, Boolean(scopeSessionId || collapsedVisitKey));
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (isMobile || collapsed || !hasRows || !panel || !mobileAnchor) {
+      panel?.style.removeProperty('top');
+      return undefined;
+    }
+    const syncDesktopTop = () => {
+      const mainEl = panel.closest('.chat-main');
+      if (!mainEl) return;
+      const mainRect = mainEl.getBoundingClientRect();
+      const anchorRect = mobileAnchor.getBoundingClientRect();
+      if (mainRect.height <= 0 || anchorRect.height <= 0) {
+        panel.style.removeProperty('top');
+        return;
+      }
+      const offsetTop = Math.max(40, Math.ceil(anchorRect.bottom - mainRect.top));
+      if (offsetTop > 40) panel.style.top = `${offsetTop}px`;
+      else panel.style.removeProperty('top');
+    };
+    syncDesktopTop();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(syncDesktopTop);
+    const mainEl = panel.closest('.chat-main');
+    if (observer) {
+      observer.observe(mobileAnchor);
+      if (mainEl && mainEl !== mobileAnchor) observer.observe(mainEl);
+    }
+    window.addEventListener('resize', syncDesktopTop);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', syncDesktopTop);
+      panel.style.removeProperty('top');
+    };
+  }, [isMobile, collapsed, hasRows, mobileAnchor]);
   useLayoutEffect(() => {
     const panel = panelRef.current;
     if (!usesInlineMobileFit || !hasRows || !panel) {
@@ -398,7 +432,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
     </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
-  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}${isFullscreen ? ' is-fullscreen' : ''}`} data-testid="task-pair-status-panel" onScroll={clampElementScroll}>
+  const panelEl = <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}${isFullscreen ? ' is-fullscreen' : ''}`} data-testid="task-pair-status-panel" onScroll={clampElementScroll}>
     {!isMobile && !collapsed && <div class="task-pair-status-resize" role="separator" tabIndex={0}
       aria-label={t('taskPair.panel_resize')} title={t('taskPair.panel_resize')} aria-orientation="vertical"
       aria-valuemin={panelWidth.min} aria-valuemax={panelWidth.max} aria-valuenow={panelWidth.width}
@@ -479,6 +513,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       }); })()}
     </div></div>}
   </aside>;
+  return shouldPortalToAnchor && mobileAnchor ? createPortal(panelEl, mobileAnchor) : panelEl;
 }
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
@@ -534,9 +569,8 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   // box may cover the conversation. The panel reappears with fresh data.
   if (authorityUnavailable) return null;
   const { mobileAnchor, mobileAnchorRef, ...panelProps } = props;
-  const panel = <TaskPairStatusPanel {...panelProps} mobileAnchor={resolvedMobileAnchor} />;
-  // The titlebar is the only safe host: keeping the panel in normal flow makes
-  // both mobile and desktop controls reserve space instead of being covered by
-  // a chat-main overlay. Expanded rows still open below the titlebar.
-  return resolvedMobileAnchor ? createPortal(panel, resolvedMobileAnchor) : panel;
+  // Portal only when mobile or collapsed (so collapsed strips sit in .chat-titlebar
+  // flex flow and mobile inline/fullscreen anchors against .chat-titlebar). Desktop
+  // expanded panels render directly inside .chat-main so bottom: 0 fills full height.
+  return <TaskPairStatusPanel {...panelProps} mobileAnchor={resolvedMobileAnchor} />;
 }

@@ -589,4 +589,74 @@ describe('everything that is not a phone sub-session is unchanged', () => {
       window.removeEventListener('deck:navigate', onNavigate);
     }
   });
+
+  it('keeps desktop expanded panel directly in chat-main (not portaled into chat-titlebar), clears tall titlebars, and portals collapsed strip to titlebar', () => {
+    setDevice('desktop');
+    const host = document.createElement('div');
+    host.className = 'chat-main';
+    const titlebar = document.createElement('div');
+    titlebar.className = 'chat-titlebar';
+    host.appendChild(titlebar);
+    document.body.appendChild(host);
+    let titlebarBottom = 138;
+    host.getBoundingClientRect = () => ({ top: 100, bottom: 1060, left: 0, right: 1280, width: 1280, height: 960, x: 0, y: 100, toJSON: () => ({}) } as DOMRect);
+    titlebar.getBoundingClientRect = () => ({ top: 100, bottom: titlebarBottom, left: 0, right: 1280, width: 1280, height: titlebarBottom - 100, x: 0, y: 100, toJSON: () => ({}) } as DOMRect);
+    const anchorRef = { current: titlebar };
+    const mountTarget = document.createElement('div');
+    host.appendChild(mountTarget);
+
+    try {
+      const view = render(
+        <TaskPairStatusPanelHost
+          events={live}
+          serverId="srv-desktop-host"
+          mobileAnchorRef={anchorRef}
+        />,
+        { container: mountTarget },
+      );
+
+      // Expanded on desktop -> stays directly under mountTarget/.chat-main (never portaled into .chat-titlebar)
+      const expandedPanel = mountTarget.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement | null;
+      expect(expandedPanel).toBeTruthy();
+      expect(titlebar.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
+      expect(expandedPanel!.classList.contains('is-desktop')).toBe(true);
+      expect(expandedPanel!.classList.contains('is-collapsed')).toBe(false);
+      expect(expandedPanel!.style.getPropertyValue(TASK_PAIR_PANEL_MAX_HEIGHT_VAR)).toBe('');
+      expect(expandedPanel!.style.top).toBe('');
+
+      // Tall wrapped titlebar (> 40px) shifts top offset cleanly below titlebar without overlapping
+      titlebarBottom = 154;
+      act(() => {
+        window.dispatchEvent(new Event('resize'));
+      });
+      expect(expandedPanel!.style.top).toBe('54px');
+
+      // Collapse on desktop -> portals into .chat-titlebar and removes inline top
+      fireEvent.click(expandedPanel!.querySelector('.task-pair-status-toggle') as HTMLElement);
+      const collapsedPanel = titlebar.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement | null;
+      expect(collapsedPanel).toBeTruthy();
+      expect(mountTarget.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
+      expect(collapsedPanel!.classList.contains('is-collapsed')).toBe(true);
+      expect(collapsedPanel!.style.top).toBe('');
+
+      // Expand again on desktop -> moves back out of .chat-titlebar into .chat-main host
+      fireEvent.click(collapsedPanel!.querySelector('.task-pair-status-toggle') as HTMLElement);
+      const reExpanded = mountTarget.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement | null;
+      expect(reExpanded).toBeTruthy();
+      expect(titlebar.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
+      expect(reExpanded!.classList.contains('is-collapsed')).toBe(false);
+      expect(reExpanded!.style.top).toBe('54px');
+
+      // Resize to narrow mobile (<=720) -> portals back into .chat-titlebar cleanly
+      setDevice('phone');
+      act(() => {
+        window.dispatchEvent(new Event('resize'));
+      });
+      expect(titlebar.querySelector('[data-testid="task-pair-status-panel"]')).toBeTruthy();
+      expect(mountTarget.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
+      view.unmount();
+    } finally {
+      host.remove();
+    }
+  });
 });
