@@ -526,4 +526,47 @@ describe('useTimeline — stale window: latest first, then newest→oldest', () 
     const ids = new Set(hook.current!.events.map((event) => event.eventId));
     expect(all.slice(60).every((event) => ids.has(event.eventId))).toBe(true);
   });
+
+  it('does not flip loading back to true or drop already-received live events when ws reconnects on a cold long-idle server', async () => {
+    const sessionName = `deck_cold_reconnect_${Date.now()}`;
+    const all = makeSession(sessionName, 10);
+    const daemon = makeDaemon(all, sessionName);
+    let connected = false;
+    const baseWs = daemon.ws;
+    const toggleableWs = new Proxy(baseWs, {
+      get(target, prop, receiver) {
+        if (prop === 'connected') return connected;
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as WsClient;
+    installHttp(all, daemon.requests);
+
+    const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
+    const view = render(h(Probe, { sessionName, ws: toggleableWs, hook }));
+
+    // A live WS event arrives while IDB/local snapshot is empty.
+    act(() => {
+      daemon.emit({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `${sessionName}-live-1`,
+          sessionId: sessionName,
+          ts: 9_999_999,
+          epoch: 2,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'live reply before reconnect' },
+        },
+      } as ServerMessage);
+    });
+    await waitFor(() => expect(hook.current!.events.some((e) => e.eventId === `${sessionName}-live-1`)).toBe(true));
+
+    // Reconnect completes (ws.connected flips false -> true). Existing events must stay visible without flipping loading=true.
+    connected = true;
+    view.rerender(h(Probe, { sessionName, ws: { ...toggleableWs, connected: true } as unknown as WsClient, hook }));
+    expect(hook.current!.events.some((e) => e.eventId === `${sessionName}-live-1`)).toBe(true);
+    expect(hook.current!.loading).toBe(false);
+  });
 });

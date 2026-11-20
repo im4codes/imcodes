@@ -3615,4 +3615,69 @@ describe('ChatView', () => {
       expect(container.textContent).toContain('chat.no_events');
     });
   });
+
+  it('keeps follow engaged and ignores spurious scrollTop=0 during pre-seeded mount and server switch', async () => {
+    const onLoadOlder = vi.fn();
+    const makeServerEvents = (serverTag: string, count: number) =>
+      Array.from({ length: count }, (_, idx) => ({
+        eventId: `${serverTag}-evt-${idx + 1}`,
+        type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+        ts: 1000 + idx,
+        epoch: 1,
+        seq: idx + 1,
+        sessionId: 'deck_shared_brain',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `${serverTag} message ${idx + 1}`, streaming: false },
+      }));
+
+    let scrollTopValue = 0;
+    let scrollHeightValue = 2_400;
+    const { container, rerender } = render(
+      <ChatView
+        events={makeServerEvents('srv-cached-a', 15) as any}
+        loading={false}
+        hasOlderHistory
+        onLoadOlder={onLoadOlder}
+        serverId="srv-cached-a"
+        sessionId="deck_shared_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, get: () => 400 });
+
+    // Simulate a layout/browser scroll event at scrollTop=0 before the initial pin rAF completes.
+    scrollTopValue = 0;
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => expect(scrollTopValue).toBe(2_400));
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Switch to another server with the same session name (scrollTop resets to 0 transiently).
+    scrollTopValue = 0;
+    scrollHeightValue = 3_200;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-cached-b', 20) as any}
+        loading={false}
+        hasOlderHistory
+        onLoadOlder={onLoadOlder}
+        serverId="srv-cached-b"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => expect(scrollTopValue).toBe(3_200));
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+  });
 });

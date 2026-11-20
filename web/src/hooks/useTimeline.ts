@@ -3141,7 +3141,7 @@ export function useTimeline(
     if (disableHistory || !cacheKey) {
       localRestoredKeyRef.current = nextKey;
       localRestoredIdsRef.current = new Set();
-      setEvents([]);
+      setEvents((prev) => (prev.length === 0 ? prev : []));
       setLoading(false);
       setHistoryStatus(createIdleHistoryStatus());
       return;
@@ -3162,7 +3162,7 @@ export function useTimeline(
       return;
     }
 
-    setEvents([]);
+    setEvents((prev) => (prev.length === 0 ? prev : []));
     setLoading(true);
     setHistoryStatus(createBootstrapHistoryStatus({ canHttp: false }));
   }, [cacheKey, disableHistory, isActiveSession, isVisible, sessionId]);
@@ -3404,7 +3404,7 @@ export function useTimeline(
     let coldDaemonRequested = false;
     let coldDaemonTimer: ReturnType<typeof setTimeout> | null = null;
     if (localSnapshot.length === 0) {
-      setLoading(true);
+      if (eventsRef.current.length === 0) setLoading(true);
       if (shouldBootstrapVisibleHistory && wsConnected) {
         // Give a healthy local read one short head start, then hedge with the
         // daemon instead of awaiting IDB indefinitely. This preserves the cheap
