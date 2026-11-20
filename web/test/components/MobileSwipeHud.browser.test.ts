@@ -24,11 +24,13 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
     }
     const { buildSync } = require('esbuild') as typeof import('esbuild');
     const here = dirname(fileURLToPath(import.meta.url));
-    const componentPath = resolve(here, '../../src/components/MobileSwipeHud.tsx');
-    const i18nPath = resolve(here, '../../src/i18n/index.ts');
-    const css = readFileSync(resolve(here, '../../src/styles.css'), 'utf8');
+    const webDir = resolve(here, '../..');
+    const componentPath = resolve(webDir, 'src/components/MobileSwipeHud.tsx');
+    const i18nPath = resolve(webDir, 'src/i18n/index.ts');
+    const css = readFileSync(resolve(webDir, 'src/styles.css'), 'utf8');
 
     const compiled = buildSync({
+      absWorkingDir: webDir,
       stdin: {
         contents: `
           import { render } from 'preact';
@@ -39,7 +41,7 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
             render(<MobileSwipeHud progress={progress} targets={targets} />, document.getElementById('root'));
           };
         `,
-        resolveDir: resolve(here, '../..'),
+        resolveDir: webDir,
         loader: 'tsx',
       },
       bundle: true,
@@ -332,11 +334,13 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
     }
     const { buildSync } = require('esbuild') as typeof import('esbuild');
     const here = dirname(fileURLToPath(import.meta.url));
-    const componentPath = resolve(here, '../../src/components/MobileSwipeHud.tsx');
-    const i18nPath = resolve(here, '../../src/i18n/index.ts');
-    const css = readFileSync(resolve(here, '../../src/styles.css'), 'utf8');
+    const webDir = resolve(here, '../..');
+    const componentPath = resolve(webDir, 'src/components/MobileSwipeHud.tsx');
+    const i18nPath = resolve(webDir, 'src/i18n/index.ts');
+    const css = readFileSync(resolve(webDir, 'src/styles.css'), 'utf8');
 
     const compiled = buildSync({
+      absWorkingDir: webDir,
       stdin: {
         contents: `
           import { render } from 'preact';
@@ -347,7 +351,7 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
             render(<MobileSwipeHud progress={progress} targets={targets} />, document.getElementById('root'));
           };
         `,
-        resolveDir: resolve(here, '../..'),
+        resolveDir: webDir,
         loader: 'tsx',
       },
       bundle: true,
