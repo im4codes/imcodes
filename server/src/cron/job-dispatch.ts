@@ -116,6 +116,27 @@ export async function readCronJobAndProvenanceLocked(
   if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') {
     return { job: null, provenance: { ok: true, row: null } };
   }
+  // Consistent lock order: lock cron_jobs row FIRST (blocking behind any concurrent
+  // writer that already locked cron_jobs before mutating cron_job_provenance),
+  // then start a fresh READ COMMITTED statement to read cron_job_provenance so
+  // EvalPlanQual on a single LEFT JOIN ... FOR UPDATE OF j can never pair a
+  // refetched j with a statement-start snapshot of provenance.
+  const job = await db.queryOne<DbCronJob>(
+    'SELECT * FROM cron_jobs WHERE id = $1 FOR UPDATE',
+    [jobId],
+  );
+  if (!job) return { job: null, provenance: { ok: true, row: null } };
+  const provenance = await readCronJobProvenance(db, job.id);
+  return { job, provenance };
+}
+
+async function readCronJobAndProvenanceSnapshot(
+  db: Database,
+  jobId: string,
+): Promise<{ job: DbCronJob | null; provenance: CronProvenanceLookup }> {
+  if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') {
+    return { job: null, provenance: { ok: true, row: null } };
+  }
   const row = await db.queryOne<CronJobWithJoinedProvenance>(
     `SELECT j.*,
             p.creator_user_id AS prov_creator_user_id,
@@ -123,8 +144,7 @@ export async function readCronJobAndProvenanceLocked(
             (p.job_id IS NOT NULL) AS prov_present
        FROM cron_jobs j
        LEFT JOIN cron_job_provenance p ON p.job_id = j.id
-      WHERE j.id = $1
-      FOR UPDATE OF j`,
+      WHERE j.id = $1`,
     [jobId],
   );
   if (!row) return { job: null, provenance: { ok: true, row: null } };
@@ -331,7 +351,7 @@ export async function dispatchJobNow(
   if (opts?.skipReload && opts.verifiedProvenance) {
     provenance = opts.verifiedProvenance;
   } else if (typeof (env.DB as { queryOne?: unknown })?.queryOne === 'function') {
-    const loaded = await readCronJobAndProvenanceLocked(env.DB, passedJob.id);
+    const loaded = await readCronJobAndProvenanceSnapshot(env.DB, passedJob.id);
     if (!loaded.job) {
       throw new Error('cron_not_found');
     }
@@ -417,21 +437,16 @@ async function claimDueJobs(
   env: Env,
   now: number,
 ): Promise<ClaimedCronJob[]> {
-  const selectDue = async (db: typeof env.DB): Promise<Array<ClaimedCronJob & CronJobWithJoinedProvenance>> => (
-    db.query<ClaimedCronJob & CronJobWithJoinedProvenance>(
-      `SELECT j.*,
-              j.last_run_at AS previous_run_at,
-              p.creator_user_id AS prov_creator_user_id,
-              p.shared AS prov_shared,
-              (p.job_id IS NOT NULL) AS prov_present
-         FROM cron_jobs j
-         LEFT JOIN cron_job_provenance p ON p.job_id = j.id
-        WHERE j.status = $2 AND j.next_run_at <= $1
-          AND (j.expires_at IS NULL OR j.expires_at >= $1)
-          AND ${activeUserExistsSql('j.user_id')}
-        ORDER BY j.next_run_at ASC
+  const selectDue = async (db: typeof env.DB): Promise<ClaimedCronJob[]> => (
+    db.query<ClaimedCronJob>(
+      `SELECT *, last_run_at AS previous_run_at
+         FROM cron_jobs
+        WHERE status = $2 AND next_run_at <= $1
+          AND (expires_at IS NULL OR expires_at >= $1)
+          AND ${activeUserExistsSql('cron_jobs.user_id')}
+        ORDER BY next_run_at ASC
         LIMIT 50
-        FOR UPDATE OF j SKIP LOCKED`,
+        FOR UPDATE SKIP LOCKED`,
       [now, CRON_STATUS.ACTIVE],
     )
   );
@@ -447,7 +462,7 @@ async function claimDueJobs(
       const jobs = await selectDue(tx);
       const claimed: ClaimedCronJob[] = [];
       for (const job of jobs) {
-        const snapshotProvenance = extractJoinedProvenance(job) ?? await readCronJobProvenance(tx, job.id);
+        const snapshotProvenance = await readCronJobProvenance(tx, job.id);
         const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
         const result = await tx.execute(
           'UPDATE cron_jobs SET last_run_at = $1, next_run_at = $2 WHERE id = $3 AND status = $4 AND next_run_at <= $1',
@@ -499,16 +514,12 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
   }).transaction!;
   const now = Date.now();
   return transaction.call<typeof env.DB, [(tx: typeof env.DB) => Promise<ClaimedCronJob[]>], Promise<ClaimedCronJob[]>>(env.DB, async (tx) => {
-    const rows = await tx.query<ClaimedCronJob & CronJobWithJoinedProvenance & { execution_detail?: string | null }>(
+    const rows = await tx.query<ClaimedCronJob & { execution_detail?: string | null }>(
       `SELECT j.*,
               e.id AS execution_id,
-              e.detail AS execution_detail,
-              p.creator_user_id AS prov_creator_user_id,
-              p.shared AS prov_shared,
-              (p.job_id IS NOT NULL) AS prov_present
+              e.detail AS execution_detail
          FROM cron_executions e
          JOIN cron_jobs j ON j.id = e.job_id
-         LEFT JOIN cron_job_provenance p ON p.job_id = j.id
         WHERE (e.status = 'pending_dispatch'
            OR (e.status = 'dispatching' AND e.created_at <= $1))
           AND ${activeUserExistsSql('j.user_id')}
@@ -519,7 +530,7 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
     );
     const claimed: ClaimedCronJob[] = [];
     for (const row of rows.filter((candidate) => typeof candidate.execution_id === 'string' && candidate.execution_id.length > 0)) {
-      const snapshotProvenance = extractJoinedProvenance(row) ?? await readCronJobProvenance(tx, row.id);
+      const snapshotProvenance = await readCronJobProvenance(tx, row.id);
       let detail: { previousRunAt?: number | null; nextRunAt?: number } = {};
       try {
         detail = row.execution_detail ? JSON.parse(row.execution_detail) as typeof detail : {};

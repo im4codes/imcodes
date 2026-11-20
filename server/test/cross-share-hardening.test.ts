@@ -1586,6 +1586,13 @@ describe('cross-share & platform hardening regressions', () => {
               revoked_at: null,
             };
           }
+          if (s.includes('from cron_job_provenance where job_id')) {
+            if (throwJoinedRead) throw new Error('trigger_provenance_join_failed');
+            const job = jobsMap.get(params[0] as string);
+            return job?.prov_present
+              ? { creator_user_id: job.prov_creator_user_id ?? null, shared: Boolean(job.prov_shared) }
+              : null;
+          }
           if (s.includes('from cron_jobs') && s.includes('left join cron_job_provenance')) {
             if (throwJoinedRead) throw new Error('trigger_provenance_join_failed');
             return jobsMap.get(params[0] as string) ?? null;

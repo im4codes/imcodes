@@ -27,6 +27,7 @@ import { signJwt } from '../src/security/crypto.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { CRON_STATUS } from '../../shared/cron-types.js';
 import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
+import { jobDispatchCron, readCronJobAndProvenanceLocked } from '../src/cron/job-dispatch.js';
 import type { Env } from '../src/env.js';
 
 const JWT_KEY = 'test-jwt-key-real-machine-32chars!';
@@ -716,5 +717,316 @@ describe('Real-machine test: daemon authored-bindings cross-tenant isolation', (
       bindingId: 'bind-valid-a',
       content: 'Allowed Tenant A rule',
     });
+  });
+});
+
+describe('PostgreSQL READ COMMITTED lock-wait pairing: EvalPlanQual prevention', () => {
+  const EPQ_JOB_LOCK = 'cron-epq-lock-001';
+  const EPQ_JOB_TRIGGER_REVOKE = 'cron-epq-trigger-revoke-002';
+  const EPQ_JOB_TRIGGER_ALLOW = 'cron-epq-trigger-allow-003';
+  const EPQ_JOB_SCHED = 'cron-epq-sched-004';
+  const EPQ_JOB_RECOVER = 'cron-epq-recover-005';
+
+  afterEach(async () => {
+    const ids = [EPQ_JOB_LOCK, EPQ_JOB_TRIGGER_REVOKE, EPQ_JOB_TRIGGER_ALLOW, EPQ_JOB_SCHED, EPQ_JOB_RECOVER];
+    await db.execute(`DELETE FROM cron_executions WHERE job_id = ANY($1::text[])`, [ids]);
+    await db.execute(`DELETE FROM cron_job_provenance WHERE job_id = ANY($1::text[])`, [ids]);
+    await db.execute(`DELETE FROM cron_jobs WHERE id = ANY($1::text[])`, [ids]);
+  });
+
+  async function seedCronWithProvenance(opts: {
+    id: string;
+    name: string;
+    action: Record<string, unknown>;
+    creatorUserId: string;
+    shared: boolean;
+    targetRole?: string;
+    targetSessionName?: string | null;
+    nextRunAt?: number | null;
+  }) {
+    const now = Date.now();
+    await db.execute(
+      `INSERT INTO cron_jobs (id, user_id, server_id, name, cron_expr, project_name, target_role, target_session_name, action, status, next_run_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
+      [
+        opts.id,
+        OWNER_ID,
+        SERVER_ID,
+        opts.name,
+        '0 9 * * *',
+        PROJECT_NAME,
+        opts.targetRole ?? 'brain',
+        opts.targetSessionName ?? MAIN_SESSION,
+        JSON.stringify(opts.action),
+        CRON_STATUS.ACTIVE,
+        opts.nextRunAt ?? null,
+        now,
+      ],
+    );
+    await db.execute(
+      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [opts.id, opts.creatorUserId, SERVER_ID, PROJECT_NAME, opts.shared, now],
+    );
+  }
+
+  it('readCronJobAndProvenanceLocked waits on writer lock and pairs v2 job with v2 provenance (never v2+v1)', async () => {
+    await seedCronWithProvenance({
+      id: EPQ_JOB_LOCK,
+      name: 'EPQ Lock Pair Check',
+      action: { type: 'send', target: MAIN_SESSION, message: 'v1-payload' },
+      creatorUserId: OUTSIDER_ID,
+      shared: true,
+    });
+
+    let writerLocked!: () => void;
+    const writerLockedPromise = new Promise<void>((r) => { writerLocked = r; });
+    let allowCommit!: () => void;
+    const allowCommitPromise = new Promise<void>((r) => { allowCommit = r; });
+
+    const writerTx = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT id FROM cron_jobs WHERE id = $1 FOR UPDATE', [EPQ_JOB_LOCK]);
+      await tx.execute(
+        'UPDATE cron_jobs SET action = $1, updated_at = $2 WHERE id = $3',
+        [JSON.stringify({ type: 'send', target: MAIN_SESSION, message: 'v2-payload' }), Date.now(), EPQ_JOB_LOCK],
+      );
+      await tx.execute(
+        'UPDATE cron_job_provenance SET creator_user_id = $1, shared = $2 WHERE job_id = $3',
+        [PARTICIPANT_ID, true, EPQ_JOB_LOCK],
+      );
+      writerLocked();
+      await allowCommitPromise;
+    });
+
+    await writerLockedPromise;
+
+    let readerResolved = false;
+    const readerTx = db.transaction(async (tx) => {
+      const res = await readCronJobAndProvenanceLocked(tx, EPQ_JOB_LOCK);
+      readerResolved = true;
+      return res;
+    });
+
+    // Give Connection 2 time to hit Connection 1's row lock under READ COMMITTED
+    await new Promise((r) => setTimeout(r, 50));
+    expect(readerResolved).toBe(false);
+
+    allowCommit();
+    await writerTx;
+    const locked = await readerTx;
+
+    expect(locked.job).not.toBeNull();
+    expect(JSON.parse(locked.job!.action)).toMatchObject({ type: 'send', message: 'v2-payload' });
+    expect(locked.provenance).toEqual({
+      ok: true,
+      row: { creator_user_id: PARTICIPANT_ID, shared: true },
+    });
+  });
+
+  it('POST /api/cron/:id/trigger under lock wait rejects when concurrent writer revokes provenance (v2+v2, 0 WS dispatches)', async () => {
+    await seedCronWithProvenance({
+      id: EPQ_JOB_TRIGGER_REVOKE,
+      name: 'EPQ Trigger Revoke',
+      action: { type: 'command', command: '/v1-safe' },
+      creatorUserId: PARTICIPANT_ID,
+      shared: true,
+    });
+
+    const bridge = WsBridge.get(SERVER_ID);
+    const sendSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => true);
+    vi.spyOn(bridge, 'hasDaemonCapability').mockReturnValue(true);
+
+    let writerLocked!: () => void;
+    const writerLockedPromise = new Promise<void>((r) => { writerLocked = r; });
+    let allowCommit!: () => void;
+    const allowCommitPromise = new Promise<void>((r) => { allowCommit = r; });
+
+    const writerTx = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT id FROM cron_jobs WHERE id = $1 FOR UPDATE', [EPQ_JOB_TRIGGER_REVOKE]);
+      await tx.execute(
+        'UPDATE cron_jobs SET action = $1, updated_at = $2 WHERE id = $3',
+        [JSON.stringify({ type: 'command', command: '/v2-revoked-escalated' }), Date.now(), EPQ_JOB_TRIGGER_REVOKE],
+      );
+      await tx.execute(
+        'UPDATE cron_job_provenance SET creator_user_id = $1, shared = $2 WHERE job_id = $3',
+        [OUTSIDER_ID, true, EPQ_JOB_TRIGGER_REVOKE],
+      );
+      writerLocked();
+      await allowCommitPromise;
+    });
+
+    await writerLockedPromise;
+
+    let triggerDone = false;
+    const triggerPromise = app.request(`/api/cron/${EPQ_JOB_TRIGGER_REVOKE}/trigger`, {
+      method: 'POST',
+      headers: { Authorization: bearer(OWNER_ID) },
+    }).then((res) => {
+      triggerDone = true;
+      return res;
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(triggerDone).toBe(false);
+
+    allowCommit();
+    await writerTx;
+    const res = await triggerPromise;
+
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('share_revoked');
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('POST /api/cron/:id/trigger under lock wait dispatches only paired v2 action when provenance becomes authorized', async () => {
+    await seedCronWithProvenance({
+      id: EPQ_JOB_TRIGGER_ALLOW,
+      name: 'EPQ Trigger Allow',
+      action: { type: 'send', target: MAIN_SESSION, message: 'v1-untrusted' },
+      creatorUserId: OUTSIDER_ID,
+      shared: true,
+    });
+
+    const bridge = WsBridge.get(SERVER_ID);
+    const sendSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => true);
+    vi.spyOn(bridge, 'hasDaemonCapability').mockReturnValue(true);
+
+    let writerLocked!: () => void;
+    const writerLockedPromise = new Promise<void>((r) => { writerLocked = r; });
+    let allowCommit!: () => void;
+    const allowCommitPromise = new Promise<void>((r) => { allowCommit = r; });
+
+    const writerTx = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT id FROM cron_jobs WHERE id = $1 FOR UPDATE', [EPQ_JOB_TRIGGER_ALLOW]);
+      await tx.execute(
+        'UPDATE cron_jobs SET action = $1, target_role = $2, target_session_name = $3, updated_at = $4 WHERE id = $5',
+        [
+          JSON.stringify({ type: 'send', target: SUB_SESSION_NAME, message: 'v2-trusted' }),
+          'subsession',
+          SUB_SESSION_NAME,
+          Date.now(),
+          EPQ_JOB_TRIGGER_ALLOW,
+        ],
+      );
+      await tx.execute(
+        'UPDATE cron_job_provenance SET creator_user_id = $1, shared = $2 WHERE job_id = $3',
+        [PARTICIPANT_ID, true, EPQ_JOB_TRIGGER_ALLOW],
+      );
+      writerLocked();
+      await allowCommitPromise;
+    });
+
+    await writerLockedPromise;
+
+    let triggerDone = false;
+    const triggerPromise = app.request(`/api/cron/${EPQ_JOB_TRIGGER_ALLOW}/trigger`, {
+      method: 'POST',
+      headers: { Authorization: bearer(PARTICIPANT_ID) },
+    }).then((res) => {
+      triggerDone = true;
+      return res;
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(triggerDone).toBe(false);
+
+    allowCommit();
+    await writerTx;
+    const res = await triggerPromise;
+
+    expect(res.status).toBe(200);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    const sent = JSON.parse(sendSpy.mock.calls[0]![0] as string) as {
+      action: { type: string; target?: string; message?: string };
+      exactTargetSessionName?: string;
+    };
+    expect(sent.action).toMatchObject({ type: 'send', target: SUB_SESSION_NAME, message: 'v2-trusted' });
+    expect(sent.exactTargetSessionName).toBe(SUB_SESSION_NAME);
+  });
+
+  it('jobDispatchCron claimDueJobs and recoverPendingDispatches consume only paired (v2, v2) under concurrent writer lock', async () => {
+    const past = Date.now() - 10_000;
+    await seedCronWithProvenance({
+      id: EPQ_JOB_SCHED,
+      name: 'EPQ Scheduled Claim',
+      action: { type: 'send', target: MAIN_SESSION, message: 'v1-sched-untrusted' },
+      creatorUserId: OUTSIDER_ID,
+      shared: true,
+      nextRunAt: past,
+    });
+    await seedCronWithProvenance({
+      id: EPQ_JOB_RECOVER,
+      name: 'EPQ Pending Recovery',
+      action: { type: 'send', target: MAIN_SESSION, message: 'v1-recover-untrusted' },
+      creatorUserId: OUTSIDER_ID,
+      shared: true,
+      nextRunAt: Date.now() + 3_600_000,
+    });
+    await db.execute(
+      `INSERT INTO cron_executions (id, job_id, status, detail, created_at) VALUES ($1, $2, $3, $4, $5)`,
+      ['exec-epq-recover-005', EPQ_JOB_RECOVER, 'pending_dispatch', null, past],
+    );
+
+    const bridge = WsBridge.get(SERVER_ID);
+    const sendSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => true);
+    vi.spyOn(bridge, 'hasDaemonCapability').mockReturnValue(true);
+
+    let writerLocked!: () => void;
+    const writerLockedPromise = new Promise<void>((r) => { writerLocked = r; });
+    let allowCommit!: () => void;
+    const allowCommitPromise = new Promise<void>((r) => { allowCommit = r; });
+
+    const writerTx = db.transaction(async (tx) => {
+      await tx.queryOne('SELECT id FROM cron_jobs WHERE id = ANY($1::text[]) FOR UPDATE', [[EPQ_JOB_SCHED, EPQ_JOB_RECOVER]]);
+      await tx.execute(
+        'UPDATE cron_jobs SET action = $1, target_role = $2, target_session_name = $3, updated_at = $4 WHERE id = $5',
+        [
+          JSON.stringify({ type: 'send', target: SUB_SESSION_NAME, message: 'v2-sched-trusted' }),
+          'subsession',
+          SUB_SESSION_NAME,
+          Date.now(),
+          EPQ_JOB_SCHED,
+        ],
+      );
+      await tx.execute(
+        'UPDATE cron_jobs SET action = $1, target_role = $2, target_session_name = $3, updated_at = $4 WHERE id = $5',
+        [
+          JSON.stringify({ type: 'send', target: SUB_SESSION_NAME, message: 'v2-recover-trusted' }),
+          'subsession',
+          SUB_SESSION_NAME,
+          Date.now(),
+          EPQ_JOB_RECOVER,
+        ],
+      );
+      await tx.execute(
+        'UPDATE cron_job_provenance SET creator_user_id = $1, shared = $2 WHERE job_id = ANY($3::text[])',
+        [PARTICIPANT_ID, true, [EPQ_JOB_SCHED, EPQ_JOB_RECOVER]],
+      );
+      writerLocked();
+      await allowCommitPromise;
+    });
+
+    await writerLockedPromise;
+
+    const env = { DB: db } as unknown as Env;
+    // While writer holds FOR UPDATE, SKIP LOCKED skips both rows instead of mixing snapshots
+    await jobDispatchCron(env);
+    expect(sendSpy).not.toHaveBeenCalled();
+
+    allowCommit();
+    await writerTx;
+
+    await jobDispatchCron(env);
+    const dispatched = sendSpy.mock.calls.map((c) => JSON.parse(c[0] as string) as {
+      jobId: string;
+      action: { message?: string; target?: string };
+      exactTargetSessionName?: string;
+    });
+    const byJob = new Map(dispatched.map((d) => [d.jobId, d]));
+    expect(byJob.get(EPQ_JOB_SCHED)?.action).toMatchObject({ target: SUB_SESSION_NAME, message: 'v2-sched-trusted' });
+    expect(byJob.get(EPQ_JOB_SCHED)?.exactTargetSessionName).toBe(SUB_SESSION_NAME);
+    expect(byJob.get(EPQ_JOB_RECOVER)?.action).toMatchObject({ target: SUB_SESSION_NAME, message: 'v2-recover-trusted' });
+    expect(byJob.get(EPQ_JOB_RECOVER)?.exactTargetSessionName).toBe(SUB_SESSION_NAME);
   });
 });
