@@ -20,6 +20,7 @@ import {
   downloadControlledNodeExecutable,
   ApiError,
 } from '../src/api.js';
+import { CONTROLLED_NODE_ABI_GLIBC217 } from '../../shared/controlled-node-abi.js';
 import { buildControlledNodeDownloadTargets } from '../src/api/machines.js';
 
 afterEach(() => {
@@ -59,6 +60,20 @@ describe('buildControlledNodeDownloadTargets', () => {
       { os: 'win', arch: 'x64' },
       { os: 'mac', arch: 'universal' },
       { os: 'linux', arch: 'x64' },
+    ]);
+  });
+
+  it('keeps modern and glibc217 Linux artifacts as distinct targets', () => {
+    const targets = buildControlledNodeDownloadTargets({
+      available: ['linux'],
+      artifacts: [
+        { os: 'linux', arch: 'x64', filename: 'imcodes-node-linux', sizeBytes: 10, sha256: VALID_SHA256 },
+        { os: 'linux', arch: 'x64', abiProfile: CONTROLLED_NODE_ABI_GLIBC217, filename: 'imcodes-node-linux-glibc217', sizeBytes: 20, sha256: VALID_SHA256 },
+      ],
+    });
+    expect(targets).toEqual([
+      { os: 'linux', arch: 'x64' },
+      { os: 'linux', arch: 'x64', abiProfile: CONTROLLED_NODE_ABI_GLIBC217 },
     ]);
   });
 

@@ -2572,6 +2572,7 @@ enrollRoutes.get('/v2/availability', requireAuth(), async (c) => {
     artifacts: descriptors.map((d) => ({
       os: d.os,
       arch: d.arch,
+      ...(d.abiProfile ? { abiProfile: d.abiProfile } : {}),
       filename: d.filename,
       sizeBytes: d.sizeBytes,
       sha256: d.sha256,

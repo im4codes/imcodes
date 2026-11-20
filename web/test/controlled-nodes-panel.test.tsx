@@ -9,7 +9,12 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
+import { buildControlledNodeDownloadTargets, type ControlledNodeAvailability, type MachineListItem } from '../src/api/machines.js';
+import {
+  CONTROLLED_NODE_ABI_GLIBC217,
+  CONTROLLED_NODE_ABI_MODERN,
+  normalizeControlledNodeAbiProfile,
+} from '@shared/controlled-node-abi.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
 import { installClipboardStub, removeClipboardStub } from './support/clipboard-stub.js';
@@ -2135,4 +2140,34 @@ it('opens connect-by-id and saved remote devices in-app without window.open on m
   fireEvent.click(overlay.querySelector('.remote-desktop-guest-exit') as HTMLButtonElement);
   expect(document.body.querySelector('.remote-desktop-guest-overlay')).toBeNull();
   openSpy.mockRestore();
+});
+
+it('renders distinct Linux modern and glibc217 compat cards with separate sizes and keeps DaemonRemoteDesktopSetup modern-only', async () => {
+  const availability: ControlledNodeAvailability = {
+    available: ['win', 'mac', 'linux'],
+    artifacts: [
+      { os: 'linux', arch: 'x64', filename: 'imcodes-node-linux', sizeBytes: 10 * 1024 * 1024, sha256: '1'.repeat(64) },
+      { os: 'linux', arch: 'x64', abiProfile: CONTROLLED_NODE_ABI_GLIBC217, filename: 'imcodes-node-linux-glibc217', sizeBytes: 22 * 1024 * 1024, sha256: '2'.repeat(64) },
+    ],
+  };
+  listAvailableExecutables.mockResolvedValueOnce(availability);
+
+  const { container } = renderInstallTab();
+  await waitFor(() => {
+    expect(container.querySelectorAll('.controlled-nodes-download-item.is-linux')).toHaveLength(2);
+  });
+
+  const titles = Array.from(container.querySelectorAll('.controlled-nodes-download-item.is-linux .controlled-nodes-platform-copy strong'))
+    .map((el) => el.textContent);
+  expect(titles).toEqual(['Linux', 'controlled_nodes.linux_compat_headless']);
+
+  const metas = Array.from(container.querySelectorAll('.controlled-nodes-download-item.is-linux .controlled-nodes-artifact-meta'))
+    .map((el) => el.textContent);
+  expect(metas[0]).not.toBe(metas[1]);
+  expect(metas[0]).toContain('10.0 MB');
+  expect(metas[1]).toContain('22.0 MB');
+
+  const daemonTargets = buildControlledNodeDownloadTargets(availability)
+    .filter((target) => normalizeControlledNodeAbiProfile(target.abiProfile) === CONTROLLED_NODE_ABI_MODERN);
+  expect(daemonTargets).toEqual([{ os: 'linux', arch: 'x64' }]);
 });

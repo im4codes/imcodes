@@ -3267,6 +3267,43 @@ describe('ABI enrollment, download and old-peer fences (real PostgreSQL)', () =>
     expect((await app.request(`/api/enroll/v2/download?${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${profile}`, { headers: { authorization: `Bearer ${ticket.ticket}` } })).status).toBe(400);
     expect(await db.queryOne('SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id=$1', [ticket.ticketId])).toEqual({ consumed_count: 0 });
   });
+
+  it('GET /api/enroll/v2/availability returns both modern and glibc217 Linux artifacts with distinct metadata and abiProfile', async () => {
+    const compatBytes = await writeCompatRelease();
+    artifactCatalog = createArtifactCatalog();
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const r = await app.request('/api/enroll/v2/availability', {
+      headers: { authorization: `Bearer ${o.accountToken}` },
+    });
+    expect(r.status).toBe(200);
+    const body = await r.json() as {
+      available: string[];
+      artifacts: Array<{ os: string; arch: string; abiProfile?: string; filename: string; sizeBytes: number; sha256: string }>;
+    };
+    const modernLinux = body.artifacts.find((a) => a.os === 'linux' && a.arch === 'x64' && !a.abiProfile);
+    const compatLinux = body.artifacts.find((a) => a.os === 'linux' && a.arch === 'x64' && a.abiProfile === CONTROLLED_NODE_ABI_GLIBC217);
+    expect(modernLinux).toEqual({
+      os: 'linux',
+      arch: 'x64',
+      filename: 'imcodes-node-linux',
+      sizeBytes: FAKE_BINARY.length,
+      sha256: sha256(FAKE_BINARY),
+    });
+    expect('abiProfile' in modernLinux!).toBe(false);
+    expect(compatLinux).toEqual({
+      os: 'linux',
+      arch: 'x64',
+      abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      filename: CONTROLLED_NODE_ABI_PROFILES.GLIBC217.fileName,
+      sizeBytes: compatBytes.length,
+      sha256: sha256(compatBytes),
+    });
+    expect(compatLinux!.sizeBytes).not.toBe(modernLinux!.sizeBytes);
+    expect(compatLinux!.sha256).not.toBe(modernLinux!.sha256);
+  });
 });
 
 describe('HEAD /api/enroll/v2/node-artifact', () => {
