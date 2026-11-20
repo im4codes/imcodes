@@ -23372,7 +23372,9 @@ html.native-ios-mac .global-task-mode-entry-btn {
   top: calc(100% + 6px);
   right: 0;
   z-index: 40;
-  min-width: 210px;
+  width: min(540px, calc(100vw - 24px));
+  max-height: min(65vh, 460px, calc(var(--vvh, var(--imcodes-ui-dvh, 100vh)) - var(--filter-menu-top, 56px) - 16px));
+  box-sizing: border-box;
   padding: 8px 10px;
   border-radius: 10px;
   border: 1px solid rgba(148, 163, 184, 0.26);
@@ -23381,23 +23383,57 @@ html.native-ios-mac .global-task-mode-entry-btn {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  overflow: hidden;
 }
 
 .global-task-server-filter-title {
+  flex-shrink: 0;
   font-size: 11px;
   font-weight: 600;
   color: #94a3b8;
   margin-bottom: 2px;
 }
 
+.global-task-server-filter-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 10px;
+  padding-right: 2px;
+}
+
 .global-task-server-filter-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
+  min-width: 0;
   font-size: 12px;
   color: #e2e8f0;
   cursor: pointer;
-  padding: 3px 2px;
+  padding: 5px 6px;
+  border-radius: 6px;
+}
+
+.global-task-server-filter-item:hover {
+  background: rgba(148, 163, 184, 0.12);
+}
+
+.global-task-server-filter-item input,
+.global-task-server-filter-item .global-task-dot {
+  flex-shrink: 0;
+}
+
+.global-task-server-filter-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .global-task-server-filter-empty {
@@ -23954,5 +23990,21 @@ html.native-ios-mac .global-task-mode-entry-btn {
   }
   .global-task-add-fields {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .global-task-server-filter-menu {
+    position: fixed;
+    top: var(--filter-menu-top, 56px);
+    left: 10px;
+    right: 10px;
+    width: auto;
+    max-height: min(68vh, calc(var(--vvh, var(--imcodes-ui-dvh, 100vh)) - var(--filter-menu-top, 56px) - env(safe-area-inset-bottom, 0px) - 12px));
+  }
+
+  .global-task-server-filter-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 8px;
   }
 }

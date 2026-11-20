@@ -600,4 +600,77 @@ describe('GlobalTaskModeView', () => {
       }
     }
   });
+
+  it('renders a scrollable 2/3-column grid server filter menu for 24+ servers with truncation, click-outside containment, and empty state', async () => {
+    const servers = Array.from({ length: 24 }, (_, idx) => ({
+      id: `srv-${idx + 1}`,
+      name: idx === 0 ? '1d5c5b1f8ce8-very-long-server-name' : `Node-${idx + 1}`,
+      online: idx % 2 === 0,
+    }));
+
+    const { ws } = await mountWithSnapshot();
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: 11_000,
+        servers,
+        brains: [],
+        tasks: [],
+        mutedServerIds: [],
+      });
+    });
+
+    const filterBtn = screen.getByTestId('task-mode-server-filter-btn');
+    expect(filterBtn.textContent).toContain('24/24');
+    fireEvent.click(filterBtn);
+
+    const menu = screen.getByTestId('task-mode-server-filter-menu');
+    const list = screen.getByTestId('task-mode-server-filter-list');
+    expect(menu.contains(list)).toBe(true);
+    expect(list.querySelectorAll('.global-task-server-filter-item')).toHaveLength(24);
+    const longNameEl = list.querySelector('.global-task-server-filter-name');
+    expect(longNameEl?.getAttribute('title')).toBe('1d5c5b1f8ce8-very-long-server-name');
+
+    // Clicking inside scrollable list does NOT trigger click-outside close
+    fireEvent.pointerDown(list);
+    expect(screen.queryByTestId('task-mode-server-filter-menu')).not.toBeNull();
+
+    // Toggling the 24th server updates active count & stays open
+    fireEvent.click(screen.getByTestId('task-mode-server-toggle-srv-24'));
+    expect(filterBtn.textContent).toContain('23/24');
+    expect(ws.sent.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: GLOBAL_TASK_MODE_MSG.SET_FILTER,
+      mutedServerIds: ['srv-24'],
+    });
+    expect(screen.queryByTestId('task-mode-server-filter-menu')).not.toBeNull();
+
+    // Pointer down outside closes the menu
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByTestId('task-mode-server-filter-menu')).toBeNull();
+
+    // Empty server list renders empty placeholder without list grid collapse
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: 12_000,
+        servers: [],
+        brains: [],
+        tasks: [],
+        mutedServerIds: [],
+      });
+    });
+    fireEvent.click(filterBtn);
+    expect(screen.getByTestId('task-mode-server-filter-menu').textContent).toContain('No servers');
+    expect(screen.queryByTestId('task-mode-server-filter-list')).toBeNull();
+
+    // CSS contract: scrollable list with touch containment, 3-col desktop / 2-col mobile grid, ellipsis truncation
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const css = readFileSync(resolve(process.cwd().endsWith('/web') ? process.cwd() : resolve(process.cwd(), 'web'), 'src/styles.css'), 'utf8');
+    expect(css).toMatch(/\.global-task-server-filter-menu\s*\{[^}]*max-height:[^}]*overflow:\s*hidden;/s);
+    expect(css).toMatch(/\.global-task-server-filter-list\s*\{[^}]*overflow-y:\s*auto;[^}]*overscroll-behavior:\s*contain;[^}]*touch-action:\s*pan-y;[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\);/s);
+    expect(css).toMatch(/@media\s*\(max-width:\s*640px\)\s*\{[^}]*\.global-task-server-filter-menu\s*\{[^}]*position:\s*fixed;[^}]*left:\s*10px;[^}]*right:\s*10px;[^}]*\}\s*\.global-task-server-filter-list\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
+    expect(css).toMatch(/\.global-task-server-filter-name\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
+  });
 });

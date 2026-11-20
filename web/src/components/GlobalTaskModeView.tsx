@@ -189,6 +189,8 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
   const [ttsSettingsOpen, setTtsSettingsOpen] = useState(false);
   const ttsControlRef = useRef<HTMLDivElement>(null);
   const serverFilterRef = useRef<HTMLDivElement>(null);
+  const serverFilterBtnRef = useRef<HTMLButtonElement>(null);
+  const [serverMenuTop, setServerMenuTop] = useState<number | null>(null);
 
   const [composerTarget, setComposerTarget] = useState<TaskModeTargetSnapshot | null>(null);
   const [composerDraft, setComposerDraft] = useState('');
@@ -356,6 +358,27 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
     return () => {
       document.removeEventListener('pointerdown', onPointerDown, true);
       document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [serverMenuOpen]);
+
+  // Keep server filter dropdown bounded within current viewport on open / resize
+  useEffect(() => {
+    if (!serverMenuOpen) {
+      setServerMenuTop(null);
+      return;
+    }
+    const updateMenuTop = () => {
+      const rect = serverFilterBtnRef.current?.getBoundingClientRect();
+      if (rect && rect.bottom > 0) {
+        setServerMenuTop(Math.round(rect.bottom + 6));
+      }
+    };
+    updateMenuTop();
+    window.addEventListener('resize', updateMenuTop);
+    window.visualViewport?.addEventListener('resize', updateMenuTop);
+    return () => {
+      window.removeEventListener('resize', updateMenuTop);
+      window.visualViewport?.removeEventListener('resize', updateMenuTop);
     };
   }, [serverMenuOpen]);
 
@@ -926,6 +949,7 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
           {/* Server Filter Dropdown */}
           <div ref={serverFilterRef} class="global-task-server-filter-wrap">
             <button
+              ref={serverFilterBtnRef}
               type="button"
               class="global-task-server-filter-btn"
               data-testid="task-mode-server-filter-btn"
@@ -935,26 +959,33 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
               {t('taskMode.server_filter', { active: activeServersCount, total: totalServersCount })}
             </button>
             {serverMenuOpen && (
-              <div class="global-task-server-filter-menu" data-testid="task-mode-server-filter-menu" role="dialog">
+              <div
+                class="global-task-server-filter-menu"
+                data-testid="task-mode-server-filter-menu"
+                role="dialog"
+                style={serverMenuTop !== null ? ({ '--filter-menu-top': `${serverMenuTop}px` } as Record<string, string>) : undefined}
+              >
                 <div class="global-task-server-filter-title">{t('taskMode.server_filter_heading', 'Visible Servers')}</div>
                 {state.servers.length === 0 ? (
                   <div class="global-task-server-filter-empty">{t('taskMode.no_servers', 'No servers')}</div>
                 ) : (
-                  state.servers.map((server) => {
-                    const enabled = !mutedSet.has(server.id);
-                    return (
-                      <label key={server.id} class="global-task-server-filter-item">
-                        <input
-                          type="checkbox"
-                          checked={enabled}
-                          data-testid={`task-mode-server-toggle-${server.id}`}
-                          onChange={() => globalTaskModeStore.toggleMutedServer(server.id)}
-                        />
-                        <span class={`global-task-dot${server.online ? ' is-online' : ' is-offline'}`} aria-hidden="true" />
-                        <span class="global-task-server-filter-name">{server.name}</span>
-                      </label>
-                    );
-                  })
+                  <div class="global-task-server-filter-list" data-testid="task-mode-server-filter-list">
+                    {state.servers.map((server) => {
+                      const enabled = !mutedSet.has(server.id);
+                      return (
+                        <label key={server.id} class="global-task-server-filter-item">
+                          <input
+                            type="checkbox"
+                            checked={enabled}
+                            data-testid={`task-mode-server-toggle-${server.id}`}
+                            onChange={() => globalTaskModeStore.toggleMutedServer(server.id)}
+                          />
+                          <span class={`global-task-dot${server.online ? ' is-online' : ' is-offline'}`} aria-hidden="true" />
+                          <span class="global-task-server-filter-name" title={server.name}>{server.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
                 )}
               </div>
             )}
