@@ -3380,14 +3380,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ? activeSession?.supervisionMode ?? SUPERVISION_MODE.OFF
     : supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
   const auditedSessionName = activeSession?.name ?? null;
-  const workflowControlsHidden = !!(hideWorkflowControls || subSessionId);
-  const canQuickPeerAudit = !!(
-    !workflowControlsHidden
-    && activeSession
+  const supportsSupervisionSurface = !!(
+    activeSession
     && serverId
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
   );
+  const workflowControlsHidden = !!(hideWorkflowControls || subSessionId);
+  const canQuickPeerAudit = !workflowControlsHidden && supportsSupervisionSurface;
   const canQuickViewSupervision = canQuickPeerAudit
     && canSessionRoleOwnAutomaticSupervision(activeSession?.role)
     && (!isShareScopedSession || (
@@ -11503,7 +11503,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     <SessionActionMenuIcon kind="settings" />
                     <span class="session-action-menu-label">{t('session.settings')}</span>
                   </button>
-                  {canQuickPeerAudit && (
+                  {supportsSupervisionSurface && (
                     <button
                       class="menu-item session-action-menu-item"
                       onClick={() => { onSettings({ surface: 'supervision' }); setMenuOpen(false); }}

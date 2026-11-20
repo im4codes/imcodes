@@ -313,6 +313,83 @@ describe('SessionControls shared participant settings entry points', () => {
     expect(onSettings).toHaveBeenCalledWith({ surface: 'supervision' });
   });
 
+  it('keeps toolbar workflow controls hidden while keeping Supervision settings in the action menu when subSessionId and hideWorkflowControls are both set', () => {
+    const onSettings = vi.fn();
+    const view = render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={{
+          ...sharedSession('participant'),
+          name: 'deck_sub_worker',
+          role: 'worker',
+        } as SessionInfo}
+        subSessionId="sub-1"
+        hideWorkflowControls
+        onSubStop={vi.fn()}
+        quickData={quickData}
+        onSettings={onSettings}
+      />,
+    );
+    expect(view.container.querySelector('[data-testid="peer-audit-icon"]')).toBeNull();
+    expect(view.container.querySelector('.shortcut-btn-auto')).toBeNull();
+
+    fireEvent.click(screen.getByTitle('Actions'));
+    const actionMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    fireEvent.click(within(actionMenu).getByRole('button', { name: 'Supervision settings' }));
+    expect(onSettings).toHaveBeenCalledWith({ surface: 'supervision' });
+
+    view.rerender(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={{
+          ...sharedSession('viewer'),
+          name: 'deck_sub_worker',
+          role: 'worker',
+        } as SessionInfo}
+        subSessionId="sub-1"
+        hideWorkflowControls
+        onSubStop={vi.fn()}
+        quickData={quickData}
+        onSettings={onSettings}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const viewerMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(viewerMenu).not.toBeNull();
+    expect(within(viewerMenu).queryByRole('button', { name: 'Supervision settings' })).toBeNull();
+    expect(within(viewerMenu).queryByRole('button', { name: 'Settings' })).toBeNull();
+    view.unmount();
+
+    render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={{
+          ...sharedSession('participant'),
+          name: 'deck_sub_shell',
+          role: 'worker',
+          agentType: 'shell',
+          runtimeType: 'process',
+        } as SessionInfo}
+        subSessionId="sub-1"
+        hideWorkflowControls
+        onSubStop={vi.fn()}
+        quickData={quickData}
+        onSettings={onSettings}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const shellMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(shellMenu).not.toBeNull();
+    expect(within(shellMenu).getByRole('button', { name: 'Settings' })).toBeDefined();
+    expect(within(shellMenu).queryByRole('button', { name: 'Supervision settings' })).toBeNull();
+  });
+
   it('removes both settings entries when an open participant surface is downgraded to viewer', () => {
     const onSettings = vi.fn();
     const view = renderControls('participant', onSettings);
