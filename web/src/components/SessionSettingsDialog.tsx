@@ -14,6 +14,7 @@ import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { DAEMON_USER_NOTICE_CODE } from '@shared/daemon-user-notices.js';
 import { loadAgyModelPreference, saveAgyModelPreference } from '../agy-model-preference.js';
 import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
@@ -544,7 +545,7 @@ export function SessionSettingsDialog({
   const initialSessionModel = activeModel?.trim() || modelDisplay?.trim() || requestedModel?.trim() || '';
   const [sessionModel, setSessionModel] = useState(initialSessionModel);
   const [appliedSessionModel, setAppliedSessionModel] = useState(initialSessionModel);
-  const [modelApplyState, setModelApplyState] = useState<'idle' | 'applying' | 'applied' | 'error'>('idle');
+  const [modelApplyState, setModelApplyState] = useState<'idle' | 'applying' | 'pending' | 'applied' | 'error'>('idle');
   const [modelApplyError, setModelApplyError] = useState('');
   const [pendingSessionModel, setPendingSessionModel] = useState<string | null>(null);
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
@@ -615,27 +616,77 @@ export function SessionSettingsDialog({
     if (pendingSessionModel) {
       // requestedModel is only intent. The daemon's active/effective projection
       // is the confirmation that the provider actually accepted the switch.
-      if (activeEffectiveModel !== pendingSessionModel) return;
-      setAppliedSessionModel(activeEffectiveModel);
-      setSessionModel(activeEffectiveModel);
-      setModelApplyState('applied');
-      setModelApplyError('');
-      setPendingSessionModel(null);
-      onSaved({
-        requestedModel: pendingSessionModel,
-        activeModel: activeEffectiveModel,
-        modelDisplay: activeEffectiveModel,
-      });
+      if (activeEffectiveModel === pendingSessionModel) {
+        setAppliedSessionModel(activeEffectiveModel);
+        setSessionModel(activeEffectiveModel);
+        setModelApplyState('applied');
+        setModelApplyError('');
+        setPendingSessionModel(null);
+        onSaved({
+          requestedModel: pendingSessionModel,
+          activeModel: activeEffectiveModel,
+          modelDisplay: activeEffectiveModel,
+        });
+        return;
+      }
+      if (
+        agentType === AGY_SDK_PROVIDER_ID
+        && modelApplyState === 'applying'
+        && requestedModel?.trim() === pendingSessionModel
+        && activeEffectiveModel !== ''
+        && activeEffectiveModel !== pendingSessionModel
+      ) {
+        setModelApplyState('pending');
+        setModelApplyError('');
+      }
       return;
     }
     setAppliedSessionModel((previous) => {
       setSessionModel((selected) => selected === previous ? observedModel : selected);
       return observedModel;
     });
-  }, [activeModel, modelDisplay, onSaved, pendingSessionModel, requestedModel]);
+  }, [activeModel, agentType, modelApplyState, modelDisplay, onSaved, pendingSessionModel, requestedModel]);
 
   useEffect(() => {
-    if (!pendingSessionModel) return;
+    if (!ws?.onMessage || !pendingSessionModel) return;
+    return ws.onMessage((message: unknown) => {
+      if (!message || typeof message !== 'object') return;
+      const msg = message as { type?: unknown; event?: { sessionId?: unknown; type?: unknown; payload?: Record<string, unknown> } };
+      if (msg.type !== 'timeline.event' || !msg.event || msg.event.sessionId !== sessionName) return;
+      if (msg.event.type !== 'assistant.text') return;
+      const payload = msg.event.payload;
+      const noticeCode = typeof payload?.noticeCode === 'string' ? payload.noticeCode : '';
+      const noticeParams = payload?.noticeParams && typeof payload.noticeParams === 'object'
+        ? payload.noticeParams as Record<string, unknown>
+        : undefined;
+      if (noticeCode === DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING) {
+        const noticeModel = typeof noticeParams?.model === 'string' ? noticeParams.model.trim() : '';
+        if (!noticeModel || noticeModel === pendingSessionModel) {
+          setModelApplyState('pending');
+          setModelApplyError('');
+        }
+        return;
+      }
+      if (
+        modelApplyState === 'applying'
+        && (
+          noticeCode === DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR
+          || noticeCode === DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL
+          || noticeCode === DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED
+        )
+      ) {
+        const detail = typeof noticeParams?.detail === 'string' && noticeParams.detail.trim()
+          ? noticeParams.detail.trim()
+          : (typeof payload?.text === 'string' && payload.text.trim() ? payload.text.trim() : t('session.modelSettings.confirmationTimeout'));
+        setPendingSessionModel(null);
+        setModelApplyError(detail);
+        setModelApplyState('error');
+      }
+    });
+  }, [ws, pendingSessionModel, sessionName, modelApplyState, t]);
+
+  useEffect(() => {
+    if (!pendingSessionModel || modelApplyState === 'pending') return;
     const timer = window.setTimeout(() => {
       setPendingSessionModel((current) => {
         if (current !== pendingSessionModel) return current;
@@ -645,7 +696,7 @@ export function SessionSettingsDialog({
       });
     }, SESSION_MODEL_CONFIRMATION_TIMEOUT_MS);
     return () => window.clearTimeout(timer);
-  }, [pendingSessionModel, t]);
+  }, [modelApplyState, pendingSessionModel, t]);
 
   const sessionDynamicModels = useTransportModels(
     ws ?? null,
@@ -1202,6 +1253,7 @@ export function SessionSettingsDialog({
                   onInput={(event) => {
                     providerModelManuallySelectedRef.current = true;
                     setSessionModel((event.target as HTMLSelectElement).value);
+                    setPendingSessionModel(null);
                     setModelApplyState('idle');
                     setModelApplyError('');
                   }}
@@ -1222,7 +1274,14 @@ export function SessionSettingsDialog({
                     type="button"
                     class="btn btn-secondary"
                     onClick={() => { void handleApplySessionModel(); }}
-                    disabled={!ws || agentType !== type || !sessionModelDirty || !sessionModel.trim() || modelApplyState === 'applying'}
+                    disabled={
+                      !ws
+                      || agentType !== type
+                      || !sessionModelDirty
+                      || !sessionModel.trim()
+                      || modelApplyState === 'applying'
+                      || (modelApplyState === 'pending' && sessionModel.trim() === pendingSessionModel)
+                    }
                   >
                     {modelApplyState === 'applying'
                       ? t('session.modelSettings.applying')
@@ -1231,6 +1290,11 @@ export function SessionSettingsDialog({
                 </div>
                 {sessionDynamicModels.loading && (
                   <div class="session-settings-field-help">{t('session.modelSettings.loading')}</div>
+                )}
+                {modelApplyState === 'pending' && pendingSessionModel && (
+                  <div class="session-settings-notice" role="status">
+                    {t('session.modelSettings.pendingNextTurn', { model: pendingSessionModel })}
+                  </div>
                 )}
                 {modelApplyState === 'applied' && (
                   <div class="session-settings-success" role="status">{t('session.modelSettings.applied')}</div>

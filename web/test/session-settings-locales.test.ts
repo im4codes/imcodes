@@ -17,7 +17,7 @@ describe('independent session settings locale coverage', () => {
         expect(session?.supervision?.[`poolEntryRole_${role}`], `${locale}:${role}`).toBeTruthy();
       }
       expect(session?.supervision?.settingsTitle, locale).toBeTruthy();
-      for (const key of ['label', 'help', 'current', 'default', 'apply', 'applying', 'applied', 'confirmationTimeout', 'disconnected', 'failed', 'loading', 'unsupported']) {
+      for (const key of ['label', 'help', 'current', 'default', 'apply', 'applying', 'pendingNextTurn', 'applied', 'confirmationTimeout', 'disconnected', 'failed', 'loading', 'unsupported']) {
         expect(session?.modelSettings?.[key], `${locale}:${key}`).toBeTruthy();
       }
     }

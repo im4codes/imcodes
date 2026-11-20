@@ -374,6 +374,14 @@ export function setTransportSessionRestoredCallback(cb: TransportSessionRestored
   _onTransportSessionRestored = cb;
 }
 
+type SessionInfoModelSyncCallback = (sessionName: string) => void;
+let _onSessionInfoModelSync: SessionInfoModelSyncCallback | null = null;
+
+/** Push live model updates from provider sessionInfo to connected clients. */
+export function setSessionInfoModelSyncCallback(cb: SessionInfoModelSyncCallback | null): void {
+  _onSessionInfoModelSync = cb;
+}
+
 function emitTransportSessionRestored(sessionName: string): void {
   try {
     _onTransportSessionRestored?.(sessionName);
@@ -2586,14 +2594,17 @@ function wireTransportSessionInfo(
     const presetSelectedModelIsAuthoritative = isClaudeCodeSdkAgentType(agentType)
       && !!next.ccPreset
       && !!next.requestedModel;
+    let modelChanged = false;
     if (typeof info.model === 'string' && info.model && !presetSelectedModelIsAuthoritative) {
       if (next.activeModel !== info.model) {
         next.activeModel = info.model;
         changed = true;
+        modelChanged = true;
       }
       if (next.modelDisplay !== info.model) {
         next.modelDisplay = info.model;
         changed = true;
+        modelChanged = true;
       }
     }
 
@@ -2689,6 +2700,9 @@ function wireTransportSessionInfo(
     const persisted = getSession(sessionName) ?? next;
     persistence?.onPersisted?.(persisted);
     emitSessionPersist(persisted, sessionName);
+    if (modelChanged) {
+      _onSessionInfoModelSync?.(sessionName);
+    }
   };
   return () => latestInfo ? { ...latestInfo } : undefined;
 }

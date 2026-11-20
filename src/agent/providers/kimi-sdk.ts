@@ -279,6 +279,8 @@ interface KimiSdkSessionState {
   model?: string;
   modelIsDefault?: boolean;
   confirmedModel?: string;
+  /** Set when a mid-turn strict model switch completed RPC but deferred UI sessionInfo emission until settle. */
+  strictModelInfoPending?: boolean;
   modelRevision: number;
   sessionLoadEpoch: number;
   modelControlIntent?: { previous?: string };
@@ -1196,6 +1198,9 @@ export class KimiSdkProvider implements TransportProvider {
     }
     state.lastStatusSignature = null;
     this.clearStatus(sessionId, state);
+    if (!state.promptInFlight && state.turnModel === undefined) {
+      this.reconcileStrictSessionModelOnIdle(sessionId, state);
+    }
     return true;
   }
 
@@ -1652,7 +1657,14 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.modelIsDefault = false;
-    if (state.model !== agentId) { state.model = agentId; state.modelRevision++; state.modelControlIntent = undefined; }
+    if (state.model !== agentId) {
+      state.model = agentId;
+      state.modelRevision++;
+      state.modelControlIntent = undefined;
+      if (this.profile.strictModelSelection && state.promptInFlight && state.turnModel !== agentId) {
+        state.strictModelInfoPending = true;
+      }
+    }
     if (this.profile.strictModelSelection) return;
     // If session already loaded, best-effort push the model change via the
     // experimental RPC. Swallow errors: if the CLI version predates it,
@@ -1692,12 +1704,14 @@ export class KimiSdkProvider implements TransportProvider {
       // Native AG updates its session selection immediately, but an existing
       // executor keeps its captured model until the next ordinary turn.
       const pending = state.promptInFlight && state.turnModel !== model;
+      state.strictModelInfoPending = pending;
       if (!pending) this.emitSessionInfo(sessionId, { model });
       return pending ? SESSION_MODEL_APPLIED.NEXT_START : SESSION_MODEL_APPLIED.LIVE;
     } catch (error) {
       if (this.sessions.get(sessionId) === state && state.modelControlIntent === intent) {
         state.model = previous;
         state.modelRevision++;
+        state.strictModelInfoPending = false;
         // Explicit RPC rejection retains the last confirmed model. A timeout
         // has already invalidated it below: that uncertain write needs a
         // reconfirmation before another prompt.
@@ -1806,7 +1820,58 @@ export class KimiSdkProvider implements TransportProvider {
     if (switchedConfirmedModel
       && !state.modelControlIntent
       && !(state.promptInFlight && state.turnModel && state.turnModel !== model)) {
+      state.strictModelInfoPending = false;
       this.emitSessionInfo(sessionId, { model });
+    }
+  }
+
+  private emitConvergedStrictModelOnSettle(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    previousTurnModel?: string,
+  ): void {
+    if (!this.profile.strictModelSelection || this.sessions.get(sessionId) !== state) return;
+    if (state.promptInFlight || state.modelControlIntent) return;
+    if (state.confirmedModel && state.confirmedModel === state.model) {
+      if (previousTurnModel !== state.confirmedModel || state.strictModelInfoPending) {
+        state.strictModelInfoPending = false;
+        this.emitSessionInfo(sessionId, { model: state.confirmedModel });
+      } else {
+        state.strictModelInfoPending = false;
+      }
+    }
+  }
+
+  private reconcileStrictSessionModelOnIdle(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    previousTurnModel?: string,
+  ): void {
+    this.emitConvergedStrictModelOnSettle(sessionId, state, previousTurnModel);
+    if (!this.profile.strictModelSelection || this.sessions.get(sessionId) !== state) return;
+    if (
+      this.isDisconnecting
+      || state.disposed
+      || state.cancelled
+      || state.promptInFlight
+      || state.modelControlIntent
+      || !state.loaded
+      || !state.acpSessionId
+      || !state.model
+      || !this.connectionForState(state)
+    ) {
+      return;
+    }
+    if (state.confirmedModel !== state.model) {
+      const targetRevision = state.modelRevision;
+      void this.confirmStrictSessionModel(sessionId, state).catch((err) => {
+        if (this.isDisconnecting || this.sessions.get(sessionId) !== state || state.modelRevision !== targetRevision) {
+          return;
+        }
+        const normalized = this.normalizeError(err);
+        if (normalized.code === PROVIDER_ERROR_CODES.CANCELLED) return;
+        this.emitError(sessionId, normalized);
+      });
     }
   }
 
@@ -1909,6 +1974,7 @@ export class KimiSdkProvider implements TransportProvider {
       state.confirmedModel = undefined;
       state.modelApplyRequest = undefined;
       state.modelControlIntent = undefined;
+      state.strictModelInfoPending = false;
     }
     state.modelRevision++;
     state.stoppedByCancel = true;
@@ -2807,6 +2873,8 @@ export class KimiSdkProvider implements TransportProvider {
     state.autonomousTurnGeneration = undefined;
     state.promptInFlight = false;
     state.promptSubmittedGeneration = null;
+    const previousTurnModel = state.turnModel;
+    state.turnModel = undefined;
     state.cancelled = false;
     state.stoppedByCancel = true;
     this.retireOpenToolCalls(sessionId, state, {
@@ -2825,6 +2893,7 @@ export class KimiSdkProvider implements TransportProvider {
     this.refreshIdleHibernateTimer();
     if (this.isDisconnecting) return;
     this.emitError(sessionId, this.normalizeError(error));
+    this.reconcileStrictSessionModelOnIdle(sessionId, state, previousTurnModel);
     this.scheduleDeferredSharedRecycleIfDrained();
   }
 
@@ -3396,15 +3465,19 @@ export class KimiSdkProvider implements TransportProvider {
     // only this captured run; callbacks may already have started a successor.
     run?.complete();
 
+    const previousTurnModel = state.turnModel;
     try {
       if (steeringFailure !== undefined) {
+        state.turnModel = undefined;
         state.cancelled = false;
         state.stoppedByCancel = true;
         this.emitError(sessionId, this.normalizeError(steeringFailure));
+        this.reconcileStrictSessionModelOnIdle(sessionId, state, previousTurnModel);
         return;
       }
       if (stopReason === 'cancelled' || state.cancelled) {
         this.interruptAndCloseAgyBridges(sessionId, state);
+        state.turnModel = undefined;
         state.cancelled = false;
         state.stoppedByCancel = true;
         state.activePromptGenerations?.clear();
@@ -3416,13 +3489,16 @@ export class KimiSdkProvider implements TransportProvider {
           sessionId,
           this.makeError(PROVIDER_ERROR_CODES.CANCELLED, `${this.profile.displayName} turn cancelled`, true),
         );
+        this.reconcileStrictSessionModelOnIdle(sessionId, state, previousTurnModel);
         return;
       }
       if (stopReason === 'refusal') {
+        state.turnModel = undefined;
         this.emitError(
           sessionId,
           this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `${this.profile.displayName} refused the request`, false),
         );
+        this.reconcileStrictSessionModelOnIdle(sessionId, state, previousTurnModel);
         return;
       }
       // Snapshot + clear the per-turn ACP usage so each onComplete carries its
@@ -3462,7 +3538,9 @@ export class KimiSdkProvider implements TransportProvider {
           ...(turnUsage ? { usage: turnUsage } : {}),
         },
       };
+      state.turnModel = undefined;
       for (const cb of this.completeCallbacks) cb(sessionId, msg);
+      this.reconcileStrictSessionModelOnIdle(sessionId, state, previousTurnModel);
       if (
         this.id === AGY_SDK_PROVIDER_ID
         && this.sessions.get(sessionId) === state

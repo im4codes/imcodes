@@ -14,7 +14,7 @@ import { createSupervisionSessionPresentationResolver } from './supervision-sess
 import { createSupervisionPairRefreshScheduler } from './supervision-pair-refresh.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { markDaemonProcess } from './process-role.js';
-import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
+import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setSessionInfoModelSyncCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
 import {
   captureRestartContinuationsBeforeShutdownDetailed,
@@ -28,7 +28,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions } from './command-handler.js';
+import { handleWebCommand, pushSessionModelProjection, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -1577,6 +1577,10 @@ export async function startup(): Promise<DaemonContext> {
 
   setTransportSessionRestoredCallback((sessionName) => {
     supervisionAutomation.applyPersistedSnapshot(sessionName);
+  });
+  setSessionInfoModelSyncCallback((sessionName) => {
+    if (!serverLink) return;
+    void pushSessionModelProjection(serverLink, sessionName);
   });
   // Coalesce schedule transitions into the existing session snapshot channels.
   // The browser ticks locally; only a new deadline/state causes daemon traffic.

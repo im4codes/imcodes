@@ -725,11 +725,61 @@ describe('AG native ACP', () => {
     } finally { await Promise.all([rm(hold, { force: true }), rm(modelHold, { force: true })]); }
     await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(complete.mock.calls[0][1].metadata.model).toBe('model-a');
+    expect(info.mock.calls.at(-1)?.[1].model).toBe('model-b');
+    expect((await requests()).filter(row => row.method === 'session/set_model')).toHaveLength(1);
     await provider.send(id, 'NEXT_TURN');
     await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
     expect(complete.mock.calls[1][1].metadata.model).toBe('model-b');
     expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(true);
     expect((await requests()).filter(row => row.fixture === 'prompt-model').at(-1).model).toBe('model-b');
+  });
+
+  it('converges sessionInfo immediately on settle for rapid A->B->C, A->B->A, and reactive->idle transitions without duplicate set_model', async () => {
+    const { provider, requests, root } = await setup();
+    const id = await route(provider);
+    const complete = vi.fn();
+    const info: SessionInfoUpdate[] = [];
+    provider.onComplete(complete);
+    provider.onSessionInfo((_id, update) => info.push(update));
+
+    const hold = path.join(root, 'rpc.jsonl.hold');
+    await writeFile(hold, 'hold');
+    try {
+      await provider.send(id, 'TURN_1');
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/prompt')).toBe(true), { timeout: 5000 });
+      expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(info.filter(x => x.model === 'model-c')).toHaveLength(0);
+    } finally {
+      await rm(hold, { force: true });
+    }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0][1].metadata.model).toBe('model-a');
+    expect(info.filter(x => x.model).at(-1)?.model).toBe('model-c');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(r => r.params.modelId)).toEqual(['model-b', 'model-c']);
+
+    // Mid-turn A->B->A returns LIVE immediately when reverting to the running turn model.
+    await writeFile(hold, 'hold');
+    try {
+      await provider.send(id, 'TURN_2');
+      await vi.waitFor(async () => expect((await requests()).filter(row => row.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
+      expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE);
+      expect(info.filter(x => x.model).at(-1)?.model).toBe('model-c');
+    } finally {
+      await rm(hold, { force: true });
+    }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(complete.mock.calls[1][1].metadata.model).toBe('model-c');
+
+    // Reactive -> foreground-idle boundary reconciles an unconfirmed model once reactive work clears.
+    const state = (provider as any).sessions.get(id);
+    state.agyReactive = true;
+    provider.setSessionAgentId(id, 'model-b');
+    state.agyReactive = false;
+    (provider as any).syncAgyStatusAfterTurn(id, state);
+    await vi.waitFor(() => expect(info.filter(x => x.model).at(-1)?.model).toBe('model-b'), { timeout: 5000 });
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(r => r.params.modelId)).toEqual(['model-b', 'model-c', 'model-b', 'model-c', 'model-b']);
   });
 
   it('orders C after a delayed B but never publishes the superseded B ACK', async () => {

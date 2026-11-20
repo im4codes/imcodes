@@ -14,7 +14,7 @@ const LOCALES = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
 describe('daemon user notice contract', () => {
   it('describes saved CLI model selection as pending instead of already live', () => {
     expect(createDaemonUserNoticePayload(DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING, { model: 'fixture-B' })).toEqual({
-      text: '⚠️ Saved model fixture-B; it will apply to the next turn after the current turn finishes.',
+      text: '⚠️ Antigravity cannot change model inside a running turn; saved fixture-B and it will apply automatically when the current turn ends.',
       noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING,
       noticeParams: { model: 'fixture-B' },
     });

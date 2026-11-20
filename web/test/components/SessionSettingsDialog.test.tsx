@@ -357,6 +357,105 @@ describe('SessionSettingsDialog supervision', () => {
     }
   });
 
+  it('shows truthful pending-next-turn state for running Antigravity sessions without false 15s timeout, then confirms on settle', async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = makeIdentityAckWs();
+      const onSaved = vi.fn();
+      const props = {
+        serverId: 'srv-1',
+        sessionName: 'deck_proj_agy',
+        label: 'AG',
+        description: '',
+        cwd: '/proj',
+        type: 'agy-sdk',
+        activeModel: 'gemini-3.8-flash-low',
+        requestedModel: 'gemini-3.8-flash-low',
+        transportConfig: null,
+        surface: 'session' as const,
+        ws: ws as any,
+        onClose: vi.fn(),
+        onSaved,
+      };
+      const view = render(<SessionSettingsDialog {...props} />);
+      changeSelect(screen.getByLabelText('label'), 'claude-opus-5-5-low');
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'apply' })); });
+      expect(screen.getByRole('button', { name: 'applying' })).toBeTruthy();
+
+      await act(async () => {
+        for (const call of ws.onMessage.mock.calls) {
+          call[0]({
+            type: 'timeline.event',
+            event: {
+              sessionId: 'deck_proj_agy',
+              type: 'assistant.text',
+              payload: {
+                noticeCode: 'model_switch_pending',
+                noticeParams: { model: 'claude-opus-5-5-low' },
+              },
+            },
+          });
+        }
+      });
+      expect(screen.getByRole('status').textContent).toBe('pendingNextTurn');
+
+      await act(async () => { vi.advanceTimersByTime(SESSION_MODEL_CONFIRMATION_TIMEOUT_MS + 5_000); });
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(screen.getByRole('status').textContent).toBe('pendingNextTurn');
+      expect(onSaved).not.toHaveBeenCalled();
+
+      view.rerender(<SessionSettingsDialog {...props} requestedModel="claude-opus-5-5-low" activeModel="claude-opus-5-5-low" modelDisplay="claude-opus-5-5-low" />);
+      await act(async () => {});
+      expect(onSaved).toHaveBeenCalledWith({
+        requestedModel: 'claude-opus-5-5-low',
+        activeModel: 'claude-opus-5-5-low',
+        modelDisplay: 'claude-opus-5-5-low',
+      });
+      expect(screen.getByRole('status').textContent).toBe('applied');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('surfaces inline model switch refusal errors immediately without waiting 15 seconds', async () => {
+    const ws = makeIdentityAckWs();
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_agy"
+        label="AG"
+        description=""
+        cwd="/proj"
+        type="agy-sdk"
+        activeModel="gemini-3.8-flash-low"
+        requestedModel="gemini-3.8-flash-low"
+        transportConfig={null}
+        surface="session"
+        ws={ws as any}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    changeSelect(screen.getByLabelText('label'), 'claude-opus-5-5-low');
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'apply' })); });
+    await act(async () => {
+      for (const call of ws.onMessage.mock.calls) {
+        call[0]({
+          type: 'timeline.event',
+          event: {
+            sessionId: 'deck_proj_agy',
+            type: 'assistant.text',
+            payload: {
+              noticeCode: 'session_inline_error',
+              noticeParams: { detail: 'Selected Antigravity model is unavailable' },
+            },
+          },
+        });
+      }
+    });
+    expect(screen.getByRole('alert').textContent).toBe('failed');
+  });
+
   it('saves a manually entered exact-session identity online and requests an immediate runtime refresh', async () => {
     const ws = makeIdentityAckWs();
     render(

@@ -1730,6 +1730,15 @@ async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLin
   try { await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(sessionName)); } catch { /* ignore */ }
 }
 
+/** Push converged session model projection over the active daemon ServerLink. */
+export async function pushSessionModelProjection(serverLink: ServerLink, sessionName: string): Promise<void> {
+  if (sessionName.startsWith('deck_sub_')) {
+    await syncSubSessionIfNeeded(sessionName, serverLink);
+    return;
+  }
+  await handleGetSessions(serverLink).catch(() => {});
+}
+
 function getSubSessionSyncOptions(_sessionName: string): undefined {
   return undefined;
 }
@@ -3692,7 +3701,9 @@ async function applyTransportModelSwitch(
   if (!deferred) timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
   timelineEmitter.emit(sessionName, 'assistant.text', {
     ...attachDaemonUserNotice(deferred ? DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING : DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
-      deferred ? `Saved model ${requestedModel}; it will apply to the next turn after the current turn finishes.` : `Switched model to ${requestedModel}`, { model: requestedModel }),
+      deferred
+        ? `Antigravity cannot change model inside a running turn; saved ${requestedModel} and it will apply automatically when the current turn ends.`
+        : `Switched model to ${requestedModel}`, { model: requestedModel }),
     streaming: false,
     automation: true,
     memoryExcluded: true,

@@ -114,7 +114,7 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
     await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
     expect(finalized()).toHaveLength(1);
     expect(nativeCompletions).toEqual([expect.objectContaining({ model: 'model-a' })]);
-    expect(getSession(NAME)).toMatchObject({ requestedModel: 'model-c', activeModel: 'model-a' });
+    expect(getSession(NAME)).toMatchObject({ requestedModel: 'model-c', activeModel: 'model-c', modelDisplay: 'model-c' });
     await vi.waitFor(() => expect(events.filter(event => event.type === 'usage.update' && typeof event.payload.model === 'string').at(-1)?.payload.model, 'current turn usage keeps A').toBe('model-a'));
     expect(rows.filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']);
     runtime.send('NEXT_WITH_C', 'e2e-agy-next-selected-c');
@@ -410,7 +410,7 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
       await flushStore();
       const stage4Sqlite = readPersistedSqliteRow();
       expect(stage4Sqlite?.state).toBe('idle');
-      expect(stage4Sqlite?.record).toMatchObject({ requestedModel: 'model-b', activeModel: 'model-a' });
+      expect(stage4Sqlite?.record).toMatchObject({ requestedModel: 'model-b', activeModel: 'model-b', modelDisplay: 'model-b' });
       expect(persistedEvents.filter(e => e.type === 'usage.update' && typeof e.payload.model === 'string').at(-1)?.payload.model).toBe('model-a');
       expect(stage4Sqlite?.record.providerResumeId).toBe('native-1');
       expect(stage4Sqlite?.record.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.STARTED);

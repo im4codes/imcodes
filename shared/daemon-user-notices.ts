@@ -258,7 +258,7 @@ export function formatDaemonUserNoticeEnglish(
     case DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED:
       return `Switched model to ${stringParam(params, 'model')}.`;
     case DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING:
-      return `Saved model ${stringParam(params, 'model')}; it will apply to the next turn after the current turn finishes.`;
+      return `Antigravity cannot change model inside a running turn; saved ${stringParam(params, 'model')} and it will apply automatically when the current turn ends.`;
     case DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED:
       return `Model switching for ${stringParam(params, 'model')} is unavailable until the provider capability is verified.`;
     case DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED:
