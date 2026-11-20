@@ -14,15 +14,20 @@ import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
 import { configure as configureApi, configureApiKey, clearApiKey } from '../src/api.js';
 import {
   clearGlobalTaskModeSessionState,
+  clearTaskModeOpenPersistence,
   computeDefaultMutedServerIds,
   formatTaskReplyMessage,
   GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY,
   GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY,
   GlobalTaskModeStore,
   MAX_RECENT_BRAINS,
+  readInitialTaskModeOpen,
+  RELOAD_INTENT_STORAGE_KEY,
   resolveQuickDispatchBrains,
   sortGlobalTaskCards,
   sortGlobalTaskServers,
+  syncTaskModeOpenPersistence,
+  TASK_MODE_OPEN_STORAGE_KEY,
 } from '../src/global-task-mode-store.js';
 
 class MockWebSocket {
@@ -984,5 +989,88 @@ describe('global-task-mode-store', () => {
       t: 1,
     });
     legacyStore.stop();
+  });
+});
+
+describe('task mode open-state persistence', () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  it('restores via sessionStorage or reload-intent on standard browser without polluting localStorage across tabs', () => {
+    expect(readInitialTaskModeOpen()).toBe(false);
+
+    syncTaskModeOpenPersistence(true);
+    expect(sessionStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBe('1');
+    // Standard multi-tab browser must not set localStorage so new tabs stay on Workspace
+    expect(localStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBeNull();
+    expect(readInitialTaskModeOpen()).toBe(true);
+
+    // Even if localStorage somehow had '1', another browser tab with fresh sessionStorage ignores it
+    sessionStorage.clear();
+    localStorage.setItem(TASK_MODE_OPEN_STORAGE_KEY, '1');
+    expect(readInitialTaskModeOpen()).toBe(false);
+
+    // Reload intent JSON restores open state
+    localStorage.clear();
+    sessionStorage.setItem(RELOAD_INTENT_STORAGE_KEY, JSON.stringify({ serverId: 'srv-1', showTaskMode: true }));
+    expect(readInitialTaskModeOpen()).toBe(true);
+
+    // Clearing removes task mode key and clears showTaskMode from reload-intent while keeping serverId
+    clearTaskModeOpenPersistence();
+    expect(sessionStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBeNull();
+    expect(JSON.parse(sessionStorage.getItem(RELOAD_INTENT_STORAGE_KEY)!)).toEqual({ serverId: 'srv-1' });
+    expect(readInitialTaskModeOpen()).toBe(false);
+  });
+
+  it('persists and restores via localStorage on Capacitor native and Electron pc-app cold starts', () => {
+    // Capacitor native
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    syncTaskModeOpenPersistence(true);
+    expect(localStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBe('1');
+    sessionStorage.clear();
+    expect(readInitialTaskModeOpen()).toBe(true);
+    clearTaskModeOpenPersistence();
+    expect(localStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBeNull();
+    expect(readInitialTaskModeOpen()).toBe(false);
+
+    // Electron pc-app
+    vi.unstubAllGlobals();
+    vi.stubGlobal('__IMCODES_PC_APP__', { isElectron: true });
+    syncTaskModeOpenPersistence(true);
+    expect(localStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBe('1');
+    sessionStorage.clear();
+    expect(readInitialTaskModeOpen()).toBe(true);
+    syncTaskModeOpenPersistence(false);
+    expect(localStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY)).toBeNull();
+  });
+
+  it('yields on explicit shared routes and degrades gracefully when Web Storage throws', () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    syncTaskModeOpenPersistence(true);
+    expect(readInitialTaskModeOpen({ isSharedRoute: true })).toBe(false);
+
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new DOMException('Blocked', 'SecurityError');
+    });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('Quota exceeded', 'QuotaExceededError');
+    });
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+      throw new DOMException('Blocked', 'SecurityError');
+    });
+
+    expect(() => syncTaskModeOpenPersistence(true)).not.toThrow();
+    expect(() => clearTaskModeOpenPersistence()).not.toThrow();
+    expect(readInitialTaskModeOpen()).toBe(false);
   });
 });

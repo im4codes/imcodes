@@ -21,10 +21,14 @@ import { fallbackReadableSessionDisplay, pickReadableSessionDisplay } from '@sha
 import { parseSyncedPreference, type SyncedPreferencePayload } from '@shared/synced-preference.js';
 import { formatLabel } from './format-label.js';
 import { ApiError, apiFetch, closeServerTaskPair, getApiBaseUrl, getUserPref, saveUserPref, sendSessionViaHttp } from './api.js';
+import { isNative } from './native.js';
+import { isPcAppDesktop } from './native-platform.js';
 
 export const GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY = 'imcodes.global-task-mode.muted-servers';
 export const GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY = 'imcodes.global-task-mode.pinned-brains';
 export const GLOBAL_TASK_RECENT_BRAINS_STORAGE_KEY = 'imcodes.global-task-mode.recent-brains';
+export const TASK_MODE_OPEN_STORAGE_KEY = 'imcodes:task-mode-open';
+export const RELOAD_INTENT_STORAGE_KEY = 'imcodes:reload-intent';
 export const MAX_RECENT_BRAINS = 8;
 
 const RECONNECT_INITIAL_MS = 1000;
@@ -1251,4 +1255,64 @@ export const globalTaskModeStore = new GlobalTaskModeStore();
 
 export function clearGlobalTaskModeSessionState(): void {
   globalTaskModeStore.clearSessionState();
+}
+
+function isSingleWindowTaskModeShell(): boolean {
+  return isNative() || isPcAppDesktop();
+}
+
+export function readInitialTaskModeOpen(options?: { isSharedRoute?: boolean }): boolean {
+  if (options?.isSharedRoute) return false;
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      if (sessionStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY) === '1') return true;
+      const reloadRaw = sessionStorage.getItem(RELOAD_INTENT_STORAGE_KEY);
+      if (reloadRaw) {
+        const parsed = JSON.parse(reloadRaw) as { showTaskMode?: unknown } | null;
+        if (parsed?.showTaskMode === true) return true;
+      }
+    }
+  } catch { /* ignore restricted or malformed sessionStorage */ }
+
+  if (!isSingleWindowTaskModeShell()) return false;
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem(TASK_MODE_OPEN_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function syncTaskModeOpenPersistence(open: boolean): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      if (open) {
+        sessionStorage.setItem(TASK_MODE_OPEN_STORAGE_KEY, '1');
+      } else {
+        sessionStorage.removeItem(TASK_MODE_OPEN_STORAGE_KEY);
+        const reloadRaw = sessionStorage.getItem(RELOAD_INTENT_STORAGE_KEY);
+        if (reloadRaw) {
+          try {
+            const parsed = JSON.parse(reloadRaw) as Record<string, unknown> | null;
+            if (parsed && parsed.showTaskMode === true) {
+              delete parsed.showTaskMode;
+              sessionStorage.setItem(RELOAD_INTENT_STORAGE_KEY, JSON.stringify(parsed));
+            }
+          } catch { /* ignore malformed reload-intent */ }
+        }
+      }
+    }
+  } catch { /* ignore restricted sessionStorage */ }
+
+  if (!open || isSingleWindowTaskModeShell()) {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        if (open) localStorage.setItem(TASK_MODE_OPEN_STORAGE_KEY, '1');
+        else localStorage.removeItem(TASK_MODE_OPEN_STORAGE_KEY);
+      }
+    } catch { /* ignore restricted localStorage */ }
+  }
+}
+
+export function clearTaskModeOpenPersistence(): void {
+  syncTaskModeOpenPersistence(false);
 }

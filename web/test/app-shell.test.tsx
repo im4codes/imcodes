@@ -10069,6 +10069,106 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(pane.getAttribute('data-is-active')).toBe('true');
   }, 15000);
 
+  it('persists and restores Task Mode across app update reload, native cold restart, and clears on exit/shared routes', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const origLocation = window.location;
+    const reloadMock = vi.fn();
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: {
+        ...origLocation,
+        origin: origLocation.origin,
+        pathname: origLocation.pathname,
+        hash: origLocation.hash,
+        href: origLocation.href,
+        reload: reloadMock,
+      },
+    });
+
+    try {
+      const { App } = await importApp();
+      const firstMount = render(<App />);
+      const desktopTaskBtn = await screen.findByTestId('desktop-task-mode-btn');
+      fireEvent.click(desktopTaskBtn);
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+      // Trigger app update notice and click Refresh while in Task Mode
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent('imcodes:app-update-required', {
+          detail: { reason: 'build_mismatch', currentBuildId: 'b2', loadedBuildId: 'b1' },
+        }));
+      });
+      const refreshBtn = await screen.findByText('appUpdate.refresh');
+      fireEvent.click(refreshBtn);
+
+      expect(reloadMock).toHaveBeenCalledTimes(1);
+      expect(sessionStorage.getItem('imcodes:task-mode-open')).toBe('1');
+      expect(JSON.parse(sessionStorage.getItem('imcodes:reload-intent')!).showTaskMode).toBe(true);
+      firstMount.unmount();
+
+      // Simulated browser reload in the same tab restores directly into Task Mode
+      vi.resetModules();
+      const { App: ReloadedApp } = await importApp();
+      const secondMount = render(<ReloadedApp />);
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+
+      // Exiting Task Mode clears persisted state so subsequent reload opens Workspace
+      fireEvent.click(screen.getByTestId('task-mode-exit-btn'));
+      await waitFor(() => expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull());
+      expect(sessionStorage.getItem('imcodes:task-mode-open')).toBeNull();
+      expect(JSON.parse(sessionStorage.getItem('imcodes:reload-intent')!).showTaskMode).toBeUndefined();
+      secondMount.unmount();
+
+      vi.resetModules();
+      const { App: WorkspaceApp } = await importApp();
+      const thirdMount = render(<WorkspaceApp />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+      thirdMount.unmount();
+
+      // Native OTA cold-start (fresh sessionStorage, persisted localStorage) restores Task Mode,
+      // unless opening an explicit ?shared= deep link
+      sessionStorage.clear();
+      nativeState.value = true;
+      getServerUrlMock.mockResolvedValue('http://localhost');
+      getAuthKeyMock.mockResolvedValue('secret-key');
+      localStorage.setItem('imcodes:task-mode-open', '1');
+
+      vi.resetModules();
+      const { App: NativeOtaApp } = await importApp();
+      const fourthMount = render(<NativeOtaApp />);
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
+      fourthMount.unmount();
+
+      // Explicit ?shared= route overrides Task Mode persistence
+      sessionStorage.clear();
+      nativeState.value = false;
+      localStorage.setItem('imcodes:task-mode-open', '1');
+      sessionStorage.setItem('imcodes:task-mode-open', '1');
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        value: {
+          ...origLocation,
+          origin: origLocation.origin,
+          pathname: origLocation.pathname,
+          hash: '#/srv-1/deck_alpha_brain?shared=share-entry-1',
+          href: `${origLocation.origin}${origLocation.pathname}#/srv-1/deck_alpha_brain?shared=share-entry-1`,
+          reload: reloadMock,
+        },
+      });
+      vi.resetModules();
+      const { App: SharedApp } = await importApp();
+      render(<SharedApp />);
+      await waitFor(() => expect(apiFetchMock).toHaveBeenCalled());
+      expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: origLocation });
+    }
+  }, 20000);
+
   it('switches servers (up/down) and tabs (left/right, multi-step) via mobile 1-finger long-press swipes with watermark HUD', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const mkTouchEvent = (

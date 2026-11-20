@@ -79,7 +79,14 @@ import {
 } from './components/SupervisionTaskConsole.js';
 import { CloudDocsGlyphIcon, CloudDocsPanel } from './components/CloudDocsPanel.js';
 import { GlobalTaskModeView, TaskModeGlyphIcon } from './components/GlobalTaskModeView.js';
-import { clearGlobalTaskModeSessionState, globalTaskModeStore } from './global-task-mode-store.js';
+import {
+  clearGlobalTaskModeSessionState,
+  clearTaskModeOpenPersistence,
+  globalTaskModeStore,
+  readInitialTaskModeOpen,
+  RELOAD_INTENT_STORAGE_KEY,
+  syncTaskModeOpenPersistence,
+} from './global-task-mode-store.js';
 import type { CloudDocsMainChatContext } from './components/CloudDocsMainChatFloat.js';
 import {
   executeCloudDocQuote,
@@ -1163,6 +1170,7 @@ function InternalMainApp() {
     clearSharedChangesCache();
     clearSessionRepoContexts();
     setShowTaskMode(false);
+    clearTaskModeOpenPersistence();
     clearGlobalTaskModeSessionState();
     if (preserveSharedRoute) {
       initialHashStateRef.current = sharedRoute;
@@ -1269,7 +1277,12 @@ function InternalMainApp() {
   }, [showMobileServerMenu]);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [showCloudDocs, setShowCloudDocs] = useState(false);
-  const [showTaskMode, setShowTaskMode] = useState(false);
+  const [showTaskMode, setShowTaskMode] = useState(() =>
+    readInitialTaskModeOpen({ isSharedRoute: Boolean(initialHashStateRef.current.sharedEntryId) }),
+  );
+  useEffect(() => {
+    syncTaskModeOpenPersistence(showTaskMode);
+  }, [showTaskMode]);
   const [taskModeEntrySummary, setTaskModeEntrySummary] = useState(() => {
     const active = globalTaskModeStore.getState().tasks.filter((t) => !t.isTerminal);
     return {
@@ -2597,16 +2610,18 @@ function InternalMainApp() {
     });
   }, [checkForAppUpdate, showAppUpdateBlocker]);
   const reloadForAppUpdate = useCallback(() => {
+    syncTaskModeOpenPersistence(showTaskMode);
     try {
-      sessionStorage.setItem('imcodes:reload-intent', JSON.stringify({
+      sessionStorage.setItem(RELOAD_INTENT_STORAGE_KEY, JSON.stringify({
         serverId: selectedServerId,
         session: activeSession,
         featureLabel: appUpdateNotice?.featureLabel,
+        showTaskMode,
         at: Date.now(),
       }));
     } catch { /* ignore */ }
     window.location.reload();
-  }, [activeSession, appUpdateNotice?.featureLabel, selectedServerId]);
+  }, [activeSession, appUpdateNotice?.featureLabel, selectedServerId, showTaskMode]);
   const showSuccessToast = useCallback((title: string) => {
     const id = Date.now() + Math.random();
     setToasts((prev) => [...prev, { id, kind: 'success', title }]);
@@ -6910,6 +6925,7 @@ function InternalMainApp() {
     clearSharedChangesCache();
     clearSessionRepoContexts();
     setShowTaskMode(false);
+    clearTaskModeOpenPersistence();
     clearGlobalTaskModeSessionState();
     setManualDashboard(false);
     setAutoEnteringRecent(false);
