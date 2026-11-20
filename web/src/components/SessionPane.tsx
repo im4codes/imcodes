@@ -468,7 +468,7 @@ export function SessionPane({
     >
       {/* Terminal view: kept alive, shown/hidden via CSS display */}
       <div
-        key={`term-${sessionName}`}
+        key={`term-${serverId}:${sessionName}`}
         style={{ display: terminalVisible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
       >
         {terminalVisible && <TerminalView

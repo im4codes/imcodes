@@ -2189,4 +2189,167 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     newGate.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
     await act(async () => { await vi.advanceTimersByTimeAsync(20); });
   });
+
+  it('visible main session with open sub-session window (isActiveSession=false, isVisible=true, bootstrapWhenVisible=true) still backfills on cache hit, reconnect, and visibility flip', async () => {
+    const sessionName = `deck_visible_subopen_${Date.now()}`;
+    const serverId = `srv-visible-subopen-${Date.now()}`;
+    const seed: TimelineEvent = {
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1_000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'cached seed' },
+    };
+    const caughtUp: TimelineEvent = {
+      eventId: `${sessionName}-caught-up`,
+      sessionId: sessionName,
+      ts: 2_000,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'backfilled while sub-session open' },
+    };
+    ingestTimelineEventForCache(seed, serverId);
+
+    fetchSpy.mockResolvedValue({
+      events: [caughtUp],
+      epoch: 1,
+      hasMore: false,
+      nextCursor: null,
+    });
+
+    let wsHandler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => `hist-${sessionName}`);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (fn: (msg: ServerMessage) => void) => {
+        wsHandler = fn;
+        return () => { wsHandler = null; };
+      },
+      sendTimelineReplayRequest: vi.fn(() => `replay-${sessionName}`),
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe({ visible }: { visible: boolean }) {
+      const { events } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+        isVisible: visible,
+        subscriptionMode: visible ? 'full' : 'summary',
+        bootstrapWhenVisible: true,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'probe-subopen' },
+        events.map((e) => String(e.payload.text ?? '')).join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const view = render(h(Probe, { visible: true }));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-subopen').textContent).toContain('backfilled while sub-session open');
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // WS connected event while visible + open sub-session window still triggers refresh
+    sendTimelineHistoryRequest.mockClear();
+    __resetBackfillCooldownsForTests();
+    await act(async () => {
+      wsHandler?.({ type: 'session.event', event: 'connected' } as unknown as ServerMessage);
+      await vi.advanceTimersByTimeAsync(20);
+    });
+    expect(sendTimelineHistoryRequest).toHaveBeenCalled();
+
+    // Hidden -> visible transition while isActiveSession remains false triggers catch-up
+    fetchSpy.mockClear();
+    __resetBackfillCooldownsForTests();
+    view.rerender(h(Probe, { visible: false }));
+    view.rerender(h(Probe, { visible: true }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rapidly switching servers discards stale in-flight HTTP responses from previous server', async () => {
+    const sessionName = `deck_rapid_switch_${Date.now()}`;
+    const gateA = deferred<{ events: TimelineEvent[]; epoch: number; hasMore: boolean; nextCursor: null }>();
+    const gateB = deferred<{ events: TimelineEvent[]; epoch: number; hasMore: boolean; nextCursor: null }>();
+
+    fetchSpy.mockImplementation((srv: string) => (srv === 'srv-b' ? gateB.promise : gateA.promise));
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'hist'),
+    } as unknown as WsClient;
+
+    function Probe({ serverId }: { serverId: string }) {
+      const { events } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: true,
+        isVisible: true,
+        bootstrapWhenVisible: true,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'rapid-probe' },
+        events.map((e) => String(e.payload.text ?? '')).join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const view = render(h(Probe, { serverId: 'srv-a' }));
+    // Switch to srv-b and trigger its backfill, then quickly back to srv-a before srv-b resolves
+    view.rerender(h(Probe, { serverId: 'srv-b' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    view.rerender(h(Probe, { serverId: 'srv-a' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+
+    await act(async () => {
+      gateB.resolve({
+        events: [{
+          eventId: 'b-only',
+          sessionId: sessionName,
+          ts: 5000,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'from-server-B' },
+        }],
+        epoch: 1,
+        hasMore: false,
+        nextCursor: null,
+      });
+      gateA.resolve({
+        events: [{
+          eventId: 'a-only',
+          sessionId: sessionName,
+          ts: 4000,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'from-server-A' },
+        }],
+        epoch: 1,
+        hasMore: false,
+        nextCursor: null,
+      });
+      await vi.advanceTimersByTimeAsync(20);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('rapid-probe').textContent).toBe('from-server-A');
+    });
+  });
 });

@@ -3121,14 +3121,15 @@ export function useTimeline(
 
   const synchronousSeedTriggerRef = useRef<{ cacheKey: string | null; active: boolean }>({
     cacheKey: cacheKey ?? null,
-    active: isActiveSession,
+    active: isActiveSession || isVisible,
   });
   useLayoutEffect(() => {
     const nextKey = cacheKey ?? null;
     const previous = synchronousSeedTriggerRef.current;
     const cacheKeyChanged = previous.cacheKey !== nextKey;
-    const activated = !previous.active && isActiveSession;
-    synchronousSeedTriggerRef.current = { cacheKey: nextKey, active: isActiveSession };
+    const nextActive = isActiveSession || isVisible;
+    const activated = !previous.active && nextActive;
+    synchronousSeedTriggerRef.current = { cacheKey: nextKey, active: nextActive };
     // A newer cursor is scoped to one session/cache chain.  Reset it before
     // the next bootstrap request so two sessions with identical epoch/seq
     // cursors cannot suppress the new session's first delta fetch.
@@ -3164,7 +3165,7 @@ export function useTimeline(
     setEvents([]);
     setLoading(true);
     setHistoryStatus(createBootstrapHistoryStatus({ canHttp: false }));
-  }, [cacheKey, disableHistory, isActiveSession, sessionId]);
+  }, [cacheKey, disableHistory, isActiveSession, isVisible, sessionId]);
 
   // The shared per-session cache fans every merge out to EVERY hook of that
   // session (card, window, pane). Presentations nobody is looking at only need
@@ -3337,7 +3338,7 @@ export function useTimeline(
       // here: the module cache is only ever written by full sources — IDB /
       // daemon / HTTP — never by the low-completeness localStorage seed, so a
       // small memCached is a genuinely small session, not a truncated tail.)
-      if (isActiveSession && !isIncognito) {
+      if (shouldBootstrapVisibleHistory && !isIncognito) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
       return () => { cancelled = true; };
@@ -3372,7 +3373,7 @@ export function useTimeline(
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
       requestDaemonHistory(false, MAX_MEMORY_EVENTS, localSnapshot);
-      if (isActiveSession) {
+      if (shouldBootstrapVisibleHistory) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
     }
@@ -3389,7 +3390,7 @@ export function useTimeline(
       // only reached when a prior full load already completed for this session
       // — see the IDB-stored branch which only locks historyLoadedRef when the
       // restore is NOT low-completeness — so tail mode is correct here.)
-      if (isActiveSession) {
+      if (shouldBootstrapVisibleHistory) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
       return () => { cancelled = true; };
@@ -3564,7 +3565,7 @@ export function useTimeline(
         // WS event; reopening after a mid-chat close may leave a gap. A
         // low-completeness restore pulls the full newest window instead of a
         // tail catch-up so the bulk history below the seed is recovered.
-        if (isActiveSession) {
+        if (shouldBootstrapVisibleHistory) {
           fireHttpBackfillRef.current(200, restoredLooksComplete
             ? { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' }
             : { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' });
@@ -5396,7 +5397,7 @@ export function useTimeline(
       staleToolSelfHealRef.current = null;
       return;
     }
-    if (!isActiveSessionRef.current) return;
+    if (!isActiveSessionRef.current && !shouldBootstrapVisibleHistoryRef.current) return;
     let newestToolCallEventId = 'anonymous';
     for (let index = events.length - 1; index >= 0; index -= 1) {
       if (events[index]?.type === 'tool.call') {
@@ -5502,13 +5503,13 @@ export function useTimeline(
   // mount and only react to subsequent flips. Using a ref makes the
   // transition detection idempotent across re-renders that don't change
   // `isActiveSession`.
-  const prevIsActiveRef = useRef(isActiveSession);
+  const prevBootstrapVisibleRef = useRef(shouldBootstrapVisibleHistory);
   useEffect(() => {
     if (disableHistory) return;
-    const prev = prevIsActiveRef.current;
-    prevIsActiveRef.current = isActiveSession;
-    if (!prev && isActiveSession) {
-      backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
+    const prev = prevBootstrapVisibleRef.current;
+    prevBootstrapVisibleRef.current = shouldBootstrapVisibleHistory;
+    if (!prev && shouldBootstrapVisibleHistory) {
+      backfillDebug('shouldBootstrapVisibleHistory false→true: firing backfill', { sessionId });
       // Tapping a chat that was not on screen: its latest messages first (tiny text-only tail), before the
       // window request below is even sent.
       sendStaleWindowPeekRef.current(
@@ -5537,7 +5538,7 @@ export function useTimeline(
       // usually arrives in the same commit.
       fireHttpBackfillRef.current(0, { phase: 'refresh', cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
     }
-  }, [isActiveSession, disableHistory, sessionId]);
+  }, [shouldBootstrapVisibleHistory, disableHistory, sessionId]);
 
   // ── Foreground staleness watchdog ───────────────────────────────────────
   // A session the user is actively looking at can silently miss a live
@@ -5555,7 +5556,7 @@ export function useTimeline(
     if (disableHistory || typeof window === 'undefined') return;
     const tick = (): void => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      if (!isActiveSessionRef.current) return;
+      if (!isActiveSessionRef.current && !shouldBootstrapVisibleHistoryRef.current) return;
       if (!serverId || !sessionId) return;
       // HTTP backfill is independent of the socket, but if the WS is down the
       // reconnect path already owns recovery; the watchdog targets the
@@ -5917,7 +5918,7 @@ export function useTimeline(
             // While a hole is open the window keeps the tail AND the cache it will be stitched to.
             mergeHistoryEventsYielding(acceptedEvents, getTimelineGap(cacheKeyRef.current) ? MAX_HISTORY_EVENTS : undefined);
           }
-        } else if (msg.events.length === 0 && historyRetryRef.current < 2 && ws?.connected && isActiveSessionRef.current && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
+        } else if (msg.events.length === 0 && historyRetryRef.current < 2 && ws?.connected && (isActiveSessionRef.current || shouldBootstrapVisibleHistoryRef.current) && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
           // Legacy empty response with no cached events — retry once after a
           // short delay. Explicit protocol outcomes (empty success, deferred,
           // queue-full, timeout, unavailable, malformed, internal, etc.) are
@@ -5928,7 +5929,7 @@ export function useTimeline(
           setTimeout(() => {
             // Re-check the flag at fire time — the user may have switched
             // away in the 1-2s delay window.
-            if (!isActiveSessionRef.current) return;
+            if (!isActiveSessionRef.current && !shouldBootstrapVisibleHistoryRef.current) return;
             if (ws?.connected && sessionId) sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
           }, 1000 * historyRetryRef.current);
         }
@@ -6005,7 +6006,7 @@ export function useTimeline(
         // plus live WS events; the next time the user activates one, its
         // hook's isActiveSession flips true and the active-session-refresh
         // listener pulls fresh history then.
-        if (!isActiveSessionRef.current) return;
+        if (!isActiveSessionRef.current && !shouldBootstrapVisibleHistoryRef.current) return;
         // Keep local optimistic bubbles visible across reconnect. The daemon may
         // have received and persisted the send while the browser missed the ack
         // or the live timeline echo; removing the bubble here makes the message
@@ -6075,7 +6076,7 @@ export function useTimeline(
         // timeline.replay calls every reconnect. Inactive sub-session
         // cards keep their cache and pick up live events; full history
         // re-sync happens when the user next activates that card.
-        if (!isActiveSessionRef.current) return;
+        if (!isActiveSessionRef.current && !shouldBootstrapVisibleHistoryRef.current) return;
         if (ws && sessionId) {
           if (!beginReconnectRefresh('browser')) return;
           setHistoryStatus({

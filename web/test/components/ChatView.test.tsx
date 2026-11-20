@@ -3496,4 +3496,123 @@ describe('ChatView', () => {
     );
     expect(hiddenContainer.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
   });
+
+  it('resets scroll to bottom per (serverId, sessionId) and snaps to bottom when async history hydrates after mount', async () => {
+    const makeServerEvents = (serverId: string, count: number) => Array.from({ length: count }, (_, idx) => ({
+      eventId: `${serverId}-evt-${idx}`,
+      sessionId: 'deck_shared_brain',
+      ts: 1_700_000_000_000 + idx,
+      epoch: 1,
+      seq: idx + 1,
+      type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+      payload: { text: `${serverId} message ${idx}` },
+    }));
+
+    const { container, rerender } = render(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        serverId="srv-1"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 200;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 320 });
+
+    // Async history arrives after empty initial mount -> snaps cleanly to bottom.
+    scrollHeightValue = 2_400;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-1', 12) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-1"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await waitFor(() => expect(scrollTopValue).toBe(2_400));
+
+    // User manually scrolls up -> auto-scroll pauses for subsequent live messages on srv-1.
+    scrollTopValue = 400;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    scrollHeightValue = 2_600;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-1', 13) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-1"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    expect(scrollTopValue).toBe(400);
+
+    // Switching serverId with identical sessionId resets auto-follow and lands at srv-2 bottom,
+    // even when srv-2 history hydrates asynchronously after a loading state.
+    scrollTopValue = 0;
+    scrollHeightValue = 200;
+    rerender(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        serverId="srv-2"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    scrollHeightValue = 3_100;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-2', 16) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-2"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await waitFor(() => expect(scrollTopValue).toBe(3_100));
+
+    // Manual scroll-up on srv-2 still pauses auto-scroll on subsequent live messages.
+    scrollTopValue = 500;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    scrollHeightValue = 3_300;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-2', 17) as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-2"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    expect(scrollTopValue).toBe(500);
+  });
+
+  it('settles cleanly when switching to a brand-new empty session with 0 events', async () => {
+    const { container } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-empty"
+        sessionId="deck_brand_new"
+      />,
+    );
+    await waitFor(() => {
+      expect(container.textContent).toContain('chat.no_events');
+    });
+  });
 });

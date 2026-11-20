@@ -6856,6 +6856,7 @@ function InternalMainApp() {
     focusedSubIdRef.current = null;
     setFocusedSubIdState(null);
     lastAutoFocusedRef.current = null;
+    chatScrollFnsRef.current.clear();
     setActiveSession(null, { remember: false, keepSubWindows: true });
     setSharedActiveDispatchIds(new Map());
     setDaemonStats(null);
@@ -9847,9 +9848,9 @@ function InternalMainApp() {
               <div class="supervision-task-console-primary">
               {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
               {visibleMainSessions.map((s) => (
-              <ErrorBoundary key={`eb-${s.name}`}>
+              <ErrorBoundary key={`eb-${selectedServerId ?? ''}:${s.name}`}>
               <SessionPane
-                key={s.name}
+                key={`${selectedServerId ?? ''}:${s.name}`}
                 serverId={selectedServerId ?? ''}
                 onPendingQuestion={surfaceAskQuestionFromHistory}
                 session={s}
@@ -10910,7 +10911,7 @@ function InternalMainApp() {
         const pairRole = activePair?.executorSubId === sub.id ? 'executor' : activePair?.auditorSubId === sub.id ? 'auditor' : null;
         return (
           <div
-            key={sub.id}
+            key={`${selectedServerId ?? ''}:${sub.id}`}
             data-subsession-retained={sub.id}
             style={{ display: windowVisible ? 'contents' : 'none' }}
           >

@@ -2595,11 +2595,25 @@ function VirtualizedViewItems({ items, contentRevision, scrollRef, enabled, reve
     if (!enabled) return;
     const root = scrollRef.current;
     if (!root) return;
+    if (resetKeyRef.current !== resetKey) {
+      resetKeyRef.current = resetKey;
+      heightsRef.current.clear();
+      measuredSumRef.current = 0;
+      estimateRef.current = VIRTUAL_ESTIMATE_FLOOR;
+      nextEstimateAtRef.current = VIRTUAL_ESTIMATE_MIN_SAMPLES;
+      biasRef.current = 0;
+      viewportAnchorRef.current = null;
+      itemKeysRef.current = null;
+      resumeSnapshotRef.current = null;
+      wasAtBottomRef.current = true;
+      lastCommitSignatureRef.current = '';
+      lastExternalSignatureRef.current = '';
+    }
     if (itemKeysUnchanged(itemKeysRef.current, resumeGeneration, items)) return;
     itemKeysRef.current = snapshotItemKeys(resumeGeneration, items);
     const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
     const resumeSnapshot = resumeSnapshotRef.current;
-    if (resumeSnapshot?.atBottom || (!resumeSnapshot && wasAtBottomRef.current)) {
+    if (resumeSnapshot?.atBottom || (!resumeSnapshot && (wasAtBottomRef.current || isFollowingRef.current?.()))) {
       root.scrollTop = root.scrollHeight;
     } else {
       const preferredTop = resumeSnapshot?.scrollTop ?? root.scrollTop;
@@ -2866,8 +2880,16 @@ function VirtualizedViewItems({ items, contentRevision, scrollRef, enabled, reve
   if (resetKeyRef.current !== resetKey) {
     // A different conversation: nothing recorded about the previous one applies.
     resetKeyRef.current = resetKey;
+    heightsRef.current.clear();
+    measuredSumRef.current = 0;
+    estimateRef.current = VIRTUAL_ESTIMATE_FLOOR;
+    nextEstimateAtRef.current = VIRTUAL_ESTIMATE_MIN_SAMPLES;
     biasRef.current = 0;
     viewportAnchorRef.current = null;
+    itemKeysRef.current = null;
+    resumeSnapshotRef.current = null;
+    wasAtBottomRef.current = true;
+    scrollTopRef.current = scrollRef.current?.scrollHeight ?? 0;
   }
   // Keep the arithmetic local and deterministic; no O(n) DOM work occurs.
   const heights = items.map(getHeight);
@@ -3971,6 +3993,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // follow/suppress policy stays synchronous so ordering against callers that
   // set state right after is unchanged.
   const pendingScrollFrameRef = useRef<number | null>(null);
+  const pendingEngageFollowRef = useRef(false);
   // Single-flight frame for every "follow the bottom" request in this view.
   // These fire from timeline updates, scroll handling and ResizeObserver — all
   // of which keep running while the display is asleep and frames are not
@@ -3978,12 +4001,19 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // the browser executes in one post-unlock frame. See useCoalescedFrame.
   const scheduleFollowFrame = useCoalescedFrame();
 
+  const pinScrollToBottomNow = (el: HTMLDivElement) => {
+    markProgrammaticScroll();
+    el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
+  };
+
   const scrollToBottom = (engageFollow: boolean = true) => {
     if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el) return;
     if (engageFollow) {
       autoScrollRef.current = true;
+      pendingEngageFollowRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
@@ -3992,17 +4022,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (pendingScrollFrameRef.current !== null) return;
     pendingScrollFrameRef.current = requestAnimationFrame(() => {
       pendingScrollFrameRef.current = null;
+      const shouldEngage = pendingEngageFollowRef.current;
+      pendingEngageFollowRef.current = false;
       const node = scrollRef.current;
       if (!node) return;
       // A wheel/touch scroll-away can land between scheduling and this frame.
       // Follow intent is re-checked HERE (not only when scheduled) so a reader
       // is never snapped back down by a pin that was queued before they moved.
-      if (!engageFollow && !preview && !autoScrollRef.current) return;
+      if (!shouldEngage && !preview && !autoScrollRef.current) return;
       // Armed here rather than at call time: it is a 200ms one-shot guard
       // against the synthetic scroll event fired by the write below.
-      markProgrammaticScroll();
-      node.scrollTop = node.scrollHeight;
-      lastScrollTopRef.current = node.scrollTop;
+      pinScrollToBottomNow(node);
     });
   };
 
@@ -4107,7 +4137,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // there reads more clearly than threading preview-awareness through a
   // helper that would otherwise have to capture the prop.)
 
-  // On session change, reset scroll position to bottom
+  // On server or session change, reset scroll position to bottom before initial hydration runs.
+  const scrollScopeKey = sessionId ? `${serverId ?? ''}:${sessionId}` : (serverId ?? '');
   useEffect(() => {
     autoScrollRef.current = true;
     hasInitialScrolledRef.current = false;
@@ -4115,10 +4146,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     setNewSinceUnfollow(0);
     countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     setShowScrollBtn(false);
-    // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
+    // Force scroll to bottom on server/tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
     scheduleFollowFrame(() => scrollToBottom(true));
-  }, [sessionId, scheduleFollowFrame]);
+  }, [scrollScopeKey, scheduleFollowFrame]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
   // Save the relative bottom offset on focusin, then restore against the new layout
@@ -4283,6 +4314,20 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const layoutHandledVisibleTsRef = useRef(lastVisibleTs);
   const prevRenderedRevisionRef = useRef(renderedRevision);
   const prevLoadingRef = useRef(loading);
+  const prevScrollScopeRef = useRef<string>(scrollScopeKey);
+  const wasEmptyAtScopeStartRef = useRef(lastVisibleTs === 0);
+
+  // Reset scroll tracking synchronously when (serverId, sessionId) changes on a reused instance.
+  useLayoutEffect(() => {
+    if (prevScrollScopeRef.current === scrollScopeKey) return;
+    prevScrollScopeRef.current = scrollScopeKey;
+    wasEmptyAtScopeStartRef.current = lastVisibleTs === 0;
+    autoScrollRef.current = true;
+    hasInitialScrolledRef.current = false;
+    prevVisibleTsRef.current = 0;
+    layoutHandledVisibleTsRef.current = 0;
+    lastScrollTopRef.current = 0;
+  }, [scrollScopeKey]);
 
   // Synchronous scroll-to-bottom BEFORE paint on initial history load.
   // useLayoutEffect runs after DOM mutation but before the browser paints,
@@ -4291,17 +4336,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (preview) return;
     if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
       hasInitialScrolledRef.current = true;
-      // Use the non-engaging variant. autoScrollRef is initialised to true,
-      // so on the genuine first mount this still scrolls. On rerenders that
-      // happen while the user has scrolled away (autoScrollRef=false), the
-      // session-change effect's reset of hasInitialScrolledRef can cause
-      // this branch to re-fire when lastVisibleTs next advances; in that
-      // window we MUST NOT engage follow because the user did not request
-      // it. The session-change effect itself already schedules an explicit
-      // force-jump rAF so the genuine session-switch case still re-engages.
-      if (autoScrollRef.current) scrollToBottom(false);
+      // Pin synchronously before paint when async hydration transitions 0 -> N events
+      // so scrollTop=0 cannot trigger a spurious disengageFollow before the rAF runs,
+      // and schedule a non-engaging rAF pass for post-paint layout settle.
+      if (autoScrollRef.current) {
+        if (wasEmptyAtScopeStartRef.current && visible && scrollRef.current) {
+          pinScrollToBottomNow(scrollRef.current);
+        }
+        scrollToBottom(false);
+      }
     }
-  }, [lastVisibleTs]);
+  }, [lastVisibleTs, scrollScopeKey, visible]);
 
   // Any visible content update should follow IFF the user is currently
   // engaged with auto-follow. Preview mode keeps its existing "always follow"
@@ -4399,6 +4444,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // threshold and the explicit wheel/touch up-gesture handlers below.
   const userScrollUpUntilRef = useRef(0);
   const disengageFollow = () => {
+    pendingEngageFollowRef.current = false;
     if (!autoScrollRef.current) return;
     autoScrollRef.current = false;
     newSinceUnfollowRef.current = 0;
@@ -4681,7 +4727,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       scrollToBottom(false);
     }, CHAT_MOUNT_SETTLE_TICK_MS);
     return () => clearInterval(timer);
-  }, [sessionId, preview, visible]);
+  }, [serverId, sessionId, preview, visible]);
 
   // Touch gesture mode is based on pointer coarseness only. Narrow desktop
   // windows still need native selection and the Copy/Quote popup.
@@ -5404,7 +5450,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             revealKey={virtualRevealKey}
             onMeasuredLayout={applyMeasuredLayoutScroll}
             absorbTopShiftRef={absorbTopShiftRef}
-            resetKey={sessionId ?? undefined}
+            resetKey={scrollScopeKey || undefined}
             isFollowing={() => autoScrollRef.current}
             onTopOffsetReconciled={() => { if (!autoScrollRef.current) captureReaderAnchor(); }}
             renderItem={(item) => {

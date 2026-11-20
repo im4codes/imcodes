@@ -11982,4 +11982,43 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     });
     await waitFor(() => expect(document.activeElement).toBe(sharedComposer));
   }, 20_000);
+
+  it('remounts SessionPane cleanly when switching between servers with identical session names', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions' || path === '/api/server/srv-2/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_shared_brain', project_name: 'shared', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/shared', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_shared_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const paneSrv1 = await screen.findByTestId('session-pane-deck_shared_brain');
+    const server2Btn = await screen.findByText('server-select-srv-2');
+    fireEvent.click(server2Btn);
+
+    await waitFor(() => {
+      const paneSrv2 = screen.getByTestId('session-pane-deck_shared_brain');
+      expect(paneSrv2).not.toBe(paneSrv1);
+    });
+  }, 20_000);
 });
