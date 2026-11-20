@@ -24,6 +24,7 @@ import { serverSessionStorageKey } from '../src/server-tab-state.js';
 
 const {
   apiFetchMock,
+  autoRegisterChatScrollState,
   chatScrollMock,
   clearApiKeyMock,
   clearAuthKeyMock,
@@ -51,6 +52,7 @@ const {
 } = vi.hoisted(() => ({
   syncedPrefs: { enabled: false, get: vi.fn(), save: vi.fn() },
   apiFetchMock: vi.fn(),
+  autoRegisterChatScrollState: { enabled: false, mainCalls: [] as string[], subCalls: [] as string[] },
   chatScrollMock: vi.fn(),
   clearApiKeyMock: vi.fn(),
   clearAuthKeyMock: vi.fn(async () => undefined),
@@ -657,6 +659,14 @@ vi.mock('../src/components/SessionPane.js', () => ({
       else onInputRefLatest.current?.(null);
       return () => onInputRefLatest.current?.(null);
     }, [isActive]);
+    const onChatScrollFnLatest = useRef(onChatScrollFn);
+    onChatScrollFnLatest.current = onChatScrollFn;
+    useEffect(() => {
+      if (!autoRegisterChatScrollState.enabled) return;
+      onChatScrollFnLatest.current?.(() => {
+        autoRegisterChatScrollState.mainCalls.push(session.name);
+      });
+    }, [session.name]);
     return (
     <div
       data-testid={`session-pane-${session.name}`}
@@ -849,7 +859,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onInputRef, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey, onClosePairSplit }: any) => {
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onInputRef, onChatScrollFn, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey, onClosePairSplit }: any) => {
     const incomingViewer = !!sharedState
       && sharedState.outgoing !== true
       && sharedState.effectiveRole !== 'participant';
@@ -861,6 +871,14 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       else onInputRefLatest.current?.(null);
       return () => onInputRefLatest.current?.(null);
     }, [visible, active, sub?.viewMode]);
+    const onChatScrollFnLatest = useRef(onChatScrollFn);
+    onChatScrollFnLatest.current = onChatScrollFn;
+    useEffect(() => {
+      if (!autoRegisterChatScrollState.enabled || !sub?.id) return;
+      onChatScrollFnLatest.current?.(() => {
+        autoRegisterChatScrollState.subCalls.push(sub.id);
+      });
+    }, [sub?.id]);
     return (
     <div
       class="subsession-window"
@@ -1263,6 +1281,9 @@ beforeEach(() => {
   loginState.userId = 'user-1';
   loginState.baseUrl = 'http://localhost';
   nativeState.value = false;
+  autoRegisterChatScrollState.enabled = false;
+  autoRegisterChatScrollState.mainCalls = [];
+  autoRegisterChatScrollState.subCalls = [];
   chatScrollMock.mockReset();
   clearApiKeyMock.mockReset();
   clearAuthKeyMock.mockReset();
@@ -12201,4 +12222,122 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       platformSpy.mockRestore();
     }
   }, 20_000);
+
+  it('auto-scrolls target chat to bottom on shortcut server switch (including delayed session hydration), tab switch, sub-session quick focus, and return to main window', async () => {
+    // Prior fake-timer tests in this file leave jsdom's requestAnimationFrame unreliable after vi.useRealTimers();
+    // restore a working timer-backed rAF for this test and clean up in afterEach/restoreAllMocks.
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => window.setTimeout(() => cb(Date.now()), 16));
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => window.clearTimeout(id));
+    autoRegisterChatScrollState.enabled = true;
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        // Simulate network latency past initial rAF so delayed SessionPane registration consumes pending scroll
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return {
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-scroll-1',
+        sessionName: 'deck_sub_scroll_1',
+        parentSession: 'deck_alpha_brain',
+        type: 'claude-code-sdk',
+        runtimeType: 'transport',
+        label: 'Sub 1',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaInput));
+
+      // Clear initial load calls before testing shortcut switches
+      autoRegisterChatScrollState.mainCalls = [];
+      autoRegisterChatScrollState.subCalls = [];
+
+      // 1) Shortcut tab switch (Alt+l) -> beta tab chat scrolls to bottom
+      alphaInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
+      const betaInput = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_beta_brain'), { timeout: 5000 });
+
+      // Switch back to alpha (Alt+j)
+      autoRegisterChatScrollState.mainCalls = [];
+      betaInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_alpha_brain'), { timeout: 5000 });
+
+      // 2) Shortcut sub-session open/focus (Ctrl+1) -> sub-scroll-1 scrolls to bottom; Ctrl+0 closes all and scrolls main back to bottom
+      autoRegisterChatScrollState.subCalls = [];
+      alphaInput.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      const sub1Input = await screen.findByTestId('sub-window-controls-input-sub-scroll-1', undefined, { timeout: 5000 });
+      await waitFor(() => expect(autoRegisterChatScrollState.subCalls).toContain('sub-scroll-1'), { timeout: 5000 });
+
+      autoRegisterChatScrollState.mainCalls = [];
+      sub1Input.dispatchEvent(new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_alpha_brain'), { timeout: 5000 });
+
+      // 3) Pinned message locate still respects scrollToBottom: false (must NOT force scroll to bottom)
+      autoRegisterChatScrollState.mainCalls = [];
+      const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+      act(() => requestMessagePinNavigation({
+        id: 'pin-check',
+        serverId: 'srv-1',
+        sessionName: 'deck_beta_brain',
+        eventId: 'evt-pin',
+        eventTs: 100,
+        eventType: 'assistant.text',
+        text: 'Pinned',
+        createdAt: 100,
+        updatedAt: 100,
+      }));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
+      expect(autoRegisterChatScrollState.mainCalls).not.toContain('deck_beta_brain');
+
+      // 4) Shortcut server switch (Alt+k) with delayed /api/server/srv-2/sessions -> deck_delta_brain auto-scrolls once mounted
+      autoRegisterChatScrollState.mainCalls = [];
+      const betaAfterPin = await screen.findByTestId('pane-composer-deck_beta_brain');
+      betaAfterPin.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await screen.findByTestId('session-pane-deck_delta_brain', undefined, { timeout: 5000 });
+      await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_delta_brain'), { timeout: 5000 });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 30_000);
 });

@@ -3576,39 +3576,84 @@ function InternalMainApp() {
     bringSubToFront(id);
   }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
+  // Per-session chat scroll functions — registered by SessionPane and SubSessionWindow.
+  const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
+  const subChatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
+  const pendingChatScrollSessionRef = useRef<string | null>(null);
+  const pendingServerSwitchScrollRef = useRef<string | null>(null);
+  const pendingSubScrollIdsRef = useRef<Set<string>>(new Set());
+
+  const scheduleMainChatScrollToBottom = useCallback((name: string) => {
+    pendingChatScrollSessionRef.current = name;
+    requestAnimationFrame(() => {
+      if (pendingChatScrollSessionRef.current !== name) return;
+      const fn = chatScrollFnsRef.current.get(name);
+      if (fn) {
+        pendingChatScrollSessionRef.current = null;
+        fn();
+      }
+    });
+  }, []);
+
+  const scheduleSubChatScrollToBottom = useCallback((id: string) => {
+    pendingSubScrollIdsRef.current.add(id);
+    requestAnimationFrame(() => {
+      if (!pendingSubScrollIdsRef.current.has(id)) return;
+      const fn = subChatScrollFnsRef.current.get(id);
+      if (fn) {
+        pendingSubScrollIdsRef.current.delete(id);
+        fn();
+      }
+    });
+  }, []);
+
   const maximizeOpenSubSession = useCallback((id: string) => {
     if (isMobileRef.current) return;
     unpinSubSessionPanel(id);
     setSubSessionMaximized(id, true);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
+    scheduleSubChatScrollToBottom(id);
+  }, [bringSubToFront, scheduleSubChatScrollToBottom, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   const restoreSubSession = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     bringSubToFront(id);
-  }, [bringSubToFront, clearSubSessionMaximized]);
+    scheduleSubChatScrollToBottom(id);
+  }, [bringSubToFront, clearSubSessionMaximized, scheduleSubChatScrollToBottom]);
 
-  const openSubSessionWindow = useCallback((id: string) => {
+  const openSubSessionWindow = useCallback((id: string, opts?: { scrollToBottom?: boolean }) => {
     clearSubSessionMaximized(id);
 
     if (isMobileRef.current) {
       setOpenSubIds(new Set([id]));
+      if (opts?.scrollToBottom !== false) {
+        scheduleSubChatScrollToBottom(id);
+      } else {
+        pendingSubScrollIdsRef.current.delete(id);
+      }
       return;
     }
 
     unpinSubSessionPanel(id);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, clearSubSessionMaximized, setOpenSubIds, unpinSubSessionPanel]);
+    if (opts?.scrollToBottom !== false) {
+      scheduleSubChatScrollToBottom(id);
+    } else {
+      pendingSubScrollIdsRef.current.delete(id);
+    }
+  }, [bringSubToFront, clearSubSessionMaximized, scheduleSubChatScrollToBottom, setOpenSubIds, unpinSubSessionPanel]);
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
 
     if (mobile) {
       clearSubSessionMaximized(id);
-      const next = openSubIdsRef.current.has(id) ? new Set<string>() : new Set([id]);
+      const willOpen = !openSubIdsRef.current.has(id);
+      const next = willOpen ? new Set([id]) : new Set<string>();
       setOpenSubIds(next);
+      if (willOpen) scheduleSubChatScrollToBottom(id);
       return;
     }
 
@@ -3616,6 +3661,7 @@ function InternalMainApp() {
     const next = new Set(openSubIdsRef.current);
     if (next.has(id) && !wasPinned && focusedSubIdRef.current !== id) {
       bringSubToFront(id);
+      scheduleSubChatScrollToBottom(id);
       return;
     }
 
@@ -3627,6 +3673,7 @@ function InternalMainApp() {
       setOpenSubIds(next);
       if (wasPinned) unpinSubSessionPanel(id);
       bringSubToFront(id);
+      scheduleSubChatScrollToBottom(id);
     } else {
       next.delete(id);
       setOpenSubIds(next);
@@ -3637,6 +3684,7 @@ function InternalMainApp() {
     clearSubSessionMaximized,
     isSubSessionPinnedPanel,
     removeDesktopWindow,
+    scheduleSubChatScrollToBottom,
     setOpenSubIds,
     unpinSubSessionPanel,
   ]);
@@ -3911,11 +3959,19 @@ function InternalMainApp() {
         setOpenSubIds(new Set(), { retainPrevious: true });
       }
     }
-    // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
-    if (name && opts?.scrollToBottom !== false) {
-      requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
+    // scroll chat to bottom on session switch (rAF + onChatScrollFn registration handles async mount)
+    if (opts?.scrollToBottom === false) {
+      if (!name || pendingChatScrollSessionRef.current === name) {
+        pendingChatScrollSessionRef.current = null;
+      }
+      pendingServerSwitchScrollRef.current = null;
+    } else if (name) {
+      if (pendingServerSwitchScrollRef.current) {
+        pendingServerSwitchScrollRef.current = null;
+      }
+      scheduleMainChatScrollToBottom(name);
     }
-  }, [selectedServerId, setOpenSubIds]);
+  }, [scheduleMainChatScrollToBottom, selectedServerId, setOpenSubIds]);
 
   // Keep a server-scoped snapshot of the tab the user deliberately opened.
   // It is written ONLY for an explicit choice (rememberIntentRef): an
@@ -4014,6 +4070,7 @@ function InternalMainApp() {
     claimExplicitSessionNavigation(name);
     if (name === activeSessionRef.current) {
       closeAllSubSessionWindows();
+      scheduleMainChatScrollToBottom(name);
     } else {
       setActiveSession(name);
     }
@@ -4022,7 +4079,7 @@ function InternalMainApp() {
       next.delete(name);
       return next;
     });
-  }, [claimExplicitSessionNavigation, closeAllSubSessionWindows, setActiveSession]);
+  }, [claimExplicitSessionNavigation, closeAllSubSessionWindows, scheduleMainChatScrollToBottom, setActiveSession]);
 
   const selectSubSessionFromTree = useCallback((sub: SubSession) => {
     claimExplicitSessionNavigation(sub.parentSession ?? activeSessionRef.current ?? sub.sessionName);
@@ -4850,8 +4907,6 @@ function InternalMainApp() {
   const termFocusFnsRef = useRef<Map<string, () => void>>(new Map());
   const termFitFnsRef = useRef<Map<string, () => void>>(new Map());
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());
-  // Per-session chat scroll functions — registered by SessionPane
-  const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
@@ -6929,6 +6984,12 @@ function InternalMainApp() {
     setFocusedSubIdState(null);
     lastAutoFocusedRef.current = null;
     chatScrollFnsRef.current.clear();
+    subChatScrollFnsRef.current.clear();
+    pendingChatScrollSessionRef.current = null;
+    pendingSubScrollIdsRef.current.clear();
+    if (!nextServerId || pendingServerSwitchScrollRef.current !== nextServerId) {
+      pendingServerSwitchScrollRef.current = null;
+    }
     setActiveSession(null, { remember: false, keepSubWindows: true });
     setSharedActiveDispatchIds(new Map());
     setDaemonStats(null);
@@ -7365,7 +7426,7 @@ function InternalMainApp() {
       // it replaces the previously-open overlay. The old inline add-to-set
       // logic left both mobile windows mounted at the same z-index; whichever
       // happened to render last covered the notification target.
-      openSubSessionWindow(sub.id);
+      openSubSessionWindow(sub.id, { scrollToBottom: options?.scrollToBottom });
     } else {
       safeLocalStorageSetItem('rcc_session', session);
       setActiveSession(session, { scrollToBottom: options?.scrollToBottom });
@@ -7571,6 +7632,8 @@ function InternalMainApp() {
     ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(auditorSubId), getSubSessionDesktopWindowMeta(auditorSubId), { bringToFront: true });
     ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(executorSubId), getSubSessionDesktopWindowMeta(executorSubId), { bringToFront: true });
     activateSubId(executorSubId);
+    scheduleSubChatScrollToBottom(auditorSubId);
+    scheduleSubChatScrollToBottom(executorSubId);
 
     activeSplitPairRef.current = { taskId, title, executorSubId, auditorSubId };
     setActiveSplitPairTaskId(taskId);
@@ -8127,8 +8190,11 @@ function InternalMainApp() {
       }
     }
     lastAutoFocusedRef.current = null;
+    if (activeSessionRef.current) {
+      scheduleMainChatScrollToBottom(activeSessionRef.current);
+    }
     setSubQuickFocusTick((prev) => prev + 1);
-  }, []);
+  }, [scheduleMainChatScrollToBottom]);
   const returnToMainWindowRef = useRef(returnToMainWindow);
   returnToMainWindowRef.current = returnToMainWindow;
   hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
@@ -8323,9 +8389,11 @@ function InternalMainApp() {
       }));
       if (targetSharedEntry) {
         armServerSwitchFocusGuard();
+        pendingServerSwitchScrollRef.current = nextServer.id;
         void handleOpenSharedEntryNavRef.current(targetSharedEntry);
       } else {
         armServerSwitchFocusGuard();
+        pendingServerSwitchScrollRef.current = nextServer.id;
         void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
       }
     }
@@ -9976,7 +10044,14 @@ function InternalMainApp() {
                 onFitFn={(fn) => { termFitFnsRef.current.set(s.name, fn); }}
                 onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
                 onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}
-                onChatScrollFn={(fn) => { chatScrollFnsRef.current.set(s.name, fn); }}
+                onChatScrollFn={(fn) => {
+                  chatScrollFnsRef.current.set(s.name, fn);
+                  if (pendingChatScrollSessionRef.current === s.name) {
+                    pendingChatScrollSessionRef.current = null;
+                    fn();
+                    requestAnimationFrame(() => fn());
+                  }
+                }}
                 onInputRef={(el) => registerComposerInputRef(s.name, el)}
                 onDiff={(apply) => registerDiffApplyer(s.name, apply)}
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
@@ -11114,6 +11189,14 @@ function InternalMainApp() {
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onInputRef={(el) => registerComposerInputRef(sub.sessionName, el)}
+              onChatScrollFn={(fn) => {
+                subChatScrollFnsRef.current.set(sub.id, fn);
+                if (pendingSubScrollIdsRef.current.has(sub.id)) {
+                  pendingSubScrollIdsRef.current.delete(sub.id);
+                  fn();
+                  requestAnimationFrame(() => fn());
+                }
+              }}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(sub.id))}
               sessions={quickDelegationSessions}
               subSessions={subSessionsSlim}

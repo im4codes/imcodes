@@ -135,6 +135,8 @@ interface Props {
   onDesktopFileBrowserClose?: () => void;
   /** Optional: register this sub-session's composer `.controls-input` element with app.tsx. */
   onInputRef?: (el: HTMLDivElement | null) => void;
+  /** Optional: register this sub-session's chat scroll-to-bottom callback with app.tsx. */
+  onChatScrollFn?: (fn: () => void) => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -304,7 +306,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(sharedState);
@@ -551,8 +553,33 @@ export function SubSessionWindow({
   viewModeRef.current = viewMode;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
+  const onChatScrollFnRef = useRef(onChatScrollFn);
+  onChatScrollFnRef.current = onChatScrollFn;
   const onTermScrollBottomFn = useCallback((fn: () => void) => { termScrollRef.current = fn; }, []);
-  const onChatScrollBottomFn = useCallback((fn: () => void) => { chatScrollRef.current = fn; }, []);
+  const onChatScrollBottomFn = useCallback((fn: () => void) => {
+    chatScrollRef.current = fn;
+    onChatScrollFnRef.current?.(fn);
+  }, []);
+
+  // Scroll sub-session chat to bottom whenever this window becomes visible & active
+  // (e.g. opened, restored from retained/minimized state, or focused via shortcut).
+  const prevActiveVisibleChatRef = useRef(false);
+  useEffect(() => {
+    const isActiveVisibleChat = Boolean(visible && active && viewMode === 'chat');
+    const becameActiveVisible = isActiveVisibleChat && !prevActiveVisibleChatRef.current;
+    prevActiveVisibleChatRef.current = isActiveVisibleChat;
+    if (!becameActiveVisible) return undefined;
+    if (chatScrollRef.current) {
+      chatScrollRef.current();
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      const id = requestAnimationFrame(() => {
+        chatScrollRef.current?.();
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    return undefined;
+  }, [visible, active, viewMode]);
 
   // SessionInfo shape for SessionControls — read metadata from sub-session object directly
   const sessionInfo: SessionInfo = {

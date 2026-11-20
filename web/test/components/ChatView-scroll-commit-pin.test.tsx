@@ -594,4 +594,99 @@ describe('ChatView — scroll ownership across commits', () => {
     expect(scrollEl.querySelector('[data-event-id="evt-29"]')).not.toBeNull();
     expect(scrollEl.querySelector('[data-event-id="evt-0"]')).toBeNull();
   });
+
+  it('re-pins to bottom when visible transitions false -> true and keeps onScrollBottomFn live after mounting hidden', async () => {
+    let scrollBottomFn: (() => void) | null = null;
+    geometry.scrollHeight = 2160;
+    geometry.scrollTop = 2160 - geometry.clientHeight;
+    const view = render(
+      <ChatView
+        events={events(30) as never}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId={SESSION}
+        visible={false}
+        onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+      />,
+    );
+
+    // Simulate user scrolling up while visible, then hiding (switching window/tab away)
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(30) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={true}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+    const scrollEl = view.container.querySelector('.chat-view') as HTMLDivElement;
+    geometry.scrollTop = 400;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    expect(view.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+    // Hide the pane (visible=false)
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(30) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={false}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+
+    // Switch back to the pane (visible: false -> true): must re-engage bottom follow & pin synchronously
+    geometry.scrollHeight = 2300;
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(31) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={true}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+    expect(geometry.scrollTop).toBeGreaterThanOrEqual(2300 - geometry.clientHeight);
+    expect(view.container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Verify manual scroll-up while remaining visible=true stays unfollowed on incoming chunks
+    geometry.scrollTop = 500;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    geometry.scrollHeight = 2400;
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(32) as never}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId={SESSION}
+          visible={true}
+          onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
+        />,
+      );
+    });
+    flushFrames();
+    expect(geometry.scrollTop).toBe(500);
+    expect(view.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+    // Calling the captured onScrollBottomFn after visible false->true->true must still work (no stale visible=false closure)
+    act(() => {
+      scrollBottomFn?.();
+    });
+    flushFrames();
+    expect(geometry.scrollTop).toBeGreaterThanOrEqual(2400 - geometry.clientHeight);
+    expect(view.container.querySelector('.chat-scroll-btn')).toBeNull();
+  });
 });

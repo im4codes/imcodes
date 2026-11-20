@@ -4029,6 +4029,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const pendingEngageFollowRef = useRef(false);
   const hasInitialPinCompletedRef = useRef(false);
   const lastVisibleTsRef = useRef(0);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   // Single-flight frame for every "follow the bottom" request in this view.
   // These fire from timeline updates, scroll handling and ResizeObserver — all
   // of which keep running while the display is asleep and frames are not
@@ -4040,21 +4042,23 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     markProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
     lastScrollTopRef.current = el.scrollTop;
-    if (lastVisibleTsRef.current > 0) {
+    if (lastVisibleTsRef.current > 0 && (el.clientHeight > 0 || el.scrollHeight === 0)) {
       hasInitialPinCompletedRef.current = true;
     }
   };
 
   const scrollToBottom = (engageFollow: boolean = true) => {
-    if (!visible) return undefined;
+    if (!visibleRef.current) return undefined;
     const el = scrollRef.current;
     if (!el) return;
     if (engageFollow) {
+      userScrollUpUntilRef.current = 0;
       autoScrollRef.current = true;
       pendingEngageFollowRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+      setShowScrollBtn(false);
     }
     suppressLoadOlder();
     if (pendingScrollFrameRef.current !== null) return;
@@ -4063,7 +4067,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       const shouldEngage = pendingEngageFollowRef.current;
       pendingEngageFollowRef.current = false;
       const node = scrollRef.current;
-      if (!node) return;
+      if (!node || !visibleRef.current) return;
       // A wheel/touch scroll-away can land between scheduling and this frame.
       // Follow intent is re-checked HERE (not only when scheduled) so a reader
       // is never snapped back down by a pin that was queued before they moved.
@@ -4073,6 +4077,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       pinScrollToBottomNow(node);
     });
   };
+  const scrollToBottomRef = useRef(scrollToBottom);
+  scrollToBottomRef.current = scrollToBottom;
 
   // The reading anchor: the first row that reaches into the viewport and where its
   // top edge sits in SCROLL-CONTENT coordinates (which do not change while the
@@ -4236,9 +4242,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     };
   }, []);
 
-  // Expose scroll-to-bottom fn to parent (stable when parent uses useCallback).
+  // Expose scroll-to-bottom fn to parent via stable ref delegate so retained/hidden
+  // parents never invoke a stale closure after `visible` transitions false -> true.
   useEffect(() => {
-    onScrollBottomFn?.(scrollToBottom);
+    onScrollBottomFn?.(() => scrollToBottomRef.current(true));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onScrollBottomFn]);
 
@@ -4377,11 +4384,28 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     suppressLoadOlder();
   }, [scrollScopeKey]);
 
-  // Synchronous scroll-to-bottom BEFORE paint on initial history load.
+  const prevVisibleRef = useRef(visible);
+
+  // Synchronous scroll-to-bottom BEFORE paint on initial history load or when a
+  // retained ChatView becomes visible again (visible: false -> true).
   // useLayoutEffect runs after DOM mutation but before the browser paints,
   // so the user never sees content at the top position.
   useLayoutEffect(() => {
+    const becameVisible = !prevVisibleRef.current && visible;
+    prevVisibleRef.current = visible;
     if (preview || !visible) return;
+    if (becameVisible && !pendingPinnedLocateIdRef.current) {
+      autoScrollRef.current = true;
+      pendingEngageFollowRef.current = true;
+      hasInitialScrolledRef.current = false;
+      hasInitialPinCompletedRef.current = false;
+      userScrollUpUntilRef.current = 0;
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+      countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+      setShowScrollBtn(false);
+      suppressLoadOlder();
+    }
     if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
       hasInitialScrolledRef.current = true;
       // Pin synchronously before paint whenever initial content renders (both

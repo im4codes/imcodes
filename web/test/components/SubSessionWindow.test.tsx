@@ -2312,4 +2312,150 @@ describe('SDK window startup budget', () => {
       hideWorkflowControls: true,
     });
   });
+
+  it('forwards onChatScrollFn and triggers chat scroll-to-bottom on visible/active transitions without affecting shell sub-sessions', async () => {
+    const scrollBottomSpy = vi.fn();
+    let registeredScrollFn: (() => void) | null = null;
+    const onChatScrollFn = vi.fn((fn: () => void) => { registeredScrollFn = fn; });
+    const sub = makeSubSession({
+      id: 'sub-scroll-focus',
+      sessionName: 'deck_sub_scroll_focus',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+      cwd: '/repo',
+    } as any);
+
+    chatViewPropsSpy.mockImplementation((props: any) => {
+      props.onScrollBottomFn?.(scrollBottomSpy);
+    });
+
+    try {
+      const view = render(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={false}
+          visible={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+
+      // Minimized/hidden startup keeps ChatView unmounted until visible=true
+      expect(onChatScrollFn).not.toHaveBeenCalled();
+      expect(scrollBottomSpy).not.toHaveBeenCalled();
+
+      // Transition visible=true, active=false -> ChatView mounts and registers onChatScrollFn (not active yet)
+      view.rerender(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={false}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+      expect(onChatScrollFn).toHaveBeenCalled();
+      expect(scrollBottomSpy).not.toHaveBeenCalled();
+
+      // Calling registered parent callback invokes underlying ChatView scroll fn
+      registeredScrollFn?.();
+      expect(scrollBottomSpy).toHaveBeenCalledTimes(1);
+      scrollBottomSpy.mockClear();
+
+      // Transition active=true -> scrolls chat to bottom
+      view.rerender(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={true}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+      await waitFor(() => expect(scrollBottomSpy).toHaveBeenCalled());
+
+      // Unrelated re-render while remaining visible & active must NOT re-trigger auto scroll
+      scrollBottomSpy.mockClear();
+      view.rerender(
+        <SubSessionWindow
+          sub={sub}
+          ws={ws}
+          connected={true}
+          active={true}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          onChatScrollFn={onChatScrollFn}
+          zIndex={5010}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+      expect(scrollBottomSpy).not.toHaveBeenCalled();
+
+      // Shell sub-session (terminal mode) handles visible/active cleanly without throwing
+      const shellSub = makeSubSession({
+        id: 'sub-shell-only',
+        sessionName: 'deck_sub_shell_only',
+        type: 'shell',
+        viewMode: 'terminal',
+        state: 'idle',
+      } as any);
+      render(
+        <SubSessionWindow
+          sub={shellSub}
+          ws={ws}
+          connected={true}
+          active={true}
+          visible={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          zIndex={5000}
+          onFocus={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+    } finally {
+      chatViewPropsSpy.mockReset();
+    }
+  });
 });
