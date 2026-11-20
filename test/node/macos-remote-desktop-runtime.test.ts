@@ -35,7 +35,9 @@ import {
 } from '../../src/node/runtime.js';
 import { ServerClockEstimator } from '../../shared/clock-sync.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '../../shared/controlled-node-auto-unlock.js';
-import { REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_INSTALL_MSG, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
+import { CONTROLLED_NODE_WORKER_REFRESH_MSG } from '../../shared/controlled-node-worker-refresh.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
 
 const USER = {
@@ -703,6 +705,201 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     const capabilities = authCapabilities(socket);
     expect(capabilities).toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
     expect(capabilities).not.toContain(REMOTE_DESKTOP_SESSION_CAPABILITY);
+    runtime.stop();
+  });
+
+  it('falls back to starting verified installed components when a new release fails notarization, republishes capabilities, and still retries upgrade later', async () => {
+    const sockets: MockSocket[] = [];
+    const options = macosRuntimeOptions([], { disclosure: true, accessibility: true });
+    let launchAgentStarts = 0;
+    const createSupervisor = options.createLaunchAgentSupervisor;
+    options.createLaunchAgentSupervisor = (dependencies) => {
+      const supervisor = createSupervisor(dependencies);
+      return {
+        ...supervisor,
+        start: async () => {
+          launchAgentStarts += 1;
+          return supervisor.start();
+        },
+      };
+    };
+    let now = 1_000_000;
+    let notarizationFixed = false;
+    let installedForThisRelease = false;
+    const install = vi.fn(async () => {
+      if (!notarizationFixed) {
+        throw new Error('macos_remote_desktop_artifact_notarization_rejected');
+      }
+      installedForThisRelease = true;
+      return true;
+    });
+
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    }, {
+      platform: 'darwin',
+      arch: 'arm64',
+      now: () => now,
+      macosRemoteDesktopComponentsInstalled: async () => installedForThisRelease,
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopWorker: options,
+    });
+
+    runtime.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    // Upgrade-first ordering preserved: startup skips the older worker before attempting install.
+    expect(launchAgentStarts).toBe(0);
+    expect(authCapabilities(sockets[0]!)).toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+
+    sockets[0]!.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+    // Truthful FAILED status emitted for the notarization rejection.
+    await vi.waitFor(() => {
+      const statuses = sockets[0]!.sent
+        .map((raw) => JSON.parse(raw))
+        .filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.at(-1)).toEqual(expect.objectContaining({
+        phase: 'failed',
+        reason: 'macos_remote_desktop_artifact_notarization_rejected',
+      }));
+    });
+    // Verified existing components started as fallback and capabilities republished without installable flag.
+    await vi.waitFor(() => expect(launchAgentStarts).toBe(1));
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+    await vi.waitFor(() => expect(authCapabilities(sockets.at(-1)!)).toContain(REMOTE_DESKTOP_SESSION_CAPABILITY));
+    expect(authCapabilities(sockets.at(-1)!)).not.toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+
+    // Next retry window while worker is already available: failure must NOT restart the running worker.
+    now += 5 * 60_000 + 1_000;
+    sockets.at(-1)!.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => { setTimeout(resolve, 30); });
+    expect(launchAgentStarts).toBe(1);
+
+    // Once notarization succeeds in the next retry window, the upgrade proceeds normally.
+    notarizationFixed = true;
+    now += 5 * 60_000 + 1_000;
+    sockets.at(-1)!.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => {
+      const statuses = sockets.at(-1)!.sent
+        .map((raw) => JSON.parse(raw))
+        .filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.at(-1)).toEqual(expect.objectContaining({ phase: 'succeeded' }));
+    });
+    runtime.stop();
+  });
+
+  it('restarts verified fallback components on explicit force request when worker is down, while truly uninstalled Macs stay installable on failure', async () => {
+    const sockets: MockSocket[] = [];
+    const options = macosRuntimeOptions([], { disclosure: true, accessibility: true });
+    let launchAgentStarts = 0;
+    let capturedServerOptions: MacosRemoteDesktopIpcServerOptions | null = null;
+    let supervisorStop: (() => Promise<void>) | null = null;
+    const createIpc = options.createIpcServer;
+    options.createIpcServer = (ipcOpts) => {
+      capturedServerOptions = ipcOpts;
+      return createIpc(ipcOpts);
+    };
+    const createSupervisor = options.createLaunchAgentSupervisor;
+    options.createLaunchAgentSupervisor = (dependencies) => {
+      const supervisor = createSupervisor(dependencies);
+      supervisorStop = () => {
+        capturedServerOptions?.onDisconnect?.('peer_disconnected');
+        return supervisor.stop();
+      };
+      return {
+        ...supervisor,
+        start: async () => {
+          launchAgentStarts += 1;
+          return supervisor.start();
+        },
+      };
+    };
+    let hasArtifact = true;
+    options.resolveVerifiedArtifact = async () => (hasArtifact ? verifiedArtifact() : null);
+
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    }, {
+      platform: 'darwin',
+      arch: 'arm64',
+      macosRemoteDesktopComponentsInstalled: async () => false,
+      installMacosRemoteDesktopComponents: async () => false,
+      macosRemoteDesktopWorker: options,
+    });
+
+    runtime.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    await vi.waitFor(() => expect(sockets[0]!.readyState).toBe(1));
+    sockets[0]!.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(launchAgentStarts).toBe(1));
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+    await vi.waitFor(() => expect(sockets.at(-1)!.readyState).toBe(1));
+
+    // Simulate worker going idle/down, then explicit manual refresh request (`force = true`).
+    await (supervisorStop as (() => Promise<void>) | null)?.();
+    sockets.at(-1)!.emit('message', JSON.stringify({ type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST }));
+    await vi.waitFor(() => expect(launchAgentStarts).toBe(2));
+
+    // Truly uninstalled Mac (no verified artifact): install failure must NOT start worker or hide installable.
+    hasArtifact = false;
+    await (supervisorStop as (() => Promise<void>) | null)?.();
+    const freshSocket = new MockSocket();
+    const createFreshSocket = vi.fn(() => freshSocket);
+    let freshStarts = 0;
+    const freshOptions = macosRuntimeOptions([], { disclosure: true, accessibility: true });
+    const freshCreateSupervisor = freshOptions.createLaunchAgentSupervisor;
+    freshOptions.createLaunchAgentSupervisor = (dependencies) => {
+      const supervisor = freshCreateSupervisor(dependencies);
+      return {
+        ...supervisor,
+        start: async () => {
+          freshStarts += 1;
+          return supervisor.start();
+        },
+      };
+    };
+    freshOptions.resolveVerifiedArtifact = async () => null;
+    const freshRuntime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-fresh',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, createFreshSocket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      macosRemoteDesktopComponentsInstalled: async () => false,
+      installMacosRemoteDesktopComponents: async () => {
+        throw new Error('macos_remote_desktop_artifact_notarization_rejected');
+      },
+      macosRemoteDesktopWorker: freshOptions,
+    });
+    freshRuntime.start();
+    await vi.waitFor(() => expect(createFreshSocket).toHaveBeenCalledOnce());
+    freshSocket.open();
+    freshSocket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await new Promise((resolve) => { setTimeout(resolve, 40); });
+    expect(freshStarts).toBe(0);
+    expect(authCapabilities(freshSocket)).toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+
+    freshRuntime.stop();
     runtime.stop();
   });
 });

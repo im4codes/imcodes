@@ -229,4 +229,177 @@ describe('macOS worker refresh runtime', () => {
       runtime.stop();
     });
   });
+
+  describe('fallback startup on production installer outcomes', () => {
+    const teamId = 'ABCDE12345';
+    const workerReq = `identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${teamId}`;
+    const agentReq = `identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${teamId}`;
+    const makeArtifact = (workerVersion: string) => ({
+      artifactDirectory: '/verified/release',
+      manifestPath: '/verified/release/imcodes-remote-desktop.manifest.json',
+      setSha256: 'a'.repeat(64),
+      components: {
+        worker: {
+          kind: 'worker',
+          executablePath: '/verified/release/imcodes-remote-desktop-worker',
+          fileName: 'imcodes-remote-desktop-worker',
+          size: 1,
+          sha256: 'c'.repeat(64),
+          bundleIdentifier: 'cc.imcodes.node.remote-desktop-worker',
+          designatedRequirement: workerReq,
+        },
+        disclosure: {},
+        launchAgent: {
+          kind: 'launchAgent',
+          executablePath: '/verified/release/imcodes-remote-desktop-launch-agent',
+          fileName: 'imcodes-remote-desktop-launch-agent',
+          size: 1,
+          sha256: 'b'.repeat(64),
+          bundleIdentifier: 'cc.imcodes.node.remote-desktop-agent',
+          designatedRequirement: agentReq,
+        },
+      },
+      manifest: {
+        workerVersion,
+        os: 'darwin',
+        arch: 'arm64',
+        codeSignature: {
+          teamId,
+          bundles: {
+            worker: { bundleIdentifier: 'cc.imcodes.node.remote-desktop-worker', designatedRequirement: workerReq, hardenedRuntime: true },
+            disclosure: {},
+            launchAgent: { bundleIdentifier: 'cc.imcodes.node.remote-desktop-agent', designatedRequirement: agentReq, hardenedRuntime: true },
+          },
+        },
+      },
+    });
+
+    const makeWorkerHostOptions = (onStart: () => void) => {
+      let serverOpts: { onPeerAuthenticated?: (launch: { workerGeneration: number; challenge: string; socketPath: string }) => void } | null = null;
+      return {
+        resolveVerifiedArtifact: async () => (await selectMacSet('', 'current')) ?? (await selectMacSet('', 'lastKnownGood')) ?? null,
+        capturePrivacy: true,
+        resolveUserSession: async () => ({
+          name: 'desktop-user',
+          uid: 501,
+          gid: 20,
+          home: '/Users/desktop-user',
+          tempDir: '/private/var/folders/test/T/',
+        }),
+        inspectReadiness: async () => ({
+          screenRecording: true,
+          encoder: true,
+          accessibility: true,
+          clipboard: true,
+          disclosure: true,
+        }),
+        inspectPeerUid: async () => 501,
+        verifyPeerCodeIdentity: async (_s: unknown, expected: { bundleIdentifier: string; teamId: string; designatedRequirement: string }) => expected,
+        createIpcServer: (opts: { onPeerAuthenticated?: (launch: { workerGeneration: number; challenge: string; socketPath: string }) => void }) => {
+          serverOpts = opts;
+          return {
+            start: async () => ({ workerGeneration: 1, challenge: 'A'.repeat(43), socketPath: '/tmp/rd.sock' }),
+            sendCommand: async () => undefined,
+            stop: async () => undefined,
+          };
+        },
+        createLaunchAgentSupervisor: (deps: { beginIpcLaunch: () => { workerGeneration: number; challenge: string; socketPath: string } }) => ({
+          start: async () => {
+            onStart();
+            const active = deps.beginIpcLaunch();
+            queueMicrotask(() => serverOpts?.onPeerAuthenticated?.(active));
+            return {
+              user: { name: 'desktop-user', uid: 501, gid: 20, home: '/Users/desktop-user', tempDir: '/private/var/folders/test/T/' },
+              workerGeneration: active.workerGeneration,
+              serviceTarget: 'gui/501/cc.imcodes.node.remote-desktop',
+              socketPath: active.socketPath,
+            };
+          },
+          stop: async () => undefined,
+        }),
+      };
+    };
+
+    it('starts existing verified current worker when probe returns worker_current or worker_downgrade_rejected while current != DAEMON_VERSION', async () => {
+      for (const scenario of ['worker_current', 'worker_downgrade_rejected'] as const) {
+        vi.clearAllMocks();
+        selectMacSet.mockResolvedValue(makeArtifact('2026.9.5113-dev.5644'));
+        probeMacMetadata.mockResolvedValue(scenario === 'worker_current'
+          ? { status: 'ok', version: '2026.9.5113-dev.5644', sha256: 'c'.repeat(64) }
+          : { status: 'ok', version: '2026.8.5000-dev.5000', sha256: 'd'.repeat(64) });
+        const socket = new MockSocket();
+        const createSocket = vi.fn(() => socket);
+        let starts = 0;
+        const runtime = createControlledNodeRuntime({
+          serverUrl: 'https://im.example',
+          serverId: `mac-fallback-${scenario}`,
+          token: 'secret',
+          nodeRole: NODE_ROLE.CONTROLLED,
+        }, createSocket, {
+          platform: 'darwin',
+          arch: 'arm64',
+          now: () => 10_000,
+          macosRemoteDesktopWorker: makeWorkerHostOptions(() => { starts += 1; }) as never,
+        });
+        runtime.start();
+        await vi.waitFor(() => expect(createSocket).toHaveBeenCalledOnce());
+        socket.open();
+        socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+        await vi.waitFor(() => expect(starts).toBe(1));
+        await vi.waitFor(() => {
+          const statuses = socket.sent
+            .map((raw) => JSON.parse(raw))
+            .filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+          expect(statuses.at(-1)).toEqual(expect.objectContaining({
+            phase: scenario === 'worker_current' ? 'succeeded' : 'failed',
+            reason: scenario,
+          }));
+        });
+        runtime.stop();
+      }
+    });
+
+    it('checks lastKnownGood when current is corrupted/null and download/promotion fails', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'imcodes-mac-lkg-fallback-'));
+      tempDirs.push(root);
+      const manifestPath = join(root, 'manifest.json');
+      await writeFile(manifestPath, JSON.stringify({ workerVersion: '2026.10.5371-dev.5816' }));
+      selectMacSet.mockImplementation(async (_storeRoot: string, selector: string) => (
+        selector === 'lastKnownGood' ? makeArtifact('2026.9.5113-dev.5644') : null
+      ));
+      probeMacMetadata.mockResolvedValue({ status: 'ok', version: '2026.10.5371-dev.5816' });
+      downloadMacSet.mockResolvedValue({ componentDirectory: join(root, 'components'), manifestPath, artifactSha256: 'a'.repeat(64) });
+      promoteMacSet.mockRejectedValue(new Error('macos_remote_desktop_artifact_notarization_rejected'));
+
+      const socket = new MockSocket();
+      const createSocket = vi.fn(() => socket);
+      let starts = 0;
+      const runtime = createControlledNodeRuntime({
+        serverUrl: 'https://im.example',
+        serverId: 'mac-lkg-fallback',
+        token: 'secret',
+        nodeRole: NODE_ROLE.CONTROLLED,
+      }, createSocket, {
+        platform: 'darwin',
+        arch: 'arm64',
+        now: () => 10_000,
+        macosRemoteDesktopWorker: makeWorkerHostOptions(() => { starts += 1; }) as never,
+      });
+      runtime.start();
+      await vi.waitFor(() => expect(createSocket).toHaveBeenCalledOnce());
+      socket.open();
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(starts).toBe(1));
+      await vi.waitFor(() => {
+        const statuses = socket.sent
+          .map((raw) => JSON.parse(raw))
+          .filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+        expect(statuses.at(-1)).toEqual(expect.objectContaining({
+          phase: 'failed',
+          reason: 'macos_remote_desktop_artifact_notarization_rejected',
+        }));
+      });
+      runtime.stop();
+    });
+  });
 });

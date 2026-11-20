@@ -47,6 +47,7 @@ import {
   promoteMacosRemoteDesktopArtifact,
   pruneMacosRemoteDesktopArtifactStoreBacklog,
   selectMacosRemoteDesktopArtifact,
+  type VerifiedMacosRemoteDesktopArtifact,
 } from './macos-remote-desktop-artifact.js';
 import { defaultMacosRemoteDesktopArtifactStoreRoot } from './macos-remote-desktop-production.js';
 import type { ControlledNodeCredential } from './enrollment.js';
@@ -1139,7 +1140,75 @@ export function createControlledNodeRuntime(
     } else {
       return false;
     }
-    if (!force && now < macosRemoteDesktopInstallNextAttemptAt) return false;
+    let resolvedCurrentAttempted = false;
+    let resolvedCurrentArtifact: VerifiedMacosRemoteDesktopArtifact | null = null;
+    const resolveCurrentArtifactOnce = async (): Promise<VerifiedMacosRemoteDesktopArtifact | null> => {
+      if (!resolvedCurrentAttempted) {
+        resolvedCurrentAttempted = true;
+        resolvedCurrentArtifact = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
+          runtime: { platform, arch: componentArch },
+        }).catch(() => null);
+      }
+      return resolvedCurrentArtifact;
+    };
+    const hasVerifiedInstalledMacosComponents = async (): Promise<boolean> => {
+      if (options.installMacosRemoteDesktopComponents && options.macosRemoteDesktopWorker?.resolveVerifiedArtifact) {
+        const verified = await options.macosRemoteDesktopWorker.resolveVerifiedArtifact().catch(() => null);
+        return Boolean(verified);
+      }
+      const currentArtifact = await resolveCurrentArtifactOnce();
+      if (currentArtifact) return true;
+      const lastKnownGood = await selectMacosRemoteDesktopArtifact(storeRoot, 'lastKnownGood', {
+        runtime: { platform, arch: componentArch },
+      }).catch(() => null);
+      if (lastKnownGood) return true;
+      if (options.macosRemoteDesktopWorker?.resolveVerifiedArtifact) {
+        const verified = await options.macosRemoteDesktopWorker.resolveVerifiedArtifact().catch(() => null);
+        return Boolean(verified);
+      }
+      return false;
+    };
+    const isRemoteDesktopWorkerAvailableNow = (): boolean => {
+      try {
+        return remoteDesktopWorker.available();
+      } catch {
+        return false;
+      }
+    };
+    const canAttemptInstalledMacosWorkerFallback = (allowWhenEverAvailable: boolean): boolean => Boolean(
+      remoteDesktopWorkerStartup
+      && !isRemoteDesktopWorkerAvailableNow()
+      && (allowWhenEverAvailable || !macosRemoteDesktopEverAvailable),
+    );
+    const tryStartInstalledMacosWorkerFallback = async (allowWhenEverAvailable: boolean): Promise<void> => {
+      if (!canAttemptInstalledMacosWorkerFallback(allowWhenEverAvailable)) return;
+      if (!await hasVerifiedInstalledMacosComponents()) return;
+      try {
+        await remoteDesktopWorkerStartup!();
+        await remoteDesktopWorker.setAccessPaused?.(remoteDesktopAccessPaused);
+      } catch (error) {
+        logger.warn({ err: error }, 'installed macOS remote-desktop fallback components did not start');
+      }
+      try {
+        macosRemoteDesktopEverAvailable = macosRemoteDesktopEverAvailable
+          || remoteDesktopWorker.available();
+      } catch {
+        // Leave the flag as-is; a broken availability probe is not proof
+        // of either state.
+      }
+      republishCapabilitiesIfChanged();
+    };
+    if (!force && now < macosRemoteDesktopInstallNextAttemptAt) {
+      if (canAttemptInstalledMacosWorkerFallback(false)) {
+        macosRemoteDesktopInstallInFlight = true;
+        try {
+          await tryStartInstalledMacosWorkerFallback(false);
+        } finally {
+          macosRemoteDesktopInstallInFlight = false;
+        }
+      }
+      return false;
+    }
     macosRemoteDesktopInstallNextAttemptAt = now + MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS;
     macosRemoteDesktopInstallInFlight = true;
     const refreshAttemptId = randomUUID();
@@ -1162,9 +1231,7 @@ export function createControlledNodeRuntime(
     let installedArtifactSha256: string | undefined;
     const install = options.installMacosRemoteDesktopComponents ?? (async () => {
       const fetchImpl = options.fetchImpl ?? fetch;
-      const current = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
-        runtime: { platform, arch: componentArch },
-      }).catch(() => null);
+      const current = await resolveCurrentArtifactOnce();
       if (current?.manifest.workerVersion) {
         installedCurrentVersion = current.manifest.workerVersion;
         const probe = await probeControlledNodeArtifactMetadata({
@@ -1298,30 +1365,45 @@ export function createControlledNodeRuntime(
         });
       } else if (installFailureReason === 'worker_current') {
         macosRemoteDesktopInstallNextAttemptAt = (options.now?.() ?? Date.now()) + MACOS_REMOTE_DESKTOP_CURRENT_CHECK_INTERVAL_MS;
-        macosRemoteDesktopInstallInFlight = false;
+        const shouldFallback = canAttemptInstalledMacosWorkerFallback(force);
+        if (!shouldFallback) macosRemoteDesktopInstallInFlight = false;
         emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, {
           installedVersion: installedCurrentVersion ?? installedTargetVersion ?? DAEMON_VERSION,
           targetVersion: installedTargetVersion ?? installedCurrentVersion ?? DAEMON_VERSION,
           ...(installedArtifactSha256 ? { artifactSha256: installedArtifactSha256 } : {}),
           reason: installFailureReason,
         });
+        if (shouldFallback) {
+          await tryStartInstalledMacosWorkerFallback(force);
+          macosRemoteDesktopInstallInFlight = false;
+        }
       } else {
         if (installFailureReason === 'worker_downgrade_rejected') {
           macosRemoteDesktopInstallNextAttemptAt = (options.now?.() ?? Date.now()) + MACOS_REMOTE_DESKTOP_CURRENT_CHECK_INTERVAL_MS;
         }
-        macosRemoteDesktopInstallInFlight = false;
+        const shouldFallback = canAttemptInstalledMacosWorkerFallback(force);
+        if (!shouldFallback) macosRemoteDesktopInstallInFlight = false;
         emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
           ...(installedTargetVersion ? { targetVersion: installedTargetVersion } : {}),
           reason: installFailureReason ?? 'worker_not_available',
         });
+        if (shouldFallback) {
+          await tryStartInstalledMacosWorkerFallback(force);
+          macosRemoteDesktopInstallInFlight = false;
+        }
       }
       return installed;
     } catch (error) {
-      macosRemoteDesktopInstallInFlight = false;
+      const shouldFallback = canAttemptInstalledMacosWorkerFallback(force);
+      if (!shouldFallback) macosRemoteDesktopInstallInFlight = false;
       logger.warn({ err: error }, 'macOS remote-desktop component install failed');
       emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
         reason: error instanceof Error ? error.message : 'worker_refresh_failed',
       });
+      if (shouldFallback) {
+        await tryStartInstalledMacosWorkerFallback(force);
+        macosRemoteDesktopInstallInFlight = false;
+      }
       return false;
     } finally {
       macosRemoteDesktopInstallInFlight = false;
