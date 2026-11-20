@@ -8,9 +8,9 @@ import { resizeHandleHoverEvents } from './window-resize.js';
 
 const LS_COLLAPSED = 'sidebar_collapsed';
 const LS_WIDTH = 'sidebar_width_';
-const MIN_WIDTH = 180;
-const MAX_WIDTH = 500;
-const DEFAULT_WIDTH = 240;
+export const MIN_WIDTH = 180;
+export const MAX_WIDTH = 560;
+export const DEFAULT_WIDTH = 380;
 
 interface Props {
   collapsed: boolean;
