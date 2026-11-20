@@ -24,6 +24,13 @@ import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { AMBIGUOUS_PARTICIPANT_ACTOR } from '../../src/daemon/sender-participant-turn.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
+vi.mock('../../src/context/embedding.js', () => ({
+  generateEmbedding: vi.fn(async () => new Float32Array([1])),
+  cosineSimilarity: (_query: Float32Array, emb: Float32Array) => emb[0] ?? 0,
+  encodeEmbedding: (vec: Float32Array) => Buffer.from(new Uint8Array(vec.buffer.slice(0))),
+  decodeEmbedding: (_buf: Buffer | null) => null,
+}));
+
 describe('daemon participant memory isolation against owner-private storage', () => {
   let tempDir: string;
   let configDir: string;
@@ -148,6 +155,10 @@ describe('daemon participant memory isolation against owner-private storage', ()
         listTargets: () => [],
       },
       ...deps,
+      memorySearchOptions: {
+        credentials: null,
+        ...deps.memorySearchOptions,
+      },
     });
   }
 
