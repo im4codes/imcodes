@@ -2321,6 +2321,63 @@ describe('SubSessionBar', () => {
     }
   });
 
+  it('does not render the vertical rail portal when zero sub-sessions exist even if a host element is mounted', () => {
+    const host = document.createElement('aside');
+    document.body.append(host);
+    try {
+      const view = render(
+        <SubSessionBar
+          subSessions={[]}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          onDesktopLayoutChange={vi.fn()}
+          desktopDockSide={SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+          onDesktopDockSideChange={vi.fn()}
+          verticalRailHost={host}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+
+      expect(host.querySelector('[data-testid="subsession-vertical-rail"]')).toBeNull();
+      expect(host.children).toHaveLength(0);
+
+      view.rerender(
+        <SubSessionBar
+          subSessions={[makeSubSession()]}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          onDesktopLayoutChange={vi.fn()}
+          desktopDockSide={SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+          onDesktopDockSideChange={vi.fn()}
+          verticalRailHost={host}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+
+      expect(host.querySelector('[data-testid="subsession-vertical-rail"]')).toBeTruthy();
+    } finally {
+      host.remove();
+    }
+  });
+
   it('ships desktop layout labels in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, any>;

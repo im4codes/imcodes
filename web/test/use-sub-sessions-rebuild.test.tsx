@@ -192,4 +192,71 @@ describe('useSubSessions rebuild gating', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(listSubSessions).toHaveBeenCalledTimes(1);
   });
+
+  it('clears loadedServerId across server switches and hides visibleSubSessions while activeSession is null', async () => {
+    const ws = { subSessionRebuildAll: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    listSubSessions.mockResolvedValueOnce([
+      {
+        id: 's1',
+        serverId: 'srv1',
+        type: 'shell',
+        shellBin: null,
+        cwd: null,
+        label: 'S1',
+        parentSession: 'deck_srv1_brain',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+      {
+        id: 'orphan',
+        serverId: 'srv1',
+        type: 'shell',
+        shellBin: null,
+        cwd: null,
+        label: 'Orphan',
+        parentSession: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+
+    let state!: ReturnType<typeof useSubSessions>;
+    function Harness(props: { serverId: string; activeSession: string | null }) {
+      state = useSubSessions(props.serverId, ws, true, props.activeSession);
+      return null;
+    }
+
+    const view = render(<Harness serverId="srv1" activeSession={null} />);
+    await waitFor(() => expect(state.loadedServerId).toBe('srv1'));
+    expect(state.subSessions).toHaveLength(2);
+    expect(state.visibleSubSessions).toEqual([]);
+
+    view.rerender(<Harness serverId="srv1" activeSession="deck_srv1_brain" />);
+    expect(state.visibleSubSessions.map((s) => s.id)).toEqual(['s1', 'orphan']);
+
+    const srv2Pending = deferred<any[]>();
+    listSubSessions.mockReturnValueOnce(srv2Pending.promise);
+    view.rerender(<Harness serverId="srv2" activeSession={null} />);
+    expect(state.loadedServerId).toBeNull();
+    expect(state.visibleSubSessions).toEqual([]);
+
+    srv2Pending.resolve([
+      {
+        id: 's2-other',
+        serverId: 'srv2',
+        type: 'shell',
+        shellBin: null,
+        cwd: null,
+        label: 'S2 Other',
+        parentSession: 'deck_srv2_other',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    await waitFor(() => expect(state.loadedServerId).toBe('srv2'));
+    expect(state.visibleSubSessions).toEqual([]);
+
+    view.rerender(<Harness serverId="srv2" activeSession="deck_srv2_brain" />);
+    expect(state.visibleSubSessions).toEqual([]);
+  });
 });

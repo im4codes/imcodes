@@ -1709,7 +1709,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     />
   ));
 
-  const verticalRail = isVerticalRail && verticalRailHost
+  const verticalRail = isVerticalRail && verticalRailHost && orderedSessions.length > 0
     ? createPortal(
       <div class="subsession-vertical-rail" data-testid="subsession-vertical-rail">
         <div class="subsession-vertical-rail-header">

@@ -762,7 +762,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
       data-team-discussion-layout={teamDiscussionLayout}
       data-daemon-badge-state={daemonBadgeState ?? ''}
     >
-      {verticalRailHost && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && createPortal(
+      {verticalRailHost && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && subSessions.length > 0 && createPortal(
         <div data-testid="app-shell-subsession-vertical-rail">mock vertical rail</div>,
         verticalRailHost,
       )}
@@ -2542,6 +2542,16 @@ describe('App shell', () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.loadedServerId = 'srv-1';
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_1',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper 1',
+      type: 'codex-sdk',
+      state: 'idle',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
     const { App } = await importApp();
     render(<App />);
     const bar = await screen.findByTestId('app-shell-subsession-bar');
@@ -2566,6 +2576,16 @@ describe('App shell', () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.loadedServerId = 'srv-1';
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_1',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper 1',
+      type: 'codex-sdk',
+      state: 'idle',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
 
     const { App } = await importApp();
     const view = render(<App />);
@@ -3947,6 +3967,92 @@ describe('App shell', () => {
       expect(screen.queryByText('server-context-menu')).toBeNull();
       expect(screen.queryByText('subbar-open-sub-1')).toBeNull();
       expect(view.container.querySelector('.daemon-stats-card')).toBeNull();
+    }, 30_000);
+
+    it('does not render or flash the desktop vertical rail with zero or unsettled sub-sessions across session and server switches', async () => {
+      seedLogin('srv-1');
+      useSubSessionsState.loadedServerId = null;
+      useSubSessionsState.subSessions = [{
+        id: 'sub-unsettled',
+        sessionName: 'deck_sub_alpha_unsettled',
+        parentSession: 'deck_alpha_brain',
+        label: 'Unsettled Helper',
+        type: 'codex-sdk',
+        state: 'idle',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      let gateSrv2Sessions = false;
+      let releaseSrv2Sessions!: () => void;
+      const srv2SessionsGate = new Promise<void>((resolve) => { releaseSrv2Sessions = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (gateSrv2Sessions && serverId === 'srv-2') await srv2SessionsGate;
+          return { sessions: listFor(serverId) };
+        },
+      });
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      // Unsettled server scope (loadedServerId === null) must never render the vertical rail host
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      // Settling with 0 visible sub-sessions also keeps the vertical rail host unmounted
+      useSubSessionsState.loadedServerId = 'srv-1';
+      useSubSessionsState.subSessions = [];
+      useSubSessionsState.visibleSubSessions = [];
+      view.rerender(<App />);
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      // Creating a stable sub-session mounts the vertical rail host cleanly
+      useSubSessionsState.subSessions = [{
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper 1',
+        type: 'codex-sdk',
+        state: 'running',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      view.rerender(<App />);
+      expect(await screen.findByTestId('subsession-vertical-rail-host')).toBeTruthy();
+      expect(screen.getByTestId('app-shell-subsession-vertical-rail')).toBeTruthy();
+
+      // Switching sessions on the same server to a session with 0 sub-sessions unmounts the rail immediately
+      useSubSessionsState.visibleSubSessions = [];
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      // Switching back to deck_alpha_brain mounts it again, then switching to srv-2 never flashes even while loadedServerId is stale/null
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+      await expectActive('deck_alpha_brain');
+      expect(await screen.findByTestId('subsession-vertical-rail-host')).toBeTruthy();
+
+      // Switching to srv-2 while sessions API is still pending (activeSession === null) must never flash the rail,
+      // even if listSubSessions resolves first (loadedServerId === 'srv-2' with rawVisibleSubSessions non-empty)
+      gateSrv2Sessions = true;
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+      useSubSessionsState.loadedServerId = 'srv-2';
+      view.rerender(<App />);
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+
+      useSubSessionsState.subSessions = [];
+      useSubSessionsState.visibleSubSessions = [];
+      releaseSrv2Sessions();
+      await expectActive('deck_gamma_brain');
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
     }, 30_000);
 
     it('closes mobile sidebar and mobile server menu immediately when switching servers on mobile', async () => {

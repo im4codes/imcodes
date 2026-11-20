@@ -4336,16 +4336,17 @@ function InternalMainApp() {
       staleSubSessionsSnapshotRef.current = null;
     }
   }, [rawSubSessions]);
+  const activeScopedSession = activeSession || canonicalSharedSessionName || null;
   const subSessionsScopedToServer = Boolean(selectedServerId)
-    && (loadedServerId === null || loadedServerId === selectedServerId)
+    && loadedServerId === selectedServerId
     && rawSubSessions !== staleSubSessionsSnapshotRef.current;
   const subSessions = useMemo(
     () => (subSessionsScopedToServer ? rawSubSessions : []),
     [rawSubSessions, subSessionsScopedToServer],
   );
   const visibleSubSessions = useMemo(
-    () => (subSessionsScopedToServer ? rawVisibleSubSessions : []),
-    [rawVisibleSubSessions, subSessionsScopedToServer],
+    () => (subSessionsScopedToServer && activeScopedSession ? rawVisibleSubSessions : []),
+    [activeScopedSession, rawVisibleSubSessions, subSessionsScopedToServer],
   );
 
   // Session settings may stay open across a daemon rolling upgrade. Keep the
@@ -9345,10 +9346,14 @@ function InternalMainApp() {
     );
   }
 
+  const showSubSessionVerticalRail = !isMobile
+    && Boolean(selectedServerId)
+    && subSessionDesktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+    && subSessionsScopedToServer
+    && Boolean(activeScopedSession)
+    && visibleSubSessions.length > 0;
   const renderSubSessionVerticalRailHost = (side: SubSessionDesktopDockSide) => (
-    !isMobile
-      && selectedServerId
-      && subSessionDesktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+    showSubSessionVerticalRail
       && subSessionDesktopDockSide === side
       ? (
         <aside
@@ -10271,7 +10276,7 @@ function InternalMainApp() {
                 onDesktopLayoutChange={handleSubSessionDesktopLayoutChange}
                 desktopDockSide={subSessionDesktopDockSide}
                 onDesktopDockSideChange={handleSubSessionDesktopDockSideChange}
-                verticalRailHost={subSessionVerticalRailHost}
+                verticalRailHost={showSubSessionVerticalRail ? subSessionVerticalRailHost : null}
                 teamDiscussionLayout={teamDiscussionLayout}
                 onTeamDiscussionLayoutChange={handleTeamDiscussionLayoutChange}
                 teamDiscussionRailHost={teamDiscussionRailHost}

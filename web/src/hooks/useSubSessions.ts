@@ -211,6 +211,7 @@ export function useSubSessions(
       // Seed preserved in-memory incognito sub-sessions for this server immediately
       // without clearing or touching other servers' incognito entries.
       setSubSessionsRaw(savedIncognito);
+      if (!disableHttpLoad) setLoadedServerId(null);
     }
     if (disableHttpLoad) {
       const gen = ++loadGenRef.current;
@@ -985,12 +986,12 @@ export function useSubSessions(
   }, []);
 
   // Filter sub-sessions by active main session (show only those belonging to it).
-  // Sub-sessions with no parentSession (null) are always visible — they were created
-  // before the parentSession feature or from a context without an active session.
+  // When no active session is selected yet (e.g. during server/session switch), return empty
+  // so sub-sessions from other main sessions never flash before the active session settles.
   const visibleSubSessions = useMemo(() =>
     activeSession
       ? subSessions.filter((s) => !s.parentSession || s.parentSession === activeSession)
-      : subSessions,
+      : [],
     [subSessions, activeSession],
   );
 
