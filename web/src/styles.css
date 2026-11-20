@@ -8836,6 +8836,7 @@ html.mobile-nav-gesture-active .chat-view {
 .floating-panel-titlebar * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 html.imcodes-window-dragging,
 html.imcodes-window-dragging * { -webkit-user-select: none !important; user-select: none !important; -webkit-touch-callout: none !important; }
+html.imcodes-window-dragging iframe { pointer-events: none !important; }
 .subsession-drag-icon { color: rgba(34,211,238,0.48); font-size: 16px; cursor: grab; text-shadow: 0 0 8px rgba(34,211,238,0.16); }
 .subsession-title-group { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 6px; overflow: hidden; }
 .subsession-title-group.is-pair { display: flex; flex-direction: column; align-items: flex-start; gap: 0; line-height: 1.15; }
@@ -20779,21 +20780,26 @@ button.quick-agent-delegation-preset.active {
 
 .cloud-docs-main-chat-anchor {
   position: absolute;
-  right: 14px;
-  bottom: 14px;
+  inset: 0;
   z-index: 25;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 8px;
   pointer-events: none;
-  max-width: calc(100% - 28px);
-  max-height: calc(100% - 28px);
+}
+
+.cloud-docs-mini-chat-interaction-shield {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: auto;
+  background: transparent;
+  touch-action: none;
 }
 
 .cloud-docs-fab {
   pointer-events: auto;
-  position: relative;
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 1;
   isolation: isolate;
   overflow: visible;
   width: 40px;
@@ -20993,12 +20999,17 @@ button.quick-agent-delegation-preset.active {
 }
 
 .cloud-docs-mini-chat {
-  position: relative;
+  position: absolute;
+  right: 14px;
+  bottom: 62px;
+  z-index: 2;
   pointer-events: auto;
-  width: min(380px, 100%);
-  height: min(420px, calc(var(--imcodes-ui-vh, 100vh) - 180px));
-  max-height: calc(100% - 52px);
-  min-height: 220px;
+  width: min(380px, calc(100% - 28px));
+  height: min(420px, calc(var(--imcodes-ui-vh, 100vh) - 180px), calc(100% - 76px));
+  max-width: calc(100% - 28px);
+  max-height: calc(100% - 76px);
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   border-radius: 12px;
@@ -21008,22 +21019,56 @@ button.quick-agent-delegation-preset.active {
   overflow: hidden;
 }
 
+.cloud-docs-mini-chat.is-positioned {
+  right: auto;
+  bottom: auto;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 16px);
+}
+
+.cloud-docs-mini-chat.is-dragging,
+.cloud-docs-mini-chat.is-resizing {
+  box-shadow: 0 22px 48px rgba(2, 6, 23, 0.84), 0 0 0 1px rgba(56, 189, 248, 0.45);
+}
+
 .mini-chat-resize-handle {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 7px;
-  cursor: ns-resize;
-  z-index: 3;
+  z-index: 4;
+  background: rgb(0 0 0 / 1%);
+  pointer-events: auto;
   touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.mini-chat-resize-handle::after {
+  content: '';
+  position: absolute;
+  opacity: 0;
+  background: rgba(96, 165, 250, 0.85);
+  transition: opacity 140ms ease, background 140ms ease;
+  pointer-events: none;
+}
+
+.mini-chat-resize-handle:hover::after,
+.mini-chat-resize-handle.is-active::after {
+  opacity: 1;
+}
+
+.mini-chat-resize-n {
+  top: 0;
+  left: 14px;
+  right: 14px;
+  height: 8px;
+  cursor: ns-resize;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.mini-chat-resize-handle::after {
-  content: '';
+.mini-chat-resize-n::after {
+  position: static;
+  opacity: 1;
   width: 32px;
   height: 2px;
   border-radius: 999px;
@@ -21031,21 +21076,106 @@ button.quick-agent-delegation-preset.active {
   transition: background 140ms ease, width 140ms ease;
 }
 
-.mini-chat-resize-handle:hover::after,
-.cloud-docs-mini-chat.is-resizing .mini-chat-resize-handle::after {
+.mini-chat-resize-n:hover::after,
+.mini-chat-resize-n.is-active::after {
   width: 48px;
   background: rgba(96, 165, 250, 0.85);
 }
+
+.mini-chat-resize-s {
+  bottom: 0;
+  left: 14px;
+  right: 14px;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.mini-chat-resize-s::after {
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+
+.mini-chat-resize-w {
+  left: 0;
+  top: 14px;
+  bottom: 14px;
+  width: 6px;
+  cursor: ew-resize;
+}
+
+.mini-chat-resize-e {
+  right: 0;
+  top: 14px;
+  bottom: 14px;
+  width: 6px;
+  cursor: ew-resize;
+}
+
+.mini-chat-resize-w:hover,
+.mini-chat-resize-w.is-active,
+.mini-chat-resize-e:hover,
+.mini-chat-resize-e.is-active {
+  width: 10px;
+}
+
+.mini-chat-resize-w::after,
+.mini-chat-resize-e::after {
+  top: 0;
+  bottom: 0;
+  width: 2px;
+}
+
+.mini-chat-resize-w::after { left: 0; }
+.mini-chat-resize-e::after { right: 0; }
+
+.mini-chat-resize-nw,
+.mini-chat-resize-ne,
+.mini-chat-resize-sw,
+.mini-chat-resize-se {
+  width: 14px;
+  height: 14px;
+  z-index: 5;
+}
+
+.mini-chat-resize-nw { top: 0; left: 0; cursor: nwse-resize; }
+.mini-chat-resize-ne { top: 0; right: 0; cursor: nesw-resize; }
+.mini-chat-resize-sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.mini-chat-resize-se { bottom: 0; right: 0; cursor: nwse-resize; }
+
+.mini-chat-resize-nw::after,
+.mini-chat-resize-ne::after,
+.mini-chat-resize-sw::after,
+.mini-chat-resize-se::after {
+  width: 10px;
+  height: 10px;
+  background: none;
+  border: 2px solid rgba(96, 165, 250, 0.9);
+}
+
+.mini-chat-resize-nw::after { top: 0; left: 0; border-right: none; border-bottom: none; border-top-left-radius: 10px; }
+.mini-chat-resize-ne::after { top: 0; right: 0; border-left: none; border-bottom: none; border-top-right-radius: 10px; }
+.mini-chat-resize-sw::after { bottom: 0; left: 0; border-right: none; border-top: none; border-bottom-left-radius: 10px; }
+.mini-chat-resize-se::after { bottom: 0; right: 0; border-left: none; border-top: none; border-bottom-right-radius: 10px; }
 
 .cloud-docs-mini-chat-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 7px 10px;
+  padding: 8px 12px;
   border-bottom: 1px solid #1e293b;
   background: #0f172a;
   flex-shrink: 0;
+  cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.cloud-docs-mini-chat.is-dragging .cloud-docs-mini-chat-header {
+  cursor: grabbing;
 }
 
 .cloud-docs-mini-chat-title-group {
@@ -21107,6 +21237,8 @@ button.quick-agent-delegation-preset.active {
 }
 
 .cloud-docs-mini-chat-close {
+  position: relative;
+  z-index: 6;
   width: 22px;
   height: 22px;
   border: none;
@@ -21186,16 +21318,25 @@ button.quick-agent-delegation-preset.active {
 }
 
 @media (max-width: 600px) {
-  .cloud-docs-main-chat-anchor {
+  .cloud-docs-fab {
     right: 10px;
     bottom: 10px;
-    max-width: calc(100% - 20px);
-    max-height: calc(100% - 20px);
   }
 
   .cloud-docs-mini-chat {
-    width: calc(var(--imcodes-ui-vw, 100vw) - 24px);
-    height: min(380px, calc(var(--imcodes-ui-dvh) - 130px));
+    right: 10px;
+    bottom: 58px;
+    width: min(380px, calc(100% - 20px));
+    height: min(380px, calc(var(--imcodes-ui-dvh) - 130px), calc(100% - 68px));
+    max-width: calc(100% - 20px);
+    max-height: calc(100% - 68px);
+  }
+
+  .cloud-docs-mini-chat.is-positioned {
+    right: auto;
+    bottom: auto;
+    max-width: calc(100% - 16px);
+    max-height: calc(100% - 16px);
   }
 }
 

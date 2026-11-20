@@ -51,6 +51,8 @@ import { CloudDocsMainChatFloat, type CloudDocsMainChatContext } from './CloudDo
 
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 
+export const CLOUD_DOCS_MINI_CHAT_HEIGHT_STORAGE_KEY = 'imcodes_cloud_docs_mini_chat_height_v1';
+
 export type CloudDocsTab = 'recent' | 'my_docs' | 'shared';
 export type CloudDocsViewMode = 'list' | 'grid';
 export type CloudDocsSortBy = 'updated' | 'name' | 'size';
@@ -2362,6 +2364,7 @@ export function CloudDocsPanel({
             mainChat={mainChat}
             activePreviewQuote={previewQuoteTarget}
             onOpenDoc={handleOpenDocFromMiniChat}
+            heightStorageKey={CLOUD_DOCS_MINI_CHAT_HEIGHT_STORAGE_KEY}
           />
         )}
         {renderShareModal()}
@@ -3280,13 +3283,6 @@ export function CloudDocsPanel({
         )}
       </div>
 
-      {mainChat && !standalone && (
-        <CloudDocsMainChatFloat
-          mainChat={mainChat}
-          activePreviewQuote={previewQuoteTarget}
-          onOpenDoc={handleOpenDocFromMiniChat}
-        />
-      )}
       {renderContextMenu()}
       {renderShareModal()}
     </div>

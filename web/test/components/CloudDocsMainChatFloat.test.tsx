@@ -583,4 +583,246 @@ describe('CloudDocsMainChatFloat', () => {
     expect(fabSection).toContain('@media (prefers-reduced-motion: reduce)');
     expect(fabSection).not.toContain('backdrop-filter');
   });
+
+  it('supports header drag positioning with container boundary clamping, close-button exclusion, interaction shield, and layout persistence', async () => {
+    const storageKey = 'test_mini_chat_drag_pos';
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    const view = render(
+      <div data-testid="drag-host" style={{ position: 'relative', width: '900px', height: '700px' }}>
+        <CloudDocsMainChatFloat
+          mainChat={mainChat}
+          heightStorageKey={storageKey}
+          overlayClassName={REMOTE_DESKTOP_OVERLAY_CLASS}
+        />
+      </div>,
+    );
+
+    const host = screen.getByTestId('drag-host');
+    Object.defineProperty(host, 'clientWidth', { configurable: true, value: 900 });
+    Object.defineProperty(host, 'clientHeight', { configurable: true, value: 700 });
+    vi.spyOn(host, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, width: 900, height: 700, right: 900, bottom: 700, x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    vi.spyOn(miniChat, 'getBoundingClientRect').mockReturnValue({
+      left: 506, top: 218, width: 380, height: 420, right: 886, bottom: 638, x: 506, y: 218, toJSON: () => ({}),
+    });
+
+    const closeBtn = screen.getByTestId('cloud-docs-mini-chat-close');
+    const header = screen.getByTestId('cloud-docs-mini-chat-header');
+
+    // Pointerdown on close button must NOT enter drag mode
+    fireEvent(closeBtn, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 870, clientY: 230, pointerId: 10,
+    }));
+    expect(miniChat.classList.contains('is-dragging')).toBe(false);
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(false);
+
+    // Drag header by (-200, -100) -> moves from (506, 218) to (306, 118)
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem');
+    fireEvent(header, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 600, clientY: 230, pointerId: 11,
+    }));
+    expect(miniChat.classList.contains('is-dragging')).toBe(true);
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(true);
+    const shield = screen.getByTestId('cloud-docs-mini-chat-interaction-shield');
+    expect(shield.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: 400, clientY: 130, pointerId: 11,
+    }));
+    expect(miniChat.classList.contains('is-positioned')).toBe(true);
+    expect(miniChat.style.left).toBe('306px');
+    expect(miniChat.style.top).toBe('118px');
+    // No synchronous localStorage churn during pointermove
+    expect(setItemSpy).not.toHaveBeenCalled();
+
+    // Clamp against top-left edge (8px margin)
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: -400, clientY: -400, pointerId: 11,
+    }));
+    expect(miniChat.style.left).toBe('8px');
+    expect(miniChat.style.top).toBe('8px');
+
+    // Clamp against bottom-right edge: (900 - 380 - 8 = 512, 700 - 420 - 8 = 272)
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: 1600, clientY: 1400, pointerId: 11,
+    }));
+    expect(miniChat.style.left).toBe('512px');
+    expect(miniChat.style.top).toBe('272px');
+
+    // Commit at (240, 120) -> delta (-360, -110) => (506 - 360 = 146, 218 - 110 = 108)
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: 240, clientY: 120, pointerId: 11,
+    }));
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientX: 240, clientY: 120, pointerId: 11,
+    }));
+
+    expect(miniChat.classList.contains('is-dragging')).toBe(false);
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(false);
+    expect(screen.queryByTestId('cloud-docs-mini-chat-interaction-shield')).toBeNull();
+    expect(JSON.parse(localStorage.getItem(`${storageKey}:layout`) || '{}')).toEqual({
+      position: undefined,
+      x: 146,
+      y: 108,
+    });
+
+    // Unmount & remount in a smaller container (300x260) clamps restored position & size safely inside container
+    view.unmount();
+    render(
+      <div data-testid="tiny-host" style={{ position: 'relative', width: '300px', height: '260px' }}>
+        <CloudDocsMainChatFloat mainChat={mainChat} heightStorageKey={storageKey} />
+      </div>,
+    );
+    const tinyHost = screen.getByTestId('tiny-host');
+    Object.defineProperty(tinyHost, 'clientWidth', { configurable: true, value: 300 });
+    Object.defineProperty(tinyHost, 'clientHeight', { configurable: true, value: 260 });
+    vi.spyOn(tinyHost, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, width: 300, height: 260, right: 300, bottom: 260, x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    const tinyMiniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    const restoredLeft = Number.parseInt(tinyMiniChat.style.left, 10);
+    const restoredTop = Number.parseInt(tinyMiniChat.style.top, 10);
+    expect(restoredLeft).toBeGreaterThanOrEqual(0);
+    expect(restoredTop).toBeGreaterThanOrEqual(0);
+    expect(restoredLeft).toBeLessThan(300);
+    expect(restoredTop).toBeLessThan(260);
+  });
+
+  it('supports 8-direction width+height resizing, backward-compat height storage, corrupt layout recovery, blur/cancel guard release, and iframe pointer blocking CSS', async () => {
+    const storageKey = 'test_mini_chat_multi_resize';
+    const { ws } = createSharedMockWs();
+    const mainChat = makeMainChatContext(ws);
+
+    // Corrupt layout JSON + legacy plain-numeric height should not crash and should keep legacy height
+    localStorage.setItem(storageKey, '460');
+    localStorage.setItem(`${storageKey}:layout`, '{corrupt-json');
+
+    render(
+      <div data-testid="resize-host" style={{ position: 'relative', width: '900px', height: '700px' }}>
+        <CloudDocsMainChatFloat
+          mainChat={mainChat}
+          heightStorageKey={storageKey}
+          defaultWidth={380}
+          minWidth={280}
+          maxWidth={600}
+          defaultHeight={420}
+          minHeight={220}
+          maxHeight={560}
+        />
+      </div>,
+    );
+    const host = screen.getByTestId('resize-host');
+    Object.defineProperty(host, 'clientWidth', { configurable: true, value: 900 });
+    Object.defineProperty(host, 'clientHeight', { configurable: true, value: 700 });
+    vi.spyOn(host, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, width: 900, height: 700, right: 900, bottom: 700, x: 0, y: 0, toJSON: () => ({}),
+    });
+
+    fireEvent.click(screen.getByTestId('cloud-docs-main-chat-fab'));
+    const miniChat = await screen.findByTestId('cloud-docs-mini-chat');
+    expect(miniChat.style.height).toBe('460px');
+    expect(miniChat.style.width).toBe('');
+    expect(miniChat.style.left).toBe('');
+
+    vi.spyOn(miniChat, 'getBoundingClientRect').mockReturnValue({
+      left: 506, top: 178, width: 380, height: 460, right: 886, bottom: 638, x: 506, y: 178, toJSON: () => ({}),
+    });
+
+    // Resize west handle left by 80px -> width 380 -> 460 while staying docked at right/bottom
+    const westHandle = screen.getByTestId('mini-chat-resize-handle-w');
+    fireEvent(westHandle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 506, clientY: 300, pointerId: 21,
+    }));
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(true);
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: 426, clientY: 300, pointerId: 21,
+    }));
+    expect(miniChat.style.width).toBe('460px');
+    expect(miniChat.style.left).toBe('');
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientX: 426, clientY: 300, pointerId: 21,
+    }));
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(false);
+    expect(JSON.parse(localStorage.getItem(`${storageKey}:layout`) || '{}')).toMatchObject({ width: 460 });
+
+    // Resize north-west handle after positioning: updates width, height, left, top while pinning right/bottom
+    vi.spyOn(miniChat, 'getBoundingClientRect').mockReturnValue({
+      left: 426, top: 178, width: 460, height: 460, right: 886, bottom: 638, x: 426, y: 178, toJSON: () => ({}),
+    });
+    const header = screen.getByTestId('cloud-docs-mini-chat-header');
+    fireEvent(header, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 500, clientY: 190, pointerId: 22,
+    }));
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: 450, clientY: 160, pointerId: 22,
+    }));
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientX: 450, clientY: 160, pointerId: 22,
+    }));
+    // Now positioned at (376, 148)
+    expect(miniChat.style.left).toBe('376px');
+    expect(miniChat.style.top).toBe('148px');
+
+    vi.spyOn(miniChat, 'getBoundingClientRect').mockReturnValue({
+      left: 376, top: 148, width: 460, height: 460, right: 836, bottom: 608, x: 376, y: 148, toJSON: () => ({}),
+    });
+    const seHandle = screen.getByTestId('mini-chat-resize-handle-se');
+    fireEvent(seHandle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 836, clientY: 608, pointerId: 23,
+    }));
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: 876, clientY: 648, pointerId: 23,
+    }));
+    expect(miniChat.style.width).toBe('500px');
+    expect(miniChat.style.height).toBe('500px');
+    expect(miniChat.style.left).toBe('376px');
+    expect(miniChat.style.top).toBe('148px');
+
+    // Window blur mid-resize cleanly releases dragging guard and active state
+    fireEvent(window, new Event('blur'));
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(false);
+    expect(miniChat.classList.contains('is-resizing')).toBe(false);
+    expect(screen.queryByTestId('cloud-docs-mini-chat-interaction-shield')).toBeNull();
+
+    // North-west corner resize updates width, height, left, top together while pinning bottom-right
+    vi.spyOn(miniChat, 'getBoundingClientRect').mockReturnValue({
+      left: 376, top: 148, width: 500, height: 500, right: 876, bottom: 648, x: 376, y: 148, toJSON: () => ({}),
+    });
+    const nwHandle = screen.getByTestId('mini-chat-resize-handle-nw');
+    fireEvent(nwHandle, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 376, clientY: 148, pointerId: 24,
+    }));
+    fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true }), {
+      clientX: 336, clientY: 108, pointerId: 24,
+    }));
+    expect(miniChat.style.width).toBe('540px');
+    expect(miniChat.style.height).toBe('540px');
+    expect(miniChat.style.left).toBe('336px');
+    expect(miniChat.style.top).toBe('108px');
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientX: 336, clientY: 108, pointerId: 24,
+    }));
+    expect(localStorage.getItem(storageKey)).toBe('540');
+    expect(JSON.parse(localStorage.getItem(`${storageKey}:layout`) || '{}')).toEqual({
+      width: 540,
+      x: 336,
+      y: 108,
+    });
+
+    // Verify iframe pointer-events block rule in styles.css
+    const stylesPath = process.cwd().endsWith('/web')
+      ? resolve(process.cwd(), 'src/styles.css')
+      : resolve(process.cwd(), 'web/src/styles.css');
+    const css = readFileSync(stylesPath, 'utf8');
+    expect(css).toMatch(/html\.imcodes-window-dragging\s+iframe\s*\{\s*pointer-events:\s*none\s*!important;\s*\}/);
+    expect(css).toContain('.cloud-docs-mini-chat-interaction-shield');
+  });
 });

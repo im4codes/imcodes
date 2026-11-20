@@ -35,6 +35,7 @@ import {
   isPointOverRemoteDesktopOverlay,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../remote-desktop-pointer-overlay.js';
+import { WINDOW_DRAGGING_CLASS } from './window-drag.js';
 import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import { isNative } from '../native.js';
 import { recordPerfRender } from '../perf-render-debug.js';
@@ -2162,7 +2163,10 @@ export function RemoteDesktopPanel({
     // desktop, which is why target ownership was rejected here originally.
     // `elementFromPoint` is pure geometry, so it answers the occlusion
     // question without inheriting that problem.
-    if (isPointOverRemoteDesktopOverlay(clientX, clientY)) {
+    if (
+      (typeof document !== 'undefined' && document.documentElement.classList.contains(WINDOW_DRAGGING_CLASS))
+      || isPointOverRemoteDesktopOverlay(clientX, clientY)
+    ) {
       pointerMovesOutsideRef.current += 1;
       return;
     }

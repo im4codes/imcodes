@@ -891,6 +891,20 @@ describe('RemoteDesktopWorkspace', () => {
     expect(miniChat.style.height).toBe('500px');
     expect(localStorage.getItem(REMOTE_DESKTOP_MINI_CHAT_HEIGHT_STORAGE_KEY)).toBe('500');
 
+    // Dragging header activates interaction shield with overlay class and blocks pointer fallthrough
+    const miniHeader = screen.getByTestId('cloud-docs-mini-chat-header');
+    fireEvent(miniHeader, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+      button: 0, clientX: 300, clientY: 300, pointerId: 12,
+    }));
+    const shield = screen.getByTestId('cloud-docs-mini-chat-interaction-shield');
+    expect(shield.classList.contains(REMOTE_DESKTOP_OVERLAY_CLASS)).toBe(true);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => shield)).toBe(true);
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(true);
+    fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true }), {
+      clientX: 300, clientY: 300, pointerId: 12,
+    }));
+    expect(document.documentElement.classList.contains('imcodes-window-dragging')).toBe(false);
+
     // Right-clicking inside mini-chat messages is NOT preventDefault'd by workspace chrome
     const chatMsgEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
     expect(screen.getByTestId('rd-mock-chat-view').dispatchEvent(chatMsgEvent)).toBe(true);

@@ -53,12 +53,13 @@ vi.mock('../../src/components/OfficePreview.js', () => ({
 
 const mainChatFloatSpy = vi.fn();
 vi.mock('../../src/components/CloudDocsMainChatFloat.js', () => ({
-  CloudDocsMainChatFloat: (props: { mainChat: unknown; activePreviewQuote?: unknown }) => {
+  CloudDocsMainChatFloat: (props: { mainChat: unknown; activePreviewQuote?: unknown; heightStorageKey?: string }) => {
     mainChatFloatSpy(props);
     return (
       <div
         data-testid="mock-cloud-docs-main-chat-float"
         data-active-quote={props.activePreviewQuote ? JSON.stringify(props.activePreviewQuote) : ''}
+        data-height-storage-key={props.heightStorageKey ?? ''}
       />
     );
   },
@@ -1971,21 +1972,32 @@ describe('CloudDocsPanel', () => {
     } as unknown as NonNullable<Parameters<typeof CloudDocsPanel>[0]['mainChat']>;
 
     try {
-      // In-app mounts main chat float in list view and attaches preview target when opened
+      // In-app omits main chat float in list view and mounts it only once a document is opened
       mainChatFloatSpy.mockClear();
       const { rerender } = render(<CloudDocsPanel initialTab="my_docs" mainChat={fakeMainChat} />);
-      await waitFor(() => expect(screen.getByTestId('mock-cloud-docs-main-chat-float')).toBeTruthy());
-      expect(screen.getByTestId('mock-cloud-docs-main-chat-float').getAttribute('data-active-quote')).toBe('');
+      await waitFor(() => expect(screen.getByText('Standalone.docx')).toBeTruthy());
+      expect(screen.queryByTestId('mock-cloud-docs-main-chat-float')).toBeNull();
 
       fireEvent.click(screen.getByText('Standalone.docx'));
       await waitFor(() => expect(screen.getByTestId('mock-office-preview')).toBeTruthy());
-      expect(JSON.parse(screen.getByTestId('mock-cloud-docs-main-chat-float').getAttribute('data-active-quote') || '{}')).toMatchObject({
+      const floatEl = screen.getByTestId('mock-cloud-docs-main-chat-float');
+      expect(JSON.parse(floatEl.getAttribute('data-active-quote') || '{}')).toMatchObject({
         kind: 'cloud_doc',
         docId: 'doc-bc-1',
         name: 'Standalone.docx',
       });
+      expect(floatEl.getAttribute('data-height-storage-key')).toBe('imcodes_cloud_docs_mini_chat_height_v1');
 
-      // Standalone omits floating main-session chat and uses BroadcastChannel for Quote
+      // Returning to list view removes the floating AI robot entrance
+      fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+      await waitFor(() => expect(screen.queryByTestId('mock-office-preview')).toBeNull());
+      expect(screen.queryByTestId('mock-cloud-docs-main-chat-float')).toBeNull();
+
+      // Re-open document, then switch to standalone -> omits floating main-session chat and uses BroadcastChannel for Quote
+      fireEvent.click(screen.getByText('Standalone.docx'));
+      await waitFor(() => expect(screen.getByTestId('mock-office-preview')).toBeTruthy());
+      expect(screen.getByTestId('mock-cloud-docs-main-chat-float')).toBeTruthy();
+
       rerender(<CloudDocsPanel initialTab="my_docs" standalone mainChat={fakeMainChat} />);
       expect(screen.queryByTestId('mock-cloud-docs-main-chat-float')).toBeNull();
       fireEvent.click(screen.getByTestId('cloud-docs-preview-quote'));
