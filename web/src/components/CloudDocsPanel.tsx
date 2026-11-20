@@ -67,6 +67,7 @@ export interface CloudDocsPanelProps {
   docRequest?: { docId: string; seq: number } | null;
   onQuoteDoc?: (target: CloudDocQuoteTarget) => void;
   mainChat?: CloudDocsMainChatContext | null;
+  onRemoteDesktopClick?: (targetId: string) => void;
 }
 
 type PreviewTarget =
@@ -436,6 +437,7 @@ export function CloudDocsPanel({
   docRequest = null,
   onQuoteDoc,
   mainChat = null,
+  onRemoteDesktopClick,
 }: CloudDocsPanelProps) {
   const { t } = useTranslation();
   const tRef = useRef(t);
@@ -2364,6 +2366,7 @@ export function CloudDocsPanel({
             mainChat={mainChat}
             activePreviewQuote={previewQuoteTarget}
             onOpenDoc={handleOpenDocFromMiniChat}
+            onRemoteDesktopClick={onRemoteDesktopClick}
             heightStorageKey={CLOUD_DOCS_MINI_CHAT_HEIGHT_STORAGE_KEY}
           />
         )}

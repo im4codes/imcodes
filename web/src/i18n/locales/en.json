@@ -5588,6 +5588,8 @@
       "thinking": "Thinking...",
       "reattach_doc": "Attach {{name}}",
       "reattach_doc_hint": "Re-attach \"{{name}}\" as quote context",
+      "reattach_remote_desktop": "Attach {{name}}",
+      "reattach_remote_desktop_hint": "Re-attach \"{{name}}\" as quote context",
       "resize_height": "Resize AI chat height"
     }
   },
@@ -5645,6 +5647,21 @@
     "auditor_none": "None",
     "project_label": "Project",
     "enter_session": "Open session",
-    "send_failed": "Failed to send message"
+    "send_failed": "Failed to send message",
+    "cancel_task": "Cancel task",
+    "close_task_done": "Close as done",
+    "cancel_confirm_title": "Cancel this task?",
+    "cancel_confirm_body": "\"{{title}}\" will be marked cancelled and stopped.",
+    "close_done_confirm_title": "Close task as done?",
+    "close_done_confirm_body": "\"{{title}}\" will be closed and marked done.",
+    "cancel_confirm_action": "Cancel task",
+    "close_done_confirm_action": "Close as done",
+    "cancel_keep": "Keep task",
+    "cancel_failed": "Failed to cancel task",
+    "close_error_offline": "Daemon is offline",
+    "close_error_timeout": "Request timed out",
+    "close_error_forbidden": "Only the server owner can cancel tasks",
+    "close_error_already_terminal": "Task is already closed",
+    "swipe_cancel_hint": "Cancel"
   }
 }

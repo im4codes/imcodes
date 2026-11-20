@@ -490,4 +490,108 @@ describe('ChatView — scroll ownership across commits', () => {
     });
     expect(queuedFrames).toHaveLength(0);
   });
+
+  it('starts from the bottom slice when crossing into virtualization (> 24 items) after chunked cold hydration', async () => {
+    const onLoadOlder = vi.fn();
+    const view = render(
+      <ChatView
+        events={[] as never}
+        loading
+        hasOlderHistory
+        onLoadOlder={onLoadOlder}
+        serverId="srv-idle"
+        sessionId={SESSION}
+      />,
+    );
+    const scrollEl = view.container.querySelector('.chat-view') as HTMLDivElement;
+
+    // Chunk 1 (10 items): still unvirtualized, layout establishes viewportRef > 0 while scrollTop starts at 0.
+    geometry.scrollHeight = 720;
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(10) as never}
+          loading={false}
+          hasOlderHistory
+          onLoadOlder={onLoadOlder}
+          serverId="srv-idle"
+          sessionId={SESSION}
+        />,
+      );
+    });
+    // Spurious browser/layout scroll at 0 during initial settle must not disengage or trigger Load Older.
+    geometry.scrollTop = 0;
+    fireEvent.scroll(scrollEl);
+
+    // Chunk 2 (30 items): crosses > 24 virtual threshold; first virtualized render must mount bottom slice, not top.
+    geometry.scrollHeight = 2160;
+    act(() => {
+      view.rerender(
+        <ChatView
+          events={events(30) as never}
+          loading={false}
+          hasOlderHistory
+          onLoadOlder={onLoadOlder}
+          serverId="srv-idle"
+          sessionId={SESSION}
+        />,
+      );
+    });
+    flushFrames();
+
+    expect(scrollEl.querySelector('[data-event-id="evt-29"]')).not.toBeNull();
+    expect(scrollEl.querySelector('[data-event-id="evt-0"]')).toBeNull();
+    expect(geometry.scrollTop).toBeGreaterThanOrEqual(2160 - geometry.clientHeight);
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(view.container.querySelector('.chat-scroll-btn')).toBeNull();
+  });
+
+  it('preserves real upward wheel scroll immediately after mount without snapping back', async () => {
+    const view = render(
+      <ChatView events={events(12) as never} loading={false} hasOlderHistory={false} sessionId={SESSION} />,
+    );
+    const scrollEl = view.container.querySelector('.chat-view') as HTMLDivElement;
+
+    // User scrolls up immediately before initial mount frames flush.
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    geometry.scrollTop = 500;
+    fireEvent.scroll(scrollEl);
+    flushFrames();
+
+    expect(geometry.scrollTop).toBe(500);
+    expect(view.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+  });
+
+  it('pins pre-seeded initial mount to the bottom synchronously before any rAF runs', () => {
+    geometry.scrollHeight = 1400;
+    const view = render(
+      <ChatView
+        events={events(15) as never}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-preseeded-short"
+        sessionId={SESSION}
+      />,
+    );
+    // Do NOT flush rAFs: initial mount commit itself must have pinned scrollTop before paint.
+    expect(geometry.scrollTop).toBe(1400 - geometry.clientHeight);
+    view.unmount();
+
+    geometry.scrollTop = 0;
+    geometry.scrollHeight = 2160;
+    const virtualView = render(
+      <ChatView
+        events={events(30) as never}
+        loading={false}
+        hasOlderHistory={false}
+        serverId="srv-preseeded-virtual"
+        sessionId={SESSION}
+      />,
+    );
+    const scrollEl = virtualView.container.querySelector('.chat-view') as HTMLDivElement;
+    // Still before any rAF runs: synchronous commit must sit at bottom with tail mounted.
+    expect(geometry.scrollTop).toBe(2160 - geometry.clientHeight);
+    expect(scrollEl.querySelector('[data-event-id="evt-29"]')).not.toBeNull();
+    expect(scrollEl.querySelector('[data-event-id="evt-0"]')).toBeNull();
+  });
 });

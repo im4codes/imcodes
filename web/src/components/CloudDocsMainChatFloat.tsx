@@ -17,6 +17,7 @@ import {
   formatCloudDocQuoteBadge,
   getCloudDocQuoteKey,
   sanitizeCloudDocQuoteName,
+  sanitizeRemoteDesktopCitationName,
   type CloudDocQuoteTarget,
 } from '../cloud-docs-reference.js';
 import { acquireWindowPointerInteractionGuard } from './window-drag.js';
@@ -59,6 +60,7 @@ interface CloudDocsMainChatFloatProps {
   mainChat: CloudDocsMainChatContext;
   activePreviewQuote?: CloudDocQuoteTarget | null;
   onOpenDoc?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   heightStorageKey?: string;
   defaultWidth?: number;
   minWidth?: number;
@@ -285,6 +287,7 @@ export function CloudDocsMainChatFloat({
   mainChat,
   activePreviewQuote = null,
   onOpenDoc,
+  onRemoteDesktopClick,
   heightStorageKey,
   defaultWidth = DEFAULT_MINI_CHAT_WIDTH,
   minWidth = DEFAULT_MINI_CHAT_MIN_WIDTH,
@@ -1030,6 +1033,7 @@ export function CloudDocsMainChatFloat({
               canManageFileShares={!isShareScopedState(session.sharedState)}
               onQuote={(text) => setExtraQuotes((prev) => [...prev, text])}
               onCloudDocClick={onOpenDoc}
+              onRemoteDesktopClick={onRemoteDesktopClick}
               agentType={session.agentType}
               onResendFailed={handleResendFailed}
               hideFilePanel
@@ -1037,23 +1041,29 @@ export function CloudDocsMainChatFloat({
             />
           </div>
 
-          {activePreviewQuote && activeDocKey && dismissedDocKey === activeDocKey && (
-            <div class="cloud-docs-mini-chat-doc-strip">
-              <button
-                type="button"
-                class="cloud-docs-mini-chat-reattach-btn"
-                onClick={() => setDismissedDocKey(null)}
-                data-testid="cloud-docs-mini-chat-reattach"
-                title={t('cloud_docs.ai_chat.reattach_doc_hint', {
-                  name: sanitizeCloudDocQuoteName(activePreviewQuote.name),
-                })}
-              >
-                + {t('cloud_docs.ai_chat.reattach_doc', {
-                  name: sanitizeCloudDocQuoteName(activePreviewQuote.name),
-                })}
-              </button>
-            </div>
-          )}
+          {activePreviewQuote && activeDocKey && dismissedDocKey === activeDocKey && (() => {
+            const isRemoteDesktop = activePreviewQuote.kind === 'remote_desktop';
+            const safeName = isRemoteDesktop
+              ? sanitizeRemoteDesktopCitationName(activePreviewQuote.name)
+              : sanitizeCloudDocQuoteName(activePreviewQuote.name);
+            return (
+              <div class="cloud-docs-mini-chat-doc-strip">
+                <button
+                  type="button"
+                  class="cloud-docs-mini-chat-reattach-btn"
+                  onClick={() => setDismissedDocKey(null)}
+                  data-testid="cloud-docs-mini-chat-reattach"
+                  title={isRemoteDesktop
+                    ? t('cloud_docs.ai_chat.reattach_remote_desktop_hint', { name: safeName })
+                    : t('cloud_docs.ai_chat.reattach_doc_hint', { name: safeName })}
+                >
+                  + {isRemoteDesktop
+                    ? t('cloud_docs.ai_chat.reattach_remote_desktop', { name: safeName })
+                    : t('cloud_docs.ai_chat.reattach_doc', { name: safeName })}
+                </button>
+              </div>
+            );
+          })()}
 
           <div class="cloud-docs-mini-chat-controls">
             <SessionControls

@@ -13,6 +13,11 @@ import {
   type GlobalTaskSummaryRow,
 } from '../../../shared/global-task-mode.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
+import {
+  fallbackReadableSessionDisplay,
+  isInternalSessionDisplayValue,
+  pickReadableSessionDisplay,
+} from '../../../shared/session-display.js';
 import type { Database } from './client.js';
 import { getFullServersByUserId, type DbServer, type DbSession } from './queries.js';
 
@@ -86,11 +91,24 @@ function mapRawSummaryRow(
   row: RawSummaryRow,
   serverMeta: { name: string; online: boolean },
   brainLabelFallback?: string,
+  brainProjectFallback?: string,
 ): GlobalTaskSummaryRow {
   const flags = parseFlagsJson(row.flags_json);
   const status = String(row.status || '');
   const brainSession = String(row.brain_session || '');
-  const brainLabel = cleanStr(row.brain_label) || cleanStr(brainLabelFallback) || brainSession;
+  const brainLabel = pickReadableSessionDisplay(
+    [brainLabelFallback, row.brain_label, brainProjectFallback, row.project_name],
+    brainSession,
+  ) ?? fallbackReadableSessionDisplay(brainSession, { defaultLabel: 'Brain', workerLabel: 'Worker' });
+  const rawExecutorLabel = cleanOptionalStr(row.executor_label);
+  const executorLabel = rawExecutorLabel && !isInternalSessionDisplayValue(rawExecutorLabel)
+    ? rawExecutorLabel
+    : undefined;
+  const auditor = cleanOptionalStr(row.auditor);
+  const rawAuditorLabel = cleanOptionalStr(row.auditor_label);
+  const auditorLabel = rawAuditorLabel && !isInternalSessionDisplayValue(rawAuditorLabel, auditor)
+    ? rawAuditorLabel
+    : undefined;
   const startedAt = typeof row.started_at === 'number' || (typeof row.started_at === 'string' && row.started_at !== '')
     ? (Number(row.started_at) || 0)
     : 0;
@@ -114,9 +132,9 @@ function mapRawSummaryRow(
       implemented: Number(row.checklist_implemented ?? 0),
       audited: Number(row.checklist_audited ?? 0),
     }),
-    ...(cleanOptionalStr(row.executor_label) ? { executorLabel: cleanOptionalStr(row.executor_label) } : {}),
-    ...(cleanOptionalStr(row.auditor_label) ? { auditorLabel: cleanOptionalStr(row.auditor_label) } : {}),
-    ...(cleanOptionalStr(row.auditor) ? { auditor: cleanOptionalStr(row.auditor) } : {}),
+    ...(executorLabel ? { executorLabel } : {}),
+    ...(auditorLabel ? { auditorLabel } : {}),
+    ...(auditor ? { auditor } : {}),
     ...(cleanOptionalStr(row.live_summary) ? { liveSummary: cleanOptionalStr(row.live_summary) } : {}),
     ...(startedAt > 0 ? { startedAt } : {}),
     ...(endedAt > 0 ? { endedAt } : {}),
@@ -378,15 +396,19 @@ export async function getGlobalTaskSummaryForServerTask(
   if (!serverMeta) return null;
 
   let brainLabelFallback: string | undefined;
+  let brainProjectFallback: string | undefined;
   if (row.brain_session) {
-    const sess = await db.queryOne<{ label: string | null }>(
-      'SELECT label FROM sessions WHERE server_id = $1 AND name = $2',
+    const sess = await db.queryOne<{ label: string | null; project_name: string | null }>(
+      'SELECT label, project_name FROM sessions WHERE server_id = $1 AND name = $2',
       [serverId, row.brain_session],
     );
-    if (sess?.label) brainLabelFallback = sess.label;
+    if (sess) {
+      brainLabelFallback = cleanOptionalStr(sess.label);
+      brainProjectFallback = cleanOptionalStr(sess.project_name);
+    }
   }
 
-  return mapRawSummaryRow(row, serverMeta, brainLabelFallback);
+  return mapRawSummaryRow(row, serverMeta, brainLabelFallback, brainProjectFallback);
 }
 
 export async function listGlobalTaskSnapshotForUser(
@@ -419,14 +441,20 @@ export async function listGlobalTaskSnapshotForUser(
     activeServerIds,
   );
 
-  const brainLabelByKey = new Map<string, string>();
+  const liveSessionLabelByKey = new Map<string, string>();
+  const liveSessionProjectByKey = new Map<string, string>();
   const brains: GlobalTaskBrainSummary[] = [];
   for (const sess of sessionRows) {
     if (!sess.name || sess.name.startsWith('deck_sub_')) continue;
     const meta = serverMetaById.get(sess.server_id);
     if (!meta) continue;
-    const label = cleanStr(sess.label) || sess.name;
-    brainLabelByKey.set(`${sess.server_id}\u0000${sess.name}`, label);
+    const key = `${sess.server_id}\u0000${sess.name}`;
+    const explicitLabel = cleanOptionalStr(sess.label);
+    const projectFallback = cleanOptionalStr(sess.project_name);
+    if (explicitLabel) liveSessionLabelByKey.set(key, explicitLabel);
+    if (projectFallback) liveSessionProjectByKey.set(key, projectFallback);
+    const label = pickReadableSessionDisplay([explicitLabel, projectFallback], sess.name)
+      ?? fallbackReadableSessionDisplay(sess.name, { defaultLabel: 'Brain', workerLabel: 'Worker' });
     brains.push({
       serverId: sess.server_id,
       serverName: meta.name,
@@ -461,10 +489,10 @@ export async function listGlobalTaskSnapshotForUser(
   for (const row of [...activeTaskRows, ...recentTerminalRows]) {
     const meta = serverMetaById.get(row.server_id);
     if (!meta) continue;
-    const brainFallback = row.brain_session
-      ? brainLabelByKey.get(`${row.server_id}\u0000${row.brain_session}`)
-      : undefined;
-    tasks.push(mapRawSummaryRow(row, meta, brainFallback));
+    const brainKey = row.brain_session ? `${row.server_id}\u0000${row.brain_session}` : '';
+    const brainFallback = brainKey ? liveSessionLabelByKey.get(brainKey) : undefined;
+    const projectFallback = brainKey ? liveSessionProjectByKey.get(brainKey) : undefined;
+    tasks.push(mapRawSummaryRow(row, meta, brainFallback, projectFallback));
   }
 
   return { tasks, brains, servers, ts };

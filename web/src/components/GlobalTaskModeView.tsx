@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
+import type { GlobalTaskBrainSummary, GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
+import { isInternalSessionDisplayValue, pickReadableSessionDisplay } from '@shared/session-display.js';
+import { taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { formatLabel } from '../format-label.js';
 import {
   brainKey,
   computeDefaultMutedServerIds,
   globalTaskModeStore,
   resolveQuickDispatchBrains,
+  resolveReadableSessionName,
   sortGlobalTaskServers,
   taskKey,
   type GlobalTaskModeState,
@@ -28,6 +32,15 @@ import { TtsQuickSettingsPopover } from './TtsQuickSettingsPopover.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
+import {
+  clampContextMenuPosition,
+  formatTaskPairCloseError,
+  TaskPairCloseConfirmDialog,
+  TaskPairContextMenu,
+  type TaskPairCloseConfirmTarget,
+  type TaskPairContextMenuItem,
+} from './TaskPairActionMenus.js';
+import type { TaskPairCloseAction } from '@shared/task-pair-close.js';
 
 export type GlobalTaskStatusFilter = 'all' | 'attention' | 'working' | 'audit' | 'done';
 
@@ -64,6 +77,12 @@ interface PressTracker {
 
 const LONG_PRESS_MS = 260;
 const MOVE_CANCEL_PX = 12;
+const SWIPE_START_DX_PX = -12;
+const SWIPE_VERTICAL_SLOP_PX = 10;
+const SWIPE_REVEAL_OFFSET_PX = -84;
+const SWIPE_MIN_OFFSET_PX = -112;
+const SWIPE_REVEAL_THRESHOLD_PX = 40;
+const SWIPE_CONFIRM_THRESHOLD_PX = 88;
 
 export const GLOBAL_TASK_TTS_MAX_AGE_MS = 2 * 60 * 1000;
 export const GLOBAL_TASK_TTS_CLOCK_SKEW_MS = 30 * 1000;
@@ -353,6 +372,24 @@ export function GlobalTaskModeView({
   const [addMessage, setAddMessage] = useState('');
   const [addSending, setAddSending] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+
+  const [revealedSwipeKey, setRevealedSwipeKey] = useState<string | null>(null);
+  const [draggingSwipe, setDraggingSwipe] = useState<{ key: string; offset: number } | null>(null);
+  const [cardContextMenu, setCardContextMenu] = useState<{ task: GlobalTaskSummaryRow; x: number; y: number } | null>(null);
+  const [closeConfirmTarget, setCloseConfirmTarget] = useState<TaskPairCloseConfirmTarget | null>(null);
+  const [closeSending, setCloseSending] = useState(false);
+  const [closeError, setCloseError] = useState<string | null>(null);
+  const swipeDragRef = useRef<{
+    key: string;
+    startX: number;
+    startY: number;
+    dx: number;
+    mode: 'undecided' | 'horizontal' | 'vertical';
+    source: 'touch' | 'pointer';
+    pointerId?: number;
+    baseOffset: number;
+  } | null>(null);
+  const suppressCardClickKeyRef = useRef<string | null>(null);
 
   // Refs for TTS lifecycle & press gestures
   const ttsAutoReadRef = useRef(ttsAutoRead);
@@ -670,6 +707,25 @@ export function GlobalTaskModeView({
     () => new Set(state.pinnedBrains.map((p) => brainKey(p.serverId, p.sessionName))),
     [state.pinnedBrains],
   );
+  const brainsByKey = useMemo(() => {
+    const map = new Map<string, GlobalTaskBrainSummary>();
+    for (const b of state.brains) {
+      map.set(brainKey(b.serverId, b.sessionName), b);
+    }
+    return map;
+  }, [state.brains]);
+
+  const resolveBrainLabel = useCallback((b: Pick<GlobalTaskBrainSummary, 'label' | 'projectName' | 'sessionName'>): string => (
+    resolveReadableSessionName([b.label, b.projectName], b.sessionName)
+  ), []);
+
+  const resolveTaskBrainLabel = useCallback((task: GlobalTaskSummaryRow): string => {
+    const liveBrain = brainsByKey.get(brainKey(task.serverId, task.brainSession));
+    return resolveReadableSessionName(
+      [liveBrain?.label, task.brainLabel, liveBrain?.projectName, task.projectName],
+      task.brainSession,
+    );
+  }, [brainsByKey]);
 
   const quickDispatchBrains = useMemo(
     () => resolveQuickDispatchBrains(
@@ -932,7 +988,7 @@ export function GlobalTaskModeView({
         text,
         locale,
         projectName: brainMeta?.projectName,
-        label: brainMeta?.label ?? addSessionName,
+        label: resolveReadableSessionName([brainMeta?.label, brainMeta?.projectName], addSessionName),
       });
       setAddModalOpen(false);
       setAddMessage('');
@@ -967,6 +1023,129 @@ export function GlobalTaskModeView({
       return next;
     });
   }, []);
+
+  const openCloseConfirm = useCallback((task: GlobalTaskSummaryRow, action: TaskPairCloseAction = 'cancel') => {
+    setRevealedSwipeKey(null);
+    setDraggingSwipe(null);
+    setCardContextMenu(null);
+    setCloseError(null);
+    setCloseConfirmTarget({
+      serverId: task.serverId,
+      taskId: task.taskId,
+      title: task.title,
+      action,
+      status: task.status,
+    });
+  }, []);
+
+  const handleConfirmCloseTask = useCallback(async () => {
+    const target = closeConfirmTarget;
+    if (!target || closeSending) return;
+    setCloseSending(true);
+    setCloseError(null);
+    try {
+      const result = await globalTaskModeStore.closeTaskPair({
+        serverId: target.serverId,
+        taskId: target.taskId,
+        action: target.action,
+        ...(target.action === 'done' ? { force: true } : {}),
+      });
+      if (!result.ok) {
+        setCloseError(formatTaskPairCloseError(result.error, (k, d) => t(k, d ?? k)));
+        return;
+      }
+      setCloseConfirmTarget(null);
+      setCloseError(null);
+    } catch (err) {
+      setCloseError(err instanceof Error ? err.message : t('taskMode.cancel_failed', 'Failed to cancel task'));
+    } finally {
+      setCloseSending(false);
+    }
+  }, [closeConfirmTarget, closeSending, t]);
+
+  const startCardSwipe = useCallback((
+    key: string,
+    task: GlobalTaskSummaryRow,
+    clientX: number,
+    clientY: number,
+    source: 'touch' | 'pointer',
+    eventTarget: EventTarget | null,
+    pointerId?: number,
+  ) => {
+    if (task.isTerminal) return;
+    if (source === 'pointer' && swipeDragRef.current?.source === 'touch') return;
+    const el = eventTarget as Element | null;
+    if (el?.closest?.('button, a, input, textarea, select')) return;
+    swipeDragRef.current = {
+      key,
+      startX: clientX,
+      startY: clientY,
+      dx: 0,
+      mode: 'undecided',
+      source,
+      pointerId,
+      baseOffset: revealedSwipeKey === key ? SWIPE_REVEAL_OFFSET_PX : 0,
+    };
+  }, [revealedSwipeKey]);
+
+  const moveCardSwipe = useCallback((
+    key: string,
+    clientX: number,
+    clientY: number,
+    source: 'touch' | 'pointer',
+    pointerId?: number,
+  ) => {
+    const drag = swipeDragRef.current;
+    if (!drag || drag.key !== key || drag.source !== source) return;
+    if (source === 'pointer' && pointerId !== drag.pointerId) return;
+    const dx = clientX - drag.startX;
+    const dy = clientY - drag.startY;
+    drag.dx = dx;
+    if (drag.mode === 'undecided') {
+      if (Math.abs(dy) > SWIPE_VERTICAL_SLOP_PX && Math.abs(dy) >= Math.abs(dx)) {
+        drag.mode = 'vertical';
+        setDraggingSwipe(null);
+        return;
+      }
+      const wantsHorizontalLeft = dx < SWIPE_START_DX_PX && Math.abs(dx) > Math.abs(dy) * 1.4;
+      const wantsDismissRight = drag.baseOffset < 0 && dx > 12 && Math.abs(dx) > Math.abs(dy) * 1.4;
+      if (wantsHorizontalLeft || wantsDismissRight) {
+        drag.mode = 'horizontal';
+        suppressCardClickKeyRef.current = key;
+      } else {
+        return;
+      }
+    }
+    if (drag.mode === 'horizontal') {
+      const nextOffset = Math.max(SWIPE_MIN_OFFSET_PX, Math.min(0, drag.baseOffset + dx));
+      setDraggingSwipe({ key, offset: nextOffset });
+    }
+  }, []);
+
+  const endCardSwipe = useCallback((
+    key: string,
+    task: GlobalTaskSummaryRow,
+    source: 'touch' | 'pointer',
+    cancelled = false,
+    pointerId?: number,
+  ) => {
+    const drag = swipeDragRef.current;
+    if (!drag || drag.key !== key || drag.source !== source) return;
+    if (source === 'pointer' && pointerId !== undefined && pointerId !== drag.pointerId) return;
+    swipeDragRef.current = null;
+    setDraggingSwipe(null);
+    if (cancelled || drag.mode !== 'horizontal') {
+      return;
+    }
+    const finalOffset = Math.max(SWIPE_MIN_OFFSET_PX, Math.min(0, drag.baseOffset + drag.dx));
+    if (!task.isTerminal && Math.abs(finalOffset) >= SWIPE_CONFIRM_THRESHOLD_PX) {
+      openCloseConfirm(task, 'cancel');
+    } else if (!task.isTerminal && Math.abs(finalOffset) >= SWIPE_REVEAL_THRESHOLD_PX) {
+      setRevealedSwipeKey(key);
+    } else {
+      setRevealedSwipeKey((prev) => (prev === key ? null : prev));
+    }
+  }, [openCloseConfirm]);
 
   const renderTaskStatusLabel = (task: GlobalTaskSummaryRow): string => {
     if (task.flags.includes('blocked')) return t('taskPair.flag.blocked');
@@ -1018,11 +1197,30 @@ export function GlobalTaskModeView({
       </span>
     ) : null;
 
+    const taskBrainLabel = resolveTaskBrainLabel(task);
+    const executorDisplay = (() => {
+      const normalized = taskPairDisplaySessionLabel('', task.executorLabel) ?? task.executorLabel?.trim();
+      const readable = pickReadableSessionDisplay([normalized]);
+      return readable ? formatLabel(readable) : t('taskPair.card_unassigned');
+    })();
+    const auditorDisplay = (() => {
+      if (task.auditor === 'none') return t('taskMode.auditor_none', 'None');
+      const normalized = task.auditorLabel
+        ? (taskPairDisplaySessionLabel(task.auditor ?? '', task.auditorLabel) ?? task.auditorLabel.trim())
+        : undefined;
+      const readable = pickReadableSessionDisplay([normalized], task.auditor);
+      if (readable) return formatLabel(readable);
+      if (task.auditor && !isInternalSessionDisplayValue(task.auditor)) {
+        return formatLabel(task.auditor);
+      }
+      return task.auditor ? t('taskPair.panel_auditor') : t('taskPair.card_unassigned');
+    })();
+
     const replySnapshot: TaskModeTargetSnapshot = {
       serverId: task.serverId,
       serverName: task.serverName,
       sessionName: task.brainSession,
-      label: task.brainLabel || task.brainSession,
+      label: taskBrainLabel,
       projectName: task.projectName,
       taskTitle: task.title,
       mode: 'reply',
@@ -1034,13 +1232,81 @@ export function GlobalTaskModeView({
       () => openVoiceInput(replySnapshot),
     );
 
+    const swipeOffset = !task.isTerminal
+      ? (draggingSwipe?.key === key ? draggingSwipe.offset : (revealedSwipeKey === key ? SWIPE_REVEAL_OFFSET_PX : 0))
+      : 0;
+    const isSwipeDragging = draggingSwipe?.key === key;
+
     return (
       <article
         key={key}
-        class={`global-task-card is-${tone}${task.isTerminal ? ' is-terminal' : ''}${expanded ? ' is-expanded' : ''}`}
+        class={`global-task-card is-${tone}${task.isTerminal ? ' is-terminal' : ''}${expanded ? ' is-expanded' : ''}${swipeOffset < 0 ? ' is-swiped' : ''}`}
         data-testid={`task-mode-card-${task.taskId}`}
-        onClick={() => toggleExpandTask(key)}
+        onClick={() => {
+          if (suppressCardClickKeyRef.current === key) {
+            suppressCardClickKeyRef.current = null;
+            return;
+          }
+          if (revealedSwipeKey === key) {
+            setRevealedSwipeKey(null);
+            return;
+          }
+          toggleExpandTask(key);
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const pos = clampContextMenuPosition(e.clientX, e.clientY, 210, 150);
+          setCardContextMenu({ task, x: pos.x, y: pos.y });
+        }}
+        onTouchStart={(e) => {
+          if (e.touches.length !== 1) return;
+          const touch = e.touches[0]!;
+          startCardSwipe(key, task, touch.clientX, touch.clientY, 'touch', e.target);
+        }}
+        onTouchMove={(e) => {
+          if (e.touches.length !== 1) return;
+          const touch = e.touches[0]!;
+          moveCardSwipe(key, touch.clientX, touch.clientY, 'touch');
+        }}
+        onTouchEnd={() => endCardSwipe(key, task, 'touch', false)}
+        onTouchCancel={() => endCardSwipe(key, task, 'touch', true)}
+        onPointerDown={(e) => {
+          if (e.pointerType !== 'touch') return;
+          startCardSwipe(key, task, e.clientX, e.clientY, 'pointer', e.target, e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          if (e.pointerType !== 'touch') return;
+          moveCardSwipe(key, e.clientX, e.clientY, 'pointer', e.pointerId);
+        }}
+        onPointerUp={(e) => {
+          if (e.pointerType !== 'touch') return;
+          endCardSwipe(key, task, 'pointer', false, e.pointerId);
+        }}
+        onPointerCancel={(e) => {
+          if (e.pointerType !== 'touch') return;
+          endCardSwipe(key, task, 'pointer', true, e.pointerId);
+        }}
       >
+        {!task.isTerminal && swipeOffset < 0 && (
+          <div class="global-task-swipe-action">
+            <button
+              type="button"
+              class="global-task-swipe-cancel-btn"
+              data-testid={`task-mode-swipe-cancel-${task.taskId}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                openCloseConfirm(task, 'cancel');
+              }}
+            >
+              {t('taskMode.swipe_cancel_hint', 'Cancel')}
+            </button>
+          </div>
+        )}
+        <div
+          class={`global-task-card-surface${isSwipeDragging ? ' is-dragging' : ''}`}
+          style={swipeOffset !== 0 ? { transform: `translateX(${swipeOffset}px)` } : undefined}
+        >
         <div class="global-task-card-main">
           <div class="global-task-card-content">
             <div class="global-task-card-meta">
@@ -1048,7 +1314,7 @@ export function GlobalTaskModeView({
                 <span class="global-task-dot" aria-hidden="true" />
                 <span class="global-task-tag-text">{task.serverName}</span>
               </span>
-              <span class="global-task-brain-tag" title={task.brainLabel || task.brainSession}>{task.brainLabel || task.brainSession}</span>
+              <span class="global-task-brain-tag" title={taskBrainLabel}>{taskBrainLabel}</span>
               <span class={`global-task-status-badge is-${tone}`}>{renderTaskStatusLabel(task)}</span>
               {task.round > 0 && (
                 <span class="global-task-round-badge">R{task.round}</span>
@@ -1122,11 +1388,9 @@ export function GlobalTaskModeView({
         {expanded && (
           <div class="global-task-card-details" data-testid={`task-mode-details-${task.taskId}`} onClick={(e) => e.stopPropagation()}>
             <div class="global-task-detail-row">
-              <span>{t('taskPair.card_executor')}: {task.executorLabel || t('taskPair.card_unassigned')}</span>
+              <span>{t('taskPair.card_executor')}: {executorDisplay}</span>
               <span>
-                {t('taskPair.card_auditor')}: {task.auditor === 'none'
-                  ? t('taskMode.auditor_none', 'None')
-                  : (task.auditorLabel || task.auditor || t('taskPair.card_unassigned'))}
+                {t('taskPair.card_auditor')}: {auditorDisplay}
               </span>
               {task.projectName && <span>{t('taskMode.project_label', 'Project')}: {task.projectName}</span>}
               {task.updatedAt > 0 && <span>{formatUpdatedRelative(task.updatedAt, locale)}</span>}
@@ -1155,6 +1419,7 @@ export function GlobalTaskModeView({
             </div>
           </div>
         )}
+        </div>
       </article>
     );
   };
@@ -1370,15 +1635,16 @@ export function GlobalTaskModeView({
           {quickDispatchBrains.length > 0 && (
             <div class="global-task-quickbar-list" data-testid="task-mode-quickbar-list">
               {quickDispatchBrains.map((brain: GlobalTaskQuickDispatchBrain) => {
+                const displayLabel = resolveBrainLabel(brain);
                 const dispatchSnapshot: TaskModeTargetSnapshot = {
                   serverId: brain.serverId,
                   serverName: brain.serverName,
                   sessionName: brain.sessionName,
-                  label: brain.label,
+                  label: displayLabel,
                   projectName: brain.projectName,
                   mode: 'dispatch',
                 };
-                const pillLabel = `${brain.serverName} · ${brain.label}`;
+                const pillLabel = `${brain.serverName} · ${displayLabel}`;
                 const pressProps = bindDualActionButton(
                   `brain:${brain.serverId}:${brain.sessionName}`,
                   () => openQuickComposer(dispatchSnapshot),
@@ -1414,7 +1680,7 @@ export function GlobalTaskModeView({
                         globalTaskModeStore.togglePinnedBrain({
                           serverId: brain.serverId,
                           sessionName: brain.sessionName,
-                          label: brain.label,
+                          label: displayLabel,
                           projectName: brain.projectName,
                         });
                       }}
@@ -1498,14 +1764,30 @@ export function GlobalTaskModeView({
                   <span class="global-task-composer-task-title">{composerTarget.taskTitle}</span>
                 )}
               </div>
-              <button
-                type="button"
-                class="global-task-modal-close"
-                aria-label={t('common.close', 'Close')}
-                onClick={() => setComposerTarget(null)}
-              >
-                ✕
-              </button>
+              <div class="global-task-composer-actions">
+                <button
+                  type="button"
+                  class="global-task-composer-enter-btn"
+                  data-testid="task-mode-composer-enter-session"
+                  onClick={() => {
+                    const { serverId, sessionName } = composerTarget;
+                    setComposerTarget(null);
+                    setComposerDraft('');
+                    setComposerError(null);
+                    onJumpToSession(serverId, sessionName);
+                  }}
+                >
+                  {t('taskMode.enter_session', 'Open session')}
+                </button>
+                <button
+                  type="button"
+                  class="global-task-modal-close"
+                  aria-label={t('common.close', 'Close')}
+                  onClick={() => setComposerTarget(null)}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {composerTarget.mode === 'reply' && (
@@ -1623,11 +1905,14 @@ export function GlobalTaskModeView({
                   value={addSessionName}
                   onChange={(e) => setAddSessionName((e.currentTarget as HTMLSelectElement).value)}
                 >
-                  {brainsForSelectedAddServer.map((b) => (
-                    <option key={b.sessionName} value={b.sessionName}>
-                      {b.label}{b.projectName ? ` (${b.projectName})` : ''}
-                    </option>
-                  ))}
+                  {brainsForSelectedAddServer.map((b) => {
+                    const displayLabel = resolveBrainLabel(b);
+                    return (
+                      <option key={b.sessionName} value={b.sessionName}>
+                        {displayLabel}{b.projectName && b.projectName !== displayLabel ? ` (${b.projectName})` : ''}
+                      </option>
+                    );
+                  })}
                 </select>
               </label>
             </div>
@@ -1643,7 +1928,7 @@ export function GlobalTaskModeView({
                     globalTaskModeStore.togglePinnedBrain({
                       serverId: addServerId,
                       sessionName: addSessionName,
-                      label: brain?.label ?? addSessionName,
+                      label: resolveReadableSessionName([brain?.label, brain?.projectName], addSessionName),
                       projectName: brain?.projectName,
                     });
                   }}
@@ -1684,7 +1969,7 @@ export function GlobalTaskModeView({
                     serverId: addServerId,
                     serverName: server?.name ?? addServerId,
                     sessionName: addSessionName,
-                    label: brain?.label ?? addSessionName,
+                    label: resolveReadableSessionName([brain?.label, brain?.projectName], addSessionName),
                     projectName: brain?.projectName ?? '',
                     mode: 'dispatch',
                     initialText: addMessage,
@@ -1720,6 +2005,72 @@ export function GlobalTaskModeView({
           onSend={handleVoiceSend}
         />
       )}
+
+      {cardContextMenu && (() => {
+        const ctxTask = cardContextMenu.task;
+        const ctxBrainLabel = resolveTaskBrainLabel(ctxTask);
+        const ctxReplySnapshot: TaskModeTargetSnapshot = {
+          serverId: ctxTask.serverId,
+          serverName: ctxTask.serverName,
+          sessionName: ctxTask.brainSession,
+          label: ctxBrainLabel,
+          projectName: ctxTask.projectName,
+          taskTitle: ctxTask.title,
+          mode: 'reply',
+        };
+        const items: TaskPairContextMenuItem[] = [];
+        if (!ctxTask.isTerminal) {
+          items.push({
+            id: 'cancel',
+            label: t('taskMode.cancel_task', 'Cancel task'),
+            danger: true,
+            testId: `task-mode-ctx-cancel-${ctxTask.taskId}`,
+            onSelect: () => openCloseConfirm(ctxTask, 'cancel'),
+          });
+          if (ctxTask.status === 'passed' || ctxTask.status === 'awaiting_brain_decision') {
+            items.push({
+              id: 'done',
+              label: t('taskMode.close_task_done', 'Close as done'),
+              testId: `task-mode-ctx-done-${ctxTask.taskId}`,
+              onSelect: () => openCloseConfirm(ctxTask, 'done'),
+            });
+          }
+        }
+        items.push({
+          id: 'open-session',
+          label: t('taskMode.enter_session', 'Open session'),
+          testId: `task-mode-ctx-open-${ctxTask.taskId}`,
+          onSelect: () => onJumpToSession(ctxTask.serverId, ctxTask.brainSession),
+        });
+        items.push({
+          id: 'reply',
+          label: ctxTask.isTerminal ? t('taskMode.follow_up', 'Follow up') : t('taskMode.reply', 'Reply'),
+          testId: `task-mode-ctx-reply-${ctxTask.taskId}`,
+          onSelect: () => openQuickComposer(ctxReplySnapshot),
+        });
+        return (
+          <TaskPairContextMenu
+            x={cardContextMenu.x}
+            y={cardContextMenu.y}
+            ariaLabel={ctxTask.title}
+            items={items}
+            onClose={() => setCardContextMenu(null)}
+          />
+        );
+      })()}
+
+      <TaskPairCloseConfirmDialog
+        target={closeConfirmTarget}
+        busy={closeSending}
+        error={closeError}
+        onCancel={() => {
+          if (!closeSending) {
+            setCloseConfirmTarget(null);
+            setCloseError(null);
+          }
+        }}
+        onConfirm={() => void handleConfirmCloseTask()}
+      />
     </div>
   );
 }

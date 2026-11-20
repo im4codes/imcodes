@@ -64,6 +64,7 @@ import { agentMcpRoutes } from './routes/agent-mcp.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
+import { taskPairsRoutes } from './routes/task-pairs.js';
 import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { onlyofficeRoutes } from './routes/onlyoffice.js';
 import { createCloudDocsRoutes } from './routes/cloud-docs.js';
@@ -777,6 +778,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api/server', sessionMgmtRoutes);
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
+  app.route('/api/server', taskPairsRoutes);
   app.route('/api/preferences', preferencesRoutes);
   // User-level alias store: flat, pod-independent (no serverId). Mounted under
   // /api/* so it inherits the global CORS + CSRF middleware.

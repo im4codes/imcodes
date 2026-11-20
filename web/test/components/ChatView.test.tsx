@@ -596,7 +596,7 @@ vi.mock('../../src/components/ChatMarkdown.js', async () => {
   return {
     ChatMarkdown: (props: Parameters<typeof actual.ChatMarkdown>[0]) => {
       chatMarkdownRenderSpy(props.text);
-      if (props.onCloudDocClick) {
+      if (props.onCloudDocClick || props.onRemoteDesktopClick) {
         return <actual.ChatMarkdown {...props} />;
       }
       const { text, onUrlClick } = props;
@@ -3420,6 +3420,48 @@ describe('ChatView', () => {
     expect(onPreviewFile.mock.calls[0]?.[0]).toMatchObject({ path: '/tmp/local.xlsx' });
   });
 
+  it('renders [RemoteDesktop: ...] chips in user and assistant messages and invokes onRemoteDesktopClick', () => {
+    const onRemoteDesktopClick = vi.fn();
+    const onPreviewFile = vi.fn();
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-rd',
+            type: 'user.message',
+            ts: new Date('2026-04-17T12:34:00Z').getTime(),
+            payload: { text: '[RemoteDesktop: Alpha Node | id=6000000001] 帮我检查桌面' },
+          },
+          {
+            eventId: 'evt-assistant-rd',
+            type: 'assistant.text',
+            ts: new Date('2026-04-17T12:35:00Z').getTime(),
+            payload: { text: '已打开 [RemoteDesktop: Beta Host | id=srv_beta_01] 并检查完成。' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        serverId="srv-1"
+        ws={{ fsReadFile: vi.fn() } as any}
+        onPreviewFile={onPreviewFile}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+
+    const userChip = container.querySelector('.chat-user .chat-remote-desktop-chip') as HTMLElement | null;
+    const assistantChip = container.querySelector('.chat-assistant .chat-remote-desktop-chip') as HTMLElement | null;
+    expect(userChip).toBeTruthy();
+    expect(assistantChip).toBeTruthy();
+    expect(userChip?.textContent).toContain('Alpha Node');
+    expect(assistantChip?.textContent).toContain('Beta Host');
+
+    fireEvent.click(userChip!);
+    fireEvent.click(assistantChip!);
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(1, '6000000001');
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(2, 'srv_beta_01');
+    expect(onPreviewFile).not.toHaveBeenCalled();
+  });
+
   it('hides split file panel toggle and right file browser when hideFilePanel is true', () => {
     const mockWs = {
       fsReadFile: vi.fn(),
@@ -3614,5 +3656,130 @@ describe('ChatView', () => {
     await waitFor(() => {
       expect(container.textContent).toContain('chat.no_events');
     });
+  });
+
+  it('keeps follow engaged and ignores spurious scrollTop=0 during pre-seeded mount and server switch', async () => {
+    const onLoadOlder = vi.fn();
+    const makeServerEvents = (serverTag: string, count: number) =>
+      Array.from({ length: count }, (_, idx) => ({
+        eventId: `${serverTag}-evt-${idx + 1}`,
+        type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+        ts: 1000 + idx,
+        epoch: 1,
+        seq: idx + 1,
+        sessionId: 'deck_shared_brain',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `${serverTag} message ${idx + 1}`, streaming: false },
+      }));
+
+    let scrollTopValue = 0;
+    let scrollHeightValue = 2_400;
+    const { container, rerender } = render(
+      <ChatView
+        events={makeServerEvents('srv-cached-a', 15) as any}
+        loading={false}
+        hasOlderHistory
+        onLoadOlder={onLoadOlder}
+        serverId="srv-cached-a"
+        sessionId="deck_shared_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, get: () => 400 });
+
+    // Simulate a layout/browser scroll event at scrollTop=0 before the initial pin rAF completes.
+    scrollTopValue = 0;
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => expect(scrollTopValue).toBe(2_400));
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Switch to another server with the same session name (scrollTop resets to 0 transiently).
+    scrollTopValue = 0;
+    scrollHeightValue = 3_200;
+    rerender(
+      <ChatView
+        events={makeServerEvents('srv-cached-b', 20) as any}
+        loading={false}
+        hasOlderHistory
+        onLoadOlder={onLoadOlder}
+        serverId="srv-cached-b"
+        sessionId="deck_shared_brain"
+      />,
+    );
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => expect(scrollTopValue).toBe(3_200));
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+  });
+
+  it('pins pre-seeded initial mount synchronously before any requestAnimationFrame flushes', () => {
+    const queuedFrames: FrameRequestCallback[] = [];
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      queuedFrames.push(cb);
+      return queuedFrames.length;
+    });
+    const cafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined);
+
+    let scrollTopValue = 0;
+    const isChatViewEl = (el: HTMLElement) =>
+      el.classList.contains('chat-view') && !el.classList.contains('chat-view-preview');
+    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? scrollTopValue : 0; },
+      set(this: HTMLElement, v: number) { if (isChatViewEl(this)) scrollTopValue = v; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? 2_400 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return isChatViewEl(this) ? 400 : 0; },
+    });
+
+    try {
+      const preSeeded = Array.from({ length: 15 }, (_, idx) => ({
+        eventId: `preseeded-${idx + 1}`,
+        type: idx % 2 === 0 ? 'user.message' : 'assistant.text',
+        ts: 1000 + idx,
+        epoch: 1,
+        seq: idx + 1,
+        sessionId: 'deck_preseeded_sync',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `message ${idx + 1}`, streaming: false },
+      }));
+
+      render(
+        <ChatView
+          events={preSeeded as any}
+          loading={false}
+          hasOlderHistory={false}
+          serverId="srv-preseeded-sync"
+          sessionId="deck_preseeded_sync"
+        />,
+      );
+
+      // Before flushing any rAF, synchronous layout commit must already be pinned at the bottom.
+      expect(scrollTopValue).toBeGreaterThanOrEqual(2_400 - 400);
+      expect(queuedFrames.length).toBeGreaterThan(0);
+    } finally {
+      rafSpy.mockRestore();
+      cafSpy.mockRestore();
+      for (const prop of ['scrollTop', 'scrollHeight', 'clientHeight']) {
+        delete (HTMLElement.prototype as unknown as Record<string, unknown>)[prop];
+      }
+    }
   });
 });

@@ -10,7 +10,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { marked, type Token, type Tokens } from 'marked';
+import { Marked, Tokenizer, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
 import {
   chatPathHasFileExtension,
@@ -26,6 +26,7 @@ import { repairStreamingMarkdown, STREAMING_MARKDOWN_REFRESH_MS } from '../strea
 import {
   renderChatPathActions,
   renderCloudDocAction,
+  renderRemoteDesktopAction,
   isImagePreviewPath,
   splitTextWithCloudDocsAndUrls,
   type ChatPathDownloadHandler,
@@ -35,6 +36,10 @@ import {
   findPairedCloudDocIdInTrailingText,
   parseCloudDocQuoteTag,
 } from '../cloud-docs-reference.js';
+import {
+  REMOTE_DESKTOP_CITATION_PREFIX,
+  parseRemoteDesktopCitationTag,
+} from '@shared/remote-desktop-reference.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import {
   ChatLoopbackLink,
@@ -49,6 +54,7 @@ interface Props {
   streaming?: boolean;
   onPathClick?: (path: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   /** Called to download a file path. Only shown for paths with extensions. */
   onDownload?: ChatPathDownloadHandler;
@@ -60,6 +66,7 @@ interface Props {
 interface RenderContext {
   onPathClick?: (path: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -77,6 +84,7 @@ function CodeBlock({
   text,
   onPathClick,
   onCloudDocClick,
+  onRemoteDesktopClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -89,6 +97,7 @@ function CodeBlock({
   text: string;
   onPathClick?: (path: string) => void;
   onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -111,6 +120,7 @@ function CodeBlock({
   const renderContext: RenderContext = {
     onPathClick,
     onCloudDocClick,
+    onRemoteDesktopClick,
     onUrlClick,
     onDownload,
     onHtmlPreview,
@@ -253,6 +263,15 @@ function renderToken(
             onCloudDocClick: ctx.onCloudDocClick,
           });
         }
+        const rdTag = parseRemoteDesktopCitationTag(t.text);
+        if (rdTag) {
+          return renderRemoteDesktopAction({
+            key,
+            targetId: rdTag.targetId,
+            content: rdTag.name,
+            onRemoteDesktopClick: ctx.onRemoteDesktopClick,
+          });
+        }
         const cloudDocIdToken = extractCloudDocIdToken(t.text);
         if (cloudDocIdToken) {
           return renderCloudDocAction({
@@ -309,6 +328,7 @@ function renderToken(
           text={t.text}
           onPathClick={ctx.onPathClick}
           onCloudDocClick={ctx.onCloudDocClick}
+          onRemoteDesktopClick={ctx.onRemoteDesktopClick}
           onUrlClick={ctx.onUrlClick}
           onDownload={ctx.onDownload}
           onHtmlPreview={ctx.onHtmlPreview}
@@ -477,14 +497,17 @@ function splitPathsAndUrlsInternal(
   ctx: RenderContext,
 ): h.JSX.Element[] {
   const hasCloudDocText = text.includes('cdoc_') || text.includes('[CloudDoc:');
+  const hasRemoteDesktopText = text.includes(REMOTE_DESKTOP_CITATION_PREFIX);
   if (
     !ctx.onPathClick
     && !ctx.onUrlClick
     && !ctx.onImagePreview
     && !ctx.onOpenLocalWebPreview
     && !ctx.onCloudDocClick
+    && !ctx.onRemoteDesktopClick
     && !ctx.trailingCloudDocId
     && !hasCloudDocText
+    && !hasRemoteDesktopText
   ) {
     return [<span>{text}</span>];
   }
@@ -493,7 +516,7 @@ function splitPathsAndUrlsInternal(
   // so preserve spaces and Unicode instead of letting the inline regex stop at
   // the first space. Prose containing a path still follows the conservative
   // token scanner below.
-  if (!hasCloudDocText) {
+  if (!hasCloudDocText && !hasRemoteDesktopText) {
     const standaloneRaw = text.trim();
     const standaloneMatches = findChatFileReferencesInText(standaloneRaw);
     const standaloneMatch = standaloneMatches.length === 1
@@ -534,6 +557,7 @@ function splitPathsAndUrlsInternal(
 
   return splitTextWithCloudDocsAndUrls(text, {
     onCloudDocClick: ctx.onCloudDocClick,
+    onRemoteDesktopClick: ctx.onRemoteDesktopClick,
     onUrlClick: ctx.onUrlClick,
     onOpenLocalWebPreview: ctx.onOpenLocalWebPreview,
     renderPlainText: (chunkText, baseOffset) => {
@@ -614,6 +638,32 @@ export function __getChatMarkdownCacheSizeForTests(): number {
   return markdownTokenCache.size;
 }
 
+// Bound quadratic inline emphasis/strikethrough backtracking in marked when a
+// message contains thousands of unclosed `*`, `_`, or `~` delimiters (e.g. globs
+// or raw logs under the 20k markdown limit). Once the failed-scan budget for a
+// single parse pass is exhausted, remaining unclosed delimiters degrade cleanly to
+// plain text instead of wedging the main thread.
+const MAX_FAILED_INLINE_SCAN_CHARS = 120_000;
+let activeFailedInlineScanBudget = { remaining: MAX_FAILED_INLINE_SCAN_CHARS };
+const chatMarkdownLexer = new Marked({
+  breaks: true,
+  gfm: true,
+  tokenizer: {
+    emStrong(src, maskedSrc, prevChar) {
+      if (activeFailedInlineScanBudget.remaining <= 0) return undefined;
+      const token = Tokenizer.prototype.emStrong.call(this, src, maskedSrc, prevChar);
+      if (!token) activeFailedInlineScanBudget.remaining -= maskedSrc.length;
+      return token;
+    },
+    del(src, maskedSrc, prevChar) {
+      if (activeFailedInlineScanBudget.remaining <= 0) return undefined;
+      const token = Tokenizer.prototype.del.call(this, src, maskedSrc, prevChar);
+      if (!token) activeFailedInlineScanBudget.remaining -= maskedSrc.length;
+      return token;
+    },
+  },
+});
+
 function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
   const normalized = normalizeLocalMarkdownDestinations(text);
   const key = cacheKey ? `${cacheKey}:${markdownRevision(normalized)}` : `text:${markdownRevision(normalized)}`;
@@ -623,7 +673,14 @@ function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
     markdownTokenCache.set(key, hit);
     return hit.tokens;
   }
-  const tokens = marked.lexer(normalized);
+  const previousBudget = activeFailedInlineScanBudget;
+  activeFailedInlineScanBudget = { remaining: MAX_FAILED_INLINE_SCAN_CHARS };
+  let tokens: Token[];
+  try {
+    tokens = chatMarkdownLexer.lexer(normalized);
+  } finally {
+    activeFailedInlineScanBudget = previousBudget;
+  }
   markdownTokenCache.set(key, { text: normalized, tokens });
   while (markdownTokenCache.size > MARKDOWN_CACHE_LIMIT) {
     const oldest = markdownTokenCache.keys().next().value;
@@ -633,7 +690,7 @@ function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
   return tokens;
 }
 
-export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, onCloudDocClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
+export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, onCloudDocClick, onRemoteDesktopClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
   const { t } = useTranslation();
   // A streaming block re-parses at most every STREAMING_MARKDOWN_REFRESH_MS
   // (a THROTTLE with a trailing update: a steady stream can never starve it, and
@@ -672,6 +729,7 @@ export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, o
   const renderContext = useMemo<RenderContext>(() => ({
     onPathClick,
     onCloudDocClick,
+    onRemoteDesktopClick,
     onUrlClick,
     onDownload,
     onHtmlPreview,
@@ -679,7 +737,7 @@ export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, o
     onOpenLocalWebPreview,
     downloadLabel: t('upload.download_file'),
     htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
-  }), [onPathClick, onCloudDocClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
+  }), [onPathClick, onCloudDocClick, onRemoteDesktopClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
 
   if (skipRichTextEnhancement) {
     return (

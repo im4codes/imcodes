@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { isInternalSessionDisplayValue, pickReadableSessionDisplay } from '../../shared/session-display.js';
+import {
+  fallbackReadableSessionDisplay,
+  isInternalSessionDisplayValue,
+  pickReadableSessionDisplay,
+} from '../../shared/session-display.js';
 
 describe('session display helpers', () => {
   it('treats internal session identifiers as unreadable display values', () => {
     expect(isInternalSessionDisplayValue('deck_cd_brain')).toBe(true);
     expect(isInternalSessionDisplayValue('deck_sub_ab12cd34')).toBe(true);
+    expect(isInternalSessionDisplayValue('deck_sub_pair_auto_6ac6fe82aa0aecfc')).toBe(true);
     expect(isInternalSessionDisplayValue('bootmainxowfy6', 'bootmainxowfy6')).toBe(true);
     expect(isInternalSessionDisplayValue('bootmainxowfy6')).toBe(true);
   });
@@ -17,7 +22,15 @@ describe('session display helpers', () => {
 
   it('picks the first readable display candidate', () => {
     expect(pickReadableSessionDisplay(['deck_sub_ab12cd34', 'deck_cd_brain', 'Readable Main'])).toBe('Readable Main');
+    expect(pickReadableSessionDisplay(['deck_sub_pair_auto_6ac6fe82aa0aecfc', 'Pair auditor'])).toBe('Pair auditor');
     expect(pickReadableSessionDisplay(['bootmainxowfy6', 'Boot Main'], 'bootmainxowfy6')).toBe('Boot Main');
     expect(pickReadableSessionDisplay(['bootmainxowfy6', 'Boot Main'], 'deck_sub_ab12cd34')).toBe('Boot Main');
+  });
+
+  it('produces safe generic readable fallbacks when all candidates are internal IDs', () => {
+    expect(fallbackReadableSessionDisplay('deck_cd_brain')).toBe('Brain');
+    expect(fallbackReadableSessionDisplay('bootmainxowfy6')).toBe('Brain');
+    expect(fallbackReadableSessionDisplay('deck_sub_pair_auto_6ac6fe82aa0aecfc')).toBe('Worker');
+    expect(fallbackReadableSessionDisplay('deck_proj_w2')).toBe('W2');
   });
 });

@@ -5578,6 +5578,8 @@
       "thinking": "Pensando...",
       "reattach_doc": "Adjuntar {{name}}",
       "reattach_doc_hint": "Volver a adjuntar \"{{name}}\" como contexto citado",
+      "reattach_remote_desktop": "Adjuntar {{name}}",
+      "reattach_remote_desktop_hint": "Volver a adjuntar \"{{name}}\" como contexto citado",
       "resize_height": "Ajustar altura del chat de IA"
     }
   },
@@ -5635,6 +5637,21 @@
     "auditor_none": "Ninguno",
     "project_label": "Proyecto",
     "enter_session": "Abrir sesión",
-    "send_failed": "Error al enviar el mensaje"
+    "send_failed": "Error al enviar el mensaje",
+    "cancel_task": "Cancelar tarea",
+    "close_task_done": "Cerrar como completada",
+    "cancel_confirm_title": "¿Cancelar esta tarea?",
+    "cancel_confirm_body": "«{{title}}» se detendrá y se marcará como cancelada.",
+    "close_done_confirm_title": "¿Cerrar tarea como completada?",
+    "close_done_confirm_body": "«{{title}}» se cerrará y se marcará como completada.",
+    "cancel_confirm_action": "Cancelar tarea",
+    "close_done_confirm_action": "Cerrar como completada",
+    "cancel_keep": "Mantener tarea",
+    "cancel_failed": "No se pudo cancelar la tarea",
+    "close_error_offline": "El demonio está desconectado",
+    "close_error_timeout": "Tiempo de espera agotado",
+    "close_error_forbidden": "Solo el propietario del servidor puede cancelar tareas",
+    "close_error_already_terminal": "La tarea ya está cerrada",
+    "swipe_cancel_hint": "Cancelar"
   }
 }

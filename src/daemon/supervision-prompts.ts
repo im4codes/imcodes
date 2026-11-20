@@ -37,7 +37,11 @@ import {
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_INERT_AUTHORIZATION_RULE, TASK_PAIR_MULTI_PHASE_CRON_TOKEN, TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE, TASK_PAIR_SPLIT_UNRELATED_TOKEN, TASK_PAIR_USER_FACING_TITLE_TOKEN, type TaskPairEngineState } from '../../shared/task-pair.js';
 import { TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN } from '../../shared/task-pair-workspace.js';
-import { CLOUD_DOC_OUTPUT_CONTRACT_ID, FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
+import {
+  CLOUD_DOC_OUTPUT_CONTRACT_ID,
+  FILE_OUTPUT_CONTRACT_ID,
+  REMOTE_DESKTOP_OUTPUT_CONTRACT_ID,
+} from '../../shared/file-output-contract.js';
 import {
   LOAD_VALIDATION_SAFETY_BY_LOCALE,
   LOAD_VALIDATION_SAFETY_CLAUSE,
@@ -773,7 +777,7 @@ export function buildSupervisionMessagingContract(): string {
       materialize: 'once_after_open_audit',
       eligibility: SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
       recovery: 'boot_sweep',
-      failure: 'Brain_same_object_manual_exact_route',
+      failure: 'Brain_same_object_exact',
       successChatter: false,
     },
     blocker: { immediateReply: true, fields: AGENT_DELEGATION_BLOCKER_REPORT_FIELDS },
@@ -802,7 +806,7 @@ export function buildSupervisionMessagingContract(): string {
       needsInput: 'only_when_brain_also_lacks_external_information',
     },
     determinate: {
-      direct: ['exact_pass_or_rework', 'unique_auditor_delivery', 'evidence_determined_repair'],
+      direct: ['exact_pass_or_rework', 'unique_auditor', 'evidence_repair'],
       brainChatter: false,
     },
     heartbeat: {
@@ -897,7 +901,7 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    `${CLOUD_DOC_OUTPUT_CONTRACT_ID}; ${FILE_OUTPUT_CONTRACT_ID}; auto-audit enabled; Brain coordinates and integrates.`,
+    `${CLOUD_DOC_OUTPUT_CONTRACT_ID}; ${REMOTE_DESKTOP_OUTPUT_CONTRACT_ID}; ${FILE_OUTPUT_CONTRACT_ID}; auto-audit enabled; Brain coordinates and integrates.`,
     JSON.stringify({ auditMode: true, beforePass: 'no_delivery_finalization', rework: 'fix_validate_fresh_audit', evidence: 'code_plus_exact_report_no_duplicate_run' }),
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
@@ -916,7 +920,7 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    `${CLOUD_DOC_OUTPUT_CONTRACT_ID}; ${FILE_OUTPUT_CONTRACT_ID}; auto-audit off.`,
+    `${CLOUD_DOC_OUTPUT_CONTRACT_ID}; ${REMOTE_DESKTOP_OUTPUT_CONTRACT_ID}; ${FILE_OUTPUT_CONTRACT_ID}; auto-audit off.`,
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
   ].join('');

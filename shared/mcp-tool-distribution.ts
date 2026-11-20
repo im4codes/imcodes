@@ -1,6 +1,7 @@
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from './agent-types.js';
 import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { CLOUD_DOC_CHAT_CITATION_PATTERN } from './cloud-docs.js';
+import { REMOTE_DESKTOP_CHAT_CITATION_PATTERN } from './remote-desktop-reference.js';
 
 /** Canonical shared contract for every IM.codes MCP-consuming runtime. */
 export const MCP_TOOL_DISTRIBUTION_CONTRACT_VERSION = 1 as const;
@@ -104,12 +105,13 @@ export const MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS = [
   'A fresh or resumed connection is callable-ready only after a validated complete tools/list generation; missing generation requires cold hydration before direct calls.',
   'If the exact selected tool is absent from the host schema, call mcp_tool_search again with that exact tool name; every exact tool result includes its registered inputSchema and exact fallback target. Then call mcp_tool_search with fallbackCall { name, arguments } satisfying that schema; the wrapper invokes only that registered tool through its original validation and authority handler.',
   'For OCU, Open Computer Use, computer use, or computer control requests, never infer unavailability from the initial callable list: search the exact alias ocu to publish the bounded file-transfer-computer-use group, then query the selected exact tool name (computer_use_docs or computer_use_call) for the same generic inputSchema/fallback contract when its live schema is absent.',
+  `When citing a Remote Desktop host or machine ID in chat, format it as \`${REMOTE_DESKTOP_CHAT_CITATION_PATTERN}\` using its canonical \`nodeId\` or \`serverId\` so the UI opens that Remote Desktop on click.`,
   'For Cloud Docs, 云文档, cloud doc, ONLYOFFICE, DocBuilder, or shared collaborative document tasks, never infer unavailability from the initial callable list: search "cloud doc", "云文档", or exact group "group:cloud-docs" via mcp_tool_search to publish cloud_docs (executes the unified imcodes cloud-docs CLI; start with `["list"]`, `["read","<docId>"]`, or `["docs"]`, and load detailed topics on demand with `["docs","--topic","quickstart|docx|xlsx|pptx|edit|convert|share|troubleshooting"]`, or pass fallbackCall { name: "cloud_docs", arguments }); in EVERY chat reply turn (including turn 2+, follow-ups, and after rename/edit) and EVERY mention within a reply, always cite `[CloudDoc: <name> | id=<docId>]` with the latest filename and `id=<docId>` (never drop `id=<docId>` on repeated mentions, and never output a bare filename, `` `<name>` ``, `<name> (id=...)`, or local Markdown link `[<name>](/path)`).',
   'Unknown or unregistered names, caller-supplied schemas, wildcard/prefix fallback, and full long-tail publication must fail closed.',
 ].join(' ');
 
 export const MEMORY_MCP_SERVER_INSTRUCTIONS =
-  `Cloud Docs (\`cdoc_*\`): in EVERY turn and EVERY mention (including renames and repeats), cite \`${CLOUD_DOC_CHAT_CITATION_PATTERN}\`; never write bare/backticked filenames, split \`name (id=...)\`, or \`[name](/path)\`.`;
+  `Cloud Docs (\`cdoc_*\`): in EVERY turn and EVERY mention cite \`${CLOUD_DOC_CHAT_CITATION_PATTERN}\`; never use bare/backticked names or \`[name](/path)\`. Remote Desktops: cite \`${REMOTE_DESKTOP_CHAT_CITATION_PATTERN}\`.`;
 
 export const MCP_TOOL_DISCOVERY_DESCRIPTION =
   'Use mcp_tool_search for one exact IM.codes tool/group. All are backend-active. After list_changed refetch every tools/list page; if the target stays absent, call again with exact fallbackCall { name, arguments }.';

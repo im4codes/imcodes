@@ -45,6 +45,7 @@ import {
   FILE_OUTPUT_CONTRACT_ID,
   buildCloudDocOutputContract,
   buildFileOutputContract,
+  buildRemoteDesktopOutputContract,
 } from './file-output-contract.js';
 
 /**
@@ -122,5 +123,5 @@ export function buildGeneratedImageReportingPrompt(): string {
  * outside user-authored prompt caps.
  */
 export function buildFilePathReportingPrompt(): string {
-  return `${buildFileOutputContract()}\n${buildCloudDocOutputContract()}`;
+  return `${buildFileOutputContract()}\n${buildCloudDocOutputContract()}\n${buildRemoteDesktopOutputContract()}`;
 }

@@ -52,6 +52,10 @@ import { ChatView } from '../src/components/ChatView.js';
 describe('scale & desktop unlock recovery', () => {
   afterEach(() => {
     cleanup();
+    for (const prop of ['clientHeight', 'scrollHeight', 'scrollTop']) {
+      delete (HTMLElement.prototype as any)[prop];
+    }
+    delete (document as any).visibilityState;
     vi.unstubAllGlobals();
     vi.useRealTimers();
     listSubSessionsMock.mockResolvedValue([]);
@@ -259,6 +263,37 @@ describe('scale & desktop unlock recovery', () => {
   });
 
   describe('Desktop ChatView VirtualChatList loop & ResizeObserver stability', () => {
+    const isMainChatScroll = (el: HTMLElement) =>
+      el.classList?.contains('chat-view') && !el.classList?.contains('chat-view-preview');
+
+    function installVirtualScrollGeometry(getClientHeight: () => number, totalHeight = 3200) {
+      let scrollTop = 0;
+      Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+        configurable: true,
+        get: () => getClientHeight(),
+      });
+      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+        configurable: true,
+        get(this: HTMLElement) { return isMainChatScroll(this) ? totalHeight : 0; },
+      });
+      Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+        configurable: true,
+        get(this: HTMLElement) { return isMainChatScroll(this) ? scrollTop : 0; },
+        set(this: HTMLElement, v: number) {
+          if (!isMainChatScroll(this)) return;
+          const maxTop = Math.max(0, totalHeight - getClientHeight());
+          scrollTop = Math.max(0, Math.min(v, maxTop));
+        },
+      });
+      return () => scrollTop;
+    }
+
+    function rowRect(vk: string, h: number, scrollTop: number): DOMRect {
+      const idx = Number(vk.split('-').pop() ?? 0);
+      const top = idx * 72 - scrollTop;
+      return { top, bottom: top + h, height: h, left: 0, right: 400, width: 400, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+    }
+
     it('bounds synchronous pre-paint layout oscillation to <= 3 passes and does not recreate ResizeObserver per layoutVersion', async () => {
       let observerConstructions = 0;
       class MockResizeObserver {
@@ -333,24 +368,20 @@ describe('scale & desktop unlock recovery', () => {
       vi.stubGlobal('ResizeObserver', MockResizeObserver);
 
       let currentClientHeight = 600;
-      let firstKey: string | null = null;
-      let targetKey: string | null = null;
+      const getScrollTop = installVirtualScrollGeometry(() => currentClientHeight);
+      const targetKey = 'ev-38';
       let targetFlip = false;
       const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
         const vk = this?.dataset?.virtualKey;
         if (vk) {
-          if (!firstKey) firstKey = vk;
-          else if (!targetKey && vk !== firstKey) targetKey = vk;
           if (vk === targetKey) {
             targetFlip = !targetFlip;
-            const h = targetFlip ? 42 : 56;
-            return { top: 0, bottom: h, height: h, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+            return rowRect(vk, targetFlip ? 42 : 56, getScrollTop());
           }
-          return { top: 0, bottom: 42, height: 42, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+          return rowRect(vk, 42, getScrollTop());
         }
         return { top: 0, bottom: currentClientHeight, height: currentClientHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
       });
-      Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => currentClientHeight });
 
       const makeEvents = (count: number) => Array.from({ length: count }, (_, i) => ({
         eventId: `ev-${i}`,
@@ -413,6 +444,8 @@ describe('scale & desktop unlock recovery', () => {
 
       rectSpy.mockRestore();
       delete (HTMLElement.prototype as any).clientHeight;
+      delete (HTMLElement.prototype as any).scrollHeight;
+      delete (HTMLElement.prototype as any).scrollTop;
     });
 
     it('bounds active ResizeObserver oscillation after visibilitychange resume and replenishes on item/viewport changes', async () => {
@@ -448,25 +481,22 @@ describe('scale & desktop unlock recovery', () => {
       vi.stubGlobal('ResizeObserver', ActiveResizeObserver);
 
       let currentClientHeight = 600;
-      let firstKey: string | null = null;
-      let targetKey: string | null = null;
+      const getScrollTop = installVirtualScrollGeometry(() => currentClientHeight);
+      const targetKey = 'ev-38';
       let currentTargetHeight = 42;
       let totalTargetRectReads = 0;
 
       const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
         const vk = this?.dataset?.virtualKey;
         if (vk) {
-          if (!firstKey) firstKey = vk;
-          else if (!targetKey && vk !== firstKey) targetKey = vk;
           if (vk === targetKey) {
             totalTargetRectReads += 1;
-            return { top: 0, bottom: currentTargetHeight, height: currentTargetHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+            return rowRect(vk, currentTargetHeight, getScrollTop());
           }
-          return { top: 0, bottom: 42, height: 42, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+          return rowRect(vk, 42, getScrollTop());
         }
         return { top: 0, bottom: currentClientHeight, height: currentClientHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
       });
-      Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => currentClientHeight });
 
       const rafQueue: FrameRequestCallback[] = [];
       vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
@@ -582,6 +612,8 @@ describe('scale & desktop unlock recovery', () => {
       nowSpy.mockRestore();
       rectSpy.mockRestore();
       delete (HTMLElement.prototype as any).clientHeight;
+      delete (HTMLElement.prototype as any).scrollHeight;
+      delete (HTMLElement.prototype as any).scrollTop;
       delete (document as any).visibilityState;
     });
 
@@ -618,25 +650,22 @@ describe('scale & desktop unlock recovery', () => {
       vi.stubGlobal('ResizeObserver', ActiveResizeObserver);
 
       let currentClientHeight = 600;
-      let firstKey: string | null = null;
-      let targetKey: string | null = null;
+      const getScrollTop = installVirtualScrollGeometry(() => currentClientHeight);
+      const targetKey = 'ev-col-38';
       let currentTargetHeight = 42;
       let totalTargetRectReads = 0;
 
       const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
         const vk = this?.dataset?.virtualKey;
         if (vk) {
-          if (!firstKey) firstKey = vk;
-          else if (!targetKey && vk !== firstKey) targetKey = vk;
           if (vk === targetKey) {
             totalTargetRectReads += 1;
-            return { top: 0, bottom: currentTargetHeight, height: currentTargetHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+            return rowRect(vk, currentTargetHeight, getScrollTop());
           }
-          return { top: 0, bottom: 42, height: 42, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+          return rowRect(vk, 42, getScrollTop());
         }
         return { top: 0, bottom: currentClientHeight, height: currentClientHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
       });
-      Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => currentClientHeight });
 
       let visibilityState: DocumentVisibilityState = 'visible';
       Object.defineProperty(document, 'visibilityState', {
@@ -695,6 +724,8 @@ describe('scale & desktop unlock recovery', () => {
 
       rectSpy.mockRestore();
       delete (HTMLElement.prototype as any).clientHeight;
+      delete (HTMLElement.prototype as any).scrollHeight;
+      delete (HTMLElement.prototype as any).scrollTop;
       delete (document as any).visibilityState;
     });
   });

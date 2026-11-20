@@ -5,8 +5,13 @@ import {
   sanitizeCloudDocCitationId,
   sanitizeCloudDocQuoteName,
 } from '../../shared/cloud-docs.js';
+import {
+  formatRemoteDesktopCitation,
+  sanitizeRemoteDesktopCitationId,
+  sanitizeRemoteDesktopCitationName,
+} from '../../shared/remote-desktop-reference.js';
 
-export { sanitizeCloudDocQuoteName };
+export { sanitizeCloudDocQuoteName, sanitizeRemoteDesktopCitationName };
 
 export type CloudDocQuoteTarget =
   | {
@@ -20,6 +25,13 @@ export type CloudDocQuoteTarget =
       path: string;
       name: string;
       serverId?: string;
+    }
+  | {
+      kind: 'remote_desktop';
+      id: string;
+      serverId: string;
+      nodeId?: string;
+      name: string;
     };
 
 export type ResolvedQuoteDestination =
@@ -35,6 +47,9 @@ const DEFAULT_FALLBACK_COMPOSER_RESERVE_PX = 140;
 export function getCloudDocQuoteKey(target: CloudDocQuoteTarget): string {
   if (target.kind === 'cloud_doc') {
     return `cloud_doc:${sanitizeCloudDocCitationId(target.docId)}`;
+  }
+  if (target.kind === 'remote_desktop') {
+    return `remote_desktop:${sanitizeRemoteDesktopCitationId(target.id)}`;
   }
   return `server_file:${target.serverId ?? ''}:${sanitizeCloudDocCitationId(target.path)}`;
 }
@@ -54,6 +69,9 @@ export function formatCloudDocQuoteText(target: CloudDocQuoteTarget): string {
 export function formatCloudDocQuoteBadge(target: CloudDocQuoteTarget): string {
   if (target.kind === 'cloud_doc') {
     return formatCloudDocCitation(target.name, target.docId);
+  }
+  if (target.kind === 'remote_desktop') {
+    return formatRemoteDesktopCitation(target.name, target.id);
   }
   const cleanPath = sanitizeCloudDocCitationId(target.path);
   return cleanPath.startsWith('@') ? cleanPath : `@${cleanPath}`;
@@ -264,7 +282,7 @@ export interface CloudDocTextSegment {
 
 const CLOUD_DOC_ID_BODY = 'cdoc_[A-Za-z0-9_-]{4,}';
 const CLOUD_DOC_QUOTE_TAG_EXACT_RE = /^\s*\[CloudDoc:\s*([^\]|\n]+?)\s*\|\s*id=([^\]\s]+)\]\s*$/;
-const CLOUD_DOC_QUOTE_TAG_GLOBAL_RE = /\[CloudDoc:\s*([^\]|\n]+?)\s*\|\s*id=([^\]\s]+)\]/g;
+const CLOUD_DOC_QUOTE_TAG_GLOBAL_RE = /\[CloudDoc:\s*([^\]|\n]{1,300}?)\s*\|\s*id=([^\]\s]{1,128})\]/g;
 const CLOUD_DOC_ID_EXACT_RE = new RegExp(`^\\s*(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})\\s*$`);
 const CLOUD_DOC_ID_GLOBAL_RE = new RegExp(`(?<![A-Za-z0-9_])(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})(?![A-Za-z0-9_-])`, 'g');
 const CLOUD_DOC_FIRST_ID_RE = new RegExp(`(?<![A-Za-z0-9_])(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})(?![A-Za-z0-9_-])`);

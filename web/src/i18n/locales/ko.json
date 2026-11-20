@@ -5577,6 +5577,8 @@
       "thinking": "생각 중...",
       "reattach_doc": "{{name}} 연결",
       "reattach_doc_hint": "\"{{name}}\" 문서를 인용 컨텍스트로 다시 연결",
+      "reattach_remote_desktop": "{{name}} 연결",
+      "reattach_remote_desktop_hint": "원격 데스크톱 \"{{name}}\"을 인용 컨텍스트로 다시 연결",
       "resize_height": "AI 채팅 높이 조절"
     }
   },
@@ -5634,6 +5636,21 @@
     "auditor_none": "없음",
     "project_label": "프로젝트",
     "enter_session": "세션 열기",
-    "send_failed": "메시지 전송 실패"
+    "send_failed": "메시지 전송 실패",
+    "cancel_task": "작업 취소",
+    "close_task_done": "완료로 닫기",
+    "cancel_confirm_title": "이 작업을 취소하시겠습니까?",
+    "cancel_confirm_body": "\"{{title}}\" 작업이 중단되고 취소됨으로 표시됩니다.",
+    "close_done_confirm_title": "작업을 완료로 닫으시겠습니까?",
+    "close_done_confirm_body": "\"{{title}}\" 작업을 닫고 완료로 표시합니다.",
+    "cancel_confirm_action": "취소 확인",
+    "close_done_confirm_action": "완료로 닫기",
+    "cancel_keep": "작업 유지",
+    "cancel_failed": "작업 취소에 실패했습니다",
+    "close_error_offline": "데몬이 오프라인입니다",
+    "close_error_timeout": "요청 시간이 초과되었습니다",
+    "close_error_forbidden": "서버 소유자만 작업을 취소할 수 있습니다",
+    "close_error_already_terminal": "작업이 이미 종료되었습니다",
+    "swipe_cancel_hint": "취소"
   }
 }

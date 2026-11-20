@@ -1783,6 +1783,8 @@ export interface TaskPairTransition {
   verdict?: TaskPairVerdictJudgementResult;
   /** Existing claim that blocked a CLAIM marker; exposed for actionable conflict reporting. */
   resourceConflict?: TaskPairResourceClaim;
+  /** Human-readable reason when a lifecycle marker is rejected, exposed to synchronous structured callers (MCP). */
+  rejectionReason?: string;
 }
 
 export interface TaskPairApplyContext {
@@ -2053,8 +2055,21 @@ function clearSideFlags(pair: TaskPairState, role: TaskPairRole, all = false): v
   }
 }
 
-function recorded(pair: TaskPairState | undefined, unusual = true, intents: TaskPairIntent[] = []): TaskPairTransition {
-  return { pair: undefined, fromStatus: pair?.status, toStatus: pair?.status, effect: 'recorded', unusual, intents };
+function recorded(
+  pair: TaskPairState | undefined,
+  unusual = true,
+  intents: TaskPairIntent[] = [],
+  rejectionReason?: string,
+): TaskPairTransition {
+  return {
+    pair: undefined,
+    fromStatus: pair?.status,
+    toStatus: pair?.status,
+    effect: 'recorded',
+    unusual,
+    intents,
+    ...(rejectionReason ? { rejectionReason } : {}),
+  };
 }
 
 /**
@@ -2283,9 +2298,14 @@ export function applyTaskPairMarker(
     pair, fromStatus, toStatus: pair.status, effect, unusual, intents, ...extra,
   });
   const reject = (text: string): TaskPairTransition => {
-    if (!spendCap(pair, 'policy_rejection', intents)) return recorded(existing);
+    if (ctx.source === 'mcp') {
+      // Structured MCP calls receive the rejection reason synchronously in their tool error;
+      // never spend the chat policy-rejection cap or inject a chat message into the caller's timeline.
+      return done('recorded', { unusual: true, rejectionReason: text });
+    }
+    if (!spendCap(pair, 'policy_rejection', intents)) return recorded(existing, true, [], text);
     intents.push({ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId, text });
-    return done('recorded', { unusual: true });
+    return done('recorded', { unusual: true, rejectionReason: text });
   };
 
   // A merge review may reject an already-audited result after PASS. Brain's
@@ -2562,7 +2582,7 @@ export function applyTaskPairMarker(
       return done('next_round');
     }
     case 'DONE': {
-      const force = role === 'brain' && isTrue(attrs.force);
+      const force = roleAuthority && isTrue(attrs.force);
       if (terminal && existing.status === 'done' && roleAuthority && attrs[TASK_PAIR_INTEGRATION_ATTR] === TASK_PAIR_INTEGRATION_DISMISS_VALUE) return dismissIntegration(existing, ctx.now);
       if (terminal) return recorded(existing, false);
       if (force) {
@@ -2572,7 +2592,7 @@ export function applyTaskPairMarker(
         intents.push({ kind: 'slot_changed' });
         return done('forced');
       }
-      if (hasAudit(pair) && role === 'executor' && pair.status === 'passed') {
+      if (hasAudit(pair) && (role === 'executor' || roleAuthority) && pair.status === 'passed') {
         applyOutputAttr(pair, attrs);
         pair.status = 'done';
         intents.push({ kind: 'slot_changed' });

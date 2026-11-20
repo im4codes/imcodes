@@ -5578,6 +5578,8 @@
       "thinking": "思考中...",
       "reattach_doc": "關聯 {{name}}",
       "reattach_doc_hint": "重新關聯「{{name}}」作為引用上下文",
+      "reattach_remote_desktop": "關聯 {{name}}",
+      "reattach_remote_desktop_hint": "重新關聯遠桌「{{name}}」作為引用上下文",
       "resize_height": "拖曳調整 AI 對話高度"
     }
   },
@@ -5635,6 +5637,21 @@
     "auditor_none": "無審計",
     "project_label": "專案",
     "enter_session": "進入該工作階段",
-    "send_failed": "傳送失敗"
+    "send_failed": "傳送失敗",
+    "cancel_task": "取消任務",
+    "close_task_done": "標記完成並關閉",
+    "cancel_confirm_title": "確認取消此任務？",
+    "cancel_confirm_body": "「{{title}}」將被終止並標記為已取消。",
+    "close_done_confirm_title": "確認完成並關閉任務？",
+    "close_done_confirm_body": "「{{title}}」將被關閉並標記為已完成。",
+    "cancel_confirm_action": "確認取消",
+    "close_done_confirm_action": "確認關閉",
+    "cancel_keep": "保留任務",
+    "cancel_failed": "取消任務失敗",
+    "close_error_offline": "節點離線，無法關閉任務",
+    "close_error_timeout": "請求逾時，請重試",
+    "close_error_forbidden": "僅伺服器擁有者可取消任務",
+    "close_error_already_terminal": "任務已處於結束狀態",
+    "swipe_cancel_hint": "取消"
   }
 }

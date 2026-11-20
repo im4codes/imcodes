@@ -201,31 +201,113 @@ interface MarkdownLinkMatch {
   value: string;
 }
 
-function matchUnwrappedLocalMarkdownLink(source: string, start: number): MarkdownLinkMatch | null {
+interface MatchingDelimiters {
+  closeBracketByOpen: Map<number, number>;
+  closeParenByOpen: Map<number, number>;
+  hasNonAngleLinkParen: boolean;
+}
+
+interface MonotonicCharState {
+  pos: number;
+  dead: boolean;
+}
+
+function findNextCharMonotonic(text: string, needle: string, from: number, state: MonotonicCharState): number {
+  if (state.dead) return -1;
+  if (state.pos >= from) return state.pos;
+  const idx = text.indexOf(needle, from);
+  if (idx < 0) {
+    state.dead = true;
+    return -1;
+  }
+  state.pos = idx;
+  return idx;
+}
+
+function findNextLineEndMonotonic(
+  text: string,
+  from: number,
+  lfState: MonotonicCharState,
+  crState: MonotonicCharState,
+): number {
+  const lf = findNextCharMonotonic(text, '\n', from, lfState);
+  const cr = findNextCharMonotonic(text, '\r', from, crState);
+  if (lf < 0) return cr < 0 ? text.length : cr;
+  if (cr < 0) return lf;
+  return Math.min(lf, cr);
+}
+
+function buildLineParenMap(source: string): {
+  closeParenByOpen: Map<number, number>;
+  hasNonAngleLinkParen: boolean;
+} {
+  const closeParenByOpen = new Map<number, number>();
+  let hasNonAngleLinkParen = false;
+  if (!source.includes('](') || (!source.includes(')') && !source.includes('）'))) {
+    return { closeParenByOpen, hasNonAngleLinkParen };
+  }
+  const parenStack: number[] = [];
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === '\n' || char === '\r') {
+      parenStack.length = 0;
+      continue;
+    }
+    if (char === '\\') {
+      if (parenStack.length > 0) i += 1;
+      continue;
+    }
+    if (char === '(' || char === '（') {
+      if (parenStack.length > 0 || (i > 0 && source[i - 1] === ']')) {
+        parenStack.push(i);
+      }
+    } else if ((char === ')' || char === '）') && parenStack.length > 0) {
+      const openIdx = parenStack.pop()!;
+      if (openIdx > 0 && source[openIdx - 1] === ']') {
+        closeParenByOpen.set(openIdx, i);
+        if (source[openIdx + 1] !== '<') {
+          hasNonAngleLinkParen = true;
+        }
+      }
+    }
+  }
+  return { closeParenByOpen, hasNonAngleLinkParen };
+}
+
+function buildMatchingDelimiters(source: string): MatchingDelimiters {
+  const closeBracketByOpen = new Map<number, number>();
+  const bracketStack: number[] = [];
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === '\\') {
+      if (bracketStack.length > 0) i += 1;
+      continue;
+    }
+    if (char === '[') {
+      bracketStack.push(i);
+    } else if (char === ']' && bracketStack.length > 0) {
+      const openIdx = bracketStack.pop()!;
+      if (source[i + 1] === '(') {
+        closeBracketByOpen.set(openIdx, i);
+      }
+    }
+  }
+  const { closeParenByOpen, hasNonAngleLinkParen } = buildLineParenMap(source);
+  return { closeBracketByOpen, closeParenByOpen, hasNonAngleLinkParen };
+}
+
+function matchUnwrappedLocalMarkdownLink(
+  source: string,
+  start: number,
+  delimiters: MatchingDelimiters,
+): MarkdownLinkMatch | null {
   const labelStart = source[start] === '!' ? start + 1 : start;
   if (source[labelStart] !== '[') return null;
-  let labelDepth = 1;
-  let labelEnd = -1;
-  for (let i = labelStart + 1; i < source.length; i += 1) {
-    if (source[i] === '\\') { i += 1; continue; }
-    if (source[i] === '[') labelDepth += 1;
-    if (source[i] === ']' && --labelDepth === 0) { labelEnd = i; break; }
-  }
+  const labelEnd = delimiters.closeBracketByOpen.get(labelStart) ?? -1;
   if (labelEnd < 0 || source[labelEnd + 1] !== '(' || source[labelEnd + 2] === '<') return null;
 
   const destinationStart = labelEnd + 2;
-  let depth = 0;
-  let destinationEnd = -1;
-  for (let i = destinationStart; i < source.length; i += 1) {
-    const char = source[i];
-    if (char === '\\') { i += 1; continue; }
-    if (char === '\n' || char === '\r') return null;
-    if (char === '(' || char === '（') { depth += 1; continue; }
-    if (char === ')' || char === '）') {
-      if (depth === 0) { destinationEnd = i; break; }
-      depth -= 1;
-    }
-  }
+  const destinationEnd = delimiters.closeParenByOpen.get(labelEnd + 1) ?? -1;
   if (destinationEnd < 0) return null;
   const destination = source.slice(destinationStart, destinationEnd);
   const normalized = normalizeChatFileReference(destination);
@@ -233,11 +315,19 @@ function matchUnwrappedLocalMarkdownLink(source: string, start: number): Markdow
   return { destinationStart, end: destinationEnd + 1, value: `${source.slice(start, destinationStart)}<${destination}>)` };
 }
 
-function transformOutsideMarkdownCode(
+function scanOutsideMarkdownCode(
   source: string,
-  transform: (source: string, start: number) => MarkdownLinkMatch | null,
-): string {
-  let output = '';
+  onCandidate: (start: number) => number,
+): void {
+  if (!source.includes('`') && !source.includes('~')) {
+    let pos = source.indexOf('[', 0);
+    while (pos >= 0) {
+      const candidateStart = pos > 0 && source[pos - 1] === '!' ? pos - 1 : pos;
+      const nextCursor = onCandidate(candidateStart);
+      pos = source.indexOf('[', nextCursor > pos ? nextCursor : pos + 1);
+    }
+    return;
+  }
   let cursor = 0;
   let codeDelimiter: { char: '`' | '~'; length: number } | null = null;
   while (cursor < source.length) {
@@ -251,70 +341,106 @@ function transformOutsideMarkdownCode(
       } else if (char === '`' || runLength >= 3) {
         codeDelimiter = { char, length: runLength };
       }
-      output += source.slice(cursor, runEnd);
       cursor = runEnd;
       continue;
     }
     if (!codeDelimiter && (char === '[' || (char === '!' && source[cursor + 1] === '['))) {
-      const match = transform(source, cursor);
-      if (match) { output += match.value; cursor = match.end; continue; }
+      const nextCursor = onCandidate(cursor);
+      if (nextCursor > cursor) {
+        cursor = nextCursor;
+        continue;
+      }
     }
-    output += char;
     cursor += 1;
   }
-  return output;
+}
+
+function normalizeLocalMarkdownDestinationsInternal(source: string): {
+  normalized: string;
+  delimiters: MatchingDelimiters | null;
+} {
+  if (!source.includes('](') || (!source.includes(')') && !source.includes('）'))) {
+    return { normalized: source, delimiters: null };
+  }
+  const delimiters = buildMatchingDelimiters(source);
+  if (!delimiters.hasNonAngleLinkParen) {
+    return { normalized: source, delimiters };
+  }
+  const parts: string[] = [];
+  let lastCopy = 0;
+  scanOutsideMarkdownCode(source, (start) => {
+    const match = matchUnwrappedLocalMarkdownLink(source, start, delimiters);
+    if (!match) return -1;
+    if (start > lastCopy) parts.push(source.slice(lastCopy, start));
+    parts.push(match.value);
+    lastCopy = match.end;
+    return match.end;
+  });
+  if (parts.length === 0) return { normalized: source, delimiters };
+  if (lastCopy < source.length) parts.push(source.slice(lastCopy));
+  return { normalized: parts.join(''), delimiters };
 }
 
 /** CommonMark requires destinations containing spaces to use `<...>`. */
 export function normalizeLocalMarkdownDestinations(source: string): string {
-  return transformOutsideMarkdownCode(source, matchUnwrappedLocalMarkdownLink);
+  return normalizeLocalMarkdownDestinationsInternal(source).normalized;
+}
+
+function extractMarkdownLocalFileDestinationsInternal(source: string): {
+  paths: string[];
+  normalized: string;
+  delimiters: MatchingDelimiters | null;
+} {
+  if (!source.includes('](') || (!source.includes(')') && !source.includes('）'))) {
+    return { paths: [], normalized: source, delimiters: null };
+  }
+  const { normalized, delimiters: initialDelimiters } = normalizeLocalMarkdownDestinationsInternal(source);
+  const delimiters = normalized === source && initialDelimiters ? initialDelimiters : buildMatchingDelimiters(normalized);
+  const paths = new Set<string>();
+  const angleState: MonotonicCharState = { pos: -1, dead: false };
+  const angleParenState: MonotonicCharState = { pos: -1, dead: false };
+  const lfState: MonotonicCharState = { pos: -1, dead: false };
+  const crState: MonotonicCharState = { pos: -1, dead: false };
+  scanOutsideMarkdownCode(normalized, (start) => {
+    const labelStart = normalized[start] === '!' ? start + 1 : start;
+    if (normalized[labelStart] !== '[') return -1;
+    const labelEnd = delimiters.closeBracketByOpen.get(labelStart) ?? -1;
+    if (labelEnd < 0 || normalized[labelEnd + 1] !== '(') return -1;
+    const destinationStart = labelEnd + 2;
+    let end = -1;
+    if (normalized[destinationStart] === '<') {
+      const lineEnd = findNextLineEndMonotonic(normalized, destinationStart, lfState, crState);
+      const angleEnd = findNextCharMonotonic(normalized, '>', destinationStart + 1, angleState);
+      if (angleEnd >= 0 && angleEnd < lineEnd) {
+        const parenEnd = findNextCharMonotonic(normalized, ')', angleEnd + 1, angleParenState);
+        if (parenEnd >= 0 && parenEnd < lineEnd) end = parenEnd;
+      }
+    } else {
+      end = delimiters.closeParenByOpen.get(labelEnd + 1) ?? -1;
+    }
+    if (end < 0) return -1;
+    const raw = normalized.slice(start, end + 1);
+    const path = rawMarkdownDestination(raw);
+    const canonical = path === null ? null : normalizeChatFileReference(path);
+    if (canonical && chatPathHasFileExtension(canonical)) paths.add(canonical);
+    return end + 1;
+  });
+  return { paths: [...paths], normalized, delimiters };
 }
 
 /** Exact local file destinations published through Markdown links/images. */
 export function extractMarkdownLocalFileDestinations(source: string): string[] {
-  const normalized = normalizeLocalMarkdownDestinations(source);
-  const paths = new Set<string>();
-  transformOutsideMarkdownCode(normalized, (text, start) => {
-    const labelStart = text[start] === '!' ? start + 1 : start;
-    let depth = 1;
-    let labelEnd = -1;
-    for (let i = labelStart + 1; i < text.length; i += 1) {
-      if (text[i] === '\\') { i += 1; continue; }
-      if (text[i] === '[') depth += 1;
-      if (text[i] === ']' && --depth === 0) { labelEnd = i; break; }
-    }
-    if (labelEnd < 0 || text[labelEnd + 1] !== '(') return null;
-    const destinationStart = labelEnd + 2;
-    let end = -1;
-    if (text[destinationStart] === '<') {
-      const angleEnd = text.indexOf('>', destinationStart + 1);
-      if (angleEnd >= 0) end = text.indexOf(')', angleEnd + 1);
-    } else {
-      let parenDepth = 0;
-      for (let i = destinationStart; i < text.length; i += 1) {
-        if (text[i] === '\\') { i += 1; continue; }
-        if (text[i] === '(' || text[i] === '（') parenDepth += 1;
-        else if ((text[i] === ')' || text[i] === '）') && parenDepth-- === 0) { end = i; break; }
-        if (text[i] === '\n' || text[i] === '\r') break;
-      }
-    }
-    if (end < 0) return null;
-    const raw = text.slice(start, end + 1);
-    const path = rawMarkdownDestination(raw);
-    const canonical = path === null ? null : normalizeChatFileReference(path);
-    if (canonical && chatPathHasFileExtension(canonical)) paths.add(canonical);
-    return { destinationStart, end: end + 1, value: raw };
-  });
-  return [...paths];
+  return extractMarkdownLocalFileDestinationsInternal(source).paths;
 }
 
 const FILE_REFERENCE_BOUNDARY = '(?=$|[\\s`,;!?，。；！？、\'"”’）】》」』]|\\.(?:\\s|$))';
-const ROOTED_FILE_REFERENCE_RE = new RegExp(`(?<![:/])(?:file:\\/\\/(?:localhost)?\\/|[A-Za-z]:[/\\\\]|~[/\\\\]|\\.{1,2}[/\\\\]|\\/)[^\`\\r\\n<>"|]*?\\.[\\p{L}\\p{N}]{1,10}(?::\\d+(?::\\d+)?)?${FILE_REFERENCE_BOUNDARY}`, 'giu');
+const ROOTED_FILE_REFERENCE_RE = new RegExp(`(?<![:/])(?:file:\\/\\/(?:localhost)?\\/|[A-Za-z]:[/\\\\]|~[/\\\\]|\\.{1,2}[/\\\\]|\\/)[^\`\\r\\n<>"|]{0,512}?\\.[\\p{L}\\p{N}]{1,10}(?::\\d+(?::\\d+)?)?${FILE_REFERENCE_BOUNDARY}`, 'giu');
 const RELATIVE_FILE_REFERENCE_RE = new RegExp(`(?<![:/\\\\\\w\\p{L}.$~()（）-])(?:[\\w\\p{L}.$~()（）-]+[/\\\\])+[\\w\\p{L}.$~()（）-]+\\.[\\p{L}\\p{N}]{1,10}(?::\\d+(?::\\d+)?)?${FILE_REFERENCE_BOUNDARY}`, 'gu');
-const BARE_FILE_REFERENCE_RE = new RegExp(`(?<![:/\\w\\p{L}])[\\w\\p{L}.$~()（）-]+\\.[\\p{L}\\p{N}]{1,10}(?::\\d+(?::\\d+)?)?${FILE_REFERENCE_BOUNDARY}`, 'gu');
+const BARE_FILE_REFERENCE_RE = new RegExp(`(?<![:/\\w\\p{L}.$~-])[\\w\\p{L}.$~()（）-]+\\.[\\p{L}\\p{N}]{1,10}(?::\\d+(?::\\d+)?)?${FILE_REFERENCE_BOUNDARY}`, 'gu');
 const COMMON_WEB_TLD_RE = /\.(?:com|net|org|io|ai|app|dev|cn|co|me|info|biz|xyz|top|site)$/i;
 
 export function findChatFileReferencesInText(text: string): ChatFileReferenceMatch[] {
+  if (!text || !text.includes('.')) return [];
   const matches: ChatFileReferenceMatch[] = [];
   const occupied: Array<[number, number]> = [];
   const collect = (regexp: RegExp) => {
@@ -338,16 +464,71 @@ export function findChatFileReferencesInText(text: string): ChatFileReferenceMat
   return matches.sort((left, right) => left.start - right.start);
 }
 
+function maskMarkdownLinks(source: string, precomputedCloseParenByOpen?: Map<number, number>): string {
+  if (!source.includes('](') || (!source.includes(')') && !source.includes('）'))) return source;
+  const closeParenByOpen = precomputedCloseParenByOpen ?? buildLineParenMap(source).closeParenByOpen;
+  const out: string[] = [];
+  let cursor = 0;
+  let openStart = -1;
+  const angleState: MonotonicCharState = { pos: -1, dead: false };
+  const parenState: MonotonicCharState = { pos: -1, dead: false };
+  const lfState: MonotonicCharState = { pos: -1, dead: false };
+  const crState: MonotonicCharState = { pos: -1, dead: false };
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === '\n' || ch === '\r') {
+      openStart = -1;
+      continue;
+    }
+    if (ch === '[') {
+      if (openStart < 0) openStart = i > 0 && source[i - 1] === '!' ? i - 1 : i;
+      continue;
+    }
+    if (ch === ']') {
+      if (openStart >= 0 && source[i + 1] === '(') {
+        const destStart = i + 2;
+        const lineEnd = findNextLineEndMonotonic(source, destStart, lfState, crState);
+        let end = -1;
+        if (source[destStart] === '<') {
+          const angleEnd = findNextCharMonotonic(source, '>', destStart + 1, angleState);
+          if (angleEnd >= 0 && angleEnd < lineEnd && source[angleEnd + 1] === ')') {
+            end = angleEnd + 2;
+          }
+        }
+        if (end < 0) {
+          const balancedClose = closeParenByOpen.get(i + 1);
+          if (balancedClose !== undefined && balancedClose < lineEnd) {
+            end = balancedClose + 1;
+          } else {
+            const closeParen = findNextCharMonotonic(source, ')', destStart, parenState);
+            if (closeParen >= 0 && closeParen < lineEnd) {
+              end = closeParen + 1;
+            }
+          }
+        }
+        if (end > openStart) {
+          if (openStart > cursor) out.push(source.slice(cursor, openStart));
+          out.push(' '.repeat(end - openStart));
+          cursor = end;
+          i = end - 1;
+        }
+      }
+      openStart = -1;
+    }
+  }
+  if (cursor === 0) return source;
+  if (cursor < source.length) out.push(source.slice(cursor));
+  return out.join('');
+}
+
 /** All explicit AI-authored file references accepted by the chat renderer. */
 export function extractChatFileReferences(source: string): string[] {
-  const paths = new Set(extractMarkdownLocalFileDestinations(source));
+  const { paths: localPaths, normalized, delimiters } = extractMarkdownLocalFileDestinationsInternal(source);
+  const paths = new Set(localPaths);
   // Do not let a display label from a remote/rejected Markdown link become a
   // separate read grant. Local destinations were extracted authoritatively
   // above; mask every link/image before scanning legacy plain-text forms.
-  const legacySource = normalizeLocalMarkdownDestinations(source).replace(
-    /!?\[[^\]\r\n]*\]\((?:<[^>\r\n]*>|[^\r\n)]*)\)/g,
-    (raw) => ' '.repeat(raw.length),
-  );
+  const legacySource = maskMarkdownLinks(normalized, delimiters?.closeParenByOpen);
   for (const match of findChatFileReferencesInText(legacySource)) paths.add(match.path);
   // Complete lines preserve spaces in unwrapped old-format paths/code blocks.
   for (const line of legacySource.split(/\r?\n/)) {

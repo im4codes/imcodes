@@ -35,6 +35,8 @@ export interface PanelRenderContext {
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   /** Open a Cloud Docs preview by document ID. */
   onCloudDocClick?: (docId: string) => void;
+  /** Open a Remote Desktop window by nodeId or serverId. */
+  onRemoteDesktopClick?: (targetId: string) => void;
   /** Sync preview state from a source FileBrowser into the floating preview host/cache. */
   onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
   /** Current active session name — for file browser to follow tab switches */

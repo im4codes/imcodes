@@ -227,7 +227,8 @@ import {
   reorderRemoteDesktopWorkspaceHost,
 } from './remote-desktop-workspace-state.js';
 import { DaemonRemoteDesktopControl } from './components/DaemonRemoteDesktopControl.js';
-import type { MachineListItem } from './api/machines.js';
+import { listControllableMachines, type MachineListItem } from './api/machines.js';
+import { openRemoteDesktopReference } from './remote-desktop-open.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
@@ -3219,6 +3220,8 @@ function InternalMainApp() {
   const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
     createRemoteDesktopWorkspaceState,
   );
+  const remoteDesktopWorkspaceRef = useRef(remoteDesktopWorkspace);
+  remoteDesktopWorkspaceRef.current = remoteDesktopWorkspace;
   const [remoteDesktopWorkspaceMinimized, setRemoteDesktopWorkspaceMinimized] = useState(false);
   const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
   const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
@@ -3262,6 +3265,20 @@ function InternalMainApp() {
       publicNodeId: typeof initialPublicNodeId === 'string' ? initialPublicNodeId : undefined,
     });
   }, []);
+
+  const handleOpenRemoteDesktopRef = useCallback((targetId: string) => {
+    void openRemoteDesktopReference(targetId, {
+      workspace: remoteDesktopWorkspaceRef.current,
+      machines: [],
+      refetchMachines: listControllableMachines,
+      servers: serversRef.current,
+      selectedServerId,
+      selectedServerCapabilities: wsRef.current?.getDaemonCapabilitySnapshot()?.capabilities ?? [],
+      openRemoteDesktop,
+      openRemoteDesktopById,
+      openControlledNodes,
+    });
+  }, [openControlledNodes, openRemoteDesktop, openRemoteDesktopById, selectedServerId]);
 
   const closeRemoteDesktopWall = useCallback((hostKeys: readonly string[]) => {
     const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
@@ -8945,6 +8962,7 @@ function InternalMainApp() {
       onOpenNodeGroups: openControlledNodes,
       onOpenLocalWebPreview: openLocalWebPreviewFromChat,
       onCloudDocClick: openCloudDocPreview,
+      onRemoteDesktopClick: handleOpenRemoteDesktopRef,
       onPreviewStateChange: handlePreviewStateChange,
       activeSession: sidebarActiveSession,
       activeProjectDir: sidebarProjectDir,
@@ -9934,6 +9952,7 @@ function InternalMainApp() {
                 onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
                 onOpenLocalWebPreview={openLocalWebPreviewFromChat}
                 onCloudDocClick={openCloudDocPreview}
+                onRemoteDesktopClick={handleOpenRemoteDesktopRef}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -10708,6 +10727,7 @@ function InternalMainApp() {
             docRequest={cloudDocsRequest}
             onQuoteDoc={handleQuoteCloudDoc}
             mainChat={cloudDocsMainChatContext}
+            onRemoteDesktopClick={handleOpenRemoteDesktopRef}
           />
         </FloatingPanel>
       )}
@@ -10718,6 +10738,8 @@ function InternalMainApp() {
           manager={remoteDesktopConnectionManager}
           quickData={quickData}
           mainChat={cloudDocsMainChatContext}
+          onOpenDoc={openCloudDocPreview}
+          onRemoteDesktopClick={handleOpenRemoteDesktopRef}
           ws={wsRef.current}
           minimized={remoteDesktopWorkspaceMinimized}
           zIndex={getDesktopWindowZIndex(
@@ -11022,6 +11044,7 @@ function InternalMainApp() {
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
               onOpenLocalWebPreview={openLocalWebPreviewFromChat}
               onCloudDocClick={openCloudDocPreview}
+              onRemoteDesktopClick={handleOpenRemoteDesktopRef}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
               onFocus={() => bringSubToFront(sub.id)}
               desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}

@@ -11405,6 +11405,38 @@ html.imcodes-window-dragging iframe { pointer-events: none !important; }
 }
 .chat-cloud-doc-link.is-clickable { cursor: pointer; }
 .chat-cloud-doc-link.is-clickable:hover { color: #7dd3fc; }
+.chat-remote-desktop-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 8px;
+  margin: 1px 2px;
+  border-radius: 6px;
+  border: 1px solid rgba(52, 211, 153, 0.42);
+  background: rgba(16, 185, 129, 0.14);
+  color: #d1fae5;
+  font: inherit;
+  font-size: 0.92em;
+  line-height: 1.35;
+  vertical-align: middle;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.chat-remote-desktop-chip:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.24);
+  border-color: rgba(52, 211, 153, 0.72);
+}
+.chat-remote-desktop-chip:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+.chat-remote-desktop-icon { flex-shrink: 0; color: #6ee7b7; }
+.chat-remote-desktop-label {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .chat-dl-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 0 2px; margin-left: 2px; vertical-align: middle; line-height: 1; }
 .chat-dl-btn:hover { color: #818cf8; }
 .chat-dl-btn:disabled { cursor: wait; opacity: 0.8; }
@@ -23644,17 +23676,64 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 
 .global-task-card {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 7px 9px;
   border-radius: 8px;
   border: 1px solid rgba(148, 163, 184, 0.18);
   background: rgba(15, 23, 42, 0.85);
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
+  overflow: hidden;
+  touch-action: pan-y;
   cursor: pointer;
+}
+
+.global-task-card-surface {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 9px;
+  background: rgb(15, 23, 42);
+  border-radius: 7px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  transition: transform 160ms ease;
+}
+
+.global-task-card-surface.is-dragging {
+  transition: none;
+}
+
+.global-task-swipe-action {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 84px;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  z-index: 0;
+}
+
+.global-task-swipe-cancel-btn {
+  width: 100%;
+  border: 0;
+  background: #dc2626;
+  color: #fef2f2;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0 8px;
+}
+
+.global-task-swipe-cancel-btn:hover {
+  background: #b91c1c;
 }
 
 .global-task-card.is-attention {
@@ -23667,6 +23746,9 @@ html.native-ios-mac .global-task-mode-entry-btn {
 
 .global-task-card.is-terminal {
   opacity: 0.78;
+}
+
+.global-task-card.is-terminal .global-task-card-surface {
   padding: 6px 9px;
 }
 
@@ -24060,6 +24142,25 @@ html.native-ios-mac .global-task-mode-entry-btn {
   word-break: break-word;
 }
 
+.global-task-composer-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.global-task-composer-enter-btn {
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  background: rgba(14, 165, 233, 0.16);
+  color: #bae6fd;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
 .global-task-modal-close {
   border: 0;
   background: transparent;
@@ -24184,6 +24285,100 @@ html.native-ios-mac .global-task-mode-entry-btn {
   font-size: 12px;
 }
 
+.task-pair-context-menu {
+  position: fixed;
+  z-index: 10040;
+  min-width: 180px;
+  max-width: min(260px, calc(100vw - 16px));
+  padding: 4px;
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: #0f172a;
+  color: #e2e8f0;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.52);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.task-pair-context-menu-item {
+  width: 100%;
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: transparent;
+  color: #e2e8f0;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-pair-context-menu-item:hover:not(:disabled) {
+  background: rgba(51, 65, 85, 0.72);
+}
+
+.task-pair-context-menu-item.is-danger:not(:disabled) {
+  color: #fca5a5;
+}
+
+.task-pair-context-menu-item.is-danger:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.22);
+  color: #fecaca;
+}
+
+.task-pair-context-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.task-pair-close-confirm-backdrop {
+  z-index: 10050;
+}
+
+.task-pair-close-confirm-body {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: #cbd5e1;
+}
+
+.task-pair-close-keep-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(30, 41, 59, 0.85);
+  color: #e2e8f0;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.task-pair-close-keep-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.task-pair-close-confirm-btn {
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 0;
+  background: #dc2626;
+  color: #fef2f2;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.task-pair-close-confirm-btn:hover:not(:disabled) {
+  background: #b91c1c;
+}
+
+.task-pair-close-confirm-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 @media (max-width: 720px) {
   .global-task-mode-topbar {
     padding: 8px 10px;
@@ -24250,11 +24445,17 @@ html.native-ios-mac .global-task-mode-entry-btn {
     gap: 6px;
   }
   .global-task-card {
-    padding: 5px 7px;
-    gap: 2.5px;
     border-radius: 7px;
   }
+  .global-task-card-surface {
+    padding: 5px 7px;
+    gap: 2.5px;
+    border-radius: 6px;
+  }
   .global-task-card.is-terminal {
+    padding: 0;
+  }
+  .global-task-card.is-terminal .global-task-card-surface {
     padding: 4px 7px;
   }
   .global-task-card-content {

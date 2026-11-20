@@ -11,6 +11,10 @@ import {
   splitTextByCloudDocQuoteTags,
   type CloudDocTextSegment,
 } from './cloud-docs-reference.js';
+import {
+  formatRemoteDesktopCitation,
+  splitTextByRemoteDesktopCitations,
+} from '@shared/remote-desktop-reference.js';
 import { splitTextByHttpUrls } from './link-detection.js';
 import {
   ChatLocalImagePreview,
@@ -299,15 +303,59 @@ export function renderCloudDocAction({
   );
 }
 
+export interface ChatRemoteDesktopActionOptions {
+  key?: string | number;
+  targetId: string;
+  content: ComponentChildren;
+  onRemoteDesktopClick?: (targetId: string) => void;
+}
+
+/** Render a clickable Remote Desktop chip for `[RemoteDesktop: <name> | id=<id>]` references. */
+export function renderRemoteDesktopAction({
+  key,
+  targetId,
+  content,
+  onRemoteDesktopClick,
+}: ChatRemoteDesktopActionOptions): h.JSX.Element {
+  const labelText = typeof content === 'string' ? content : targetId;
+  const title = formatRemoteDesktopCitation(labelText, targetId);
+  const handleActivate = (e: Event) => {
+    if (!onRemoteDesktopClick) return;
+    e.stopPropagation();
+    onRemoteDesktopClick(targetId);
+  };
+
+  return (
+    <button
+      key={key}
+      type="button"
+      class="chat-remote-desktop-chip"
+      data-testid="chat-remote-desktop-link"
+      data-remote-desktop-id={targetId}
+      title={title}
+      aria-label={title}
+      disabled={!onRemoteDesktopClick}
+      onClick={handleActivate}
+    >
+      <svg class="chat-remote-desktop-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.8" />
+        <path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+      </svg>
+      <span class="chat-remote-desktop-label">{content}</span>
+    </button>
+  );
+}
+
 /**
- * Split plain text by Cloud Doc quote tags, HTTP(S) URLs, `cdoc_...` IDs, and
- * filenames paired with `cdoc_...`, delegating only remaining non-URL text chunks
- * to `renderPlainText` for local path detection.
+ * Split plain text by Cloud Doc quote tags, Remote Desktop citation tags,
+ * HTTP(S) URLs, `cdoc_...` IDs, and filenames paired with `cdoc_...`,
+ * delegating only remaining non-URL text chunks to `renderPlainText` for local path detection.
  */
 export function splitTextWithCloudDocsAndUrls(
   text: string,
   options: {
     onCloudDocClick?: (docId: string) => void;
+    onRemoteDesktopClick?: (targetId: string) => void;
     onUrlClick?: (url: string) => void;
     onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
     renderPlainText: (chunkText: string, baseOffset: number) => h.JSX.Element[];
@@ -326,34 +374,47 @@ export function splitTextWithCloudDocsAndUrls(
       continue;
     }
 
-    for (const urlChunk of splitTextByHttpUrls(quoteSeg.value)) {
-      const urlBase = quoteSeg.start + urlChunk.start;
-      if (urlChunk.type === 'url') {
-        parts.push(
-          <ChatLoopbackLink
-            key={`u${urlBase}`}
-            href={urlChunk.value}
-            onOpenLocalWebPreview={options.onOpenLocalWebPreview}
-            onUrlClick={options.onUrlClick}
-          >
-            {urlChunk.value}
-          </ChatLoopbackLink>,
-        );
+    for (const rdSeg of splitTextByRemoteDesktopCitations(quoteSeg.value)) {
+      const rdBase = quoteSeg.start + rdSeg.start;
+      if (rdSeg.type === 'remote_desktop' && rdSeg.targetId) {
+        parts.push(renderRemoteDesktopAction({
+          key: `rd${rdBase}`,
+          targetId: rdSeg.targetId,
+          content: rdSeg.label ?? rdSeg.value,
+          onRemoteDesktopClick: options.onRemoteDesktopClick,
+        }));
         continue;
       }
 
-      for (const idSeg of splitPlainTextByCloudDocIds(urlChunk.value)) {
-        const segBase = urlBase + idSeg.start;
-        if (idSeg.type === 'cloud_doc' && idSeg.docId) {
-          parts.push(renderCloudDocAction({
-            key: `cd${segBase}`,
-            docId: idSeg.docId,
-            content: idSeg.label ?? idSeg.value,
-            kind: idSeg.kind ?? 'id',
-            onCloudDocClick: options.onCloudDocClick,
-          }));
-        } else {
-          parts.push(...options.renderPlainText(idSeg.value, segBase));
+      for (const urlChunk of splitTextByHttpUrls(rdSeg.value)) {
+        const urlBase = rdBase + urlChunk.start;
+        if (urlChunk.type === 'url') {
+          parts.push(
+            <ChatLoopbackLink
+              key={`u${urlBase}`}
+              href={urlChunk.value}
+              onOpenLocalWebPreview={options.onOpenLocalWebPreview}
+              onUrlClick={options.onUrlClick}
+            >
+              {urlChunk.value}
+            </ChatLoopbackLink>,
+          );
+          continue;
+        }
+
+        for (const idSeg of splitPlainTextByCloudDocIds(urlChunk.value)) {
+          const segBase = urlBase + idSeg.start;
+          if (idSeg.type === 'cloud_doc' && idSeg.docId) {
+            parts.push(renderCloudDocAction({
+              key: `cd${segBase}`,
+              docId: idSeg.docId,
+              content: idSeg.label ?? idSeg.value,
+              kind: idSeg.kind ?? 'id',
+              onCloudDocClick: options.onCloudDocClick,
+            }));
+          } else {
+            parts.push(...options.renderPlainText(idSeg.value, segBase));
+          }
         }
       }
     }

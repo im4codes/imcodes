@@ -825,4 +825,56 @@ describe('streaming render mode', () => {
     expect(onPathClick).toHaveBeenCalledTimes(1);
     expect(onPathClick).toHaveBeenCalledWith('local-only.xlsx');
   });
+
+  it('bounds pathological emphasis and strikethrough backtracking while keeping normal formatting intact', () => {
+    const cases = [
+      `**bold** *italic* ~~gone~~ ${'*.ts *.tsx *.js '.repeat(1_100)}`,
+      `**real** ${'**a ** '.repeat(2_800)}`,
+      `~~real~~ ${'~~a ~~ '.repeat(2_800)}`,
+    ];
+    for (const [idx, text] of cases.entries()) {
+      expect(text.length).toBeLessThanOrEqual(RICH_TEXT_ENHANCEMENT_CHAR_LIMIT);
+      const t0 = performance.now();
+      const { container, unmount } = render(<ChatMarkdown text={text} cacheKey={`pathological-${idx}`} />);
+      const elapsedMs = performance.now() - t0;
+      if (idx === 0) {
+        expect(container.querySelector('strong')?.textContent).toBe('bold');
+        expect(container.querySelector('em')?.textContent).toBe('italic');
+        expect(container.querySelector('del')?.textContent).toBe('gone');
+      } else if (idx === 1) {
+        expect(container.querySelector('strong')?.textContent).toBe('real');
+      } else {
+        expect(container.querySelector('del')?.textContent).toBe('real');
+      }
+      expect(elapsedMs).toBeLessThan(400);
+      unmount();
+    }
+  });
+
+  it('renders [RemoteDesktop: <name> | id=<id>] tags in prose and codespans as clickable remote-desktop chips', () => {
+    const onRemoteDesktopClick = vi.fn();
+    const onPathClick = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={[
+          '连接到 [RemoteDesktop: Mac Studio | id=6000000001]，也可用 `[RemoteDesktop: Prod Win | id=srv_win_01]`。',
+        ].join('\n\n')}
+        serverId="srv-1"
+        onPathClick={onPathClick}
+        onRemoteDesktopClick={onRemoteDesktopClick}
+      />,
+    );
+
+    const chips = Array.from(container.querySelectorAll('.chat-remote-desktop-chip'));
+    expect(chips).toHaveLength(2);
+    expect(chips[0]?.textContent).toContain('Mac Studio');
+    expect(chips[1]?.textContent).toContain('Prod Win');
+    expect(chips[0]?.textContent).not.toContain('[RemoteDesktop:');
+
+    fireEvent.click(chips[0]!);
+    fireEvent.click(chips[1]!);
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(1, '6000000001');
+    expect(onRemoteDesktopClick).toHaveBeenNthCalledWith(2, 'srv_win_01');
+    expect(onPathClick).not.toHaveBeenCalled();
+  });
 });

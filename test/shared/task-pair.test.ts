@@ -936,4 +936,33 @@ describe('pair contract consistency regressions', () => {
     expect(TASK_PAIR_BRAIN_MCP_ONLY_RULE).toContain('Never reuse a sub-session across concurrent open pairs');
     expect(TASK_PAIR_BRAIN_MCP_ONLY_RULE).toContain('omit executor/auditor/models on pair_create by default');
   });
+
+  it('lets Brain close an already-passed audited pair without force or unaudited flag, and isolates MCP rejections from chat notices', () => {
+    const passed = withStatus('passed');
+    const brainDone = applyTaskPairMarker(passed, { knownVerb: 'DONE', taskId: 'T42', attrs: {} }, {
+      writer: BRAIN, fallbackBrain: BRAIN, now: 200, source: 'mcp',
+    });
+    expect(brainDone).toMatchObject({ effect: 'status', unusual: false, toStatus: 'done' });
+    expect(brainDone.pair?.flags).not.toContain('unaudited');
+    expect(brainDone.intents).toContainEqual({ kind: 'slot_changed' });
+
+    // Auditor still cannot DONE a passed audited pair.
+    const audDone = apply(passed, AUD, '<!-- IMCODES_TASK DONE T42 -->');
+    expect(audDone).toMatchObject({ effect: 'recorded', unusual: true, toStatus: 'passed' });
+    expect(audDone.intents).toContainEqual(expect.objectContaining({ kind: 'policy_notice', to: AUD }));
+
+    // Structured MCP rejection surfaces rejectionReason directly without emitting a chat policy_notice or consuming the cap.
+    const working = withStatus('working');
+    const mcpRejected = applyTaskPairMarker(working, { knownVerb: 'DONE', taskId: 'T42', attrs: {} }, {
+      writer: BRAIN, fallbackBrain: BRAIN, now: 200, source: 'mcp',
+    });
+    expect(mcpRejected).toMatchObject({
+      effect: 'recorded',
+      unusual: true,
+      toStatus: 'working',
+      rejectionReason: expect.stringContaining('DONE cannot close or advance an audited pair'),
+    });
+    expect(mcpRejected.intents).toEqual([]);
+    expect(mcpRejected.pair?.capCounts.policy_rejection).toBeUndefined();
+  });
 });
