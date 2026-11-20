@@ -2297,6 +2297,7 @@ export class WsBridge {
   /** Current daemon generation has completed durable route reconciliation. */
   private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
+  private exactCronSendSupported = false;
   private daemonControlledAbiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_ABI_MODERN;
   private daemonControlledOs: ControlledNodeOs | null = null;
   private daemonControlledArch: string | null = null;
@@ -6433,6 +6434,7 @@ export class WsBridge {
         this.resetLegacyUpgradeRescueForGeneration(connectionGeneration);
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
+        this.exactCronSendSupported = msg.cronExactSend === true;
         this.recentTextBySession.clear();
         this.incognitoSessions.clear();
         this.pendingIncognitoSubSessionStarts.clear();
@@ -13958,6 +13960,11 @@ export class WsBridge {
   /** Returns true if the daemon WebSocket is connected and authenticated. */
   isDaemonConnected(): boolean {
     return !!(this.daemonWs && this.authenticated);
+  }
+
+  /** Returns true when the connected daemon advertised exact scoped cron send support. */
+  supportsExactCronSend(): boolean {
+    return this.exactCronSendSupported;
   }
 
   private isRemoteDesktopGuestOutboxTargetAvailable(): boolean {

@@ -6054,8 +6054,18 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   return { dispatchId, delivered, queued, errors, messages };
 }
 
-export async function dispatchCronSend(input: CronSendDispatchInput, deps?: SendToolDeps): Promise<CronSendDispatchResult> {
-  const d = depsWithDefaults(deps);
+export async function dispatchCronSend(
+  input: CronSendDispatchInput & { exactTargetOnly?: boolean },
+  deps?: SendToolDeps,
+): Promise<CronSendDispatchResult> {
+  const exactTargetOnly = Boolean(input.exactTargetOnly || deps?.exactTargetOnly);
+  if (exactTargetOnly && input.broadcast) {
+    throw new Error('broadcast is forbidden for exact-target cron send');
+  }
+  const effectiveDeps: SendToolDeps | undefined = exactTargetOnly
+    ? { ...deps, exactTargetOnly: true }
+    : deps;
+  const d = depsWithDefaults(effectiveDeps);
   const fromSession = d.getSession(input.fromSessionName);
   if (!fromSession) throw new Error(`cron send source session not found: ${input.fromSessionName}`);
   const result = await dispatchSendMessage({
@@ -6074,7 +6084,7 @@ export async function dispatchCronSend(input: CronSendDispatchInput, deps?: Send
     // wider refusal: firing every N minutes into a target that cannot run the
     // task builds a backlog and burns the retry budget for nothing.
     newWorkload: true,
-  }), deps);
+  }), effectiveDeps);
   if (result.status !== 'accepted') {
     if (result.status === 'error'
       && (result.reason === SEND_TOOL_ERROR_REASONS.TARGET_LIMITED

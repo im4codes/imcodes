@@ -31,7 +31,14 @@ import type { TimelineEvent } from './timeline-event.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import { authorizedDelegationCandidates } from './delegation-admission.js';
+import {
+  authorizedDelegationCandidates,
+  DELEGATION_ADMISSION_REASONS,
+  evaluateDelegationAdmission,
+} from './delegation-admission.js';
+import { isExecutionClone } from './execution-clone.js';
+import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
+import { createSendDispatchId, createSendMessageId } from '../../shared/send-message-id.js';
 import { normalizeCronSendActionForInterval } from '../../shared/cron-types.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 
@@ -47,6 +54,7 @@ const BUSY_STATES = new Set(['streaming', 'thinking', 'tool_running', 'permissio
 export interface CronSendDispatchInput {
   fromSessionName: string;
   target: string;
+  exactTargetOnly?: boolean;
   message: string;
   reply?: boolean;
   broadcast?: boolean;
@@ -128,8 +136,19 @@ type CronProcessCommandSender = (
 ) => Promise<void>;
 let cronProcessCommandSenderOverride: CronProcessCommandSender | null = null;
 
+type CronExactSelfSender = (
+  target: SessionRecord,
+  message: string,
+  options: { dispatchId: string; messageId: string; messageOrigin?: typeof CHAT_MESSAGE_ORIGINS.SYSTEM },
+) => Promise<'sent' | 'queued'>;
+let cronExactSelfSenderOverride: CronExactSelfSender | null = null;
+
 export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
   cronSendDispatcherOverride = dispatcher;
+}
+
+export function __setCronExactSelfSenderForTests(sender: CronExactSelfSender | null): void {
+  cronExactSelfSenderOverride = sender;
 }
 
 export function __setCronProcessCommandSenderForTests(
@@ -398,6 +417,187 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   if (action.type === 'send') {
+    const exactTarget = typeof msg.exactTargetSessionName === 'string' && msg.exactTargetSessionName.trim()
+      ? msg.exactTargetSessionName.trim()
+      : (targetSessionName && !ownerMachineAuthority ? name : null);
+
+    if (exactTarget) {
+      if (action.broadcast === true) {
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: 'Cron structured send rejected: broadcast is forbidden for scoped cron',
+        });
+        return;
+      }
+      if (action.target.trim() !== exactTarget) {
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron structured send target mismatch: expected ${exactTarget}`,
+        });
+        return;
+      }
+      const exactRecipient = getSession(exactTarget);
+      const allSessions = listSessions();
+      const recipientProject = exactRecipient
+        ? (allSessions.length > 0 ? resolveEffectiveProjectName(exactRecipient, allSessions) : (exactRecipient.projectName ?? ''))
+        : '';
+      const belongsToProject = !!exactRecipient
+        && recipientProject === projectName
+        && (!exactRecipient.parentSession || exactRecipient.parentSession.startsWith(`deck_${projectName}_`));
+      if (!exactRecipient || exactRecipient.state === 'stopped' || isExecutionClone(exactRecipient) || !belongsToProject) {
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron structured send exact target unavailable: ${exactTarget}`,
+        });
+        return;
+      }
+      if (action.onlyWhenIdle === true) {
+        if (exactRecipient.runtimeType === 'transport') {
+          const status = getTransportRuntime(exactRecipient.name)?.getStatus();
+          if (status && status !== 'idle') {
+            sendCommandResult(serverLink, {
+              type: CRON_MSG.COMMAND_RESULT,
+              jobId,
+              executionId,
+              status: 'skipped_busy',
+              detail: `Cron idle-only recipient is busy: ${exactRecipient.name} (${status})`,
+            });
+            return;
+          }
+        } else {
+          try {
+            const status = await detectStatusAsync(exactRecipient.name, exactRecipient.agentType as AgentType);
+            if (BUSY_STATES.has(status)) {
+              sendCommandResult(serverLink, {
+                type: CRON_MSG.COMMAND_RESULT,
+                jobId,
+                executionId,
+                status: 'skipped_busy',
+                detail: `Cron idle-only recipient is busy: ${exactRecipient.name} (${status})`,
+              });
+              return;
+            }
+          } catch (err) {
+            logger.warn({ sessionName: exactRecipient.name, err }, 'Cron: idle-only recipient status detection failed, proceeding');
+          }
+        }
+      }
+
+      if (exactTarget === name) {
+        // Authorized self-session send uses the exact session-dispatch boundary directly,
+        // avoiding send-tool's sibling exclusion and fuzzy label/agentType matching.
+        const evidence = allSessions.length > 0 ? allSessions : [exactRecipient];
+        const gate = evaluateDelegationAdmission(evidence, [exactRecipient], Date.now(), { newWorkload: true });
+        if (gate.dispatchable.length === 0) {
+          const blocked = gate.blocked[0];
+          sendCommandResult(serverLink, {
+            type: CRON_MSG.COMMAND_RESULT,
+            jobId,
+            executionId,
+            status: 'error',
+            detail: blocked?.reason === DELEGATION_ADMISSION_REASONS.TARGET_LIMITED
+              ? JSON.stringify({
+                  reason: blocked.reason,
+                  targets: gate.blocked,
+                  alternatives: [],
+                  retryAt: blocked.retryAt,
+                })
+              : `Cron structured send target unavailable: ${exactTarget}`,
+          });
+          return;
+        }
+        const dispatchId = createSendDispatchId();
+        const messageId = createSendMessageId();
+        try {
+          const exactSender = cronExactSelfSenderOverride ?? (await import('./session-dispatch.js')).dispatchSessionMessage;
+          await exactSender(exactRecipient, action.message, {
+            dispatchId,
+            messageId,
+            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+          });
+          sendCommandResult(serverLink, {
+            type: CRON_MSG.COMMAND_RESULT,
+            jobId,
+            executionId,
+            status: 'dispatched',
+            detail: JSON.stringify({
+              dispatchId,
+              deliveries: [{ target: exactRecipient.name, messageId, status: 'delivered' }],
+            }),
+          });
+        } catch (err) {
+          logger.error({ jobId, executionId, err }, 'Cron: exact self-session send dispatch failed');
+          sendCommandResult(serverLink, {
+            type: CRON_MSG.COMMAND_RESULT,
+            jobId,
+            executionId,
+            status: 'error',
+            detail: `Cron structured send failed: ${formatErr(err)}`,
+          });
+        }
+        return;
+      }
+
+      // Authorized cross-session scoped cron send must still enforce exactTargetOnly (no label/agentType fallback).
+      try {
+        const dispatchCronSend = await loadCronSendDispatcher();
+        const result = await dispatchCronSend({
+          fromSessionName: name,
+          target: exactTarget,
+          exactTargetOnly: true,
+          message: action.message,
+          ...(action.reply !== undefined ? { reply: action.reply } : {}),
+          ...(action.idempotencyKey ? { idempotencyKey: action.idempotencyKey } : {}),
+          ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
+        });
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: result.status ?? 'dispatched',
+          detail: JSON.stringify({
+            dispatchId: result.dispatchId,
+            deliveries: result.deliveries,
+          }),
+        });
+      } catch (err) {
+        const limited = asCronTargetLimited(err);
+        if (limited) {
+          sendCommandResult(serverLink, {
+            type: CRON_MSG.COMMAND_RESULT,
+            jobId,
+            executionId,
+            status: 'error',
+            detail: JSON.stringify({
+              reason: limited.reason,
+              targets: limited.limited?.targets ?? [],
+              alternatives: limited.limited?.alternatives ?? [],
+              retryAt: limited.limited?.targets[0]?.retryAt,
+            }),
+          });
+          return;
+        }
+        logger.error({ jobId, executionId, err }, 'Cron: exact scoped send dispatch failed');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron structured send failed: ${formatErr(err)}`,
+        });
+      }
+      return;
+    }
+
     if (action.onlyWhenIdle === true) {
       const busyRecipient = await findBusyCronSendRecipient(action, projectName, name);
       if (busyRecipient) {

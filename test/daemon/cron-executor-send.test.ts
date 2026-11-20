@@ -39,6 +39,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import {
+  __setCronExactSelfSenderForTests,
   __setCronSendDispatcherForTests,
   executeCronJob,
   type CronSendDispatchInput,
@@ -349,5 +350,114 @@ describe('executeCronJob structured send actions', () => {
     ]);
     await executeCronJob({ ...makeSendMsg(), executionId: 'exec-send-stopped', action: { ...makeSendMsg().action, onlyWhenIdle: true } }, mockServerLink);
     expect(dispatchCronSend).toHaveBeenCalledTimes(2);
+  });
+
+  it('enforces exactTargetSessionName at daemon delivery: routes authorized self-send without fuzzy label/type fallback and binds cross-session exact target', async () => {
+    const { dispatchCronSend: realDispatchCronSend } = await import('../../src/daemon/send-tool.js');
+    const exactSelfSender = vi.fn(async () => 'sent' as const);
+    const exactCrossDispatchMessage = vi.fn(async () => 'sent' as const);
+
+    const subAllowed = {
+      name: 'deck_sub_allowed1',
+      agentType: 'codex-sdk',
+      state: 'idle',
+      projectName: 'myapp',
+      projectDir: '/home/user/myapp',
+      parentSession: 'deck_myapp_brain',
+      label: 'Allowed Sub',
+    };
+    const decoyWorker = {
+      name: 'deck_myapp_w1',
+      agentType: 'deck_sub_allowed1',
+      state: 'idle',
+      projectName: 'myapp',
+      projectDir: '/home/user/myapp',
+      role: 'w1',
+      label: 'deck_sub_allowed1',
+    };
+    const decoyW2 = {
+      name: 'deck_myapp_w2',
+      agentType: 'claude-code',
+      state: 'idle',
+      projectName: 'myapp',
+      projectDir: '/home/user/myapp',
+      role: 'w2',
+      label: 'deck_myapp_w1',
+    };
+    const sessions = [makeSession(), subAllowed, decoyWorker, decoyW2];
+
+    (getSession as ReturnType<typeof vi.fn>).mockImplementation((n: string) => sessions.find((s) => s.name === n));
+    (listSessions as ReturnType<typeof vi.fn>).mockReturnValue(sessions);
+
+    __setCronExactSelfSenderForTests(exactSelfSender);
+    __setCronSendDispatcherForTests((input) => realDispatchCronSend(input, {
+      listSessions: () => listSessions() as any,
+      getSession: (n) => getSession(n) as any,
+      dispatchMessage: exactCrossDispatchMessage,
+    }));
+
+    // 1) Self-delivery on subsession even when decoy shares identical label & agentType -> delivers ONLY to deck_sub_allowed1
+    await executeCronJob({
+      ...makeSendMsg(),
+      executionId: 'exec-exact-self',
+      targetSessionName: 'deck_sub_allowed1',
+      exactTargetSessionName: 'deck_sub_allowed1',
+      action: { type: 'send', target: 'deck_sub_allowed1', message: 'self check' },
+    }, mockServerLink);
+
+    expect(exactSelfSender).toHaveBeenCalledTimes(1);
+    expect((exactSelfSender.mock.calls[0] as any)?.[0]?.name).toBe('deck_sub_allowed1');
+    expect(exactCrossDispatchMessage).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      executionId: 'exec-exact-self',
+      status: 'dispatched',
+    }));
+
+    // 2) Cross-session exact delivery with label trap: decoyW2 has label === 'deck_myapp_w1', real deck_myapp_w1 is delivered
+    exactSelfSender.mockClear();
+    await executeCronJob({
+      ...makeSendMsg(),
+      executionId: 'exec-exact-cross',
+      exactTargetSessionName: 'deck_myapp_w1',
+      action: { type: 'send', target: 'deck_myapp_w1', message: 'exact sibling', onlyWhenIdle: false },
+    }, mockServerLink);
+
+    expect(exactCrossDispatchMessage).toHaveBeenCalledTimes(1);
+    expect((exactCrossDispatchMessage.mock.calls[0] as any)?.[0]?.name).toBe('deck_myapp_w1');
+
+    // 3) Missing exact target when decoy has label === target -> MUST fail closed, ZERO fuzzy delivery to decoy
+    exactCrossDispatchMessage.mockClear();
+    const sessionsWithoutW1 = [makeSession(), decoyW2];
+    (getSession as ReturnType<typeof vi.fn>).mockImplementation((n: string) => sessionsWithoutW1.find((s) => s.name === n));
+    (listSessions as ReturnType<typeof vi.fn>).mockReturnValue(sessionsWithoutW1);
+
+    await executeCronJob({
+      ...makeSendMsg(),
+      executionId: 'exec-exact-missing-decoy',
+      exactTargetSessionName: 'deck_myapp_w1',
+      action: { type: 'send', target: 'deck_myapp_w1', message: 'must fail closed', onlyWhenIdle: false },
+    }, mockServerLink);
+
+    expect(exactCrossDispatchMessage).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      executionId: 'exec-exact-missing-decoy',
+      status: 'error',
+    }));
+
+    // 4) Broadcast or target mismatch on exact-scoped cron -> fail closed, ZERO deliveries
+    await executeCronJob({
+      ...makeSendMsg(),
+      executionId: 'exec-exact-bcast',
+      exactTargetSessionName: 'deck_sub_allowed1',
+      action: { type: 'send', target: 'deck_sub_allowed1', message: 'no bcast', broadcast: true },
+    }, mockServerLink);
+    expect(exactSelfSender).not.toHaveBeenCalled();
+    expect(exactCrossDispatchMessage).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      executionId: 'exec-exact-bcast',
+      status: 'error',
+    }));
+
+    __setCronExactSelfSenderForTests(null);
   });
 });

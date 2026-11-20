@@ -654,6 +654,7 @@ export class ServerLink {
       serverId: this.serverId,
       token: this.token,
       daemonVersion: this.daemonVersion,
+      cronExactSend: true,
       [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
         DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
     });

@@ -253,19 +253,21 @@ async function resolveCronScope(
     requestedProjectName?: string | null;
     mode: CronAccessMode;
     pinnedSessionName?: string | null;
+    db?: Database;
   },
 ): Promise<{ ok: true; scope: CronScope } | { ok: false; reason: string }> {
+  const db = params.db ?? c.env.DB;
   const pinnedSession = params.pinnedSessionName?.trim() || '';
   const member = pinnedSession
     ? { ok: false as const, reason: 'pinned-shared-session' }
-    : await resolveServerMemberAccessOrShareDeny(c.env.DB, {
+    : await resolveServerMemberAccessOrShareDeny(db, {
         serverId: params.serverId,
         userId: params.userId,
       });
   if (member.ok) {
     // Operational authority includes server Participants and group members;
     // jobs belong to the server owner, not the visiting actor.
-    const server = await c.env.DB.queryOne<{ user_id: string }>(
+    const server = await db.queryOne<{ user_id: string }>(
       'SELECT user_id FROM servers WHERE id = $1', [params.serverId],
     );
     if (!server) return { ok: false, reason: 'share-target-unavailable' };
@@ -284,7 +286,7 @@ async function resolveCronScope(
   let sessionName = pinnedSession || (c.req.query('sessionName') ?? '').trim();
   let target = shareTargetFromSessionName(params.serverId, sessionName);
   if (!target && !pinnedSession) {
-    const userShares = await listActiveSharesForUser(c.env.DB, params.userId, Date.now()).catch(() => []);
+    const userShares = await listActiveSharesForUser(db, params.userId, Date.now()).catch(() => []);
     const serverShare = userShares.find((s) => s.serverId === params.serverId && s.target.kind === 'server')
       ?? userShares.find((s) => s.serverId === params.serverId);
     if (serverShare) {
@@ -293,19 +295,19 @@ async function resolveCronScope(
     }
   }
   if (!target) return { ok: false, reason: member.reason };
-  let access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+  let access = await resolveHttpShareAccessForCoveredSession(db, {
     serverId: params.serverId,
     userId: params.userId,
     target,
   });
 
   if (access.actor.kind !== 'share' && target.kind === 'main' && !pinnedSession) {
-    const userShares = await listActiveSharesForUser(c.env.DB, params.userId, Date.now()).catch(() => []);
+    const userShares = await listActiveSharesForUser(db, params.userId, Date.now()).catch(() => []);
     for (const share of userShares) {
       if (share.serverId !== params.serverId || share.target.kind !== 'subsession') continue;
-      const child = await getSubSessionById(c.env.DB, share.target.subSessionId, params.serverId);
+      const child = await getSubSessionById(db, share.target.subSessionId, params.serverId);
       if (child && child.closed_at === null && child.parent_session === target.sessionName) {
-        const subAccess = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+        const subAccess = await resolveHttpShareAccessForCoveredSession(db, {
           serverId: params.serverId,
           userId: params.userId,
           target: share.target,
@@ -327,22 +329,22 @@ async function resolveCronScope(
 
   let projectName: string | null = null;
   if (target.kind === 'main') {
-    const row = await c.env.DB.queryOne<{ project_name: string; role: string }>(
+    const row = await db.queryOne<{ project_name: string; role: string }>(
       'SELECT project_name, role FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
       [params.serverId, target.sessionName],
     );
     projectName = row?.project_name ?? null;
   } else if (target.kind === 'subsession') {
-    const row = await getSubSessionById(c.env.DB, target.subSessionId, params.serverId);
+    const row = await getSubSessionById(db, target.subSessionId, params.serverId);
     if (row?.parent_session) {
-      const parent = await c.env.DB.queryOne<{ project_name: string }>(
+      const parent = await db.queryOne<{ project_name: string }>(
         'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
         [params.serverId, row.parent_session],
       );
       projectName = parent?.project_name ?? null;
     }
   }
-  const server = await c.env.DB.queryOne<{ user_id: string }>(
+  const server = await db.queryOne<{ user_id: string }>(
     'SELECT user_id FROM servers WHERE id = $1',
     [params.serverId],
   );
@@ -366,14 +368,16 @@ async function resolveCronScope(
 
 async function resolveCronJobScope(
   c: Context<CronRouteEnv>,
-  params: { userId: string; job: DbCronJob; mode: CronAccessMode; pinnedSessionName?: string | null },
+  params: { userId: string; job: DbCronJob; mode: CronAccessMode; pinnedSessionName?: string | null; db?: Database },
 ): Promise<{ ok: true; scope: CronScope } | { ok: false; reason: string }> {
+  const db = params.db ?? c.env.DB;
   const access = await resolveCronScope(c, {
     serverId: params.job.server_id,
     userId: params.userId,
     requestedProjectName: params.job.project_name,
     mode: params.mode,
     pinnedSessionName: params.pinnedSessionName,
+    db,
   });
   if (!access.ok) return access;
   if (
@@ -391,7 +395,7 @@ async function resolveCronJobScope(
     targetRole: params.job.target_role,
     targetSessionName: params.job.target_session_name,
     action,
-  }, params.pinnedSessionName)) {
+  }, params.pinnedSessionName, db)) {
     return { ok: false, reason: 'share-direct-surface-denied' };
   }
   return access;
@@ -463,6 +467,7 @@ async function cronScopeCoversPayload(
   scope: CronScope,
   payload: { targetRole?: string | null; targetSessionName?: string | null; action?: z.infer<typeof cronActionSchema> },
   pinnedSessionName?: string | null,
+  db: Database = c.env.DB,
 ): Promise<boolean> {
   if (pinnedSessionName && !pinnedSessionCoversPayload(pinnedSessionName, payload)) {
     return false;
@@ -490,12 +495,16 @@ async function cronScopeCoversPayload(
     return true;
   }
 
-  if (payload.action.type === 'send' && payload.action.broadcast) {
-    return false;
+  if (payload.action.type === 'send') {
+    if (payload.action.broadcast) return false;
+    const rawTarget = payload.action.target.trim();
+    if (!rolePattern.test(rawTarget) && !rawTarget.startsWith('deck_')) {
+      return false;
+    }
   }
 
   if (payload.targetSessionName) {
-    if (!await sessionBelongsToProject(c.env.DB, serverId, payload.targetSessionName, scope.projectName)) {
+    if (!await sessionBelongsToProject(db, serverId, payload.targetSessionName, scope.projectName)) {
       return false;
     }
   } else if (payload.targetRole) {
@@ -509,7 +518,7 @@ async function cronScopeCoversPayload(
 
   const sessionRefs = cronPayloadSessionRefs(payload);
   for (const name of sessionRefs) {
-    if (!await sessionBelongsToProject(c.env.DB, serverId, name, scope.projectName)) {
+    if (!await sessionBelongsToProject(db, serverId, name, scope.projectName)) {
       return false;
     }
   }
@@ -574,16 +583,19 @@ async function isSharedCronMutationAllowed(
     sharedScope: boolean;
     isParticipantDaemon: boolean;
     actingUserId: string;
+    provenance?: { shared?: boolean; creator_user_id?: string } | null;
   },
 ): Promise<boolean> {
   const isSharedOrNonOwner = params.sharedScope
     || params.isParticipantDaemon
     || params.actingUserId !== params.job.user_id;
   if (!isSharedOrNonOwner) return true;
-  const prov = await db.queryOne<{ shared?: boolean }>(
-    'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
-    [params.job.id],
-  );
+  const prov = params.provenance !== undefined
+    ? params.provenance
+    : await db.queryOne<{ shared?: boolean }>(
+        'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
+        [params.job.id],
+      );
   return Boolean(prov?.shared);
 }
 
@@ -832,138 +844,160 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const parsed = cronJobUpdateSchema.safeParse(await withDefaultCronTimezone(c, userId, body));
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
-  const job = await c.env.DB.queryOne<DbCronJob>(
+  const initialJob = await c.env.DB.queryOne<DbCronJob>(
     'SELECT * FROM cron_jobs WHERE id = $1',
     [jobId],
   );
-  if (!job) return c.json({ error: 'not_found' }, 404);
-  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
-  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!initialJob) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(initialJob.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, initialJob.server_id);
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const pinnedSessionName = pinnedSessionForAuthority(authority);
+  const isDaemonReq = isDaemonCronRequest(c, routeServerId, authority.kind);
+  const forceFlag = c.req.query('force') === 'true';
 
-  const access = await resolveCronJobScope(c, { userId: authority.actorUserId, job, mode: 'write', pinnedSessionName });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  if (!await isSharedCronMutationAllowed(c.env.DB, {
-    job,
-    sharedScope: access.scope.shared,
-    isParticipantDaemon: authority.kind === 'participant_daemon',
-    actingUserId: authority.actorUserId,
-  })) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-  }
+  type PutTxResult =
+    | { kind: 'ok'; serverId: string; completionPolicy?: string }
+    | { kind: 'not_found' }
+    | { kind: 'conflict' }
+    | { kind: 'forbidden'; reason: string }
+    | { kind: 'force_required'; completionPolicy: string }
+    | { kind: 'invalid_expr'; error: string }
+    | { kind: 'invalid_control'; reason: string };
 
-  const updates = { ...parsed.data };
-  if (access.scope.shared) updates.projectName = access.scope.projectName ?? undefined;
-  let existingAction: z.infer<typeof cronActionSchema> | undefined;
-  try {
-    const parsedExisting = cronActionSchema.safeParse(JSON.parse(job.action));
-    if (parsedExisting.success) existingAction = parsedExisting.data;
-  } catch { /* invalid legacy action remains non-editable through a shared scope */ }
-  if (!await cronScopeCoversPayload(c, job.server_id, access.scope, {
-    targetRole: updates.targetRole !== undefined ? updates.targetRole : job.target_role,
-    targetSessionName: updates.targetSessionName !== undefined ? updates.targetSessionName : job.target_session_name,
-    action: updates.action ?? existingAction,
-  }, pinnedSessionName)) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-  }
-  const now = Date.now();
-  if (
-    isDaemonCronRequest(c, routeServerId, authority.kind)
-    && normalizeCronCompletionPolicy(job.completion_policy) === CRON_COMPLETION_POLICY.RECURRING
-    && updates.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
-    && c.req.query('force') !== 'true'
-  ) {
-    return c.json({
-      error: 'cron_force_required',
-      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
-      message: 'Changing a recurring cron to until_complete from an agent requires force=true',
-    }, 409);
-  }
-
-  // Re-validate cron expression if changed
-  let nextRunAt: number | undefined;
-  let effectiveIntervalMs: number | null | undefined;
-  const newCronExpr = updates.cronExpr;
-  const effectiveTz = updates.timezone ?? job.timezone ?? undefined;
-  const scheduleChanged = (newCronExpr !== undefined && newCronExpr !== job.cron_expr)
-    || (updates.timezone !== undefined && updates.timezone !== job.timezone);
-  if (scheduleChanged) {
-    const validation = validateCronExpr(newCronExpr ?? job.cron_expr, effectiveTz);
-    if ('error' in validation) {
-      return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
-    }
-    nextRunAt = validation.nextRunAt;
-    effectiveIntervalMs = validation.intervalMs;
-  }
-
-  // Build dynamic UPDATE
-  const sets: string[] = ['updated_at = $1'];
-  const vals: unknown[] = [now];
-  let idx = 2;
-
-  if (effectiveIntervalMs === undefined && (updates.action !== undefined || existingAction?.type === 'send')) {
-    const scheduleValidation = validateCronExpr(newCronExpr ?? job.cron_expr, effectiveTz);
-    if (!('error' in scheduleValidation)) effectiveIntervalMs = scheduleValidation.intervalMs;
-  }
-
-  // When an action is omitted, keep the existing action but still apply the
-  // idle-only default to legacy rows that predate onlyWhenIdle. Explicit true
-  // and false values remain untouched by the shared normalizer.
-  if (updates.action === undefined && existingAction && existingAction.type !== 'p2p') {
-    const normalizedExistingAction = normalizeCronSendActionForInterval(existingAction, effectiveIntervalMs);
-    if (normalizedExistingAction !== existingAction) {
-      sets.push(`action = $${idx++}`);
-      vals.push(JSON.stringify(normalizedExistingAction));
-    }
-  }
-
-  if (updates.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(updates.name); }
-  if (updates.cronExpr !== undefined) { sets.push(`cron_expr = $${idx++}`); vals.push(updates.cronExpr); }
-  if (updates.projectName !== undefined) { sets.push(`project_name = $${idx++}`); vals.push(updates.projectName); }
-  if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
-  if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
-  if (updates.action !== undefined) {
-    const unboundAction = normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId, authority.kind));
-    const registeredAction = registerSelfManagedCronAction(
-      unboundAction,
-      jobId,
-      updates.completionPolicy ?? normalizeCronCompletionPolicy(job.completion_policy),
+  const txResult: PutTxResult = await runCronWriteTx(c.env.DB, async (tx): Promise<PutTxResult> => {
+    const lockedJob = await tx.queryOne<DbCronJob>(
+      'SELECT * FROM cron_jobs WHERE id = $1 FOR UPDATE',
+      [jobId],
     );
-    if (!registeredAction.ok) {
-      return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
+    if (!lockedJob || isWrongPodStickyServer(lockedJob.server_id, routeServerId)) {
+      return { kind: 'not_found' };
     }
-    const normalizedAction = normalizeCronSendActionForInterval(
-      registeredAction.action,
-      effectiveIntervalMs,
+    const lockedProv = await tx.queryOne<{ creator_user_id?: string; shared?: boolean }>(
+      'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1 FOR UPDATE',
+      [jobId],
     );
-    sets.push(`action = $${idx++}`);
-    vals.push(JSON.stringify(normalizedAction));
-  }
-  if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
-  if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
-  if (updates.completionPolicy !== undefined) { sets.push(`completion_policy = $${idx++}`); vals.push(updates.completionPolicy); }
-  if (nextRunAt !== undefined) { sets.push(`next_run_at = $${idx++}`); vals.push(nextRunAt); }
+    if (lockedJob.server_id !== initialJob.server_id || lockedJob.user_id !== initialJob.user_id) {
+      return { kind: 'conflict' };
+    }
 
-  // Reset expired/error jobs to paused on edit
-  if (job.status === CRON_STATUS.EXPIRED || job.status === CRON_STATUS.ERROR) {
-    sets.push(`status = $${idx++}`); vals.push(CRON_STATUS.PAUSED);
-  }
+    const access = await resolveCronJobScope(c, {
+      userId: authority.actorUserId,
+      job: lockedJob,
+      mode: 'write',
+      pinnedSessionName,
+      db: tx,
+    });
+    if (!access.ok) return { kind: 'forbidden', reason: access.reason };
+    if (!await isSharedCronMutationAllowed(tx, {
+      job: lockedJob,
+      sharedScope: access.scope.shared,
+      isParticipantDaemon: authority.kind === 'participant_daemon',
+      actingUserId: authority.actorUserId,
+      provenance: lockedProv ?? null,
+    })) {
+      return { kind: 'forbidden', reason: 'share-direct-surface-denied' };
+    }
 
-  vals.push(jobId);
-  const isSharedOrNonOwner = access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== job.user_id;
-  const txAllowed = await runCronWriteTx(c.env.DB, async (tx) => {
-    if (isSharedOrNonOwner) {
-      const prov = await tx.queryOne<{ shared?: boolean }>(
-        'SELECT shared FROM cron_job_provenance WHERE job_id = $1',
-        [jobId],
+    const updates = { ...parsed.data };
+    if (access.scope.shared) updates.projectName = access.scope.projectName ?? undefined;
+    let existingAction: z.infer<typeof cronActionSchema> | undefined;
+    try {
+      const parsedExisting = cronActionSchema.safeParse(JSON.parse(lockedJob.action));
+      if (parsedExisting.success) existingAction = parsedExisting.data;
+    } catch { /* invalid legacy action remains non-editable through a shared scope */ }
+    if (!await cronScopeCoversPayload(c, lockedJob.server_id, access.scope, {
+      targetRole: updates.targetRole !== undefined ? updates.targetRole : lockedJob.target_role,
+      targetSessionName: updates.targetSessionName !== undefined ? updates.targetSessionName : lockedJob.target_session_name,
+      action: updates.action ?? existingAction,
+    }, pinnedSessionName, tx)) {
+      return { kind: 'forbidden', reason: 'share-direct-surface-denied' };
+    }
+
+    const now = Date.now();
+    if (
+      isDaemonReq
+      && normalizeCronCompletionPolicy(lockedJob.completion_policy) === CRON_COMPLETION_POLICY.RECURRING
+      && updates.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+      && !forceFlag
+    ) {
+      return { kind: 'force_required', completionPolicy: CRON_COMPLETION_POLICY.RECURRING };
+    }
+
+    let nextRunAt: number | undefined;
+    let effectiveIntervalMs: number | null | undefined;
+    const newCronExpr = updates.cronExpr;
+    const effectiveTz = updates.timezone ?? lockedJob.timezone ?? undefined;
+    const scheduleChanged = (newCronExpr !== undefined && newCronExpr !== lockedJob.cron_expr)
+      || (updates.timezone !== undefined && updates.timezone !== lockedJob.timezone);
+    if (scheduleChanged) {
+      const validation = validateCronExpr(newCronExpr ?? lockedJob.cron_expr, effectiveTz);
+      if ('error' in validation) {
+        return { kind: 'invalid_expr', error: validation.error };
+      }
+      nextRunAt = validation.nextRunAt;
+      effectiveIntervalMs = validation.intervalMs;
+    }
+
+    const sets: string[] = ['updated_at = $1'];
+    const vals: unknown[] = [now];
+    let idx = 2;
+
+    if (effectiveIntervalMs === undefined && (updates.action !== undefined || existingAction?.type === 'send')) {
+      const scheduleValidation = validateCronExpr(newCronExpr ?? lockedJob.cron_expr, effectiveTz);
+      if (!('error' in scheduleValidation)) effectiveIntervalMs = scheduleValidation.intervalMs;
+    }
+
+    if (updates.action === undefined && existingAction && existingAction.type !== 'p2p') {
+      const normalizedExistingAction = normalizeCronSendActionForInterval(existingAction, effectiveIntervalMs);
+      if (normalizedExistingAction !== existingAction) {
+        sets.push(`action = $${idx++}`);
+        vals.push(JSON.stringify(normalizedExistingAction));
+      }
+    }
+
+    if (updates.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(updates.name); }
+    if (updates.cronExpr !== undefined) { sets.push(`cron_expr = $${idx++}`); vals.push(updates.cronExpr); }
+    if (updates.projectName !== undefined) { sets.push(`project_name = $${idx++}`); vals.push(updates.projectName); }
+    if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
+    if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
+    if (updates.action !== undefined) {
+      const unboundAction = normalizeCronActionForPersistence(updates.action, isDaemonReq);
+      const registeredAction = registerSelfManagedCronAction(
+        unboundAction,
+        jobId,
+        updates.completionPolicy ?? normalizeCronCompletionPolicy(lockedJob.completion_policy),
       );
-      if (!prov?.shared) return false;
+      if (!registeredAction.ok) {
+        return { kind: 'invalid_control', reason: registeredAction.reason };
+      }
+      const normalizedAction = normalizeCronSendActionForInterval(
+        registeredAction.action,
+        effectiveIntervalMs,
+      );
+      sets.push(`action = $${idx++}`);
+      vals.push(JSON.stringify(normalizedAction));
     }
-    await tx.execute(
-      `UPDATE cron_jobs SET ${sets.join(', ')} WHERE id = $${idx}`,
-      vals,
+    if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
+    if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
+    if (updates.completionPolicy !== undefined) { sets.push(`completion_policy = $${idx++}`); vals.push(updates.completionPolicy); }
+    if (nextRunAt !== undefined) { sets.push(`next_run_at = $${idx++}`); vals.push(nextRunAt); }
+
+    if (lockedJob.status === CRON_STATUS.EXPIRED || lockedJob.status === CRON_STATUS.ERROR) {
+      sets.push(`status = $${idx++}`); vals.push(CRON_STATUS.PAUSED);
+    }
+
+    const updatedAtIdx = idx++;
+    const idIdx = idx;
+    const upd = await tx.execute(
+      `UPDATE cron_jobs SET ${sets.join(', ')} WHERE updated_at IS NOT DISTINCT FROM $${updatedAtIdx} AND id = $${idIdx}`,
+      [...vals, lockedJob.updated_at ?? null, jobId],
     );
+    if (upd.changes !== 1) {
+      return { kind: 'conflict' };
+    }
+
+    const isSharedOrNonOwner = access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== lockedJob.user_id;
     if (isSharedOrNonOwner) {
       await tx.execute(
         `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
@@ -973,13 +1007,27 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
                server_id = EXCLUDED.server_id,
                project_name = EXCLUDED.project_name,
                shared = TRUE`,
-        [jobId, authority.actorUserId, job.server_id, updates.projectName ?? job.project_name ?? null, now],
+        [jobId, authority.actorUserId, lockedJob.server_id, updates.projectName ?? lockedJob.project_name ?? null, now],
       );
     }
-    return true;
+    return { kind: 'ok', serverId: lockedJob.server_id, completionPolicy: updates.completionPolicy };
   });
-  if (!txAllowed) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+
+  if (txResult.kind === 'not_found') return c.json({ error: 'not_found' }, 404);
+  if (txResult.kind === 'conflict') return c.json({ error: 'cron_concurrent_modification' }, 409);
+  if (txResult.kind === 'forbidden') return c.json({ error: 'forbidden', reason: txResult.reason }, 403);
+  if (txResult.kind === 'force_required') {
+    return c.json({
+      error: 'cron_force_required',
+      completionPolicy: txResult.completionPolicy,
+      message: 'Changing a recurring cron to until_complete from an agent requires force=true',
+    }, 409);
+  }
+  if (txResult.kind === 'invalid_expr') {
+    return c.json({ error: txResult.error, ...(txResult.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
+  }
+  if (txResult.kind === 'invalid_control') {
+    return c.json({ error: 'invalid_cron_control', reason: txResult.reason }, 400);
   }
 
   await logAudit({
@@ -987,15 +1035,15 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
     action: 'cron.update',
     details: {
       id: jobId,
-      ...(updates.completionPolicy !== undefined
+      ...(txResult.completionPolicy !== undefined
         ? {
-          completionPolicy: updates.completionPolicy,
-          forced: isDaemonCronRequest(c, routeServerId) ? c.req.query('force') === 'true' : false,
+          completionPolicy: txResult.completionPolicy,
+          forced: isDaemonCronRequest(c, routeServerId) ? forceFlag : false,
         }
         : {}),
     },
   }, c.env.DB);
-  WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'update' });
+  WsBridge.publishResourceChanged(txResult.serverId, RESOURCE_TOPICS.cron, { action: 'update' });
   return c.json({ ok: true });
 });
 
@@ -1011,39 +1059,63 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
     return c.json({ error: 'invalid_status' }, 400);
   }
 
-  const job = await c.env.DB.queryOne<DbCronJob>(
+  const initialJob = await c.env.DB.queryOne<DbCronJob>(
     'SELECT * FROM cron_jobs WHERE id = $1',
     [jobId],
   );
-  if (!job) return c.json({ error: 'not_found' }, 404);
-  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
-  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!initialJob) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(initialJob.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, initialJob.server_id);
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const userId = authority.actorUserId;
   const pinnedSessionName = pinnedSessionForAuthority(authority);
 
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  if (!await isSharedCronMutationAllowed(c.env.DB, {
-    job,
-    sharedScope: access.scope.shared,
-    isParticipantDaemon: authority.kind === 'participant_daemon',
-    actingUserId: userId,
-  })) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-  }
+  type StatusTxResult =
+    | { kind: 'ok'; serverId: string }
+    | { kind: 'not_found' }
+    | { kind: 'conflict' }
+    | { kind: 'forbidden'; reason: string }
+    | { kind: 'cannot_resume'; currentStatus: string };
 
-  if (newStatus === CRON_STATUS.ACTIVE && job.status !== CRON_STATUS.PAUSED) {
-    return c.json({ error: 'cannot_resume', currentStatus: job.status }, 400);
-  }
+  const txResult: StatusTxResult = await runCronWriteTx(c.env.DB, async (tx): Promise<StatusTxResult> => {
+    const lockedJob = await tx.queryOne<DbCronJob>(
+      'SELECT * FROM cron_jobs WHERE id = $1 FOR UPDATE',
+      [jobId],
+    );
+    if (!lockedJob || isWrongPodStickyServer(lockedJob.server_id, routeServerId)) return { kind: 'not_found' };
+    const lockedProv = await tx.queryOne<{ creator_user_id?: string; shared?: boolean }>(
+      'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1 FOR UPDATE',
+      [jobId],
+    );
+    const access = await resolveCronJobScope(c, { userId, job: lockedJob, mode: 'write', pinnedSessionName, db: tx });
+    if (!access.ok) return { kind: 'forbidden', reason: access.reason };
+    if (!await isSharedCronMutationAllowed(tx, {
+      job: lockedJob,
+      sharedScope: access.scope.shared,
+      isParticipantDaemon: authority.kind === 'participant_daemon',
+      actingUserId: userId,
+      provenance: lockedProv ?? null,
+    })) {
+      return { kind: 'forbidden', reason: 'share-direct-surface-denied' };
+    }
+    if (newStatus === CRON_STATUS.ACTIVE && lockedJob.status !== CRON_STATUS.PAUSED) {
+      return { kind: 'cannot_resume', currentStatus: lockedJob.status };
+    }
+    const upd = await tx.execute(
+      'UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE updated_at IS NOT DISTINCT FROM $3 AND id = $4',
+      [newStatus, Date.now(), lockedJob.updated_at ?? null, jobId],
+    );
+    if (upd.changes !== 1) return { kind: 'conflict' };
+    return { kind: 'ok', serverId: lockedJob.server_id };
+  });
 
-  await c.env.DB.execute(
-    'UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3',
-    [newStatus, Date.now(), jobId],
-  );
+  if (txResult.kind === 'not_found') return c.json({ error: 'not_found' }, 404);
+  if (txResult.kind === 'conflict') return c.json({ error: 'cron_concurrent_modification' }, 409);
+  if (txResult.kind === 'forbidden') return c.json({ error: 'forbidden', reason: txResult.reason }, 403);
+  if (txResult.kind === 'cannot_resume') return c.json({ error: 'cannot_resume', currentStatus: txResult.currentStatus }, 400);
 
   await logAudit({ userId, action: 'cron.status', details: { id: jobId, status: newStatus } }, c.env.DB);
-  WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'status' });
+  WsBridge.publishResourceChanged(txResult.serverId, RESOURCE_TOPICS.cron, { action: 'status' });
   return c.json({ ok: true });
 });
 
@@ -1054,54 +1126,80 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
 
-  const job = await c.env.DB.queryOne<DbCronJob>(
+  const initialJob = await c.env.DB.queryOne<DbCronJob>(
     'SELECT * FROM cron_jobs WHERE id = $1',
     [jobId],
   );
-  if (!job) return c.json({ error: 'not_found' }, 404);
-  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
-  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!initialJob) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(initialJob.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, initialJob.server_id);
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const userId = authority.actorUserId;
   const pinnedSessionName = pinnedSessionForAuthority(authority);
-
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  if (!await isSharedCronMutationAllowed(c.env.DB, {
-    job,
-    sharedScope: access.scope.shared,
-    isParticipantDaemon: authority.kind === 'participant_daemon',
-    actingUserId: userId,
-  })) {
-    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-  }
-
-  const completionPolicy = normalizeCronCompletionPolicy(job.completion_policy);
+  const isDaemonReq = isDaemonCronRequest(c, routeServerId, authority.kind);
   const force = c.req.query('force') === 'true';
-  if (
-    isDaemonCronRequest(c, routeServerId, authority.kind)
-    && completionPolicy === CRON_COMPLETION_POLICY.RECURRING
-    && !force
-  ) {
+
+  type DeleteTxResult =
+    | { kind: 'ok'; serverId: string; completionPolicy: string }
+    | { kind: 'not_found' }
+    | { kind: 'conflict' }
+    | { kind: 'forbidden'; reason: string }
+    | { kind: 'force_required'; completionPolicy: string };
+
+  const txResult: DeleteTxResult = await runCronWriteTx(c.env.DB, async (tx): Promise<DeleteTxResult> => {
+    const lockedJob = await tx.queryOne<DbCronJob>(
+      'SELECT * FROM cron_jobs WHERE id = $1 FOR UPDATE',
+      [jobId],
+    );
+    if (!lockedJob || isWrongPodStickyServer(lockedJob.server_id, routeServerId)) return { kind: 'not_found' };
+    const lockedProv = await tx.queryOne<{ creator_user_id?: string; shared?: boolean }>(
+      'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1 FOR UPDATE',
+      [jobId],
+    );
+    const access = await resolveCronJobScope(c, { userId, job: lockedJob, mode: 'write', pinnedSessionName, db: tx });
+    if (!access.ok) return { kind: 'forbidden', reason: access.reason };
+    if (!await isSharedCronMutationAllowed(tx, {
+      job: lockedJob,
+      sharedScope: access.scope.shared,
+      isParticipantDaemon: authority.kind === 'participant_daemon',
+      actingUserId: userId,
+      provenance: lockedProv ?? null,
+    })) {
+      return { kind: 'forbidden', reason: 'share-direct-surface-denied' };
+    }
+    const completionPolicy = normalizeCronCompletionPolicy(lockedJob.completion_policy);
+    if (isDaemonReq && completionPolicy === CRON_COMPLETION_POLICY.RECURRING && !force) {
+      return { kind: 'force_required', completionPolicy };
+    }
+    const del = await tx.execute(
+      'DELETE FROM cron_jobs WHERE id = $1 AND updated_at IS NOT DISTINCT FROM $2',
+      [jobId, lockedJob.updated_at ?? null],
+    );
+    if (del.changes !== 1) return { kind: 'conflict' };
+    return { kind: 'ok', serverId: lockedJob.server_id, completionPolicy };
+  });
+
+  if (txResult.kind === 'not_found') return c.json({ error: 'not_found' }, 404);
+  if (txResult.kind === 'conflict') return c.json({ error: 'cron_concurrent_modification' }, 409);
+  if (txResult.kind === 'forbidden') return c.json({ error: 'forbidden', reason: txResult.reason }, 403);
+  if (txResult.kind === 'force_required') {
     return c.json({
       error: 'cron_force_required',
-      completionPolicy,
+      completionPolicy: txResult.completionPolicy,
       message: 'Deleting a recurring cron from an agent requires force=true',
     }, 409);
   }
-
-  await c.env.DB.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
 
   await logAudit({
     userId,
     action: 'cron.delete',
     details: {
       id: jobId,
-      completionPolicy,
-      forced: isDaemonCronRequest(c, routeServerId, authority.kind) ? force : false,
+      completionPolicy: txResult.completionPolicy,
+      forced: isDaemonReq ? force : false,
     },
   }, c.env.DB);
-  WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'delete' });
+  WsBridge.publishResourceChanged(txResult.serverId, RESOURCE_TOPICS.cron, { action: 'delete' });
   return c.json({ ok: true });
 });
 

@@ -429,6 +429,8 @@ export interface CronDispatchMessage {
   nextRunAt?: number | null;
   /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
   targetSessionName?: string;
+  /** Authoritative single session name enforced at delivery for scoped shared cron send actions. */
+  exactTargetSessionName?: string;
   /** Server-signed owner-turn authority for non-shared host-owner cron dispatches. */
   [OWNER_MACHINE_AUTHORITY_FIELD]?: string;
   action: CronAction;

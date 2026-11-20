@@ -31,6 +31,8 @@ type ClaimedCronJob = DbCronJob & {
   previous_run_at?: number | null;
   /** Stable outbox id; present for transactional claims and recovery. */
   execution_id?: string;
+  /** Provenance read inside the same DB snapshot/transaction as the job row. */
+  snapshotProvenance?: CronProvenanceLookup;
 };
 
 /** Parse, validate and durably register legacy self-managed actions before use. */
@@ -81,23 +83,46 @@ async function readCronJobProvenance(db: Database, jobId: string): Promise<CronP
   }
 }
 
+type SharedCronDispatchAuth =
+  | { authorized: false }
+  | { authorized: true; exactTargetSessionName?: string };
+
+async function readJobAndProvenanceSnapshot(
+  db: Database,
+  fallbackJob: DbCronJob,
+): Promise<{ job: DbCronJob; provenance: CronProvenanceLookup }> {
+  const readPair = async (conn: Database): Promise<{ job: DbCronJob; provenance: CronProvenanceLookup }> => {
+    const freshRow = typeof (conn as { queryOne?: unknown })?.queryOne === 'function'
+      ? await conn.queryOne<DbCronJob>('SELECT * FROM cron_jobs WHERE id = $1', [fallbackJob.id])
+      : null;
+    const job = freshRow ?? fallbackJob;
+    const provenance = await readCronJobProvenance(conn, job.id);
+    return { job, provenance };
+  };
+  const txFn = (db as Database & { transaction?: (fn: (tx: Database) => Promise<unknown>) => Promise<unknown> }).transaction;
+  if (typeof txFn === 'function') {
+    return await txFn.call(db, async (tx) => readPair(tx)) as { job: DbCronJob; provenance: CronProvenanceLookup };
+  }
+  return readPair(db);
+}
+
 async function verifySharedCronCreatorStillAuthorized(
   db: Database,
   job: DbCronJob,
   now: number,
   prov: CronProvenanceRow | null,
-): Promise<boolean> {
-  if (!prov || !prov.shared || prov.creator_user_id === job.user_id) return true;
+): Promise<SharedCronDispatchAuth> {
+  if (!prov || !prov.shared || prov.creator_user_id === job.user_id) return { authorized: true };
 
   const member = await resolveServerMemberAccessOrShareDeny(db, {
     serverId: job.server_id,
     userId: prov.creator_user_id,
   });
-  if (member.ok) return true;
+  if (member.ok) return { authorized: true };
 
   const shares = await listActiveSharesForUser(db, prov.creator_user_id, now);
   const participantShares = shares.filter((s) => s.serverId === job.server_id && s.role === 'participant');
-  if (participantShares.length === 0) return false;
+  if (participantShares.length === 0) return { authorized: false };
 
   let hasMatchingMainShare = false;
   for (const s of participantShares) {
@@ -120,80 +145,128 @@ async function verifySharedCronCreatorStillAuthorized(
       parsedAction = parsed as Record<string, unknown>;
     }
   } catch {
-    return false;
+    return { authorized: false };
   }
 
   // Non-whole-server shared crons must never use broadcast send semantics,
   // which fan out across all project candidates regardless of target.
   if (parsedAction?.type === 'send' && parsedAction.broadcast === true) {
-    return false;
+    return { authorized: false };
   }
+
+  const resolveExactSendTarget = async (allowedPinnedSession: string | null): Promise<string | null> => {
+    if (parsedAction?.type !== 'send') return null;
+    const rawTarget = typeof parsedAction.target === 'string' ? parsedAction.target.trim() : '';
+    if (!rawTarget) return null;
+    let canonical: string | null = null;
+    if (rawTarget.startsWith('deck_')) {
+      canonical = rawTarget;
+    } else if (/^(brain|w\d+)$/.test(rawTarget) && job.project_name) {
+      canonical = `deck_${job.project_name}_${rawTarget}`;
+    } else {
+      // Never accept arbitrary label / agentType strings on non-whole-server shared crons.
+      return null;
+    }
+    if (allowedPinnedSession && canonical !== allowedPinnedSession) {
+      return null;
+    }
+    const coveredTarget = shareTargetFromSessionName(job.server_id, canonical);
+    if (!coveredTarget) return null;
+    const access = await resolveHttpShareAccessForCoveredSession(db, {
+      serverId: job.server_id,
+      userId: prov.creator_user_id,
+      target: coveredTarget,
+    });
+    if (access.actor.kind === 'share' && access.actor.effectiveActorRole === 'participant') {
+      return canonical;
+    }
+    if (!allowedPinnedSession && hasMatchingMainShare && job.project_name) {
+      if (coveredTarget.kind === 'main') {
+        const sess = await db.queryOne<{ project_name: string }>(
+          'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+          [job.server_id, coveredTarget.sessionName],
+        );
+        if (sess?.project_name === job.project_name) return canonical;
+      } else if (coveredTarget.kind === 'subsession') {
+        const sub = await db.queryOne<{ parent_session: string | null; closed_at: number | null; execution_clone_metadata: unknown }>(
+          'SELECT parent_session, closed_at, execution_clone_metadata FROM sub_sessions WHERE id = $1 AND server_id = $2 LIMIT 1',
+          [coveredTarget.subSessionId, job.server_id],
+        );
+        if (sub && sub.closed_at === null && !sub.execution_clone_metadata && sub.parent_session) {
+          const parent = await db.queryOne<{ project_name: string }>(
+            'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+            [job.server_id, sub.parent_session],
+          );
+          if (parent?.project_name === job.project_name) return canonical;
+        }
+      }
+    }
+    return null;
+  };
 
   if (job.target_session_name) {
     const target = shareTargetFromSessionName(job.server_id, job.target_session_name);
-    if (!target) return false;
+    if (!target) return { authorized: false };
     const access = await resolveHttpShareAccessForCoveredSession(db, {
       serverId: job.server_id,
       userId: prov.creator_user_id,
       target,
     });
     if (access.actor.kind !== 'share' || access.actor.effectiveActorRole !== 'participant') {
-      return false;
+      return { authorized: false };
     }
-    if (!hasMatchingMainShare) {
-      if (parsedAction?.type === 'send' && parsedAction.target !== job.target_session_name) {
-        return false;
+    let exactSendTarget: string | undefined;
+    if (parsedAction?.type === 'send') {
+      const resolved = await resolveExactSendTarget(hasMatchingMainShare ? null : job.target_session_name);
+      if (!resolved) return { authorized: false };
+      if (!hasMatchingMainShare && resolved !== job.target_session_name) return { authorized: false };
+      exactSendTarget = resolved;
+    }
+    if (!hasMatchingMainShare && parsedAction?.type === 'p2p') {
+      if (Array.isArray(parsedAction.participants) && parsedAction.participants.length > 0) {
+        return { authorized: false };
       }
-      if (parsedAction?.type === 'p2p') {
-        if (Array.isArray(parsedAction.participants) && parsedAction.participants.length > 0) {
-          return false;
-        }
-        const entries = Array.isArray(parsedAction.participantEntries) ? parsedAction.participantEntries : [];
-        for (const entry of entries) {
-          if (!entry || typeof entry !== 'object'
-            || (entry as Record<string, unknown>).type !== 'session'
-            || (entry as Record<string, unknown>).value !== job.target_session_name) {
-            return false;
-          }
+      const entries = Array.isArray(parsedAction.participantEntries) ? parsedAction.participantEntries : [];
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object'
+          || (entry as Record<string, unknown>).type !== 'session'
+          || (entry as Record<string, unknown>).value !== job.target_session_name) {
+          return { authorized: false };
         }
       }
     }
-    return true;
+    return exactSendTarget ? { authorized: true, exactTargetSessionName: exactSendTarget } : { authorized: true };
   }
 
-  if (parsedAction?.type === 'send' && typeof parsedAction.target === 'string' && parsedAction.target.startsWith('deck_')) {
-    const sendTarget = shareTargetFromSessionName(job.server_id, parsedAction.target);
-    if (!sendTarget) return false;
-    const access = await resolveHttpShareAccessForCoveredSession(db, {
-      serverId: job.server_id,
-      userId: prov.creator_user_id,
-      target: sendTarget,
-    });
-    if (access.actor.kind !== 'share' || access.actor.effectiveActorRole !== 'participant') {
-      return false;
-    }
+  if (!hasMatchingMainShare) return { authorized: false };
+
+  let exactMainSendTarget: string | undefined;
+  if (parsedAction?.type === 'send') {
+    const resolved = await resolveExactSendTarget(null);
+    if (!resolved) return { authorized: false };
+    exactMainSendTarget = resolved;
   }
   if (parsedAction?.type === 'p2p') {
     const entries = Array.isArray(parsedAction.participantEntries) ? parsedAction.participantEntries : [];
     for (const entry of entries) {
       if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).type === 'session') {
         const value = (entry as Record<string, unknown>).value;
-        if (typeof value !== 'string') return false;
+        if (typeof value !== 'string') return { authorized: false };
         const entryTarget = shareTargetFromSessionName(job.server_id, value);
-        if (!entryTarget) return false;
+        if (!entryTarget) return { authorized: false };
         const access = await resolveHttpShareAccessForCoveredSession(db, {
           serverId: job.server_id,
           userId: prov.creator_user_id,
           target: entryTarget,
         });
         if (access.actor.kind !== 'share' || access.actor.effectiveActorRole !== 'participant') {
-          return false;
+          return { authorized: false };
         }
       }
     }
   }
 
-  return hasMatchingMainShare;
+  return exactMainSendTarget ? { authorized: true, exactTargetSessionName: exactMainSendTarget } : { authorized: true };
 }
 
 async function issueCronOwnerAuthority(
@@ -220,12 +293,15 @@ async function issueCronOwnerAuthority(
 }
 
 /** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
-export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
-  const provenance = await readCronJobProvenance(env.DB, job.id);
+export async function dispatchJobNow(env: Env, passedJob: DbCronJob): Promise<void> {
+  const snapshot = await readJobAndProvenanceSnapshot(env.DB, passedJob);
+  const job = snapshot.job;
+  const provenance = snapshot.provenance;
   if (!provenance.ok) {
     throw provenance.error instanceof Error ? provenance.error : new Error('cron_provenance_read_failed');
   }
-  if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, Date.now(), provenance.row)) {
+  const auth = await verifySharedCronCreatorStillAuthorized(env.DB, job, Date.now(), provenance.row);
+  if (!auth.authorized) {
     await env.DB.execute('UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3', [CRON_STATUS.PAUSED, Date.now(), job.id]).catch(() => {});
     await logExecution(env, randomHex(12), job.id, 'error', 'share_revoked');
     throw new Error('share_revoked');
@@ -235,12 +311,22 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     await logExecution(env, randomHex(12), job.id, 'error', prepared.reason);
     throw new Error(prepared.reason);
   }
-  const action = prepared.action;
+  const action = auth.exactTargetSessionName && prepared.action.type === 'send'
+    ? { ...prepared.action, target: auth.exactTargetSessionName }
+    : prepared.action;
 
   const bridge = WsBridge.get(job.server_id);
   if (!bridge.isDaemonConnected()) {
     await logExecution(env, randomHex(12), job.id, 'skipped_offline');
     throw new Error('daemon_offline');
+  }
+  if (auth.exactTargetSessionName && action.type === 'send') {
+    const supportsExact = typeof (bridge as { supportsExactCronSend?: unknown }).supportsExactCronSend === 'function'
+      && (bridge as { supportsExactCronSend: () => boolean }).supportsExactCronSend();
+    if (!supportsExact) {
+      await logExecution(env, randomHex(12), job.id, 'error', 'daemon_upgrade_required_exact_cron_send');
+      throw new Error('daemon_upgrade_required_exact_cron_send');
+    }
   }
 
   if (!job.target_role) {
@@ -263,6 +349,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     previousRunAt: job.last_run_at,
     nextRunAt: job.next_run_at,
     ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
+    ...(auth.exactTargetSessionName ? { exactTargetSessionName: auth.exactTargetSessionName } : {}),
     ...(ownerMachineAuthority ? { [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : {}),
     action,
   };
@@ -311,6 +398,7 @@ async function claimDueJobs(
       const jobs = await selectDue(tx);
       const claimed: ClaimedCronJob[] = [];
       for (const job of jobs) {
+        const snapshotProvenance = await readCronJobProvenance(tx, job.id);
         const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
         const result = await tx.execute(
           'UPDATE cron_jobs SET last_run_at = $1, next_run_at = $2 WHERE id = $3 AND status = $4 AND next_run_at <= $1',
@@ -325,7 +413,7 @@ async function claimDueJobs(
           'INSERT INTO cron_executions (id, job_id, status, detail, created_at) VALUES ($1, $2, $3, $4, $5)',
           [executionId, job.id, 'pending_dispatch', JSON.stringify({ previousRunAt: job.last_run_at, nextRunAt: nextRun }), now],
         );
-        claimed.push({ ...job, last_run_at: now, next_run_at: nextRun, execution_id: executionId });
+        claimed.push({ ...job, last_run_at: now, next_run_at: nextRun, execution_id: executionId, snapshotProvenance });
       }
       return claimed;
     }) as ClaimedCronJob[];
@@ -371,11 +459,12 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
           AND ${activeUserExistsSql('j.user_id')}
         ORDER BY e.created_at ASC
         LIMIT 50
-        FOR UPDATE OF e SKIP LOCKED`,
+        FOR UPDATE OF e, j SKIP LOCKED`,
       [now - 60_000],
     );
     const claimed: ClaimedCronJob[] = [];
     for (const row of rows.filter((candidate) => typeof candidate.execution_id === 'string' && candidate.execution_id.length > 0)) {
+      const snapshotProvenance = await readCronJobProvenance(tx, row.id);
       let detail: { previousRunAt?: number | null; nextRunAt?: number } = {};
       try {
         detail = row.execution_detail ? JSON.parse(row.execution_detail) as typeof detail : {};
@@ -388,6 +477,7 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
         ...row,
         ...(detail.previousRunAt !== undefined ? { previous_run_at: detail.previousRunAt } : {}),
         ...(detail.nextRunAt !== undefined ? { next_run_at: detail.nextRunAt } : {}),
+        snapshotProvenance,
       });
     }
     return claimed;
@@ -409,7 +499,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
 
   for (const job of dueJobs) {
     try {
-      const provenance = await readCronJobProvenance(env.DB, job.id);
+      const provenance = job.snapshotProvenance ?? await readCronJobProvenance(env.DB, job.id);
       if (!provenance.ok) {
         logger.error({ jobId: job.id, err: provenance.error }, 'Cron provenance read failed; refusing dispatch and keeping pending for retry');
         if (job.execution_id) {
@@ -421,7 +511,8 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         }
         continue;
       }
-      if (!await verifySharedCronCreatorStillAuthorized(env.DB, job, now, provenance.row)) {
+      const auth = await verifySharedCronCreatorStillAuthorized(env.DB, job, now, provenance.row);
+      if (!auth.authorized) {
         logger.info({ jobId: job.id }, 'Pausing shared cron job because creator access was revoked');
         await env.DB.execute('UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3', [CRON_STATUS.PAUSED, now, job.id]).catch(() => {});
         if (job.execution_id) {
@@ -444,7 +535,9 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         await logExecution(env, randomHex(12), job.id, 'error', prepared.reason);
         continue;
       }
-      const action = prepared.action;
+      const action = auth.exactTargetSessionName && prepared.action.type === 'send'
+        ? { ...prepared.action, target: auth.exactTargetSessionName }
+        : prepared.action;
 
       // Skip if daemon offline (fire-and-forget)
       const bridge = WsBridge.get(job.server_id);
@@ -460,6 +553,20 @@ export async function jobDispatchCron(env: Env): Promise<void> {
           await logExecution(env, randomHex(12), job.id, 'skipped_offline');
         }
         continue;
+      }
+      if (auth.exactTargetSessionName && action.type === 'send') {
+        const supportsExact = typeof (bridge as { supportsExactCronSend?: unknown }).supportsExactCronSend === 'function'
+          && (bridge as { supportsExactCronSend: () => boolean }).supportsExactCronSend();
+        if (!supportsExact) {
+          logger.error({ jobId: job.id }, 'Daemon does not support exact scoped cron send; refusing dispatch');
+          if (job.execution_id) {
+            await env.DB.execute('UPDATE cron_executions SET status = $1, detail = $2 WHERE id = $3 AND status = $4', [
+              'error', 'daemon_upgrade_required_exact_cron_send', job.execution_id, 'dispatching',
+            ]);
+          }
+          await logExecution(env, randomHex(12), job.id, 'error', 'daemon_upgrade_required_exact_cron_send');
+          continue;
+        }
       }
 
       // Dispatch to daemon.  Transactional claims already advanced the
@@ -510,6 +617,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
           : job.last_run_at,
         nextRunAt: nextRun,
         ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
+        ...(auth.exactTargetSessionName ? { exactTargetSessionName: auth.exactTargetSessionName } : {}),
         ...(ownerMachineAuthority ? { [OWNER_MACHINE_AUTHORITY_FIELD]: ownerMachineAuthority } : {}),
         action,
       };
