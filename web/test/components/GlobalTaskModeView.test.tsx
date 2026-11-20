@@ -1539,4 +1539,111 @@ describe('GlobalTaskModeView', () => {
     expect(doneCard.className).not.toContain('is-expanded');
     expect(screen.getByTestId('mock-voice-overlay').getAttribute('data-session-label')).toContain('Ship WS backend');
   });
+
+  it('displays compact start time and live/final execution duration on cards and tightens mobile layout CSS', async () => {
+    const baseNow = Date.now();
+    const { ws } = await mountWithSnapshot();
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: baseNow,
+        servers: [{ id: 'srv-1', name: 'Alpha Box', online: true }],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'Alpha Box',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'Main',
+            taskId: 'tsk_live_timed',
+            title: 'Active timed task',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 4, implemented: 2, audited: 1 },
+            startedAt: baseNow - 65_000,
+            createdAt: baseNow - 120_000,
+            updatedAt: baseNow - 5_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'Alpha Box',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'Main',
+            taskId: 'tsk_queued_no_start',
+            title: 'Queued task without startedAt',
+            status: 'queued',
+            flags: [],
+            round: 0,
+            checklist: { total: 0, implemented: 0, audited: 0 },
+            createdAt: baseNow - 30_000,
+            updatedAt: baseNow - 30_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'Alpha Box',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'Main',
+            taskId: 'tsk_done_frozen',
+            title: 'Terminal task with fixed duration',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 0, implemented: 0, audited: 0 },
+            startedAt: baseNow - 90_000,
+            endedAt: baseNow - 20_000,
+            createdAt: baseNow - 100_000,
+            updatedAt: baseNow - 15_000,
+            isTerminal: true,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    const liveTiming = screen.getByTestId('task-mode-timing-tsk_live_timed');
+    expect(liveTiming.closest('.global-task-progress-wrap')).not.toBeNull();
+    expect(liveTiming.textContent).toContain('1m 5s');
+    expect(liveTiming.textContent).not.toContain('NaN');
+
+    const queuedTiming = screen.getByTestId('task-mode-timing-tsk_queued_no_start');
+    expect(queuedTiming.closest('.global-task-timing-row')).not.toBeNull();
+    expect(queuedTiming.textContent).toContain('30s');
+    expect(queuedTiming.textContent).not.toContain('NaN');
+
+    const doneTiming = screen.getByTestId('task-mode-timing-tsk_done_frozen');
+    expect(doneTiming.textContent).toContain('1m 10s');
+
+    // Advance 5 seconds: active & queued tick forward, terminal stays frozen at 1m 10s
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(screen.getByTestId('task-mode-timing-tsk_live_timed').textContent).toContain('1m 10s');
+    expect(screen.getByTestId('task-mode-timing-tsk_queued_no_start').textContent).toContain('35s');
+    expect(screen.getByTestId('task-mode-timing-tsk_done_frozen').textContent).toContain('1m 10s');
+
+    // Verify mobile <=720px compact spacing rules in styles.css
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const css = readFileSync(resolve(process.cwd().endsWith('/web') ? process.cwd() : resolve(process.cwd(), 'web'), 'src/styles.css'), 'utf8');
+    const mobileBlock = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
+    expect(mobileBlock).toMatch(/\.global-task-mode-body\s*\{[^}]*padding:\s*8px;[^}]*gap:\s*6px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-quickbar\s*\{[^}]*padding:\s*6px 8px;[^}]*gap:\s*5px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-card\s*\{[^}]*padding:\s*5px 7px;[^}]*gap:\s*2\.5px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-card\.is-terminal\s*\{[^}]*padding:\s*4px 7px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-card-title\s*\{[^}]*font-size:\s*11\.5px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-card-timing\s*\{[^}]*font-size:\s*9\.5px;/s);
+    expect(mobileBlock).toMatch(/\.global-task-progress-track\s*\{[^}]*min-width:\s*20px;/s);
+  });
 });

@@ -407,7 +407,10 @@ import {
   SUBSESSION_NAME_PREFIX,
   isAutoCreatedSubSessionName,
 } from '../../../shared/task-pair.js';
-import { GLOBAL_TASK_FLEET_SNAPSHOT_MSG } from '../../../shared/global-task-mode.js';
+import {
+  GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+  isGlobalTaskTerminalStatus,
+} from '../../../shared/global-task-mode.js';
 import {
   upsertGlobalTaskSummariesBatchChanges,
   upsertGlobalTaskSummaryWithChange,
@@ -15730,6 +15733,8 @@ export class WsBridge {
         auditorLabel: typeof item.auditorLabel === 'string' ? item.auditorLabel : undefined,
         auditor: typeof item.auditor === 'string' ? item.auditor : undefined,
         liveSummary: typeof item.liveSummary === 'string' ? item.liveSummary : undefined,
+        startedAt: typeof item.startedAt === 'number' ? item.startedAt : undefined,
+        endedAt: typeof item.endedAt === 'number' ? item.endedAt : undefined,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : undefined,
         updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : undefined,
       });
@@ -15778,6 +15783,12 @@ export class WsBridge {
       auditorLabel: typeof pair.auditorLabel === 'string' ? pair.auditorLabel : undefined,
       auditor: typeof pair.auditor === 'string' ? pair.auditor : undefined,
       liveSummary,
+      startedAt: typeof pair.startedAt === 'number'
+        ? pair.startedAt
+        : (typeof task.startedAt === 'number' ? task.startedAt : undefined),
+      endedAt: typeof pair.endedAt === 'number'
+        ? pair.endedAt
+        : (typeof task.endedAt === 'number' ? task.endedAt : undefined),
       createdAt: typeof pair.createdAt === 'number' ? pair.createdAt : undefined,
       updatedAt: typeof pair.updatedAt === 'number'
         ? pair.updatedAt
@@ -15837,6 +15848,14 @@ export class WsBridge {
           auditorLabel: typeof payload.auditorLabel === 'string' ? payload.auditorLabel : undefined,
           auditor: typeof payload.auditor === 'string' ? payload.auditor : undefined,
           liveSummary,
+          startedAt: typeof payload.startedAt === 'number'
+            ? payload.startedAt
+            : (status === 'working' && payload.fromStatus === 'queued' ? eventTs : undefined),
+          endedAt: typeof payload.endedAt === 'number'
+            ? payload.endedAt
+            : (typeof payload.finishedAt === 'number'
+              ? payload.finishedAt
+              : (isGlobalTaskTerminalStatus(status) ? eventTs : undefined)),
           updatedAt: eventTs,
         });
         if (saved && changed) {

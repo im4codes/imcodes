@@ -46,6 +46,8 @@ export interface GlobalTaskSummaryRow {
   auditorLabel?: string;
   auditor?: string;
   liveSummary?: string;
+  startedAt?: number;
+  endedAt?: number;
   createdAt: number;
   updatedAt: number;
   isTerminal: boolean;
@@ -111,6 +113,8 @@ export interface GlobalTaskFleetSnapshotPair {
   auditorLabel?: string;
   auditor?: string;
   liveSummary?: string;
+  startedAt?: number;
+  endedAt?: number;
   createdAt: number;
   updatedAt: number;
 }

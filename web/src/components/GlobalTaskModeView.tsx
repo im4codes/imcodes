@@ -26,6 +26,8 @@ import {
 } from '../tts.js';
 import { TtsQuickSettingsPopover } from './TtsQuickSettingsPopover.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
+import { formatTaskDuration } from '../util/tool-duration.js';
 
 export type GlobalTaskStatusFilter = 'all' | 'attention' | 'working' | 'audit' | 'done';
 
@@ -611,6 +613,27 @@ export function GlobalTaskModeView({
     [filteredTasks],
   );
 
+  const hasLiveTimingTask = useMemo(
+    () => activeTasks.some((task) => {
+      const startTs = typeof task.startedAt === 'number' && Number.isFinite(task.startedAt) && task.startedAt > 0
+        ? task.startedAt
+        : (typeof task.createdAt === 'number' && Number.isFinite(task.createdAt) && task.createdAt > 0 ? task.createdAt : 0);
+      return startTs > 0;
+    }),
+    [activeTasks],
+  );
+  const now = useNowTicker(hasLiveTimingTask);
+  const durationUnits = useMemo(
+    () => ({
+      day: t('taskPair.panel_duration_day'),
+      hour: t('taskPair.panel_duration_hour'),
+      minute: t('taskPair.panel_duration_minute'),
+      second: t('taskPair.panel_duration_second'),
+      separator: t('taskPair.panel_duration_separator'),
+    }),
+    [t],
+  );
+
   // Gesture helpers: tap -> quick composer, long-press (260ms) -> VoiceOverlay, scroll (>12px) -> cancelled
   const finishPressTracker = useCallback((key: string, cancelPress: boolean) => {
     const tracker = pressTrackersRef.current.get(key);
@@ -844,6 +867,27 @@ export function GlobalTaskModeView({
     const implPct = total > 0 ? Math.round((implDone / total) * 100) : 0;
     const auditPct = total > 0 ? Math.round((auditDone / total) * 100) : 0;
 
+    const effectiveStartTs = typeof task.startedAt === 'number' && Number.isFinite(task.startedAt) && task.startedAt > 0
+      ? task.startedAt
+      : (typeof task.createdAt === 'number' && Number.isFinite(task.createdAt) && task.createdAt > 0 ? task.createdAt : 0);
+    const startTimeText = effectiveStartTs > 0 ? formatUpdatedRelative(effectiveStartTs, locale) : '';
+    const durationText = effectiveStartTs > 0
+      ? formatTaskDuration({
+          startedAt: effectiveStartTs,
+          endedAt: task.endedAt,
+          updatedAt: task.updatedAt,
+          now,
+          terminal: task.isTerminal,
+        }, durationUnits)
+      : undefined;
+    const timingEl = (startTimeText || durationText) ? (
+      <span class="global-task-card-timing" data-testid={`task-mode-timing-${task.taskId}`}>
+        {startTimeText && durationText
+          ? `${startTimeText} · ⏱ ${durationText}`
+          : (durationText ? `⏱ ${durationText}` : startTimeText)}
+      </span>
+    ) : null;
+
     const replySnapshot: TaskModeTargetSnapshot = {
       serverId: task.serverId,
       serverName: task.serverName,
@@ -908,7 +952,12 @@ export function GlobalTaskModeView({
                   <div class="global-task-progress-impl-bar" style={{ width: `${implPct}%` }} />
                   <div class="global-task-progress-audit-bar" style={{ width: `${auditPct}%` }} />
                 </div>
+                {timingEl}
               </div>
+            )}
+
+            {total === 0 && timingEl && (
+              <div class="global-task-timing-row">{timingEl}</div>
             )}
 
             {task.liveSummary && (

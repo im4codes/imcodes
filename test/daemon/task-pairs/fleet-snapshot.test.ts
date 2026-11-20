@@ -75,7 +75,13 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     store.savePair('proj', makePairState({
       taskId: 'tsk_active',
       status: 'in_audit',
+      startedAt: now - 45_000,
       updatedAt: now - 5_000,
+    }));
+    store.savePair('proj', makePairState({
+      taskId: 'tsk_queued',
+      status: 'queued',
+      updatedAt: now - 10_000,
     }));
     store.savePair('proj', makePairState({
       taskId: 'tsk_old_active',
@@ -85,7 +91,15 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     store.savePair('proj', makePairState({
       taskId: 'tsk_recent_done',
       status: 'done',
+      startedAt: now - 180_000,
       updatedAt: now - 60_000,
+      workspace: {
+        kind: 'worktree',
+        path: '/tmp/wt',
+        createdAt: now - 180_000,
+        status: 'ended',
+        endedAt: now - 62_000,
+      },
     }));
     store.savePair('proj', makePairState({
       taskId: 'tsk_boundary_done',
@@ -102,6 +116,7 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     expect(frame.type).toBe(GLOBAL_TASK_FLEET_SNAPSHOT_MSG);
     expect(frame.pairs.map((p) => p.taskId)).toEqual([
       'tsk_active',
+      'tsk_queued',
       'tsk_old_active',
       'tsk_recent_done',
       'tsk_boundary_done',
@@ -112,5 +127,18 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     expect(active.executorLabel).toBe('Exec One');
     expect(active.auditorLabel).toBe('Aud One');
     expect(active.projectName).toBe('proj');
+    expect(active.startedAt).toBe(now - 45_000);
+    expect(active.endedAt).toBeUndefined();
+
+    const queued = frame.pairs[1]!;
+    expect(queued.startedAt).toBeUndefined();
+    expect(queued.endedAt).toBeUndefined();
+
+    const done = frame.pairs[3]!;
+    expect(done.startedAt).toBe(now - 180_000);
+    expect(done.endedAt).toBe(now - 62_000);
+
+    const cancelledNoWorkspace = frame.pairs[4]!;
+    expect(cancelledNoWorkspace.endedAt).toBe(now - GLOBAL_TASK_TERMINAL_WINDOW_MS);
   });
 });

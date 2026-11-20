@@ -2,6 +2,7 @@ import {
   GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
   GLOBAL_TASK_RECENT_FINISHED_LIMIT,
   GLOBAL_TASK_TERMINAL_WINDOW_MS,
+  isGlobalTaskTerminalStatus,
   type GlobalTaskFleetSnapshotFrame,
   type GlobalTaskFleetSnapshotPair,
 } from '../../../shared/global-task-mode.js';
@@ -22,6 +23,13 @@ export function toGlobalTaskFleetSnapshotPair(stored: StoredTaskPair): GlobalTas
   const executorLabel = sessionLabel(state.executor);
   const auditorLabel = sessionLabel(state.auditor);
   const liveSummary = state.blockedNote?.trim() || state.lastVerdict?.noticeText?.trim() || undefined;
+  const startedAt = typeof state.startedAt === 'number' && Number.isFinite(state.startedAt) && state.startedAt > 0
+    ? state.startedAt
+    : undefined;
+  const rawEndedAt = state.workspace?.endedAt;
+  const endedAt = typeof rawEndedAt === 'number' && Number.isFinite(rawEndedAt) && rawEndedAt > 0
+    ? rawEndedAt
+    : (isGlobalTaskTerminalStatus(state.status) ? (state.updatedAt || state.createdAt || undefined) : undefined);
   return {
     taskId: state.taskId,
     brain: state.brain,
@@ -35,6 +43,8 @@ export function toGlobalTaskFleetSnapshotPair(stored: StoredTaskPair): GlobalTas
     ...(auditorLabel ? { auditorLabel } : {}),
     ...(state.auditor ? { auditor: state.auditor } : {}),
     ...(liveSummary ? { liveSummary: liveSummary.slice(0, 240) } : {}),
+    ...(startedAt !== undefined ? { startedAt } : {}),
+    ...(endedAt !== undefined ? { endedAt } : {}),
     createdAt: state.createdAt,
     updatedAt: state.updatedAt || state.createdAt || 0,
   };

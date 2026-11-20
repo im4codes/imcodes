@@ -23839,6 +23839,21 @@ html.native-ios-mac .global-task-mode-entry-btn {
   background: #34d399;
 }
 
+.global-task-timing-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.global-task-card-timing {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1.2;
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .global-task-live-summary {
   font-size: 11px;
   color: #94a3b8;
@@ -24222,9 +24237,60 @@ html.native-ios-mac .global-task-mode-entry-btn {
   .global-task-quickbar-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+  .global-task-mode-body {
+    padding: 8px;
+    gap: 6px;
+  }
+  .global-task-quickbar {
+    padding: 6px 8px;
+    gap: 5px;
+  }
   .global-task-mode-grid {
     grid-template-columns: minmax(0, 1fr);
     gap: 6px;
+  }
+  .global-task-card {
+    padding: 5px 7px;
+    gap: 2.5px;
+    border-radius: 7px;
+  }
+  .global-task-card.is-terminal {
+    padding: 4px 7px;
+  }
+  .global-task-card-content {
+    gap: 2px;
+  }
+  .global-task-card-meta {
+    font-size: 10px;
+    gap: 3px;
+  }
+  .global-task-card-title {
+    font-size: 11.5px;
+    line-height: 1.25;
+  }
+  .global-task-progress-wrap {
+    gap: 5px;
+  }
+  .global-task-progress-labels {
+    gap: 4px;
+    font-size: 10px;
+  }
+  .global-task-progress-track {
+    min-width: 20px;
+  }
+  .global-task-card-timing {
+    font-size: 9.5px;
+  }
+  .global-task-live-summary {
+    font-size: 10.5px;
+    line-height: 1.2;
+  }
+  .global-task-brain-preview {
+    padding: 2px 5px;
+  }
+  .global-task-brain-preview-text {
+    font-size: 10.5px;
+    line-height: 1.25;
   }
   .global-task-add-fields {
     grid-template-columns: minmax(0, 1fr);

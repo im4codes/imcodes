@@ -31,6 +31,8 @@ export interface GlobalTaskSummaryUpsertInput {
   auditorLabel?: string;
   auditor?: string;
   liveSummary?: string;
+  startedAt?: number;
+  endedAt?: number;
   createdAt?: number;
   updatedAt?: number;
 }
@@ -54,6 +56,8 @@ interface RawSummaryRow {
   live_summary: string | null;
   is_terminal: boolean | number;
   needs_attention: boolean | number;
+  started_at?: number | string | null;
+  ended_at?: number | string | null;
   created_at: number | string;
   updated_at: number | string;
 }
@@ -87,6 +91,12 @@ function mapRawSummaryRow(
   const status = String(row.status || '');
   const brainSession = String(row.brain_session || '');
   const brainLabel = cleanStr(row.brain_label) || cleanStr(brainLabelFallback) || brainSession;
+  const startedAt = typeof row.started_at === 'number' || (typeof row.started_at === 'string' && row.started_at !== '')
+    ? (Number(row.started_at) || 0)
+    : 0;
+  const endedAt = typeof row.ended_at === 'number' || (typeof row.ended_at === 'string' && row.ended_at !== '')
+    ? (Number(row.ended_at) || 0)
+    : 0;
   return {
     serverId: String(row.server_id),
     serverName: serverMeta.name,
@@ -108,6 +118,8 @@ function mapRawSummaryRow(
     ...(cleanOptionalStr(row.auditor_label) ? { auditorLabel: cleanOptionalStr(row.auditor_label) } : {}),
     ...(cleanOptionalStr(row.auditor) ? { auditor: cleanOptionalStr(row.auditor) } : {}),
     ...(cleanOptionalStr(row.live_summary) ? { liveSummary: cleanOptionalStr(row.live_summary) } : {}),
+    ...(startedAt > 0 ? { startedAt } : {}),
+    ...(endedAt > 0 ? { endedAt } : {}),
     createdAt: Number(row.created_at ?? 0) || 0,
     updatedAt: Number(row.updated_at ?? 0) || 0,
     isTerminal: row.is_terminal === true || row.is_terminal === 1 || isGlobalTaskTerminalStatus(status),
@@ -163,6 +175,8 @@ export function hasGlobalTaskSummaryChanged(
     || prev.auditor !== next.auditor
     || prev.isTerminal !== next.isTerminal
     || prev.needsAttention !== next.needsAttention
+    || prev.startedAt !== next.startedAt
+    || prev.endedAt !== next.endedAt
     || prev.updatedAt !== next.updatedAt
     || prev.checklist.total !== next.checklist.total
     || prev.checklist.implemented !== next.checklist.implemented
@@ -211,6 +225,12 @@ export async function upsertGlobalTaskSummaryWithChange(
   const statusNeedsAttention = isGlobalTaskAttentionNeeded(status, cleanFlags);
   const now = Date.now();
   const createdAt = Math.max(0, Math.floor(Number(input.createdAt ?? 0) || 0));
+  const startedAt = typeof input.startedAt === 'number' && Number.isFinite(input.startedAt) && input.startedAt > 0
+    ? Math.floor(input.startedAt)
+    : 0;
+  const endedAt = typeof input.endedAt === 'number' && Number.isFinite(input.endedAt) && input.endedAt > 0
+    ? Math.floor(input.endedAt)
+    : 0;
   const hasExplicitUpdatedAt = typeof input.updatedAt === 'number' && Number.isFinite(input.updatedAt) && input.updatedAt > 0;
   const updatedAt = hasExplicitUpdatedAt
     ? Math.floor(input.updatedAt as number)
@@ -230,13 +250,13 @@ export async function upsertGlobalTaskSummaryWithChange(
       status, flags_json, round,
       checklist_total, checklist_implemented, checklist_audited,
       executor_label, auditor_label, auditor, live_summary,
-      is_terminal, needs_attention, created_at, updated_at
+      is_terminal, needs_attention, created_at, updated_at, started_at, ended_at
     ) VALUES (
       $1, $2, $3, $4, $5, $6,
       $7, CASE WHEN $8 = '' THEN '[]' ELSE $8 END, $9,
       $10, $11, $12,
       NULLIF($13, ''), NULLIF($14, ''), NULLIF($15, ''), NULLIF($16, ''),
-      $17, $18, $19, $20
+      $17, $18, $19, $20, $21, $22
     )
     ON CONFLICT (server_id, task_id) DO UPDATE SET
       project_name = CASE WHEN excluded.project_name <> '' THEN excluded.project_name ELSE global_task_pair_summaries.project_name END,
@@ -270,6 +290,12 @@ export async function upsertGlobalTaskSummaryWithChange(
       updated_at = CASE
         WHEN excluded.updated_at > global_task_pair_summaries.updated_at THEN excluded.updated_at
         ELSE global_task_pair_summaries.updated_at
+      END,
+      started_at = COALESCE(global_task_pair_summaries.started_at, excluded.started_at),
+      ended_at = CASE
+        WHEN excluded.updated_at < global_task_pair_summaries.updated_at THEN global_task_pair_summaries.ended_at
+        WHEN excluded.is_terminal THEN COALESCE(excluded.ended_at, global_task_pair_summaries.ended_at)
+        ELSE NULL
       END`,
     [
       serverId,
@@ -292,6 +318,8 @@ export async function upsertGlobalTaskSummaryWithChange(
       statusNeedsAttention,
       createdAt || updatedAt,
       updatedAt,
+      startedAt > 0 ? startedAt : null,
+      endedAt > 0 ? endedAt : null,
     ],
   );
 

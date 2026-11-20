@@ -82,6 +82,8 @@ interface MemSummaryRow {
   live_summary: string | null;
   is_terminal: boolean;
   needs_attention: boolean;
+  started_at?: number | null;
+  ended_at?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -220,6 +222,8 @@ class InMemoryGlobalTaskDb {
             needsAttention,
             createdAt,
             updatedAt,
+            startedAt,
+            endedAt,
           ] = params;
 
           const key = this.summaryKey(String(serverId), String(taskId));
@@ -241,6 +245,8 @@ class InMemoryGlobalTaskDb {
           const bAttention = Boolean(needsAttention);
           const nCreated = Number(createdAt ?? 0);
           const nUpdated = Number(updatedAt ?? 0);
+          const nStarted = typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0 ? startedAt : null;
+          const nEnded = typeof endedAt === 'number' && Number.isFinite(endedAt) && endedAt > 0 ? endedAt : null;
 
           if (!existing) {
             this.summaries.set(key, {
@@ -262,6 +268,8 @@ class InMemoryGlobalTaskDb {
               live_summary: sLive,
               is_terminal: bTerminal,
               needs_attention: bAttention,
+              started_at: nStarted,
+              ended_at: nEnded,
               created_at: nCreated,
               updated_at: nUpdated,
             });
@@ -290,6 +298,10 @@ class InMemoryGlobalTaskDb {
                 : (sFlags !== ''
                   ? bAttention
                   : (bTerminal ? false : (bAttention ? true : existing.needs_attention))),
+              started_at: existing.started_at ?? nStarted,
+              ended_at: !isNewerOrEqual
+                ? (existing.ended_at ?? null)
+                : (bTerminal ? (nEnded ?? existing.ended_at ?? null) : null),
               created_at: existing.created_at > 0 && nCreated > 0
                 ? Math.min(existing.created_at, nCreated)
                 : (nCreated > 0 ? nCreated : existing.created_at),
@@ -1312,5 +1324,118 @@ describe('global-task-mode server engine', () => {
     });
     expect(framesFor(userAFrames)).toHaveLength(2);
     expect((userAWs.close as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(1008, 'account_inactive');
+  });
+
+  it('round-trips startedAt and endedAt across fleet_snapshot, DB persistence, and legacy null rows', async () => {
+    const now = Date.now();
+    memDb.servers.set('srv-time', {
+      id: 'srv-time',
+      user_id: 'user-a',
+      team_id: null,
+      name: 'Timer Box',
+      token_hash: 'h-time',
+      last_heartbeat_at: now,
+      status: 'online',
+      daemon_version: '1.0.0',
+      bound_with_key_id: null,
+      created_at: now - 10_000,
+    });
+
+    // 1. Legacy row with null started_at and ended_at omits them safely without NaN
+    memDb.summaries.set('srv-time\u0000tsk_legacy', {
+      server_id: 'srv-time',
+      task_id: 'tsk_legacy',
+      project_name: 'imcodes',
+      brain_session: 'deck_proj_brain',
+      brain_label: 'Brain',
+      title: 'Legacy row',
+      status: 'done',
+      flags_json: '[]',
+      round: 1,
+      checklist_total: 0,
+      checklist_implemented: 0,
+      checklist_audited: 0,
+      executor_label: null,
+      auditor_label: null,
+      auditor: null,
+      live_summary: null,
+      is_terminal: true,
+      needs_attention: false,
+      started_at: null,
+      ended_at: null,
+      created_at: now - 50_000,
+      updated_at: now - 10_000,
+    });
+
+    const legacy = await getGlobalTaskSummaryForServerTask(db, 'srv-time', 'tsk_legacy');
+    expect(legacy?.startedAt).toBeUndefined();
+    expect(legacy?.endedAt).toBeUndefined();
+    expect(legacy?.createdAt).toBe(now - 50_000);
+
+    // 2. WsBridge ingests fleet_snapshot with startedAt & endedAt, preserves startedAt on partial update, and clears endedAt on reopen
+    const bridge = WsBridge.get('srv-time') as unknown as {
+      ingestGlobalTaskFleetSnapshot(db: Database, msg: Record<string, unknown>): Promise<void>;
+      ingestGlobalTaskFrame(db: Database, msg: Record<string, unknown>): Promise<void>;
+    };
+    await bridge.ingestGlobalTaskFleetSnapshot(db, {
+      type: GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+      pairs: [
+        {
+          taskId: 'tsk_timed',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Timed task',
+          status: 'working',
+          flags: [],
+          round: 1,
+          checklist: { total: 2, implemented: 1, audited: 0 },
+          startedAt: now - 40_000,
+          createdAt: now - 60_000,
+          updatedAt: now - 5_000,
+        },
+        {
+          taskId: 'tsk_done_timed',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Done timed',
+          status: 'done',
+          flags: [],
+          round: 1,
+          checklist: { total: 1, implemented: 1, audited: 1 },
+          startedAt: now - 90_000,
+          endedAt: now - 15_000,
+          createdAt: now - 100_000,
+          updatedAt: now - 10_000,
+        },
+      ],
+    });
+
+    const activeTimed = await getGlobalTaskSummaryForServerTask(db, 'srv-time', 'tsk_timed');
+    expect(activeTimed?.startedAt).toBe(now - 40_000);
+    expect(activeTimed?.endedAt).toBeUndefined();
+
+    const doneTimed = await getGlobalTaskSummaryForServerTask(db, 'srv-time', 'tsk_done_timed');
+    expect(doneTimed?.startedAt).toBe(now - 90_000);
+    expect(doneTimed?.endedAt).toBe(now - 15_000);
+
+    // Partial update omitting startedAt preserves existing startedAt; reopening done clears endedAt
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-time',
+      taskId: 'tsk_timed',
+      status: 'in_audit',
+      updatedAt: now - 2_000,
+    });
+    const afterPartial = await getGlobalTaskSummaryForServerTask(db, 'srv-time', 'tsk_timed');
+    expect(afterPartial?.startedAt).toBe(now - 40_000);
+
+    await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-time',
+      taskId: 'tsk_done_timed',
+      status: 'working',
+      updatedAt: now - 1_000,
+    });
+    const afterReopen = await getGlobalTaskSummaryForServerTask(db, 'srv-time', 'tsk_done_timed');
+    expect(afterReopen?.startedAt).toBe(now - 90_000);
+    expect(afterReopen?.endedAt).toBeUndefined();
   });
 });
