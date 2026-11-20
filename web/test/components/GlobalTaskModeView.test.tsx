@@ -2824,4 +2824,37 @@ describe('GlobalTaskModeView', () => {
 
     expect(screen.queryByTestId('task-mode-models-t-no-models')).toBeNull();
   });
+
+  it('toggles TTS quick settings popover cleanly above Task Mode and switches cleanly with server filter dropdown', async () => {
+    await mountWithSnapshot();
+
+    const ttsBtn = screen.getByTestId('task-mode-tts-settings-btn');
+    const filterBtn = screen.getByTestId('task-mode-server-filter-btn');
+
+    // Opening TTS settings portals popover into document.body
+    fireEvent.click(ttsBtn);
+    const popover = screen.getByTestId('chat-tts-settings-popover');
+    expect(popover).toBeTruthy();
+    expect(document.body.contains(popover)).toBe(true);
+    expect(ttsBtn.getAttribute('aria-expanded')).toBe('true');
+
+    // Clicking server filter opens menu and closes TTS settings popover via outside pointerdown
+    fireEvent.pointerDown(filterBtn, { bubbles: true });
+    fireEvent.click(filterBtn);
+    expect(screen.getByTestId('task-mode-server-filter-menu')).toBeTruthy();
+    expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
+    expect(filterBtn.getAttribute('aria-expanded')).toBe('true');
+
+    // Clicking TTS settings while server menu is open closes server menu and opens popover
+    fireEvent.pointerDown(ttsBtn, { bubbles: true });
+    fireEvent.click(ttsBtn);
+    expect(screen.getByTestId('chat-tts-settings-popover')).toBeTruthy();
+    expect(screen.queryByTestId('task-mode-server-filter-menu')).toBeNull();
+
+    // Clicking TTS settings again closes popover cleanly
+    fireEvent.pointerDown(ttsBtn, { bubbles: true });
+    fireEvent.click(ttsBtn);
+    expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
+    expect(ttsBtn.getAttribute('aria-expanded')).toBe('false');
+  });
 });

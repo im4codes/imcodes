@@ -1932,4 +1932,31 @@ describe('styles.css regression contracts', () => {
     expect(titlebarCollapsedRule).toMatch(/position:\s*static/);
     expect(titlebarCollapsedRule).toMatch(/height:\s*auto/);
   });
+
+  it('layers .chat-tts-settings-popover above .global-task-mode-overlay (below 10050) and separates Task Mode TTS & server filter controls', () => {
+    const topLevelCss = `{\n${cssWithoutComments}\n}`;
+    const popoverRule = extractDirectStyleRule(topLevelCss, /\.chat-tts-settings-popover\s*/) ?? '';
+    const overlayRule = extractDirectStyleRule(topLevelCss, /\.global-task-mode-overlay\s*/) ?? '';
+    const appUpdateBackdropRule = extractDirectStyleRule(topLevelCss, /\.task-pair-close-confirm-backdrop\s*/) ?? '';
+    const popoverZ = Number(popoverRule.match(/z-index:\s*(\d+)/)?.[1] ?? NaN);
+    const overlayZ = Number(overlayRule.match(/z-index:\s*(\d+)/)?.[1] ?? NaN);
+    const backdropZ = Number(appUpdateBackdropRule.match(/z-index:\s*(\d+)/)?.[1] ?? NaN);
+    expect(Number.isFinite(popoverZ)).toBe(true);
+    expect(Number.isFinite(overlayZ)).toBe(true);
+    expect(Number.isFinite(backdropZ)).toBe(true);
+    expect(popoverZ).toBeGreaterThan(overlayZ);
+    expect(popoverZ).toBeLessThan(backdropZ);
+
+    const serverWrapRule = extractDirectStyleRule(topLevelCss, /\.global-task-mode-topbar-right\s+\.global-task-server-filter-wrap\s*/) ?? '';
+    const ttsBtnRule = extractDirectStyleRule(topLevelCss, /\.global-task-mode-topbar-right\s+\.chat-tts-settings-btn\s*/) ?? '';
+    expect(serverWrapRule).toMatch(/margin-left:\s*8px/);
+    expect(ttsBtnRule).toMatch(/min-width:\s*22px/);
+
+    const mobile720 = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*720px\)/).join('\n');
+    expect(mobile720).toMatch(/\.global-task-mode-topbar-right\s+\.global-task-server-filter-wrap\s*\{[^}]*margin-left:\s*6px/);
+    expect(mobile720).toMatch(/\.global-task-mode-topbar-right\s+\.chat-tts-settings-btn\s*\{[^}]*min-width:\s*21px/);
+
+    const mobile350 = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*350px\)/).join('\n');
+    expect(mobile350).toMatch(/\.chat-titlebar:has\([^)]*\.task-pair-status-panel\.is-mobile\.is-collapsed\)\s+\.chat-tts-settings-btn\s*\{[^}]*width:\s*15px/);
+  });
 });

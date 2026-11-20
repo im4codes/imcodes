@@ -6543,7 +6543,7 @@ html.native-ios-mac .chat-dl-btn {
   position: fixed;
   top: 48px;
   right: 8px;
-  z-index: 9000;
+  z-index: 10020;
   box-sizing: border-box;
   width: 272px;
   max-width: calc(100vw - 16px);
@@ -23467,6 +23467,15 @@ html.native-ios-mac .global-task-mode-entry-btn {
   gap: 8px;
 }
 
+.global-task-mode-topbar-right .chat-tts-settings-btn {
+  width: 22px;
+  min-width: 22px;
+}
+
+.global-task-mode-topbar-right .global-task-server-filter-wrap {
+  margin-left: 8px;
+}
+
 .global-task-mode-switcher {
   display: inline-flex;
   align-items: center;
@@ -24623,6 +24632,13 @@ html.native-ios-mac .global-task-mode-entry-btn {
     justify-content: flex-end;
     flex-wrap: nowrap;
     gap: 5px;
+  }
+  .global-task-mode-topbar-right .chat-tts-settings-btn {
+    width: 21px;
+    min-width: 21px;
+  }
+  .global-task-mode-topbar-right .global-task-server-filter-wrap {
+    margin-left: 6px;
   }
   .global-task-mode-sync-badge {
     padding: 0;
