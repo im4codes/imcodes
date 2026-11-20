@@ -718,7 +718,8 @@ describe('server TTS playback', () => {
       { input: 'Привет.', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'ru-RU' },
     ]);
 
-    // When /voices fails on a fresh session, fallbackVoice still plays without blocking
+    // When /voices fails on a truly fresh uncached session, fallbackVoice still plays without blocking
+    localStorage.clear();
     vi.resetModules();
     const ttsFallback = await import('../src/tts.js');
     const fallbackBodies: Array<{ input: string; voice?: string; lang?: string }> = [];
@@ -747,5 +748,127 @@ describe('server TTS playback', () => {
     expect(fallbackBodies).toEqual([
       { input: 'Hello world!', speed: 1.1, voice: 'zh-CN-XiaoxiaoNeural', lang: 'en-US' },
     ]);
+  });
+
+  it('persists upstream voices in localStorage across reloads, coalesces concurrent fetches, invalidates on baseUrl change, and keeps upstream cache over transient preset fallbacks', async () => {
+    let voicesCalls = 0;
+    let resolveDelayedFetch!: (res: Response) => void;
+    globalThis.fetch = vi.fn((url) => {
+      if (String(url).includes('/voices')) {
+        voicesCalls += 1;
+        if (voicesCalls === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveDelayedFetch = resolve;
+          });
+        }
+        if (String(url).includes('refresh=1')) {
+          return Promise.resolve(new Response(JSON.stringify({
+            voices: [{ id: 'alloy', name: 'alloy' }],
+            source: 'preset',
+            endpointConfigured: true,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://tts-a.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+
+    // Concurrent calls share one in-flight fetch
+    const p1 = tts.fetchServerTtsVoices();
+    const p2 = tts.fetchServerTtsVoices();
+    await vi.waitFor(() => expect(voicesCalls).toBe(1));
+    resolveDelayedFetch(new Response(JSON.stringify({
+      voices: [
+        { id: 'zh-CN-XiaoxiaoNeural', name: 'Xiaoxiao', locale: 'zh-CN' },
+        { id: 'en-US-AriaNeural', name: 'Aria', locale: 'en-US' },
+      ],
+      source: 'upstream',
+      endpointConfigured: true,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+    expect(r2?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+    expect(localStorage.getItem(tts.TTS_SERVER_VOICES_CACHE_KEY)).toBeTruthy();
+
+    // Reloading module hydrates persisted upstream list synchronously before any fetch
+    vi.resetModules();
+    const reloaded = await import('../src/tts.js');
+    const hydrated = reloaded.getCachedServerTtsVoices();
+    expect(hydrated?.source).toBe('upstream');
+    expect(hydrated?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+
+    // Transient preset fallback on forced refresh does NOT wipe persisted upstream voices
+    const forced = await reloaded.fetchServerTtsVoices({ forceRefresh: true });
+    expect(forced?.source).toBe('upstream');
+    expect(forced?.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+
+    // Changing baseUrl invalidates cached voices cleanly
+    reloaded.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://tts-b.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'alloy',
+      voicesByLang: {},
+      responseFormat: 'mp3',
+      serverDefaultConfigured: false,
+    });
+    expect(reloaded.getCachedServerTtsVoices()).toBeNull();
+    expect(localStorage.getItem(reloaded.TTS_SERVER_VOICES_CACHE_KEY)).toBeNull();
+  });
+
+  it('previewServerTtsVoice chooses language-matched sample text and aborts active preview on rapid switch', async () => {
+    URL.createObjectURL = vi.fn(() => 'blob:mock/preview');
+    URL.revokeObjectURL = vi.fn();
+    class MockAudio {
+      src = '';
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play = vi.fn(async () => {
+        queueMicrotask(() => this.onended?.());
+      });
+      pause = vi.fn();
+    }
+    vi.stubGlobal('Audio', MockAudio);
+
+    const speechRequests: Array<{ input: string; voice?: string; lang?: string; speed?: number }> = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      speechRequests.push(JSON.parse(String(init?.body ?? '{}')));
+      return new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    const sampleJa = tts.resolveTtsPreviewSample({
+      voice: 'ja-JP-NanamiNeural',
+      availableVoices: [{ id: 'ja-JP-NanamiNeural', locale: 'ja-JP' }],
+    });
+    expect(sampleJa).toEqual({ langKey: 'ja', text: tts.TTS_PREVIEW_SAMPLE_TEXT.ja });
+
+    const res = await tts.previewServerTtsVoice({
+      voice: 'zh-CN-YunxiNeural',
+      rate: 1.25,
+      previewId: 'preview-yunxi',
+    });
+    expect(res).toEqual({ started: true });
+    await vi.waitFor(() => expect(tts.getTtsState().status).toBe('idle'));
+    expect(speechRequests[0]).toEqual({
+      input: tts.TTS_PREVIEW_SAMPLE_TEXT['zh-CN'],
+      speed: 1.25,
+      voice: 'zh-CN-YunxiNeural',
+      lang: 'zh-CN',
+    });
   });
 });

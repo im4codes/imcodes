@@ -13,16 +13,20 @@ import {
   getTtsAutoReadEnabled,
   getTtsMode,
   getTtsSpeechRate,
+  getTtsState,
   isServerTtsConfigured,
   openNativeTtsSettings,
+  previewServerTtsVoice,
   saveServerTtsConfig,
   setTtsAutoReadEnabled,
   setTtsMode,
   setTtsSpeechRate,
   stopSpeaking,
   subscribeTtsPreferences,
+  subscribeTtsState,
   TTS_RATE_OPTIONS,
   type TtsEngineMode,
+  type TtsPlaybackState,
   type TtsPublicConfig,
   type TtsVoiceOption,
 } from '../tts.js';
@@ -116,6 +120,10 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
     getCachedServerTtsVoices()?.voices ?? getDefaultPresetTtsVoices(getCachedServerTtsConfig()?.voice)
   ));
   const [savingVoice, setSavingVoice] = useState(false);
+  const [ttsPlayback, setTtsPlayback] = useState<TtsPlaybackState>(() => (
+    typeof getTtsState === 'function' ? getTtsState() : { status: 'idle', activeMessageId: null, error: null }
+  ));
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const lastVoiceChangeRef = useRef(currentServerVoice);
   if (!savingVoice) {
     lastVoiceChangeRef.current = currentServerVoice;
@@ -132,6 +140,13 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
     setLocalTtsMode(getTtsMode());
     setServerConfig(getCachedServerTtsConfig());
   }), []);
+
+  useEffect(() => {
+    if (typeof subscribeTtsState !== 'function') return undefined;
+    return subscribeTtsState((next) => {
+      setTtsPlayback(next);
+    });
+  }, []);
 
   useEffect(() => {
     if (ttsMode !== 'server' || !serverConfigured || typeof fetchServerTtsVoices !== 'function') return;
@@ -333,29 +348,67 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
               ))}
             </div>
           </div>
-          {ttsMode === 'server' && serverConfigured && (
-            <div class="chat-tts-settings-section" data-testid="chat-tts-settings-voice-section">
-              <label class="chat-tts-settings-label" for="chat-tts-settings-voice-select">
-                {t('settings.tts_server_voice')}
-              </label>
-              <select
-                id="chat-tts-settings-voice-select"
-                data-testid="chat-tts-settings-voice-select"
-                class="chat-tts-settings-select"
-                value={currentServerVoice}
-                disabled={savingVoice}
-                onInput={(e) => void handleVoiceSelect(e)}
-                onChange={(e) => void handleVoiceSelect(e)}
-              >
-                {voiceSelectOptions.map((voice) => {
-                  const label = voice.name && voice.name !== voice.id
-                    ? `${voice.name} (${voice.id})`
-                    : voice.id;
-                  return <option key={voice.id} value={voice.id}>{voice.locale ? `${label} · ${voice.locale}` : label}</option>;
-                })}
-              </select>
-            </div>
-          )}
+          {ttsMode === 'server' && serverConfigured && (() => {
+            const quickPreviewId = 'chat-quick-voice-preview';
+            const isPreviewing = ttsPlayback.status === 'speaking' && ttsPlayback.activeMessageId === quickPreviewId;
+            return (
+              <div class="chat-tts-settings-section" data-testid="chat-tts-settings-voice-section">
+                <label class="chat-tts-settings-label" for="chat-tts-settings-voice-select">
+                  {t('settings.tts_server_voice')}
+                </label>
+                <div class="chat-tts-settings-voice-row">
+                  <select
+                    id="chat-tts-settings-voice-select"
+                    data-testid="chat-tts-settings-voice-select"
+                    class="chat-tts-settings-select"
+                    value={currentServerVoice}
+                    disabled={savingVoice}
+                    onInput={(e) => void handleVoiceSelect(e)}
+                    onChange={(e) => void handleVoiceSelect(e)}
+                  >
+                    {voiceSelectOptions.map((voice) => {
+                      const label = voice.name && voice.name !== voice.id
+                        ? `${voice.name} (${voice.id})`
+                        : voice.id;
+                      return <option key={voice.id} value={voice.id}>{voice.locale ? `${label} · ${voice.locale}` : label}</option>;
+                    })}
+                  </select>
+                  <button
+                    type="button"
+                    data-testid="chat-tts-settings-voice-preview"
+                    class={`chat-tts-settings-voice-preview-btn${isPreviewing ? ' is-playing' : ''}`}
+                    title={isPreviewing ? t('settings.tts_preview_stop') : t('settings.tts_preview_voice')}
+                    aria-label={isPreviewing ? t('settings.tts_preview_stop') : t('settings.tts_preview_voice')}
+                    onClick={async () => {
+                      setPreviewError(null);
+                      if (isPreviewing) {
+                        await stopSpeaking();
+                        return;
+                      }
+                      if (typeof previewServerTtsVoice !== 'function') return;
+                      const res = await previewServerTtsVoice({
+                        voice: currentServerVoice,
+                        rate: ttsRate,
+                        availableVoices: voiceSelectOptions,
+                        fallbackLocale: locale,
+                        previewId: quickPreviewId,
+                      });
+                      if (!res.started && res.reason === 'error' && res.error) {
+                        setPreviewError(t('settings.tts_preview_failed', { error: res.error }));
+                      }
+                    }}
+                  >
+                    {isPreviewing ? `■ ${t('settings.tts_preview_stop')}` : `▶ ${t('settings.tts_preview_voice')}`}
+                  </button>
+                </div>
+                {previewError && (
+                  <div class="chat-tts-settings-hint" data-testid="chat-tts-settings-voice-preview-error">
+                    {previewError}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </>
       ) : (
         <div class="chat-tts-settings-hint" data-testid="chat-tts-settings-server-hint">

@@ -40,6 +40,7 @@ const mockApi = vi.hoisted(() => ({
   getServerTtsConfig: vi.fn(),
   updateServerTtsConfig: vi.fn(),
   getServerTtsVoices: vi.fn(),
+  synthesizeServerTtsSpeech: vi.fn(),
 }));
 
 vi.mock('../../src/api.js', () => ({
@@ -47,6 +48,7 @@ vi.mock('../../src/api.js', () => ({
   getServerTtsConfig: (...args: unknown[]) => mockApi.getServerTtsConfig(...args),
   updateServerTtsConfig: (...args: unknown[]) => mockApi.updateServerTtsConfig(...args),
   getServerTtsVoices: (...args: unknown[]) => mockApi.getServerTtsVoices(...args),
+  synthesizeServerTtsSpeech: (...args: unknown[]) => mockApi.synthesizeServerTtsSpeech(...args),
   passwordChange: vi.fn(),
   passkeyVerifyBegin: vi.fn(),
   passwordSetupWithPasskey: vi.fn(),
@@ -79,6 +81,8 @@ beforeEach(() => {
   mockApi.getServerTtsConfig.mockClear();
   mockApi.updateServerTtsConfig.mockClear();
   mockApi.getServerTtsVoices.mockClear();
+  mockApi.synthesizeServerTtsSpeech.mockClear();
+  mockApi.synthesizeServerTtsSpeech.mockResolvedValue(new Blob(['audio'], { type: 'audio/mpeg' }));
   mockApi.getServerTtsVoices.mockResolvedValue({
     voices: [
       { id: 'alloy', name: 'alloy' },
@@ -658,5 +662,127 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
         },
       }));
     });
+  });
+
+  it('auditions default and per-language voices in SettingsPage and TtsQuickSettingsPopover without saving and supports force refresh', async () => {
+    const origCreateObjectURL = URL.createObjectURL;
+    const origRevokeObjectURL = URL.revokeObjectURL;
+    const origAudio = globalThis.Audio;
+    URL.createObjectURL = vi.fn(() => 'blob:mock/preview');
+    URL.revokeObjectURL = vi.fn();
+    let lastAudioInstance: { onended: (() => void) | null } | null = null;
+    class MockAudio {
+      src = '';
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play = vi.fn(async () => {
+        lastAudioInstance = this;
+      });
+      pause = vi.fn();
+    }
+    vi.stubGlobal('Audio', MockAudio);
+
+    try {
+      mockApi.getServerTtsConfig.mockResolvedValueOnce({
+        mode: 'server',
+        baseUrl: '',
+        hasApiKey: false,
+        apiKeyMasked: null,
+        model: 'tts-1',
+        voice: 'zh-CN-XiaoxiaoNeural',
+        voicesByLang: {},
+        responseFormat: 'mp3',
+        serverDefaultConfigured: true,
+      });
+      mockApi.getServerTtsVoices.mockResolvedValue({
+        voices: [
+          { id: 'zh-CN-XiaoxiaoNeural', name: 'Xiaoxiao', locale: 'zh-CN' },
+          { id: 'zh-CN-YunxiNeural', name: 'Yunxi', locale: 'zh-CN' },
+          { id: 'en-US-AriaNeural', name: 'Aria', locale: 'en-US' },
+          { id: 'ja-JP-NanamiNeural', name: 'Nanami', locale: 'ja-JP' },
+        ],
+        source: 'upstream',
+        endpointConfigured: true,
+      });
+
+      const settingsRender = render(
+        <SettingsPage
+          displayName="Tester"
+          username="tester"
+          hasPassword={true}
+          onBack={() => {}}
+          onDisplayNameChanged={() => {}}
+          onUserAuthUpdated={() => {}}
+        />,
+      );
+
+      const voiceSelect = await screen.findByTestId('settings-tts-server-voice-select') as HTMLSelectElement;
+      await waitFor(() => {
+        expect(Array.from(voiceSelect.options).some((opt) => opt.value === 'zh-CN-YunxiNeural')).toBe(true);
+      });
+
+      // Refresh button triggers forceRefresh (?refresh=1)
+      fireEvent.click(screen.getByTestId('settings-tts-server-refresh-voices'));
+      await waitFor(() => {
+        expect(mockApi.getServerTtsVoices).toHaveBeenCalledWith({ refresh: true });
+      });
+
+      // Change default voice WITHOUT saving and audition it
+      fireEvent.change(voiceSelect, { target: { value: 'zh-CN-YunxiNeural' } });
+      fireEvent.click(screen.getByTestId('settings-tts-server-voice-preview'));
+      await waitFor(() => {
+        expect(mockApi.synthesizeServerTtsSpeech).toHaveBeenCalledWith(
+          expect.objectContaining({ voice: 'zh-CN-YunxiNeural', lang: 'zh-CN' }),
+          expect.anything(),
+        );
+        expect(screen.getByTestId('settings-tts-server-voice-preview').textContent).toContain('settings.tts_preview_stop');
+      });
+
+      // Repeat click stops preview cleanly
+      fireEvent.click(screen.getByTestId('settings-tts-server-voice-preview'));
+      await waitFor(() => {
+        expect(screen.getByTestId('settings-tts-server-voice-preview').textContent).toContain('settings.tts_preview_voice');
+      });
+
+      // Per-language preview auditions selected / auto-matched voice in that language
+      mockApi.synthesizeServerTtsSpeech.mockClear();
+      fireEvent.click(screen.getByTestId('settings-tts-lang-voice-preview-ja'));
+      await waitFor(() => {
+        expect(mockApi.synthesizeServerTtsSpeech).toHaveBeenCalledWith(
+          expect.objectContaining({ voice: 'ja-JP-NanamiNeural', lang: 'ja' }),
+          expect.anything(),
+        );
+      });
+      lastAudioInstance?.onended?.();
+      settingsRender.unmount();
+
+      // Quick popover preview button auditions currentServerVoice
+      mockApi.synthesizeServerTtsSpeech.mockClear();
+      applyServerTtsConfig({
+        mode: 'server',
+        baseUrl: '',
+        hasApiKey: false,
+        apiKeyMasked: null,
+        model: 'tts-1',
+        voice: 'en-US-AriaNeural',
+        responseFormat: 'mp3',
+        serverDefaultConfigured: true,
+      });
+      const anchorRef = { current: document.createElement('div') };
+      render(<TtsQuickSettingsPopover anchorRef={anchorRef} onClose={() => {}} />);
+      const quickPreviewBtn = await screen.findByTestId('chat-tts-settings-voice-preview');
+      fireEvent.click(quickPreviewBtn);
+      await waitFor(() => {
+        expect(mockApi.synthesizeServerTtsSpeech).toHaveBeenCalledWith(
+          expect.objectContaining({ voice: 'en-US-AriaNeural', lang: 'en' }),
+          expect.anything(),
+        );
+      });
+      lastAudioInstance?.onended?.();
+    } finally {
+      URL.createObjectURL = origCreateObjectURL;
+      URL.revokeObjectURL = origRevokeObjectURL;
+      vi.stubGlobal('Audio', origAudio);
+    }
   });
 });

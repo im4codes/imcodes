@@ -3,6 +3,7 @@ import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { signJwt } from '../src/security/crypto.js';
+import { clearServerTtsVoicesCache } from '../src/routes/tts.js';
 import { activeUserAnswer } from './helpers/user-status.js';
 import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
 import {
@@ -86,6 +87,7 @@ describe('TTS routes & preferences isolation', () => {
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    clearServerTtsVoicesCache();
   });
 
   afterEach(() => {
@@ -631,5 +633,85 @@ describe('TTS routes & preferences isolation', () => {
     }, env);
 
     expect(upstreamVoices).toEqual(['en-GB-SoniaNeural', 'zh-CN-YunxiNeural', 'en-US-AriaNeural']);
+  });
+
+  it('caches upstream voice lists across requests, honors ?refresh=1, isolates cache keys by target+key, and falls back to stale upstream voices on transient refresh errors', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db, {
+      TTS_BASE_URL: 'https://edge-tts.example.com/v1',
+      TTS_API_KEY: 'key-alpha',
+      TTS_VOICE: 'zh-CN-XiaoxiaoNeural',
+    });
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    let upstreamCalls = 0;
+    let shouldFailUpstream = false;
+    let returnedVoices = [
+      { ShortName: 'zh-CN-XiaoxiaoNeural', FriendlyName: 'Xiaoxiao', Locale: 'zh-CN' },
+      { ShortName: 'en-US-AriaNeural', FriendlyName: 'Aria', Locale: 'en-US' },
+    ];
+    globalThis.fetch = vi.fn(async (url) => {
+      upstreamCalls += 1;
+      if (shouldFailUpstream) {
+        return new Response('gateway timeout', { status: 504 });
+      }
+      if (String(url).endsWith('/audio/voices')) {
+        return new Response('not found', { status: 404 });
+      }
+      return new Response(JSON.stringify({ voices: returnedVoices }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    // 1. Cold fetch populates cache
+    const res1 = await app.request(TTS_VOICES_PATH, { method: 'GET', headers: { Cookie: cookie } }, env);
+    expect(res1.status).toBe(200);
+    const body1 = await res1.json() as { voices: Array<{ id: string }>; source: string };
+    expect(body1.source).toBe('upstream');
+    expect(body1.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+    const callsAfterCold = upstreamCalls;
+    expect(callsAfterCold).toBeGreaterThan(0);
+
+    // 2. Subsequent GET serves from cache with zero upstream calls (even if upstream is currently failing)
+    shouldFailUpstream = true;
+    const res2 = await app.request(TTS_VOICES_PATH, { method: 'GET', headers: { Cookie: cookie } }, env);
+    expect(res2.status).toBe(200);
+    const body2 = await res2.json() as { voices: Array<{ id: string }>; source: string };
+    expect(body2.source).toBe('upstream');
+    expect(body2.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+    expect(upstreamCalls).toBe(callsAfterCold);
+
+    // 3. Forced ?refresh=1 probes upstream; if upstream transiently fails, retains stale upstream list (NOT preset!)
+    const res3 = await app.request(`${TTS_VOICES_PATH}?refresh=1`, { method: 'GET', headers: { Cookie: cookie } }, env);
+    expect(res3.status).toBe(200);
+    const body3 = await res3.json() as { voices: Array<{ id: string }>; source: string };
+    expect(body3.source).toBe('upstream');
+    expect(body3.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'en-US-AriaNeural']);
+    expect(upstreamCalls).toBeGreaterThan(callsAfterCold);
+
+    // 4. Forced ?refresh=1 updates cache when upstream recovers with new voices
+    shouldFailUpstream = false;
+    returnedVoices = [
+      { ShortName: 'zh-CN-YunxiNeural', FriendlyName: 'Yunxi', Locale: 'zh-CN' },
+    ];
+    const res4 = await app.request(`${TTS_VOICES_PATH}?refresh=1`, { method: 'GET', headers: { Cookie: cookie } }, env);
+    const body4 = await res4.json() as { voices: Array<{ id: string }>; source: string };
+    expect(body4.source).toBe('upstream');
+    // Unmatched user currentVoice is still prepended cleanly without polluting cache
+    expect(body4.voices.map((v) => v.id)).toEqual(['zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural']);
+
+    // 5. Different apiKey / baseUrl isolates cache keys cleanly (never serves stale voices from another key)
+    const otherKeyEnv = makeEnv(db, {
+      TTS_BASE_URL: 'https://edge-tts.example.com/v1',
+      TTS_API_KEY: 'key-beta',
+      TTS_VOICE: 'alloy',
+    });
+    const otherApp = buildApp(otherKeyEnv);
+    shouldFailUpstream = true;
+    const otherRes = await otherApp.request(TTS_VOICES_PATH, { method: 'GET', headers: { Cookie: cookie } }, otherKeyEnv);
+    const otherBody = await otherRes.json() as { voices: Array<{ id: string }>; source: string };
+    expect(otherBody.source).toBe('preset');
   });
 });

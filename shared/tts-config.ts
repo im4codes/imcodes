@@ -42,7 +42,8 @@ export const TTS_MAX_SPEED = 4.0;
 export const TTS_DEFAULT_SPEED = 1.0;
 export const TTS_REQUEST_TIMEOUT_MS = 25_000;
 export const TTS_MAX_RESPONSE_BYTES = 15 * 1024 * 1024;
-export const TTS_VOICES_TIMEOUT_MS = 8_000;
+export const TTS_VOICES_TIMEOUT_MS = 15_000;
+export const TTS_VOICES_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 export const TTS_VOICES_MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export interface TtsVoiceOption {

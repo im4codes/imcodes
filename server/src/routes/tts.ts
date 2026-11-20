@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../env.js';
@@ -16,6 +17,7 @@ import {
   TTS_REQUEST_TIMEOUT_MS,
   TTS_RESPONSE_FORMATS,
   TTS_USER_CONFIG_PREF_KEY,
+  TTS_VOICES_CACHE_TTL_MS,
   TTS_VOICES_MAX_RESPONSE_BYTES,
   TTS_VOICES_TIMEOUT_MS,
   clampTtsServerSpeed,
@@ -39,6 +41,23 @@ import {
 export const ttsRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
 ttsRoutes.use('/*', requireAuth());
+
+interface CachedUpstreamVoicesEntry {
+  voices: TtsVoiceOption[];
+  fetchedAt: number;
+}
+
+const upstreamVoicesCache = new Map<string, CachedUpstreamVoicesEntry>();
+
+/** Clear cached upstream voice discovery entries (for tests). */
+export function clearServerTtsVoicesCache(): void {
+  upstreamVoicesCache.clear();
+}
+
+function upstreamVoicesCacheKey(baseUrl: string, apiKey: string): string {
+  const keyHash = apiKey ? createHash('sha256').update(apiKey).digest('hex').slice(0, 16) : '';
+  return `${baseUrl}\u0000${keyHash}`;
+}
 
 interface StoredUserTtsConfig {
   mode?: TtsEngineMode;
@@ -380,7 +399,7 @@ ttsRoutes.put('/config', async (c) => {
   });
 });
 
-/** GET /api/tts/voices — probe upstream OpenAI-compatible voice endpoints or fall back to standard presets. */
+/** GET /api/tts/voices — probe upstream OpenAI-compatible voice endpoints (with 6h upstream cache) or fall back to standard presets. */
 ttsRoutes.get('/voices', async (c) => {
   const userId = c.get('userId' as never) as string;
   const stored = await loadStoredUserTtsConfig(c.env, userId);
@@ -399,6 +418,22 @@ ttsRoutes.get('/voices', async (c) => {
 
   if (!effectiveBaseUrl || decryptFailed) {
     return respondPreset(Boolean(effectiveBaseUrl));
+  }
+
+  const respondUpstream = (voices: TtsVoiceOption[]) => {
+    const body: TtsVoicesResponse = {
+      voices: appendMissingCurrentVoice(voices, currentVoice),
+      source: 'upstream',
+      endpointConfigured: true,
+    };
+    return c.json(body, 200, { 'Cache-Control': 'no-store' });
+  };
+
+  const cacheKey = upstreamVoicesCacheKey(effectiveBaseUrl, effectiveApiKey);
+  const cachedEntry = upstreamVoicesCache.get(cacheKey);
+  const forceRefresh = c.req.query('refresh') === '1';
+  if (!forceRefresh && cachedEntry && (Date.now() - cachedEntry.fetchedAt) < TTS_VOICES_CACHE_TTL_MS) {
+    return respondUpstream(cachedEntry.voices);
   }
 
   let endpoints: string[];
@@ -456,12 +491,8 @@ ttsRoutes.get('/voices', async (c) => {
       }
       const normalized = normalizeUpstreamVoicesPayload(parsedJson);
       if (normalized.length > 0) {
-        const body: TtsVoicesResponse = {
-          voices: appendMissingCurrentVoice(normalized, currentVoice),
-          source: 'upstream',
-          endpointConfigured: true,
-        };
-        return c.json(body, 200, { 'Cache-Control': 'no-store' });
+        upstreamVoicesCache.set(cacheKey, { voices: normalized, fetchedAt: Date.now() });
+        return respondUpstream(normalized);
       }
     } catch {
       if (clientSignal?.aborted) {
@@ -473,6 +504,9 @@ ttsRoutes.get('/voices', async (c) => {
     }
   }
 
+  if (cachedEntry && cachedEntry.voices.length > 0) {
+    return respondUpstream(cachedEntry.voices);
+  }
   return respondPreset(true);
 });
 

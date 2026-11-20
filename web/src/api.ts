@@ -3972,8 +3972,9 @@ export async function getServerTtsConfig(): Promise<TtsPublicConfig> {
   return apiFetch<TtsPublicConfig>(TTS_CONFIG_PATH, { cache: 'no-store' });
 }
 
-export async function getServerTtsVoices(): Promise<TtsVoicesResponse> {
-  return apiFetch<TtsVoicesResponse>(TTS_VOICES_PATH, { cache: 'no-store' });
+export async function getServerTtsVoices(options: { refresh?: boolean } = {}): Promise<TtsVoicesResponse> {
+  const path = options.refresh ? `${TTS_VOICES_PATH}?refresh=1` : TTS_VOICES_PATH;
+  return apiFetch<TtsVoicesResponse>(path, { cache: 'no-store' });
 }
 
 export async function updateServerTtsConfig(

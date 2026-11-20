@@ -76,7 +76,9 @@ import {
   getTtsAutoReadEnabled,
   getTtsMode,
   getTtsSpeechRate,
+  getTtsState,
   openNativeTtsSettings,
+  previewServerTtsVoice,
   saveServerTtsConfig,
   setTtsAutoReadEnabled,
   setTtsMode,
@@ -84,8 +86,10 @@ import {
   speakText,
   stopSpeaking,
   subscribeTtsPreferences,
+  subscribeTtsState,
   TTS_RATE_OPTIONS,
   type TtsEngineMode,
+  type TtsPlaybackState,
   type TtsVoiceOption,
 } from '../tts.js';
 import {
@@ -161,14 +165,17 @@ export function SettingsPage({
   const [ttsVoicesLoading, setTtsVoicesLoading] = useState(false);
   const [ttsSaving, setTtsSaving] = useState(false);
   const [ttsTesting, setTtsTesting] = useState(false);
+  const [ttsPlayback, setTtsPlayback] = useState<TtsPlaybackState>(() => (
+    typeof getTtsState === 'function' ? getTtsState() : { status: 'idle', activeMessageId: null, error: null }
+  ));
   const [ttsServerMsg, setTtsServerMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [nativeVoiceQuality, setNativeVoiceQuality] = useState<NativeTtsVoiceQualityInfo | null>(null);
 
-  const refreshTtsVoices = useCallback(async () => {
+  const refreshTtsVoices = useCallback(async (forceRefresh = false) => {
     if (typeof fetchServerTtsVoices !== 'function') return;
     setTtsVoicesLoading(true);
     try {
-      const res = await fetchServerTtsVoices();
+      const res = await fetchServerTtsVoices(forceRefresh ? { forceRefresh: true } : undefined);
       if (!mountedRef.current) return;
       if (res?.voices && res.voices.length > 0) {
         setTtsVoices(res.voices);
@@ -189,11 +196,43 @@ export function SettingsPage({
     return base;
   }, [ttsVoices, ttsVoice]);
 
+  const handleVoicePreviewClick = useCallback(async (params: {
+    previewId: string;
+    voice: string;
+    lang?: string;
+    isPreviewing: boolean;
+  }) => {
+    setTtsServerMsg(null);
+    if (params.isPreviewing) {
+      await stopSpeaking();
+      return;
+    }
+    if (typeof previewServerTtsVoice !== 'function') return;
+    const res = await previewServerTtsVoice({
+      voice: params.voice,
+      lang: params.lang,
+      rate: ttsRate,
+      availableVoices: ttsVoiceOptions,
+      fallbackLocale: currentLang,
+      previewId: params.previewId,
+    });
+    if (!res.started && res.reason === 'error' && res.error) {
+      setTtsServerMsg({ type: 'err', text: t('settings.tts_preview_failed', { error: res.error }) });
+    }
+  }, [currentLang, t, ttsRate, ttsVoiceOptions]);
+
   useEffect(() => {
     return subscribeTtsPreferences(() => {
       setTtsAutoRead(getTtsAutoReadEnabled());
       setTtsRate(getTtsSpeechRate());
       setLocalTtsMode(getTtsMode());
+    });
+  }, []);
+
+  useEffect(() => {
+    if (typeof subscribeTtsState !== 'function') return undefined;
+    return subscribeTtsState((next) => {
+      setTtsPlayback(next);
     });
   }, []);
 
@@ -1028,32 +1067,56 @@ export function SettingsPage({
                               class="settings-btn-secondary"
                               style={{ padding: '2px 8px', fontSize: '11px' }}
                               disabled={ttsVoicesLoading || ttsSaving}
-                              onClick={() => void refreshTtsVoices()}
+                              onClick={() => void refreshTtsVoices(true)}
                             >
                               {ttsVoicesLoading ? '...' : t('settings.tts_server_voices_refresh')}
                             </button>
                           </div>
-                          <select
-                            id="settings-tts-server-voice-select"
-                            data-testid="settings-tts-server-voice-select"
-                            aria-label={t('settings.tts_server_voice')}
-                            class="settings-input"
-                            style={{ marginBottom: 6 }}
-                            value={ttsVoice}
-                            onInput={(e) => setTtsVoice((e.currentTarget as HTMLSelectElement).value)}
-                            onChange={(e) => setTtsVoice((e.currentTarget as HTMLSelectElement).value)}
-                          >
-                            {ttsVoiceOptions.map((voice) => {
-                              const label = voice.name && voice.name !== voice.id
-                                ? `${voice.name} (${voice.id})`
-                                : voice.id;
-                              return (
-                                <option key={voice.id} value={voice.id}>
-                                  {voice.locale ? `${label} · ${voice.locale}` : label}
-                                </option>
-                              );
-                            })}
-                          </select>
+                          {(() => {
+                            const defaultPreviewId = 'settings-default-voice-preview';
+                            const isPreviewingDefault = ttsPlayback.status === 'speaking' && ttsPlayback.activeMessageId === defaultPreviewId;
+                            return (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                                <select
+                                  id="settings-tts-server-voice-select"
+                                  data-testid="settings-tts-server-voice-select"
+                                  aria-label={t('settings.tts_server_voice')}
+                                  class="settings-input"
+                                  style={{ flex: 1, minWidth: 0 }}
+                                  value={ttsVoice}
+                                  onInput={(e) => setTtsVoice((e.currentTarget as HTMLSelectElement).value)}
+                                  onChange={(e) => setTtsVoice((e.currentTarget as HTMLSelectElement).value)}
+                                >
+                                  {ttsVoiceOptions.map((voice) => {
+                                    const label = voice.name && voice.name !== voice.id
+                                      ? `${voice.name} (${voice.id})`
+                                      : voice.id;
+                                    return (
+                                      <option key={voice.id} value={voice.id}>
+                                        {voice.locale ? `${label} · ${voice.locale}` : label}
+                                      </option>
+                                    );
+                                  })}
+                                </select>
+                                <button
+                                  type="button"
+                                  data-testid="settings-tts-server-voice-preview"
+                                  class="settings-btn-secondary"
+                                  style={{ flex: '0 0 auto', padding: '6px 10px', fontSize: '12px', whiteSpace: 'nowrap' }}
+                                  disabled={ttsSaving}
+                                  title={isPreviewingDefault ? t('settings.tts_preview_stop') : t('settings.tts_preview_voice')}
+                                  aria-label={isPreviewingDefault ? t('settings.tts_preview_stop') : t('settings.tts_preview_voice')}
+                                  onClick={() => void handleVoicePreviewClick({
+                                    previewId: defaultPreviewId,
+                                    voice: ttsVoice.trim() || TTS_DEFAULT_VOICE,
+                                    isPreviewing: isPreviewingDefault,
+                                  })}
+                                >
+                                  {isPreviewingDefault ? `■ ${t('settings.tts_preview_stop')}` : `▶ ${t('settings.tts_preview_voice')}`}
+                                </button>
+                              </div>
+                            );
+                          })()}
                           <input
                             id="settings-tts-server-voice-input"
                             data-testid="settings-tts-server-voice"
@@ -1115,35 +1178,58 @@ export function SettingsPage({
                                 return next;
                               });
                             };
+                            const langPreviewId = `settings-lang-voice-preview:${langKey}`;
+                            const isPreviewingLang = ttsPlayback.status === 'speaking' && ttsPlayback.activeMessageId === langPreviewId;
+                            const langPreviewVoice = selectedVal || autoResolved;
                             return (
                               <div key={langKey}>
                                 <label style={inlineLabelStyle} for={`settings-tts-lang-voice-${langKey}`}>
                                   {t(`settings.tts_lang_${langKey}`)}
                                 </label>
-                                <select
-                                  id={`settings-tts-lang-voice-${langKey}`}
-                                  data-testid={`settings-tts-lang-voice-${langKey}`}
-                                  aria-label={t(`settings.tts_lang_${langKey}`)}
-                                  class="settings-input"
-                                  value={selectedVal}
-                                  onInput={handleLangSelect}
-                                  onChange={handleLangSelect}
-                                >
-                                  <option value="">{autoLabel}</option>
-                                  {!hasSelectedInOrdered && (
-                                    <option value={selectedVal}>{selectedVal}</option>
-                                  )}
-                                  {ordered.map((voice) => {
-                                    const label = voice.name && voice.name !== voice.id
-                                      ? `${voice.name} (${voice.id})`
-                                      : voice.id;
-                                    return (
-                                      <option key={voice.id} value={voice.id}>
-                                        {voice.locale ? `${label} · ${voice.locale}` : label}
-                                      </option>
-                                    );
-                                  })}
-                                </select>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <select
+                                    id={`settings-tts-lang-voice-${langKey}`}
+                                    data-testid={`settings-tts-lang-voice-${langKey}`}
+                                    aria-label={t(`settings.tts_lang_${langKey}`)}
+                                    class="settings-input"
+                                    style={{ flex: 1, minWidth: 0 }}
+                                    value={selectedVal}
+                                    onInput={handleLangSelect}
+                                    onChange={handleLangSelect}
+                                  >
+                                    <option value="">{autoLabel}</option>
+                                    {!hasSelectedInOrdered && (
+                                      <option value={selectedVal}>{selectedVal}</option>
+                                    )}
+                                    {ordered.map((voice) => {
+                                      const label = voice.name && voice.name !== voice.id
+                                        ? `${voice.name} (${voice.id})`
+                                        : voice.id;
+                                      return (
+                                        <option key={voice.id} value={voice.id}>
+                                          {voice.locale ? `${label} · ${voice.locale}` : label}
+                                        </option>
+                                      );
+                                    })}
+                                  </select>
+                                  <button
+                                    type="button"
+                                    data-testid={`settings-tts-lang-voice-preview-${langKey}`}
+                                    class="settings-btn-secondary"
+                                    style={{ flex: '0 0 auto', padding: '6px 8px', fontSize: '11px', whiteSpace: 'nowrap' }}
+                                    disabled={ttsSaving}
+                                    title={isPreviewingLang ? t('settings.tts_preview_stop') : t('settings.tts_preview_voice')}
+                                    aria-label={isPreviewingLang ? t('settings.tts_preview_stop') : `${t('settings.tts_preview_voice')} ${t(`settings.tts_lang_${langKey}`)}`}
+                                    onClick={() => void handleVoicePreviewClick({
+                                      previewId: langPreviewId,
+                                      voice: langPreviewVoice,
+                                      lang: langKey,
+                                      isPreviewing: isPreviewingLang,
+                                    })}
+                                  >
+                                    {isPreviewingLang ? '■' : '▶'}
+                                  </button>
+                                </div>
                               </div>
                             );
                           })}
