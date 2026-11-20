@@ -150,6 +150,13 @@ class InMemoryGlobalTaskDb {
             .sort((a, b) => b.updated_at - a.updated_at) as unknown as T[];
         }
 
+        if (norm.includes('from global_task_pair_summaries') && norm.includes("status = 'done'")) {
+          const cutoff = Number(params.at(-1) ?? 0);
+          const serverIds = new Set(params.slice(0, -1).map(String));
+          return [...this.summaries.values()]
+            .filter((r) => serverIds.has(r.server_id) && r.status === 'done' && r.updated_at >= cutoff) as unknown as T[];
+        }
+
         if (norm.includes('from global_task_pair_summaries') && norm.includes('is_terminal = true')) {
           const limit = Number(params.at(-1) ?? 50);
           const hasCutoff = norm.includes('updated_at >=');
@@ -1584,5 +1591,74 @@ describe('global-task-mode server engine', () => {
     expect(internalLegacy?.brainLabel).toBe('Brain');
     expect(internalLegacy?.brainLabel).not.toContain('bootmain');
     expect(internalLegacy?.brainLabel).not.toContain('deck_');
+  });
+
+  it('aggregates 24h / 48h / 1w / 1m completion stats across active servers while keeping the 48h task card window unchanged', async () => {
+    const now = Date.now();
+    const hourMs = 60 * 60 * 1000;
+    const dayMs = 24 * hourMs;
+    const makeRow = (
+      serverId: string,
+      taskId: string,
+      status: string,
+      opts: { startedAt?: number | null; endedAt?: number | null; createdAt: number; updatedAt: number },
+    ) => {
+      memDb.summaries.set(`${serverId}\u0000${taskId}`, {
+        server_id: serverId,
+        task_id: taskId,
+        project_name: 'imcodes',
+        brain_session: 'deck_cd_brain',
+        brain_label: 'cd',
+        title: taskId,
+        status,
+        flags_json: '[]',
+        round: 1,
+        checklist_total: 1,
+        checklist_implemented: status === 'done' ? 1 : 0,
+        checklist_audited: status === 'done' ? 1 : 0,
+        executor_label: null,
+        auditor_label: null,
+        auditor: null,
+        live_summary: null,
+        is_terminal: status === 'done' || status === 'cancelled',
+        needs_attention: false,
+        created_at: opts.createdAt,
+        updated_at: opts.updatedAt,
+        started_at: opts.startedAt ?? null,
+        ended_at: opts.endedAt ?? null,
+      });
+    };
+
+    // srv-a: 1 in 24h (60s), 1 in 48h (120s), 1 in 1w (180s), 1 in 1m (240s), 1 >30d (ignored), 1 cancelled (ignored)
+    makeRow('srv-a', 't_24h', 'done', { createdAt: now - 2 * hourMs, startedAt: now - hourMs - 60_000, endedAt: now - hourMs, updatedAt: now - hourMs });
+    makeRow('srv-a', 't_48h', 'done', { createdAt: now - 30 * hourMs - 120_000, updatedAt: now - 30 * hourMs });
+    makeRow('srv-a', 't_1w', 'done', { createdAt: now - 5 * dayMs - 180_000, startedAt: now - 5 * dayMs - 180_000, endedAt: now - 5 * dayMs, updatedAt: now - 5 * dayMs });
+    makeRow('srv-a', 't_1m', 'done', { createdAt: now - 20 * dayMs - 240_000, startedAt: now - 20 * dayMs - 240_000, endedAt: now - 20 * dayMs, updatedAt: now - 20 * dayMs });
+    makeRow('srv-a', 't_too_old', 'done', { createdAt: now - 35 * dayMs - 300_000, startedAt: now - 35 * dayMs - 300_000, endedAt: now - 35 * dayMs, updatedAt: now - 35 * dayMs });
+    makeRow('srv-a', 't_cancelled', 'cancelled', { createdAt: now - hourMs, startedAt: now - hourMs, endedAt: now - 10_000, updatedAt: now - 10_000 });
+    // srv-b: 1 in 24h (120s) to verify muted server filtering
+    makeRow('srv-b', 't_srv_b_24h', 'done', { createdAt: now - hourMs, startedAt: now - 200_000, endedAt: now - 80_000, updatedAt: now - 80_000 });
+
+    const snapAll = await listGlobalTaskSnapshotForUser(db, 'user-a');
+    // Terminal card window stays 48h (excludes t_1w and t_1m cards)
+    expect(snapAll.tasks.map((t) => t.taskId)).toContain('t_24h');
+    expect(snapAll.tasks.map((t) => t.taskId)).toContain('t_48h');
+    expect(snapAll.tasks.map((t) => t.taskId)).not.toContain('t_1w');
+    expect(snapAll.tasks.map((t) => t.taskId)).not.toContain('t_1m');
+    expect(snapAll.stats).toEqual({
+      h24: { completedCount: 1, avgDurationMs: 60_000 },
+      h48: { completedCount: 2, avgDurationMs: 90_000 },
+      w1: { completedCount: 3, avgDurationMs: 120_000 },
+      m1: { completedCount: 4, avgDurationMs: 150_000 },
+    });
+
+    // Muting srv-a zeros stats
+    const snapMuted = await listGlobalTaskSnapshotForUser(db, 'user-a', ['srv-a']);
+    expect(snapMuted.stats).toEqual({
+      h24: { completedCount: 0, avgDurationMs: null },
+      h48: { completedCount: 0, avgDurationMs: null },
+      w1: { completedCount: 0, avgDurationMs: null },
+      m1: { completedCount: 0, avgDurationMs: null },
+    });
   });
 });

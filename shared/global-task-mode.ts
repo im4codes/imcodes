@@ -10,6 +10,26 @@ export const GLOBAL_TASK_WS_TICKET_TYPE = 'global-tasks-ws-ticket' as const;
 export const GLOBAL_TASK_PG_NOTIFY_MAX_BYTES = 4000 as const;
 export const GLOBAL_TASK_RECENT_FINISHED_LIMIT = 50 as const;
 export const GLOBAL_TASK_TERMINAL_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
+export const GLOBAL_TASK_STATS_WINDOW_MS = {
+  h24: 24 * 60 * 60 * 1000,
+  h48: 48 * 60 * 60 * 1000,
+  w1: 7 * 24 * 60 * 60 * 1000,
+  m1: 30 * 24 * 60 * 60 * 1000,
+} as const;
+export const GLOBAL_TASK_STATS_MAX_WINDOW_MS = GLOBAL_TASK_STATS_WINDOW_MS.m1;
+export const GLOBAL_TASK_STATS_FUTURE_SKEW_MS = 60 * 1000;
+
+export interface GlobalTaskWindowStats {
+  completedCount: number;
+  avgDurationMs: number | null;
+}
+
+export interface GlobalTaskCompletionStats {
+  h24: GlobalTaskWindowStats;
+  h48: GlobalTaskWindowStats;
+  w1: GlobalTaskWindowStats;
+  m1: GlobalTaskWindowStats;
+}
 
 export const GLOBAL_TASK_MODE_MSG = {
   SET_FILTER: 'global_tasks.set_filter',
@@ -97,6 +117,7 @@ export interface GlobalTaskSnapshotResponse {
   tasks: GlobalTaskSummaryRow[];
   brains: GlobalTaskBrainSummary[];
   servers: GlobalTaskServerSummary[];
+  stats?: GlobalTaskCompletionStats;
   ts: number;
 }
 
@@ -158,6 +179,83 @@ export function isGlobalTaskWithinSyncWindow(
   if (!terminal) return true;
   const updatedAt = typeof task.updatedAt === 'number' && Number.isFinite(task.updatedAt) ? task.updatedAt : 0;
   return updatedAt >= now - GLOBAL_TASK_TERMINAL_WINDOW_MS;
+}
+
+export function emptyGlobalTaskCompletionStats(): GlobalTaskCompletionStats {
+  return {
+    h24: { completedCount: 0, avgDurationMs: null },
+    h48: { completedCount: 0, avgDurationMs: null },
+    w1: { completedCount: 0, avgDurationMs: null },
+    m1: { completedCount: 0, avgDurationMs: null },
+  };
+}
+
+export interface GlobalTaskStatsSample {
+  status: string;
+  startedAt?: number | null;
+  endedAt?: number | null;
+  createdAt?: number | null;
+  updatedAt?: number | null;
+}
+
+function validPositiveStatTs(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Aggregate 24h / 48h / 1w / 1m completion counts and average durations
+ * for finished (`status === 'done'`) tasks, using endedAt->updatedAt and
+ * startedAt->createdAt fallbacks while ignoring cancelled and reversed rows.
+ */
+export function computeGlobalTaskCompletionStats(
+  rows: readonly GlobalTaskStatsSample[],
+  nowMs: number,
+): GlobalTaskCompletionStats {
+  if (!Number.isFinite(nowMs) || nowMs <= 0) {
+    return emptyGlobalTaskCompletionStats();
+  }
+  const maxEndTs = nowMs + GLOBAL_TASK_STATS_FUTURE_SKEW_MS;
+  const keys = ['h24', 'h48', 'w1', 'm1'] as const;
+  const sums: Record<(typeof keys)[number], number> = { h24: 0, h48: 0, w1: 0, m1: 0 };
+  const durCounts: Record<(typeof keys)[number], number> = { h24: 0, h48: 0, w1: 0, m1: 0 };
+  const counts: Record<(typeof keys)[number], number> = { h24: 0, h48: 0, w1: 0, m1: 0 };
+
+  for (const row of rows) {
+    if (row.status !== 'done') continue;
+    const endTs = validPositiveStatTs(row.endedAt) ?? validPositiveStatTs(row.updatedAt);
+    if (endTs === null || endTs > maxEndTs || endTs < nowMs - GLOBAL_TASK_STATS_MAX_WINDOW_MS) continue;
+    const startTs = validPositiveStatTs(row.startedAt) ?? validPositiveStatTs(row.createdAt);
+    const duration = startTs !== null && endTs >= startTs ? endTs - startTs : null;
+
+    for (const key of keys) {
+      if (endTs >= nowMs - GLOBAL_TASK_STATS_WINDOW_MS[key]) {
+        counts[key] += 1;
+        if (duration !== null) {
+          sums[key] += duration;
+          durCounts[key] += 1;
+        }
+      }
+    }
+  }
+
+  return {
+    h24: {
+      completedCount: counts.h24,
+      avgDurationMs: durCounts.h24 > 0 ? Math.round(sums.h24 / durCounts.h24) : null,
+    },
+    h48: {
+      completedCount: counts.h48,
+      avgDurationMs: durCounts.h48 > 0 ? Math.round(sums.h48 / durCounts.h48) : null,
+    },
+    w1: {
+      completedCount: counts.w1,
+      avgDurationMs: durCounts.w1 > 0 ? Math.round(sums.w1 / durCounts.w1) : null,
+    },
+    m1: {
+      completedCount: counts.m1,
+      avgDurationMs: durCounts.m1 > 0 ? Math.round(sums.m1 / durCounts.m1) : null,
+    },
+  };
 }
 
 export function isGlobalTaskAttentionNeeded(status: string, flags: readonly string[]): boolean {

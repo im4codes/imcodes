@@ -1,7 +1,10 @@
 import {
   GLOBAL_TASK_NOTIFY_CHANNEL,
   GLOBAL_TASK_RECENT_FINISHED_LIMIT,
+  GLOBAL_TASK_STATS_MAX_WINDOW_MS,
   GLOBAL_TASK_TERMINAL_WINDOW_MS,
+  computeGlobalTaskCompletionStats,
+  emptyGlobalTaskCompletionStats,
   isGlobalTaskAttentionNeeded,
   isGlobalTaskTerminalStatus,
   isGlobalTaskWithinSyncWindow,
@@ -429,7 +432,7 @@ export async function listGlobalTaskSnapshotForUser(
   const ts = Date.now();
 
   if (activeServerIds.length === 0) {
-    return { tasks: [], brains: [], servers, ts };
+    return { tasks: [], brains: [], servers, stats: emptyGlobalTaskCompletionStats(), ts };
   }
 
   const serverPlaceholders = activeServerIds.map((_, idx) => `$${idx + 1}`).join(', ');
@@ -485,6 +488,25 @@ export async function listGlobalTaskSnapshotForUser(
     [...activeServerIds, ts - GLOBAL_TASK_TERMINAL_WINDOW_MS, GLOBAL_TASK_RECENT_FINISHED_LIMIT],
   );
 
+  const statsRows = await db.query<Pick<RawSummaryRow, 'status' | 'started_at' | 'ended_at' | 'created_at' | 'updated_at'>>(
+    `SELECT status, started_at, ended_at, created_at, updated_at
+       FROM global_task_pair_summaries
+      WHERE server_id IN (${serverPlaceholders})
+        AND status = 'done'
+        AND updated_at >= $${activeServerIds.length + 1}`,
+    [...activeServerIds, ts - GLOBAL_TASK_STATS_MAX_WINDOW_MS],
+  );
+  const stats = computeGlobalTaskCompletionStats(
+    statsRows.map((row) => ({
+      status: String(row.status || ''),
+      startedAt: Number(row.started_at ?? 0) || 0,
+      endedAt: Number(row.ended_at ?? 0) || 0,
+      createdAt: Number(row.created_at ?? 0) || 0,
+      updatedAt: Number(row.updated_at ?? 0) || 0,
+    })),
+    ts,
+  );
+
   const tasks: GlobalTaskSummaryRow[] = [];
   for (const row of [...activeTaskRows, ...recentTerminalRows]) {
     const meta = serverMetaById.get(row.server_id);
@@ -495,5 +517,5 @@ export async function listGlobalTaskSnapshotForUser(
     tasks.push(mapRawSummaryRow(row, meta, brainFallback, projectFallback));
   }
 
-  return { tasks, brains, servers, ts };
+  return { tasks, brains, servers, stats, ts };
 }

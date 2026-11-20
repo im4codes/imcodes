@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { GlobalTaskBrainSummary, GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
+import {
+  computeGlobalTaskCompletionStats,
+  type GlobalTaskBrainSummary,
+  type GlobalTaskCompletionStats,
+  type GlobalTaskSummaryRow,
+  type GlobalTaskWindowStats,
+} from '@shared/global-task-mode.js';
 import { isInternalSessionDisplayValue, pickReadableSessionDisplay } from '@shared/session-display.js';
 import { taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { formatLabel } from '../format-label.js';
@@ -31,7 +37,7 @@ import {
 import { TtsQuickSettingsPopover } from './TtsQuickSettingsPopover.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
-import { formatTaskDuration } from '../util/tool-duration.js';
+import { formatTaskDuration, type ElapsedDurationUnits } from '../util/tool-duration.js';
 import {
   clampContextMenuPosition,
   formatTaskPairCloseError,
@@ -88,17 +94,7 @@ export const GLOBAL_TASK_TTS_MAX_AGE_MS = 2 * 60 * 1000;
 export const GLOBAL_TASK_TTS_CLOCK_SKEW_MS = 30 * 1000;
 export const GLOBAL_TASK_TTS_QUEUE_CAP = 64;
 
-const TASK_MODE_STATS_WINDOW_MS = 24 * 60 * 60 * 1000;
-const TASK_MODE_STATS_FUTURE_SKEW_MS = 60 * 1000;
-
-export interface TaskMode24hStats {
-  completedCount: number;
-  avgDurationMs: number | null;
-}
-
-function validPositiveTs(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
-}
+export type TaskMode24hStats = GlobalTaskWindowStats;
 
 /**
  * Compute compact 24h completion count & average duration for finished (`done`)
@@ -108,31 +104,37 @@ export function computeTaskMode24hStats(
   tasks: readonly GlobalTaskSummaryRow[],
   nowMs: number,
 ): TaskMode24hStats {
-  if (!Number.isFinite(nowMs) || nowMs <= 0) {
-    return { completedCount: 0, avgDurationMs: null };
-  }
-  const minEndTs = nowMs - TASK_MODE_STATS_WINDOW_MS;
-  const maxEndTs = nowMs + TASK_MODE_STATS_FUTURE_SKEW_MS;
-  let completedCount = 0;
-  let durationSumMs = 0;
-  let durationCount = 0;
+  return computeGlobalTaskCompletionStats(tasks, nowMs).h24;
+}
 
-  for (const task of tasks) {
-    if (task.status !== 'done') continue;
-    const endTs = validPositiveTs(task.endedAt) ?? validPositiveTs(task.updatedAt);
-    if (endTs === null || endTs < minEndTs || endTs > maxEndTs) continue;
-    completedCount += 1;
-    const startTs = validPositiveTs(task.startedAt) ?? validPositiveTs(task.createdAt);
-    if (startTs !== null && endTs >= startTs) {
-      durationSumMs += endTs - startTs;
-      durationCount += 1;
-    }
-  }
+const STATS_WINDOW_LABELS: ReadonlyArray<{ key: keyof GlobalTaskCompletionStats; label: string }> = [
+  { key: 'h24', label: '24h' },
+  { key: 'h48', label: '48h' },
+  { key: 'w1', label: '1w' },
+  { key: 'm1', label: '1m' },
+];
 
-  return {
-    completedCount,
-    avgDurationMs: durationCount > 0 ? Math.round(durationSumMs / durationCount) : null,
-  };
+function formatCompactStatDuration(ms: number | null, units: ElapsedDurationUnits): string | null {
+  if (ms === null || !Number.isFinite(ms) || ms < 0) return null;
+  const totalSeconds = Math.floor(ms / 1000);
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (days > 0) return hours > 0 ? `${days}${units.day}${hours}${units.hour}` : `${days}${units.day}`;
+  if (hours > 0) return minutes > 0 ? `${hours}${units.hour}${minutes}${units.minute}` : `${hours}${units.hour}`;
+  if (minutes > 0) return seconds > 0 && minutes < 10 ? `${minutes}${units.minute}${seconds}${units.second}` : `${minutes}${units.minute}`;
+  return `${seconds}${units.second}`;
+}
+
+function formatWindowStatToken(
+  label: string,
+  stat: GlobalTaskWindowStats,
+  units: ElapsedDurationUnits,
+): string {
+  if (stat.completedCount <= 0) return `${label} 0`;
+  const avg = formatCompactStatDuration(stat.avgDurationMs, units);
+  return avg ? `${label} ${stat.completedCount}·${avg}` : `${label} ${stat.completedCount}`;
 }
 
 export interface QueuedTaskModeTtsItem {
@@ -865,16 +867,17 @@ export function GlobalTaskModeView({
     }),
     [t],
   );
-  const stats24h = useMemo(
-    () => computeTaskMode24hStats(terminalTasks, now),
-    [terminalTasks, now],
+  const completionStats = useMemo<GlobalTaskCompletionStats>(
+    () => state.stats ?? computeGlobalTaskCompletionStats(terminalTasks, now),
+    [state.stats, terminalTasks, now],
   );
-  const stats24hAvgText = stats24h.avgDurationMs !== null
-    ? formatTaskDuration({ durationMs: stats24h.avgDurationMs }, durationUnits)
-    : undefined;
-  const stats24hText = stats24hAvgText
-    ? t('taskMode.stats_24h_with_avg', { count: stats24h.completedCount, avg: stats24hAvgText })
-    : t('taskMode.stats_24h_count_only', { count: stats24h.completedCount });
+  const statsItems = useMemo(
+    () => STATS_WINDOW_LABELS.map(({ key, label }) => ({
+      key,
+      text: formatWindowStatToken(label, completionStats[key], durationUnits),
+    })),
+    [completionStats, durationUnits],
+  );
 
   // Gesture helpers: tap -> quick composer, long-press (260ms) -> VoiceOverlay, scroll (>12px) -> cancelled
   const finishPressTracker = useCallback((key: string, cancelPress: boolean) => {
@@ -1787,7 +1790,15 @@ export function GlobalTaskModeView({
                 <span aria-hidden="true">{statusFilter === 'done' || finishedExpanded ? '▾' : '▸'}</span>
               </button>
               <span class="global-task-finished-stats" data-testid="task-mode-24h-stats">
-                {stats24hText}
+                {statsItems.map((item, idx) => (
+                  <span
+                    key={item.key}
+                    class="global-task-finished-stat-item"
+                    data-testid={`task-mode-stat-${item.key}`}
+                  >
+                    {idx > 0 ? `· ${item.text}` : item.text}
+                  </span>
+                ))}
               </span>
             </div>
             {(statusFilter === 'done' || finishedExpanded) && (

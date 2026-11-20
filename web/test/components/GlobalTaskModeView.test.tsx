@@ -2601,15 +2601,60 @@ describe('GlobalTaskModeView', () => {
     expect(finishedSection.contains(statsEl)).toBe(true);
     expect(activeSection.contains(statsEl)).toBe(false);
     expect(toggleBtn.getAttribute('aria-expanded')).toBe('true');
-    // (t-done-1 = 60s, t-done-2 createdAt..updatedAt = 120s => avg 90s = 1m 30s)
-    expect(statsEl.textContent).toBe('24h: 2 done · avg 1m 30s');
+    // Fallback client calculation across 4 windows:
+    // h24: t-done-1 (60s) + t-done-2 (120s) -> 2, avg 1m 30s (1m30s)
+    // h48/w1/m1: + t-old-done (4h) -> 3, avg (60 + 120 + 14400)/3 = 4860s = 1h21m
+    expect(screen.getByTestId('task-mode-stat-h24').textContent).toBe('24h 2·1m30s');
+    expect(screen.getByTestId('task-mode-stat-h48').textContent).toBe('· 48h 3·1h21m');
+    expect(screen.getByTestId('task-mode-stat-w1').textContent).toBe('· 1w 3·1h21m');
+    expect(screen.getByTestId('task-mode-stat-m1').textContent).toBe('· 1m 3·1h21m');
 
     // Remains visible inline in the header row when finished section is collapsed
     fireEvent.click(toggleBtn);
     expect(screen.getByTestId('task-mode-finished-toggle').getAttribute('aria-expanded')).toBe('false');
-    expect(screen.getByTestId('task-mode-24h-stats').textContent).toBe('24h: 2 done · avg 1m 30s');
+    expect(screen.getByTestId('task-mode-stat-h24').textContent).toBe('24h 2·1m30s');
 
-    // Muting both servers / showing only cancelled-or-old leaves 0 done without NaN/avg
+    // Server-provided snapshot.stats overrides client 48h fallback for accurate 1w/1m metrics
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: nowMs,
+        servers: [{ id: 'srv-1', name: 'M3-Mac', online: true }],
+        brains: [],
+        stats: {
+          h24: { completedCount: 5, avgDurationMs: 240_000 },
+          h48: { completedCount: 12, avgDurationMs: 360_000 },
+          w1: { completedCount: 30, avgDurationMs: 480_000 },
+          m1: { completedCount: 90, avgDurationMs: 540_000 },
+        },
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-done-1',
+            title: 'Recent done',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 1, audited: 1 },
+            createdAt: nowMs - 60_000,
+            updatedAt: nowMs - 10_000,
+            isTerminal: true,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+    expect(screen.getByTestId('task-mode-stat-h24').textContent).toBe('24h 5·4m');
+    expect(screen.getByTestId('task-mode-stat-h48').textContent).toBe('· 48h 12·6m');
+    expect(screen.getByTestId('task-mode-stat-w1').textContent).toBe('· 1w 30·8m');
+    expect(screen.getByTestId('task-mode-stat-m1').textContent).toBe('· 1m 90·9m');
+
+    // Showing only cancelled-or-old leaves compact 0 counts without NaN/avg
     await act(async () => {
       ws.simulateMessage({
         type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
@@ -2638,6 +2683,9 @@ describe('GlobalTaskModeView', () => {
         ],
       });
     });
-    expect(screen.getByTestId('task-mode-24h-stats').textContent).toBe('24h: 0 done');
+    expect(screen.getByTestId('task-mode-stat-h24').textContent).toBe('24h 0');
+    expect(screen.getByTestId('task-mode-stat-h48').textContent).toBe('· 48h 0');
+    expect(screen.getByTestId('task-mode-stat-w1').textContent).toBe('· 1w 0');
+    expect(screen.getByTestId('task-mode-stat-m1').textContent).toBe('· 1m 0');
   });
 });

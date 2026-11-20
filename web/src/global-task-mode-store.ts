@@ -8,6 +8,7 @@ import {
   isGlobalTaskWithinSyncWindow,
   type GlobalTaskBrainSummary,
   type GlobalTaskBrainTextEvent,
+  type GlobalTaskCompletionStats,
   type GlobalTaskNotificationEvent,
   type GlobalTaskServerFrame,
   type GlobalTaskServerSummary,
@@ -75,6 +76,7 @@ export interface GlobalTaskModeState {
   tasks: GlobalTaskSummaryRow[];
   brains: GlobalTaskBrainSummary[];
   servers: GlobalTaskServerSummary[];
+  stats: GlobalTaskCompletionStats | null;
   mutedServerIds: string[];
   pinnedBrains: GlobalTaskPinnedBrain[];
   recentBrains: GlobalTaskRecentBrain[];
@@ -515,6 +517,7 @@ export class GlobalTaskModeStore {
       tasks: [],
       brains: [],
       servers: [],
+      stats: null,
       mutedServerIds: loadMutedServerIds(),
       pinnedBrains: this.pinnedBrainsPayload?.v ?? [],
       recentBrains: loadRecentBrains(),
@@ -995,6 +998,7 @@ export class GlobalTaskModeStore {
       tasks: [],
       brains: [],
       servers: [],
+      stats: null,
       mutedServerIds: [],
       pinnedBrains: [],
       recentBrains: [],
@@ -1228,6 +1232,7 @@ export class GlobalTaskModeStore {
       tasks,
       brains,
       servers,
+      stats: snapshot.stats ?? null,
       latestBrainTexts: nextLatestBrainTexts,
       lastSyncedAt: snapshot.ts ?? Date.now(),
     });
