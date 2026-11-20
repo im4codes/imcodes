@@ -2629,4 +2629,113 @@ describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
     expect(screen.queryByText('Spoofed Non-Authoritative')).toBeNull();
     expect(screen.queryByText('Other Server Task')).toBeNull();
   });
+
+  it('keeps the newest 20 recently completed tasks across both DESC snapshot and ASC timeline order, collapsed by default', async () => {
+    localStorage.setItem(collapsedStorageKey({ serverId: 'recent-20', mobile: false }), 'false');
+    try {
+      // Snapshot arrives newest-first (25 down to 1)
+      const descSnapshot = {
+        authoritative: true,
+        serverId: 'recent-20',
+        tasks: Array.from({ length: 25 }, (_, i) => {
+          const n = 25 - i;
+          return {
+            taskId: `recent-desc-${n}`,
+            title: `Finished task ${n}`,
+            status: 'final',
+            updatedAt: n * 1_000,
+            pair: {
+              status: n % 3 === 0 ? 'cancelled' : 'done',
+              startedAt: n * 1_000 - 500,
+              updatedAt: n * 1_000,
+              endedAt: n * 1_000,
+              executor: 'deck_exec_r',
+              auditor: 'none',
+            },
+          };
+        }),
+        assignments: [],
+      };
+      const snapshotOrdered = resolveOrderedTaskPairRows({ snapshot: descSnapshot, events: [], serverId: 'recent-20' });
+      expect(snapshotOrdered).toHaveLength(20);
+      expect(snapshotOrdered.map((r) => r.payload.taskId)).toEqual(
+        Array.from({ length: 20 }, (_, i) => `recent-desc-${25 - i}`),
+      );
+
+      // Timeline events arrive oldest-first (1 up to 25) -> still keeps newest 20 (25 down to 6)
+      const ascEvents = Array.from({ length: 25 }, (_, i) => {
+        const n = i + 1;
+        return {
+          eventId: `ev-recent-${n}`,
+          type: TASK_PAIR_TIMELINE_EVENT,
+          ts: n * 1_000,
+          payload: {
+            taskId: `recent-desc-${n}`,
+            title: `Finished task ${n}`,
+            toStatus: n % 3 === 0 ? 'cancelled' : 'done',
+            executor: 'deck_exec_r',
+            auditor: 'none',
+          },
+        };
+      }) as unknown as TimelineEvent[];
+      const timelineOrdered = resolveOrderedTaskPairRows({ snapshot: null, events: ascEvents, serverId: 'recent-20' });
+      expect(timelineOrdered.map((r) => r.payload.taskId)).toEqual(
+        snapshotOrdered.map((r) => r.payload.taskId),
+      );
+
+      // Fewer than 20 completed tasks -> retains all newest-first
+      const fewSnapshot = {
+        authoritative: true,
+        serverId: 'recent-20',
+        tasks: descSnapshot.tasks.slice(-5), // tasks 5..1
+        assignments: [],
+      };
+      expect(resolveOrderedTaskPairRows({ snapshot: fewSnapshot, events: [], serverId: 'recent-20' }).map((r) => r.payload.taskId)).toEqual([
+        'recent-desc-5', 'recent-desc-4', 'recent-desc-3', 'recent-desc-2', 'recent-desc-1',
+      ]);
+
+      // 0 active tasks + 25 completed tasks -> panel mounts with <details> recent group collapsed by default and count (20)
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = descSnapshot;
+      const { container } = render(<TaskPairStatusPanel events={[]} serverId="recent-20" />);
+      const recentGroup = container.querySelector('details.task-pair-status-group-recent') as HTMLDetailsElement | null;
+      expect(recentGroup).toBeTruthy();
+      expect(recentGroup!.open).toBe(false);
+      expect(recentGroup!.querySelector('summary h4')?.textContent).toContain('(20)');
+
+      const rows = [...recentGroup!.querySelectorAll('.task-pair-status-row-title')].map((el) => el.textContent);
+      expect(rows).toHaveLength(20);
+      expect(rows[0]).toBe('Finished task 25');
+      expect(rows[19]).toBe('Finished task 6');
+
+      // Re-rendering/receiving updated snapshot preserves collapsed state by default
+      act(() => {
+        window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+          detail: {
+            ...descSnapshot,
+            tasks: [
+              {
+                taskId: 'recent-desc-26',
+                title: 'Finished task 26',
+                status: 'final',
+                updatedAt: 26_000,
+                pair: { status: 'done', startedAt: 25_500, updatedAt: 26_000, endedAt: 26_000, executor: 'deck_exec_r', auditor: 'none' },
+              },
+              ...descSnapshot.tasks,
+            ],
+          },
+        }));
+      });
+      await waitFor(() => {
+        expect(recentGroup!.querySelector('.task-pair-status-row-title')?.textContent).toBe('Finished task 26');
+      });
+      expect(recentGroup!.open).toBe(false);
+
+      // User can manually expand the <details> group
+      recentGroup!.open = true;
+      expect(recentGroup!.open).toBe(true);
+    } finally {
+      delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+      localStorage.clear();
+    }
+  });
 });

@@ -2,7 +2,7 @@ import type { TimelineEvent } from './ws-client.js';
 import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
 import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
 
-export const TASK_PAIR_PANEL_MAX_RECENT_ROWS = 6;
+export const TASK_PAIR_PANEL_MAX_RECENT_ROWS = 20;
 
 export type TaskPairConsoleSnapshotDetail = {
   authoritative?: unknown;
@@ -118,7 +118,7 @@ export function normalizeTaskPairSnapshot(
     const startedAt = finiteTimestamp(pair.startedAt ?? pair.createdAt);
     const updatedAt = finiteTimestamp(pair.updatedAt ?? task.updatedAt, startedAt);
     const endedAt = TASK_PAIR_TERMINAL_STATUSES.includes(toStatus as TaskPairStatus)
-      ? finiteTimestamp(pair.endedAt ?? task.updatedAt, updatedAt)
+      ? finiteTimestamp(pair.endedAt ?? task.endedAt ?? task.updatedAt, updatedAt)
       : undefined;
     return {
       ...pair,
@@ -150,6 +150,18 @@ export function getTaskPairWaitKind(payload: Record<string, unknown>) {
     scheduling: payload.scheduling as TaskPairScheduling | undefined,
     status: payload.toStatus as TaskPairStatus,
   });
+}
+
+function recentRowTimestamp(row: TaskPairPanelRow): number {
+  return (
+    finiteTimestamp(row.payload.endedAt)
+    ?? finiteTimestamp(row.payload.finishedAt)
+    ?? finiteTimestamp(row.payload.updatedAt)
+    ?? finiteTimestamp(row.updatedAt)
+    ?? finiteTimestamp(row.payload.startedAt)
+    ?? finiteTimestamp(row.startedAt)
+    ?? 0
+  );
 }
 
 export function groupAndOrderTaskPairRows(
@@ -190,8 +202,10 @@ export function groupAndOrderTaskPairRows(
           (a, b) => Number(a.payload.queuePosition ?? Number.MAX_SAFE_INTEGER)
             - Number(b.payload.queuePosition ?? Number.MAX_SAFE_INTEGER),
         );
+      } else if (key === 'recent') {
+        grouped.sort((a, b) => recentRowTimestamp(b) - recentRowTimestamp(a));
       }
-      return { key, rows: key === 'recent' ? grouped.slice(-TASK_PAIR_PANEL_MAX_RECENT_ROWS) : grouped };
+      return { key, rows: key === 'recent' ? grouped.slice(0, TASK_PAIR_PANEL_MAX_RECENT_ROWS) : grouped };
     })
     .filter((group) => group.rows.length > 0);
   const orderedRows = groups.flatMap((group) => group.rows);
