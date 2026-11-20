@@ -51,6 +51,9 @@ export const TTS_MIN_RATE = 0.5;
 export const TTS_MAX_RATE = 2.0;
 export const TTS_RATE_OPTIONS = [0.9, 1.0, 1.1, 1.25, 1.5] as const;
 export const TTS_MAX_CHUNK_CHARS = 1200;
+export const TTS_SERVER_FIRST_CHUNK_MAX_CHARS = 80;
+export const TTS_SERVER_CHUNK_MAX_CHARS = 220;
+export const TTS_SERVER_PREFETCH_AHEAD = 2;
 export const TTS_MAX_QUEUE_SIZE = 64;
 
 export type TtsPlaybackStatus = 'idle' | 'speaking';
@@ -789,6 +792,152 @@ export function segmentTextForTts(text: string, fallbackLang?: string, maxChunkC
   return segments;
 }
 
+const SERVER_TTS_CJK_END_PUNCT = new Set(['。', '！', '？', '；']);
+const SERVER_TTS_ASCII_END_PUNCT = new Set(['.', '!', '?', ';']);
+const SERVER_TTS_CLOSING_PUNCT = new Set(['"', "'", '”', '’', '」', '』', ')', '）', '】', '》', ']', '〉', '〕']);
+
+function splitLineIntoSentencesForServerTts(line: string): string[] {
+  const trimmed = line.trim();
+  if (!trimmed) return [];
+  const sentences: string[] = [];
+  let start = 0;
+  let i = 0;
+
+  while (i < trimmed.length) {
+    const ch = trimmed[i]!;
+    const isCjkEnd = SERVER_TTS_CJK_END_PUNCT.has(ch);
+    const isAsciiEnd = SERVER_TTS_ASCII_END_PUNCT.has(ch);
+    if (!isCjkEnd && !isAsciiEnd) {
+      i += 1;
+      continue;
+    }
+
+    let end = i + 1;
+    while (end < trimmed.length && (SERVER_TTS_CJK_END_PUNCT.has(trimmed[end]!) || SERVER_TTS_ASCII_END_PUNCT.has(trimmed[end]!))) {
+      end += 1;
+    }
+    while (end < trimmed.length && SERVER_TTS_CLOSING_PUNCT.has(trimmed[end]!)) {
+      end += 1;
+    }
+
+    const nextCh = end < trimmed.length ? trimmed[end]! : '';
+    const hasCjkBoundary = isCjkEnd || Array.from(trimmed.slice(i, end)).some((c) => SERVER_TTS_CJK_END_PUNCT.has(c));
+    // Require whitespace or end-of-line after ASCII sentence punctuation so decimals/versions like 3.14 or v1.2 stay intact.
+    if (hasCjkBoundary || !nextCh || /\s/.test(nextCh)) {
+      const piece = trimmed.slice(start, end).trim();
+      if (piece) sentences.push(piece);
+      let nextStart = end;
+      while (nextStart < trimmed.length && /\s/.test(trimmed[nextStart]!)) {
+        nextStart += 1;
+      }
+      start = nextStart;
+      i = nextStart;
+      continue;
+    }
+
+    i = end;
+  }
+
+  if (start < trimmed.length) {
+    const tail = trimmed.slice(start).trim();
+    if (tail) sentences.push(tail);
+  }
+  return sentences;
+}
+
+function splitFirstClauseForServerTts(sentence: string, maxChars: number): [string, string] {
+  const trimmed = sentence.trim();
+  if (trimmed.length <= maxChars) return [trimmed, ''];
+  const minSplit = Math.floor(maxChars / 3);
+  let splitAt = -1;
+  for (let i = maxChars; i > minSplit; i--) {
+    const ch = trimmed[i - 1];
+    if (ch === '，' || ch === ',' || ch === '、' || ch === '；' || ch === ';' || ch === '：' || ch === ':' || ch === ' ') {
+      splitAt = i;
+      break;
+    }
+  }
+  if (splitAt <= 0) splitAt = maxChars;
+  return [trimmed.slice(0, splitAt).trim(), trimmed.slice(splitAt).trim()];
+}
+
+/**
+ * Split coarse language-tagged segments into fast-start chunks for Server TTS:
+ * chunk 0 stays capped at `firstChunkMaxChars` (default 80) for rapid time-to-first-audio,
+ * and subsequent chunks pack up to `maxChunkChars` (default 220) per request.
+ */
+export function chunkSegmentsForServerTts(
+  segments: readonly TtsSegment[],
+  options?: { firstChunkMaxChars?: number; maxChunkChars?: number },
+): TtsSegment[] {
+  const firstCap = Math.max(1, Math.floor(options?.firstChunkMaxChars ?? TTS_SERVER_FIRST_CHUNK_MAX_CHARS));
+  const chunkCap = Math.max(1, Math.floor(options?.maxChunkChars ?? TTS_SERVER_CHUNK_MAX_CHARS));
+  const out: TtsSegment[] = [];
+
+  for (const seg of segments) {
+    const trimmed = seg.text.trim();
+    if (!trimmed) continue;
+    const rawLines = trimmed.split(/\n+/);
+    const sentences: string[] = [];
+    for (const line of rawLines) {
+      sentences.push(...splitLineIntoSentencesForServerTts(line));
+    }
+    if (sentences.length === 0) continue;
+
+    let idx = 0;
+    let lockChunkZero = false;
+
+    if (out.length === 0) {
+      let first = sentences[0]!;
+      idx = 1;
+      // Merge only a tiny leading prefix (e.g. "1." <= 4 chars) with the following sentence if still <= firstCap.
+      while (first.length <= 4 && idx < sentences.length) {
+        const glue = isPauseTerminated(first) ? ' ' : (seg.lang.startsWith('zh') || seg.lang.startsWith('ja') ? ' ' : '. ');
+        const combined = `${first}${glue}${sentences[idx]!}`;
+        if (combined.length > firstCap) break;
+        first = combined;
+        idx += 1;
+      }
+
+      if (first.length <= firstCap) {
+        out.push({ text: first, lang: seg.lang });
+        lockChunkZero = true;
+      } else {
+        const [head, tail] = splitFirstClauseForServerTts(first, firstCap);
+        if (head) out.push({ text: head, lang: seg.lang });
+        if (tail) {
+          const tailPieces = tail.length <= chunkCap ? [tail] : splitOverlongSentence(tail, chunkCap);
+          for (const piece of tailPieces) {
+            out.push({ text: piece, lang: seg.lang });
+          }
+        }
+      }
+    }
+
+    for (; idx < sentences.length; idx++) {
+      const s = sentences[idx]!;
+      const pieces = s.length <= chunkCap ? [s] : splitOverlongSentence(s, chunkCap);
+      for (const piece of pieces) {
+        const prev = out[out.length - 1];
+        if (!lockChunkZero && prev && prev.lang === seg.lang) {
+          const pausePunct = isPauseTerminated(prev.text)
+            ? ''
+            : (seg.lang.startsWith('zh') || seg.lang.startsWith('ja') ? '。' : '.');
+          const nextText = `${prev.text}${pausePunct} ${piece}`;
+          if (nextText.length <= chunkCap) {
+            prev.text = nextText;
+            continue;
+          }
+        }
+        out.push({ text: piece, lang: seg.lang });
+        lockChunkZero = false;
+      }
+    }
+  }
+
+  return out;
+}
+
 function cancelWebSpeechSynthesis(): void {
   try {
     (globalThis as { speechSynthesis?: { cancel?: () => void } }).speechSynthesis?.cancel?.();
@@ -1259,24 +1408,34 @@ async function runServerSpeechPlayback(
     return { started: false, reason: 'error', error: message };
   }
 
-  const startPrefetch = (index: number): Promise<Blob> | null => {
-    if (index >= segmentCount || playbackGeneration !== gen || abortController.signal.aborted) {
-      return null;
-    }
+  const prefetched = new Map<number, Promise<Blob>>();
+  const ensurePrefetch = (index: number): Promise<Blob> => {
+    const existing = prefetched.get(index);
+    if (existing) return existing;
     const p = fetchSegmentBlob(index);
-    p.catch(() => { /* handled when awaited */ });
+    p.catch(() => { /* handled when awaited or ignored after abort */ });
+    prefetched.set(index, p);
     return p;
   };
 
-  let nextPrefetch = startPrefetch(1);
+  const scheduleLookahead = (playingIndex: number): void => {
+    if (playbackGeneration !== gen || abortController.signal.aborted) return;
+    const end = Math.min(segmentCount, playingIndex + 1 + TTS_SERVER_PREFETCH_AHEAD);
+    for (let k = playingIndex + 1; k < end; k++) {
+      ensurePrefetch(k);
+    }
+  };
+
+  scheduleLookahead(0);
 
   void (async () => {
     try {
       let result = await firstPlayback.completion;
       for (let i = 1; i < segmentCount; i++) {
         if (playbackGeneration !== gen || abortController.signal.aborted || !result.ok) break;
-        const blobPromise = nextPrefetch ?? fetchSegmentBlob(i);
-        nextPrefetch = startPrefetch(i + 1);
+        const blobPromise = ensurePrefetch(i);
+        prefetched.delete(i);
+        scheduleLookahead(i);
         const blob = await blobPromise;
         if (playbackGeneration !== gen || abortController.signal.aborted) break;
         const segPlayback = await beginAudioBlobPlayback(blob, gen, abortController);
@@ -1286,6 +1445,7 @@ async function runServerSpeechPlayback(
       if (activeServerAbortController === abortController) activeServerAbortController = null;
       if (playbackGeneration === gen && !abortController.signal.aborted) {
         if (!result.ok) {
+          abortController.abort();
           pendingQueue.length = 0;
           setState({
             status: 'idle',
@@ -1300,8 +1460,10 @@ async function runServerSpeechPlayback(
         }
       }
     } catch (err) {
+      const wasAborted = abortController.signal.aborted;
+      abortController.abort();
       if (activeServerAbortController === abortController) activeServerAbortController = null;
-      if (playbackGeneration === gen && !abortController.signal.aborted) {
+      if (playbackGeneration === gen && !wasAborted) {
         pendingQueue.length = 0;
         setState({
           status: 'idle',
@@ -1371,10 +1533,17 @@ async function speakWithServerTts(
     config = getCachedServerTtsConfig();
   }
 
+  const serverSegments = chunkSegmentsForServerTts(segments);
+  if (serverSegments.length === 0) {
+    if (activeServerAbortController === abortController) activeServerAbortController = null;
+    setState({ status: 'idle', activeMessageId: null, error: null });
+    return { started: false, reason: 'empty' };
+  }
+
   return runServerSpeechPlayback(
-    segments.length,
+    serverSegments.length,
     (index) => {
-      const seg = segments[index]!;
+      const seg = serverSegments[index]!;
       const resolvedVoice = resolveServerTtsVoiceForLang({
         lang: seg.lang,
         voicesByLang: config?.voicesByLang,

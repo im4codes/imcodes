@@ -986,4 +986,148 @@ describe('server TTS playback', () => {
       lang: 'zh-CN',
     });
   });
+
+  it('chunkSegmentsForServerTts fast-starts chunk 0 <= 80 chars, packs remaining <= 220, preserves lang tags, and splits long unpunctuated clauses', async () => {
+    const tts = await import('../src/tts.js');
+
+    // Short <= 80 single sentence stays 1 chunk with zero split overhead
+    expect(tts.chunkSegmentsForServerTts([{ text: '你好，这是一条很短的语音测试消息。', lang: 'zh-CN' }])).toEqual([
+      { text: '你好，这是一条很短的语音测试消息。', lang: 'zh-CN' },
+    ]);
+
+    // Multi-sentence 500+ char mixed Chinese & English keeps chunk 0 <= 80 and subsequent <= 220 without losing characters
+    const longZh =
+      '这是第一句很短的开场白。'
+      + '第二句用来验证长段落分段后的后续分块打包长度上限与并发预取调度表现，同时包含足够多的汉字来保证整体分块超过两百二十字阈值。'
+      + '第三句继续补充更多细节信息确保总字数超过五百字并且仍然严格遵循二百二十字的分块预算，让后端合成和前端播放都更稳定。'
+      + '第四句讨论前端在收到第一段音频后立刻开始播放同时向后并发预取两段的设计思路，从而大幅降低长文本的等待延迟。'
+      + '第五句验证中文标点后面没有空格时也能精准切分句子而不会整段卡在一个请求里等待很久，尤其适合连续输出的技术回答。'
+      + '第六句检查超过三百字长文本在各种边界情况下依然能平稳顺畅地连续播报不卡顿，并且不会打断前后相邻的语言片段。'
+      + '第七句作为收尾确认所有分段文本完整无缺且语言标签维持不变。';
+    const longEn =
+      'First English sentence stays fast and concise while testing bilingual segment transitions. '
+      + 'Second English sentence checks decimal numbers like 3.14 and software version v1.2.3 do not break unexpectedly during segmentation. '
+      + 'Third English sentence pushes total length well past two hundred twenty characters so it must split cleanly into multiple chunks.';
+
+    const baseSegments = tts.segmentTextForTts(`${longZh}\n${longEn}`, 'zh-CN');
+    expect(baseSegments[0]!.text.length).toBeGreaterThan(280);
+
+    const serverChunks = tts.chunkSegmentsForServerTts(baseSegments);
+    expect(serverChunks.length).toBeGreaterThan(4);
+    expect(serverChunks[0]!.text).toBe('这是第一句很短的开场白。');
+    expect(serverChunks[0]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_FIRST_CHUNK_MAX_CHARS);
+    expect(serverChunks[0]!.lang).toBe('zh-CN');
+    for (let i = 1; i < serverChunks.length; i++) {
+      expect(serverChunks[i]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_CHUNK_MAX_CHARS);
+      expect(serverChunks[i]!.text.length).toBeGreaterThan(0);
+    }
+    const enChunks = serverChunks.filter((c) => c.lang === 'en-US');
+    expect(enChunks.length).toBeGreaterThanOrEqual(2);
+    expect(enChunks.some((c) => c.text.includes('3.14') && c.text.includes('v1.2.3'))).toBe(true);
+
+    // Single 300+ char sentence without period punctuation splits chunk 0 <= 80 on comma/space
+    const commaOnly300 = Array.from({ length: 22 }, (_, idx) => `第${idx + 1}个逗号分隔从句内容较长`).join('，');
+    expect(commaOnly300.length).toBeGreaterThan(300);
+    const clauseChunks = tts.chunkSegmentsForServerTts([{ text: commaOnly300, lang: 'zh-CN' }]);
+    expect(clauseChunks[0]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_FIRST_CHUNK_MAX_CHARS);
+    for (let i = 1; i < clauseChunks.length; i++) {
+      expect(clauseChunks[i]!.text.length).toBeLessThanOrEqual(tts.TTS_SERVER_CHUNK_MAX_CHARS);
+    }
+    expect(clauseChunks.map((c) => c.text).join('')).toBe(commaOnly300);
+  });
+
+  it('speakText in server mode plays chunk 0 immediately, prefetches 2 chunks ahead concurrently, preserves voicesByLang, and aborts cleanly on stopSpeaking()', async () => {
+    let urlCounter = 0;
+    URL.createObjectURL = vi.fn(() => `blob:mock/stream-${++urlCounter}`);
+    URL.revokeObjectURL = vi.fn();
+
+    const audioInstances: Array<{ src: string; onended: (() => void) | null; onerror: (() => void) | null; pause: ReturnType<typeof vi.fn> }> = [];
+    class ControlledAudio {
+      src = '';
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      pause = vi.fn();
+      play = vi.fn(async () => {});
+      constructor() {
+        audioInstances.push(this);
+      }
+    }
+    vi.stubGlobal('Audio', ControlledAudio);
+
+    const requests: Array<{ input: string; voice?: string; lang?: string; signal?: AbortSignal; resolve: (res: Response) => void }> = [];
+    globalThis.fetch = vi.fn((url, init) => {
+      const u = String(url);
+      if (u.includes('/voices')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          voices: [
+            { id: 'zh-CN-XiaoxiaoNeural', locale: 'zh-CN' },
+            { id: 'en-US-AriaNeural', locale: 'en-US' },
+          ],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as { input: string; voice?: string; lang?: string };
+      return new Promise<Response>((resolve, reject) => {
+        const signal = init?.signal ?? undefined;
+        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        requests.push({ ...parsed, signal, resolve });
+      });
+    }) as typeof fetch;
+
+    const tts = await import('../src/tts.js');
+    tts.applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: 'https://tts.example.com/v1',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      voicesByLang: { en: 'en-US-JennyNeural' },
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+    await tts.fetchServerTtsVoices();
+
+    const longMixed =
+      '这是快速起播的第一句。'
+      + '第二句用来测试较长中文分块容量上限超过一百三十字后的拆分行为，'
+      + '所以这里补充更多自然语言描述确保单句长度达到一百四十字左右，'
+      + '这样它无法与下一段超长句子合并到同一个两百二十字符的请求分块中，'
+      + '从而保证系统会顺畅拆成多个中文语音块并验证多路并发预取调度效果，同时避免单次合成请求耗时过长影响首段衔接体验。'
+      + '第三句同样保持在一百四十字左右的长度范围之内，'
+      + '进一步说明当前端收到首句音频流之后会立刻开始播放，'
+      + '同时在后台并发预取后续两段语音内容避免播放衔接之间产生任何可感知的停顿延迟，确保用户在长篇回复下依然能获得接近实时流式的听觉反馈效果。'
+      + ' Fourth sentence switches cleanly to English for voice override validation.';
+
+    const speakPromise = tts.speakText(longMixed, { messageId: 'fast-stream-1' });
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]!.input).toBe('这是快速起播的第一句。');
+    expect(requests[0]!.voice).toBe('zh-CN-XiaoxiaoNeural');
+    expect(requests[0]!.lang).toBe('zh-CN');
+
+    // Resolve ONLY chunk 0 -> Audio.play() starts immediately and prefetches chunk 1 & chunk 2 concurrently (2 ahead)
+    requests[0]!.resolve(new Response(new Blob(['a0'], { type: 'audio/mpeg' }), { status: 200 }));
+    const res = await speakPromise;
+    expect(res).toEqual({ started: true });
+    expect(audioInstances).toHaveLength(1);
+    await vi.waitFor(() => expect(requests).toHaveLength(3));
+    expect(requests[1]!.lang).toBe('zh-CN');
+    expect(requests[2]!.lang).toBe('zh-CN');
+
+    // Finish chunk 0 after chunk 1 resolves -> chunk 1 plays and lookahead triggers remaining chunk 3 (with en-US Jenny override)
+    requests[1]!.resolve(new Response(new Blob(['a1'], { type: 'audio/mpeg' }), { status: 200 }));
+    await Promise.resolve();
+    audioInstances[0]!.onended?.();
+    await vi.waitFor(() => expect(audioInstances).toHaveLength(2));
+    await vi.waitFor(() => expect(requests.length).toBeGreaterThanOrEqual(4));
+    const englishReq = requests.find((r) => r.lang === 'en-US');
+    expect(englishReq?.voice).toBe('en-US-JennyNeural');
+
+    // Calling stopSpeaking() mid-stream aborts all remaining in-flight prefetches cleanly without unhandled rejections
+    const pendingSignals = requests.slice(2).map((r) => r.signal);
+    await tts.stopSpeaking();
+    expect(pendingSignals.every((s) => s?.aborted === true)).toBe(true);
+    expect(tts.getTtsState()).toEqual({ status: 'idle', activeMessageId: null, error: null });
+  });
 });
