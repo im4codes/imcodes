@@ -1,6 +1,6 @@
 import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -20,6 +20,7 @@ import { defaultHasActiveSupervisionLease, provisionSupervisionTarget } from '..
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { setPairSessionCreationDepsForTests } from '../../../src/daemon/task-pairs/session-creation.js';
 import { setTaskPairWorkspaceDepsForTests } from '../../../src/daemon/task-pairs/workspace.js';
+import { removeTree, setTaskPairHygieneDepsForTests } from '../../../src/daemon/task-pairs/workspace-hygiene.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
 
 const PROJECT = 'pair-mcp-project';
@@ -1060,6 +1061,129 @@ describe('pair MCP projections', () => {
     } finally {
       setTaskPairStoreForTests(undefined);
       removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
+  it('lets Brain pair_close(action=done) without force on a passed audited pair, returns inline MCP rejection without policy-rejection chat spam, and does not block on workspace hygiene', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    const baseDir = realpathSync(mkdtempSync(join(tmpdir(), 'imcodes-pair-close-fast-')));
+    const gitProject = join(baseDir, 'repo');
+    const worktreeDir = join(baseDir, 'wt-passed');
+    execFileSync('git', ['init', '-q', gitProject]);
+    execFileSync('git', ['-C', gitProject, 'config', 'user.email', 'test@example.invalid']);
+    execFileSync('git', ['-C', gitProject, 'config', 'user.name', 'Test']);
+    writeFileSync(join(gitProject, '.gitignore'), 'node_modules/\n');
+    writeFileSync(join(gitProject, 'README.md'), 'hello\n');
+    execFileSync('git', ['-C', gitProject, 'add', '-A']);
+    execFileSync('git', ['-C', gitProject, 'commit', '-qm', 'base']);
+    execFileSync('git', ['-C', gitProject, 'worktree', 'add', '-q', '--detach', worktreeDir]);
+    mkdirSync(join(worktreeDir, 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(worktreeDir, 'node_modules', 'pkg', 'index.js'), 'x\n');
+
+    const brainSess = session(BRAIN, 'brain', 'idle');
+    const execSess = session(EXEC, 'w1', 'idle');
+    const audSess = session(AUD, 'w2', 'idle');
+    for (const s of [brainSess, execSess, audSess]) upsertSession(s);
+    const delivered: Array<{ target: string; id: string; text: string }> = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (target, text, id) => {
+        delivered.push({ target, id, text });
+      },
+    });
+    let releaseStrip!: () => void;
+    const stripGate = new Promise<void>((resolve) => { releaseStrip = resolve; });
+    let removeStarted = false;
+    setTaskPairHygieneDepsForTests({
+      worktreesRoot: baseDir,
+      remove: async (target) => {
+        removeStarted = true;
+        await stripGate;
+        await removeTree(target);
+      },
+    });
+
+    try {
+      const handlers = createMemoryMcpToolHandlers(caller, {
+        sendDeps: { listSessions: () => [brainSess, execSess, audSess] },
+      });
+
+      // 1. Rejected MCP calls return exact state-machine reason inline and never send policy-rejection chat messages to caller.
+      putTaskPairFixture(getTaskPairStore(), PROJECT, pair('tsk_unpassed_close', 'in_audit'));
+      const unpassedClose = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({
+        taskId: 'tsk_unpassed_close',
+        action: 'done',
+      });
+      expect(unpassedClose).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        message: expect.stringContaining('DONE cannot close or advance an audited pair'),
+      });
+      const unpassedNextRound = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({
+        taskId: 'tsk_unpassed_close',
+      });
+      expect(unpassedNextRound).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        message: expect.stringContaining('NEXT_ROUND applies only to a passed pair'),
+      });
+      await taskPairService.waitForIdle();
+      expect(delivered.filter((entry) => entry.target === BRAIN && entry.id.includes(':policy-rejection:'))).toEqual([]);
+
+      // Executor inline premature DONE marker (source='marker') still sends policy-rejection chat notice.
+      const markerTransition = taskPairService.applyMarker({
+        project: PROJECT,
+        writer: EXEC,
+        marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'tsk_unpassed_close', attrs: {} },
+        source: 'marker',
+        eventId: 'exec-inline-premature-done',
+      });
+      expect(markerTransition).toMatchObject({ effect: 'recorded', unusual: true });
+      await taskPairService.waitForIdle();
+      expect(delivered.filter((entry) => entry.target === EXEC && entry.id.includes(':policy-rejection:'))).toHaveLength(1);
+
+      // 2. Passed audited pair closes cleanly without force=true/accept=true, without unaudited flag, and returns before slow workspace strip finishes.
+      putTaskPairFixture(getTaskPairStore(), PROJECT, {
+        ...pair('tsk_passed_close_fast', 'passed'),
+        material: { path: worktreeDir, head: 'abcdef1', at: 25 },
+        passRound: 1,
+        workspace: { kind: 'worktree', path: worktreeDir, status: 'active', createdAt: 10 },
+      });
+      const closed = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({
+        taskId: 'tsk_passed_close_fast',
+        action: 'done',
+      });
+      expect(closed).toMatchObject({
+        status: 'ok',
+        taskId: 'tsk_passed_close_fast',
+        state: 'done',
+        effect: 'status',
+      });
+      const afterClose = getTaskPairStore().getPair(PROJECT, 'tsk_passed_close_fast')?.state;
+      expect(afterClose?.flags).not.toContain('unaudited');
+      expect(afterClose?.workspace?.status).toBe('ended');
+      // node_modules strip is still gated in background (did not block pair_close).
+      expect(afterClose?.workspace?.strippedAt).toBeUndefined();
+      expect(existsSync(join(worktreeDir, 'node_modules'))).toBe(true);
+
+      // Release background strip and confirm waitForIdle() still drains workspace hygiene cleanly.
+      releaseStrip();
+      await taskPairService.waitForIdle();
+      expect(removeStarted).toBe(true);
+      const afterDrain = getTaskPairStore().getPair(PROJECT, 'tsk_passed_close_fast')?.state;
+      expect(afterDrain?.workspace?.strippedAt).toBeTypeOf('number');
+      expect(existsSync(join(worktreeDir, 'node_modules'))).toBe(false);
+    } finally {
+      releaseStrip?.();
+      await taskPairService.waitForIdle();
+      setTaskPairHygieneDepsForTests(undefined);
+      setTaskPairDeliveryDepsForTests(undefined);
+      setTaskPairStoreForTests(undefined);
+      removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
+      rmSync(baseDir, { recursive: true, force: true });
       if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
       else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
     }

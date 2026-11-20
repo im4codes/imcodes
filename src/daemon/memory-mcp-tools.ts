@@ -1896,11 +1896,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       suppressAutomaticBrief: false,
       ...(input.turnText ? { turnText: input.turnText } : {}),
     });
-    await taskPairService.waitForIdle();
+    if (transition.settled) await transition.settled;
     const after = store.getPair(input.project, input.taskId);
     if (!after) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair disappeared during lifecycle operation');
     if (!replay && transition.unusual && transition.effect === 'recorded') {
-      return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair ${input.verb} was rejected by the lifecycle state machine`);
+      return error(
+        MCP_ERROR_REASONS.VALIDATION_FAILED,
+        transition.rejectionReason ?? `pair ${input.verb} was rejected by the lifecycle state machine`,
+      );
     }
     return {
       status: 'ok',

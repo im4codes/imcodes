@@ -909,7 +909,7 @@ export class TaskPairService {
     return own.length === 1 ? own[0]!.state.taskId : undefined;
   }
 
-  applyMarker(input: ApplyMarkerInput): TaskPairTransition {
+  applyMarker(input: ApplyMarkerInput): TaskPairTransition & { settled?: Promise<void> } {
     for (let attempt = 0; ; attempt += 1) {
       try { return this.#applyMarkerOnce(input); }
       catch (error) {
@@ -918,7 +918,7 @@ export class TaskPairService {
     }
   }
 
-  #applyMarkerOnce(input: ApplyMarkerInput): TaskPairTransition {
+  #applyMarkerOnce(input: ApplyMarkerInput): TaskPairTransition & { settled?: Promise<void> } {
     // Persist the configured thinking level on the pair at the point a role
     // is named.  This is the durable fallback for queue/replay paths where a
     // later session-list refresh may no longer contain the participant.
@@ -1132,8 +1132,14 @@ export class TaskPairService {
     const immediateIntents = transition.intents.filter((intent) => (
       !(holdsAutoPickAuditor && intent.kind === 'pick_auditor')
       && !(busyQueued && intent.kind === 'slot_changed')
+      && !(input.source === 'mcp' && intent.kind === 'policy_notice' && intent.to === input.writer)
     ));
-    this.#track(this.#executeIntents(input.project, stored?.state, immediateIntents));
+    const callSettle: Promise<unknown>[] = [];
+    const intentsPromise = this.#executeIntents(input.project, stored?.state, immediateIntents);
+    this.#track(intentsPromise);
+    if (input.marker.knownVerb === 'REASSIGN') {
+      callSettle.push(intentsPromise);
+    }
     // A terminal transition always frees its named participant and must wake
     // queue admission immediately, even when the transition's slot_changed
     // intent was suppressed because this pair had observed a stale binding.
@@ -1195,7 +1201,11 @@ export class TaskPairService {
         this.#track(sendTaskPairMessage(stored.state.executor ?? stored.state.brain, stored.state.taskId, 'resource-cleanup', 'Claims released for ' + stored.state.taskId + '. Cleanup checklist: ' + cleanup.checklist.join(' | ')));
       }
       this.#cleanupTaskPairQueuesOnTerminal(input.project, stored.state, now);
-      this.#track(this.endWorkspace(input.project, stored.state.taskId, now));
+      const closedTaskId = stored.state.taskId;
+      const retention = this.#endWorkspaceRetention(input.project, closedTaskId, now);
+      const cleanup = retention.then(() => this.#cleanupClosedWorkspace(input.project, closedTaskId, now));
+      this.#track(cleanup);
+      callSettle.push(retention);
     }
     if (stored && transition.toStatus === 'passed' && transition.fromStatus !== 'passed') {
       this.#scheduler?.flagEconomyUnreviewed?.(input.project, stored.state.taskId);
@@ -1240,7 +1250,9 @@ export class TaskPairService {
       && input.writer === transition.pair.brain) {
       this.#recentBrainDispatch.set(`${input.project}\u0000${transition.pair.brain}\u0000${transition.pair.executor}`, { taskId: transition.pair.taskId, at: Date.now() });
     }
-    return transition;
+    return callSettle.length > 0
+      ? { ...transition, settled: Promise.allSettled(callSettle).then(() => undefined) }
+      : transition;
   }
 
   /**
@@ -2310,6 +2322,10 @@ export class TaskPairService {
    */
   async endWorkspace(project: string, taskId: string, now: number): Promise<void> {
     await this.#endWorkspaceRetention(project, taskId, now);
+    await this.#cleanupClosedWorkspace(project, taskId, now);
+  }
+
+  async #cleanupClosedWorkspace(project: string, taskId: string, now: number): Promise<void> {
     // A non-git project's pair brings its work into the project first (git_init: merge; cow: checked copy-back).
     await this.finishNonGitWorkspace(project, taskId);
     // After the deliverable copy: an `output=` path may live inside a directory
@@ -3150,7 +3166,7 @@ export class TaskPairService {
       eventId,
       suppressAutomaticBrief: true,
     });
-    await this.waitForIdle();
+    if (transition.settled) await transition.settled;
     const after = store.getPair(stored.project, taskId)?.state;
     if (!after) {
       return { ok: false, taskId, error: TASK_PAIR_CLOSE_ERROR.NOT_FOUND };
