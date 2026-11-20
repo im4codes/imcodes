@@ -131,6 +131,25 @@ export function TaskModeGlyphIcon({ size = 16, className }: { size?: number; cla
   );
 }
 
+function ReplyGlyph({ size = 12 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="9 14 4 9 9 4" />
+      <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
+    </svg>
+  );
+}
+
 function MicGlyph({ size = 13 }: { size?: number }) {
   return (
     <svg
@@ -855,6 +874,17 @@ export function GlobalTaskModeView({
               {task.round > 0 && (
                 <span class="global-task-round-badge">R{task.round}</span>
               )}
+              <button
+                type="button"
+                class="global-task-reply-btn"
+                data-testid={`task-mode-reply-${task.taskId}`}
+                title={t('taskMode.reply_hint', 'Tap to type, hold for voice')}
+                aria-label={task.isTerminal ? t('taskMode.follow_up', 'Follow up') : t('taskMode.reply', 'Reply')}
+                {...replyPressProps}
+              >
+                <ReplyGlyph size={12} />
+                <MicGlyph size={11} />
+              </button>
             </div>
 
             <div class="global-task-card-title" title={task.title}>{task.title}</div>
@@ -902,20 +932,6 @@ export function GlobalTaskModeView({
                 </button>
               </div>
             )}
-          </div>
-
-          <div class="global-task-card-actions">
-            <button
-              type="button"
-              class="global-task-reply-btn"
-              data-testid={`task-mode-reply-${task.taskId}`}
-              title={t('taskMode.reply_hint', 'Tap to type, hold for voice')}
-              aria-label={task.isTerminal ? t('taskMode.follow_up', 'Follow up') : t('taskMode.reply', 'Reply')}
-              {...replyPressProps}
-            >
-              <span>{task.isTerminal ? t('taskMode.follow_up', 'Follow up') : t('taskMode.reply', 'Reply')}</span>
-              <MicGlyph size={12} />
-            </button>
           </div>
         </div>
 

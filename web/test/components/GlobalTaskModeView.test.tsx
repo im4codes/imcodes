@@ -1495,5 +1495,48 @@ describe('GlobalTaskModeView', () => {
     expect(css).toMatch(/\.global-task-progress-wrap\s*\{[^}]*flex-direction:\s*row;[^}]*align-items:\s*center;/s);
     const mobileBlock = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
     expect(mobileBlock).toMatch(/\.global-task-mode-grid\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\);/s);
+    expect(css).not.toMatch(/\.global-task-card-actions\b/);
+    expect(css).toMatch(/\.global-task-reply-btn\s*\{[^}]*margin-left:\s*auto;[^}]*flex:\s*0\s+0\s+auto;/s);
+    expect(css).toMatch(/\.global-task-server-tag\s*\{[^}]*flex:\s*0\s+1\s+auto;[^}]*min-width:\s*0;/s);
+    expect(css).toMatch(/\.global-task-brain-tag\s*\{[^}]*flex:\s*0\s+1\s+auto;[^}]*min-width:\s*0;/s);
+  });
+
+  it('renders inline icon-only reply button inside meta header without separate actions column on active and terminal cards', async () => {
+    await mountWithSnapshot();
+
+    expect(document.querySelector('.global-task-card-actions')).toBeNull();
+
+    const activeCard = screen.getByTestId('task-mode-card-tsk_pair_1');
+    const activeReplyBtn = screen.getByTestId('task-mode-reply-tsk_pair_1');
+    expect(activeReplyBtn.parentElement?.className).toContain('global-task-card-meta');
+    expect(activeReplyBtn.querySelectorAll('svg').length).toBe(2);
+    expect(activeReplyBtn.textContent?.trim()).toBe('');
+    expect(activeReplyBtn.getAttribute('aria-label')).toBe('Reply');
+    expect(activeReplyBtn.getAttribute('title')).toBe('Tap to type, hold for voice');
+
+    fireEvent.click(activeReplyBtn);
+    expect(activeCard.className).not.toContain('is-expanded');
+    expect(screen.getByTestId('task-mode-composer').textContent).toContain('Build Global View');
+    fireEvent.click(screen.getByTestId('task-mode-composer-backdrop'));
+
+    const doneCard = screen.getByTestId('task-mode-card-tsk_done_1');
+    const doneReplyBtn = screen.getByTestId('task-mode-reply-tsk_done_1');
+    expect(doneReplyBtn.parentElement?.className).toContain('global-task-card-meta');
+    expect(doneReplyBtn.querySelectorAll('svg').length).toBe(2);
+    expect(doneReplyBtn.textContent?.trim()).toBe('');
+    expect(doneReplyBtn.getAttribute('aria-label')).toBe('Follow up');
+    expect(doneReplyBtn.getAttribute('title')).toBe('Tap to type, hold for voice');
+
+    fireEvent.click(doneReplyBtn);
+    expect(doneCard.className).not.toContain('is-expanded');
+    expect(screen.getByTestId('task-mode-composer').textContent).toContain('Ship WS backend');
+    fireEvent.click(screen.getByTestId('task-mode-composer-backdrop'));
+
+    dispatchPointer(doneReplyBtn, 'pointerdown', { clientX: 100, clientY: 100, pointerId: 9 });
+    await act(async () => {
+      vi.advanceTimersByTime(280);
+    });
+    expect(doneCard.className).not.toContain('is-expanded');
+    expect(screen.getByTestId('mock-voice-overlay').getAttribute('data-session-label')).toContain('Ship WS backend');
   });
 });

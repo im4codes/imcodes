@@ -23710,6 +23710,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: 120px;
   overflow: hidden;
@@ -23726,6 +23727,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
 
 .global-task-brain-tag {
   display: block;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: 120px;
   overflow: hidden;
@@ -23904,21 +23906,21 @@ html.native-ios-mac .global-task-mode-entry-btn {
   color: #22d3ee;
 }
 
-.global-task-card-actions {
-  flex: 0 0 auto;
-}
-
 .global-task-reply-btn {
+  margin-left: auto;
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  border-radius: 7px;
+  justify-content: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border-radius: 6px;
   border: 1px solid rgba(45, 212, 191, 0.4);
   background: rgba(20, 184, 166, 0.14);
   color: #99f6e4;
   font-size: 11px;
   font-weight: 600;
+  line-height: 1;
   cursor: pointer;
   user-select: none;
   touch-action: pan-y;
