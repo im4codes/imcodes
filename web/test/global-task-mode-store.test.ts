@@ -407,6 +407,47 @@ describe('global-task-mode-store', () => {
     expect(store.getState().recentBrains[0]?.sessionName).toBe('brain_9');
   });
 
+  it('rejects blank/whitespace-only messages and trims message text with or without taskTitle in append mode', async () => {
+    const store = new GlobalTaskModeStore();
+    await expect(store.sendGlobalBrainMessage({
+      serverId: 'srv-1',
+      sessionName: 'deck_a_brain',
+      text: '   \n\t  ',
+    })).rejects.toThrow('message text is required');
+    await expect(store.sendGlobalBrainMessage({
+      serverId: 'srv-1',
+      sessionName: 'deck_a_brain',
+      text: '  ',
+      taskTitle: 'Build',
+    })).rejects.toThrow('message text is required');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(store.getState().recentBrains).toHaveLength(0);
+
+    await store.sendGlobalBrainMessage({
+      serverId: 'srv-1',
+      sessionName: 'deck_a_brain',
+      text: '  hello append  ',
+    });
+    await store.sendGlobalBrainMessage({
+      serverId: 'srv-1',
+      sessionName: 'deck_a_brain',
+      text: '  check logs  ',
+      taskTitle: 'Build',
+      locale: 'en-US',
+    });
+
+    const sendCalls = fetchSpy.mock.calls.filter((c) => String(c[0]).includes('/session/send'));
+    expect(sendCalls).toHaveLength(2);
+    expect(JSON.parse(String((sendCalls[0]![1] as RequestInit).body))).toMatchObject({
+      text: 'hello append',
+      deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND,
+    });
+    expect(JSON.parse(String((sendCalls[1]![1] as RequestInit).body))).toMatchObject({
+      text: '[Regarding task "Build"]\ncheck logs',
+      deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND,
+    });
+  });
+
   it('resolves quick dispatch Brains with pinned sessions only, keeping recent metadata and muted exclusion', () => {
     const brains: GlobalTaskBrainSummary[] = [
       makeBrain({ serverId: 'srv-1', sessionName: 'b1', label: 'One', serverOnline: true }),

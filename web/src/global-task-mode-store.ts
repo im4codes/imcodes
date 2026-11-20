@@ -892,12 +892,16 @@ export class GlobalTaskModeStore {
   async sendGlobalBrainMessage(input: SendGlobalBrainMessageInput): Promise<void> {
     const serverId = input.serverId.trim();
     const sessionName = input.sessionName.trim();
+    const body = input.text.trim();
     if (!serverId || !sessionName) {
       throw new Error('serverId and sessionName are required');
     }
+    if (!body) {
+      throw new Error('message text is required');
+    }
     const finalText = input.taskTitle?.trim()
-      ? formatTaskReplyMessage(input.taskTitle, input.text, input.locale)
-      : input.text;
+      ? formatTaskReplyMessage(input.taskTitle, body, input.locale)
+      : body;
 
     await sendSessionViaHttp(serverId, {
       sessionName,
