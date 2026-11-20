@@ -2395,12 +2395,14 @@
     "tts_rate": "재생 속도",
     "tts_rate_desc": "시스템 음성 합성의 읽기 배속을 조절합니다.",
     "tts_voice_hint": "IM.codes는 기기에 설치된 최고 음질의 오프라인 음성을 우선 사용합니다. 기기의 손쉬운 사용 또는 TTS 설정에서 고음질/향상된 음성 팩을 다운로드할 수 있습니다.",
-    "tts_ios_enhanced_hint": "현재 기본 iOS 음성을 사용 중입니다. iOS 설정 -> 손쉬운 사용 -> 말하기 콘텐츠 -> 음성에서 향상된 음성을 다운로드하면 훨씬 자연스럽습니다.",
+    "tts_ios_enhanced_hint": "현재 기본 iOS 음성을 사용 중입니다. iOS 설정 -> 손쉬운 사용 -> 말하기 콘텐츠 -> 음성에서 향상된 음성을 다운로드하면 훨씬 자연스럽습니다(설정 상단에서 \"말하기 콘텐츠\" 또는 \"음성\"을 검색해 바로 이동할 수도 있습니다).",
     "tts_current_voice": "현재 음성: {{name}} ({{quality}})",
     "tts_quality_premium": "프리미엄",
     "tts_quality_enhanced": "향상됨",
     "tts_quality_siri": "Siri",
-    "tts_quality_default": "기본"
+    "tts_quality_default": "기본",
+    "tts_open_android_settings": "시스템 음성 설정 열기",
+    "tts_open_ios_settings": "시스템 설정 열기"
   },
   "capabilities": {
     "eyebrow": "이식 가능한 AI 기능",

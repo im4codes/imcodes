@@ -2396,12 +2396,14 @@
     "tts_rate": "Speech rate",
     "tts_rate_desc": "Playback speed multiplier for system text-to-speech.",
     "tts_voice_hint": "IM.codes prefers the highest-quality offline voice installed on your device. You can download Enhanced or neural system voices in OS accessibility or TTS settings for more natural playback.",
-    "tts_ios_enhanced_hint": "Currently using a standard iOS voice. For noticeably smoother speech, download an Enhanced or Premium voice in iOS Settings -> Accessibility -> Spoken Content -> Voices.",
+    "tts_ios_enhanced_hint": "Currently using a standard iOS voice. For noticeably smoother speech, download an Enhanced or Premium voice in iOS Settings -> Accessibility -> Spoken Content -> Voices (or search \"Spoken Content\" / \"Voices\" at the top of Settings).",
     "tts_current_voice": "Current voice: {{name}} ({{quality}})",
     "tts_quality_premium": "Premium",
     "tts_quality_enhanced": "Enhanced",
     "tts_quality_siri": "Siri",
-    "tts_quality_default": "Default"
+    "tts_quality_default": "Default",
+    "tts_open_android_settings": "Open system TTS settings",
+    "tts_open_ios_settings": "Open iOS Settings"
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

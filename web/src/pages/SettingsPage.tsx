@@ -45,9 +45,11 @@ import {
   useUiScale,
 } from '../ui-scale.js';
 import {
+  canOpenNativeTtsSettings,
   getNativeTtsVoiceQuality,
   getTtsAutoReadEnabled,
   getTtsSpeechRate,
+  openNativeTtsSettings,
   setTtsAutoReadEnabled,
   setTtsSpeechRate,
   subscribeTtsPreferences,
@@ -799,6 +801,23 @@ export function SettingsPage({
                         <div data-testid="settings-tts-ios-enhanced-hint" style={{ marginTop: 4, color: '#cbd5e1' }}>
                           {t('settings.tts_ios_enhanced_hint')}
                         </div>
+                    )}
+                    {canOpenNativeTtsSettings() && (
+                      <div style={{ marginTop: 8 }}>
+                        <button
+                          type="button"
+                          data-testid="settings-tts-open-settings-btn"
+                          class="settings-btn-secondary"
+                          style={{ padding: '6px 12px', fontSize: '12px' }}
+                          onClick={() => {
+                            void openNativeTtsSettings();
+                          }}
+                        >
+                          {isIosNativePlatform()
+                            ? t('settings.tts_open_ios_settings')
+                            : t('settings.tts_open_android_settings')}
+                        </button>
+                      </div>
                     )}
                   </div>
                 </div>

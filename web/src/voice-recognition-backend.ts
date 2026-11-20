@@ -42,6 +42,7 @@ export interface NativeSystemTts {
   stopSpeaking: () => Promise<void>;
   isSpeaking?: () => Promise<{ speaking: boolean }>;
   getTtsVoiceQuality?: (options?: { lang?: string }) => Promise<NativeTtsVoiceQualityInfo>;
+  openTtsSettings?: () => Promise<{ opened?: boolean } | void>;
   addListener?: (
     eventName: typeof STREAMING_SPEECH_TTS_STATE_EVENT,
     listenerFunc: (event: NativeTtsStateEvent) => void,
@@ -55,6 +56,7 @@ export type NativeSpeechRecognition = Pick<SpeechRecognitionPlugin, 'available' 
   stopSpeaking?: () => Promise<void>;
   isSpeaking?: () => Promise<{ speaking: boolean }>;
   getTtsVoiceQuality?: (options?: { lang?: string }) => Promise<NativeTtsVoiceQualityInfo>;
+  openTtsSettings?: () => Promise<{ opened?: boolean } | void>;
 };
 
 export type VoiceRecognitionEngine = 'builtin' | 'system';

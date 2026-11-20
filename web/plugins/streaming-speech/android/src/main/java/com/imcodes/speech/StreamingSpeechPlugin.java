@@ -1,6 +1,8 @@
 package com.imcodes.speech;
 
 import android.Manifest;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
 import androidx.lifecycle.Lifecycle;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
@@ -11,6 +13,7 @@ import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.speech.tts.Voice;
@@ -660,6 +663,35 @@ public class StreamingSpeechPlugin extends Plugin {
         }
         JSObject result = new JSObject();
         result.put("speaking", speaking);
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void openTtsSettings(PluginCall call) {
+        android.content.Context context = getContext();
+        boolean opened = false;
+        if (context != null) {
+            String[] actions = new String[] {
+                "com.android.settings.TTS_SETTINGS",
+                TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA,
+                Settings.ACTION_SETTINGS,
+            };
+            for (String action : actions) {
+                try {
+                    Intent intent = new Intent(action);
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    context.startActivity(intent);
+                    opened = true;
+                    break;
+                } catch (ActivityNotFoundException | SecurityException ignored) {
+                    // Try the next official fallback settings intent.
+                } catch (RuntimeException ignored) {
+                    // Defensive fallback for OEM ROM intent dispatch quirks.
+                }
+            }
+        }
+        JSObject result = new JSObject();
+        result.put("opened", opened);
         call.resolve(result);
     }
 

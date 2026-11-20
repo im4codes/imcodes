@@ -359,6 +359,44 @@ describe('tts service', () => {
     })).toBe(false);
   });
 
+  it('checks and opens native TTS settings safely with fallback on web, old shells, and UNIMPLEMENTED', async () => {
+    {
+      const tts = await import('../src/tts.js');
+      expect(tts.canOpenNativeTtsSettings()).toBe(false);
+      expect(await tts.openNativeTtsSettings()).toBe(false);
+    }
+
+    vi.resetModules();
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+    };
+    {
+      const oldShellTts = await import('../src/tts.js');
+      expect(oldShellTts.canOpenNativeTtsSettings()).toBe(false);
+      expect(await oldShellTts.openNativeTtsSettings()).toBe(false);
+    }
+
+    vi.resetModules();
+    const openSpy = vi.fn()
+      .mockResolvedValueOnce({ opened: true })
+      .mockResolvedValueOnce({ opened: false })
+      .mockRejectedValueOnce({ code: 'UNIMPLEMENTED', message: 'not implemented' });
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      openTtsSettings: openSpy,
+    };
+    const nativeTts = await import('../src/tts.js');
+    expect(nativeTts.canOpenNativeTtsSettings()).toBe(true);
+    expect(await nativeTts.openNativeTtsSettings()).toBe(true);
+    expect(await nativeTts.openNativeTtsSettings()).toBe(false);
+    expect(await nativeTts.openNativeTtsSettings()).toBe(false);
+    expect(openSpy).toHaveBeenCalledTimes(3);
+  });
+
   it('queues auto-read items FIFO on web/native, caps queue size, and clears on manual interrupt or stop', async () => {
     const {
       speakText,

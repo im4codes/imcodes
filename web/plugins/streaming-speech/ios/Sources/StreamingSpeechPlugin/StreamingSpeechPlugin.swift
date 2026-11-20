@@ -673,7 +673,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         CAPPluginMethod(name: "speak", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopSpeaking", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "isSpeaking", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getTtsVoiceQuality", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "getTtsVoiceQuality", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "openTtsSettings", returnType: CAPPluginReturnPromise)
     ]
     private lazy var coordinator = SpeechCoordinator { [weak self] event in
         guard let self = self else { return }
@@ -1495,6 +1496,22 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             "voiceName": voice.name,
             "voiceIdentifier": voice.identifier,
         ])
+    }
+
+    @objc public func openTtsSettings(_ call: CAPPluginCall) {
+        #if canImport(UIKit)
+        DispatchQueue.main.async {
+            guard let url = URL(string: UIApplication.openSettingsURLString) else {
+                call.resolve(["opened": false])
+                return
+            }
+            UIApplication.shared.open(url, options: [:]) { opened in
+                call.resolve(["opened": opened])
+            }
+        }
+        #else
+        call.resolve(["opened": false])
+        #endif
     }
 
     private func handleUtteranceFinishedOnMain(_ utterance: AVSpeechUtterance) {

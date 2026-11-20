@@ -327,7 +327,7 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(drainSection).not.toContain('audioLevel');
 
     // System TTS plugin contract checks (iOS AVSpeechSynthesizer + Android TextToSpeech)
-    for (const methodName of ['speak', 'stopSpeaking', 'isSpeaking']) {
+    for (const methodName of ['speak', 'stopSpeaking', 'isSpeaking', 'openTtsSettings']) {
       expect(ios).toContain(`CAPPluginMethod(name: "${methodName}", returnType: CAPPluginReturnPromise)`);
       expect(android).toContain(`public void ${methodName}(PluginCall call)`);
     }
@@ -335,6 +335,12 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('enum TtsVoiceSelector');
     expect(ios).toContain('"voiceName": voice.name');
     expect(ios).toContain('"voiceIdentifier": voice.identifier');
+    expect(ios).toContain('UIApplication.openSettingsURLString');
+    expect(ios).not.toContain('App-Prefs:');
+    expect(ios).not.toContain('prefs:root');
+    expect(android).toContain('"com.android.settings.TTS_SETTINGS"');
+    expect(android).toContain('TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA');
+    expect(android).toContain('Settings.ACTION_SETTINGS');
     expect(ios).toContain('AVSpeechSynthesizerDelegate');
     expect(ios).toContain('AVSpeechUtteranceDefaultSpeechRate');
     expect(ios).toContain('utterance.postUtteranceDelay = 0.12');
@@ -572,6 +578,9 @@ public class Voice {
       'android/speech/tts/TextToSpeech.java': `package android.speech.tts;
 import java.util.*;
 public class TextToSpeech {
+  public static class Engine {
+    public static final String ACTION_INSTALL_TTS_DATA = "android.speech.tts.engine.INSTALL_TTS_DATA";
+  }
   public static final int SUCCESS = 0, ERROR = -1, QUEUE_FLUSH = 0, QUEUE_ADD = 1, LANG_AVAILABLE = 0;
   public static volatile int nextInitStatus = SUCCESS;
   public static volatile int maxInputLen = 4000;
@@ -622,14 +631,48 @@ public class TextToSpeech {
   public int stop(){ stopCalls++; speaking = false; return SUCCESS; }
   public void shutdown(){ shutdownCalls++; speaking = false; }
 }`,
+      'android/content/ActivityNotFoundException.java': `package android.content;
+public class ActivityNotFoundException extends RuntimeException {
+  public ActivityNotFoundException(String message){ super(message); }
+}`,
+      'android/content/Intent.java': `package android.content;
+public class Intent {
+  public static final int FLAG_ACTIVITY_NEW_TASK = 0x10000000;
+  private final String action;
+  private int flags = 0;
+  public Intent(String action){ this.action = action; }
+  public String getAction(){ return action; }
+  public Intent addFlags(int flag){ this.flags |= flag; return this; }
+  public int getFlags(){ return flags; }
+}`,
+      'android/provider/Settings.java': `package android.provider;
+public class Settings {
+  public static final String ACTION_SETTINGS = "android.settings.SETTINGS";
+}`,
       'android/content/Context.java': `package android.content;
 public class Context {
   public static final String AUDIO_SERVICE = "audio";
   private static final android.media.AudioManager AUDIO_MANAGER = new android.media.AudioManager();
+  public static final java.util.List<String> startedActions = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+  public static final java.util.List<Integer> startedFlags = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+  public static final java.util.Set<String> failingActions = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+  public static volatile boolean throwSecurityOnInstallTts = false;
+  public static void resetIntents(){ startedActions.clear(); startedFlags.clear(); failingActions.clear(); throwSecurityOnInstallTts = false; }
   public Context getApplicationContext(){ return this; }
   public Object getSystemService(String name){ return AUDIO_SERVICE.equals(name) ? AUDIO_MANAGER : null; }
   public android.content.res.AssetManager getAssets(){ return new android.content.res.AssetManager(); }
   public java.io.File getNoBackupFilesDir(){ return new java.io.File(System.getProperty("java.io.tmpdir"),"speech-private"); }
+  public void startActivity(Intent intent){
+    String action = intent.getAction();
+    startedActions.add(action);
+    startedFlags.add(intent.getFlags());
+    if (throwSecurityOnInstallTts && "android.speech.tts.engine.INSTALL_TTS_DATA".equals(action)) {
+      throw new SecurityException("blocked install tts intent");
+    }
+    if (failingActions.contains(action)) {
+      throw new ActivityNotFoundException("missing activity for " + action);
+    }
+  }
 }`,
       'com/getcapacitor/Plugin.java': `package com.getcapacitor;
 public class Plugin {
@@ -1238,6 +1281,42 @@ public class Harness {
   await(stopSpeak.done);
   ttsPlugin.destroy();
   check(android.speech.tts.TextToSpeech.shutdownCalls >= 1, "destroy must shutdown TTS");
+  // openTtsSettings primary intent and safe fallbacks
+  android.content.Context.resetIntents();
+  Subject settingsPlugin = new Subject();
+  PluginCall primarySettings = new PluginCall();
+  settingsPlugin.openTtsSettings(primarySettings);
+  await(primarySettings.done);
+  check(primarySettings.value != null && primarySettings.value.contains("opened=true"), primarySettings.value);
+  check(android.content.Context.startedActions.equals(java.util.Arrays.asList("com.android.settings.TTS_SETTINGS")), android.content.Context.startedActions);
+  check((android.content.Context.startedFlags.get(0) & android.content.Intent.FLAG_ACTIVITY_NEW_TASK) != 0, "expected NEW_TASK flag");
+
+  android.content.Context.resetIntents();
+  android.content.Context.failingActions.add("com.android.settings.TTS_SETTINGS");
+  PluginCall installFallback = new PluginCall();
+  settingsPlugin.openTtsSettings(installFallback);
+  await(installFallback.done);
+  check(installFallback.value != null && installFallback.value.contains("opened=true"), installFallback.value);
+  check(android.content.Context.startedActions.equals(java.util.Arrays.asList("com.android.settings.TTS_SETTINGS", "android.speech.tts.engine.INSTALL_TTS_DATA")), android.content.Context.startedActions);
+
+  android.content.Context.resetIntents();
+  android.content.Context.failingActions.add("com.android.settings.TTS_SETTINGS");
+  android.content.Context.throwSecurityOnInstallTts = true;
+  PluginCall osSettingsFallback = new PluginCall();
+  settingsPlugin.openTtsSettings(osSettingsFallback);
+  await(osSettingsFallback.done);
+  check(osSettingsFallback.value != null && osSettingsFallback.value.contains("opened=true"), osSettingsFallback.value);
+  check(android.content.Context.startedActions.equals(java.util.Arrays.asList("com.android.settings.TTS_SETTINGS", "android.speech.tts.engine.INSTALL_TTS_DATA", "android.settings.SETTINGS")), android.content.Context.startedActions);
+
+  android.content.Context.resetIntents();
+  android.content.Context.failingActions.add("com.android.settings.TTS_SETTINGS");
+  android.content.Context.failingActions.add("android.speech.tts.engine.INSTALL_TTS_DATA");
+  android.content.Context.failingActions.add("android.settings.SETTINGS");
+  PluginCall allFailSettings = new PluginCall();
+  settingsPlugin.openTtsSettings(allFailSettings);
+  await(allFailSettings.done);
+  check(allFailSettings.error == null && allFailSettings.value != null && allFailSettings.value.contains("opened=false"), allFailSettings.value);
+  settingsPlugin.destroy();
   System.out.println("TTS_ANDROID_OK");
   SpeechGainTest.main(new String[0]);
  }

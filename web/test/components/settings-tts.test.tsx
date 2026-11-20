@@ -20,6 +20,19 @@ const mockState = vi.hoisted(() => ({
   voiceQuality: null as NativeTtsVoiceQualityInfo | null,
 }));
 
+const mocks = vi.hoisted(() => ({
+  nativePlatform: false,
+  pluginAvailable: false,
+  platform: 'web' as 'web' | 'ios' | 'android',
+  streamingPlugin: {} as Record<string, unknown>,
+}));
+
+vi.mock('@capacitor/core', () => ({
+  registerPlugin: () => new Proxy({}, {
+    get: (_target, prop) => (mocks.streamingPlugin as Record<PropertyKey, unknown>)[prop],
+  }),
+}));
+
 vi.mock('../../src/api.js', () => ({
   apiFetch: vi.fn().mockResolvedValue({ servers: [], machines: [] }),
   passwordChange: vi.fn(),
@@ -36,7 +49,7 @@ vi.mock('../../src/voice-recognition-backend.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/voice-recognition-backend.js')>();
   return {
     ...actual,
-    isIosNativePlatform: () => mockState.iosNative,
+    isIosNativePlatform: () => mockState.iosNative || mocks.platform === 'ios',
   };
 });
 
@@ -44,7 +57,9 @@ vi.mock('../../src/tts.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/tts.js')>();
   return {
     ...actual,
-    getNativeTtsVoiceQuality: vi.fn(async () => mockState.voiceQuality),
+    getNativeTtsVoiceQuality: vi.fn(async (lang?: string) => (
+      mockState.voiceQuality ?? actual.getNativeTtsVoiceQuality(lang)
+    )),
   };
 });
 
@@ -57,7 +72,7 @@ vi.mock('react-i18next', () => ({
       }
       return key;
     },
-    i18n: { language: 'en' },
+    i18n: { language: 'zh-CN' },
   }),
 }));
 
@@ -66,11 +81,21 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
     localStorage.clear();
     mockState.iosNative = false;
     mockState.voiceQuality = null;
+    mocks.nativePlatform = false;
+    mocks.pluginAvailable = false;
+    mocks.platform = 'web';
+    mocks.streamingPlugin = {};
+    vi.stubGlobal('Capacitor', {
+      isNativePlatform: () => mocks.nativePlatform,
+      isPluginAvailable: () => mocks.pluginAvailable,
+      getPlatform: () => mocks.platform,
+    });
   });
 
   afterEach(async () => {
     cleanup();
     await __resetTtsForTests();
+    vi.unstubAllGlobals();
     localStorage.clear();
   });
 
@@ -93,6 +118,7 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
     expect(TTS_RATE_OPTIONS).toEqual([0.9, 1.0, 1.1, 1.25, 1.5]);
     expect(screen.getByTestId('settings-tts-rate-1.1').getAttribute('aria-pressed')).toBe('true');
     expect(screen.getByTestId('settings-tts-voice-hint').textContent).toContain('settings.tts_voice_hint');
+    expect(screen.queryByTestId('settings-tts-open-settings-btn')).toBeNull();
 
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-checked')).toBe('true');
@@ -102,6 +128,86 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
     fireEvent.click(rateBtn);
     expect(rateBtn.getAttribute('aria-pressed')).toBe('true');
     expect(getTtsSpeechRate()).toBe(1.5);
+  });
+
+  it('hides the native TTS settings button on legacy native shells without openTtsSettings', () => {
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    mocks.platform = 'android';
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+    };
+
+    render(
+      <SettingsPage
+        displayName="Tester"
+        username="tester"
+        hasPassword={true}
+        onBack={() => {}}
+        onDisplayNameChanged={() => {}}
+        onUserAuthUpdated={() => {}}
+      />,
+    );
+
+    expect(screen.queryByTestId('settings-tts-open-settings-btn')).toBeNull();
+  });
+
+  it('shows and triggers Android and iOS native TTS settings buttons cleanly', async () => {
+    const androidOpen = vi.fn().mockResolvedValue({ opened: true });
+    mocks.nativePlatform = true;
+    mocks.pluginAvailable = true;
+    mocks.platform = 'android';
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      openTtsSettings: androidOpen,
+    };
+
+    const { unmount } = render(
+      <SettingsPage
+        displayName="Tester"
+        username="tester"
+        hasPassword={true}
+        onBack={() => {}}
+        onDisplayNameChanged={() => {}}
+        onUserAuthUpdated={() => {}}
+      />,
+    );
+
+    const androidBtn = screen.getByTestId('settings-tts-open-settings-btn');
+    expect(androidBtn.textContent).toBe('settings.tts_open_android_settings');
+    fireEvent.click(androidBtn);
+    expect(androidOpen).toHaveBeenCalledTimes(1);
+    unmount();
+
+    const iosOpen = vi.fn().mockResolvedValue({ opened: true });
+    mocks.platform = 'ios';
+    mocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      getTtsVoiceQuality: vi.fn().mockResolvedValue({ quality: 'default', language: 'zh-CN' }),
+      openTtsSettings: iosOpen,
+    };
+
+    render(
+      <SettingsPage
+        displayName="Tester"
+        username="tester"
+        hasPassword={true}
+        onBack={() => {}}
+        onDisplayNameChanged={() => {}}
+        onUserAuthUpdated={() => {}}
+      />,
+    );
+
+    const iosBtn = screen.getByTestId('settings-tts-open-settings-btn');
+    expect(iosBtn.textContent).toBe('settings.tts_open_ios_settings');
+    fireEvent.click(iosBtn);
+    expect(iosOpen).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('settings-tts-voice-hint').textContent).toContain('settings.tts_ios_enhanced_hint');
+    });
   });
 
   it('defines all TTS i18n keys across all 7 locales', () => {
@@ -133,6 +239,8 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
       expect(json.settings?.tts_quality_enhanced, `${locale} settings.tts_quality_enhanced`).toBeTruthy();
       expect(json.settings?.tts_quality_siri, `${locale} settings.tts_quality_siri`).toBeTruthy();
       expect(json.settings?.tts_quality_default, `${locale} settings.tts_quality_default`).toBeTruthy();
+      expect(json.settings?.tts_open_android_settings, `${locale} settings.tts_open_android_settings`).toBeTruthy();
+      expect(json.settings?.tts_open_ios_settings, `${locale} settings.tts_open_ios_settings`).toBeTruthy();
     }
   });
 

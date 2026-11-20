@@ -464,6 +464,26 @@ export async function getNativeTtsVoiceQuality(lang?: string): Promise<NativeTts
   }
 }
 
+export function canOpenNativeTtsSettings(): boolean {
+  if (!isNative()) return false;
+  const nativeTts = getNativeSystemTts();
+  return Boolean(nativeTts && typeof nativeTts.openTtsSettings === 'function');
+}
+
+export async function openNativeTtsSettings(): Promise<boolean> {
+  if (!isNative()) return false;
+  const nativeTts = getNativeSystemTts();
+  if (!nativeTts || typeof nativeTts.openTtsSettings !== 'function') {
+    return false;
+  }
+  try {
+    const result = await nativeTts.openTtsSettings();
+    return result?.opened === true;
+  } catch {
+    return false;
+  }
+}
+
 function isNativeUnimplementedError(err: unknown): boolean {
   if (!err || typeof err !== 'object') {
     return typeof err === 'string' && /unimplemented|not implemented/i.test(err);
