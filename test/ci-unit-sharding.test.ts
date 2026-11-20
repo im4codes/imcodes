@@ -135,11 +135,10 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
       mobileMacJobs.filter((job) => isArm64MacRunner(job['runs-on'])).length;
     expect(devPlannedMacosArm64Concurrency).toBeLessThanOrEqual(2);
 
-    // Windows controlled-node-executables remains disabled on refs/heads/dev.
+    // Windows controlled-node-executables stays enabled across dev, main, and master.
     const releaseVersionScript = jobs.release_version!.steps.map((s) => s.run ?? '').join('\n');
-    expect(releaseVersionScript).toContain('if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then');
     expect(releaseVersionScript).toMatch(
-      /if \[ "\$\{GITHUB_REF\}" = "refs\/heads\/dev" \]; then[\s\S]*?CONTROLLED_NODE_MATRIX='\[\{"key":"linux"[^'\n]*\{"key":"macos"[^'\n]*\]'[\s\S]*?else[\s\S]*?\{"key":"windows"/u,
+      /CONTROLLED_NODE_MATRIX='\[\{"key":"linux"[^'\n]*\{"key":"macos"[^'\n]*\{"key":"windows"[^'\n]*\]'/u,
     );
   });
 });

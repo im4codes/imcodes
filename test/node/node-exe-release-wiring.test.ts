@@ -715,7 +715,7 @@ describe('headless compatibility release wiring', () => {
     expect(dockerignore).toContain('server/controlled-node-artifacts/installers');
   });
 
-  it('skips Windows controlled-node build and Windows docker gates only on refs/heads/dev while keeping main/master strict', () => {
+  it('includes Windows controlled-node builds and Windows docker gates across dev, main, and master while preserving dev versioning', () => {
     const workflow = parseYaml(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
       jobs: {
         release_version: {
@@ -755,22 +755,31 @@ describe('headless compatibility release wiring', () => {
         });
         const lines = readFileSync(outFile, 'utf8').trim().split('\n');
         const matrixLine = lines.find((l) => l.startsWith('controlled_node_matrix='));
+        const appVersionLine = lines.find((l) => l.startsWith('app_version='));
         expect(matrixLine, ref).toBeTruthy();
-        return JSON.parse(matrixLine!.slice('controlled_node_matrix='.length)) as Array<{
-          key: string;
-          runner: string;
-          artifact: string;
-        }>;
+        expect(appVersionLine, ref).toBeTruthy();
+        return {
+          appVersion: appVersionLine!.slice('app_version='.length),
+          matrix: JSON.parse(matrixLine!.slice('controlled_node_matrix='.length)) as Array<{
+            key: string;
+            runner: string;
+            artifact: string;
+          }>,
+        };
       };
 
-      const devMatrix = runVersionStep('refs/heads/dev');
-      expect(devMatrix).toEqual([
+      const devResult = runVersionStep('refs/heads/dev');
+      expect(devResult.appVersion).toMatch(/^\d+\.\d+\.\d+-dev\.42$/);
+      expect(devResult.matrix).toEqual([
         { key: 'linux', runner: 'ubuntu-latest', artifact: 'imcodes-node-linux' },
         { key: 'macos', runner: 'macos-15', artifact: 'imcodes-node-macos' },
+        { key: 'windows', runner: 'windows-2022', artifact: 'imcodes-node.exe' },
       ]);
 
       for (const releaseRef of ['refs/heads/main', 'refs/heads/master']) {
-        expect(runVersionStep(releaseRef)).toEqual([
+        const relResult = runVersionStep(releaseRef);
+        expect(relResult.appVersion).toMatch(/^\d+\.\d+\.\d+$/);
+        expect(relResult.matrix).toEqual([
           { key: 'linux', runner: 'ubuntu-latest', artifact: 'imcodes-node-linux' },
           { key: 'macos', runner: 'macos-15', artifact: 'imcodes-node-macos' },
           { key: 'windows', runner: 'windows-2022', artifact: 'imcodes-node.exe' },
@@ -788,32 +797,32 @@ describe('headless compatibility release wiring', () => {
     };
 
     const verifyExeSet = byName('Verify controlled-node executable set');
-    expect(verifyExeSet).toContain('if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then');
-    expect(verifyExeSet).toContain('imcodes-node-linux imcodes-node-macos imcodes-node-linux-glibc217');
+    expect(verifyExeSet).not.toContain('refs/heads/dev');
     expect(verifyExeSet).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217');
 
     const verifyRevision = byName('Verify native artifacts came from this exact source revision');
-    expect(verifyRevision).toContain('platforms=(linux macos "$glibc217_id")');
+    expect(verifyRevision).not.toContain('refs/heads/dev');
     expect(verifyRevision).toContain('platforms=(linux macos windows "$glibc217_id")');
 
     const verifyWorker = byName('Verify remote-desktop worker artifacts for every target');
-    expect(verifyWorker).toContain('if [ "${GITHUB_REF}" != "refs/heads/dev" ]; then');
+    expect(verifyWorker).not.toContain('refs/heads/dev');
     expect(verifyWorker).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64');
+    expect(verifyWorker).toContain('aidesk-local-ui/win32-x64');
 
     const verifyDaemonRuntime = byName('Verify daemon-runtime bundles for every desktop target');
-    expect(verifyDaemonRuntime).toContain('targets=(linux-x64 darwin-arm64)');
+    expect(verifyDaemonRuntime).not.toContain('refs/heads/dev');
     expect(verifyDaemonRuntime).toContain('targets=(linux-x64 darwin-arm64 win32-x64)');
 
     const stageAssets = byName('Generate controlled-node release artifacts manifest and stage flat release assets');
-    expect(stageAssets).toContain('if [ "${GITHUB_REF}" != "refs/heads/dev" ]; then');
+    expect(stageAssets).not.toContain('refs/heads/dev');
     expect(stageAssets).toContain('desktop-release-win32-x64.manifest.json');
     expect(stageAssets).toContain('imcodes-desktop-${IMCODES_BUILD_VERSION}-win32-x64.exe');
 
     const smoke = byName('Container startup smoke test');
-    expect(smoke).toContain('-e GITHUB_REF="${GITHUB_REF}"');
-    expect(smoke).toContain("process.env.GITHUB_REF === 'refs/heads/dev'");
-    expect(smoke).toContain("? ['linux-x64', 'darwin-arm64']");
-    expect(smoke).toContain(": ['linux-x64', 'darwin-arm64', 'win32-x64']");
+    expect(smoke).not.toContain('refs/heads/dev');
+    expect(smoke).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217');
+    expect(smoke).toContain('win32 x64');
+    expect(smoke).toContain("const targets = ['linux-x64', 'darwin-arm64', 'win32-x64'];");
   });
 
   it('generateControlledNodeReleaseManifest succeeds on dev artifacts without Windows binaries or manifests', () => {
