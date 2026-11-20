@@ -706,7 +706,7 @@ async function attachSessionListeners(
 
 function resolveUsableFallbackRecognizer(
   primary: NativeSpeechRecognition,
-  requestPermission = false,
+  requestPermission = true,
 ): Promise<NativeSpeechRecognition | null> {
   if (isPcAppNativeSpeech()) return Promise.resolve(null);
   return resolveUsableFallbackRecognizerInner(primary, requestPermission);

@@ -491,6 +491,13 @@ describe('voice recognition engine preference & cache switching', () => {
     expect(onError).toHaveBeenCalledWith('system recognizer unavailable');
   });
 
+  it('does not prompt fallback permissions during passive prewarm({ requestPermission: false }) when StreamingSpeech is unavailable', async () => {
+    bridges.streaming.available.mockResolvedValueOnce({ available: false });
+    await input.prewarm({ requestPermission: false });
+    expect(bridges.streaming.requestPermissions).not.toHaveBeenCalled();
+    expect(bridges.platform.requestPermissions).not.toHaveBeenCalled();
+  });
+
   it('reports canSwitchVoiceEngine false when offline plugin is unavailable or on non-native browsers', () => {
     vi.stubGlobal('Capacitor', { isNativePlatform: () => true, isPluginAvailable: () => false });
     expect(input.canSwitchVoiceEngine()).toBe(false);
