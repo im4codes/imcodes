@@ -2036,4 +2036,124 @@ describe('GlobalTaskModeView', () => {
     expect(optionTexts).not.toContain('cd (cd)');
     expect(optionTexts).toContain('discord#general (chat-proj)');
   });
+
+  it('never leaks raw internal IDs when stale localStorage and legacy task rows have no projectName or live session', async () => {
+    const {
+      GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY,
+      GLOBAL_TASK_RECENT_BRAINS_STORAGE_KEY,
+      clearGlobalTaskModeSessionState,
+      globalTaskModeStore,
+    } = await import('../../src/global-task-mode-store.js');
+    clearGlobalTaskModeSessionState();
+    const stalePinned = [
+      { serverId: 'srv-1', sessionName: 'deck_cd_brain', label: 'deck_cd_brain' },
+      { serverId: 'srv-1', sessionName: 'deck_sub_pair_auto_6ac6fe82aa0aecfc', label: 'deck_sub_pair_auto_6ac6fe82aa0aecfc' },
+    ];
+    const staleRecent = [
+      { serverId: 'srv-1', sessionName: 'bootmainxowfy6', label: 'bootmainxowfy6', lastUsedAt: Date.now() },
+    ];
+    localStorage.setItem(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, JSON.stringify(stalePinned));
+    localStorage.setItem(GLOBAL_TASK_RECENT_BRAINS_STORAGE_KEY, JSON.stringify(staleRecent));
+    (globalTaskModeStore as unknown as { setState: (patch: Record<string, unknown>) => void }).setState({
+      pinnedBrains: stalePinned,
+      recentBrains: staleRecent,
+    });
+
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    const onJumpToSession = vi.fn();
+    render(
+      <GlobalTaskModeView
+        onExit={vi.fn()}
+        onJumpToSession={onJumpToSession}
+        pinnedSessionNames={new Set(['bootmainxowfy6'])}
+      />,
+    );
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+    const now = Date.now();
+
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: now,
+        servers: [{ id: 'srv-1', name: 'M3-Mac', online: true }],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: '',
+            brainSession: 'bootmainxowfy6',
+            brainLabel: 'bootmainxowfy6',
+            taskId: 'tsk_legacy_noproj',
+            title: 'Legacy No Project',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: now - 10_000,
+            updatedAt: now - 500,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: '',
+            brainSession: 'deck_legacy_brain',
+            brainLabel: 'Legacy Readable',
+            taskId: 'tsk_legacy_readable',
+            title: 'Legacy With Label',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: now - 10_000,
+            updatedAt: now - 200,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    // Quick dispatch pills never show deck_* or bootmain* IDs
+    const pillCd = screen.getByTestId('task-mode-brain-pill-srv-1-deck_cd_brain');
+    const pillSub = screen.getByTestId('task-mode-brain-pill-srv-1-deck_sub_pair_auto_6ac6fe82aa0aecfc');
+    const pillBoot = screen.getByTestId('task-mode-brain-pill-srv-1-bootmainxowfy6');
+    expect(pillCd.textContent).toContain('Brain');
+    expect(pillSub.textContent).toContain('Worker');
+    expect(pillBoot.textContent).toContain('Brain');
+    for (const el of [pillCd, pillSub, pillBoot]) {
+      expect(el.textContent).not.toMatch(/deck_|bootmain/);
+    }
+
+    // Legacy task with no projectName & internal brainLabel renders generic fallback; readable brainLabel keeps precedence
+    const legacyNoProjCard = screen.getByTestId('task-mode-card-tsk_legacy_noproj');
+    const legacyNoProjTag = legacyNoProjCard.querySelector('.global-task-brain-tag');
+    expect(legacyNoProjTag?.textContent).toBe('Brain');
+    expect(legacyNoProjTag?.textContent).not.toContain('bootmain');
+
+    const legacyReadableCard = screen.getByTestId('task-mode-card-tsk_legacy_readable');
+    expect(legacyReadableCard.querySelector('.global-task-brain-tag')?.textContent).toBe('Legacy Readable');
+
+    // Reply composer, VoiceOverlay, and onJumpToSession preserve routing key while displaying fallback
+    fireEvent.click(screen.getByTestId('task-mode-reply-tsk_legacy_noproj'));
+    expect(screen.getByTestId('task-mode-composer').textContent).toContain('M3-Mac · Brain');
+    expect(screen.getByTestId('task-mode-composer').textContent).not.toContain('bootmain');
+    fireEvent.click(screen.getByTestId('task-mode-composer-voice-btn'));
+    const voiceLabel = screen.getByTestId('mock-voice-overlay').getAttribute('data-session-label') ?? '';
+    expect(voiceLabel).toContain('Brain');
+    expect(voiceLabel).not.toContain('bootmain');
+    await act(async () => {
+      voiceOverlayMock.lastOnClose?.();
+    });
+
+    fireEvent.click(legacyNoProjCard);
+    fireEvent.click(screen.getByTestId('task-mode-jump-tsk_legacy_noproj'));
+    expect(onJumpToSession).toHaveBeenCalledWith('srv-1', 'bootmainxowfy6');
+  });
 });

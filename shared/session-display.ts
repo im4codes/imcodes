@@ -26,3 +26,18 @@ export function pickReadableSessionDisplay(
   }
   return undefined;
 }
+
+export function fallbackReadableSessionDisplay(
+  sessionName?: string | null,
+  options?: { defaultLabel?: string; workerLabel?: string },
+): string {
+  const normalizedSession = normalizeDisplayValue(sessionName);
+  if (normalizedSession) {
+    const workerMatch = /_w(\d+)$/i.exec(normalizedSession);
+    if (workerMatch) return `W${workerMatch[1]}`;
+    if (/^deck_sub_[a-z0-9_-]+$/i.test(normalizedSession)) {
+      return options?.workerLabel ?? 'Worker';
+    }
+  }
+  return options?.defaultLabel ?? 'Brain';
+}

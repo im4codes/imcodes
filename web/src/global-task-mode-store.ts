@@ -12,7 +12,7 @@ import {
   type GlobalTaskSnapshotResponse,
   type GlobalTaskSummaryRow,
 } from '@shared/global-task-mode.js';
-import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { fallbackReadableSessionDisplay, pickReadableSessionDisplay } from '@shared/session-display.js';
 import { formatLabel } from './format-label.js';
 import { ApiError, apiFetch, getApiBaseUrl, sendSessionViaHttp } from './api.js';
 
@@ -288,14 +288,11 @@ export function sortGlobalTaskServers(
 export function resolveReadableSessionName(
   candidates: ReadonlyArray<string | null | undefined>,
   sessionName?: string | null,
+  options?: { defaultLabel?: string; workerLabel?: string },
 ): string {
   const readable = pickReadableSessionDisplay([...candidates], sessionName);
   if (readable) return formatLabel(readable);
-  for (const candidate of candidates) {
-    const trimmed = candidate?.trim();
-    if (trimmed) return formatLabel(trimmed);
-  }
-  return sessionName?.trim() ? formatLabel(sessionName.trim()) : '';
+  return fallbackReadableSessionDisplay(sessionName, options);
 }
 
 function normalizeStoredSessionLabel(

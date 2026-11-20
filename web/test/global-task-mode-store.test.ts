@@ -768,5 +768,23 @@ describe('global-task-mode-store', () => {
       label: 'deck_sub_pair_auto_6ac6fe82aa0aecfc',
     });
     expect(store.getState().recentBrains[0]?.label).toBeUndefined();
+
+    // Stale internal-only entries with no projectName and no live snapshot must never expose raw IDs
+    const staleInternalOnly = resolveQuickDispatchBrains(
+      [
+        { serverId: 'srv-1', sessionName: 'deck_cd_brain', label: 'deck_cd_brain' },
+        { serverId: 'srv-1', sessionName: 'bootmainxowfy6', label: 'bootmainxowfy6' },
+        { serverId: 'srv-1', sessionName: 'deck_sub_pair_auto_6ac6fe82aa0aecfc', label: 'deck_sub_pair_auto_6ac6fe82aa0aecfc' },
+      ],
+      [],
+      [],
+      [],
+    );
+    expect(staleInternalOnly.find((b) => b.sessionName === 'deck_cd_brain')?.label).toBe('Brain');
+    expect(staleInternalOnly.find((b) => b.sessionName === 'bootmainxowfy6')?.label).toBe('Brain');
+    expect(staleInternalOnly.find((b) => b.sessionName === 'deck_sub_pair_auto_6ac6fe82aa0aecfc')?.label).toBe('Worker');
+    for (const item of staleInternalOnly) {
+      expect(item.label).not.toMatch(/^(deck_|bootmain)/);
+    }
   });
 });

@@ -13,7 +13,11 @@ import {
   type GlobalTaskSummaryRow,
 } from '../../../shared/global-task-mode.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
-import { isInternalSessionDisplayValue, pickReadableSessionDisplay } from '../../../shared/session-display.js';
+import {
+  fallbackReadableSessionDisplay,
+  isInternalSessionDisplayValue,
+  pickReadableSessionDisplay,
+} from '../../../shared/session-display.js';
 import type { Database } from './client.js';
 import { getFullServersByUserId, type DbServer, type DbSession } from './queries.js';
 
@@ -95,7 +99,7 @@ function mapRawSummaryRow(
   const brainLabel = pickReadableSessionDisplay(
     [brainLabelFallback, row.brain_label, brainProjectFallback, row.project_name],
     brainSession,
-  ) ?? (cleanStr(brainLabelFallback) || cleanStr(row.brain_label) || cleanStr(brainProjectFallback) || cleanStr(row.project_name) || brainSession);
+  ) ?? fallbackReadableSessionDisplay(brainSession, { defaultLabel: 'Brain', workerLabel: 'Worker' });
   const rawExecutorLabel = cleanOptionalStr(row.executor_label);
   const executorLabel = rawExecutorLabel && !isInternalSessionDisplayValue(rawExecutorLabel)
     ? rawExecutorLabel
@@ -450,7 +454,7 @@ export async function listGlobalTaskSnapshotForUser(
     if (explicitLabel) liveSessionLabelByKey.set(key, explicitLabel);
     if (projectFallback) liveSessionProjectByKey.set(key, projectFallback);
     const label = pickReadableSessionDisplay([explicitLabel, projectFallback], sess.name)
-      ?? (explicitLabel || projectFallback || sess.name);
+      ?? fallbackReadableSessionDisplay(sess.name, { defaultLabel: 'Brain', workerLabel: 'Worker' });
     brains.push({
       serverId: sess.server_id,
       serverName: meta.name,

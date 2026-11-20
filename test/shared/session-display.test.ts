@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { isInternalSessionDisplayValue, pickReadableSessionDisplay } from '../../shared/session-display.js';
+import {
+  fallbackReadableSessionDisplay,
+  isInternalSessionDisplayValue,
+  pickReadableSessionDisplay,
+} from '../../shared/session-display.js';
 
 describe('session display helpers', () => {
   it('treats internal session identifiers as unreadable display values', () => {
@@ -21,5 +25,12 @@ describe('session display helpers', () => {
     expect(pickReadableSessionDisplay(['deck_sub_pair_auto_6ac6fe82aa0aecfc', 'Pair auditor'])).toBe('Pair auditor');
     expect(pickReadableSessionDisplay(['bootmainxowfy6', 'Boot Main'], 'bootmainxowfy6')).toBe('Boot Main');
     expect(pickReadableSessionDisplay(['bootmainxowfy6', 'Boot Main'], 'deck_sub_ab12cd34')).toBe('Boot Main');
+  });
+
+  it('produces safe generic readable fallbacks when all candidates are internal IDs', () => {
+    expect(fallbackReadableSessionDisplay('deck_cd_brain')).toBe('Brain');
+    expect(fallbackReadableSessionDisplay('bootmainxowfy6')).toBe('Brain');
+    expect(fallbackReadableSessionDisplay('deck_sub_pair_auto_6ac6fe82aa0aecfc')).toBe('Worker');
+    expect(fallbackReadableSessionDisplay('deck_proj_w2')).toBe('W2');
   });
 });

@@ -1529,5 +1529,60 @@ describe('global-task-mode server engine', () => {
     expect(singleCd?.brainLabel).toBe('cd');
     const singleAlpha = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_alpha_1');
     expect(singleAlpha?.brainLabel).toBe('Alpha Renamed');
+
+    // Legacy DB rows with no project_name and no matching sessions row:
+    // - explicit readable row.brain_label still wins
+    // - internal-only row.brain_label/brain_session falls back to generic 'Brain', never raw IDs
+    memDb.summaries.set('srv-a\u0000tsk_legacy_readable', {
+      server_id: 'srv-a',
+      task_id: 'tsk_legacy_readable',
+      project_name: '',
+      brain_session: 'deck_legacy_brain',
+      brain_label: 'Legacy Brain',
+      title: 'Legacy readable',
+      status: 'done',
+      flags_json: '[]',
+      round: 1,
+      checklist_total: 0,
+      checklist_implemented: 0,
+      checklist_audited: 0,
+      executor_label: null,
+      auditor_label: null,
+      auditor: null,
+      live_summary: null,
+      is_terminal: true,
+      needs_attention: false,
+      created_at: now - 10_000,
+      updated_at: now - 100,
+    });
+    memDb.summaries.set('srv-a\u0000tsk_legacy_internal', {
+      server_id: 'srv-a',
+      task_id: 'tsk_legacy_internal',
+      project_name: '',
+      brain_session: 'bootmainxowfy6',
+      brain_label: 'bootmainxowfy6',
+      title: 'Legacy internal only',
+      status: 'working',
+      flags_json: '[]',
+      round: 1,
+      checklist_total: 0,
+      checklist_implemented: 0,
+      checklist_audited: 0,
+      executor_label: null,
+      auditor_label: null,
+      auditor: null,
+      live_summary: null,
+      is_terminal: false,
+      needs_attention: false,
+      created_at: now - 10_000,
+      updated_at: now - 50,
+    });
+
+    const afterLegacySnapshot = await listGlobalTaskSnapshotForUser(db, 'user-a');
+    expect(afterLegacySnapshot.tasks.find((t) => t.taskId === 'tsk_legacy_readable')?.brainLabel).toBe('Legacy Brain');
+    const internalLegacy = afterLegacySnapshot.tasks.find((t) => t.taskId === 'tsk_legacy_internal');
+    expect(internalLegacy?.brainLabel).toBe('Brain');
+    expect(internalLegacy?.brainLabel).not.toContain('bootmain');
+    expect(internalLegacy?.brainLabel).not.toContain('deck_');
   });
 });
