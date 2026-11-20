@@ -168,11 +168,64 @@ describe('file-transfer upload route', () => {
       expect(response.status).toBe(200);
       expect((await response.json()).attachment.serverId).toBe('srv-1');
       expect(fetch).toHaveBeenCalledTimes(1); expect(fetch.mock.calls[0]![1].method).toBe('HEAD');
-      expect(sendFileTransferRequestMock.mock.calls[0]![1]).toMatchObject({ type: FILE_TRANSFER_MSG.UPLOAD_FETCH, size: 5, originalName: 'a.txt' });
+      expect(sendFileTransferRequestMock.mock.calls[0]![1]).toMatchObject({
+        type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+        size: 5,
+        originalName: 'a.txt',
+        sessionName: 'deck_project_brain',
+      });
       const get = new URL(sendFileTransferRequestMock.mock.calls[0]![1].downloadUrl);
       expect(get.searchParams.get('X-Amz-Expires')).toBe('900');
       expect(get.pathname).toBe(new URL(url).pathname);
       expect(get.searchParams.get('X-Amz-Signature')).not.toBe(new URL(url).searchParams.get('X-Amz-Signature'));
+
+      // Session-less R2 uploads remain compatible and omit sessionName.
+      const sessionlessStage = await app.request('/api/server/srv-1/r2-relay/uploads', {
+        method: 'POST', headers: { Authorization: 'Bearer test' }, body: JSON.stringify({ filename: 'b.txt', size: 5 }),
+      });
+      expect(sessionlessStage.status).toBe(200);
+      const { id: sessionlessId } = await sessionlessStage.json() as { id: string };
+      const sessionlessCommit = await app.request(`/api/server/srv-1/r2-relay/uploads/${sessionlessId}/commit`, {
+        method: 'POST', headers: { Authorization: 'Bearer test' },
+      });
+      expect(sessionlessCommit.status).toBe(200);
+      expect(sendFileTransferRequestMock.mock.calls[1]![1]).not.toHaveProperty('sessionName');
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('uses authorizeSessionFileAccess sessionName for token-pinned R2 relay uploads even without query sessionName', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-participant-pinned' });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: { target: { kind: 'session', serverId: 'srv-1', sessionName: 'deck_pinned_tab' } },
+      },
+    });
+    const baseApp = makeApp('http://localhost', true);
+    const app = new Hono();
+    app.use('/*', async (c, next) => {
+      c.set('tokenSessionName' as never, 'deck_pinned_tab' as never);
+      return next();
+    });
+    app.route('/', baseApp);
+
+    const stage = await app.request('/api/server/srv-1/r2-relay/uploads', {
+      method: 'POST', headers: { Authorization: 'Bearer test' }, body: JSON.stringify({ filename: 'shared.txt', size: 5 }),
+    });
+    expect(stage.status).toBe(200);
+    const { id } = await stage.json() as { id: string };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { headers: { 'content-length': '5' } })));
+    try {
+      const commit = await app.request(`/api/server/srv-1/r2-relay/uploads/${id}/commit`, {
+        method: 'POST', headers: { Authorization: 'Bearer test' },
+      });
+      expect(commit.status).toBe(200);
+      expect(sendFileTransferRequestMock.mock.calls[0]![1]).toMatchObject({
+        type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+        sessionName: 'deck_pinned_tab',
+      });
     } finally { vi.unstubAllGlobals(); }
   });
 

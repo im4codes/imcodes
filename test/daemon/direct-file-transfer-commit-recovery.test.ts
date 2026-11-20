@@ -199,16 +199,19 @@ describe('direct file transfer interrupted-commit recovery', () => {
 
   it('keeps the record when the registry write fails, so the next boot retries', async () => {
     await writeFile(storedPath, 'hello');
-    await writeIntent();
+    await writeIntent({ sessionName: 'deck_session_recovery' });
     finalizeDirectUploadedFile.mockRejectedValueOnce(new Error('registry_unavailable'));
     const direct = await loadWorker();
 
     await expect(direct.recoverInterruptedUploadCommits()).resolves.toBe(0);
     expect(await exists(intentPath), 'a failed replay must not discard its own evidence').toBe(true);
 
-    // The retry is what makes retention meaningful.
+    // The retry is what makes retention meaningful and preserves sessionName.
     await expect(direct.recoverInterruptedUploadCommits()).resolves.toBe(1);
     expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(2);
+    expect(finalizeDirectUploadedFile).toHaveBeenLastCalledWith(expect.objectContaining({
+      sessionName: 'deck_session_recovery',
+    }));
     expect(await exists(intentPath)).toBe(false);
   });
 

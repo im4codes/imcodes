@@ -397,6 +397,47 @@ async function commitUploadedFileToDirectory(
   }
 }
 
+async function commitUploadedAttachmentEntry(params: {
+  id: string;
+  daemonPath: string;
+  originalName: string;
+  mime?: string;
+  size: number;
+  clientUploadId?: string;
+  sessionName?: string;
+}): Promise<AttachmentEntry> {
+  const boundSessionName = normalizeAttachmentSessionName(params.sessionName);
+  const metaPath = uploadMetadataPath(params.daemonPath);
+  const metaPayload = JSON.stringify({
+    originalName: params.originalName,
+    mime: params.mime,
+    clientUploadId: params.clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
+  });
+  if (boundSessionName) {
+    // Session-bound uploads rely on the sidecar to survive daemon restarts;
+    // fail closed if persistence fails instead of committing an unrecoverable binding.
+    await writeFile(metaPath, metaPayload);
+  } else {
+    await writeFile(metaPath, metaPayload).catch(() => {});
+  }
+  const now = Date.now();
+  const entry: AttachmentEntry = {
+    id: params.id,
+    daemonPath: params.daemonPath,
+    source: 'upload',
+    originalName: params.originalName,
+    mime: params.mime,
+    size: params.size,
+    createdAt: now,
+    expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+    clientUploadId: params.clientUploadId,
+    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
+  };
+  attachmentRegistry.set(params.id, entry);
+  return entry;
+}
+
 async function finalizeUploadedFile(params: {
   uploadId: string;
   filename: string;
@@ -421,7 +462,6 @@ async function finalizeUploadedFile(params: {
     destinationDirectory,
     sessionName,
   } = params;
-  const boundSessionName = normalizeAttachmentSessionName(sessionName);
 
   if (destinationDirectory) {
     const destination = await commitUploadedFileToDirectory(resolved, destinationDirectory, originalName ?? '');
@@ -439,40 +479,16 @@ async function finalizeUploadedFile(params: {
     return;
   }
 
-  const metaPath = uploadMetadataPath(resolved);
-  await writeFile(metaPath, JSON.stringify({
-    originalName: originalName || filename,
-    mime,
-    clientUploadId,
-    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
-  })).catch(() => {});
-
-  const now = Date.now();
-  const attachment: AttachmentRef = {
+  const entry = await commitUploadedAttachmentEntry({
     id: filename,
-    source: 'upload',
-    serverId: '', // server fills this before returning to client
     daemonPath: resolved,
     originalName: originalName || filename,
     mime,
     size,
-    createdAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS).toISOString(),
-    downloadable: true,
-  };
-
-  attachmentRegistry.set(filename, {
-    id: filename,
-    daemonPath: resolved,
-    source: 'upload',
-    originalName: originalName || filename,
-    mime,
-    size,
-    createdAt: now,
-    expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
     clientUploadId,
-    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
+    sessionName,
   });
+  const attachment = attachmentEntryToRef(entry);
 
   const response: FileUploadDone = {
     type: 'file.upload_done',
@@ -582,27 +598,15 @@ export async function finalizeDirectUploadedFile(params: {
       params.clientUploadId,
     );
   }
-  const boundSessionName = normalizeAttachmentSessionName(params.sessionName);
-  const now = Date.now();
-  await writeFile(uploadMetadataPath(params.resolved), JSON.stringify({
-    originalName: params.originalName,
-    mime: params.mime,
-    clientUploadId: params.clientUploadId,
-    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
-  })).catch(() => {});
-  const entry: AttachmentEntry = {
+  const entry = await commitUploadedAttachmentEntry({
     id: params.filename,
     daemonPath: params.resolved,
-    source: 'upload',
     originalName: params.originalName,
     mime: params.mime,
     size: params.size,
-    createdAt: now,
-    expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
     clientUploadId: params.clientUploadId,
-    ...(boundSessionName ? { sessionName: boundSessionName } : {}),
-  };
-  attachmentRegistry.set(params.filename, entry);
+    sessionName: params.sessionName,
+  });
   return attachmentEntryToRef(entry);
 }
 

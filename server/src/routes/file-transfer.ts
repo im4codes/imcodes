@@ -1914,7 +1914,7 @@ async function r2RouteAccess(c: Context, mode: SharedFileAccessMode) {
     return { response: c.body(null, 204) } as const;
   }
   if (!bridge.isDaemonConnected()) return { response: c.json({ error: 'daemon_offline' }, 503) } as const;
-  return { config, bridge, serverId, userId, sessionName: c.req.query('sessionName') || undefined } as const;
+  return { config, bridge, serverId, userId, sessionName: access.sessionName } as const;
 }
 fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, async (c) => {
   const access = await r2RouteAccess(c, 'write'); if ('response' in access) return access.response;
@@ -1959,6 +1959,7 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/:uplo
       downloadUrl: presignR2(access.config, 'GET', ticket.key),
       clientUploadId: ticket.clientUploadId ?? c.req.param('uploadId'),
       ...(ticket.destinationDirectory ? { destinationDirectory: ticket.destinationDirectory } : {}),
+      ...(ticket.sessionName ? { sessionName: ticket.sessionName } : {}),
     }, fileTransferUploadTimeoutMs(ticket.size));
     if (result.type !== FILE_TRANSFER_MSG.UPLOAD_DONE) throw new Error(R2_RELAY_ERROR.FAILED);
     const attachment = result.attachment as AttachmentRef;

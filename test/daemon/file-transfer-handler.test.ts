@@ -1206,4 +1206,111 @@ describe('file-transfer local handle hardening', () => {
     expect((reloaded.lookupAttachment(doneFetch.attachment.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_b');
     expect((reloaded.lookupAttachment(directRef.daemonPath) as { sessionName?: string })?.sessionName).toBe('deck_session_c');
   });
+
+  it('fails closed on sidecar persistence failure for session-bound inline, relay, and direct uploads so unrecoverable bindings never succeed', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    await transfer.ensureUploadDirectory();
+    const uploadBytes = Buffer.from('fail-closed-payload', 'utf8');
+    const uploadsRoot = path.join(fakeHome, '.imcodes', 'uploads');
+
+    // Create directory collisions at the exact .meta.json sidecar paths inside fakeHome
+    // so writeFile fails naturally on real filesystem I/O without mocking node:fs.
+    const inlineId = 'e'.repeat(32);
+    const inlineFilename = `${inlineId}.txt`;
+    const inlineFilePath = path.join(uploadsRoot, inlineId, 'inline.txt');
+    const inlineMetaPath = path.join(uploadsRoot, inlineId, '.meta.json');
+    await mkdir(inlineMetaPath, { recursive: true });
+
+    const inlineLink = createServerLinkMock();
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'up-inline-fail',
+      clientUploadId: 'client-inline-fail',
+      filename: inlineFilename,
+      originalName: 'inline.txt',
+      mime: 'text/plain',
+      size: uploadBytes.length,
+      content: uploadBytes.toString('base64'),
+      sessionName: 'deck_session_a',
+    }, inlineLink.serverLink as never);
+    expect(inlineLink.sent).toEqual([expect.objectContaining({ type: 'file.upload_error', uploadId: 'up-inline-fail' })]);
+    expect(transfer.lookupAttachment(inlineFilePath)).toBeUndefined();
+    expect(transfer.lookupAttachmentByClientUploadId('client-inline-fail')).toBeUndefined();
+
+    // Relay fetch upload path also fails closed on sidecar persistence failure.
+    const relayId = '0'.repeat(31) + '1';
+    const relayFilename = `${relayId}.txt`;
+    const relayFilePath = path.join(uploadsRoot, relayId, 'relay.txt');
+    const relayMetaPath = path.join(uploadsRoot, relayId, '.meta.json');
+    await mkdir(relayMetaPath, { recursive: true });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(uploadBytes, {
+      headers: { 'content-length': String(uploadBytes.length) },
+    })));
+    const relayLink = createServerLinkMock();
+    await transfer.handleFileUploadFetch({
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+      uploadId: 'up-relay-fail',
+      clientUploadId: 'client-relay-fail',
+      filename: relayFilename,
+      originalName: 'relay.txt',
+      mime: 'text/plain',
+      size: uploadBytes.length,
+      downloadUrl: 'https://relay.example/fail',
+      sessionName: 'deck_session_b',
+    }, relayLink.serverLink as never);
+    expect(relayLink.sent.at(-1)).toMatchObject({ type: 'file.upload_error', uploadId: 'up-relay-fail' });
+    expect(relayLink.sent.some((msg) => (msg as { type?: string }).type === 'file.upload_done')).toBe(false);
+    expect(transfer.lookupAttachment(relayFilePath)).toBeUndefined();
+    expect(transfer.lookupAttachmentByClientUploadId('client-relay-fail')).toBeUndefined();
+
+    // Remove directory obstruction and verify retry persists sidecar + binding cleanly.
+    await rm(inlineMetaPath, { recursive: true, force: true });
+    const inlineRetryLink = createServerLinkMock();
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'up-inline-retry',
+      clientUploadId: 'client-inline-fail',
+      filename: inlineFilename,
+      originalName: 'inline.txt',
+      mime: 'text/plain',
+      size: uploadBytes.length,
+      content: uploadBytes.toString('base64'),
+      sessionName: 'deck_session_a',
+    }, inlineRetryLink.serverLink as never);
+    expect(inlineRetryLink.sent.at(-1)).toMatchObject({ type: 'file.upload_done', uploadId: 'up-inline-retry' });
+    expect((transfer.lookupAttachment(inlineFilePath) as { sessionName?: string })?.sessionName).toBe('deck_session_a');
+
+    // Direct upload path: sidecar persistence failure rejects so commit-intent stays intact for recovery.
+    const directFilename = 'f'.repeat(32) + '.txt';
+    const directPath = path.join(uploadsRoot, directFilename);
+    await writeFile(directPath, uploadBytes);
+    await mkdir(`${directPath}.meta.json`, { recursive: true });
+    await expect(transfer.finalizeDirectUploadedFile({
+      clientUploadId: 'client-direct-fail',
+      filename: directFilename,
+      originalName: 'direct.txt',
+      mime: 'text/plain',
+      resolved: directPath,
+      size: uploadBytes.length,
+      sessionName: 'deck_session_c',
+    })).rejects.toThrow();
+    expect(transfer.lookupAttachment(directPath)).toBeUndefined();
+    expect(transfer.lookupAttachmentByClientUploadId('client-direct-fail')).toBeUndefined();
+
+    // Once sidecar path is writable and finalized, restart recovery retains sessionName.
+    await rm(`${directPath}.meta.json`, { recursive: true, force: true });
+    await transfer.finalizeDirectUploadedFile({
+      clientUploadId: 'client-direct-fail',
+      filename: directFilename,
+      originalName: 'direct.txt',
+      mime: 'text/plain',
+      resolved: directPath,
+      size: uploadBytes.length,
+      sessionName: 'deck_session_c',
+    });
+    const restarted = await loadFileTransferHandler(fakeHome);
+    await restarted.initFileTransfer();
+    expect((restarted.lookupAttachment(inlineFilePath) as { sessionName?: string })?.sessionName).toBe('deck_session_a');
+    expect((restarted.lookupAttachment(directPath) as { sessionName?: string })?.sessionName).toBe('deck_session_c');
+  });
 });
