@@ -5651,6 +5651,8 @@
     "close_error_timeout": "요청 시간이 초과되었습니다",
     "close_error_forbidden": "서버 소유자만 작업을 취소할 수 있습니다",
     "close_error_already_terminal": "작업이 이미 종료되었습니다",
-    "swipe_cancel_hint": "취소"
+    "swipe_cancel_hint": "취소",
+    "stats_24h_with_avg": "24h 완료 {{count}} · 평균 {{avg}}",
+    "stats_24h_count_only": "24h 완료 {{count}}"
   }
 }

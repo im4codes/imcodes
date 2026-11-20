@@ -2329,4 +2329,277 @@ describe('GlobalTaskModeView', () => {
     expect(closeCalls).toHaveLength(2);
     expect(screen.getByTestId('task-mode-card-tsk_pair_1').className).toContain('is-terminal');
   });
+
+  it('computes and renders compact 24h done count and average duration inline in the finished header row without affecting active section', async () => {
+    const { computeTaskMode24hStats, GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    const nowMs = 1_795_000_000_000;
+    const hourMs = 60 * 60 * 1000;
+
+    // 1. Pure helper edge cases: done only, 24h window, fallbacks, invalid/reversed timestamps
+    expect(computeTaskMode24hStats([], nowMs)).toEqual({ completedCount: 0, avgDurationMs: null });
+    const pureStats = computeTaskMode24hStats([
+      {
+        serverId: 'srv-1',
+        serverName: 'M3',
+        serverOnline: true,
+        projectName: 'p1',
+        brainSession: 'b1',
+        brainLabel: 'B1',
+        taskId: 'd-1',
+        title: 'Done with startedAt/endedAt',
+        status: 'done',
+        flags: [],
+        round: 1,
+        checklist: { total: 1, implemented: 1, audited: 1 },
+        createdAt: nowMs - 3 * hourMs,
+        startedAt: nowMs - 2 * hourMs,
+        endedAt: nowMs - 2 * hourMs + 60_000,
+        updatedAt: nowMs - 2 * hourMs + 60_000,
+        isTerminal: true,
+        needsAttention: false,
+      },
+      {
+        serverId: 'srv-1',
+        serverName: 'M3',
+        serverOnline: true,
+        projectName: 'p1',
+        brainSession: 'b1',
+        brainLabel: 'B1',
+        taskId: 'd-2',
+        title: 'Done fallback createdAt/updatedAt',
+        status: 'done',
+        flags: [],
+        round: 1,
+        checklist: { total: 1, implemented: 1, audited: 1 },
+        createdAt: nowMs - hourMs,
+        updatedAt: nowMs - hourMs + 120_000,
+        isTerminal: true,
+        needsAttention: false,
+      },
+      {
+        serverId: 'srv-1',
+        serverName: 'M3',
+        serverOnline: true,
+        projectName: 'p1',
+        brainSession: 'b1',
+        brainLabel: 'B1',
+        taskId: 'd-reversed',
+        title: 'Done reversed ts excluded from avg only',
+        status: 'done',
+        flags: [],
+        round: 1,
+        checklist: { total: 1, implemented: 1, audited: 1 },
+        createdAt: nowMs - 30_000,
+        startedAt: nowMs - 10_000,
+        endedAt: nowMs - 20_000,
+        updatedAt: nowMs - 20_000,
+        isTerminal: true,
+        needsAttention: false,
+      },
+      {
+        serverId: 'srv-1',
+        serverName: 'M3',
+        serverOnline: true,
+        projectName: 'p1',
+        brainSession: 'b1',
+        brainLabel: 'B1',
+        taskId: 'c-1',
+        title: 'Cancelled ignored',
+        status: 'cancelled',
+        flags: [],
+        round: 1,
+        checklist: { total: 1, implemented: 0, audited: 0 },
+        createdAt: nowMs - 90_000,
+        startedAt: nowMs - 80_000,
+        endedAt: nowMs - 10_000,
+        updatedAt: nowMs - 10_000,
+        isTerminal: true,
+        needsAttention: false,
+      },
+      {
+        serverId: 'srv-1',
+        serverName: 'M3',
+        serverOnline: true,
+        projectName: 'p1',
+        brainSession: 'b1',
+        brainLabel: 'B1',
+        taskId: 'd-old',
+        title: 'Done >24h old ignored',
+        status: 'done',
+        flags: [],
+        round: 1,
+        checklist: { total: 1, implemented: 1, audited: 1 },
+        createdAt: nowMs - 30 * hourMs,
+        startedAt: nowMs - 30 * hourMs,
+        endedAt: nowMs - 25 * hourMs,
+        updatedAt: nowMs - 25 * hourMs,
+        isTerminal: true,
+        needsAttention: false,
+      },
+    ], nowMs);
+    expect(pureStats).toEqual({ completedCount: 3, avgDurationMs: 90_000 });
+
+    // 2. Component rendering inline inside finished section (even while collapsed)
+    vi.setSystemTime(nowMs);
+    render(<GlobalTaskModeView onExit={vi.fn()} onJumpToSession={vi.fn()} />);
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: nowMs,
+        servers: [
+          { id: 'srv-1', name: 'M3-Mac', online: true },
+          { id: 'srv-2', name: 'Linux-GPU', online: true },
+        ],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-active',
+            title: 'Active task',
+            status: 'working',
+            flags: [],
+            round: 1,
+            checklist: { total: 2, implemented: 1, audited: 0 },
+            createdAt: nowMs - 10_000,
+            updatedAt: nowMs - 5_000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-done-1',
+            title: 'Done 60s',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 2, implemented: 2, audited: 2 },
+            createdAt: nowMs - 70_000,
+            startedAt: nowMs - 65_000,
+            endedAt: nowMs - 5_000,
+            updatedAt: nowMs - 5_000,
+            isTerminal: true,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-2',
+            serverName: 'Linux-GPU',
+            serverOnline: true,
+            projectName: 'trainer',
+            brainSession: 'deck_gpu_brain',
+            brainLabel: 'GPU Brain',
+            taskId: 't-done-2',
+            title: 'Done 120s',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 2, implemented: 2, audited: 2 },
+            createdAt: nowMs - 130_000,
+            updatedAt: nowMs - 10_000,
+            isTerminal: true,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-cancelled',
+            title: 'Cancelled task',
+            status: 'cancelled',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: nowMs - 60_000,
+            startedAt: nowMs - 50_000,
+            endedAt: nowMs - 10_000,
+            updatedAt: nowMs - 10_000,
+            isTerminal: true,
+            needsAttention: false,
+          },
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-old-done',
+            title: 'Old done >24h',
+            status: 'done',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 1, audited: 1 },
+            createdAt: nowMs - 30 * hourMs,
+            startedAt: nowMs - 30 * hourMs,
+            endedAt: nowMs - 26 * hourMs,
+            updatedAt: nowMs - 26 * hourMs,
+            isTerminal: true,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+
+    const activeSection = screen.getByTestId('task-mode-active-section');
+    const finishedSection = screen.getByTestId('task-mode-finished-section');
+    const toggleBtn = screen.getByTestId('task-mode-finished-toggle');
+    const statsEl = screen.getByTestId('task-mode-24h-stats');
+    expect(finishedSection.contains(statsEl)).toBe(true);
+    expect(activeSection.contains(statsEl)).toBe(false);
+    expect(toggleBtn.getAttribute('aria-expanded')).toBe('true');
+    // (t-done-1 = 60s, t-done-2 createdAt..updatedAt = 120s => avg 90s = 1m 30s)
+    expect(statsEl.textContent).toBe('24h: 2 done · avg 1m 30s');
+
+    // Remains visible inline in the header row when finished section is collapsed
+    fireEvent.click(toggleBtn);
+    expect(screen.getByTestId('task-mode-finished-toggle').getAttribute('aria-expanded')).toBe('false');
+    expect(screen.getByTestId('task-mode-24h-stats').textContent).toBe('24h: 2 done · avg 1m 30s');
+
+    // Muting both servers / showing only cancelled-or-old leaves 0 done without NaN/avg
+    await act(async () => {
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: nowMs,
+        servers: [{ id: 'srv-1', name: 'M3-Mac', online: true }],
+        brains: [],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Mac',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_imcodes_brain',
+            brainLabel: 'IM Brain',
+            taskId: 't-cancelled-only',
+            title: 'Cancelled only',
+            status: 'cancelled',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 0, audited: 0 },
+            createdAt: nowMs - 60_000,
+            updatedAt: nowMs - 10_000,
+            isTerminal: true,
+            needsAttention: false,
+          },
+        ],
+      });
+    });
+    expect(screen.getByTestId('task-mode-24h-stats').textContent).toBe('24h: 0 done');
+  });
 });

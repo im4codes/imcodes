@@ -88,6 +88,53 @@ export const GLOBAL_TASK_TTS_MAX_AGE_MS = 2 * 60 * 1000;
 export const GLOBAL_TASK_TTS_CLOCK_SKEW_MS = 30 * 1000;
 export const GLOBAL_TASK_TTS_QUEUE_CAP = 64;
 
+const TASK_MODE_STATS_WINDOW_MS = 24 * 60 * 60 * 1000;
+const TASK_MODE_STATS_FUTURE_SKEW_MS = 60 * 1000;
+
+export interface TaskMode24hStats {
+  completedCount: number;
+  avgDurationMs: number | null;
+}
+
+function validPositiveTs(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Compute compact 24h completion count & average duration for finished (`done`)
+ * tasks. Excludes cancelled, >24h, and invalid/reversed timestamps cleanly.
+ */
+export function computeTaskMode24hStats(
+  tasks: readonly GlobalTaskSummaryRow[],
+  nowMs: number,
+): TaskMode24hStats {
+  if (!Number.isFinite(nowMs) || nowMs <= 0) {
+    return { completedCount: 0, avgDurationMs: null };
+  }
+  const minEndTs = nowMs - TASK_MODE_STATS_WINDOW_MS;
+  const maxEndTs = nowMs + TASK_MODE_STATS_FUTURE_SKEW_MS;
+  let completedCount = 0;
+  let durationSumMs = 0;
+  let durationCount = 0;
+
+  for (const task of tasks) {
+    if (task.status !== 'done') continue;
+    const endTs = validPositiveTs(task.endedAt) ?? validPositiveTs(task.updatedAt);
+    if (endTs === null || endTs < minEndTs || endTs > maxEndTs) continue;
+    completedCount += 1;
+    const startTs = validPositiveTs(task.startedAt) ?? validPositiveTs(task.createdAt);
+    if (startTs !== null && endTs >= startTs) {
+      durationSumMs += endTs - startTs;
+      durationCount += 1;
+    }
+  }
+
+  return {
+    completedCount,
+    avgDurationMs: durationCount > 0 ? Math.round(durationSumMs / durationCount) : null,
+  };
+}
+
 export interface QueuedTaskModeTtsItem {
   text: string;
   messageId: string;
@@ -818,6 +865,16 @@ export function GlobalTaskModeView({
     }),
     [t],
   );
+  const stats24h = useMemo(
+    () => computeTaskMode24hStats(terminalTasks, now),
+    [terminalTasks, now],
+  );
+  const stats24hAvgText = stats24h.avgDurationMs !== null
+    ? formatTaskDuration({ durationMs: stats24h.avgDurationMs }, durationUnits)
+    : undefined;
+  const stats24hText = stats24hAvgText
+    ? t('taskMode.stats_24h_with_avg', { count: stats24h.completedCount, avg: stats24hAvgText })
+    : t('taskMode.stats_24h_count_only', { count: stats24h.completedCount });
 
   // Gesture helpers: tap -> quick composer, long-press (260ms) -> VoiceOverlay, scroll (>12px) -> cancelled
   const finishPressTracker = useCallback((key: string, cancelPress: boolean) => {
@@ -1718,16 +1775,21 @@ export function GlobalTaskModeView({
         {/* Recent Finished Section (collapsible) */}
         {(terminalTasks.length > 0 || statusFilter === 'done') && (
           <section class="global-task-section global-task-finished-section" data-testid="task-mode-finished-section">
-            <button
-              type="button"
-              class="global-task-finished-toggle"
-              data-testid="task-mode-finished-toggle"
-              aria-expanded={statusFilter === 'done' ? true : finishedExpanded}
-              onClick={() => setFinishedExpanded((prev) => !prev)}
-            >
-              <span>{t('taskMode.recent_finished', 'Recent finished')} ({terminalTasks.length})</span>
-              <span aria-hidden="true">{statusFilter === 'done' || finishedExpanded ? '▾' : '▸'}</span>
-            </button>
+            <div class="global-task-finished-header">
+              <button
+                type="button"
+                class="global-task-finished-toggle"
+                data-testid="task-mode-finished-toggle"
+                aria-expanded={statusFilter === 'done' ? true : finishedExpanded}
+                onClick={() => setFinishedExpanded((prev) => !prev)}
+              >
+                <span>{t('taskMode.recent_finished', 'Recent finished')} ({terminalTasks.length})</span>
+                <span aria-hidden="true">{statusFilter === 'done' || finishedExpanded ? '▾' : '▸'}</span>
+              </button>
+              <span class="global-task-finished-stats" data-testid="task-mode-24h-stats">
+                {stats24hText}
+              </span>
+            </div>
             {(statusFilter === 'done' || finishedExpanded) && (
               terminalTasks.length > 0 ? (
                 <div class="global-task-mode-grid">

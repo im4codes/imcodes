@@ -24068,6 +24068,20 @@ html.native-ios-mac .global-task-mode-entry-btn {
   cursor: pointer;
 }
 
+.global-task-finished-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.global-task-finished-stats {
+  font-size: 11px;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
 .global-task-finished-toggle {
   align-self: flex-start;
   display: inline-flex;

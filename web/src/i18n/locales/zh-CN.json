@@ -5662,6 +5662,8 @@
     "close_error_timeout": "请求超时，请重试",
     "close_error_forbidden": "仅服务器所有者可取消任务",
     "close_error_already_terminal": "任务已处于结束状态",
-    "swipe_cancel_hint": "取消"
+    "swipe_cancel_hint": "取消",
+    "stats_24h_with_avg": "24h 完成 {{count}} · 均耗时 {{avg}}",
+    "stats_24h_count_only": "24h 完成 {{count}}"
   }
 }

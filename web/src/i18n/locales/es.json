@@ -5652,6 +5652,8 @@
     "close_error_timeout": "Tiempo de espera agotado",
     "close_error_forbidden": "Solo el propietario del servidor puede cancelar tareas",
     "close_error_already_terminal": "La tarea ya está cerrada",
-    "swipe_cancel_hint": "Cancelar"
+    "swipe_cancel_hint": "Cancelar",
+    "stats_24h_with_avg": "24h: {{count}} completadas · prom. {{avg}}",
+    "stats_24h_count_only": "24h: {{count}} completadas"
   }
 }

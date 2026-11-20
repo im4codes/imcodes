@@ -5651,6 +5651,8 @@
     "close_error_timeout": "Время ожидания запроса истекло",
     "close_error_forbidden": "Только владелец сервера может отменять задачи",
     "close_error_already_terminal": "Задача уже закрыта",
-    "swipe_cancel_hint": "Отмена"
+    "swipe_cancel_hint": "Отмена",
+    "stats_24h_with_avg": "24ч: {{count}} выполн. · средн. {{avg}}",
+    "stats_24h_count_only": "24ч: {{count}} выполн."
   }
 }

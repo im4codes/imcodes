@@ -5662,6 +5662,8 @@
     "close_error_timeout": "Request timed out",
     "close_error_forbidden": "Only the server owner can cancel tasks",
     "close_error_already_terminal": "Task is already closed",
-    "swipe_cancel_hint": "Cancel"
+    "swipe_cancel_hint": "Cancel",
+    "stats_24h_with_avg": "24h: {{count}} done · avg {{avg}}",
+    "stats_24h_count_only": "24h: {{count}} done"
   }
 }

@@ -5652,6 +5652,8 @@
     "close_error_timeout": "請求逾時，請重試",
     "close_error_forbidden": "僅伺服器擁有者可取消任務",
     "close_error_already_terminal": "任務已處於結束狀態",
-    "swipe_cancel_hint": "取消"
+    "swipe_cancel_hint": "取消",
+    "stats_24h_with_avg": "24h 完成 {{count}} · 均耗時 {{avg}}",
+    "stats_24h_count_only": "24h 完成 {{count}}"
   }
 }

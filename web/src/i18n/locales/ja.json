@@ -5651,6 +5651,8 @@
     "close_error_timeout": "リクエストがタイムアウトしました",
     "close_error_forbidden": "タスクをキャンセルできるのはサーバー所有者のみです",
     "close_error_already_terminal": "タスクはすでに終了しています",
-    "swipe_cancel_hint": "キャンセル"
+    "swipe_cancel_hint": "キャンセル",
+    "stats_24h_with_avg": "24h 完了 {{count}} · 平均 {{avg}}",
+    "stats_24h_count_only": "24h 完了 {{count}}"
   }
 }
