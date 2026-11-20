@@ -118,10 +118,16 @@ import {
   CHAT_USER_SCROLL_UP_HOLD_MS,
   computeFollowThresholds,
 } from './chat-follow-thresholds.js';
-import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
+import {
+  ChatLocalImagePreview,
+  type ChatLocalImagePreviewLoader,
+  type ChatLocalImagePreviewResult,
+} from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import {
+  isImagePreviewPath,
   isLikelyDomainPath,
+  isLocalChatPath,
   renderChatPathActions,
   splitTextWithCloudDocsAndUrls,
   type ChatPathDownloadHandler,
@@ -341,6 +347,7 @@ interface AssistantBlockProps {
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
+const USER_MESSAGE_IMAGE_COLLAPSE_LINE_LIMIT = 22;
 const AGENT_MESSAGE_COLLAPSE_LINE_LIMIT = 7;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
 /**
@@ -6930,9 +6937,13 @@ const ChatEvent = memo(function ChatEvent({
               {sharedActorLabel}
             </div>
           )}
-          {attachments && serverId && attachments.map((att) => (
-            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
-          ))}
+          {attachments && serverId && attachments.length > 0 && (
+            <div class="chat-user-attachments">
+              {attachments.map((att) => (
+                <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
+              ))}
+            </div>
+          )}
           {userText && (
             <UserMessageText
               text={userText}
@@ -6946,6 +6957,7 @@ const ChatEvent = memo(function ChatEvent({
               onImagePreview={onImagePreview}
               onOpenLocalWebPreview={onOpenLocalWebPreview}
               isAgent={isAgent}
+              compactPathBadge={origin === CHAT_MESSAGE_ORIGINS.USER}
               footerRight={timeAndStatus}
             />
           )}
@@ -7775,6 +7787,7 @@ function UserMessageText({
   onImagePreview,
   onOpenLocalWebPreview,
   isAgent,
+  compactPathBadge = false,
   footerRight,
 }: {
   text: string;
@@ -7788,12 +7801,32 @@ function UserMessageText({
   onImagePreview?: ChatLocalImagePreviewLoader;
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   isAgent?: boolean;
+  compactPathBadge?: boolean;
   footerRight?: ComponentChildren;
 }) {
   const { t } = useTranslation();
   const contentRef = useRef<HTMLDivElement>(null);
   const { prose, leadingSender, trailingReply } = parseDelegationProtocolMessage(text);
-  const lineLimit = isAgent ? AGENT_MESSAGE_COLLAPSE_LINE_LIMIT : USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const richContent = splitPathsAndUrlsCore(prose, {
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel: t('upload.download_file'),
+    htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
+    onOpenLocalWebPreview,
+    onCloudDocClick,
+    onRemoteDesktopClick,
+    compactPathBadge,
+    hoistImagePreviews: compactPathBadge,
+  });
+  const hasImages = !isAgent && richContent.imagePreviews.length > 0;
+  const hasMultiImages = !isAgent && richContent.imagePreviews.length > 1;
+  const hasSplitLayout = hasImages && richContent.hasNonBadgeProse;
+  const lineLimit = isAgent
+    ? AGENT_MESSAGE_COLLAPSE_LINE_LIMIT
+    : (hasImages ? USER_MESSAGE_IMAGE_COLLAPSE_LINE_LIMIT : USER_MESSAGE_COLLAPSE_LINE_LIMIT);
   const hardLineOverflow = countHardLines(prose) > lineLimit;
   const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
     hardLineOverflow ? true : null,
@@ -7842,30 +7875,51 @@ function UserMessageText({
     };
   }, [hardLineOverflow, prose, lineLimit, visible]);
 
+  const foldFooter = (isAgent || shouldFold) && (shouldFold || footerRight) ? (
+    <div class="chat-user-footer">
+      {shouldFold && (
+        <button
+          type="button"
+          class="chat-user-message-fold-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
+        </button>
+      )}
+      {footerRight && <span class="chat-user-footer-right">{footerRight}</span>}
+    </div>
+  ) : null;
+
   return (
     <>
-      <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+      <div class={`chat-user-message-fold${hasImages ? ' has-images' : ''}${hasMultiImages ? ' has-multi-images' : ''}${hasSplitLayout ? ' has-split-layout' : ''}${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
         {leadingSender && <DelegationSenderCardView card={leadingSender} />}
-        <div
-          ref={contentRef}
-          class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
-        >
-          {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick)}
-        </div>
-        {(isAgent || shouldFold) && (shouldFold || footerRight) && (
-          <div class="chat-user-footer">
-            {shouldFold && (
-              <button
-                type="button"
-                class="chat-user-message-fold-toggle"
-                aria-expanded={expanded}
-                onClick={() => setExpanded((value) => !value)}
+        {hasImages ? (
+          <div class="chat-user-split-layout">
+            <div class="chat-user-media-pane">
+              {richContent.imagePreviews}
+            </div>
+            <div class="chat-user-text-pane">
+              <div
+                ref={contentRef}
+                class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
               >
-                {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
-              </button>
-            )}
-            {footerRight && <span class="chat-user-footer-right">{footerRight}</span>}
+                {richContent.nodes}
+              </div>
+              {foldFooter}
+            </div>
           </div>
+        ) : (
+          <>
+            <div
+              ref={contentRef}
+              class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
+            >
+              {richContent.nodes}
+            </div>
+            {foldFooter}
+          </>
         )}
         {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
       </div>
@@ -7890,6 +7944,156 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
 const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}.\-~])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
+interface SplitPathsAndUrlsOptions {
+  onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+  downloadLabel?: string;
+  htmlPreviewLabel?: string;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  onCloudDocClick?: (docId: string) => void;
+  onRemoteDesktopClick?: (targetId: string) => void;
+  compactPathBadge?: boolean;
+  hoistImagePreviews?: boolean;
+}
+
+interface SplitPathsAndUrlsResult {
+  nodes: h.JSX.Element[];
+  imagePreviews: h.JSX.Element[];
+  hasNonBadgeProse: boolean;
+}
+
+function isCompactBadgePath(path: string, isTaggedAttachment: boolean): boolean {
+  return isTaggedAttachment || path.startsWith('/') || path.startsWith('\\\\') || /^[A-Za-z]:\\/.test(path);
+}
+
+function splitPathsAndUrlsCore(
+  text: string,
+  options: SplitPathsAndUrlsOptions,
+): SplitPathsAndUrlsResult {
+  const {
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel = '',
+    htmlPreviewLabel = '',
+    onOpenLocalWebPreview,
+    onCloudDocClick,
+    onRemoteDesktopClick,
+    compactPathBadge = false,
+    hoistImagePreviews = false,
+  } = options;
+  const hasCloudDocText = text.includes('[CloudDoc:') || text.includes('cdoc_');
+  const hasRemoteDesktopText = text.includes(REMOTE_DESKTOP_CITATION_PREFIX);
+  if (
+    !onPathClick
+    && !onUrlClick
+    && !onDownload
+    && !onHtmlPreview
+    && !onImagePreview
+    && !onOpenLocalWebPreview
+    && !onCloudDocClick
+    && !onRemoteDesktopClick
+    && !hasCloudDocText
+    && !hasRemoteDesktopText
+    && !compactPathBadge
+  ) {
+    return {
+      nodes: [<span>{text}</span>],
+      imagePreviews: [],
+      hasNonBadgeProse: text.trim().length > 0,
+    };
+  }
+  if (shouldSkipRichTextEnhancement(text)) {
+    return {
+      nodes: [<span>{text}</span>],
+      imagePreviews: [],
+      hasNonBadgeProse: text.trim().length > 0,
+    };
+  }
+
+  const imagePreviews: h.JSX.Element[] = [];
+  let hasNonBadgeProse = false;
+  let plainNodeCount = 0;
+
+  const nodes = splitTextWithCloudDocsAndUrls(text, {
+    onCloudDocClick,
+    onRemoteDesktopClick,
+    onUrlClick,
+    onOpenLocalWebPreview,
+    renderPlainText: (chunkText, baseOffset) => {
+      if ((!onPathClick && !onImagePreview && !compactPathBadge) || (!chunkText.includes('/') && !chunkText.includes('\\'))) {
+        if (chunkText.trim().length > 0) hasNonBadgeProse = true;
+        plainNodeCount += 1;
+        return [<span key={`t${baseOffset}`}>{chunkText}</span>];
+      }
+      const parts: h.JSX.Element[] = [];
+      let pathLast = 0;
+      PATH_REGEX.lastIndex = 0;
+      let pm: RegExpExecArray | null;
+      while ((pm = PATH_REGEX.exec(chunkText)) !== null) {
+        const path = pm[1];
+        if (path.length < 3) continue;
+        if (isLikelyDomainPath(path)) continue;
+        const leadingSlice = chunkText.slice(pathLast, pm.index);
+        const tagMatch = compactPathBadge ? /#(\d+):\($/.exec(leadingSlice) : null;
+        const hasClosingParen = !!tagMatch && chunkText[pm.index + pm[0].length] === ')';
+        const isTaggedAttachment = !!(tagMatch && hasClosingParen);
+        const useCompactBadge = compactPathBadge && isCompactBadgePath(path, isTaggedAttachment);
+        const prefixText = isTaggedAttachment
+          ? leadingSlice.slice(0, leadingSlice.length - tagMatch![0].length)
+          : leadingSlice;
+        const badgePrefix = isTaggedAttachment ? `#${tagMatch![1]}` : undefined;
+        if (prefixText.trim().length > 0) hasNonBadgeProse = true;
+        if (prefixText) parts.push(<span key={`t${baseOffset + pathLast}`}>{prefixText}</span>);
+        const isImage = !!onImagePreview && isLocalChatPath(path) && isImagePreviewPath(path);
+        const shouldHoist = hoistImagePreviews && isImage;
+        if (shouldHoist && onImagePreview) {
+          imagePreviews.push(
+            <ChatLocalImagePreview
+              key={`img${baseOffset + pm.index}`}
+              path={path}
+              loadImagePreview={onImagePreview}
+              onDownload={onDownload
+                ? async (downloadPath) => { await onDownload(downloadPath); }
+                : undefined}
+            />,
+          );
+        }
+        parts.push(renderChatPathActions({
+          key: `p${baseOffset + pm.index}`,
+          path,
+          compactPathBadge: useCompactBadge,
+          badgePrefix,
+          hideInlineImagePreview: shouldHoist,
+          labels: { download: downloadLabel, htmlPreview: htmlPreviewLabel },
+          handlers: { onPathClick, onDownload, onHtmlPreview, onImagePreview },
+        }));
+        pathLast = pm.index + pm[0].length + (isTaggedAttachment ? 1 : 0);
+      }
+      if (pathLast < chunkText.length) {
+        const trailing = chunkText.slice(pathLast);
+        if (trailing.trim().length > 0) hasNonBadgeProse = true;
+        parts.push(<span key={`t${baseOffset + pathLast}`}>{trailing}</span>);
+      }
+      const resolved = parts.length ? parts : [<span key={`t${baseOffset}`}>{chunkText}</span>];
+      if (!parts.length && chunkText.trim().length > 0) hasNonBadgeProse = true;
+      plainNodeCount += resolved.length;
+      return resolved;
+    },
+  });
+
+  if (nodes.length > plainNodeCount) {
+    hasNonBadgeProse = true;
+  }
+
+  return { nodes, imagePreviews, hasNonBadgeProse };
+}
+
 /** Split a plain-text segment into CloudDoc, RemoteDesktop, URL, path, and plain-text tokens. */
 function splitPathsAndUrls(
   text: string,
@@ -7904,43 +8108,18 @@ function splitPathsAndUrls(
   onCloudDocClick?: (docId: string) => void,
   onRemoteDesktopClick?: (targetId: string) => void,
 ): h.JSX.Element[] {
-  const hasCloudDocText = text.includes('[CloudDoc:') || text.includes('cdoc_');
-  const hasRemoteDesktopText = text.includes(REMOTE_DESKTOP_CITATION_PREFIX);
-  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview && !onOpenLocalWebPreview && !onCloudDocClick && !onRemoteDesktopClick && !hasCloudDocText && !hasRemoteDesktopText) {
-    return [<span>{text}</span>];
-  }
-  if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
-
-  return splitTextWithCloudDocsAndUrls(text, {
+  return splitPathsAndUrlsCore(text, {
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel,
+    htmlPreviewLabel,
+    onOpenLocalWebPreview,
     onCloudDocClick,
     onRemoteDesktopClick,
-    onUrlClick,
-    onOpenLocalWebPreview,
-    renderPlainText: (chunkText, baseOffset) => {
-      if ((!onPathClick && !onImagePreview) || (!chunkText.includes('/') && !chunkText.includes('\\'))) {
-        return [<span key={`t${baseOffset}`}>{chunkText}</span>];
-      }
-      const parts: h.JSX.Element[] = [];
-      let pathLast = 0;
-      PATH_REGEX.lastIndex = 0;
-      let pm: RegExpExecArray | null;
-      while ((pm = PATH_REGEX.exec(chunkText)) !== null) {
-        const path = pm[1];
-        if (path.length < 3) continue;
-        if (isLikelyDomainPath(path)) continue;
-        if (pm.index > pathLast) parts.push(<span key={`t${baseOffset + pathLast}`}>{chunkText.slice(pathLast, pm.index)}</span>);
-        parts.push(renderChatPathActions({
-          key: `p${baseOffset + pm.index}`,
-          path,
-          labels: { download: downloadLabel, htmlPreview: htmlPreviewLabel },
-          handlers: { onPathClick, onDownload, onHtmlPreview, onImagePreview },
-        }));
-        pathLast = pm.index + pm[0].length;
-      }
-      if (pathLast < chunkText.length) parts.push(<span key={`t${baseOffset + pathLast}`}>{chunkText.slice(pathLast)}</span>);
-      return parts.length ? parts : [<span key={`t${baseOffset}`}>{chunkText}</span>];
-    },
-  });
+  }).nodes;
 }
 
 /**

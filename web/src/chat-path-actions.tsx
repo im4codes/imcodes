@@ -47,6 +47,9 @@ export interface ChatPathActionOptions {
   asCode?: boolean;
   code?: boolean;
   pathClass?: string;
+  compactPathBadge?: boolean;
+  badgePrefix?: string;
+  hideInlineImagePreview?: boolean;
   labels?: ChatPathActionLabels;
   handlers?: ChatPathActionHandlers;
   onPathClick?: (path: string) => void;
@@ -55,6 +58,10 @@ export interface ChatPathActionOptions {
   onImagePreview?: ChatLocalImagePreviewLoader;
   downloadLabel?: string;
   htmlPreviewLabel?: string;
+}
+
+export function chatPathBasename(path: string): string {
+  return path.split(/[/\\]/).filter(Boolean).pop() || path;
 }
 
 const IMAGE_PREVIEW_EXTENSIONS = new Set([
@@ -92,6 +99,9 @@ function ChatPathActions({
   asCode = false,
   code,
   pathClass,
+  compactPathBadge = false,
+  badgePrefix,
+  hideInlineImagePreview = false,
   labels,
   handlers,
   onPathClick,
@@ -109,7 +119,7 @@ function ChatPathActions({
     download: downloadLabel ?? '',
     htmlPreview: htmlPreviewLabel ?? '',
   };
-  const nodeContent = children ?? content ?? path;
+  const nodeContent = children ?? content ?? (compactPathBadge ? chatPathBasename(path) : path);
   const shouldRenderCode = asCode || code;
   const resolvedPathClass = pathClass ?? (shouldRenderCode ? 'chat-inline-code chat-path-link' : 'chat-path-link');
   const pathLabel = resolvedHandlers.onPathClick
@@ -121,14 +131,18 @@ function ChatPathActions({
       : <span class={resolvedPathClass} title={path}>{nodeContent}</span>;
   const showDownload = !!resolvedHandlers.onDownload && chatPathHasFileExtension(path);
   const showHtmlPreview = canRenderHtmlPreviewAction(path, resolvedHandlers);
-  const showImagePreview = !!resolvedHandlers.onImagePreview && isLocalChatPath(path) && isImagePreviewPath(path);
+  const showImagePreview = !hideInlineImagePreview && !!resolvedHandlers.onImagePreview && isLocalChatPath(path) && isImagePreviewPath(path);
   const downloadTitle = downloadState === 'error' && downloadError
     ? downloadError
     : downloadResult || resolvedLabels.download;
+  const actionsClass = compactPathBadge ? 'chat-path-actions chat-path-actions-badge' : 'chat-path-actions';
 
   return (
     <>
-      <span class="chat-path-actions">
+      <span class={actionsClass}>
+        {compactPathBadge && badgePrefix && (
+          <span class="chat-path-badge-index">{badgePrefix}</span>
+        )}
         {pathLabel}
         {showDownload && (
           <button
