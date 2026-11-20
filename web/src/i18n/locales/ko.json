@@ -660,7 +660,8 @@
     "tts_speak": "읽어주기",
     "tts_stop": "읽기 중지",
     "tts_autoread_on": "새 응답 자동 읽기 켜기",
-    "tts_autoread_off": "자동 읽기 끄기 및 중지"
+    "tts_autoread_off": "자동 읽기 끄기 및 중지",
+    "tts_settings": "음성 설정"
   },
   "session": {
     "incognito": "시크릿 세션",

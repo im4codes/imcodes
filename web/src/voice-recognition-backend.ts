@@ -37,6 +37,15 @@ export function isHighQualityNativeTtsVoice(info?: NativeTtsVoiceQualityInfo | n
   return isSiriNativeVoiceIdentifier(info.voiceIdentifier);
 }
 
+export function getNativeTtsVoiceQualityLabelKey(info?: NativeTtsVoiceQualityInfo | null): string {
+  if (!info) return '';
+  if (info.quality === 'premium') return 'settings.tts_quality_premium';
+  if (info.quality === 'enhanced') return 'settings.tts_quality_enhanced';
+  if (isSiriNativeVoiceIdentifier(info.voiceIdentifier)) return 'settings.tts_quality_siri';
+  if (info.quality === 'default') return 'settings.tts_quality_default';
+  return '';
+}
+
 export interface NativeSystemTts {
   speak: (options: NativeTtsSpeakOptions) => Promise<void>;
   stopSpeaking: () => Promise<void>;

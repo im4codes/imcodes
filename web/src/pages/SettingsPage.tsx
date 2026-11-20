@@ -56,9 +56,9 @@ import {
   TTS_RATE_OPTIONS,
 } from '../tts.js';
 import {
+  getNativeTtsVoiceQualityLabelKey,
   isHighQualityNativeTtsVoice,
   isIosNativePlatform,
-  isSiriNativeVoiceIdentifier,
   type NativeTtsVoiceQualityInfo,
 } from '../voice-recognition-backend.js';
 
@@ -778,15 +778,8 @@ export function SettingsPage({
                     <div>{t('settings.tts_voice_hint')}</div>
                     {isIosNativePlatform() && nativeVoiceQuality?.voiceName?.trim() && (() => {
                       const voiceName = nativeVoiceQuality.voiceName.trim();
-                      const qualityLabel = nativeVoiceQuality.quality === 'premium'
-                        ? t('settings.tts_quality_premium')
-                        : nativeVoiceQuality.quality === 'enhanced'
-                          ? t('settings.tts_quality_enhanced')
-                          : isSiriNativeVoiceIdentifier(nativeVoiceQuality.voiceIdentifier)
-                            ? t('settings.tts_quality_siri')
-                            : nativeVoiceQuality.quality === 'default'
-                              ? t('settings.tts_quality_default')
-                              : '';
+                      const qualityKey = getNativeTtsVoiceQualityLabelKey(nativeVoiceQuality);
+                      const qualityLabel = qualityKey ? t(qualityKey) : '';
                       return (
                         <div data-testid="settings-tts-current-voice" style={{ marginTop: 4, color: '#cbd5e1' }}>
                           {qualityLabel

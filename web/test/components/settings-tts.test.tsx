@@ -227,6 +227,7 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
       expect(json.chat?.tts_stop, `${locale} chat.tts_stop`).toBeTruthy();
       expect(json.chat?.tts_autoread_on, `${locale} chat.tts_autoread_on`).toBeTruthy();
       expect(json.chat?.tts_autoread_off, `${locale} chat.tts_autoread_off`).toBeTruthy();
+      expect(json.chat?.tts_settings, `${locale} chat.tts_settings`).toBeTruthy();
       expect(json.settings?.tts_title, `${locale} settings.tts_title`).toBeTruthy();
       expect(json.settings?.tts_auto_read, `${locale} settings.tts_auto_read`).toBeTruthy();
       expect(json.settings?.tts_auto_read_desc, `${locale} settings.tts_auto_read_desc`).toBeTruthy();

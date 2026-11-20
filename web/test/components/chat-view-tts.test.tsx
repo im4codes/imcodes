@@ -2,12 +2,22 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TimelineEvent } from '../../src/ws-client.js';
 
 const i18nMock = vi.hoisted(() => ({
   language: 'en-US',
+}));
+
+const nativeMocks = vi.hoisted(() => ({
+  streamingPlugin: {} as Record<string, unknown>,
+}));
+
+vi.mock('@capacitor/core', () => ({
+  registerPlugin: () => new Proxy({}, {
+    get: (_target, prop) => (nativeMocks.streamingPlugin as Record<PropertyKey, unknown>)[prop],
+  }),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -16,6 +26,21 @@ vi.mock('react-i18next', () => ({
       const enDict: Record<string, string> = {
         'chat.tts_speak': 'Read aloud',
         'chat.tts_stop': 'Stop reading',
+        'chat.tts_autoread_on': 'Enable auto-read replies',
+        'chat.tts_autoread_off': 'Disable auto-read and stop speaking',
+        'chat.tts_settings': 'Voice settings',
+        'common.on': 'On',
+        'common.off': 'Off',
+        'settings.tts_auto_read': 'Auto-read new replies',
+        'settings.tts_rate': 'Speech rate',
+        'settings.tts_current_voice': 'Current voice: {{name}} ({{quality}})',
+        'settings.tts_quality_premium': 'Premium',
+        'settings.tts_quality_enhanced': 'Enhanced',
+        'settings.tts_quality_siri': 'Siri',
+        'settings.tts_quality_default': 'Default',
+        'settings.tts_ios_enhanced_hint': 'Currently using a standard iOS voice.',
+        'settings.tts_open_ios_settings': 'Open iOS Voice Settings',
+        'settings.tts_open_android_settings': 'Open Android TTS Settings',
         'common.copy': 'Copy',
         'common.copied': 'Copied',
         'taskPair.card_untitled': 'Untitled task',
@@ -110,6 +135,7 @@ describe('ChatView system TTS integration', () => {
     i18nMock.language = 'en-US';
     spoken = [];
     cancelMock = vi.fn();
+    nativeMocks.streamingPlugin = {};
     vi.stubGlobal('Capacitor', undefined);
     vi.stubGlobal('matchMedia', vi.fn(() => ({
       matches: false,
@@ -291,19 +317,27 @@ describe('ChatView system TTS integration', () => {
     );
 
     const usageBtn = container.querySelector('.chat-session-usage-btn');
+    const controlGroup = container.querySelector('.chat-tts-control-group');
     const speakerBtn = container.querySelector('.chat-tts-autoread-btn') as HTMLButtonElement | null;
+    const settingsBtn = container.querySelector('.chat-tts-settings-btn') as HTMLButtonElement | null;
     expect(usageBtn).toBeTruthy();
+    expect(controlGroup).toBeTruthy();
     expect(speakerBtn).toBeTruthy();
-    expect(usageBtn?.nextElementSibling).toBe(speakerBtn);
+    expect(settingsBtn).toBeTruthy();
+    expect(usageBtn?.nextElementSibling?.className).toBe('chat-tts-control-wrap');
+    expect(controlGroup?.contains(speakerBtn)).toBe(true);
+    expect(controlGroup?.contains(settingsBtn)).toBe(true);
+    expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
     expect(speakerBtn?.getAttribute('aria-pressed')).toBe('false');
     expect(getTtsAutoReadEnabled()).toBe(false);
 
-    // Toggle on -> aria-pressed=true, persists auto-read=true
+    // Toggle on -> aria-pressed=true, persists auto-read=true and does NOT open popover
     await act(async () => {
       fireEvent.click(speakerBtn!);
     });
     expect(speakerBtn?.getAttribute('aria-pressed')).toBe('true');
     expect(getTtsAutoReadEnabled()).toBe(true);
+    expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
 
     // File-list-only assistant reply -> not auto-read and has no per-message read button
     await act(async () => {
@@ -437,5 +471,225 @@ describe('ChatView system TTS integration', () => {
     expect(spoken[3].text).toBe('任务「Fix login」，第 2 轮返工');
     await act(async () => { spoken[3].onend?.(); });
     expect(spoken[4].text).toBe('任务「Fix login」，审核通过');
+  });
+
+  it('opens compact voice quick-settings popover, syncs auto-read & rate bidirectionally, and closes on outside click or Escape', async () => {
+    const {
+      getTtsAutoReadEnabled,
+      getTtsSpeechRate,
+      setTtsSpeechRate,
+      setTtsAutoReadEnabled,
+    } = await import('../../src/tts.js');
+    const { ChatView } = await import('../../src/components/ChatView.js');
+
+    // Preview mode or missing sessionId omits segmented TTS control group completely
+    const previewRender = render(
+      <ChatView events={[makeAssistantEvent('p1', 'Preview reply.', 1000)]} loading={false} sessionId="sess-1" preview={true} visible={true} />,
+    );
+    expect(previewRender.container.querySelector('.chat-tts-control-group')).toBeNull();
+    previewRender.unmount();
+
+    const noSessionRender = render(
+      <ChatView events={[makeAssistantEvent('p2', 'No session.', 1000)]} loading={false} visible={true} />,
+    );
+    expect(noSessionRender.container.querySelector('.chat-tts-control-group')).toBeNull();
+    noSessionRender.unmount();
+
+    const { container } = render(
+      <div>
+        <div data-testid="outside-area">outside</div>
+        <ChatView
+          events={[makeAssistantEvent('m1', 'Ready to read.', 1000)]}
+          loading={false}
+          sessionId="sess-1"
+          visible={true}
+        />
+      </div>,
+    );
+
+    const speakerBtn = container.querySelector('.chat-tts-autoread-btn') as HTMLButtonElement;
+    const settingsBtn = screen.getByTestId('chat-tts-settings-btn');
+    expect(settingsBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
+
+    // Open popover on web -> Web hides native section
+    await act(async () => {
+      fireEvent.click(settingsBtn);
+    });
+    expect(settingsBtn.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByTestId('chat-tts-settings-popover')).toBeTruthy();
+    expect(screen.queryByTestId('chat-tts-settings-native-section')).toBeNull();
+
+    // Toggle auto-read inside popover -> syncs left speaker button + localStorage, and stops speaking when disabled
+    const popoverSwitch = screen.getByTestId('chat-tts-settings-autoread-toggle');
+    expect(popoverSwitch.getAttribute('aria-checked')).toBe('false');
+    await act(async () => {
+      fireEvent.click(popoverSwitch);
+    });
+    expect(popoverSwitch.getAttribute('aria-checked')).toBe('true');
+    expect(speakerBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(getTtsAutoReadEnabled()).toBe(true);
+
+    const callsBeforeStop = cancelMock.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(popoverSwitch);
+    });
+    expect(popoverSwitch.getAttribute('aria-checked')).toBe('false');
+    expect(speakerBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(getTtsAutoReadEnabled()).toBe(false);
+    expect(cancelMock.mock.calls.length).toBeGreaterThan(callsBeforeStop);
+
+    // External SettingsPage update reflects inside open popover immediately
+    await act(async () => {
+      setTtsAutoReadEnabled(true);
+      setTtsSpeechRate(1.25);
+    });
+    expect(popoverSwitch.getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByTestId('chat-tts-settings-rate-1.25').getAttribute('aria-pressed')).toBe('true');
+
+    // Selecting rate inside popover updates getTtsSpeechRate & pressed state
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('chat-tts-settings-rate-1.5'));
+    });
+    expect(getTtsSpeechRate()).toBe(1.5);
+    expect(screen.getByTestId('chat-tts-settings-rate-1.5').getAttribute('aria-pressed')).toBe('true');
+
+    // Escape closes popover; reopening and clicking outside closes popover
+    await act(async () => {
+      fireEvent.keyDown(document, { key: 'Escape' });
+    });
+    expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
+    expect(settingsBtn.getAttribute('aria-expanded')).toBe('false');
+
+    await act(async () => {
+      fireEvent.click(settingsBtn);
+    });
+    expect(screen.getByTestId('chat-tts-settings-popover')).toBeTruthy();
+    await waitFor(async () => {
+      fireEvent.mouseDown(screen.getByTestId('outside-area'));
+      expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
+    });
+
+    // Clicking inside the popover / control group does NOT close it; pointerdown outside does close it
+    await act(async () => {
+      fireEvent.click(settingsBtn);
+    });
+    expect(screen.getByTestId('chat-tts-settings-popover')).toBeTruthy();
+    await act(async () => {
+      fireEvent.mouseDown(screen.getByTestId('chat-tts-settings-popover'));
+    });
+    expect(screen.getByTestId('chat-tts-settings-popover')).toBeTruthy();
+    await waitFor(async () => {
+      screen.getByTestId('outside-area').dispatchEvent(new Event('pointerdown', { bubbles: true }));
+      expect(screen.queryByTestId('chat-tts-settings-popover')).toBeNull();
+    });
+  });
+
+  it('lazy-loads native iOS voice info & openTtsSettings only when popover opens, and omits missing native capabilities cleanly', async () => {
+    const getVoiceMock = vi.fn().mockResolvedValue({
+      quality: 'default',
+      language: 'zh-CN',
+      voiceName: 'Tingting',
+      voiceIdentifier: 'com.apple.voice.compact.zh-CN.Tingting',
+    });
+    const openSettingsMock = vi.fn().mockResolvedValue({ opened: true });
+
+    vi.stubGlobal('Capacitor', {
+      isNativePlatform: () => true,
+      isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+      getPlatform: () => 'ios',
+    });
+    nativeMocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      getTtsVoiceQuality: getVoiceMock,
+      openTtsSettings: openSettingsMock,
+    };
+
+    const { ChatView } = await import('../../src/components/ChatView.js');
+    const rIos = render(
+      <ChatView events={[makeAssistantEvent('m1', 'Hello.', 1000)]} loading={false} sessionId="sess-1" visible={true} />,
+    );
+
+    // Closed popover must NOT probe native voice quality eagerly
+    expect(getVoiceMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('chat-tts-settings-btn'));
+    });
+
+    await waitFor(() => {
+      expect(getVoiceMock).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('chat-tts-settings-current-voice').textContent).toBe('Current voice: Tingting (Default)');
+    });
+    expect(screen.getByTestId('chat-tts-settings-ios-hint')).toBeTruthy();
+
+    const openBtn = screen.getByTestId('chat-tts-settings-open-native-btn');
+    expect(openBtn.textContent).toBe('Open iOS Voice Settings');
+    await act(async () => {
+      fireEvent.click(openBtn);
+    });
+    expect(openSettingsMock).toHaveBeenCalledTimes(1);
+    rIos.unmount();
+
+    // Siri neural voice suppresses standard iOS warning
+    getVoiceMock.mockResolvedValueOnce({
+      quality: 'default',
+      language: 'zh-CN',
+      voiceName: 'Yushu',
+      voiceIdentifier: 'com.apple.ttsbundle.siri_yu-shu_zh-CN_compact',
+    });
+    const rSiri = render(
+      <ChatView events={[makeAssistantEvent('m2', 'Hello Siri.', 1000)]} loading={false} sessionId="sess-1" visible={true} />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('chat-tts-settings-btn'));
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-tts-settings-current-voice').textContent).toBe('Current voice: Yushu (Siri)');
+    });
+    expect(screen.queryByTestId('chat-tts-settings-ios-hint')).toBeNull();
+    rSiri.unmount();
+
+    // Android native shows Android open-settings button without iOS-only voice/hint
+    const androidOpenMock = vi.fn().mockResolvedValue({ opened: true });
+    vi.stubGlobal('Capacitor', {
+      isNativePlatform: () => true,
+      isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+      getPlatform: () => 'android',
+    });
+    nativeMocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+      openTtsSettings: androidOpenMock,
+    };
+    const rAndroid = render(
+      <ChatView events={[makeAssistantEvent('m3', 'Hello Android.', 1000)]} loading={false} sessionId="sess-1" visible={true} />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('chat-tts-settings-btn'));
+    });
+    const androidOpenBtn = screen.getByTestId('chat-tts-settings-open-native-btn');
+    expect(androidOpenBtn.textContent).toBe('Open Android TTS Settings');
+    await act(async () => {
+      fireEvent.click(androidOpenBtn);
+    });
+    expect(androidOpenMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('chat-tts-settings-current-voice')).toBeNull();
+    expect(screen.queryByTestId('chat-tts-settings-ios-hint')).toBeNull();
+    rAndroid.unmount();
+
+    // Legacy native shell without openTtsSettings / getTtsVoiceQuality hides native section cleanly
+    nativeMocks.streamingPlugin = {
+      speak: vi.fn().mockResolvedValue(undefined),
+      stopSpeaking: vi.fn().mockResolvedValue(undefined),
+    };
+    render(
+      <ChatView events={[makeAssistantEvent('m4', 'Hello Legacy.', 1000)]} loading={false} sessionId="sess-1" visible={true} />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('chat-tts-settings-btn'));
+    });
+    expect(screen.queryByTestId('chat-tts-settings-native-section')).toBeNull();
   });
 });

@@ -660,7 +660,8 @@
     "tts_speak": "朗读",
     "tts_stop": "停止朗读",
     "tts_autoread_on": "开启自动播报新回复",
-    "tts_autoread_off": "关闭自动播报并停止朗读"
+    "tts_autoread_off": "关闭自动播报并停止朗读",
+    "tts_settings": "语音设置"
   },
   "session": {
     "incognito": "无痕会话",

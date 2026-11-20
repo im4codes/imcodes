@@ -660,7 +660,8 @@
     "tts_speak": "読み上げ",
     "tts_stop": "読み上げ停止",
     "tts_autoread_on": "新しい返信の自動読み上げを有効にする",
-    "tts_autoread_off": "自動読み上げをオフにして停止"
+    "tts_autoread_off": "自動読み上げをオフにして停止",
+    "tts_settings": "音声設定"
   },
   "session": {
     "incognito": "シークレットセッション",

@@ -660,7 +660,8 @@
     "tts_speak": "Read aloud",
     "tts_stop": "Stop reading",
     "tts_autoread_on": "Enable auto-read replies",
-    "tts_autoread_off": "Disable auto-read and stop speaking"
+    "tts_autoread_off": "Disable auto-read and stop speaking",
+    "tts_settings": "Voice settings"
   },
   "session": {
     "incognito": "Incognito session",

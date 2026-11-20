@@ -107,6 +107,7 @@ import {
   type TtsPlaybackState,
 } from '../tts.js';
 import { formatTaskPairTtsAnnouncement } from '../task-pair-tts.js';
+import { TtsQuickSettingsPopover } from './TtsQuickSettingsPopover.js';
 import { claimRunKey } from './chat-run-keys.js';
 import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, reconcileTopOffset, topOffsetStyle, type ReaderAnchor } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
@@ -2978,8 +2979,16 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
 
   const [ttsState, setTtsState] = useState<TtsPlaybackState>(() => getTtsState());
   const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
+  const [ttsSettingsOpen, setTtsSettingsOpen] = useState(false);
+  const ttsControlRef = useRef<HTMLDivElement>(null);
+  const handleCloseTtsSettings = useCallback(() => {
+    setTtsSettingsOpen(false);
+  }, []);
   const ttsSupported = isTtsSupported();
   const ttsOwnedSessionRef = useRef(false);
+  useEffect(() => {
+    setTtsSettingsOpen(false);
+  }, [sessionId, preview]);
   useEffect(() => subscribeTtsState(setTtsState), []);
   useEffect(() => subscribeTtsPreferences(() => setTtsAutoRead(getTtsAutoReadEnabled())), []);
   useEffect(() => {
@@ -5136,35 +5145,61 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               </button>
             )}
             {sessionId && !preview && ttsSupported && (
-              <button
-                type="button"
-                class={`chat-tts-autoread-btn${ttsAutoRead ? ' is-active' : ''}${ttsAutoRead && ttsState.status === 'speaking' ? ' is-speaking' : ''}`}
-                title={ttsAutoRead ? t('chat.tts_autoread_off') : t('chat.tts_autoread_on')}
-                aria-label={ttsAutoRead ? t('chat.tts_autoread_off') : t('chat.tts_autoread_on')}
-                aria-pressed={ttsAutoRead}
-                onClick={() => {
-                  const next = !ttsAutoRead;
-                  setTtsAutoReadEnabled(next);
-                  setTtsAutoRead(next);
-                  if (!next) {
-                    void stopSpeaking();
-                  }
-                }}
-              >
-                {ttsAutoRead ? (
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-                  </svg>
-                ) : (
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                    <line x1="22" y1="9" x2="16" y2="15" />
-                    <line x1="16" y1="9" x2="22" y2="15" />
-                  </svg>
+              <div ref={ttsControlRef} class="chat-tts-control-wrap">
+                <div class="chat-tts-control-group" data-testid="chat-tts-control-group">
+                  <button
+                    type="button"
+                    class={`chat-tts-autoread-btn${ttsAutoRead ? ' is-active' : ''}${ttsAutoRead && ttsState.status === 'speaking' ? ' is-speaking' : ''}`}
+                    title={ttsAutoRead ? t('chat.tts_autoread_off') : t('chat.tts_autoread_on')}
+                    aria-label={ttsAutoRead ? t('chat.tts_autoread_off') : t('chat.tts_autoread_on')}
+                    aria-pressed={ttsAutoRead}
+                    onClick={() => {
+                      const next = !ttsAutoRead;
+                      setTtsAutoReadEnabled(next);
+                      setTtsAutoRead(next);
+                      if (!next) {
+                        void stopSpeaking();
+                      }
+                    }}
+                  >
+                    {ttsAutoRead ? (
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                        <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                        <line x1="22" y1="9" x2="16" y2="15" />
+                        <line x1="16" y1="9" x2="22" y2="15" />
+                      </svg>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    class={`chat-tts-settings-btn${ttsSettingsOpen ? ' is-open' : ''}`}
+                    data-testid="chat-tts-settings-btn"
+                    title={t('chat.tts_settings')}
+                    aria-label={t('chat.tts_settings')}
+                    aria-expanded={ttsSettingsOpen}
+                    aria-haspopup="dialog"
+                    onClick={() => setTtsSettingsOpen((prev) => !prev)}
+                  >
+                    <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="3" />
+                      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                    </svg>
+                  </button>
+                </div>
+                {ttsSettingsOpen && (
+                  <TtsQuickSettingsPopover
+                    anchorRef={ttsControlRef}
+                    locale={locale}
+                    onClose={handleCloseTtsSettings}
+                  />
                 )}
-              </button>
+              </div>
             )}
           </div>
         )}

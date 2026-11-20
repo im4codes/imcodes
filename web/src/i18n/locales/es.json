@@ -660,7 +660,8 @@
     "tts_speak": "Leer en voz alta",
     "tts_stop": "Detener lectura",
     "tts_autoread_on": "Activar lectura automática de respuestas",
-    "tts_autoread_off": "Desactivar lectura automática y detener"
+    "tts_autoread_off": "Desactivar lectura automática y detener",
+    "tts_settings": "Ajustes de voz"
   },
   "session": {
     "incognito": "Sesión de incógnito",
