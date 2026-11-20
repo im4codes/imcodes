@@ -2,9 +2,11 @@ import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '../../../shared/desktop-setup-auth.js';
 import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import type { Env } from '../env.js';
-import { createUser, getUserByPlatformId, upsertPlatformIdentity } from '../db/queries.js';
+import { createUser, getSetting, getUserByPlatformId, updateUserStatus, upsertPlatformIdentity } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
+import { rateLimiter } from '../security/lockout.js';
 import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 import logger from '../util/logger.js';
 
@@ -117,11 +119,33 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
 
     if (relayToken) {
       const payload = verifyJwt(relayToken, c.env.JWT_SIGNING_KEY);
-      if (!payload || payload.type !== 'auth-relay' || !payload.sub) {
+      if (
+        !payload
+        || payload.type !== 'auth-relay'
+        || typeof payload.sub !== 'string'
+        || !payload.sub
+        || typeof payload.jti !== 'string'
+        || !payload.jti
+      ) {
         return c.json({ error: 'invalid_relay_token' }, 401);
       }
-      userId = payload.sub as string;
-      targetOrigin = (payload.origin as string) ?? null;
+      const actualOrigin = resolveCurrentOAuthOrigin(c);
+      if (typeof payload.origin !== 'string' || payload.origin !== actualOrigin) {
+        return c.json({ error: 'invalid_relay_origin' }, 401);
+      }
+      const relayNonce = `oauth-relay:${payload.jti}`;
+      if (!rateLimiter.consumeJti(relayNonce, 120_000)) {
+        return c.json({ error: 'relay_token_replayed' }, 401);
+      }
+      const consumedNonce = await c.env.DB.queryOne<{ user_id: string }>(
+        'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 RETURNING user_id',
+        [relayNonce, Date.now()],
+      );
+      if (!consumedNonce || consumedNonce.user_id !== payload.sub) {
+        return c.json({ error: 'relay_token_replayed' }, 401);
+      }
+      userId = payload.sub;
+      targetOrigin = payload.origin;
       desktopCallback = typeof payload.desktopCallback === 'string'
         ? parseDesktopSetupCallbackUrl(payload.desktopCallback)?.href ?? null
         : null;
@@ -176,7 +200,15 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
 
       let user = await getUserByPlatformId(c.env.DB, config.provider, exchanged.platformUserId);
       if (!user) {
+        const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
+        if (regEnabled === 'false') {
+          return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
+        }
         user = await createUser(c.env.DB, randomHex(16));
+        const requireApproval = await getSetting(c.env.DB, 'require_approval');
+        if (requireApproval === 'true') {
+          await updateUserStatus(c.env.DB, user.id, 'pending');
+        }
         await upsertPlatformIdentity(c.env.DB, randomHex(16), user.id, config.provider, exchanged.platformUserId);
       }
       userId = user.id;
@@ -185,14 +217,25 @@ export function createPrimaryOAuthRoutes(config: PrimaryOAuthConfig) {
       if (!loginDecision.ok) return c.json({ error: loginDecision.code }, 403);
 
       if (isCrossDomain && targetOrigin) {
+        const jti = randomHex(16);
+        const now = Date.now();
+        const relayNonce = `oauth-relay:${jti}`;
+        await c.env.DB.execute(
+          'DELETE FROM auth_nonces WHERE key_id = $1 AND expires_at < $2',
+          ['oauth-relay', now],
+        );
+        await c.env.DB.execute(
+          'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+          [relayNonce, '', userId, 'oauth-relay', now + 120_000, now],
+        );
         const relay = signJwt(
-          { sub: userId, type: 'auth-relay', origin: targetOrigin, ...(desktopCallback ? { desktopCallback } : {}) },
+          { sub: userId, type: 'auth-relay', origin: targetOrigin, jti, ...(desktopCallback ? { desktopCallback } : {}) },
           c.env.JWT_SIGNING_KEY,
           120,
         );
         const relayUrl = new URL(`${targetOrigin}${config.callbackPath}`);
         relayUrl.searchParams.set('relay_token', relay);
-        logger.info({ provider: config.provider, relayUrl: relayUrl.toString() }, 'oauth callback: relaying to proxy domain with token');
+        logger.info({ provider: config.provider, targetOrigin }, 'oauth callback: relaying to proxy domain with token');
         return c.redirect(relayUrl.toString());
       }
     }

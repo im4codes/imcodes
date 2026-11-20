@@ -39,6 +39,17 @@ function makeMemDb(): Database {
         }
         return null;
       }
+      if (s.includes('update refresh_tokens set used_at = $1 where token_hash = $2') && s.includes('returning')) {
+        const now = params[0] as number;
+        const tokenHash = params[1] as string;
+        for (const rt of refreshTokens.values()) {
+          if (rt.token_hash === tokenHash && rt.used_at === null && rt.expires_at > now) {
+            rt.used_at = now;
+            return { id: rt.id, user_id: rt.user_id, family_id: rt.family_id } as T;
+          }
+        }
+        return null;
+      }
       if (s.includes('from refresh_tokens where token_hash')) {
         const now = params[1] as number;
         for (const rt of refreshTokens.values()) {

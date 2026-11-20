@@ -119,6 +119,12 @@ function makeMemDb() {
         }
         return null;
       }
+      if (s.includes('delete from passkey_challenges where id = $1 and expires_at > $2 returning')) {
+        const row = challenges.get(String(params[0]));
+        if (!row || row.expires_at <= Number(params[1])) return null;
+        challenges.delete(String(params[0]));
+        return { challenge: row.challenge, user_id: row.user_id, display_name: row.display_name } as T;
+      }
       if (s.includes('from passkey_challenges where id')) {
         const row = challenges.get(String(params[0]));
         if (!row) return null;

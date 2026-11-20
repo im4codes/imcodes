@@ -365,7 +365,17 @@ function createInMemoryDb() {
         return (row ?? null) as unknown as T | null;
       }
 
-      // Refresh token lookup
+      // Refresh token lookup / atomic rotation
+      if (normSql.startsWith('UPDATE refresh_tokens SET used_at = $1 WHERE token_hash = $2') && normSql.includes('RETURNING')) {
+        const now = Number(params[0]);
+        const tokenHash = params[1] as string;
+        const row = [...refreshTokens.values()].find(
+          (r) => r.token_hash === tokenHash && r.revoked_at === null && r.expires_at > now,
+        );
+        if (!row) return null;
+        row.revoked_at = now;
+        return row as unknown as T;
+      }
       if (normSql.includes('FROM refresh_tokens WHERE token_hash = $1')) {
         const tokenHash = params[0] as string;
         const now = typeof params[1] === 'number' ? params[1] : 0;

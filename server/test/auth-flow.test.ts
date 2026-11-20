@@ -50,6 +50,14 @@ function makeMemDb(): Database {
         }
         return null;
       }
+      if (s.includes('delete from pending_binds where code') && s.includes('returning')) {
+        const b = pendingBinds.get(params[0] as string);
+        if (b && b.expires_at > (params[1] as number)) {
+          pendingBinds.delete(params[0] as string);
+          return b as T;
+        }
+        return null;
+      }
       if (s.includes('from pending_binds where code')) {
         const b = pendingBinds.get(params[0] as string);
         if (b && b.expires_at > (params[1] as number)) return b as T;

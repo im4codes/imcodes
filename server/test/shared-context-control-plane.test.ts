@@ -113,6 +113,20 @@ function makeMockDb() {
       if (s.includes('select * from teams where id = $1')) {
         return (teams.get(params[0] as string) ?? null) as T | null;
       }
+      if (s.includes('update team_invites set used_at = $1 where token = $2 and used_at is null and expires_at > $1 returning')) {
+        const now = Number(params[0]);
+        const invite = [...invites.values()].find((entry) => entry.token === params[1]);
+        if (!invite || invite.used_at != null || invite.expires_at <= now) return null;
+        invite.used_at = now;
+        return invite as T;
+      }
+      if (s.includes('update team_invites set used_at = $1 where token = $2 and team_id = $3 and used_at is null and expires_at > $1 returning')) {
+        const now = Number(params[0]);
+        const invite = [...invites.values()].find((entry) => entry.token === params[1] && entry.team_id === params[2]);
+        if (!invite || invite.used_at != null || invite.expires_at <= now) return null;
+        invite.used_at = now;
+        return invite as T;
+      }
       if (s.includes('select * from team_invites where token = $1')) {
         const invite = [...invites.values()].find((entry) => entry.token === params[0]);
         if (!invite) return null;

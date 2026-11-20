@@ -61,6 +61,16 @@ function makeMemDb(): Database {
         }
         return null;
       }
+      if (s.includes('update refresh_tokens set used_at = $1 where token_hash = $2') && s.includes('returning')) {
+        const now = Number(params[0]);
+        for (const token of refreshTokens.values()) {
+          if (token.token_hash === params[1] && token.used_at === null && token.expires_at > now) {
+            token.used_at = now;
+            return token as T;
+          }
+        }
+        return null;
+      }
       if (s.includes('from refresh_tokens where token_hash')) {
         for (const token of refreshTokens.values()) {
           if (token.token_hash === params[0] && token.used_at === null && token.expires_at > Number(params[1])) return token as T;
@@ -155,6 +165,12 @@ function makeMemDb(): Database {
         if (user) {
           user.password_hash = params[0] as string;
           user.password_must_change = false;
+        }
+      }
+      if (s.includes('update refresh_tokens set used_at = $1 where user_id = $2')) {
+        const now = Number(params[0]);
+        for (const rt of refreshTokens.values()) {
+          if (rt.user_id === params[1] && rt.used_at === null) rt.used_at = now;
         }
       }
       if (s.includes('update users set username') && s.includes('password_hash') && s.includes('display_name')) {

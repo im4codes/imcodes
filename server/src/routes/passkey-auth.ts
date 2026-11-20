@@ -69,15 +69,60 @@ async function storeRefreshToken(db: Env['DB'], userId: string, refreshHash: str
 }
 
 /**
+ * Validate and canonicalize native callback URLs to the custom `imcodes://` scheme.
+ */
+function validateNativeCallbackUrl(raw: string | undefined): string | null {
+  if (!raw) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'imcodes:') return null;
+  return parsed.toString();
+}
+
+function safeInlineJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function escapeRefreshAttrUrl(value: string): string {
+  return value
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '%3C')
+    .replace(/>/g, '%3E');
+}
+
+function setNativePageSecurityHeaders(c: Context<HonoEnv>, nonce: string): void {
+  c.header(
+    'Content-Security-Policy',
+    `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
+  );
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
+}
+
+/**
  * Return an HTML page that redirects to a custom URL scheme.
  * ASWebAuthenticationSession reliably detects page-level navigations
  * but may not follow HTTP 302 redirects to non-HTTP schemes.
  */
 function nativeRedirectPage(c: Context<HonoEnv>, url: string): Response {
+  const validated = validateNativeCallbackUrl(url);
+  if (!validated) return c.text('Invalid callback URL', 400);
+  const nonce = randomHex(16);
+  setNativePageSecurityHeaders(c, nonce);
   const html = `<!DOCTYPE html><html><head>
-<meta http-equiv="refresh" content="0;url=${url.replace(/"/g, '&quot;')}">
+<meta http-equiv="refresh" content="0;url=${escapeRefreshAttrUrl(validated)}">
 </head><body>
-<script>window.location.href=${JSON.stringify(url)};</script>
+<script nonce="${nonce}">window.location.href=${safeInlineJson(validated)};</script>
 </body></html>`;
   return c.html(html);
 }
@@ -141,10 +186,12 @@ async function getChallenge(db: Env['DB'], id: string): Promise<PendingChallenge
 }
 
 async function consumeChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
-  const row = await getChallenge(db, id);
+  const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
+    'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 RETURNING challenge, user_id, display_name',
+    [id, Date.now()],
+  );
   if (!row) return null;
-  await db.execute('DELETE FROM passkey_challenges WHERE id = $1', [id]);
-  return row;
+  return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
 }
 
 async function listUserCredentialIds(db: Env['DB'], userId: string): Promise<Array<{ id: string; type: 'public-key' }>> {
@@ -333,6 +380,7 @@ passkeyRoutes.post('/register/complete', async (c) => {
   if (existing) return c.json({ error: 'credential_already_registered' }, 409);
 
   let userId = pending.userId;
+  let isPending = false;
   if (!userId) {
     userId = randomHex(16);
     await createUser(c.env.DB, userId);
@@ -344,6 +392,7 @@ passkeyRoutes.post('/register/complete', async (c) => {
     const { getSetting, updateUserStatus } = await import('../db/queries.js');
     const requireApproval = await getSetting(c.env.DB, 'require_approval');
     if (requireApproval === 'true') {
+      isPending = true;
       await updateUserStatus(c.env.DB, userId, 'pending');
     }
   } else {
@@ -368,9 +417,18 @@ passkeyRoutes.post('/register/complete', async (c) => {
     details: { credentialId: credentialID },
   }, c.env.DB);
 
+  // Do not mint API keys or session cookies for pending accounts awaiting admin approval
+  if (isPending) {
+    return c.json({ ok: true, pending: true });
+  }
+
   // Native callback: issue API key + redirect (skip the second login round-trip)
-  const nativeCallback = c.req.query('native_callback');
-  if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
+  if (nativeCallback) {
     return issueNativeAuthRedirect(c, userId, nativeCallback, { keyLabel: 'mobile-app' });
   }
 
@@ -452,10 +510,13 @@ passkeyRoutes.post('/login/complete', async (c) => {
   }
 
   const now = Date.now();
-  await c.env.DB.execute(
-    'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
-    [verification.authenticationInfo.newCounter, now, storedCred.id],
+  const counterUpdate = await c.env.DB.execute(
+    'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3 AND counter = $4',
+    [verification.authenticationInfo.newCounter, now, storedCred.id, storedCred.counter],
   );
+  if (counterUpdate.changes === 0) {
+    return c.json({ error: 'verification_failed' }, 409);
+  }
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
   await logAuthAudit(c, {
@@ -467,11 +528,15 @@ passkeyRoutes.post('/login/complete', async (c) => {
 
   const isNativeReq = c.req.query('native') === '1';
 
-  const nativeCallback = c.req.query('native_callback');
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
   if (isNativeReq || nativeCallback) {
     // Native app: return a persistent API key instead of setting session cookies.
     // The client stores this key in biometric-protected storage.
-    if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+    if (nativeCallback) {
       // If native_callback is provided, redirect via HTTP 302 so ASWebAuthenticationSession
       // detects the custom-scheme navigation (JS window.location.href is unreliable).
       return issueNativeAuthRedirect(c, user.id, nativeCallback, { keyLabel: 'mobile-app' });
@@ -585,10 +650,11 @@ passkeyRoutes.post('/password/setup', async (c) => {
         [challengeId, Date.now(), userId],
       );
       if (deleted.changes === 0) throw new Error('challenge_expired');
-      await tx.execute(
-        'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
-        [verification.authenticationInfo.newCounter, now, storedCred.id],
+      const counterUpdate = await tx.execute(
+        'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3 AND counter = $4',
+        [verification.authenticationInfo.newCounter, now, storedCred.id, storedCred.counter],
       );
+      if (counterUpdate.changes === 0) throw new Error('verification_failed');
       await tx.execute(
         'UPDATE users SET username = $1, password_hash = $2, password_must_change = false WHERE id = $3',
         [normalizedUsername, newHash, userId],
@@ -597,6 +663,9 @@ passkeyRoutes.post('/password/setup', async (c) => {
   } catch (err) {
     if (err instanceof Error && err.message === 'challenge_expired') {
       return c.json({ error: 'challenge_expired' }, 400);
+    }
+    if (err instanceof Error && err.message === 'verification_failed') {
+      return c.json({ error: 'verification_failed' }, 409);
     }
     if (isUniqueViolation(err)) {
       return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
@@ -612,8 +681,12 @@ passkeyRoutes.post('/password/setup', async (c) => {
     details: { credentialId: storedCred.id },
   }, c.env.DB);
 
-  const nativeCallback = c.req.query('native_callback');
-  if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+  const rawNativeCallback = c.req.query('native_callback');
+  const nativeCallback = validateNativeCallbackUrl(rawNativeCallback);
+  if (rawNativeCallback !== undefined && !nativeCallback) {
+    return c.json({ error: 'invalid_callback' }, 400);
+  }
+  if (nativeCallback) {
     return issueNativeAuthRedirect(c, userId, nativeCallback, {
       keyLabel: 'mobile-password-setup',
       includeLegacyParams: false,
@@ -666,17 +739,20 @@ passkeyRoutes.get('/credentials', async (c) => {
 // Lightweight self-contained HTML page for native iOS passkey auth.
 // Replaces loading the full SPA bundle in ASWebAuthenticationSession.
 passkeyRoutes.get('/native', async (c) => {
-  const callback = c.req.query('callback');
+  const validatedCallback = validateNativeCallbackUrl(c.req.query('callback'));
   const action = c.req.query('action') === 'register' ? 'register' : 'login';
 
-  if (!callback || !callback.startsWith('imcodes://')) {
+  if (!validatedCallback) {
     return c.text('Invalid callback URL', 400);
   }
+
+  const nonce = randomHex(16);
+  setNativePageSecurityHeaders(c, nonce);
 
   const html = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IM.codes Auth</title>
-<style>
+<style nonce="${nonce}">
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#111;color:#e0e0e0;font-family:-apple-system,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
 .c{text-align:center;max-width:320px}
@@ -690,11 +766,11 @@ body{background:#111;color:#e0e0e0;font-family:-apple-system,system-ui,sans-seri
 <div class="spinner" id="sp"></div>
 <div class="s" id="st">Authenticating\u2026</div>
 <div class="e" id="er"></div>
-<button class="r" id="rt" onclick="run()">Retry</button>
+<button class="r" id="rt">Retry</button>
 </div>
-<script>
-var CB=${JSON.stringify(callback)};
-var ACTION=${JSON.stringify(action)};
+<script nonce="${nonce}">
+var CB=${safeInlineJson(validatedCallback)};
+var ACTION=${safeInlineJson(action)};
 function gc(n){var m=document.cookie.match(new RegExp('(?:^|;\\\\s*)'+n+'=([^;]+)'));return m?decodeURIComponent(m[1]):'';}
 function $(i){return document.getElementById(i);}
 function err(m){$('sp').style.display='none';$('er').textContent=m;$('rt').style.display='inline-block';$('st').textContent='Authentication failed';}
@@ -737,6 +813,7 @@ function bufferToBase64(b){var a=new Uint8Array(b),s='';for(var i=0;i<a.length;i
 function credToJSON(c){
 if(ACTION==='register')return{id:c.id,rawId:bufferToBase64(c.rawId),type:c.type,response:{attestationObject:bufferToBase64(c.response.attestationObject),clientDataJSON:bufferToBase64(c.response.clientDataJSON)},clientExtensionResults:c.getClientExtensionResults()};
 return{id:c.id,rawId:bufferToBase64(c.rawId),type:c.type,response:{authenticatorData:bufferToBase64(c.response.authenticatorData),clientDataJSON:bufferToBase64(c.response.clientDataJSON),signature:bufferToBase64(c.response.signature),userHandle:c.response.userHandle?bufferToBase64(c.response.userHandle):null},clientExtensionResults:c.getClientExtensionResults()};}
+$('rt').addEventListener('click',run);
 run();
 </script></body></html>`;
 

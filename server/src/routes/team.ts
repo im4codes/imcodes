@@ -114,8 +114,10 @@ teamRoutes.post('/join/:token', requireAuth(), async (c) => {
   const token = c.req.param('token');
   const now = Date.now();
 
-  const invite = await c.env.DB
-    .queryOne<{ id: string; team_id: string; role: string }>('SELECT * FROM team_invites WHERE token = $1 AND used_at IS NULL AND expires_at > $2', [token, now]);
+  const invite = await c.env.DB.queryOne<{ id: string; team_id: string; role: string }>(
+    'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, team_id, role',
+    [now, token],
+  );
   if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
 
   // Add to team
@@ -123,9 +125,6 @@ teamRoutes.post('/join/:token', requireAuth(), async (c) => {
     'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
     [invite.team_id, userId, invite.role, now],
   );
-
-  // Mark invite used
-  await c.env.DB.execute('UPDATE team_invites SET used_at = $1 WHERE id = $2', [now, invite.id]);
 
   await logAudit({ userId, action: 'team.joined', details: { teamId: invite.team_id, via: 'invite' } }, c.env.DB);
 
@@ -140,8 +139,10 @@ teamRoutes.post('/:id/join', requireAuth(), async (c) => {
   const now = Date.now();
 
   if (body.token) {
-    const invite = await c.env.DB
-      .queryOne<{ id: string; role: string }>('SELECT * FROM team_invites WHERE token = $1 AND team_id = $2 AND used_at IS NULL AND expires_at > $3', [body.token, teamId, now]);
+    const invite = await c.env.DB.queryOne<{ id: string; role: string }>(
+      'UPDATE team_invites SET used_at = $1 WHERE token = $2 AND team_id = $3 AND used_at IS NULL AND expires_at > $1 RETURNING id, role',
+      [now, body.token, teamId],
+    );
     if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
 
     await c.env.DB.execute(
@@ -149,7 +150,6 @@ teamRoutes.post('/:id/join', requireAuth(), async (c) => {
       [teamId, userId, invite.role, now],
     );
 
-    await c.env.DB.execute('UPDATE team_invites SET used_at = $1 WHERE id = $2', [now, invite.id]);
     await logAudit({ userId, action: 'team.joined', details: { teamId, via: 'invite' } }, c.env.DB);
     return c.json({ ok: true, role: invite.role });
   }
@@ -240,6 +240,9 @@ teamRoutes.post('/:id/member', requireAuth(), async (c) => {
     [teamId, userId],
   );
   if (!manager) return c.json({ error: 'group_manage_denied' }, 403);
+  if (role === 'admin' && manager.role !== 'owner') {
+    return c.json({ error: 'forbidden', reason: 'owner_required_for_admin_role' }, 403);
+  }
 
   const target = await resolveUserByIdentifier(c.env.DB as Database, identifier);
   // The specific cause travels as `error`, which is the field the client reads

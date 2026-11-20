@@ -4,6 +4,8 @@ import { randomHex, sha256Hex } from '../security/crypto.js';
 import { createServer, getServerById, updateServerToken } from '../db/queries.js';
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
+import { rateLimiter } from '../security/lockout.js';
+import { activeUserExistsSql } from '../security/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { NODE_ROLE, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import { z } from 'zod';
@@ -33,13 +35,18 @@ bindRoutes.post('/initiate', requireAuth(), async (c) => {
 
 // POST /api/bind/confirm — daemon confirms the bind code and receives auth token
 bindRoutes.post('/confirm', async (c) => {
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  if (!rateLimiter.check(`bind-confirm:${ip}`, 20, 60_000)) {
+    return c.json({ error: 'rate_limited', retryAfter: 60 }, 429);
+  }
+
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ code: z.string() }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const { code } = parsed.data;
   const pending = await c.env.DB.queryOne<{ code: string; user_id: string; server_name: string }>(
-    'SELECT * FROM pending_binds WHERE code = $1 AND expires_at > $2',
+    `DELETE FROM pending_binds WHERE code = $1 AND expires_at > $2 AND ${activeUserExistsSql('user_id')} RETURNING code, user_id, server_name`,
     [code, Date.now()],
   );
 
@@ -52,10 +59,6 @@ bindRoutes.post('/confirm', async (c) => {
   const serverId = randomHex(16);
   await createServer(c.env.DB, serverId, pending.user_id, pending.server_name, tokenHash);
 
-  // Consume the bind code
-  await c.env.DB.execute('DELETE FROM pending_binds WHERE code = $1', [code]);
-
-  const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId: pending.user_id, action: 'bind.confirm', ip, details: { serverId } }, c.env.DB);
 
   return c.json({ serverId, token: rawToken });

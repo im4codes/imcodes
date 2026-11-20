@@ -4,8 +4,7 @@ import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
-import { checkIdempotency, recordIdempotency } from '../security/replay.js';
-import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
+import { checkAuthLockout, rateLimiter, recordAuthFailure } from '../security/lockout.js';
 import { DOC_COLLABORATOR_SCOPE_REFUSAL, requireAuth, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
 import {
   buildDesktopSetupCallbackRedirectUrl,
@@ -170,26 +169,26 @@ export async function initializeAuthNonceCleanup(db: Database): Promise<void> {
 
 // POST /api/auth/register — create a new user and issue initial API key
 authRoutes.post('/register', async (c) => {
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  if (!rateLimiter.check(`auth-register:${ip}`, 20, 60_000)) {
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfter: 60 }, 429);
+  }
+
   // Check if registration is enabled
   const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
   if (regEnabled === 'false') {
     return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
   }
 
-  // Idempotency: deduplicate retried registration requests
-  const idempotencyKey = c.req.header('Idempotency-Key');
-  if (idempotencyKey) {
-    const cached = await checkIdempotency(idempotencyKey, 'anon', c.env.DB);
-    if (cached) return c.body(cached.body, cached.status as never);
-  }
-
   const userId = randomHex(16);
   await createUser(c.env.DB, userId);
 
-  // Set status to pending if approval is required
+  // Set status to pending if approval is required; never issue an active API key while pending
   const requireApproval = await getSetting(c.env.DB, 'require_approval');
   if (requireApproval === 'true') {
     await updateUserStatus(c.env.DB, userId, 'pending');
+    await logAuthAudit(c, { userId, action: 'auth.register', ip }, c.env.DB);
+    return c.json({ ok: true, userId, pending: true }, 201);
   }
 
   const rawKey = `deck_${randomHex(32)}`;
@@ -200,14 +199,9 @@ authRoutes.post('/register', async (c) => {
     [randomHex(16), userId, keyHash, now],
   );
 
-  const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAuthAudit(c, { userId, action: 'auth.register', ip }, c.env.DB);
 
-  const responseBody = JSON.stringify({ userId, apiKey: rawKey });
-  if (idempotencyKey) {
-    await recordIdempotency(idempotencyKey, 'anon', 201, responseBody, c.env.DB);
-  }
-  return c.body(responseBody, 201, { 'Content-Type': 'application/json' });
+  return c.json({ userId, apiKey: rawKey }, 201);
 });
 
 // Platform identity linking is handled exclusively through verified OAuth flows
@@ -530,15 +524,13 @@ authRoutes.post('/refresh', async (c) => {
   }
 
   const tokenHash = sha256Hex(refreshToken);
+  const now = Date.now();
 
-  // Only accept unused tokens (used_at IS NULL). Already-consumed tokens are simply
-  // rejected — no family revocation. This matches the pre-security-hardening behaviour
-  // that was stable. The replay-detection pattern (revoking entire families) caused
-  // cascading logouts whenever a Set-Cookie response was lost (network glitch, browser
-  // crash, race between tabs).
+  // Atomically consume unused, non-expired refresh token so concurrent requests cannot
+  // rotate the same token twice. Already-consumed tokens are rejected without family revocation.
   const row = await c.env.DB.queryOne<{ id: string; user_id: string; family_id: string }>(
-    'SELECT * FROM refresh_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2',
-    [tokenHash, Date.now()],
+    'UPDATE refresh_tokens SET used_at = $1 WHERE token_hash = $2 AND used_at IS NULL AND expires_at > $1 RETURNING id, user_id, family_id',
+    [now, tokenHash],
   );
 
   if (!row) {
@@ -549,8 +541,6 @@ authRoutes.post('/refresh', async (c) => {
   // Reject disabled/pending users — prevents token refresh after admin disables account
   const refreshUser = await getUserById(c.env.DB, row.user_id);
   if (!refreshUser || refreshUser.status !== 'active') {
-    // Consume the token to prevent replay, but don't issue new ones
-    await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
     return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
@@ -562,8 +552,6 @@ authRoutes.post('/refresh', async (c) => {
     return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
-  // Mark old token consumed (rotation)
-  await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
   logger.info({ tokenId: row.id }, '[refresh] token consumed, issuing new pair');
 
   // Issue new access (4h) + refresh (30d) tokens
@@ -928,6 +916,14 @@ authRoutes.post('/password/change', async (c) => {
   const userId = await resolveUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
 
+  const userLockout = await checkAuthLockout(c.env.DB, `user:${userId}`);
+  if (userLockout.locked) {
+    return c.json({
+      error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS,
+      retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0,
+    }, 429);
+  }
+
   const body = await c.req.json().catch(() => null);
   const parsed = passwordChangeSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -944,13 +940,45 @@ authRoutes.post('/password/change', async (c) => {
   if (!user || !user.password_hash) return c.json({ error: 'no_password_set' }, 400);
 
   const valid = await verifyPassword(oldPassword, user.password_hash);
-  if (!valid) return c.json({ error: 'invalid_old_password' }, 401);
+  if (!valid) {
+    await recordAuthFailure(c.env.DB, `user:${userId}`, 'password_change_invalid_old_password');
+    return c.json({ error: 'invalid_old_password' }, 401);
+  }
 
   const newHash = await hashPassword(newPassword);
+  const now = Date.now();
+  const nowSec = Math.floor(now / 1000);
+  const newValidAfter = Math.max(now, nowSec * 1000 + 1);
   await c.env.DB.execute(
-    'UPDATE users SET password_hash = $1, password_must_change = false WHERE id = $2',
-    [newHash, userId],
+    'UPDATE users SET password_hash = $1, password_must_change = false, sessions_valid_after = GREATEST(sessions_valid_after, $3) WHERE id = $2',
+    [newHash, userId, newValidAfter],
   );
+  await c.env.DB.execute(
+    'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
+    [now, userId],
+  );
+
+  const hadSessionCookie = !c.req.header('Authorization') && !!getCookie(c, COOKIE_SESSION);
+  if (hadSessionCookie && c.env.JWT_SIGNING_KEY) {
+    const isSecure = c.env.NODE_ENV === 'production';
+    const nextIat = Math.ceil(newValidAfter / 1000);
+    const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, iat: nextIat }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+    const refreshRaw = randomHex(32);
+    await c.env.DB.execute(
+      'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [randomHex(16), userId, sha256Hex(refreshRaw), randomHex(16), now + 30 * 24 * 3600 * 1000, now],
+    );
+    setCookie(c, COOKIE_SESSION, accessToken, {
+      httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
+    });
+    setCookie(c, 'rcc_refresh', refreshRaw, {
+      httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
+    });
+    const existingCsrf = getCookie(c, COOKIE_CSRF);
+    setCookie(c, COOKIE_CSRF, existingCsrf || randomHex(32), {
+      httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
+    });
+  }
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAuthAudit(c, { userId, action: 'auth.password_change', ip }, c.env.DB);
@@ -1273,7 +1301,30 @@ authRoutes.post('/relay/verify', async (c) => {
   if (!jti || consumedDocRelayTickets.has(jti)) {
     return c.json({ error: 'relay_token_replayed' }, 401);
   }
-  consumedDocRelayTickets.set(jti, Date.now() + 5 * 60 * 1000);
+
+  // Persist single-use JTI consumption across replicas in passkey_challenges (nullable user_id, no FK),
+  // falling back cleanly to consumedDocRelayTickets when minimal unit-test mock DBs don't store inserts.
+  const ticketChallengeId = `doc-relay-ticket:${jti}`;
+  const now = Date.now();
+  const expiresAt = typeof payload.exp === 'number' ? payload.exp * 1000 : now + 5 * 60 * 1000;
+  await c.env.DB.execute(
+    'DELETE FROM passkey_challenges WHERE id LIKE $1 AND expires_at < $2',
+    ['doc-relay-ticket:%', now],
+  );
+  const insertedTicket = await c.env.DB.queryOne<{ id: string }>(
+    'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, NULL, $3, $4, $5) ON CONFLICT (id) DO NOTHING RETURNING id',
+    [ticketChallengeId, jti, 'doc-relay-ticket', expiresAt, now],
+  );
+  if (!insertedTicket) {
+    const existingTicket = await c.env.DB.queryOne<{ id: string }>(
+      'SELECT id FROM passkey_challenges WHERE id = $1',
+      [ticketChallengeId],
+    );
+    if (existingTicket) {
+      return c.json({ error: 'relay_token_replayed' }, 401);
+    }
+  }
+  consumedDocRelayTickets.set(jti, expiresAt);
 
   return c.json({
     ok: true,

@@ -105,7 +105,14 @@ interface MemoizedAuthEntry {
 const authOutcomeRequestCache = new WeakMap<object, MemoizedAuthEntry>();
 
 async function computeAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
-  // Task 1: Try HttpOnly session cookie first (browser sessions)
+  // When Authorization is present, resolve ONLY Bearer auth and never fall back
+  // to COOKIE_SESSION — prevents bogus-Bearer CSRF middleware bypasses.
+  const authHeader = c.req.header('Authorization');
+  if (authHeader && authHeader.trim().length > 0) {
+    return resolveBearerOutcome(c);
+  }
+
+  // Try HttpOnly session cookie (browser sessions)
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
@@ -114,7 +121,7 @@ async function computeAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
     }
   }
 
-  return resolveBearerOutcome(c);
+  return { auth: null };
 }
 
 export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
@@ -415,16 +422,26 @@ export const requireOwner = (options?: RequireAuthOptions) => requireRole('owner
  * Reads teamId from c.req.param('id') by default, or from the provided paramName.
  * Sets c.var.teamRole to the user's team role.
  */
-export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member', paramName = 'id') {
+export function requireTeamRole(
+  minRole: 'owner' | 'admin' | 'member' = 'member',
+  paramName = 'id',
+  options: RequireAuthOptions = {},
+) {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
     const resolution = await resolveAuthOutcome(c);
     const auth = resolution.auth;
     if (!auth) return authFailureResponse(c, resolution);
+    if (options.refuseDaemonCredential && auth.serverId) {
+      return c.json({ error: 'forbidden', reason: DAEMON_CREDENTIAL_REFUSAL }, 403);
+    }
     if (auth.scope === 'doc_collaborator') {
       return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
     }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
+    if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
+      return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
+    }
 
     const teamId = c.req.param(paramName);
     const row = await c.env.DB.queryOne<{ role: Role }>(
