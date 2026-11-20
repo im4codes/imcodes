@@ -1,7 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import vm from 'node:vm';
-import { Worker } from 'node:worker_threads';
 import {
   CLOUD_DOCS_MAX_UPLOAD_BYTES,
   CLOUD_DOCS_ONLYOFFICE_SCRIPT_PATH,
@@ -382,7 +380,6 @@ export interface ExecuteDocBuilderOptions {
     | 'ONLYOFFICE_INTERNAL_URL'
     | 'ONLYOFFICE_PUBLIC_URL'
     | 'ONLYOFFICE_DOCBUILDER_ISOLATED_URL'
-    | 'ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED'
     | 'ONLYOFFICE_JWT_SECRET'
     | 'SERVER_URL'
     | 'JWT_SIGNING_KEY'
@@ -1166,237 +1163,6 @@ const ALLOWED_GLOBAL_BUILDER_METHODS = new Set([
   'OpenFileAsync',
 ]);
 
-const SANDBOX_HELPER_SCRIPT = [
-  'const FORBIDDEN_PROPS = new Set(["OpenFile", "OpenFileAsync", "OpenTmpFile", "SaveTmpFile", "SetTmpFolder", "LoadFile", "LoadFromFile", "SaveToFile", "CreateImage", "AddImage", "InsertImage", "SetImage", "AddOleObject", "Download", "ImportFile", "constructor", "__proto__", "prototype"]);',
-  'class SecurityViolation extends Error { constructor(msg) { super(msg); this.name = "SecurityViolation"; } }',
-  'let callBudget = 5000;',
-  'function bumpBudget() { callBudget -= 1; if (callBudget <= 0) throw new SecurityViolation("DocBuilder sandbox call limit exceeded"); }',
-  'function makeApiProxy(path = "Api") {',
-  '  const fn = function () { bumpBudget(); return makeApiProxy(path + "()"); };',
-  '  return new Proxy(fn, {',
-  '    get(_target, prop) {',
-  '      bumpBudget();',
-  '      const key = String(prop);',
-  '      if (key === "then" || typeof prop === "symbol") return undefined;',
-  '      if (FORBIDDEN_PROPS.has(key)) throw new SecurityViolation("Forbidden DocBuilder API property: " + path + "." + key);',
-  '      return makeApiProxy(path + "." + key);',
-  '    },',
-  '    apply(_target, _thisArg, _args) { bumpBudget(); return makeApiProxy(path + "()"); },',
-  '    construct() { throw new SecurityViolation("Constructor call not permitted on " + path); },',
-  '  });',
-  '}',
-  'const builderProxy = Object.freeze({',
-  '  CreateFile: () => { bumpBudget(); },',
-  '  SaveFile: () => { bumpBudget(); },',
-  '  CloseFile: () => { bumpBudget(); },',
-  '  OpenFile: function (...args) {',
-  '    bumpBudget();',
-  '    if (args.length === 0) return;',
-  '    if (args.length !== 1 || typeof expectedInputUrl !== "string" || args[0] !== expectedInputUrl) {',
-  '      throw new SecurityViolation("DocBuilder OpenFile only permits server-controlled inputUrl");',
-  '    }',
-  '  },',
-  '  OpenFileAsync: function (...args) {',
-  '    bumpBudget();',
-  '    if (args.length === 0) return;',
-  '    if (args.length !== 1 || typeof expectedInputUrl !== "string" || args[0] !== expectedInputUrl) {',
-  '      throw new SecurityViolation("DocBuilder OpenFileAsync only permits server-controlled inputUrl");',
-  '    }',
-  '  },',
-  '});',
-  'const builderJSProxy = new Proxy({}, {',
-  '  get(_t, prop) { throw new SecurityViolation("Forbidden builderJS access: " + String(prop)); },',
-  '  set(_t, prop) { throw new SecurityViolation("Forbidden builderJS write: " + String(prop)); },',
-  '  has() { return true; },',
-  '});',
-].join('\n');
-
-function clonePlainJsonData(value: unknown, depth = 0): unknown {
-  if (depth > 8) return undefined;
-  if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.slice(0, 500).map((item) => clonePlainJsonData(item, depth + 1));
-  }
-  if (typeof value === 'object') {
-    const out: Record<string, unknown> = Object.create(null);
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
-      out[k] = clonePlainJsonData(v, depth + 1);
-    }
-    return Object.freeze(out);
-  }
-  return undefined;
-}
-
-function runDocBuilderScriptSandboxVmSync(
-  script: string,
-  inputUrl: string | undefined,
-  argument?: Record<string, unknown>,
-): void {
-  const safeArgument = clonePlainJsonData(
-    inputUrl !== undefined
-      ? { ...(argument ?? {}), inputUrl, _imcodesInputUrl: inputUrl }
-      : (argument ?? {}),
-  );
-  const context = vm.createContext(
-    {
-      expectedInputUrl: inputUrl,
-      Argument: safeArgument,
-      Api: undefined as unknown,
-      builder: undefined as unknown,
-      builderJS: undefined as unknown,
-    },
-    {
-      name: 'docbuilder-policy-sandbox',
-      codeGeneration: { strings: false, wasm: false },
-    },
-  );
-  try {
-    vm.runInContext(
-      `${SANDBOX_HELPER_SCRIPT}\nthis.Api = makeApiProxy("Api");\nthis.builder = builderProxy;\nthis.builderJS = builderJSProxy;`,
-      context,
-      { timeout: 100 },
-    );
-    vm.runInContext(script, context, { timeout: 150 });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : (err && typeof err === 'object' && 'message' in err ? String((err as { message: unknown }).message) : String(err));
-    const name = err instanceof Error ? err.name : (err && typeof err === 'object' && 'name' in err ? String((err as { name: unknown }).name) : '');
-    // Harmless ReferenceError on benign non-forbidden identifiers (e.g. unit-test dummy helpers)
-    // is permitted only after static policy has already cleared the full script.
-    if (name === 'ReferenceError') {
-      return;
-    }
-    if (err instanceof SyntaxError || name === 'SyntaxError') {
-      throw new OnlyOfficeServiceError(
-        CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-        `Invalid DocBuilder JavaScript syntax: ${msg}`,
-        400,
-      );
-    }
-    throw new OnlyOfficeServiceError(
-      CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-      `Blocked unsafe DocBuilder script execution: ${msg}`,
-      400,
-    );
-  }
-}
-
-async function verifyDocBuilderScriptInIsolatedWorker(
-  script: string,
-  inputUrl: string | undefined,
-  argument?: Record<string, unknown>,
-  timeoutMs = 1500,
-): Promise<void> {
-  const safeArgument = clonePlainJsonData(
-    inputUrl !== undefined
-      ? { ...(argument ?? {}), inputUrl, _imcodesInputUrl: inputUrl }
-      : (argument ?? {}),
-  );
-  const workerSource = `
-    const { parentPort, workerData } = require('node:worker_threads');
-    const vm = require('node:vm');
-    try {
-      const ctx = vm.createContext(
-        { expectedInputUrl: workerData.inputUrl, Argument: workerData.argument },
-        { name: 'docbuilder-worker-isolate', codeGeneration: { strings: false, wasm: false } }
-      );
-      vm.runInContext(workerData.bootstrap + "\\nthis.Api = makeApiProxy('Api');\\nthis.builder = builderProxy;\\nthis.builderJS = builderJSProxy;", ctx, { timeout: 100 });
-      try {
-        vm.runInContext(workerData.script, ctx, { timeout: 150 });
-      } catch (err) {
-        if (!(err && err.name === 'ReferenceError')) {
-          throw err;
-        }
-      }
-      parentPort.postMessage({ ok: true });
-    } catch (err) {
-      parentPort.postMessage({
-        ok: false,
-        name: err && err.name ? String(err.name) : 'Error',
-        message: err && err.message ? String(err.message) : String(err),
-      });
-    }
-  `;
-
-  await new Promise<void>((resolve, reject) => {
-    const worker = new Worker(workerSource, {
-      eval: true,
-      workerData: {
-        script,
-        inputUrl,
-        argument: safeArgument,
-        bootstrap: SANDBOX_HELPER_SCRIPT,
-      },
-      resourceLimits: {
-        maxOldGenerationSizeMb: 32,
-        maxYoungGenerationSizeMb: 16,
-      },
-    });
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      void worker.terminate();
-      reject(
-        new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          'DocBuilder sandbox worker timed out',
-          400,
-        ),
-      );
-    }, Math.max(250, timeoutMs));
-
-    worker.once('message', (msg: { ok: boolean; name?: string; message?: string }) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      void worker.terminate();
-      if (msg.ok) {
-        resolve();
-      } else {
-        reject(
-          new OnlyOfficeServiceError(
-            CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-            `Blocked unsafe DocBuilder script execution in isolated worker: ${msg.message || 'security_violation'}`,
-            400,
-          ),
-        );
-      }
-    });
-    worker.once('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      void worker.terminate();
-      reject(
-        new OnlyOfficeServiceError(
-          CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-          `DocBuilder isolated worker error: ${err.message}`,
-          400,
-        ),
-      );
-    });
-    worker.once('exit', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(
-          new OnlyOfficeServiceError(
-            CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT,
-            `DocBuilder isolated worker exited unexpectedly (${code})`,
-            400,
-          ),
-        );
-      }
-    });
-  });
-}
-
 export function compileOnlyOfficeDocBuilderTemplate(
   template: OnlyOfficeDocBuilderTemplate,
   options: {
@@ -1733,7 +1499,6 @@ export function prepareOnlyOfficeDocBuilderScript(
     i = token.nextIndex;
   }
 
-  runDocBuilderScriptSandboxVmSync(out, inputUrl);
   return out;
 }
 
@@ -1755,10 +1520,10 @@ export async function executeOnlyOfficeDocBuilder(
 
   const isTrustedTemplate = options.template !== undefined && !options.script?.trim();
   const isolatedUrl = options.env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL?.trim().replace(/\/+$/, '');
-  if (!isTrustedTemplate && !isolatedUrl && options.env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED === 'true') {
+  if (!isTrustedTemplate && !isolatedUrl) {
     throw new OnlyOfficeServiceError(
       CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED,
-      'Isolated DocBuilder executor is required for raw scripts',
+      'Generic DocBuilder scripts require an isolated executor (ONLYOFFICE_DOCBUILDER_ISOLATED_URL); shared Document Server only accepts trusted templates',
       503,
     );
   }
@@ -1795,7 +1560,6 @@ export async function executeOnlyOfficeDocBuilder(
       );
     }
     preparedScript = prepareOnlyOfficeDocBuilderScript(options.script, { inputUrl });
-    await verifyDocBuilderScriptInIsolatedWorker(preparedScript, inputUrl, options.argument, Math.min(timeoutMs, 1500));
   }
   const scriptId = await scriptStore.put(preparedScript, scriptTtlMs);
   const scriptToken = signDocBuilderScriptToken(

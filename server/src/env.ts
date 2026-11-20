@@ -46,8 +46,6 @@ export interface EnvConfig {
   ONLYOFFICE_INTERNAL_URL?: string;
   /** Optional isolated DocBuilder runner endpoint URL for executing raw scripts outside the shared Document Server. */
   ONLYOFFICE_DOCBUILDER_ISOLATED_URL?: string;
-  /** When 'true', raw DocBuilder scripts require ONLYOFFICE_DOCBUILDER_ISOLATED_URL (trusted templates remain enabled). */
-  ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED?: string;
   IMCODES_CLOUD_DOCS_DIR?: string;
 
   // Server URL (used to build webhook URLs)
@@ -189,7 +187,6 @@ export function loadEnv(): EnvConfig {
     ONLYOFFICE_PUBLIC_URL: process.env.ONLYOFFICE_PUBLIC_URL,
     ONLYOFFICE_INTERNAL_URL: process.env.ONLYOFFICE_INTERNAL_URL ?? 'http://onlyoffice:80',
     ONLYOFFICE_DOCBUILDER_ISOLATED_URL: process.env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL,
-    ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: process.env.ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED,
     IMCODES_CLOUD_DOCS_DIR: process.env.IMCODES_CLOUD_DOCS_DIR,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,

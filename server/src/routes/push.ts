@@ -545,11 +545,8 @@ async function relayPush(
   relaySecret?: string,
 ): Promise<void> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (relaySecret) {
-    headers.Authorization = `Bearer ${relaySecret}`;
-  }
   const normalizedBase = relayBaseUrl.replace(/\/+$/, '');
-  const res = await fetch(`${normalizedBase}/api/push/relay`, {
+  const init: RequestInit = {
     method: 'POST',
     headers,
     body: JSON.stringify({
@@ -561,9 +558,13 @@ async function relayPush(
       data: payload.data,
       type: payload.type,
     }),
-    redirect: 'error',
     signal: AbortSignal.timeout(10_000),
-  });
+  };
+  if (relaySecret) {
+    headers.Authorization = `Bearer ${relaySecret}`;
+    init.redirect = 'error';
+  }
+  const res = await fetch(`${normalizedBase}/api/push/relay`, init);
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');

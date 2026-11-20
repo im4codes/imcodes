@@ -1,3 +1,4 @@
+import http from 'node:http';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import {
@@ -1350,11 +1351,95 @@ describe('push preferences and registration routes', () => {
         expect(seenCalls[0]).toMatchObject({
           url: 'https://app.im.codes/api/push/relay',
           auth: null,
-          redirect: 'error',
+          redirect: undefined,
         });
       } finally {
         fetchSpy.mockRestore();
         globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('P0-4 redirect compat: keyless relay follows 307/308 POST redirects while authenticated PUSH_RELAY_CLIENT_SECRET refuses redirects before leaking credentials', async () => {
+      const targetRequests: Array<{ url?: string; auth?: string; body: string }> = [];
+      const targetServer = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', () => {
+          targetRequests.push({
+            url: req.url,
+            auth: typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      await new Promise<void>((resolve) => targetServer.listen(0, '127.0.0.1', () => resolve()));
+      const targetPort = (targetServer.address() as { port: number }).port;
+
+      let redirectStatus = 308;
+      const redirectServer = http.createServer((_req, res) => {
+        res.statusCode = redirectStatus;
+        res.setHeader('Location', `http://127.0.0.1:${targetPort}/api/push/relay`);
+        res.end();
+      });
+      await new Promise<void>((resolve) => redirectServer.listen(0, '127.0.0.1', () => resolve()));
+      const redirectPort = (redirectServer.address() as { port: number }).port;
+
+      const validPushRow = {
+        token: 'jpush-redirect-test-1',
+        platform: PUSH_PLATFORM_ANDROID_JPUSH,
+        notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+        push_enabled_server_ids: ['srv-redir-1'],
+        push_notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+      };
+
+      try {
+        // 1. Keyless relay (no PUSH_RELAY_CLIENT_SECRET) follows 308/307 POST redirects
+        redirectStatus = 308;
+        mockDb.query.mockResolvedValueOnce([validPushRow]);
+        mockDb.query.mockResolvedValueOnce([{ badge_count: 1 }]);
+        await dispatchPush(
+          { userId: 'u-redir', serverId: 'srv-redir-1', title: 'R308', body: 'Keyless', type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE },
+          {
+            DB: mockDb as any,
+            PUSH_RELAY_URL: `http://127.0.0.1:${redirectPort}`,
+          } as any,
+        );
+        expect(targetRequests).toHaveLength(1);
+        expect(targetRequests[0]?.auth).toBeUndefined();
+
+        redirectStatus = 307;
+        targetRequests.length = 0;
+        mockDb.query.mockResolvedValueOnce([validPushRow]);
+        mockDb.query.mockResolvedValueOnce([{ badge_count: 2 }]);
+        await dispatchPush(
+          { userId: 'u-redir', serverId: 'srv-redir-1', title: 'R307', body: 'Keyless', type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE },
+          {
+            DB: mockDb as any,
+            PUSH_RELAY_URL: `http://127.0.0.1:${redirectPort}`,
+          } as any,
+        );
+        expect(targetRequests).toHaveLength(1);
+        expect(targetRequests[0]?.auth).toBeUndefined();
+
+        // 2. Authenticated relay (PUSH_RELAY_CLIENT_SECRET set) refuses 307/308 redirects BEFORE contacting target
+        targetRequests.length = 0;
+        mockDb.query.mockResolvedValueOnce([validPushRow]);
+        mockDb.query.mockResolvedValueOnce([{ badge_count: 3 }]);
+        await dispatchPush(
+          { userId: 'u-redir', serverId: 'srv-redir-1', title: 'SecretR308', body: 'Blocked', type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE },
+          {
+            DB: mockDb as any,
+            PUSH_RELAY_URL: `http://127.0.0.1:${redirectPort}`,
+            PUSH_RELAY_CLIENT_SECRET: 'do-not-leak-on-redirect',
+          } as any,
+        );
+        expect(targetRequests).toHaveLength(0);
+      } finally {
+        await new Promise<void>((resolve) => redirectServer.close(() => resolve()));
+        await new Promise<void>((resolve) => targetServer.close(() => resolve()));
       }
     });
   });

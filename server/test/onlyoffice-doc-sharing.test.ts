@@ -3138,7 +3138,7 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     const fileUrl = new URL(cfg.config.document.url);
     const ooSecret = 'onlyoffice-jwt-secret-key-test!!';
 
-    // 1. Valid operation=download and public-proxy URL are accepted
+    // 1. Official envelope { payload: { url }, operation: 'download' }, flat operation=download, legacy wrapped { payload: { url } }, and public-proxy URL are accepted
     const opDownloadJwt = signJwt({ url: cfg.config.document.url, operation: 'download' }, ooSecret, 300);
     expect(
       (await publicApp.request(`${fileUrl.pathname}${fileUrl.search}`, {
@@ -3146,17 +3146,39 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
       })).status,
     ).toBe(200);
 
+    const officialEnvelopeJwt = signJwt(
+      { payload: { url: cfg.config.document.url }, operation: 'download' },
+      ooSecret,
+      300,
+    );
+    expect(
+      (await publicApp.request(`${fileUrl.pathname}${fileUrl.search}`, {
+        headers: { Authorization: `Bearer ${officialEnvelopeJwt}` },
+      })).status,
+    ).toBe(200);
+
+    const legacyEnvelopeJwt = signJwt({ payload: { url: cfg.config.document.url } }, ooSecret, 300);
+    expect(
+      (await publicApp.request(`${fileUrl.pathname}${fileUrl.search}`, {
+        headers: { Authorization: `Bearer ${legacyEnvelopeJwt}` },
+      })).status,
+    ).toBe(200);
+
     const proxiedUrl = `https://docs.example.com/onlyoffice${fileUrl.pathname}${fileUrl.search}`;
-    const proxiedJwt = signJwt({ url: proxiedUrl }, ooSecret, 300);
+    const proxiedJwt = signJwt({ payload: { url: proxiedUrl }, operation: 'download' }, ooSecret, 300);
     expect(
       (await publicApp.request(`${fileUrl.pathname}${fileUrl.search}`, {
         headers: { Authorization: `Bearer ${proxiedJwt}` },
       })).status,
     ).toBe(200);
 
-    // 2. Wrong operation, missing url, untrusted base URL, or another file token's URL -> 401
+    // 2. Wrong top-level/nested operation, conflicting operation fields, missing url, untrusted base URL, or another file token's URL -> 401
     for (const badPayload of [
       { url: cfg.config.document.url, operation: 'converter' },
+      { payload: { url: cfg.config.document.url }, operation: 'converter' },
+      { operation: 'download', payload: { url: cfg.config.document.url, operation: 'converter' } },
+      { operation: 'converter', payload: { url: cfg.config.document.url, operation: 'download' } },
+      { payload: { url: cfg.config.document.url }, operation: '' },
       { operation: 'download' },
       { url: `https://evil.attacker.invalid${fileUrl.pathname}${fileUrl.search}` },
       { url: `http://localhost:19138/api/server/srv-1/onlyoffice/file/different-doc-token?serverId=srv-1` },

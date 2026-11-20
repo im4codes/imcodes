@@ -183,6 +183,7 @@ describe('onlyoffice-docbuilder service', () => {
       env: {
         ONLYOFFICE_ENABLED: 'true',
         ONLYOFFICE_INTERNAL_URL: mockOo.baseUrl,
+        ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockOo.baseUrl,
         ONLYOFFICE_PUBLIC_URL: 'https://public.example.com/onlyoffice',
         ONLYOFFICE_JWT_SECRET: OO_SECRET,
         SERVER_URL: 'http://127.0.0.1:19138',
@@ -224,6 +225,7 @@ describe('onlyoffice-docbuilder service', () => {
         env: {
           ONLYOFFICE_ENABLED: 'true',
           ONLYOFFICE_INTERNAL_URL: mockOo.baseUrl,
+          ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockOo.baseUrl,
           ONLYOFFICE_PUBLIC_URL: 'https://public.example.com/onlyoffice',
           ONLYOFFICE_JWT_SECRET: OO_SECRET,
           SERVER_URL: 'http://127.0.0.1:19138',
@@ -247,6 +249,7 @@ describe('onlyoffice-docbuilder service', () => {
         env: {
           ONLYOFFICE_ENABLED: 'true',
           ONLYOFFICE_INTERNAL_URL: mockErrOo.baseUrl,
+          ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockErrOo.baseUrl,
           ONLYOFFICE_JWT_SECRET: OO_SECRET,
           SERVER_URL: 'http://127.0.0.1:19138',
           JWT_SIGNING_KEY: JWT_KEY,
@@ -272,6 +275,7 @@ describe('onlyoffice-docbuilder service', () => {
         env: {
           ONLYOFFICE_ENABLED: 'true',
           ONLYOFFICE_INTERNAL_URL: mockSlowOo.baseUrl,
+          ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockSlowOo.baseUrl,
           ONLYOFFICE_JWT_SECRET: OO_SECRET,
           SERVER_URL: 'http://127.0.0.1:19138',
           JWT_SIGNING_KEY: JWT_KEY,
@@ -385,6 +389,7 @@ describe('onlyoffice-docbuilder service', () => {
     const env = {
       ONLYOFFICE_ENABLED: 'true',
       ONLYOFFICE_INTERNAL_URL: mockOo.baseUrl,
+      ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockOo.baseUrl,
       ONLYOFFICE_JWT_SECRET: OO_SECRET,
       SERVER_URL: 'http://127.0.0.1:19138',
       JWT_SIGNING_KEY: JWT_KEY,
@@ -528,10 +533,22 @@ describe('onlyoffice-docbuilder service', () => {
     ).rejects.toThrow(OnlyOfficeServiceError);
   });
 
-  it('P0-2: isolates raw DocBuilder execution, enforces trusted templates & worker sandbox, and rejects builderJS/tmp/obfuscation/dynamic calls before reaching ONLYOFFICE', async () => {
+  it('P0-2: rejects generic scripts by default without ONLYOFFICE_DOCBUILDER_ISOLATED_URL before store/network, allows trusted templates on shared server, and verifies isolated executor input/output boundary', async () => {
     let sharedHits = 0;
     let isolatedHits = 0;
     let capturedScript = '';
+    let storePutCalls = 0;
+
+    const authorizedInputServer = await startMockServer((req, _rawBody, res) => {
+      if (req.url === '/api/cloud-docs/onlyoffice/file/authorized-tok') {
+        res.statusCode = 200;
+        res.end('authorized-doc-bytes');
+        return;
+      }
+      res.statusCode = 403;
+      res.end('forbidden');
+    });
+    servers.push(authorizedInputServer);
 
     const mockSharedOo = await startMockServer((req, rawBody, res) => {
       sharedHits += 1;
@@ -561,14 +578,22 @@ describe('onlyoffice-docbuilder service', () => {
     });
     servers.push(mockSharedOo);
 
-    const mockIsolatedOo = await startMockServer((req, rawBody, res) => {
+    const isoReadUrls: string[] = [];
+    const mockIsolatedOo = await startMockServer(async (req, rawBody, res) => {
       isolatedHits += 1;
       if (req.url === '/docbuilder') {
-        const body = JSON.parse(rawBody) as { url?: string };
+        const body = JSON.parse(rawBody) as { url?: string; argument?: Record<string, unknown> };
         const tok = String(body.url ?? '').split('/').pop() ?? '';
         const claims = verifyDocBuilderScriptToken(tok, JWT_KEY);
         if (claims) {
-          consumeEphemeralDocBuilderScript(claims.scriptId);
+          capturedScript = consumeEphemeralDocBuilderScript(claims.scriptId) ?? '';
+        }
+        // Simulate isolated executor fetching only the authorized input URL found in script/argument
+        const match = capturedScript.match(/builder\.OpenFile\("([^"]+)"\)/);
+        if (match?.[1]) {
+          isoReadUrls.push(match[1]);
+          const inRes = await fetch(match[1]);
+          expect(inRes.status).toBe(200);
         }
         res.setHeader('Content-Type', 'application/json');
         res.end(
@@ -589,13 +614,26 @@ describe('onlyoffice-docbuilder service', () => {
     });
     servers.push(mockIsolatedOo);
 
-    // 1. Trusted data-only template runs on shared ONLYOFFICE without dynamic script injection
+    const spyScriptStore = {
+      put(script: string, ttlMs: number) {
+        storePutCalls += 1;
+        return storeEphemeralDocBuilderScript(script, ttlMs);
+      },
+      consume(id: string, opts?: { peekOnly?: boolean }) {
+        return consumeEphemeralDocBuilderScript(id, opts);
+      },
+      remove(id: string) {
+        // no-op
+      },
+    };
+
+    // 1. Default deployment (ONLYOFFICE_DOCBUILDER_ISOLATED_URL UNSET):
+    //    Trusted data-only template succeeds against shared ONLYOFFICE without dynamic script injection
     const injectedTitle = '"); builderJS.OpenFile("/etc/passwd"); //';
     const tplResult = await executeOnlyOfficeDocBuilder({
       env: {
         ONLYOFFICE_ENABLED: 'true',
         ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
-        ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: 'true',
         ONLYOFFICE_JWT_SECRET: OO_SECRET,
         SERVER_URL: 'http://127.0.0.1:19138',
         JWT_SIGNING_KEY: JWT_KEY,
@@ -603,56 +641,66 @@ describe('onlyoffice-docbuilder service', () => {
       template: 'create_document',
       argument: { type: 'docx', title: injectedTitle, text: 'Hello from template' },
       requiredExt: '.docx',
+      scriptStore: spyScriptStore,
     });
     expect(tplResult.bytes.toString('utf8')).toBe('PK\x03\x04template-docx');
     expect(sharedHits).toBe(2);
+    expect(storePutCalls).toBe(1);
     expect(capturedScript).not.toContain(injectedTitle);
     expect(capturedScript).toContain('builder.CreateFile("docx");');
 
     // Trusted append_text embeds server inputUrl directly without trusting external user URL
     const compiledAppend = compileOnlyOfficeDocBuilderTemplate('append_text', {
-      inputUrl: 'http://127.0.0.1:19138/api/cloud-docs/onlyoffice/file/signed-tok',
+      inputUrl: `${authorizedInputServer.baseUrl}/api/cloud-docs/onlyoffice/file/authorized-tok`,
       outputType: '.docx',
     });
-    expect(compiledAppend).toContain('builder.OpenFile("http://127.0.0.1:19138/api/cloud-docs/onlyoffice/file/signed-tok");');
+    expect(compiledAppend).toContain(`builder.OpenFile("${authorizedInputServer.baseUrl}/api/cloud-docs/onlyoffice/file/authorized-tok");`);
 
-    // 2. When REQUIRE_ISOLATED=true and ONLYOFFICE_DOCBUILDER_ISOLATED_URL is unset, raw script fails closed
+    // 2. Default deployment (ONLYOFFICE_DOCBUILDER_ISOLATED_URL UNSET):
+    //    Normal raw generic script MUST fail closed BEFORE writing to scriptStore or hitting shared Document Server!
     sharedHits = 0;
+    storePutCalls = 0;
     await expect(
       executeOnlyOfficeDocBuilder({
         env: {
           ONLYOFFICE_ENABLED: 'true',
           ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
-          ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: 'true',
           ONLYOFFICE_JWT_SECRET: OO_SECRET,
           SERVER_URL: 'http://127.0.0.1:19138',
           JWT_SIGNING_KEY: JWT_KEY,
         },
         script: 'builder.CreateFile("docx");',
+        scriptStore: spyScriptStore,
       }),
     ).rejects.toMatchObject({ code: CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED, statusCode: 503 });
+    expect(storePutCalls).toBe(0);
     expect(sharedHits).toBe(0);
 
-    // 3. When ONLYOFFICE_DOCBUILDER_ISOLATED_URL is set, raw script routes only to isolated runner
+    // 3. When ONLYOFFICE_DOCBUILDER_ISOLATED_URL is set, generic script routes ONLY to isolated executor
+    //    and isolated boundary verifies only authorized signed inputUrl is read and job output is written
+    const authorizedUrl = `${authorizedInputServer.baseUrl}/api/cloud-docs/onlyoffice/file/authorized-tok`;
     const isoResult = await executeOnlyOfficeDocBuilder({
       env: {
         ONLYOFFICE_ENABLED: 'true',
         ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
         ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockIsolatedOo.baseUrl,
-        ONLYOFFICE_DOCBUILDER_REQUIRE_ISOLATED: 'true',
         ONLYOFFICE_JWT_SECRET: OO_SECRET,
         SERVER_URL: 'http://127.0.0.1:19138',
         JWT_SIGNING_KEY: JWT_KEY,
       },
-      script: 'builder.CreateFile("docx");',
+      script: 'builder.OpenFile(Argument.inputUrl); builder.SaveFile("docx", "generated.docx");',
+      argument: { inputUrl: authorizedUrl },
+      scriptStore: spyScriptStore,
     });
     expect(isoResult.bytes.toString('utf8')).toBe('PK\x03\x04isolated-docx');
     expect(sharedHits).toBe(0);
     expect(isolatedHits).toBe(2);
+    expect(isoReadUrls).toEqual([authorizedUrl]);
 
-    // 4. Whole-class bypass matrix rejected before ANY network call to Document Server
+    // 4. Static policy rejects dangerous file/tmp/resource/host constructs before store/upstream requests even with isolated URL
     isolatedHits = 0;
-    const attackScripts = [
+    storePutCalls = 0;
+    const blockedScripts = [
       'builderJS.OpenFile("http://169.254.169.254/latest/meta-data/");',
       'builderJS.CreateFile("docx"); builderJS.SaveFile("docx", "out.docx");',
       'builder.OpenTmpFile("file:///etc/passwd");',
@@ -665,28 +713,30 @@ describe('onlyoffice-docbuilder service', () => {
       'new Function("builder", "builder.OpenFile(\\"http://127.0.0.1:8080/\\")")(builder);',
       'fetch("http://169.254.169.254/latest/meta-data/");',
       'var g = globalThis; g.process.exit(1);',
-      'var m = "Open" + "File"; var doc = Api.GetDocument(); doc[m]("http://127.0.0.1/");',
       'Reflect.get(builder, "OpenFile")("/etc/passwd");',
       '[].constructor.constructor("return 1")();',
     ];
-    for (const attack of attackScripts) {
+    for (const attack of blockedScripts) {
       expect(() =>
-        prepareOnlyOfficeDocBuilderScript(attack, { inputUrl: 'http://127.0.0.1:19138/file/ok' }),
+        prepareOnlyOfficeDocBuilderScript(attack, { inputUrl: authorizedUrl }),
       ).toThrowError(OnlyOfficeServiceError);
       await expect(
         executeOnlyOfficeDocBuilder({
           env: {
             ONLYOFFICE_ENABLED: 'true',
             ONLYOFFICE_INTERNAL_URL: mockSharedOo.baseUrl,
+            ONLYOFFICE_DOCBUILDER_ISOLATED_URL: mockIsolatedOo.baseUrl,
             ONLYOFFICE_JWT_SECRET: OO_SECRET,
             SERVER_URL: 'http://127.0.0.1:19138',
             JWT_SIGNING_KEY: JWT_KEY,
           },
           script: attack,
-          argument: { inputUrl: 'http://127.0.0.1:19138/file/ok' },
+          argument: { inputUrl: authorizedUrl },
+          scriptStore: spyScriptStore,
         }),
       ).rejects.toMatchObject({ code: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT, statusCode: 400 });
     }
+    expect(storePutCalls).toBe(0);
     expect(sharedHits).toBe(0);
     expect(isolatedHits).toBe(0);
   });

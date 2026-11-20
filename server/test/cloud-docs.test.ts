@@ -2691,8 +2691,22 @@ describe('cloud docs & recent documents', () => {
       (await app.request(docPath, { headers: { Authorization: `Bearer ${okDownloadOpJwt}` } })).status,
     ).toBe(200);
 
+    const okOfficialEnvelopeJwt = signJwt({ payload: { url: docUrl }, operation: 'download' }, ooSecret, 300);
+    expect(
+      (await app.request(docPath, { headers: { Authorization: `Bearer ${okOfficialEnvelopeJwt}` } })).status,
+    ).toBe(200);
+
+    const okLegacyEnvelopeJwt = signJwt({ payload: { url: docUrl } }, ooSecret, 300);
+    expect(
+      (await app.request(docPath, { headers: { Authorization: `Bearer ${okLegacyEnvelopeJwt}` } })).status,
+    ).toBe(200);
+
     for (const badPayload of [
       { url: docUrl, operation: 'converter' },
+      { payload: { url: docUrl }, operation: 'converter' },
+      { operation: 'download', payload: { url: docUrl, operation: 'converter' } },
+      { operation: 'converter', payload: { url: docUrl, operation: 'download' } },
+      { payload: { url: docUrl }, operation: '' },
       { operation: 'download' },
       { url: 'http://localhost:19138/api/cloud-docs/onlyoffice/file/wrong-token-value' },
       { url: `https://untrusted.invalid${docPath}` },

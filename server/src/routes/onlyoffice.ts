@@ -178,21 +178,39 @@ export function verifyOnlyOfficeRequestBearerJwt(
   const ooSecret = resolveOnlyOfficeJwtSecret(env);
   const verified = verifyJwt(authHeader.slice(7), ooSecret);
   if (!verified) return false;
-  const nested =
-    verified.payload && typeof verified.payload === 'object' && !Array.isArray(verified.payload)
-      ? (verified.payload as Record<string, unknown>)
-      : verified;
-  if (
-    nested.tokenKind === 'editor_config' ||
-    nested.editorConfig !== undefined ||
-    nested.document !== undefined
-  ) {
-    return false;
-  }
-  if (nested.operation !== undefined) {
-    if (typeof nested.operation !== 'string' || nested.operation.trim().toLowerCase() !== 'download') {
+  const hasPayloadWrapper =
+    verified.payload !== undefined &&
+    typeof verified.payload === 'object' &&
+    verified.payload !== null &&
+    !Array.isArray(verified.payload);
+  const nested = hasPayloadWrapper
+    ? (verified.payload as Record<string, unknown>)
+    : verified;
+  for (const obj of hasPayloadWrapper ? [verified, nested] : [verified]) {
+    if (
+      obj.tokenKind === 'editor_config' ||
+      obj.editorConfig !== undefined ||
+      obj.document !== undefined
+    ) {
       return false;
     }
+  }
+  const topOpRaw = verified.operation;
+  const nestedOpRaw = hasPayloadWrapper ? nested.operation : undefined;
+  if (topOpRaw !== undefined && (typeof topOpRaw !== 'string' || !topOpRaw.trim())) {
+    return false;
+  }
+  if (nestedOpRaw !== undefined && (typeof nestedOpRaw !== 'string' || !nestedOpRaw.trim())) {
+    return false;
+  }
+  const topOp = typeof topOpRaw === 'string' ? topOpRaw.trim().toLowerCase() : undefined;
+  const nestedOp = typeof nestedOpRaw === 'string' ? nestedOpRaw.trim().toLowerCase() : undefined;
+  if (topOp !== undefined && nestedOp !== undefined && topOp !== nestedOp) {
+    return false;
+  }
+  const effectiveOp = topOp ?? nestedOp;
+  if (effectiveOp !== undefined && effectiveOp !== 'download') {
+    return false;
   }
   if (typeof nested.url !== 'string' || !nested.url.trim()) {
     return false;

@@ -406,6 +406,7 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       SERVER_URL: appBaseUrl,
       ONLYOFFICE_ENABLED: 'true',
       ONLYOFFICE_INTERNAL_URL: ooBaseUrl,
+      ONLYOFFICE_DOCBUILDER_ISOLATED_URL: ooBaseUrl,
       ONLYOFFICE_PUBLIC_URL: 'https://public.example.com/onlyoffice',
       ONLYOFFICE_JWT_SECRET: OO_SECRET,
       DB: memDb.db,
@@ -1328,7 +1329,7 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       'builderJS.OpenFile("http://169.254.169.254/");',
       'builder.SaveTmpFile("docx", "/tmp/evil.docx");',
       'Api.CreateImage("http://127.0.0.1:9000/ssrf.png");',
-      'var fn = "Open" + "TmpFile"; var d = Api.GetDocument(); d[fn]("/etc/passwd");',
+      'builder.Op\\u0065nFile("http://127.0.0.1/");',
       '(0, eval)("builder.CreateFile(\\"docx\\")");',
     ]) {
       const badRouteRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
@@ -1340,5 +1341,35 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       expect(await badRouteRes.json()).toMatchObject({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT });
       expect(lastScriptDownloaded).toBe(prevDownloaded);
     }
+
+    // Default deployment WITHOUT ONLYOFFICE_DOCBUILDER_ISOLATED_URL:
+    // generic raw script is rejected with 503 BEFORE writing to scriptStore or calling OO,
+    // while trusted template create & edit continue working on shared Document Server.
+    delete env.ONLYOFFICE_DOCBUILDER_ISOLATED_URL;
+    const beforeScriptsCount = memDb.scripts.size;
+    const defaultRawCreate = await app.request('/api/cloud-docs/docbuilder', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'docx',
+        name: 'BlockedRaw.docx',
+        script: 'builder.CreateFile("docx");',
+      }),
+    });
+    expect(defaultRawCreate.status).toBe(503);
+    expect((await defaultRawCreate.json()).error).toBe(CLOUD_DOC_ERROR_CODES.ONLYOFFICE_DISABLED);
+    expect(memDb.scripts.size).toBe(beforeScriptsCount);
+    expect(lastScriptDownloaded).toBe(prevDownloaded);
+
+    const defaultTemplateRes = await app.request(`/api/cloud-docs/${tplDoc.id}/docbuilder`, {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        template: 'replace_text',
+        argument: { search: 'Appended', replace: 'Updated' },
+      }),
+    });
+    expect(defaultTemplateRes.status).toBe(200);
+    expect(lastScriptDownloaded).toContain('SearchAndReplace');
   });
 });
