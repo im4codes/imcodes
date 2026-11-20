@@ -39,12 +39,14 @@ vi.mock('@capacitor/core', () => ({
 const mockApi = vi.hoisted(() => ({
   getServerTtsConfig: vi.fn(),
   updateServerTtsConfig: vi.fn(),
+  getServerTtsVoices: vi.fn(),
 }));
 
 vi.mock('../../src/api.js', () => ({
   apiFetch: vi.fn().mockResolvedValue({ servers: [], machines: [] }),
   getServerTtsConfig: (...args: unknown[]) => mockApi.getServerTtsConfig(...args),
   updateServerTtsConfig: (...args: unknown[]) => mockApi.updateServerTtsConfig(...args),
+  getServerTtsVoices: (...args: unknown[]) => mockApi.getServerTtsVoices(...args),
   passwordChange: vi.fn(),
   passkeyVerifyBegin: vi.fn(),
   passwordSetupWithPasskey: vi.fn(),
@@ -76,6 +78,15 @@ vi.mock('../../src/tts.js', async (importOriginal) => {
 beforeEach(() => {
   mockApi.getServerTtsConfig.mockClear();
   mockApi.updateServerTtsConfig.mockClear();
+  mockApi.getServerTtsVoices.mockClear();
+  mockApi.getServerTtsVoices.mockResolvedValue({
+    voices: [
+      { id: 'alloy', name: 'alloy' },
+      { id: 'nova', name: 'nova' },
+    ],
+    source: 'preset',
+    endpointConfigured: false,
+  });
   mockApi.getServerTtsConfig.mockResolvedValue({
     mode: 'system',
     baseUrl: '',
@@ -294,6 +305,7 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
         'tts_server_api_key_clear',
         'tts_server_model',
         'tts_server_voice',
+        'tts_server_voices_refresh',
         'tts_server_format',
         'tts_server_save',
         'tts_server_saving',
@@ -487,6 +499,85 @@ describe('SettingsPage TTS preferences & 7-locale parity', () => {
     expect(screen.getByTestId('chat-tts-settings-engine-server').getAttribute('aria-pressed')).toBe('true');
     await waitFor(() => {
       expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith({ mode: 'server' });
+    });
+  });
+
+  it('discovers upstream voices in SettingsPage and switches voice roles in TtsQuickSettingsPopover', async () => {
+    mockApi.getServerTtsConfig.mockResolvedValueOnce({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'custom_initial_role',
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+    mockApi.getServerTtsVoices.mockResolvedValue({
+      voices: [
+        { id: 'custom_initial_role', name: 'custom_initial_role' },
+        { id: 'zh-CN-XiaoxiaoNeural', name: 'Xiaoxiao', locale: 'zh-CN' },
+        { id: 'nova', name: 'nova' },
+      ],
+      source: 'upstream',
+      endpointConfigured: true,
+    });
+
+    const settingsRender = render(
+      <SettingsPage
+        displayName="Tester"
+        username="tester"
+        hasPassword={true}
+        onBack={() => {}}
+        onDisplayNameChanged={() => {}}
+        onUserAuthUpdated={() => {}}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('settings-tts-server-panel')).toBeTruthy();
+      expect(screen.getByTestId('settings-tts-server-voice-select')).toBeTruthy();
+    });
+
+    const settingsSelect = screen.getByTestId('settings-tts-server-voice-select') as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(settingsSelect.options).some((opt) => opt.value === 'zh-CN-XiaoxiaoNeural')).toBe(true);
+    });
+    expect(settingsSelect.value).toBe('custom_initial_role');
+
+    fireEvent.change(settingsSelect, { target: { value: 'zh-CN-XiaoxiaoNeural' } });
+    expect((screen.getByTestId('settings-tts-server-voice') as HTMLInputElement).value).toBe('zh-CN-XiaoxiaoNeural');
+    fireEvent.click(screen.getByTestId('settings-tts-server-save'));
+    await waitFor(() => {
+      expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith(expect.objectContaining({
+        mode: 'server',
+        voice: 'zh-CN-XiaoxiaoNeural',
+      }));
+    });
+    settingsRender.unmount();
+
+    // Popover renders server voice dropdown when mode === 'server' and persists changes via PUT /api/tts/config
+    applyServerTtsConfig({
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'zh-CN-XiaoxiaoNeural',
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    });
+
+    const anchorRef = { current: document.createElement('div') };
+    render(<TtsQuickSettingsPopover anchorRef={anchorRef} onClose={() => {}} />);
+
+    const popSelect = await screen.findByTestId('chat-tts-settings-voice-select') as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(popSelect.options).some((opt) => opt.value === 'nova')).toBe(true);
+    });
+    fireEvent.change(popSelect, { target: { value: 'nova' } });
+    await waitFor(() => {
+      expect(mockApi.updateServerTtsConfig).toHaveBeenCalledWith({ voice: 'nova' });
     });
   });
 });

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { ApiError, apiFetch, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
@@ -64,7 +64,10 @@ import {
 import {
   canOpenNativeTtsSettings,
   fetchServerTtsConfig,
+  fetchServerTtsVoices,
   getCachedServerTtsConfig,
+  getCachedServerTtsVoices,
+  getDefaultPresetTtsVoices,
   getNativeTtsVoiceQuality,
   getTtsAutoReadEnabled,
   getTtsMode,
@@ -79,6 +82,7 @@ import {
   subscribeTtsPreferences,
   TTS_RATE_OPTIONS,
   type TtsEngineMode,
+  type TtsVoiceOption,
 } from '../tts.js';
 import {
   getNativeTtsVoiceQualityLabelKey,
@@ -146,10 +150,39 @@ export function SettingsPage({
   const [ttsVoice, setTtsVoice] = useState<string>(() => getCachedServerTtsConfig()?.voice ?? TTS_DEFAULT_VOICE);
   const [ttsFormat, setTtsFormat] = useState<TtsResponseFormat>(() => getCachedServerTtsConfig()?.responseFormat ?? TTS_DEFAULT_RESPONSE_FORMAT);
   const [ttsServerDefaultConfigured, setTtsServerDefaultConfigured] = useState<boolean>(() => getCachedServerTtsConfig()?.serverDefaultConfigured ?? false);
+  const [ttsVoices, setTtsVoices] = useState<TtsVoiceOption[]>(() => (
+    getCachedServerTtsVoices()?.voices ?? getDefaultPresetTtsVoices(getCachedServerTtsConfig()?.voice ?? TTS_DEFAULT_VOICE)
+  ));
+  const [ttsVoicesLoading, setTtsVoicesLoading] = useState(false);
   const [ttsSaving, setTtsSaving] = useState(false);
   const [ttsTesting, setTtsTesting] = useState(false);
   const [ttsServerMsg, setTtsServerMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [nativeVoiceQuality, setNativeVoiceQuality] = useState<NativeTtsVoiceQualityInfo | null>(null);
+
+  const refreshTtsVoices = useCallback(async () => {
+    if (typeof fetchServerTtsVoices !== 'function') return;
+    setTtsVoicesLoading(true);
+    try {
+      const res = await fetchServerTtsVoices();
+      if (!mountedRef.current) return;
+      if (res?.voices && res.voices.length > 0) {
+        setTtsVoices(res.voices);
+      }
+    } catch {
+      // Keep cached or preset voices when upstream discovery fails.
+    } finally {
+      if (mountedRef.current) setTtsVoicesLoading(false);
+    }
+  }, []);
+
+  const ttsVoiceOptions = useMemo(() => {
+    const base = ttsVoices.length > 0 ? ttsVoices : getDefaultPresetTtsVoices(ttsVoice);
+    const current = ttsVoice.trim();
+    if (current && !base.some((v) => v.id === current)) {
+      return [{ id: current, name: current }, ...base];
+    }
+    return base;
+  }, [ttsVoices, ttsVoice]);
 
   useEffect(() => {
     return subscribeTtsPreferences(() => {
@@ -158,6 +191,11 @@ export function SettingsPage({
       setLocalTtsMode(getTtsMode());
     });
   }, []);
+
+  useEffect(() => {
+    if (ttsMode !== 'server') return;
+    void refreshTtsVoices();
+  }, [ttsMode, refreshTtsVoices]);
 
   useEffect(() => {
     if (typeof fetchServerTtsConfig !== 'function') return;
@@ -974,9 +1012,42 @@ export function SettingsPage({
                           />
                         </div>
                         <div>
-                          <label style={inlineLabelStyle} for="settings-tts-server-voice-input">
-                            {t('settings.tts_server_voice')}
-                          </label>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                            <label style={inlineLabelStyle} for="settings-tts-server-voice-input">
+                              {t('settings.tts_server_voice')}
+                            </label>
+                            <button
+                              type="button"
+                              data-testid="settings-tts-server-refresh-voices"
+                              class="settings-btn-secondary"
+                              style={{ padding: '2px 8px', fontSize: '11px' }}
+                              disabled={ttsVoicesLoading || ttsSaving}
+                              onClick={() => void refreshTtsVoices()}
+                            >
+                              {ttsVoicesLoading ? '...' : t('settings.tts_server_voices_refresh')}
+                            </button>
+                          </div>
+                          <select
+                            id="settings-tts-server-voice-select"
+                            data-testid="settings-tts-server-voice-select"
+                            aria-label={t('settings.tts_server_voice')}
+                            class="settings-input"
+                            style={{ marginBottom: 6 }}
+                            value={ttsVoice}
+                            onInput={(e) => setTtsVoice((e.currentTarget as HTMLSelectElement).value)}
+                            onChange={(e) => setTtsVoice((e.currentTarget as HTMLSelectElement).value)}
+                          >
+                            {ttsVoiceOptions.map((voice) => {
+                              const label = voice.name && voice.name !== voice.id
+                                ? `${voice.name} (${voice.id})`
+                                : voice.id;
+                              return (
+                                <option key={voice.id} value={voice.id}>
+                                  {voice.locale ? `${label} · ${voice.locale}` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
                           <input
                             id="settings-tts-server-voice-input"
                             data-testid="settings-tts-server-voice"
@@ -1043,6 +1114,7 @@ export function SettingsPage({
                                 setTtsServerDefaultConfigured(res.config.serverDefaultConfigured);
                                 setTtsApiKeyInput('');
                                 setTtsServerMsg({ type: 'ok', text: t('settings.tts_server_saved') });
+                                void refreshTtsVoices();
                               }
                             } catch (err) {
                               setTtsServerMsg({ type: 'err', text: err instanceof Error ? err.message : t('settings.tts_server_save_error') });

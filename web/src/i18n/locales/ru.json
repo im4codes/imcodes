@@ -2419,6 +2419,7 @@
     "tts_server_api_key_clear": "Очистить ключ",
     "tts_server_model": "Модель",
     "tts_server_voice": "Голос",
+    "tts_server_voices_refresh": "Обновить голоса",
     "tts_server_format": "Формат аудио",
     "tts_server_save": "Сохранить настройки TTS",
     "tts_server_saving": "Сохранение...",

@@ -608,4 +608,53 @@ describe('server TTS playback', () => {
     expect(tts.getTtsMode()).toBe('server');
     expect(tts.isServerTtsConfigured()).toBe(true);
   });
+
+  it('defaults to server when configured without explicit system choice, preserves explicit system override, and fetches voices', async () => {
+    const serverCfg = {
+      mode: 'server',
+      baseUrl: '',
+      hasApiKey: false,
+      apiKeyMasked: null,
+      model: 'tts-1',
+      voice: 'nova',
+      responseFormat: 'mp3',
+      serverDefaultConfigured: true,
+    };
+
+    // Unconfigured falls back to system
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      ...serverCfg,
+      mode: 'system',
+      serverDefaultConfigured: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+    let tts = await import('../src/tts.js');
+    await tts.syncTtsConfigFromServer();
+    expect(tts.getTtsMode()).toBe('system');
+
+    // Legacy non-explicit localStorage 'system' upgrades to 'server' once serverDefaultConfigured=true
+    vi.resetModules();
+    tts = await import('../src/tts.js');
+    globalThis.fetch = vi.fn(async (url) => {
+      if (String(url).includes('/voices')) {
+        return new Response(JSON.stringify({
+          voices: [{ id: 'nova', name: 'Nova' }, { id: 'alloy', name: 'Alloy' }],
+          source: 'upstream',
+          endpointConfigured: true,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify(serverCfg), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+    await tts.syncTtsConfigFromServer();
+    expect(tts.getTtsMode()).toBe('server');
+
+    const voicesRes = await tts.fetchServerTtsVoices();
+    expect(voicesRes?.source).toBe('upstream');
+    expect(tts.getCachedServerTtsVoices()?.voices.map((v) => v.id)).toEqual(['nova', 'alloy']);
+
+    // Explicit user 'system' choice is NOT overwritten by subsequent syncTtsConfigFromServer()
+    tts.setTtsMode('system');
+    expect(tts.getTtsMode()).toBe('system');
+    await tts.syncTtsConfigFromServer();
+    expect(tts.getTtsMode()).toBe('system');
+  });
 });

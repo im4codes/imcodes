@@ -3,12 +3,16 @@ import {
   STREAMING_SPEECH_TTS_STATUS,
 } from '@shared/voice-recognition.js';
 import {
+  TTS_DEFAULT_VOICE,
+  TTS_OPENAI_PRESET_VOICES,
   clampTtsServerSpeed,
   isTtsEngineMode,
   type TtsConfigUpdateBody,
   type TtsEngineMode,
   type TtsPublicConfig,
   type TtsSpeechRequestBody,
+  type TtsVoiceOption,
+  type TtsVoicesResponse,
 } from '@shared/tts-config.js';
 import { isNative } from './native.js';
 import {
@@ -18,11 +22,13 @@ import {
   type NativeTtsVoiceQualityInfo,
 } from './voice-recognition-backend.js';
 
-export type { TtsEngineMode, TtsPublicConfig };
+export { TTS_OPENAI_PRESET_VOICES };
+export type { TtsEngineMode, TtsPublicConfig, TtsVoiceOption, TtsVoicesResponse };
 
 export const TTS_AUTO_READ_STORAGE_KEY = 'imcodes_tts_auto_read';
 export const TTS_SPEECH_RATE_STORAGE_KEY = 'imcodes_tts_rate';
 export const TTS_MODE_STORAGE_KEY = 'imcodes_tts_mode';
+export const TTS_MODE_EXPLICIT_STORAGE_KEY = 'imcodes_tts_mode_explicit';
 export const TTS_SERVER_CONFIG_CACHE_KEY = 'imcodes_tts_server_config';
 export const TTS_DEFAULT_RATE = 1.1;
 export const TTS_MIN_RATE = 0.5;
@@ -76,6 +82,7 @@ let nativeTtsBoundPlugin: NativeSystemTts | null = null;
 let nativeTtsListenerHandle: { remove: () => Promise<void> } | null = null;
 let nativeStateWaiter: ((event: NativeTtsStateEvent) => void) | null = null;
 let cachedServerTtsConfig: TtsPublicConfig | null = null;
+let cachedServerTtsVoices: TtsVoicesResponse | null = null;
 let activeServerAbortController: AbortController | null = null;
 let activeAudioElement: HTMLAudioElement | null = null;
 let activeAudioObjectUrl: string | null = null;
@@ -176,7 +183,14 @@ export function setTtsSpeechRate(rate: number): void {
 
 export function getTtsMode(): TtsEngineMode {
   try {
+    const explicit = globalThis.localStorage?.getItem(TTS_MODE_EXPLICIT_STORAGE_KEY);
+    if (isTtsEngineMode(explicit)) return explicit;
     const raw = globalThis.localStorage?.getItem(TTS_MODE_STORAGE_KEY);
+    if (raw === 'server') return 'server';
+    const cached = getCachedServerTtsConfig();
+    if (cached && isServerTtsConfigured(cached) && cached.mode !== 'system') {
+      return 'server';
+    }
     return isTtsEngineMode(raw) ? raw : 'system';
   } catch {
     return 'system';
@@ -187,6 +201,7 @@ export function setTtsMode(mode: TtsEngineMode): void {
   const next: TtsEngineMode = isTtsEngineMode(mode) ? mode : 'system';
   try {
     globalThis.localStorage?.setItem(TTS_MODE_STORAGE_KEY, next);
+    globalThis.localStorage?.setItem(TTS_MODE_EXPLICIT_STORAGE_KEY, next);
   } catch { /* localStorage may be unavailable */ }
   if (cachedServerTtsConfig) {
     cachedServerTtsConfig = { ...cachedServerTtsConfig, mode: next };
@@ -210,7 +225,7 @@ export function getCachedServerTtsConfig(): TtsPublicConfig | null {
       hasApiKey: parsed.hasApiKey === true,
       apiKeyMasked: typeof parsed.apiKeyMasked === 'string' ? parsed.apiKeyMasked : null,
       model: typeof parsed.model === 'string' ? parsed.model : 'gpt-4o-mini-tts',
-      voice: typeof parsed.voice === 'string' ? parsed.voice : 'alloy',
+      voice: typeof parsed.voice === 'string' ? parsed.voice : TTS_DEFAULT_VOICE,
       responseFormat: typeof parsed.responseFormat === 'string' ? parsed.responseFormat : 'mp3',
       serverDefaultConfigured: parsed.serverDefaultConfigured === true,
     };
@@ -221,9 +236,21 @@ export function getCachedServerTtsConfig(): TtsPublicConfig | null {
 }
 
 export function applyServerTtsConfig(config: TtsPublicConfig): void {
-  cachedServerTtsConfig = { ...config };
+  const configured = isServerTtsConfigured(config);
+  let explicitSystem = false;
   try {
-    globalThis.localStorage?.setItem(TTS_MODE_STORAGE_KEY, isTtsEngineMode(config.mode) ? config.mode : 'system');
+    explicitSystem = globalThis.localStorage?.getItem(TTS_MODE_EXPLICIT_STORAGE_KEY) === 'system';
+  } catch { /* ignore */ }
+  const effectiveMode: TtsEngineMode = !configured
+    ? 'system'
+    : explicitSystem
+      ? 'system'
+      : isTtsEngineMode(config.mode)
+        ? config.mode
+        : 'server';
+  cachedServerTtsConfig = { ...config, mode: effectiveMode };
+  try {
+    globalThis.localStorage?.setItem(TTS_MODE_STORAGE_KEY, effectiveMode);
     globalThis.localStorage?.setItem(TTS_SERVER_CONFIG_CACHE_KEY, JSON.stringify(cachedServerTtsConfig));
   } catch { /* localStorage may be unavailable */ }
   notifyPreferences();
@@ -232,6 +259,23 @@ export function applyServerTtsConfig(config: TtsPublicConfig): void {
 export function isServerTtsConfigured(config?: TtsPublicConfig | null): boolean {
   const effective = config ?? getCachedServerTtsConfig();
   return Boolean(effective && (effective.baseUrl.trim() || effective.serverDefaultConfigured));
+}
+
+export function getDefaultPresetTtsVoices(currentVoice?: string): TtsVoiceOption[] {
+  const presets: TtsVoiceOption[] = TTS_OPENAI_PRESET_VOICES.map((id) => ({ id, name: id }));
+  const trimmed = typeof currentVoice === 'string' ? currentVoice.trim() : '';
+  if (trimmed && !presets.some((voice) => voice.id === trimmed)) {
+    return [{ id: trimmed, name: trimmed }, ...presets];
+  }
+  return presets;
+}
+
+export function getCachedServerTtsVoices(): TtsVoicesResponse | null {
+  if (!cachedServerTtsVoices) return null;
+  return {
+    ...cachedServerTtsVoices,
+    voices: cachedServerTtsVoices.voices.map((v) => ({ ...v })),
+  };
 }
 
 function getOptionalModuleExport<T>(mod: unknown, name: string): T | null {
@@ -258,11 +302,30 @@ export async function fetchServerTtsConfig(): Promise<TtsPublicConfig | null> {
   return config;
 }
 
+export async function fetchServerTtsVoices(): Promise<TtsVoicesResponse | null> {
+  const fn = await loadTtsApiExport<() => Promise<TtsVoicesResponse>>('getServerTtsVoices');
+  if (!fn) return null;
+  const res = await fn();
+  if (res && Array.isArray(res.voices)) {
+    cachedServerTtsVoices = {
+      ...res,
+      voices: res.voices.map((v) => ({ ...v })),
+    };
+  }
+  return res;
+}
+
 export async function saveServerTtsConfig(
   body: TtsConfigUpdateBody,
 ): Promise<{ ok: true; config: TtsPublicConfig } | null> {
   const fn = await loadTtsApiExport<(input: TtsConfigUpdateBody) => Promise<{ ok: true; config: TtsPublicConfig }>>('updateServerTtsConfig');
   if (!fn) return null;
+  if (body.mode !== undefined && isTtsEngineMode(body.mode)) {
+    try {
+      globalThis.localStorage?.setItem(TTS_MODE_STORAGE_KEY, body.mode);
+      globalThis.localStorage?.setItem(TTS_MODE_EXPLICIT_STORAGE_KEY, body.mode);
+    } catch { /* ignore */ }
+  }
   const res = await fn(body);
   if (res?.config) {
     applyServerTtsConfig(res.config);
@@ -1132,6 +1195,7 @@ export async function __resetTtsForTests(): Promise<void> {
   cleanupActiveServerPlayback();
   clearActiveWebUtterance();
   cachedServerTtsConfig = null;
+  cachedServerTtsVoices = null;
   nativeStateWaiter = null;
   if (nativeTtsListenerHandle) {
     try { await nativeTtsListenerHandle.remove(); } catch { /* ignore */ }

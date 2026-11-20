@@ -2419,6 +2419,7 @@
     "tts_server_api_key_clear": "키 지우기",
     "tts_server_model": "모델",
     "tts_server_voice": "음성",
+    "tts_server_voices_refresh": "음성 새로고침",
     "tts_server_format": "오디오 형식",
     "tts_server_save": "TTS 설정 저장",
     "tts_server_saving": "저장 중...",

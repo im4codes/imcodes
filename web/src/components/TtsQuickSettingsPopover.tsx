@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import type { RefObject } from 'preact';
 import { useTranslation } from 'react-i18next';
+import { TTS_DEFAULT_VOICE } from '@shared/tts-config.js';
 import {
   canOpenNativeTtsSettings,
+  fetchServerTtsVoices,
   getCachedServerTtsConfig,
+  getCachedServerTtsVoices,
+  getDefaultPresetTtsVoices,
   getNativeTtsVoiceQuality,
   getTtsAutoReadEnabled,
   getTtsMode,
@@ -19,6 +23,8 @@ import {
   subscribeTtsPreferences,
   TTS_RATE_OPTIONS,
   type TtsEngineMode,
+  type TtsPublicConfig,
+  type TtsVoiceOption,
 } from '../tts.js';
 import {
   getNativeTtsVoiceQualityLabelKey,
@@ -103,7 +109,17 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
   const [ttsAutoRead, setTtsAutoRead] = useState<boolean>(() => getTtsAutoReadEnabled());
   const [ttsRate, setTtsRate] = useState<number>(() => getTtsSpeechRate());
   const [ttsMode, setLocalTtsMode] = useState<TtsEngineMode>(() => getTtsMode());
-  const [serverConfigured, setServerConfigured] = useState<boolean>(() => isServerTtsConfigured(getCachedServerTtsConfig()));
+  const [serverConfig, setServerConfig] = useState<TtsPublicConfig | null>(() => getCachedServerTtsConfig());
+  const serverConfigured = isServerTtsConfigured(serverConfig);
+  const currentServerVoice = serverConfig?.voice?.trim() || TTS_DEFAULT_VOICE;
+  const [serverVoices, setServerVoices] = useState<TtsVoiceOption[]>(() => (
+    getCachedServerTtsVoices()?.voices ?? getDefaultPresetTtsVoices(getCachedServerTtsConfig()?.voice)
+  ));
+  const [savingVoice, setSavingVoice] = useState(false);
+  const lastVoiceChangeRef = useRef(currentServerVoice);
+  if (!savingVoice) {
+    lastVoiceChangeRef.current = currentServerVoice;
+  }
   const [nativeVoiceQuality, setNativeVoiceQuality] = useState<NativeTtsVoiceQualityInfo | null>(null);
   const [position, setPosition] = useState<PopoverPosition | null>(null);
 
@@ -114,8 +130,28 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
     setTtsAutoRead(getTtsAutoReadEnabled());
     setTtsRate(getTtsSpeechRate());
     setLocalTtsMode(getTtsMode());
-    setServerConfigured(isServerTtsConfigured(getCachedServerTtsConfig()));
+    setServerConfig(getCachedServerTtsConfig());
   }), []);
+
+  useEffect(() => {
+    if (ttsMode !== 'server' || !serverConfigured || typeof fetchServerTtsVoices !== 'function') return;
+    let cancelled = false;
+    void fetchServerTtsVoices().then((res) => {
+      if (cancelled || !res?.voices?.length) return;
+      setServerVoices(res.voices);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [ttsMode, serverConfigured]);
+
+  const voiceSelectOptions = useMemo(() => {
+    const base = serverVoices.length > 0 ? serverVoices : getDefaultPresetTtsVoices(currentServerVoice);
+    if (currentServerVoice && !base.some((v) => v.id === currentServerVoice)) {
+      return [{ id: currentServerVoice, name: currentServerVoice }, ...base];
+    }
+    return base;
+  }, [serverVoices, currentServerVoice]);
 
   useEffect(() => {
     if (!isIosNative) {
@@ -198,6 +234,26 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
       }
     : undefined;
 
+  const handleVoiceSelect = async (e: Event) => {
+    const nextVoice = (e.currentTarget as HTMLSelectElement).value;
+    if (!nextVoice || nextVoice === currentServerVoice || nextVoice === lastVoiceChangeRef.current) return;
+    lastVoiceChangeRef.current = nextVoice;
+    void stopSpeaking();
+    if (typeof saveServerTtsConfig !== 'function') return;
+    setSavingVoice(true);
+    try {
+      const res = await saveServerTtsConfig({ voice: nextVoice });
+      if (res?.config) {
+        setServerConfig(res.config);
+        lastVoiceChangeRef.current = res.config.voice?.trim() || nextVoice;
+      }
+    } catch {
+      lastVoiceChangeRef.current = currentServerVoice;
+    } finally {
+      setSavingVoice(false);
+    }
+  };
+
   const popoverEl = (
     <div
       ref={popoverRef}
@@ -251,31 +307,56 @@ export function TtsQuickSettingsPopover({ anchorRef, locale, onClose }: Props) {
       </div>
 
       {serverConfigured || ttsMode === 'server' ? (
-        <div class="chat-tts-settings-section" data-testid="chat-tts-settings-engine-section">
-          <div class="chat-tts-settings-label">{t('settings.tts_engine')}</div>
-          <div class="chat-tts-settings-rate-group">
-            {(['system', 'server'] as const).map((engine) => (
-              <button
-                key={engine}
-                type="button"
-                data-testid={`chat-tts-settings-engine-${engine}`}
-                aria-pressed={ttsMode === engine}
-                class={`chat-tts-settings-rate-btn${ttsMode === engine ? ' is-active' : ''}`}
-                onClick={() => {
-                  if (ttsMode === engine) return;
-                  setTtsMode(engine);
-                  setLocalTtsMode(engine);
-                  void stopSpeaking();
-                  if (typeof saveServerTtsConfig === 'function') {
-                    void saveServerTtsConfig({ mode: engine }).catch(() => {});
-                  }
-                }}
-              >
-                {t(`settings.tts_engine_${engine}`)}
-              </button>
-            ))}
+        <>
+          <div class="chat-tts-settings-section" data-testid="chat-tts-settings-engine-section">
+            <div class="chat-tts-settings-label">{t('settings.tts_engine')}</div>
+            <div class="chat-tts-settings-rate-group">
+              {(['system', 'server'] as const).map((engine) => (
+                <button
+                  key={engine}
+                  type="button"
+                  data-testid={`chat-tts-settings-engine-${engine}`}
+                  aria-pressed={ttsMode === engine}
+                  class={`chat-tts-settings-rate-btn${ttsMode === engine ? ' is-active' : ''}`}
+                  onClick={() => {
+                    if (ttsMode === engine) return;
+                    setTtsMode(engine);
+                    setLocalTtsMode(engine);
+                    void stopSpeaking();
+                    if (typeof saveServerTtsConfig === 'function') {
+                      void saveServerTtsConfig({ mode: engine }).catch(() => {});
+                    }
+                  }}
+                >
+                  {t(`settings.tts_engine_${engine}`)}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+          {ttsMode === 'server' && serverConfigured && (
+            <div class="chat-tts-settings-section" data-testid="chat-tts-settings-voice-section">
+              <label class="chat-tts-settings-label" for="chat-tts-settings-voice-select">
+                {t('settings.tts_server_voice')}
+              </label>
+              <select
+                id="chat-tts-settings-voice-select"
+                data-testid="chat-tts-settings-voice-select"
+                class="chat-tts-settings-select"
+                value={currentServerVoice}
+                disabled={savingVoice}
+                onInput={(e) => void handleVoiceSelect(e)}
+                onChange={(e) => void handleVoiceSelect(e)}
+              >
+                {voiceSelectOptions.map((voice) => {
+                  const label = voice.name && voice.name !== voice.id
+                    ? `${voice.name} (${voice.id})`
+                    : voice.id;
+                  return <option key={voice.id} value={voice.id}>{voice.locale ? `${label} · ${voice.locale}` : label}</option>;
+                })}
+              </select>
+            </div>
+          )}
+        </>
       ) : (
         <div class="chat-tts-settings-hint" data-testid="chat-tts-settings-server-hint">
           {t('settings.tts_server_unconfigured_hint')}

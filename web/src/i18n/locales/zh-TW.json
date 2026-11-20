@@ -2420,6 +2420,7 @@
     "tts_server_api_key_clear": "清除金鑰",
     "tts_server_model": "模型",
     "tts_server_voice": "音色",
+    "tts_server_voices_refresh": "重新整理音色",
     "tts_server_format": "音訊格式",
     "tts_server_save": "儲存 TTS 設定",
     "tts_server_saving": "儲存中...",

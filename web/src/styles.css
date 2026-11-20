@@ -6650,6 +6650,21 @@ html.native-ios-mac .chat-dl-btn {
   border-color: rgba(56, 189, 248, 0.55);
   background: rgba(14, 165, 233, 0.18);
 }
+.chat-tts-settings-select {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(30, 41, 59, 0.72);
+  color: #e2e8f0;
+  font: inherit;
+  font-size: 12px;
+}
+.chat-tts-settings-select:focus-visible {
+  outline: none;
+  border-color: rgba(56, 189, 248, 0.6);
+}
 @media (max-width: 640px) {
   .chat-tts-control-wrap {
     position: static;

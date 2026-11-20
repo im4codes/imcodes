@@ -1,6 +1,7 @@
 export const TTS_API_BASE = '/api/tts';
 export const TTS_CONFIG_PATH = `${TTS_API_BASE}/config`;
 export const TTS_SPEECH_PATH = `${TTS_API_BASE}/speech`;
+export const TTS_VOICES_PATH = `${TTS_API_BASE}/voices`;
 
 /**
  * Reserved user_preferences key holding AES-256-GCM encrypted TTS settings.
@@ -15,6 +16,20 @@ export type TtsEngineMode = (typeof TTS_ENGINES)[number];
 export const TTS_RESPONSE_FORMATS = ['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm'] as const;
 export type TtsResponseFormat = (typeof TTS_RESPONSE_FORMATS)[number];
 
+export const TTS_OPENAI_PRESET_VOICES = [
+  'alloy',
+  'ash',
+  'ballad',
+  'coral',
+  'echo',
+  'fable',
+  'nova',
+  'onyx',
+  'sage',
+  'shimmer',
+  'verse',
+] as const;
+
 export const TTS_DEFAULT_MODEL = 'gpt-4o-mini-tts';
 export const TTS_DEFAULT_VOICE = 'alloy';
 export const TTS_DEFAULT_RESPONSE_FORMAT: TtsResponseFormat = 'mp3';
@@ -24,6 +39,21 @@ export const TTS_MAX_SPEED = 4.0;
 export const TTS_DEFAULT_SPEED = 1.0;
 export const TTS_REQUEST_TIMEOUT_MS = 25_000;
 export const TTS_MAX_RESPONSE_BYTES = 15 * 1024 * 1024;
+export const TTS_VOICES_TIMEOUT_MS = 8_000;
+export const TTS_VOICES_MAX_RESPONSE_BYTES = 1024 * 1024;
+
+export interface TtsVoiceOption {
+  id: string;
+  name?: string;
+  locale?: string;
+  gender?: string;
+}
+
+export interface TtsVoicesResponse {
+  voices: TtsVoiceOption[];
+  source: 'upstream' | 'preset';
+  endpointConfigured: boolean;
+}
 
 export interface TtsPublicConfig {
   mode: TtsEngineMode;
@@ -163,11 +193,7 @@ export function validateTtsBaseUrl(rawUrl: string): TtsBaseUrlValidationResult {
   };
 }
 
-/**
- * Normalize an OpenAI-compatible TTS base URL into the final `/v1/audio/speech` endpoint
- * without doubling `/v1` or `/audio/speech`.
- */
-export function resolveOpenAiSpeechEndpoint(baseUrl: string): string {
+function normalizeOpenAiApiPrefix(baseUrl: string): { origin: string; apiPrefix: string; search: string } {
   const validated = validateTtsBaseUrl(baseUrl);
   if (!validated.ok) {
     throw new Error(validated.error);
@@ -175,15 +201,36 @@ export function resolveOpenAiSpeechEndpoint(baseUrl: string): string {
   const parsed = new URL(validated.url);
   const cleanPath = parsed.pathname.replace(/\/+$/, '');
   const lowerPath = cleanPath.toLowerCase();
-  let targetPath: string;
+  let apiPrefix: string;
   if (lowerPath.endsWith('/audio/speech')) {
-    targetPath = cleanPath;
+    apiPrefix = cleanPath.slice(0, -'/audio/speech'.length);
   } else if (lowerPath.endsWith('/v1')) {
-    targetPath = `${cleanPath}/audio/speech`;
+    apiPrefix = cleanPath;
   } else {
-    targetPath = `${cleanPath}/v1/audio/speech`;
+    apiPrefix = `${cleanPath}/v1`;
   }
-  return `${parsed.origin}${targetPath}${parsed.search}`;
+  return { origin: parsed.origin, apiPrefix, search: parsed.search };
+}
+
+/**
+ * Normalize an OpenAI-compatible TTS base URL into the final `/v1/audio/speech` endpoint
+ * without doubling `/v1` or `/audio/speech`.
+ */
+export function resolveOpenAiSpeechEndpoint(baseUrl: string): string {
+  const { origin, apiPrefix, search } = normalizeOpenAiApiPrefix(baseUrl);
+  return `${origin}${apiPrefix}/audio/speech${search}`;
+}
+
+/**
+ * Resolve standard OpenAI-compatible voice discovery endpoints (`/v1/audio/voices`,
+ * `/v1/voices`) from a configured TTS base URL without doubling path prefixes.
+ */
+export function resolveOpenAiVoicesEndpoints(baseUrl: string): string[] {
+  const { origin, apiPrefix, search } = normalizeOpenAiApiPrefix(baseUrl);
+  return Array.from(new Set([
+    `${origin}${apiPrefix}/audio/voices${search}`,
+    `${origin}${apiPrefix}/voices${search}`,
+  ]));
 }
 
 export function ttsAudioContentType(format: TtsResponseFormat): string {

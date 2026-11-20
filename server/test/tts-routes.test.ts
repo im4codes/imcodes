@@ -11,8 +11,11 @@ import {
   TTS_DEFAULT_RESPONSE_FORMAT,
   TTS_DEFAULT_VOICE,
   TTS_MAX_RESPONSE_BYTES,
+  TTS_OPENAI_PRESET_VOICES,
   TTS_SPEECH_PATH,
   TTS_USER_CONFIG_PREF_KEY,
+  TTS_VOICES_MAX_RESPONSE_BYTES,
+  TTS_VOICES_PATH,
 } from '../../shared/tts-config.js';
 
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
@@ -231,6 +234,7 @@ describe('TTS routes & preferences isolation', () => {
     }, env);
     expect(cfgRes.status).toBe(200);
     const cfg = await cfgRes.json() as Record<string, unknown>;
+    expect(cfg.mode).toBe('server');
     expect(cfg.serverDefaultConfigured).toBe(true);
     expect(cfg.model).toBe('tts-1');
     expect(cfg.voice).toBe('nova');
@@ -379,5 +383,151 @@ describe('TTS routes & preferences isolation', () => {
     const abortRes = await reqPromise;
     expect(capturedSignal?.aborted).toBe(true);
     expect(abortRes.status).toBe(499);
+  });
+
+  it('defaults mode to server when configured unless user explicitly saves system', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db, { TTS_BASE_URL: 'https://tts.example.com/v1' });
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    // Unconfigured user without env defaults -> mode: 'system'
+    const unconfiguredEnv = makeEnv(db);
+    const unconfiguredApp = buildApp(unconfiguredEnv);
+    const rUnconf = await unconfiguredApp.request(TTS_CONFIG_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, unconfiguredEnv);
+    expect((await rUnconf.json() as Record<string, unknown>).mode).toBe('system');
+
+    // User saves baseUrl without specifying mode -> defaults to 'server'
+    const rUserBase = await unconfiguredApp.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ baseUrl: 'http://127.0.0.1:8880/v1' }),
+    }, unconfiguredEnv);
+    expect((await rUserBase.json() as { config: Record<string, unknown> }).config.mode).toBe('server');
+
+    // Admin env TTS_BASE_URL configured -> fresh user gets mode: 'server'
+    const cookie2 = authCookies('user-2');
+    const rAdmin = await app.request(TTS_CONFIG_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie2 },
+    }, env);
+    expect((await rAdmin.json() as Record<string, unknown>).mode).toBe('server');
+
+    // Explicit user override to 'system' persists
+    const rSys = await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie2),
+      body: JSON.stringify({ mode: 'system' }),
+    }, env);
+    expect((await rSys.json() as { config: Record<string, unknown> }).config.mode).toBe('system');
+    const rAfter = await app.request(TTS_CONFIG_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie2 },
+    }, env);
+    expect((await rAfter.json() as Record<string, unknown>).mode).toBe('system');
+  });
+
+  it('GET /api/tts/voices requires auth, probes /audio/voices then /voices with key isolation, normalizes shapes, and falls back to presets', async () => {
+    const { db } = makeMemDb();
+    const env = makeEnv(db, {
+      TTS_BASE_URL: 'https://admin-tts.example.com/v1',
+      TTS_API_KEY: 'admin-secret-voices-key',
+      TTS_VOICE: 'zh-CN-XiaoxiaoNeural',
+    });
+    const app = buildApp(env);
+    const cookie = authCookies();
+
+    // Auth required
+    const unauth = await app.request(TTS_VOICES_PATH, { method: 'GET' }, env);
+    expect(unauth.status).toBe(401);
+
+    // Unconfigured returns presets
+    const unconfEnv = makeEnv(db);
+    const unconfApp = buildApp(unconfEnv);
+    const unconfRes = await unconfApp.request(TTS_VOICES_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, unconfEnv);
+    expect(unconfRes.status).toBe(200);
+    const unconfBody = await unconfRes.json() as { voices: Array<{ id: string }>; source: string; endpointConfigured: boolean };
+    expect(unconfBody.source).toBe('preset');
+    expect(unconfBody.endpointConfigured).toBe(false);
+    expect(unconfBody.voices.map((v) => v.id)).toEqual(TTS_OPENAI_PRESET_VOICES);
+
+    // /v1/audio/voices 404 -> probes /v1/voices -> normalizes Azure/Edge-TTS + includes configured voice
+    const probedUrls: string[] = [];
+    const seenAuths: Array<string | undefined> = [];
+    globalThis.fetch = vi.fn(async (url, init) => {
+      probedUrls.push(String(url));
+      seenAuths.push((init?.headers as Record<string, string>)?.Authorization);
+      if (String(url).endsWith('/audio/voices')) {
+        return new Response('not found', { status: 404 });
+      }
+      return new Response(JSON.stringify({
+        voices: [
+          { ShortName: 'zh-CN-YunxiNeural', FriendlyName: 'Yunxi', Locale: 'zh-CN', Gender: 'Male' },
+          'af_bella',
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const upRes = await app.request(TTS_VOICES_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, env);
+    expect(upRes.status).toBe(200);
+    const upBody = await upRes.json() as { voices: Array<{ id: string; name?: string; locale?: string; gender?: string }>; source: string; endpointConfigured: boolean };
+    expect(probedUrls).toEqual([
+      'https://admin-tts.example.com/v1/audio/voices',
+      'https://admin-tts.example.com/v1/voices',
+    ]);
+    expect(seenAuths).toEqual(['Bearer admin-secret-voices-key', 'Bearer admin-secret-voices-key']);
+    expect(upBody.source).toBe('upstream');
+    expect(upBody.endpointConfigured).toBe(true);
+    expect(upBody.voices).toEqual([
+      { id: 'zh-CN-XiaoxiaoNeural', name: 'zh-CN-XiaoxiaoNeural' },
+      { id: 'zh-CN-YunxiNeural', name: 'Yunxi', locale: 'zh-CN', gender: 'Male' },
+      { id: 'af_bella', name: 'af_bella' },
+    ]);
+
+    // User-supplied baseUrl never receives admin TTS_API_KEY and blocks redirects / oversized / error -> preset fallback
+    await app.request(TTS_CONFIG_PATH, {
+      method: 'PUT',
+      headers: cookieWriteHeaders(cookie),
+      body: JSON.stringify({ baseUrl: 'http://127.0.0.1:5050/v1', voice: 'custom_role' }),
+    }, env);
+    const userAuths: Array<string | undefined> = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      userAuths.push((init?.headers as Record<string, string>)?.Authorization);
+      expect(init?.redirect).toBe('manual');
+      return new Response(null, { status: 302, headers: { Location: 'http://169.254.169.254/' } });
+    }) as typeof fetch;
+
+    const fbRes = await app.request(TTS_VOICES_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, env);
+    expect(fbRes.status).toBe(200);
+    const fbBody = await fbRes.json() as { voices: Array<{ id: string }>; source: string; endpointConfigured: boolean };
+    expect(userAuths).toEqual([undefined, undefined]);
+    expect(fbBody.source).toBe('preset');
+    expect(fbBody.endpointConfigured).toBe(true);
+    expect(fbBody.voices[0]?.id).toBe('custom_role');
+    expect(fbBody.voices.some((v) => v.id === 'alloy')).toBe(true);
+
+    // Oversized upstream JSON is skipped cleanly -> preset fallback
+    globalThis.fetch = vi.fn(async () => new Response('x'.repeat(10), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': String(TTS_VOICES_MAX_RESPONSE_BYTES + 1) },
+    })) as typeof fetch;
+    const bigRes = await app.request(TTS_VOICES_PATH, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    }, env);
+    expect(bigRes.status).toBe(200);
+    expect((await bigRes.json() as { source: string }).source).toBe('preset');
   });
 });

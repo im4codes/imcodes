@@ -2419,6 +2419,7 @@
     "tts_server_api_key_clear": "キーを削除",
     "tts_server_model": "モデル",
     "tts_server_voice": "ボイス",
+    "tts_server_voices_refresh": "ボイス更新",
     "tts_server_format": "音声形式",
     "tts_server_save": "TTS 設定を保存",
     "tts_server_saving": "保存中...",

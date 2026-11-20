@@ -12,19 +12,25 @@ import {
   TTS_ENGINES,
   TTS_MAX_INPUT_CHARS,
   TTS_MAX_RESPONSE_BYTES,
+  TTS_OPENAI_PRESET_VOICES,
   TTS_REQUEST_TIMEOUT_MS,
   TTS_RESPONSE_FORMATS,
   TTS_USER_CONFIG_PREF_KEY,
+  TTS_VOICES_MAX_RESPONSE_BYTES,
+  TTS_VOICES_TIMEOUT_MS,
   clampTtsServerSpeed,
   isTtsEngineMode,
   isTtsResponseFormat,
   maskTtsApiKey,
   resolveOpenAiSpeechEndpoint,
+  resolveOpenAiVoicesEndpoints,
   ttsAudioContentType,
   validateTtsBaseUrl,
   type TtsEngineMode,
   type TtsPublicConfig,
   type TtsResponseFormat,
+  type TtsVoiceOption,
+  type TtsVoicesResponse,
 } from '../../../shared/tts-config.js';
 
 export const ttsRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
@@ -124,8 +130,9 @@ function buildPublicTtsConfig(stored: StoredUserTtsConfig, env: Env): TtsPublicC
       userApiKey = '';
     }
   }
+  const effectiveConfigured = Boolean(stored.baseUrl?.trim() || envDefaults.serverDefaultConfigured);
   return {
-    mode: stored.mode ?? 'system',
+    mode: stored.mode ?? (effectiveConfigured ? 'server' : 'system'),
     baseUrl: stored.baseUrl ?? '',
     hasApiKey: Boolean(userApiKey),
     apiKeyMasked: maskTtsApiKey(userApiKey),
@@ -134,6 +141,117 @@ function buildPublicTtsConfig(stored: StoredUserTtsConfig, env: Env): TtsPublicC
     responseFormat: stored.responseFormat ?? envDefaults.responseFormat,
     serverDefaultConfigured: envDefaults.serverDefaultConfigured,
   };
+}
+
+function resolveEffectiveUpstreamTarget(
+  stored: StoredUserTtsConfig,
+  env: Env,
+  envDefaults: EnvTtsDefaults,
+): { effectiveBaseUrl: string; effectiveApiKey: string; decryptFailed: boolean } {
+  const userBaseUrl = stored.baseUrl?.trim() ?? '';
+  const effectiveBaseUrl = userBaseUrl || envDefaults.baseUrl;
+  let effectiveApiKey = '';
+  if (stored.apiKeyEncrypted) {
+    try {
+      effectiveApiKey = decryptStoredApiKey(stored, env.BOT_ENCRYPTION_KEY);
+    } catch {
+      return { effectiveBaseUrl, effectiveApiKey: '', decryptFailed: true };
+    }
+  } else if (!userBaseUrl) {
+    // Only fall back to admin TTS_API_KEY when using admin TTS_BASE_URL; never send server key to a user-supplied host.
+    effectiveApiKey = envDefaults.apiKey;
+  }
+  return { effectiveBaseUrl, effectiveApiKey, decryptFailed: false };
+}
+
+function appendMissingCurrentVoice(voices: TtsVoiceOption[], currentVoice?: string): TtsVoiceOption[] {
+  const trimmed = typeof currentVoice === 'string' ? currentVoice.trim() : '';
+  if (!trimmed || voices.some((v) => v.id === trimmed)) {
+    return voices;
+  }
+  return [{ id: trimmed, name: trimmed }, ...voices];
+}
+
+function buildPresetVoiceList(currentVoice?: string): TtsVoiceOption[] {
+  const presets: TtsVoiceOption[] = TTS_OPENAI_PRESET_VOICES.map((id) => ({ id, name: id }));
+  return appendMissingCurrentVoice(presets, currentVoice);
+}
+
+function normalizeVoiceEntry(raw: unknown): TtsVoiceOption | null {
+  if (typeof raw === 'string') {
+    const id = raw.trim();
+    return id ? { id, name: id } : null;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const idCandidate = rec.id ?? rec.ShortName ?? rec.short_name ?? rec.voice ?? rec.voice_id ?? rec.name;
+  const id = typeof idCandidate === 'string' ? idCandidate.trim() : '';
+  if (!id) return null;
+  const nameCandidate = rec.name ?? rec.FriendlyName ?? rec.friendly_name ?? rec.displayName ?? rec.display_name;
+  const localeCandidate = rec.locale ?? rec.Locale ?? rec.lang ?? rec.language;
+  const genderCandidate = rec.gender ?? rec.Gender;
+  const option: TtsVoiceOption = {
+    id,
+    name: typeof nameCandidate === 'string' && nameCandidate.trim() ? nameCandidate.trim() : id,
+  };
+  if (typeof localeCandidate === 'string' && localeCandidate.trim()) {
+    option.locale = localeCandidate.trim();
+  }
+  if (typeof genderCandidate === 'string' && genderCandidate.trim()) {
+    option.gender = genderCandidate.trim();
+  }
+  return option;
+}
+
+function normalizeUpstreamVoicesPayload(payload: unknown): TtsVoiceOption[] {
+  const list = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === 'object'
+      ? (Array.isArray((payload as { voices?: unknown }).voices)
+          ? (payload as { voices: unknown[] }).voices
+          : Array.isArray((payload as { data?: unknown }).data)
+            ? (payload as { data: unknown[] }).data
+            : [])
+      : [];
+  const seen = new Set<string>();
+  const out: TtsVoiceOption[] = [];
+  for (const item of list) {
+    const normalized = normalizeVoiceEntry(item);
+    if (!normalized || seen.has(normalized.id)) continue;
+    seen.add(normalized.id);
+    out.push(normalized);
+  }
+  return out;
+}
+
+async function readResponseTextBounded(res: Response, maxBytes: number): Promise<string | null> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => {});
+    return null;
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 function isAudioOrBinaryContentType(contentType: string | null): boolean {
@@ -221,6 +339,102 @@ ttsRoutes.put('/config', async (c) => {
   });
 });
 
+/** GET /api/tts/voices — probe upstream OpenAI-compatible voice endpoints or fall back to standard presets. */
+ttsRoutes.get('/voices', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const stored = await loadStoredUserTtsConfig(c.env, userId);
+  const envDefaults = readEnvTtsDefaults(c.env);
+  const currentVoice = stored.voice?.trim() || envDefaults.voice;
+  const { effectiveBaseUrl, effectiveApiKey, decryptFailed } = resolveEffectiveUpstreamTarget(stored, c.env, envDefaults);
+
+  const respondPreset = (endpointConfigured: boolean) => {
+    const body: TtsVoicesResponse = {
+      voices: buildPresetVoiceList(currentVoice),
+      source: 'preset',
+      endpointConfigured,
+    };
+    return c.json(body, 200, { 'Cache-Control': 'no-store' });
+  };
+
+  if (!effectiveBaseUrl || decryptFailed) {
+    return respondPreset(Boolean(effectiveBaseUrl));
+  }
+
+  let endpoints: string[];
+  try {
+    endpoints = resolveOpenAiVoicesEndpoints(effectiveBaseUrl);
+  } catch {
+    return respondPreset(false);
+  }
+
+  const clientSignal = c.req.raw.signal;
+  if (clientSignal?.aborted) {
+    return c.json({ error: 'request_aborted' }, 499 as never);
+  }
+
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (effectiveApiKey) {
+    headers.Authorization = `Bearer ${effectiveApiKey}`;
+  }
+
+  for (const endpoint of endpoints) {
+    const controller = new AbortController();
+    const onClientAbort = () => controller.abort(clientSignal?.reason ?? new Error('client_aborted'));
+    clientSignal?.addEventListener('abort', onClientAbort, { once: true });
+    const timeoutHandle = setTimeout(() => controller.abort(new Error('upstream_timeout')), TTS_VOICES_TIMEOUT_MS);
+    try {
+      const upstreamRes = await fetch(endpoint, {
+        method: 'GET',
+        headers,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if (upstreamRes.type === 'opaqueredirect' || (upstreamRes.status >= 300 && upstreamRes.status < 400)) {
+        await upstreamRes.body?.cancel().catch(() => {});
+        continue;
+      }
+      if (!upstreamRes.ok) {
+        await upstreamRes.body?.cancel().catch(() => {});
+        continue;
+      }
+      const lenHeader = upstreamRes.headers.get('content-length');
+      if (lenHeader) {
+        const len = Number(lenHeader);
+        if (Number.isFinite(len) && len > TTS_VOICES_MAX_RESPONSE_BYTES) {
+          await upstreamRes.body?.cancel().catch(() => {});
+          continue;
+        }
+      }
+      const rawText = await readResponseTextBounded(upstreamRes, TTS_VOICES_MAX_RESPONSE_BYTES);
+      if (!rawText) continue;
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(rawText);
+      } catch {
+        continue;
+      }
+      const normalized = normalizeUpstreamVoicesPayload(parsedJson);
+      if (normalized.length > 0) {
+        const body: TtsVoicesResponse = {
+          voices: appendMissingCurrentVoice(normalized, currentVoice),
+          source: 'upstream',
+          endpointConfigured: true,
+        };
+        return c.json(body, 200, { 'Cache-Control': 'no-store' });
+      }
+    } catch {
+      if (clientSignal?.aborted) {
+        return c.json({ error: 'request_aborted' }, 499 as never);
+      }
+    } finally {
+      clearTimeout(timeoutHandle);
+      clientSignal?.removeEventListener('abort', onClientAbort);
+    }
+  }
+
+  return respondPreset(true);
+});
+
 /** POST /api/tts/speech — proxy text to the configured OpenAI-compatible /v1/audio/speech endpoint. */
 ttsRoutes.post('/speech', async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -237,10 +451,12 @@ ttsRoutes.post('/speech', async (c) => {
 
   const stored = await loadStoredUserTtsConfig(c.env, userId);
   const envDefaults = readEnvTtsDefaults(c.env);
-  const userBaseUrl = stored.baseUrl?.trim() ?? '';
-  const effectiveBaseUrl = userBaseUrl || envDefaults.baseUrl;
+  const { effectiveBaseUrl, effectiveApiKey, decryptFailed } = resolveEffectiveUpstreamTarget(stored, c.env, envDefaults);
   if (!effectiveBaseUrl) {
     return c.json({ error: 'tts_not_configured' }, 400);
+  }
+  if (decryptFailed) {
+    return c.json({ error: 'tts_config_decrypt_failed' }, 500);
   }
 
   let endpoint: string;
@@ -248,18 +464,6 @@ ttsRoutes.post('/speech', async (c) => {
     endpoint = resolveOpenAiSpeechEndpoint(effectiveBaseUrl);
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : 'invalid_base_url' }, 400);
-  }
-
-  let effectiveApiKey = '';
-  if (stored.apiKeyEncrypted) {
-    try {
-      effectiveApiKey = decryptStoredApiKey(stored, c.env.BOT_ENCRYPTION_KEY);
-    } catch {
-      return c.json({ error: 'tts_config_decrypt_failed' }, 500);
-    }
-  } else if (!userBaseUrl) {
-    // Only fall back to admin TTS_API_KEY when using admin TTS_BASE_URL; never send server key to a user-supplied host.
-    effectiveApiKey = envDefaults.apiKey;
   }
 
   const responseFormat: TtsResponseFormat =

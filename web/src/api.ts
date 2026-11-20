@@ -64,9 +64,11 @@ import {
 import {
   TTS_CONFIG_PATH,
   TTS_SPEECH_PATH,
+  TTS_VOICES_PATH,
   type TtsConfigUpdateBody,
   type TtsPublicConfig,
   type TtsSpeechRequestBody,
+  type TtsVoicesResponse,
 } from '@shared/tts-config.js';
 import type {
   CloudDocBlankType,
@@ -3968,6 +3970,10 @@ export async function deleteRecentDocumentApi(recentId: string): Promise<{ ok: b
 
 export async function getServerTtsConfig(): Promise<TtsPublicConfig> {
   return apiFetch<TtsPublicConfig>(TTS_CONFIG_PATH, { cache: 'no-store' });
+}
+
+export async function getServerTtsVoices(): Promise<TtsVoicesResponse> {
+  return apiFetch<TtsVoicesResponse>(TTS_VOICES_PATH, { cache: 'no-store' });
 }
 
 export async function updateServerTtsConfig(

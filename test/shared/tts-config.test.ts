@@ -10,13 +10,16 @@ import {
   TTS_MAX_INPUT_CHARS,
   TTS_MAX_SPEED,
   TTS_MIN_SPEED,
+  TTS_OPENAI_PRESET_VOICES,
   TTS_RESPONSE_FORMATS,
   TTS_SPEECH_PATH,
+  TTS_VOICES_PATH,
   clampTtsServerSpeed,
   isTtsEngineMode,
   isTtsResponseFormat,
   maskTtsApiKey,
   resolveOpenAiSpeechEndpoint,
+  resolveOpenAiVoicesEndpoints,
   ttsAudioContentType,
   validateTtsBaseUrl,
 } from '../../shared/tts-config.js';
@@ -26,8 +29,11 @@ describe('shared tts-config contract', () => {
     expect(TTS_API_BASE).toBe('/api/tts');
     expect(TTS_CONFIG_PATH).toBe('/api/tts/config');
     expect(TTS_SPEECH_PATH).toBe('/api/tts/speech');
+    expect(TTS_VOICES_PATH).toBe('/api/tts/voices');
     expect(TTS_ENGINES).toEqual(['system', 'server']);
     expect(TTS_RESPONSE_FORMATS).toEqual(['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm']);
+    expect(TTS_OPENAI_PRESET_VOICES).toContain('alloy');
+    expect(TTS_OPENAI_PRESET_VOICES).toContain('nova');
     expect(TTS_DEFAULT_MODEL).toBe('gpt-4o-mini-tts');
     expect(TTS_DEFAULT_VOICE).toBe('alloy');
     expect(TTS_DEFAULT_RESPONSE_FORMAT).toBe('mp3');
@@ -65,6 +71,23 @@ describe('shared tts-config contract', () => {
     expect(resolveOpenAiSpeechEndpoint('https://proxy.example.com/openai')).toBe('https://proxy.example.com/openai/v1/audio/speech');
     expect(resolveOpenAiSpeechEndpoint('http://127.0.0.1:8880/v1')).toBe('http://127.0.0.1:8880/v1/audio/speech');
     expect(resolveOpenAiSpeechEndpoint('http://192.168.1.10:8880')).toBe('http://192.168.1.10:8880/v1/audio/speech');
+
+    expect(resolveOpenAiVoicesEndpoints('https://api.openai.com')).toEqual([
+      'https://api.openai.com/v1/audio/voices',
+      'https://api.openai.com/v1/voices',
+    ]);
+    expect(resolveOpenAiVoicesEndpoints('https://api.openai.com/v1/')).toEqual([
+      'https://api.openai.com/v1/audio/voices',
+      'https://api.openai.com/v1/voices',
+    ]);
+    expect(resolveOpenAiVoicesEndpoints('https://api.openai.com/v1/audio/speech')).toEqual([
+      'https://api.openai.com/v1/audio/voices',
+      'https://api.openai.com/v1/voices',
+    ]);
+    expect(resolveOpenAiVoicesEndpoints('https://proxy.example.com/openai')).toEqual([
+      'https://proxy.example.com/openai/v1/audio/voices',
+      'https://proxy.example.com/openai/v1/voices',
+    ]);
   });
 
   it('validates baseUrl security boundaries while allowing localhost and LAN HTTP', () => {

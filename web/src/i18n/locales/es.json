@@ -2420,6 +2420,7 @@
     "tts_server_api_key_clear": "Borrar clave",
     "tts_server_model": "Modelo",
     "tts_server_voice": "Voz",
+    "tts_server_voices_refresh": "Actualizar voces",
     "tts_server_format": "Formato de audio",
     "tts_server_save": "Guardar ajustes de TTS",
     "tts_server_saving": "Guardando...",
