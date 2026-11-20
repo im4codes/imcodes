@@ -107,6 +107,7 @@ import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
   canHandleGlobalNavigationShortcut,
+  canHandleOpenSettingsShortcut,
   canHandleReturnToMainWindowShortcut,
   cycleOrderedId,
   formatShortcutKeycaps,
@@ -115,6 +116,7 @@ import {
   matchNavigationShortcutBinding,
   matchSubSessionQuickShortcut,
   matchTaskPairSplitQuickShortcut,
+  matchesOpenSettingsShortcut,
   readLegacyTabOrder,
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcutSlots,
@@ -8491,6 +8493,28 @@ function InternalMainApp() {
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
   }, [isMobile, navigateServerByStep, navigateTabByStep]);
+
+  useEffect(() => {
+    const onOpenSettings = () => {
+      if (!authRef.current) return;
+      setShowSettingsPage(true);
+    };
+    const onOpenSettingsKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || !authRef.current) return;
+      const isComposing = isImeComposingKeyEvent(e);
+      if (!matchesOpenSettingsShortcut(e, isMacPlatform())) return;
+      if (!canHandleOpenSettingsShortcut(e.target, document.activeElement, { isComposing })) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setShowSettingsPage(true);
+    };
+    window.addEventListener('imcodes:open-settings', onOpenSettings);
+    window.addEventListener('keydown', onOpenSettingsKeyDown, true);
+    return () => {
+      window.removeEventListener('imcodes:open-settings', onOpenSettings);
+      window.removeEventListener('keydown', onOpenSettingsKeyDown, true);
+    };
+  }, []);
 
   useEffect(() => installMacVoiceShortcutListener({
     getTargetModifier: () => resolvedMacVoiceModifierRef.current,

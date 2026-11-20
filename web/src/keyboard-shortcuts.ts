@@ -828,6 +828,25 @@ export function canHandleGlobalNavigationShortcut(
   return true;
 }
 
+function isShortcutRecordingActive(
+  target: EventTarget | null,
+  activeElement: Element | null,
+): boolean {
+  const targetEl = target instanceof Element ? target : null;
+  if (typeof targetEl?.closest === 'function' && targetEl.closest('[data-shortcut-recording="true"]')) {
+    return true;
+  }
+  if (
+    typeof (activeElement as HTMLElement | null)?.closest === 'function'
+    && activeElement?.closest('[data-shortcut-recording="true"]')
+  ) {
+    return true;
+  }
+  const doc = (activeElement?.ownerDocument ?? (target instanceof Node ? target.ownerDocument : undefined))
+    ?? (typeof document !== 'undefined' ? document : undefined);
+  return Boolean(doc?.querySelector('[data-shortcut-recording="true"]'));
+}
+
 /**
  * Determine whether the global "return to main window" shortcut (`subSessionCloseAll`)
  * should run. Unlike general navigation shortcuts, it stays active inside Remote Desktop
@@ -843,22 +862,35 @@ export function canHandleReturnToMainWindowShortcut(
   },
 ): boolean {
   if (options.isMobile || options.isComposing) return false;
-  const targetEl = target instanceof Element ? target : null;
-  if (typeof targetEl?.closest === 'function' && targetEl.closest('[data-shortcut-recording="true"]')) {
-    return false;
-  }
-  if (
-    typeof (activeElement as HTMLElement | null)?.closest === 'function'
-    && activeElement?.closest('[data-shortcut-recording="true"]')
-  ) {
-    return false;
-  }
-  const doc = (activeElement?.ownerDocument ?? (target instanceof Node ? target.ownerDocument : undefined))
-    ?? (typeof document !== 'undefined' ? document : undefined);
-  if (doc?.querySelector('[data-shortcut-recording="true"]')) {
-    return false;
-  }
-  return true;
+  return !isShortcutRecordingActive(target, activeElement);
+}
+
+/**
+ * Determine whether the OS-standard Open Settings shortcut (`Cmd+,` on macOS,
+ * `Ctrl+,` elsewhere) should run. Remains active from composers, terminals,
+ * Task Mode, and narrow/mobile hardware-keyboard viewports, blocking only
+ * IME composition and active shortcut recording.
+ */
+export function canHandleOpenSettingsShortcut(
+  target: EventTarget | null,
+  activeElement: Element | null,
+  options?: { isComposing?: boolean },
+): boolean {
+  if (options?.isComposing) return false;
+  return !isShortcutRecordingActive(target, activeElement);
+}
+
+export function matchesOpenSettingsShortcut(
+  e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'> & {
+    isComposing?: boolean;
+    keyCode?: number;
+  },
+  isMac = isMacPlatform(),
+): boolean {
+  if (e.isComposing || e.keyCode === 229) return false;
+  if (e.altKey || e.shiftKey) return false;
+  if (isMac ? (!e.metaKey || e.ctrlKey) : (!e.ctrlKey || e.metaKey)) return false;
+  return e.key === ',' || e.code === 'Comma';
 }
 
 function isTerminalOrRemoteSurfaceElement(el: Element | null): boolean {

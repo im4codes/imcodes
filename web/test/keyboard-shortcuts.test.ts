@@ -11,6 +11,7 @@ import {
   applyTaskPairSplitModifiers,
   areSubSessionQuickModifiersEqual,
   canHandleGlobalNavigationShortcut,
+  canHandleOpenSettingsShortcut,
   canHandleReturnToMainWindowShortcut,
   chordFromKeyboardEvent,
   cycleOrderedId,
@@ -25,6 +26,7 @@ import {
   getDefaultSubSessionQuickModifiers,
   getDefaultTaskPairSplitModifiers,
   isMacPlatform,
+  matchesOpenSettingsShortcut,
   matchesShortcutChord,
   matchNavigationShortcutAction,
   matchNavigationShortcutBinding,
@@ -1104,5 +1106,37 @@ describe('keyboard-shortcuts core helpers', () => {
 
     floatingPanel.remove();
     subWin.remove();
+  });
+
+  it('matches Cmd+, on macOS and Ctrl+, on non-macOS while rejecting IME and shortcut recording', () => {
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false }, true)).toBe(true);
+    expect(matchesOpenSettingsShortcut({ key: 'Process', code: 'Comma', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false }, true)).toBe(true);
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false }, true)).toBe(false);
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false }, false)).toBe(true);
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false }, false)).toBe(false);
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: true, ctrlKey: false, altKey: true, shiftKey: false }, true)).toBe(false);
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true }, true)).toBe(false);
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false, isComposing: true }, true)).toBe(false);
+    expect(matchesOpenSettingsShortcut({ key: ',', code: 'Comma', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false, keyCode: 229 }, true)).toBe(false);
+
+    const composer = document.createElement('div');
+    composer.className = 'controls-input';
+    document.body.appendChild(composer);
+    const xterm = document.createElement('textarea');
+    xterm.className = 'xterm-helper-textarea';
+    document.body.appendChild(xterm);
+    expect(canHandleOpenSettingsShortcut(composer, composer)).toBe(true);
+    expect(canHandleOpenSettingsShortcut(xterm, xterm)).toBe(true);
+    expect(canHandleOpenSettingsShortcut(composer, composer, { isComposing: true })).toBe(false);
+
+    const recorder = document.createElement('button');
+    recorder.setAttribute('data-shortcut-recording', 'true');
+    document.body.appendChild(recorder);
+    expect(canHandleOpenSettingsShortcut(recorder, recorder)).toBe(false);
+    expect(canHandleOpenSettingsShortcut(composer, composer)).toBe(false);
+
+    composer.remove();
+    xterm.remove();
+    recorder.remove();
   });
 });

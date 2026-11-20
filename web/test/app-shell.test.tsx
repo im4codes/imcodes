@@ -12021,4 +12021,78 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(paneSrv2).not.toBe(paneSrv1);
     });
   }, 20_000);
+
+  it('opens SettingsPage via imcodes:open-settings event and Cmd+, / Ctrl+, shortcuts while respecting IME and shortcut recording', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Alpha Server', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const platformSpy = vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel');
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+
+      // 1. Desktop PC App menu event opens Settings
+      act(() => {
+        window.dispatchEvent(new CustomEvent('imcodes:open-settings'));
+      });
+      expect(await screen.findByTestId('settings-page-overlay')).toBeTruthy();
+      fireEvent.click(screen.getByText('settings-back'));
+      await waitFor(() => expect(screen.queryByTestId('settings-page-overlay')).toBeNull());
+
+      // 2. IME composition & active shortcut recording must not open Settings
+      const imeEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', metaKey: true, isComposing: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(imeEvt);
+      expect(imeEvt.defaultPrevented).toBe(false);
+      expect(screen.queryByTestId('settings-page-overlay')).toBeNull();
+
+      const recorder = document.createElement('button');
+      recorder.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorder);
+      const recordingEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', metaKey: true, bubbles: true, cancelable: true });
+      recorder.dispatchEvent(recordingEvt);
+      expect(recordingEvt.defaultPrevented).toBe(false);
+      expect(screen.queryByTestId('settings-page-overlay')).toBeNull();
+      recorder.remove();
+
+      // 3. Direct Cmd+, on macOS opens Settings from composer without leaking character input
+      const macEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', metaKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(macEvt);
+      expect(macEvt.defaultPrevented).toBe(true);
+      expect(await screen.findByTestId('settings-page-overlay')).toBeTruthy();
+      fireEvent.click(screen.getByText('settings-back'));
+      await waitFor(() => expect(screen.queryByTestId('settings-page-overlay')).toBeNull());
+
+      // 4. Ctrl+, on non-macOS opens Settings directly
+      platformSpy.mockReturnValue('Win32');
+      const winEvt = new KeyboardEvent('keydown', { key: ',', code: 'Comma', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(winEvt);
+      expect(winEvt.defaultPrevented).toBe(true);
+      expect(await screen.findByTestId('settings-page-overlay')).toBeTruthy();
+    } finally {
+      platformSpy.mockRestore();
+    }
+  }, 20_000);
 });
