@@ -6086,10 +6086,17 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   if (tokens.files.length > 0) {
     const record = getSession(sessionName);
     const projectDir = record?.projectDir ?? '';
+    const projectRealRoot = projectDir ? nodePath.resolve(projectDir) : '';
+    const restrictToSessionUploads = isNonServerSharedActor(sharedActor);
     for (const fp of tokens.files) {
       const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
       const entry = lookupAttachment(absPath);
       if (entry) {
+        if (restrictToSessionUploads) {
+          const entrySessionName = extractAttachmentEntrySessionName(entry);
+          const insideProject = !!projectRealRoot && isSameOrInsidePath(projectRealRoot, nodePath.resolve(entry.daemonPath));
+          if (!insideProject && entrySessionName !== sessionName) continue;
+        }
         attachments.push({
           id: entry.id,
           originalName: entry.originalName,
@@ -10229,20 +10236,71 @@ function isSameOrInsidePath(root: string, candidate: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
+function extractAttachmentEntrySessionName(entry: unknown): string {
+  if (!entry || typeof entry !== 'object') return '';
+  const raw = (entry as { sessionName?: unknown }).sessionName;
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function isSameResolvedUploadPath(candidate: string, registeredPath: string, realTarget: string): boolean {
+  const expanded = candidate.startsWith('~') ? candidate.replace(/^~/, homedir()) : candidate;
+  const resolved = nodePath.resolve(expanded);
+  return resolved === registeredPath || resolved === realTarget;
+}
+
+async function hasSessionUploadAttachmentGrant(
+  sessionName: string,
+  entryId: string,
+  registeredPath: string,
+  realTarget: string,
+): Promise<boolean> {
+  let events: Awaited<ReturnType<typeof timelineStore.readByTypesPreferred>>;
+  try {
+    events = await timelineStore.readByTypesPreferred(sessionName, ['user.message'], { limit: 5_000 });
+  } catch {
+    return false;
+  }
+  for (const event of events) {
+    if (event.sessionId !== sessionName || event.type !== 'user.message' || event.hidden === true) continue;
+    const attachments = event.payload?.attachments;
+    if (Array.isArray(attachments)) {
+      for (const att of attachments) {
+        if (!att || typeof att !== 'object') continue;
+        const record = att as { id?: unknown; daemonPath?: unknown };
+        if (typeof record.id === 'string' && record.id === entryId) return true;
+        if (typeof record.daemonPath === 'string' && isSameResolvedUploadPath(record.daemonPath, registeredPath, realTarget)) {
+          return true;
+        }
+      }
+    }
+    if (!isNonServerSharedActor(event.payload?.sharedActor) && typeof event.payload?.text === 'string') {
+      for (const match of event.payload.text.matchAll(TAGGED_ATTACHMENT_REFERENCE_RE)) {
+        const refPath = match[2];
+        if (refPath && isSameResolvedUploadPath(refPath, registeredPath, realTarget)) return true;
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * Shared file reads are normally confined to the session project root. Chat
  * attachments are the one deliberate exception: uploads live under the
  * daemon-owned ~/.imcodes/uploads directory, outside every project root.
  *
- * Keep the exception capability-based rather than directory-based. The exact
- * path must still be a live upload entry in the attachment registry, must be a
- * regular non-symlink file, and must remain inside the canonical upload root.
- * This permits previews/download-handle minting without exposing directory
- * listing or arbitrary files beside an attachment.
+ * Keep the exception capability-based AND session-scoped rather than global:
+ * the exact path must be a live upload entry inside the canonical upload root,
+ * and must carry trusted evidence tying it to `sessionName` (explicit entry
+ * session binding or same-session user attachment history). Uploads from other
+ * sessions or unbound global entries fail closed.
  */
-async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<string | null> {
+async function resolveRegisteredUploadReadTarget(sessionName: string, rawPath: string): Promise<string | null> {
+  if (!sessionName) return null;
   const entry = lookupAttachment(rawPath);
   if (!entry || entry.source !== 'upload' || Date.now() > entry.expiresAt) return null;
+
+  const entrySessionName = extractAttachmentEntrySessionName(entry);
+  if (entrySessionName && entrySessionName !== sessionName) return null;
 
   const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
   const registeredPath = nodePath.resolve(entry.daemonPath);
@@ -10256,10 +10314,60 @@ async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<strin
       fsRealpath(registeredPath),
     ]);
     if (!isSameOrInsidePath(realRoot, realTarget) || !isPathAllowed(realTarget)) return null;
-    return realTarget;
+    if (entrySessionName === sessionName) return realTarget;
+    const authorized = await hasSessionUploadAttachmentGrant(sessionName, entry.id, registeredPath, realTarget);
+    return authorized ? realTarget : null;
   } catch {
     return null;
   }
+}
+
+async function resolveAuthorizedSessionOutOfRootReadTarget(input: {
+  cmd: Record<string, unknown>;
+  rawPath: string;
+  inProjectError: string;
+  isChatFileReference: boolean;
+}): Promise<
+  | { ok: true; realPath: string; attemptedLocations?: string[]; matchCount?: number }
+  | { ok: false; error: string; attemptedLocations?: string[] }
+> {
+  const hasExplicitAllowedRoot = typeof input.cmd.allowedRoot === 'string' && input.cmd.allowedRoot.trim().length > 0;
+  if (hasExplicitAllowedRoot) {
+    return { ok: false, error: input.inProjectError };
+  }
+  if (!input.isChatFileReference && input.inProjectError !== FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH) {
+    return { ok: false, error: input.inProjectError };
+  }
+  const sessionName = extractFsCommandSessionName(input.cmd);
+  if (!sessionName) {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+  }
+  const registeredUpload = await resolveRegisteredUploadReadTarget(sessionName, input.rawPath);
+  if (registeredUpload) {
+    return { ok: true, realPath: registeredUpload, matchCount: 1 };
+  }
+  const published = await resolveAssistantPublishedReadTarget(sessionName, input.rawPath);
+  if (!published.granted) {
+    return {
+      ok: false,
+      error: input.isChatFileReference ? FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH : input.inProjectError,
+    };
+  }
+  if (!published.resolution.ok) {
+    return input.isChatFileReference
+      ? {
+          ok: false,
+          error: published.resolution.error,
+          attemptedLocations: published.resolution.attemptedLocations,
+        }
+      : { ok: false, error: input.inProjectError };
+  }
+  return {
+    ok: true,
+    realPath: published.resolution.realPath,
+    attemptedLocations: published.resolution.attemptedLocations,
+    matchCount: published.resolution.matchCount,
+  };
 }
 
 /**
@@ -11237,94 +11345,53 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;
   }
-  if (cmd.chatFileReference === true) {
-    // A file that already resolves inside the session's own project root has
-    // always been downloadable without any assistant grant -- this predates
-    // chatFileReference and must not regress. ChatView marks EVERY download
-    // and preview click chatFileReference:true now, including clicks on
-    // paths that its own tool.call/tool.result renderer (splitPathsAndUrls)
-    // extracted; those never mint a grant by design (session-file-read-grants
-    // only ingests assistant.text), so without this check an in-project file
-    // mentioned only in tool output, or a plain path a user pasted, would be
-    // wrongly refused with forbidden_path where it used to just work.
-    if (sessionRoot.realRoot) {
-      const inProject = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
-      if (inProject.ok) {
-        getDefaultPreviewReadCoordinator().handle(inProject.real, requestId, (message) => serverLink.send({
-          ...message,
-          path: rawPath,
-          resolvedPath: inProject.real,
-          resolutionMatchCount: 1,
-        }));
-        return;
-      }
-    }
-    const sessionName = extractFsCommandSessionName(cmd);
-    if (!sessionName) {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+  const isChatFileReference = cmd.chatFileReference === true;
+  const sendReadResult = (
+    realPath: string,
+    metadata?: { attemptedLocations?: string[]; matchCount?: number },
+  ) => {
+    if (!isChatFileReference) {
+      getDefaultPreviewReadCoordinator().handle(realPath, requestId, (message) => serverLink.send(message));
       return;
     }
-    const registeredUpload = await resolveRegisteredUploadReadTarget(rawPath);
-    if (registeredUpload) {
-      getDefaultPreviewReadCoordinator().handle(registeredUpload, requestId, (message) => serverLink.send({
-        ...message,
-        path: rawPath,
-        resolvedPath: registeredUpload,
-        resolutionMatchCount: 1,
-      }));
-      return;
-    }
-    const published = await resolveAssistantPublishedReadTarget(sessionName, rawPath);
-    if (!published.granted) {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
-      return;
-    }
-    if (!published.resolution.ok) {
-      try {
-        serverLink.send({
-          type: 'fs.read_response',
-          requestId,
-          path: rawPath,
-          status: 'error',
-          error: published.resolution.error,
-          attemptedLocations: published.resolution.attemptedLocations,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
-    const { realPath, attemptedLocations, matchCount } = published.resolution;
     getDefaultPreviewReadCoordinator().handle(realPath, requestId, (message) => serverLink.send({
       ...message,
       path: rawPath,
       resolvedPath: realPath,
-      attemptedLocations,
-      resolutionMatchCount: matchCount,
+      ...(metadata?.attemptedLocations ? { attemptedLocations: metadata.attemptedLocations } : {}),
+      resolutionMatchCount: metadata?.matchCount ?? 1,
     }));
-    return;
-  }
+  };
+
   if (sessionRoot.realRoot) {
     const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
-    if (!target.ok) {
-      const hasExplicitAllowedRoot = typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim().length > 0;
-      const registeredUpload = !hasExplicitAllowedRoot && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
-        ? await resolveRegisteredUploadReadTarget(rawPath)
-        : null;
-      const legacyPublished = !hasExplicitAllowedRoot && !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
-        ? await resolveAssistantPublishedReadTarget(
-          extractFsCommandSessionName(cmd),
-          rawPath,
-        )
-        : null;
-      const exactReadTarget = registeredUpload
-        ?? (legacyPublished?.granted && legacyPublished.resolution.ok ? legacyPublished.resolution.realPath : null);
-      if (exactReadTarget) {
-        getDefaultPreviewReadCoordinator().handle(exactReadTarget, requestId, (message) => serverLink.send(message));
-        return;
-      }
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: target.error }); } catch { /* ignore */ }
+    if (target.ok) {
+      sendReadResult(target.real, { matchCount: 1 });
       return;
     }
-    getDefaultPreviewReadCoordinator().handle(target.real, requestId, (message) => serverLink.send(message));
+    const outOfRoot = await resolveAuthorizedSessionOutOfRootReadTarget({
+      cmd,
+      rawPath,
+      inProjectError: target.error,
+      isChatFileReference,
+    });
+    if (outOfRoot.ok) {
+      sendReadResult(outOfRoot.realPath, {
+        attemptedLocations: outOfRoot.attemptedLocations,
+        matchCount: outOfRoot.matchCount,
+      });
+      return;
+    }
+    try {
+      serverLink.send({
+        type: 'fs.read_response',
+        requestId,
+        path: rawPath,
+        status: 'error',
+        error: outOfRoot.error,
+        ...(outOfRoot.attemptedLocations ? { attemptedLocations: outOfRoot.attemptedLocations } : {}),
+      });
+    } catch { /* ignore */ }
     return;
   }
   getDefaultPreviewReadCoordinator().handle(rawPath, requestId, (message) => serverLink.send(message));
