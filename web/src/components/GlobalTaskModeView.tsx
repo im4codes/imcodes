@@ -5,6 +5,7 @@ import {
   brainKey,
   globalTaskModeStore,
   resolveQuickDispatchBrains,
+  sortGlobalTaskServers,
   taskKey,
   type GlobalTaskModeState,
   type GlobalTaskQuickDispatchBrain,
@@ -30,6 +31,10 @@ export type GlobalTaskStatusFilter = 'all' | 'attention' | 'working' | 'audit' |
 export interface GlobalTaskModeViewProps {
   onExit: () => void;
   onJumpToSession: (serverId: string, sessionName: string) => void;
+  pinnedServerIds?: ReadonlySet<string>;
+  pinnedSessionNames?: ReadonlySet<string>;
+  serverOrder?: readonly string[];
+  tabOrder?: readonly string[];
 }
 
 interface TaskModeTargetSnapshot {
@@ -174,7 +179,14 @@ function formatUpdatedRelative(ts: number, locale: string): string {
   }
 }
 
-export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeViewProps) {
+export function GlobalTaskModeView({
+  onExit,
+  onJumpToSession,
+  pinnedServerIds,
+  pinnedSessionNames,
+  serverOrder,
+  tabOrder,
+}: GlobalTaskModeViewProps) {
   const { t, i18n } = useTranslation();
   const locale = i18n?.resolvedLanguage || i18n?.language || (typeof document !== 'undefined' ? document.documentElement?.lang : '') || 'en';
 
@@ -384,9 +396,13 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
 
   // Derived data
   const mutedSet = useMemo(() => new Set(state.mutedServerIds), [state.mutedServerIds]);
+  const sortedServers = useMemo(
+    () => sortGlobalTaskServers(state.servers, pinnedServerIds, serverOrder),
+    [pinnedServerIds, serverOrder, state.servers],
+  );
   const unmutedServers = useMemo(
-    () => state.servers.filter((s) => !mutedSet.has(s.id)),
-    [state.servers, mutedSet],
+    () => sortedServers.filter((s) => !mutedSet.has(s.id)),
+    [sortedServers, mutedSet],
   );
   const pinnedBrainKeys = useMemo(
     () => new Set(state.pinnedBrains.map((p) => brainKey(p.serverId, p.sessionName))),
@@ -399,14 +415,24 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
       state.recentBrains,
       state.brains,
       state.mutedServerIds,
+      { pinnedServerIds, pinnedSessionNames, serverOrder, tabOrder },
     ),
-    [state.pinnedBrains, state.recentBrains, state.brains, state.mutedServerIds],
+    [
+      pinnedServerIds,
+      pinnedSessionNames,
+      serverOrder,
+      state.brains,
+      state.mutedServerIds,
+      state.pinnedBrains,
+      state.recentBrains,
+      tabOrder,
+    ],
   );
 
   // Sync add-modal defaults when opened or servers/brains change
   useEffect(() => {
     if (!addModalOpen) return;
-    const candidates = unmutedServers.length > 0 ? unmutedServers : state.servers;
+    const candidates = unmutedServers.length > 0 ? unmutedServers : sortedServers;
     const chosenServer = candidates.some((s) => s.id === addServerId)
       ? addServerId
       : (candidates[0]?.id ?? '');
@@ -417,7 +443,7 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
     if (!brainsForServer.some((b) => b.sessionName === addSessionName)) {
       setAddSessionName(brainsForServer[0]?.sessionName ?? '');
     }
-  }, [addModalOpen, addServerId, addSessionName, state.brains, state.servers, unmutedServers]);
+  }, [addModalOpen, addServerId, addSessionName, sortedServers, state.brains, unmutedServers]);
 
   const counts = useMemo(() => {
     let attention = 0;
@@ -967,11 +993,11 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
                 style={serverMenuTop !== null ? ({ '--filter-menu-top': `${serverMenuTop}px` } as Record<string, string>) : undefined}
               >
                 <div class="global-task-server-filter-title">{t('taskMode.server_filter_heading', 'Visible Servers')}</div>
-                {state.servers.length === 0 ? (
+                {sortedServers.length === 0 ? (
                   <div class="global-task-server-filter-empty">{t('taskMode.no_servers', 'No servers')}</div>
                 ) : (
                   <div class="global-task-server-filter-list" data-testid="task-mode-server-filter-list">
-                    {state.servers.map((server) => {
+                    {sortedServers.map((server) => {
                       const enabled = !mutedSet.has(server.id);
                       return (
                         <label key={server.id} class="global-task-server-filter-item">
@@ -1253,7 +1279,7 @@ export function GlobalTaskModeView({ onExit, onJumpToSession }: GlobalTaskModeVi
                     setAddSessionName(firstBrain?.sessionName ?? '');
                   }}
                 >
-                  {(unmutedServers.length > 0 ? unmutedServers : state.servers).map((s) => (
+                  {(unmutedServers.length > 0 ? unmutedServers : sortedServers).map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
                     </option>

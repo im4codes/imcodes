@@ -17,6 +17,7 @@ import {
   MAX_RECENT_BRAINS,
   resolveQuickDispatchBrains,
   sortGlobalTaskCards,
+  sortGlobalTaskServers,
 } from '../src/global-task-mode-store.js';
 
 class MockWebSocket {
@@ -418,6 +419,116 @@ describe('global-task-mode-store', () => {
     expect(quick.map((item) => ({ s: item.serverId, pinned: item.pinned, recent: item.recent }))).toEqual([
       { s: 'srv-2', pinned: true, recent: true },
       { s: 'srv-3', pinned: false, recent: true },
+    ]);
+  });
+
+  it('ranks quick dispatch Brains across strict 4-tier workspace server+session pin priorities and tie-breakers', () => {
+    const brains: GlobalTaskBrainSummary[] = [
+      // Tier 3: unpinned server + unpinned session (online, recently used)
+      makeBrain({ serverId: 'srv-plain-1', serverName: 'Plain 1', serverOnline: true, sessionName: 's_plain', label: 'Plain' }),
+      // Tier 2: pinned server + unpinned session
+      makeBrain({ serverId: 'srv-pin-b', serverName: 'Pinned B', serverOnline: true, sessionName: 's_pin_srv_only', label: 'PinSrvOnly' }),
+      // Tier 1: unpinned server + workspace pinned session (same sessionName as Tier 0!)
+      makeBrain({ serverId: 'srv-plain-2', serverName: 'Plain 2', serverOnline: true, sessionName: 'deck_shared_brain', label: 'SharedOnPlain' }),
+      // Tier 1: unpinned server + task-mode starred session
+      makeBrain({ serverId: 'srv-plain-1', serverName: 'Plain 1', serverOnline: true, sessionName: 's_starred_plain', label: 'StarredOnPlain' }),
+      // Tier 0: pinned server (offline!) + workspace pinned session -> still stays Tier 0 above Tier 1/2/3
+      makeBrain({ serverId: 'srv-pin-b', serverName: 'Pinned B', serverOnline: false, sessionName: 'deck_shared_brain', label: 'SharedOnPinBOffline' }),
+      // Tier 0: pinned server + workspace pinned session (online)
+      makeBrain({ serverId: 'srv-pin-a', serverName: 'Pinned A', serverOnline: true, sessionName: 's_ws_pin_a', label: 'WsPinA' }),
+      // Tier 0: pinned server + task-mode starred session
+      makeBrain({ serverId: 'srv-pin-a', serverName: 'Pinned A', serverOnline: true, sessionName: 's_star_pin_a', label: 'StarPinA' }),
+      // Muted pinned server -> must still be excluded
+      makeBrain({ serverId: 'srv-pin-muted', serverName: 'Pinned Muted', serverOnline: true, sessionName: 's_ws_pin_a', label: 'MutedPin' }),
+    ];
+
+    const quick = resolveQuickDispatchBrains(
+      [
+        { serverId: 'srv-pin-a', sessionName: 's_star_pin_a', label: 'StarPinA' },
+        { serverId: 'srv-plain-1', sessionName: 's_starred_plain', label: 'StarredOnPlain' },
+      ],
+      [
+        { serverId: 'srv-plain-1', sessionName: 's_plain', lastUsedAt: 9_000 },
+        { serverId: 'srv-plain-2', sessionName: 'deck_shared_brain', lastUsedAt: 5_000 },
+      ],
+      brains,
+      ['srv-pin-muted'],
+      {
+        pinnedServerIds: new Set(['srv-pin-a', 'srv-pin-b', 'srv-pin-muted']),
+        pinnedSessionNames: new Set(['deck_shared_brain', 's_ws_pin_a']),
+        serverOrder: ['srv-pin-b', 'srv-pin-a', 'srv-plain-2', 'srv-plain-1'],
+        tabOrder: ['s_ws_pin_a', 'deck_shared_brain'],
+      },
+    );
+
+    expect(quick.map((item) => `${item.serverId}:${item.sessionName}`)).toEqual([
+      // Tier 0: explicit star first, then online before offline (same recent=0)
+      'srv-pin-a:s_star_pin_a',
+      'srv-pin-a:s_ws_pin_a',
+      'srv-pin-b:deck_shared_brain',
+      // Tier 1: explicit star first, then workspace pinned session (recent)
+      'srv-plain-1:s_starred_plain',
+      'srv-plain-2:deck_shared_brain',
+      // Tier 2: pinned server + unpinned session
+      'srv-pin-b:s_pin_srv_only',
+      // Tier 3: plain server + plain session
+      'srv-plain-1:s_plain',
+    ]);
+    expect(quick[0]).toMatchObject({ serverPinned: true, sessionPinned: true });
+    expect(quick[4]).toMatchObject({ serverPinned: false, sessionPinned: true });
+    expect(quick[5]).toMatchObject({ serverPinned: true, sessionPinned: false });
+    expect(quick[6]).toMatchObject({ serverPinned: false, sessionPinned: false });
+  });
+
+  it('breaks ties within a tier by star order, lastUsedAt, online, serverOrder, tabOrder, and label', () => {
+    const brains: GlobalTaskBrainSummary[] = [
+      makeBrain({ serverId: 'srv-b', serverName: 'Zulu', serverOnline: true, sessionName: 'tab-2', label: 'Beta' }),
+      makeBrain({ serverId: 'srv-a', serverName: 'Alpha', serverOnline: true, sessionName: 'tab-1', label: 'Alpha' }),
+      makeBrain({ serverId: 'srv-a', serverName: 'Alpha', serverOnline: true, sessionName: 'tab-0', label: 'Gamma' }),
+    ];
+
+    const quick = resolveQuickDispatchBrains(
+      [],
+      [],
+      brains,
+      [],
+      {
+        pinnedServerIds: new Set(['srv-a', 'srv-b']),
+        pinnedSessionNames: new Set(['tab-0', 'tab-1', 'tab-2']),
+        serverOrder: ['srv-b', 'srv-a'],
+        tabOrder: ['tab-1', 'tab-0'],
+      },
+    );
+
+    // All Tier 0, unstarred, same lastUsedAt, all online -> serverOrder puts srv-b first, then tabOrder puts tab-1 before tab-0
+    expect(quick.map((b) => `${b.serverId}:${b.sessionName}`)).toEqual([
+      'srv-b:tab-2',
+      'srv-a:tab-1',
+      'srv-a:tab-0',
+    ]);
+  });
+
+  it('sorts servers with pinned servers first (by serverOrder then name), then online-first unpinned servers', () => {
+    const servers: GlobalTaskServerSummary[] = [
+      { id: 'u-off', name: 'A-Offline', online: false },
+      { id: 'u-on-b', name: 'B-Online', online: true },
+      { id: 'u-on-a', name: 'A-Online', online: true },
+      { id: 'p-off', name: 'Z-PinnedOffline', online: false },
+      { id: 'p-on', name: 'M-PinnedOnline', online: true },
+    ];
+
+    const sorted = sortGlobalTaskServers(
+      servers,
+      new Set(['p-off', 'p-on']),
+      ['p-off', 'u-on-b'],
+    );
+
+    expect(sorted.map((s) => s.id)).toEqual([
+      'p-off',
+      'p-on',
+      'u-on-b',
+      'u-on-a',
+      'u-off',
     ]);
   });
 });

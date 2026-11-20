@@ -10805,6 +10805,10 @@ function InternalMainApp() {
           <GlobalTaskModeView
             onExit={() => setShowTaskMode(false)}
             onJumpToSession={handleJumpToGlobalTaskSession}
+            pinnedServerIds={pinnedServerIds}
+            pinnedSessionNames={pinnedTabs}
+            serverOrder={serverOrder}
+            tabOrder={tabOrder}
           />
         </div>
       )}

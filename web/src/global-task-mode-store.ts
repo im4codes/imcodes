@@ -46,6 +46,15 @@ export interface GlobalTaskQuickDispatchBrain {
   pinned: boolean;
   recent: boolean;
   lastUsedAt?: number;
+  serverPinned?: boolean;
+  sessionPinned?: boolean;
+}
+
+export interface GlobalTaskQuickDispatchPinContext {
+  pinnedServerIds?: ReadonlySet<string>;
+  pinnedSessionNames?: ReadonlySet<string>;
+  serverOrder?: readonly string[];
+  tabOrder?: readonly string[];
 }
 
 export interface GlobalTaskModeState {
@@ -207,11 +216,49 @@ export function sortGlobalTaskCards(items: readonly GlobalTaskSummaryRow[]): Glo
   });
 }
 
+function buildOrderIndex(order?: readonly string[]): Map<string, number> {
+  const index = new Map<string, number>();
+  if (!order) return index;
+  for (let i = 0; i < order.length; i += 1) {
+    const id = order[i];
+    if (id && !index.has(id)) {
+      index.set(id, i);
+    }
+  }
+  return index;
+}
+
+export function sortGlobalTaskServers(
+  servers: readonly GlobalTaskServerSummary[],
+  pinnedServerIds?: ReadonlySet<string>,
+  serverOrder?: readonly string[],
+): GlobalTaskServerSummary[] {
+  const hasPinned = Boolean(pinnedServerIds && pinnedServerIds.size > 0);
+  const hasOrder = Boolean(serverOrder && serverOrder.length > 0);
+  if (!hasPinned && !hasOrder) {
+    return [...servers];
+  }
+  const serverOrderIndex = buildOrderIndex(serverOrder);
+  return [...servers].sort((a, b) => {
+    const aPinned = Boolean(pinnedServerIds?.has(a.id));
+    const bPinned = Boolean(pinnedServerIds?.has(b.id));
+    if (aPinned !== bPinned) return aPinned ? -1 : 1;
+    if (!aPinned && a.online !== b.online) {
+      return a.online ? -1 : 1;
+    }
+    const orderA = serverOrderIndex.get(a.id) ?? Number.MAX_SAFE_INTEGER;
+    const orderB = serverOrderIndex.get(b.id) ?? Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    return a.name.localeCompare(b.name);
+  });
+}
+
 export function resolveQuickDispatchBrains(
   pinned: readonly GlobalTaskPinnedBrain[],
   recent: readonly GlobalTaskRecentBrain[],
   brainsFromSnapshot: readonly GlobalTaskBrainSummary[],
   mutedServerIds: readonly string[],
+  pinCtx?: GlobalTaskQuickDispatchPinContext,
 ): GlobalTaskQuickDispatchBrain[] {
   const mutedSet = new Set(mutedServerIds);
   const liveByKey = new Map<string, GlobalTaskBrainSummary>();
@@ -226,7 +273,8 @@ export function resolveQuickDispatchBrains(
     recentByKey.set(brainKey(r.serverId, r.sessionName), r);
   }
 
-  const result: GlobalTaskQuickDispatchBrain[] = [];
+  const pinnedIndexByKey = new Map<string, number>();
+  const candidates: GlobalTaskQuickDispatchBrain[] = [];
   const seen = new Set<string>();
 
   const pushBrain = (
@@ -240,7 +288,9 @@ export function resolveQuickDispatchBrains(
     seen.add(key);
     const live = liveByKey.get(key);
     const recentEntry = recentByKey.get(key);
-    result.push({
+    const isServerPinned = Boolean(pinCtx?.pinnedServerIds?.has(entry.serverId));
+    const isSessionPinned = pinnedFlag || Boolean(pinCtx?.pinnedSessionNames?.has(entry.sessionName));
+    candidates.push({
       serverId: entry.serverId,
       serverName: live?.serverName ?? entry.serverId,
       serverOnline: live?.serverOnline ?? false,
@@ -251,28 +301,70 @@ export function resolveQuickDispatchBrains(
       agentType: live?.agentType ?? '',
       pinned: pinnedFlag,
       recent: recentFlag || recentByKey.has(key),
+      serverPinned: isServerPinned,
+      sessionPinned: isSessionPinned,
       ...(entry.lastUsedAt ?? recentEntry?.lastUsedAt ? { lastUsedAt: entry.lastUsedAt ?? recentEntry?.lastUsedAt } : {}),
     });
   };
 
-  for (const p of pinned) {
+  for (let i = 0; i < pinned.length; i += 1) {
+    const p = pinned[i]!;
+    const key = brainKey(p.serverId, p.sessionName);
+    if (!pinnedIndexByKey.has(key)) {
+      pinnedIndexByKey.set(key, i);
+    }
     pushBrain(p, true, false);
   }
   const sortedRecent = [...recent].sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
   for (const r of sortedRecent) {
     pushBrain(r, false, true);
   }
-  const sortedLive = [...brainsFromSnapshot]
-    .filter((b) => !mutedSet.has(b.serverId))
-    .sort((a, b) => {
-      if (a.serverOnline !== b.serverOnline) return a.serverOnline ? -1 : 1;
-      return a.label.localeCompare(b.label);
-    });
-  for (const live of sortedLive) {
+  for (const live of brainsFromSnapshot) {
     pushBrain(live, false, false);
   }
 
-  return result;
+  const serverOrderIndex = buildOrderIndex(pinCtx?.serverOrder);
+  const tabOrderIndex = buildOrderIndex(pinCtx?.tabOrder);
+
+  const tierOf = (item: GlobalTaskQuickDispatchBrain): number => {
+    const srv = Boolean(item.serverPinned);
+    const ses = Boolean(item.sessionPinned);
+    if (srv && ses) return 0;
+    if (ses) return 1;
+    if (srv) return 2;
+    return 3;
+  };
+
+  candidates.sort((a, b) => {
+    const tierDiff = tierOf(a) - tierOf(b);
+    if (tierDiff !== 0) return tierDiff;
+
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    if (a.pinned && b.pinned) {
+      const idxA = pinnedIndexByKey.get(brainKey(a.serverId, a.sessionName)) ?? Number.MAX_SAFE_INTEGER;
+      const idxB = pinnedIndexByKey.get(brainKey(b.serverId, b.sessionName)) ?? Number.MAX_SAFE_INTEGER;
+      if (idxA !== idxB) return idxA - idxB;
+    }
+
+    const usedDiff = (b.lastUsedAt || 0) - (a.lastUsedAt || 0);
+    if (usedDiff !== 0) return usedDiff;
+
+    if (a.serverOnline !== b.serverOnline) return a.serverOnline ? -1 : 1;
+
+    const srvOrderA = serverOrderIndex.get(a.serverId) ?? Number.MAX_SAFE_INTEGER;
+    const srvOrderB = serverOrderIndex.get(b.serverId) ?? Number.MAX_SAFE_INTEGER;
+    if (srvOrderA !== srvOrderB) return srvOrderA - srvOrderB;
+
+    const tabOrderA = tabOrderIndex.get(a.sessionName) ?? Number.MAX_SAFE_INTEGER;
+    const tabOrderB = tabOrderIndex.get(b.sessionName) ?? Number.MAX_SAFE_INTEGER;
+    if (tabOrderA !== tabOrderB) return tabOrderA - tabOrderB;
+
+    const labelCmp = a.label.localeCompare(b.label);
+    if (labelCmp !== 0) return labelCmp;
+    return a.serverName.localeCompare(b.serverName);
+  });
+
+  return candidates;
 }
 
 function makeCommandId(): string {

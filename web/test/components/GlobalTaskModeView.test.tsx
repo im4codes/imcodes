@@ -730,4 +730,109 @@ describe('GlobalTaskModeView', () => {
     expect(mobileBlock).toMatch(/\.global-task-mode-topbar-right\s*\{[^}]*flex-wrap:\s*nowrap;/s);
     expect(mobileBlock).toMatch(/\.global-task-quickbar-list\s*\{\s*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
   });
+
+  it('orders quick-dispatch pills, server filter list, and add-modal server select by workspace pinned server + pinned session priorities', async () => {
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    render(
+      <GlobalTaskModeView
+        onExit={vi.fn()}
+        onJumpToSession={vi.fn()}
+        pinnedServerIds={new Set(['srv-pin'])}
+        pinnedSessionNames={new Set(['sess_pin'])}
+        serverOrder={['srv-pin', 'srv-plain-2', 'srv-plain-1']}
+        tabOrder={['sess_pin', 'sess_plain']}
+      />,
+    );
+
+    await waitFor(() => expect(MockWebSocket.instances.length).toBe(1));
+    const ws = MockWebSocket.instances[0]!;
+
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: GLOBAL_TASK_MODE_MSG.SNAPSHOT,
+        ts: 20_000,
+        servers: [
+          { id: 'srv-plain-1', name: 'Plain-1', online: true },
+          { id: 'srv-plain-2', name: 'Plain-2', online: true },
+          { id: 'srv-pin', name: 'Pinned-Srv', online: false },
+        ],
+        brains: [
+          {
+            serverId: 'srv-plain-1',
+            serverName: 'Plain-1',
+            serverOnline: true,
+            sessionName: 'sess_plain',
+            projectName: 'p3',
+            label: 'Tier3-Plain',
+            state: 'idle',
+            agentType: 'claude-code',
+          },
+          {
+            serverId: 'srv-pin',
+            serverName: 'Pinned-Srv',
+            serverOnline: false,
+            sessionName: 'sess_plain_on_pin',
+            projectName: 'p2',
+            label: 'Tier2-PinSrvOnly',
+            state: 'idle',
+            agentType: 'claude-code',
+          },
+          {
+            serverId: 'srv-plain-2',
+            serverName: 'Plain-2',
+            serverOnline: true,
+            sessionName: 'sess_pin',
+            projectName: 'p1',
+            label: 'Tier1-PinSessOnly',
+            state: 'idle',
+            agentType: 'claude-code',
+          },
+          {
+            serverId: 'srv-pin',
+            serverName: 'Pinned-Srv',
+            serverOnline: false,
+            sessionName: 'sess_pin',
+            projectName: 'p0',
+            label: 'Tier0-BothPinned',
+            state: 'idle',
+            agentType: 'claude-code',
+          },
+        ],
+        tasks: [],
+        mutedServerIds: [],
+      });
+    });
+
+    const pills = Array.from(
+      screen.getByTestId('task-mode-quickbar-list').querySelectorAll('.global-task-brain-pill'),
+    ).map((el) => el.getAttribute('data-testid'));
+    expect(pills).toEqual([
+      'task-mode-brain-pill-srv-pin-sess_pin',
+      'task-mode-brain-pill-srv-plain-2-sess_pin',
+      'task-mode-brain-pill-srv-pin-sess_plain_on_pin',
+      'task-mode-brain-pill-srv-plain-1-sess_plain',
+    ]);
+
+    // Server filter menu puts pinned server first, followed by unpinned servers in serverOrder
+    fireEvent.click(screen.getByTestId('task-mode-server-filter-btn'));
+    const filterOrder = Array.from(
+      screen.getByTestId('task-mode-server-filter-list').querySelectorAll('input[type="checkbox"]'),
+    ).map((el) => el.getAttribute('data-testid'));
+    expect(filterOrder).toEqual([
+      'task-mode-server-toggle-srv-pin',
+      'task-mode-server-toggle-srv-plain-2',
+      'task-mode-server-toggle-srv-plain-1',
+    ]);
+
+    // Add-modal server select also lists pinned server first and selects it by default
+    fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
+    const selectEl = screen.getByTestId('task-mode-add-server-select') as HTMLSelectElement;
+    expect(Array.from(selectEl.options).map((o) => o.value)).toEqual([
+      'srv-pin',
+      'srv-plain-2',
+      'srv-plain-1',
+    ]);
+    expect(selectEl.value).toBe('srv-pin');
+  });
 });
