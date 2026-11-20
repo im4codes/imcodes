@@ -12,9 +12,11 @@ import {
   type GlobalTaskSnapshotResponse,
   type GlobalTaskSummaryRow,
 } from '@shared/global-task-mode.js';
+import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
 import { fallbackReadableSessionDisplay, pickReadableSessionDisplay } from '@shared/session-display.js';
+import { parseSyncedPreference, type SyncedPreferencePayload } from '@shared/synced-preference.js';
 import { formatLabel } from './format-label.js';
-import { ApiError, apiFetch, getApiBaseUrl, sendSessionViaHttp } from './api.js';
+import { ApiError, apiFetch, getApiBaseUrl, getUserPref, saveUserPref, sendSessionViaHttp } from './api.js';
 
 export const GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY = 'imcodes.global-task-mode.muted-servers';
 export const GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY = 'imcodes.global-task-mode.pinned-brains';
@@ -144,8 +146,7 @@ export function computeDefaultMutedServerIds(
   return servers.filter((s) => !pinnedServerIds.has(s.id)).map((s) => s.id);
 }
 
-function loadPinnedBrains(): GlobalTaskPinnedBrain[] {
-  const raw = readStorageJson<unknown>(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, []);
+function sanitizePinnedBrains(raw: unknown): GlobalTaskPinnedBrain[] {
   if (!Array.isArray(raw)) return [];
   const out: GlobalTaskPinnedBrain[] = [];
   const seen = new Set<string>();
@@ -158,14 +159,59 @@ function loadPinnedBrains(): GlobalTaskPinnedBrain[] {
     const key = brainKey(serverId, sessionName);
     if (seen.has(key)) continue;
     seen.add(key);
+    const rawLabel = typeof obj.label === 'string' && obj.label.trim() ? obj.label.trim() : undefined;
+    const projectName = typeof obj.projectName === 'string' && obj.projectName.trim() ? obj.projectName.trim() : undefined;
+    const label = rawLabel ? normalizeStoredSessionLabel(rawLabel, projectName, sessionName) : undefined;
     out.push({
       serverId,
       sessionName,
-      ...(typeof obj.label === 'string' && obj.label.trim() ? { label: obj.label.trim() } : {}),
-      ...(typeof obj.projectName === 'string' && obj.projectName.trim() ? { projectName: obj.projectName.trim() } : {}),
+      ...(label ? { label } : {}),
+      ...(projectName ? { projectName } : {}),
     });
   }
   return out;
+}
+
+function parsePinnedBrainsEnvelope(raw: unknown): SyncedPreferencePayload<GlobalTaskPinnedBrain[]> | null {
+  const parsed = parseSyncedPreference<unknown>(raw);
+  if (!parsed || !Array.isArray(parsed.v)) return null;
+  return { v: sanitizePinnedBrains(parsed.v), t: parsed.t };
+}
+
+function parsePinnedBrainsLocalValue(rawText: string | null): SyncedPreferencePayload<GlobalTaskPinnedBrain[]> | null {
+  if (!rawText) return null;
+  const envelope = parsePinnedBrainsEnvelope(rawText);
+  if (envelope) return envelope;
+  try {
+    const parsed = JSON.parse(rawText) as unknown;
+    if (Array.isArray(parsed)) {
+      const migrated = sanitizePinnedBrains(parsed);
+      // Empty legacy un-enveloped array has no write timestamp (treat as t=0 untouched default)
+      // so a fresh device never overwrites synced remote stars with [].
+      return migrated.length > 0 ? { v: migrated, t: 1 } : null;
+    }
+  } catch {
+    // Ignore malformed legacy data.
+  }
+  return null;
+}
+
+function readLocalPinnedBrainsPayload(): SyncedPreferencePayload<GlobalTaskPinnedBrain[]> | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    return parsePinnedBrainsLocalValue(localStorage.getItem(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY));
+  } catch {
+    return null;
+  }
+}
+
+function samePinnedBrains(a: readonly GlobalTaskPinnedBrain[], b: readonly GlobalTaskPinnedBrain[]): boolean {
+  if (a.length !== b.length) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
 }
 
 function loadRecentBrains(): GlobalTaskRecentBrain[] {
@@ -444,6 +490,16 @@ export class GlobalTaskModeStore {
   private activeConsumerCount = 0;
   private brainTextOrder: string[] = [];
   private hasExplicitMutedFilter = hasStoredMutedServerFilter();
+  private pinnedBrainsPayload: SyncedPreferencePayload<GlobalTaskPinnedBrain[]> | null = readLocalPinnedBrainsPayload();
+  private pinnedLocalWriteSeq = 0;
+  private pinnedSyncEpoch = 0;
+  private pinnedSaveEpoch = 0;
+  private pinnedSyncInFlight = false;
+  private pinnedSyncQueued = false;
+  private pinnedSaveInFlight = false;
+  private pinnedSaveQueued = false;
+  private syncAbortController: AbortController | null = null;
+  private syncListenersAttached = false;
   private state: GlobalTaskModeState = this.createInitialState();
 
   private createInitialState(): GlobalTaskModeState {
@@ -457,7 +513,7 @@ export class GlobalTaskModeStore {
       brains: [],
       servers: [],
       mutedServerIds: loadMutedServerIds(),
-      pinnedBrains: loadPinnedBrains(),
+      pinnedBrains: this.pinnedBrainsPayload?.v ?? [],
       recentBrains: loadRecentBrains(),
       latestBrainTexts: {},
       lastSyncedAt: null,
@@ -524,17 +580,171 @@ export class GlobalTaskModeStore {
     this.emit();
   }
 
+  private readonly handleWindowWake = (): void => {
+    if (!this.running) return;
+    void this.syncPinnedBrainsFromServer();
+  };
+
+  private readonly handleVisibilityChange = (): void => {
+    if (!this.running || typeof document === 'undefined' || document.visibilityState !== 'visible') return;
+    void this.syncPinnedBrainsFromServer();
+  };
+
+  private readonly handleStorageEvent = (event: StorageEvent): void => {
+    if (!this.running || event.key !== GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY) return;
+    const incoming = parsePinnedBrainsLocalValue(event.newValue);
+    const local = this.readLatestPinnedPayload();
+    if (incoming && (!local || incoming.t >= local.t)) {
+      this.pinnedLocalWriteSeq += 1;
+      this.applySyncedPinnedPayload(incoming, false);
+    } else if (local && incoming && incoming.t < local.t) {
+      writeStorageJson(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, local);
+    }
+  };
+
+  private attachSyncListeners(): void {
+    if (this.syncListenersAttached) return;
+    this.syncListenersAttached = true;
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', this.handleWindowWake);
+      window.addEventListener('online', this.handleWindowWake);
+      window.addEventListener('storage', this.handleStorageEvent);
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+  }
+
+  private detachSyncListeners(): void {
+    if (!this.syncListenersAttached) return;
+    this.syncListenersAttached = false;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('focus', this.handleWindowWake);
+      window.removeEventListener('online', this.handleWindowWake);
+      window.removeEventListener('storage', this.handleStorageEvent);
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+  }
+
+  private readLatestPinnedPayload(): SyncedPreferencePayload<GlobalTaskPinnedBrain[]> | null {
+    const disk = readLocalPinnedBrainsPayload();
+    const memory = this.pinnedBrainsPayload;
+    return disk && (!memory || disk.t > memory.t) ? disk : memory;
+  }
+
+  private applySyncedPinnedPayload(payload: SyncedPreferencePayload<GlobalTaskPinnedBrain[]>, writeDisk: boolean): void {
+    this.pinnedBrainsPayload = payload;
+    if (writeDisk) {
+      writeStorageJson(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, payload);
+    }
+    if (!samePinnedBrains(this.state.pinnedBrains, payload.v)) {
+      this.setState({ pinnedBrains: payload.v });
+    }
+  }
+
+  private pinnedSaveToken = 0;
+  private pinnedSyncToken = 0;
+
+  private async flushPinnedSaveQueue(): Promise<void> {
+    if (this.pinnedSaveInFlight) {
+      this.pinnedSaveQueued = true;
+      return;
+    }
+    this.pinnedSaveInFlight = true;
+    const loopEpoch = this.pinnedSaveEpoch;
+    const myToken = ++this.pinnedSaveToken;
+    try {
+      do {
+        this.pinnedSaveQueued = false;
+        const payload = this.pinnedBrainsPayload;
+        if (!payload || this.pinnedSaveEpoch !== loopEpoch) break;
+        try {
+          await saveUserPref(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, JSON.stringify(payload));
+        } catch {
+          // Preserve local payload; subsequent lifecycle sync reconciles when reachable.
+        }
+      } while (this.pinnedSaveQueued && this.pinnedSaveEpoch === loopEpoch);
+    } finally {
+      if (this.pinnedSaveToken === myToken) {
+        this.pinnedSaveInFlight = false;
+      }
+    }
+  }
+
+  async syncPinnedBrainsFromServer(): Promise<void> {
+    if (this.pinnedSyncInFlight) {
+      this.pinnedSyncQueued = true;
+      return;
+    }
+    this.pinnedSyncInFlight = true;
+    const loopEpoch = this.pinnedSyncEpoch;
+    const myToken = ++this.pinnedSyncToken;
+    try {
+      do {
+        this.pinnedSyncQueued = false;
+        const writeSeqAtStart = this.pinnedLocalWriteSeq;
+        const signal = this.syncAbortController?.signal;
+        if (signal?.aborted) break;
+        try {
+          const raw = await getUserPref(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, { strict: true, signal });
+          if (this.pinnedSyncEpoch !== loopEpoch || signal?.aborted) break;
+          // If a local toggle occurred while GET was in flight, never overwrite it with the stale response.
+          if (this.pinnedLocalWriteSeq !== writeSeqAtStart) continue;
+
+          if (raw !== null) {
+            const remote = parsePinnedBrainsEnvelope(raw);
+            if (!remote) continue;
+            const local = this.readLatestPinnedPayload();
+            if (!local || remote.t >= local.t) {
+              this.applySyncedPinnedPayload(remote, true);
+            } else {
+              await this.flushPinnedSaveQueue();
+            }
+          } else {
+            const local = this.readLatestPinnedPayload();
+            if (local) {
+              this.applySyncedPinnedPayload(local, true);
+              await this.flushPinnedSaveQueue();
+            }
+          }
+        } catch {
+          // Transient read failure is never treated as missing preference.
+        }
+      } while (this.pinnedSyncQueued && this.pinnedSyncEpoch === loopEpoch);
+    } finally {
+      if (this.pinnedSyncToken === myToken) {
+        this.pinnedSyncInFlight = false;
+      }
+    }
+  }
+
   async start(): Promise<void> {
     if (this.running && (this.ws || this.state.connecting || this.reconnectTimer)) {
       return;
     }
     this.running = true;
+    if (!this.syncAbortController || this.syncAbortController.signal.aborted) {
+      this.syncAbortController = new AbortController();
+    }
+    this.attachSyncListeners();
+    void this.syncPinnedBrainsFromServer();
     await this.connectOnce();
   }
 
   stop(): void {
     this.running = false;
     this.connectionGeneration += 1;
+    this.pinnedSyncEpoch += 1;
+    this.pinnedSyncToken += 1;
+    this.pinnedSyncInFlight = false;
+    this.pinnedSyncQueued = false;
+    this.detachSyncListeners();
+    if (this.syncAbortController) {
+      this.syncAbortController.abort();
+      this.syncAbortController = null;
+    }
     this.clearTimers();
     const ws = this.ws;
     this.ws = null;
@@ -646,8 +856,16 @@ export class GlobalTaskModeStore {
           ...(entry.projectName ? { projectName: entry.projectName } : {}),
         },
       ];
-    writeStorageJson(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, next);
+    const prevPayload = this.readLatestPinnedPayload();
+    const payload: SyncedPreferencePayload<GlobalTaskPinnedBrain[]> = {
+      v: next,
+      t: Math.max(Date.now(), (prevPayload?.t ?? 0) + 1),
+    };
+    this.pinnedLocalWriteSeq += 1;
+    this.pinnedBrainsPayload = payload;
+    writeStorageJson(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, payload);
     this.setState({ pinnedBrains: next });
+    void this.flushPinnedSaveQueue();
   }
 
   recordRecentBrain(entry: Omit<GlobalTaskRecentBrain, 'lastUsedAt'> & { lastUsedAt?: number }): void {
@@ -685,6 +903,7 @@ export class GlobalTaskModeStore {
       sessionName,
       text: finalText,
       commandId: makeCommandId(),
+      deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND,
     });
 
     this.recordRecentBrain({
@@ -698,6 +917,12 @@ export class GlobalTaskModeStore {
   clearSessionState(): void {
     this.activeConsumerCount = 0;
     this.stop();
+    this.pinnedLocalWriteSeq += 1;
+    this.pinnedSaveEpoch += 1;
+    this.pinnedSaveToken += 1;
+    this.pinnedSaveInFlight = false;
+    this.pinnedSaveQueued = false;
+    this.pinnedBrainsPayload = null;
     this.seenBrainEventIds.clear();
     this.seenNotificationEventIds.clear();
     this.brainTextOrder = [];

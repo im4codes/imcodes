@@ -24060,6 +24060,25 @@ html.native-ios-mac .global-task-mode-entry-btn {
   word-break: break-word;
 }
 
+.global-task-composer-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.global-task-composer-enter-btn {
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  background: rgba(14, 165, 233, 0.16);
+  color: #bae6fd;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
 .global-task-modal-close {
   border: 0;
   background: transparent;

@@ -10,12 +10,14 @@ import {
   type GlobalTaskServerSummary,
   type GlobalTaskSummaryRow,
 } from '@shared/global-task-mode.js';
+import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
 import { configure as configureApi, configureApiKey, clearApiKey } from '../src/api.js';
 import {
   clearGlobalTaskModeSessionState,
   computeDefaultMutedServerIds,
   formatTaskReplyMessage,
   GLOBAL_TASK_MUTED_SERVERS_STORAGE_KEY,
+  GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY,
   GlobalTaskModeStore,
   MAX_RECENT_BRAINS,
   resolveQuickDispatchBrains,
@@ -386,6 +388,7 @@ describe('global-task-mode-store', () => {
     const firstBody = JSON.parse(String((firstCall![1] as RequestInit).body));
     expect(firstBody.sessionName).toBe('deck_a_brain');
     expect(firstBody.text).toBe('[关于任务「Global Store」]\nApprove merge');
+    expect(firstBody.deliveryMode).toBe(SESSION_SEND_DELIVERY_MODES.APPEND);
 
     for (let i = 0; i < 10; i++) {
       await store.sendGlobalBrainMessage({
@@ -399,6 +402,7 @@ describe('global-task-mode-store', () => {
     expect(String(lastCall[0])).toContain('/api/server/srv-9/session/send');
     const lastBody = JSON.parse(String((lastCall[1] as RequestInit).body));
     expect(lastBody.text).toBe('Raw dispatch 9');
+    expect(lastBody.deliveryMode).toBe(SESSION_SEND_DELIVERY_MODES.APPEND);
     expect(store.getState().recentBrains).toHaveLength(MAX_RECENT_BRAINS);
     expect(store.getState().recentBrains[0]?.sessionName).toBe('brain_9');
   });
@@ -786,5 +790,158 @@ describe('global-task-mode-store', () => {
     for (const item of staleInternalOnly) {
       expect(item.label).not.toMatch(/^(deck_|bootmain)/);
     }
+  });
+
+  it('syncs pinnedBrains account-wide via LWW user preferences, migrates legacy arrays, and prevents stale GET/out-of-order PUT races', async () => {
+    let remotePrefValue: string | null = JSON.stringify({
+      v: [{ serverId: 'srv-remote', sessionName: 'deck_remote_brain', label: 'Remote', projectName: 'remote' }],
+      t: 5_000,
+    });
+    const savedPrefPayloads: string[] = [];
+    let holdFirstGet: ((value: Response) => void) | null = null;
+    let deferFirstGet = false;
+
+    fetchSpy.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.endsWith(GLOBAL_TASK_TICKET_PATH)) {
+        ticketCount += 1;
+        return new Response(JSON.stringify({ ticket: `ticket-${ticketCount}` }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.endsWith(`/api/preferences/${GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY}`)) {
+        if (method === 'PUT') {
+          const parsedBody = JSON.parse(String(init?.body ?? '{}')) as { value?: string };
+          if (typeof parsedBody.value === 'string') {
+            remotePrefValue = parsedBody.value;
+            savedPrefPayloads.push(parsedBody.value);
+          }
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (deferFirstGet) {
+          deferFirstGet = false;
+          return await new Promise<Response>((resolve) => {
+            holdFirstGet = resolve;
+          });
+        }
+        return new Response(JSON.stringify({ value: remotePrefValue }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    // 1. Fresh untouched device (and legacy empty [] in localStorage) must adopt server stars, never overwrite with []
+    localStorage.setItem(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY, '[]');
+    const store = new GlobalTaskModeStore();
+    expect(store.getState().pinnedBrains).toEqual([]);
+    await store.start();
+    await vi.waitFor(() => {
+      expect(store.getState().pinnedBrains).toEqual([
+        { serverId: 'srv-remote', sessionName: 'deck_remote_brain', label: 'Remote', projectName: 'remote' },
+      ]);
+    });
+    expect(savedPrefPayloads).toHaveLength(0);
+    expect(JSON.parse(localStorage.getItem(GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY)!)).toEqual({
+      v: [{ serverId: 'srv-remote', sessionName: 'deck_remote_brain', label: 'Remote', projectName: 'remote' }],
+      t: 5_000,
+    });
+
+    // 2. Focus / online / visibilitychange wakes adopt newer stars added on another device
+    remotePrefValue = JSON.stringify({
+      v: [
+        { serverId: 'srv-remote', sessionName: 'deck_remote_brain', label: 'Remote', projectName: 'remote' },
+        { serverId: 'srv-phone', sessionName: 'deck_phone_brain', label: 'Phone', projectName: 'phone' },
+      ],
+      t: 9_000,
+    });
+    window.dispatchEvent(new Event('focus'));
+    await vi.waitFor(() => {
+      expect(store.getState().pinnedBrains).toHaveLength(2);
+    });
+    expect(store.getState().pinnedBrains[1]?.sessionName).toBe('deck_phone_brain');
+
+    // Cross-tab storage event updates without redundant PUT
+    const countBeforeStorage = savedPrefPayloads.length;
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY,
+      newValue: JSON.stringify({
+        v: [{ serverId: 'srv-tab', sessionName: 'deck_tab_brain', label: 'Tab', projectName: 'tab' }],
+        t: 10_000,
+      }),
+    }));
+    expect(store.getState().pinnedBrains).toEqual([
+      { serverId: 'srv-tab', sessionName: 'deck_tab_brain', label: 'Tab', projectName: 'tab' },
+    ]);
+    expect(savedPrefPayloads).toHaveLength(countBeforeStorage);
+
+    // 3. stop() detaches lifecycle listeners so subsequent focus/online events do not fetch
+    store.stop();
+    const fetchCallsAfterStop = fetchSpy.mock.calls.length;
+    window.dispatchEvent(new Event('focus'));
+    window.dispatchEvent(new Event('online'));
+    expect(fetchSpy.mock.calls.length).toBe(fetchCallsAfterStop);
+
+    // 4. Rapid double-toggling while an earlier GET is in flight must not revert to stale GET response
+    vi.setSystemTime(20_000);
+    deferFirstGet = true;
+    await store.start();
+    expect(holdFirstGet).not.toBeNull();
+    store.togglePinnedBrain({ serverId: 'srv-fast-1', sessionName: 'deck_fast_1', label: 'Fast1', projectName: 'f1' });
+    store.togglePinnedBrain({ serverId: 'srv-fast-2', sessionName: 'deck_fast_2', label: 'Fast2', projectName: 'f2' });
+
+    holdFirstGet!(new Response(JSON.stringify({
+      value: JSON.stringify({
+        v: [{ serverId: 'srv-stale', sessionName: 'deck_stale', label: 'Stale', projectName: 'stale' }],
+        t: 15_000,
+      }),
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    await vi.waitFor(() => {
+      expect(savedPrefPayloads.length).toBeGreaterThanOrEqual(2);
+    });
+    expect(store.getState().pinnedBrains.map((b) => b.sessionName)).toEqual([
+      'deck_tab_brain',
+      'deck_fast_1',
+      'deck_fast_2',
+    ]);
+    const latestRemote = JSON.parse(remotePrefValue!) as { v: Array<{ sessionName: string }>; t: number };
+    expect(latestRemote.v.map((b) => b.sessionName)).toEqual([
+      'deck_tab_brain',
+      'deck_fast_1',
+      'deck_fast_2',
+    ]);
+    expect(latestRemote.t).toBeGreaterThanOrEqual(20_001);
+    store.stop();
+
+    // 5. Legacy non-empty plain-array localStorage data backfills to server when remote is null
+    localStorage.setItem(
+      GLOBAL_TASK_PINNED_BRAINS_STORAGE_KEY,
+      JSON.stringify([{ serverId: 'srv-legacy', sessionName: 'deck_legacy_brain', label: 'Legacy', projectName: 'legacy' }]),
+    );
+    remotePrefValue = null;
+    savedPrefPayloads.length = 0;
+    const legacyStore = new GlobalTaskModeStore();
+    expect(legacyStore.getState().pinnedBrains).toEqual([
+      { serverId: 'srv-legacy', sessionName: 'deck_legacy_brain', label: 'Legacy', projectName: 'legacy' },
+    ]);
+    await legacyStore.start();
+    await vi.waitFor(() => {
+      expect(savedPrefPayloads).toHaveLength(1);
+    });
+    expect(JSON.parse(savedPrefPayloads[0]!)).toEqual({
+      v: [{ serverId: 'srv-legacy', sessionName: 'deck_legacy_brain', label: 'Legacy', projectName: 'legacy' }],
+      t: 1,
+    });
+    legacyStore.stop();
   });
 });

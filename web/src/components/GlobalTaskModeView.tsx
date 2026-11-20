@@ -1539,14 +1539,30 @@ export function GlobalTaskModeView({
                   <span class="global-task-composer-task-title">{composerTarget.taskTitle}</span>
                 )}
               </div>
-              <button
-                type="button"
-                class="global-task-modal-close"
-                aria-label={t('common.close', 'Close')}
-                onClick={() => setComposerTarget(null)}
-              >
-                ✕
-              </button>
+              <div class="global-task-composer-actions">
+                <button
+                  type="button"
+                  class="global-task-composer-enter-btn"
+                  data-testid="task-mode-composer-enter-session"
+                  onClick={() => {
+                    const { serverId, sessionName } = composerTarget;
+                    setComposerTarget(null);
+                    setComposerDraft('');
+                    setComposerError(null);
+                    onJumpToSession(serverId, sessionName);
+                  }}
+                >
+                  {t('taskMode.enter_session', 'Open session')}
+                </button>
+                <button
+                  type="button"
+                  class="global-task-modal-close"
+                  aria-label={t('common.close', 'Close')}
+                  onClick={() => setComposerTarget(null)}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {composerTarget.mode === 'reply' && (

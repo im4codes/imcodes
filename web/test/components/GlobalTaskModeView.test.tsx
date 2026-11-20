@@ -428,6 +428,7 @@ describe('GlobalTaskModeView', () => {
       const body = JSON.parse(String((sendCall![1] as RequestInit).body));
       expect(body.sessionName).toBe('deck_imcodes_brain');
       expect(body.text).toBe('Start audit cleanup');
+      expect(body.deliveryMode).toBe('append');
       expect(screen.queryByTestId('task-mode-add-modal')).toBeNull();
     });
 
@@ -442,6 +443,7 @@ describe('GlobalTaskModeView', () => {
       const sendCalls = fetchSpy.mock.calls.filter((c) => String(c[0]).includes('/api/server/srv-1/session/send'));
       const lastBody = JSON.parse(String((sendCalls.at(-1)![1] as RequestInit).body));
       expect(lastBody.text).toBe('[Regarding task "Build Global View"]\nCheck failing spec');
+      expect(lastBody.deliveryMode).toBe('append');
       expect(screen.queryByTestId('task-mode-composer')).toBeNull();
     });
 
@@ -2155,5 +2157,34 @@ describe('GlobalTaskModeView', () => {
     fireEvent.click(legacyNoProjCard);
     fireEvent.click(screen.getByTestId('task-mode-jump-tsk_legacy_noproj'));
     expect(onJumpToSession).toHaveBeenCalledWith('srv-1', 'bootmainxowfy6');
+  });
+
+  it('provides an Open session button in the Quick Composer header for both reply and dispatch targets', async () => {
+    const { onJumpToSession } = await mountWithSnapshot();
+
+    // 1. Reply composer mode: header button closes modal and jumps to session
+    fireEvent.click(screen.getByTestId('task-mode-reply-tsk_pair_1'));
+    expect(screen.getByTestId('task-mode-composer')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('task-mode-composer-enter-session'));
+    expect(screen.queryByTestId('task-mode-composer')).toBeNull();
+    expect(onJumpToSession).toHaveBeenNthCalledWith(1, 'srv-1', 'deck_imcodes_brain');
+
+    // 2. Pin a Brain pill -> open Dispatch composer mode -> header button closes modal and jumps to session
+    fireEvent.click(screen.getByTestId('task-mode-add-brain-btn'));
+    const srvSelect = screen.getByTestId('task-mode-add-server-select') as HTMLSelectElement;
+    await waitFor(() => expect(srvSelect.value).toBe('srv-1'));
+    await act(async () => {
+      srvSelect.value = 'srv-2';
+      srvSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await waitFor(() => expect((screen.getByTestId('task-mode-add-brain-select') as HTMLSelectElement).value).toBe('deck_gpu_brain'));
+    fireEvent.click(screen.getByTestId('task-mode-add-pin-toggle'));
+    fireEvent.click(screen.getByTestId('task-mode-add-modal').querySelector('.global-task-modal-close')!);
+
+    fireEvent.click(screen.getByTestId('task-mode-brain-pill-srv-2-deck_gpu_brain'));
+    expect(screen.getByTestId('task-mode-composer')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('task-mode-composer-enter-session'));
+    expect(screen.queryByTestId('task-mode-composer')).toBeNull();
+    expect(onJumpToSession).toHaveBeenNthCalledWith(2, 'srv-2', 'deck_gpu_brain');
   });
 });
