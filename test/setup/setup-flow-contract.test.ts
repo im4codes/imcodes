@@ -108,9 +108,18 @@ function ensureDockerFixtureImages(run: DockerRunner = (args) => spawnSync('dock
   dockerFixtureImagesReady = true;
 }
 
+const DOCKER_FIXTURE_HOOK_TIMEOUT_MS = 300_000;
+
 function expectDockerSuccess(result: DockerResult, operation: string): void {
   const detail = String(result.stderr ?? result.stdout ?? '').trim();
   expect(result.status, `${operation} failed${detail ? `: ${detail}` : ''}`).toBe(0);
+}
+
+/** Register the suite-level Docker fixture image warmup with enough hook budget for cold CI pulls. */
+function useDockerFixtureImages(dockerAvailable: boolean): void {
+  beforeAll(() => {
+    if (dockerAvailable) ensureDockerFixtureImages();
+  }, DOCKER_FIXTURE_HOOK_TIMEOUT_MS);
 }
 
 describe('Docker fixture image preparation', () => {
@@ -1513,9 +1522,7 @@ describe('docker compose validates both network strategies', () => {
     }
   })();
 
-  beforeAll(() => {
-    if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  useDockerFixtureImages(dockerAvailable);
 
   function renderDeployment(relayMinPort: number, relayMaxPort: number, rangeOrigin: 'capacity' | 'configured') {
     return {
@@ -1843,9 +1850,7 @@ describe('retained Windows artifact versions survive Server image replacement', 
     }
   })();
 
-  beforeAll(() => {
-    if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  useDockerFixtureImages(dockerAvailable);
 
   async function templates() {
     return await import('../../src/setup/templates.js');
@@ -2191,9 +2196,7 @@ describe('legacy discovery distinguishes unreadable from absent, against real co
     }
   })();
 
-  beforeAll(() => {
-    if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  useDockerFixtureImages(dockerAvailable);
 
   it.skipIf(!dockerAvailable)('blocks replacement when the legacy directory cannot be listed', async () => {
     // The masked form (`ls ... 2>/dev/null || true`) turned EACCES into exit 0
@@ -2268,9 +2271,7 @@ describe('a stopped pre-fix Server still gets migrated', () => {
     }
   })();
 
-  beforeAll(() => {
-    if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  useDockerFixtureImages(dockerAvailable);
 
   it.skipIf(!dockerAvailable)('stages pinned bytes from an exited legacy container and survives replacement', async () => {
     // `compose ps -q` hides stopped containers, so an exited or
