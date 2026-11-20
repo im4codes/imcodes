@@ -29,6 +29,8 @@ export interface AppMenuOptions {
   onClearSession: () => void;
   onBindFallback: () => void;
   onOpenDocs: () => void;
+  onOpenSettings?: () => void;
+  settingsEnabled?: boolean;
 }
 
 function formatServerLabel(server: SavedServer): string {
@@ -56,6 +58,8 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
     onClearSession,
     onBindFallback,
     onOpenDocs,
+    onOpenSettings,
+    settingsEnabled,
   } = options;
 
   const serverItems: MenuItemOptionsLike[] = servers.length > 0
@@ -130,6 +134,14 @@ export function buildAppMenuTemplate(options: AppMenuOptions): MenuItemOptionsLi
       label: appName,
       submenu: [
         { role: 'about' },
+        { type: 'separator' },
+        {
+          id: 'app:settings',
+          label: 'Settings…',
+          accelerator: 'CmdOrCtrl+,',
+          enabled: settingsEnabled ?? Boolean(activeOrigin),
+          click: () => onOpenSettings?.(),
+        },
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },

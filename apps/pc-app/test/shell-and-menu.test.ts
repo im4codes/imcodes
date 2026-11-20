@@ -33,6 +33,7 @@ function createFakeShellWindow(opts: {
     reload: vi.fn(),
     reloadIgnoringCache: vi.fn(),
     toggleDevTools: vi.fn(),
+    executeJavaScript: vi.fn(async () => undefined),
     session,
   });
 
@@ -410,5 +411,89 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     } finally {
       rmSync(badHome, { recursive: true, force: true });
     }
+  });
+
+  it('adds Cmd+, Settings… menu item on macOS, disabled on welcome screen and guarded by trusted origin when connected', async () => {
+    let createdWin!: ReturnType<typeof createFakeShellWindow>;
+    let latestMenu: MenuItemOptionsLike[] = [];
+
+    const shell = createPcAppShell({
+      platform: 'darwin',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      createMainWindow: (opts) => {
+        createdWin = createFakeShellWindow({ webPreferences: opts.webPreferences });
+        return createdWin;
+      },
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: (template) => {
+        latestMenu = template;
+      },
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 1 }),
+    });
+
+    await shell.ensureWindow();
+    // Welcome screen: Settings… exists with CmdOrCtrl+, accelerator but disabled and no-op
+    let settingsItem = findMenuItem(latestMenu, 'app:settings');
+    expect(settingsItem).toBeDefined();
+    expect(settingsItem?.accelerator).toBe('CmdOrCtrl+,');
+    expect(settingsItem?.enabled).toBe(false);
+    settingsItem?.click?.();
+    expect(createdWin.webContents.executeJavaScript).not.toHaveBeenCalled();
+
+    // Connect to trusted origin via welcome connect action: Settings… becomes enabled and dispatches imcodes:open-settings
+    const connectEv = { preventDefault: vi.fn() };
+    createdWin.webContentsEmitter.emit(
+      'will-navigate',
+      connectEv,
+      'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fapp.im.codes',
+    );
+    await vi.waitFor(() => {
+      expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes');
+      expect(createdWin.webContents.getURL()).toBe('https://app.im.codes');
+      expect(findMenuItem(latestMenu, 'app:settings')?.enabled).toBe(true);
+    });
+    settingsItem = findMenuItem(latestMenu, 'app:settings');
+    settingsItem?.click?.();
+    expect(createdWin.webContents.executeJavaScript).toHaveBeenCalledTimes(1);
+    expect(createdWin.webContents.executeJavaScript).toHaveBeenCalledWith(
+      'window.dispatchEvent(new CustomEvent("imcodes:open-settings"))',
+      true,
+    );
+
+    // If webContents navigated away to an untrusted origin, did-navigate disables Settings… and click is a safe no-op
+    (createdWin.webContents.executeJavaScript as ReturnType<typeof vi.fn>).mockClear();
+    await createdWin.loadURL('https://evil.example/');
+    createdWin.webContentsEmitter.emit('did-navigate');
+    settingsItem = findMenuItem(latestMenu, 'app:settings');
+    expect(settingsItem?.enabled).toBe(false);
+    settingsItem?.click?.();
+    expect(createdWin.webContents.executeJavaScript).not.toHaveBeenCalled();
+  });
+
+  it('omits macOS app:settings menu item on non-darwin platforms', async () => {
+    let latestMenu: MenuItemOptionsLike[] = [];
+    const shell = createPcAppShell({
+      platform: 'win32',
+      appName: 'IM.codes',
+      userDataDir: tempDir,
+      createMainWindow: (opts) => createFakeShellWindow({ webPreferences: opts.webPreferences }),
+      createPromptWindow: () => {
+        throw new Error('unused');
+      },
+      setApplicationMenu: (template) => {
+        latestMenu = template;
+      },
+      openExternal: () => {},
+      showSaveDialogSync: () => undefined,
+      showMessageBox: async () => ({ response: 1 }),
+    });
+
+    await shell.ensureWindow();
+    expect(findMenuItem(latestMenu, 'app:settings')).toBeUndefined();
   });
 });

@@ -38,6 +38,7 @@ export interface ShellWindowLike extends TrustedWindowLike {
     reload(): void;
     reloadIgnoringCache(): void;
     toggleDevTools(): void;
+    executeJavaScript?(code: string, userGesture?: boolean): Promise<unknown>;
   };
 }
 
@@ -249,6 +250,14 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
     }
   };
 
+  const handleOpenSettings = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!controller.currentTrustedOrigin()) return;
+    void mainWindow.webContents
+      .executeJavaScript?.('window.dispatchEvent(new CustomEvent("imcodes:open-settings"))', true)
+      ?.catch(() => {});
+  };
+
   const rebuildMenu = () => {
     const template = buildAppMenuTemplate({
       platform: deps.platform,
@@ -278,6 +287,8 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
       onClearSession: () => void handleClearSession(),
       onBindFallback: () => void handleBindFallback(),
       onOpenDocs: () => void openDocsSafely(DOCS_HELP_URL),
+      onOpenSettings: handleOpenSettings,
+      settingsEnabled: Boolean(controller.currentTrustedOrigin()),
     });
     deps.setApplicationMenu(template);
   };
@@ -388,6 +399,7 @@ export function createPcAppShell(deps: PcAppShellDeps): PcAppShellInstance {
 
     win.webContents.on('did-navigate', () => {
       controller.notifyDidNavigate();
+      rebuildMenu();
     });
 
     if (win.webContents.session.cookies) {
